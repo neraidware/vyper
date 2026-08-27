@@ -16,6 +16,7 @@ import sws "vendor/ffmpeg/swscale"
 // rolling frame pool once real-time multi-track composition lands.
 Clip_Decoder :: struct {
 	opened:      bool,
+	path:        cstring,
 	fmt_ctx:     ^avfmt.FormatContext,
 	dec_ctx:     ^avcodec.CodecContext,
 	video_idx:   c.int,
@@ -330,6 +331,35 @@ decode_into_buffer :: proc(dec: ^Clip_Decoder, out: []u8, w, h: c.int) {
 		copy(out[uint(row) * uint(row_bytes):][:uint(row_bytes)], src)
 	}
 	return
+}
+
+// decode_clip_frame_sync decodes the given source frame of `path` into `out`
+// (PREVIEW_W x PREVIEW_H RGBA), opening the decoder on first use and using the
+// decoder's RAM frame cache to avoid re-decoding. Returns true on success. Used
+// by the multi-clip preview compositor (one decoder per clip).
+decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64, out: []u8) -> bool {
+	if !dec.opened || dec.path != path {
+		if dec.opened {
+			clip_decoder_reset(dec)
+		}
+		if !open_clip_decoder(dec, path) {
+			dec.path = path
+			return false
+		}
+		dec.path = path
+	}
+	if cached := cache_find(dec, frame_idx); cached != nil {
+		copy(out, cached)
+		dec.last_frame = frame_idx
+		dec.have_last = true
+		return true
+	}
+	if !decode_source_frame(dec, frame_idx) {
+		return false
+	}
+	decode_into_buffer(dec, out, PREVIEW_W, PREVIEW_H)
+	cache_store(dec, frame_idx, out)
+	return true
 }
 
 // Stream_Probe holds the stream layout of an imported media file.

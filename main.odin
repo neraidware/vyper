@@ -23,6 +23,9 @@ BUTTON_BORDER :: clay.Color{27, 48, 76, 255}
 BUTTON_HOVER :: clay.Color{15, 18, 25, 255}
 BUTTON_BORDER_HOVER :: clay.Color{64, 170, 194, 255}
 AUDIO_CLIP :: clay.Color{58, 44, 66, 255}
+SELECT_BORDER :: clay.Color{120, 220, 120, 255}
+HANDLE_FILL :: clay.Color{30, 30, 30, 255}
+HANDLE_BORDER :: clay.Color{200, 200, 200, 255}
 TEXT :: clay.Color{255, 255, 255, 255}
 
 Project :: struct {
@@ -35,7 +38,31 @@ file_info_text: string
 
 Media_Kind :: enum { Video, Audio, Image, Other }
 Media_Asset :: struct { id: u64, path: cstring, kind: Media_Kind, metadata: string, frame_count: i64 }
-Clip :: struct { asset_id: u64, path: cstring, kind: Media_Kind, stream_index: c.int, source_start_frame: i64, source_length_frames: i64, timeline_start_frame: i64, layer: i32 }
+Clip :: struct {
+	asset_id: u64,
+	path: cstring,
+	kind: Media_Kind,
+	stream_index: c.int,
+	source_start_frame: i64,
+	source_length_frames: i64,
+	timeline_start_frame: i64,
+	layer: i32,
+	// Transform: center of the clip's image within the project canvas, in
+	// project-resolution pixels. Default (width/2, height/2) centers the clip so
+	// it fills the preview at scale 1.
+	transform_x: f32,
+	transform_y: f32,
+	// Scale: uniform (aspect-locked) factor that resizes the on-screen bounding
+	// box relative to the project canvas, independent of crop.
+	scale: f32,
+	// Crop: per-edge trim insets, normalized fractions (0..1) of the scale box.
+	// Trimming edits the box edges (revealing background behind the clip) while
+	// keeping the source's zoom constant, distinct from scale.
+	crop_l: f32,
+	crop_r: f32,
+	crop_t: f32,
+	crop_b: f32,
+}
 clip_timeline_end :: proc(clip: Clip) -> i64 { return clip.timeline_start_frame + clip.source_length_frames }
 
 Track :: struct {
@@ -67,6 +94,58 @@ drag_clip: ^Clip
 selected_track: int = -1
 selected_index: int = -1
 
+// Transform dragging: moving the selected clip around within the preview.
+moving_preview_clip: bool
+preview_drag_offset_x: f32
+preview_drag_offset_y: f32
+
+// Inline editing of a clip property text field (X or Y). editing_field is 0
+// (none), 1 (X) or 2 (Y); edit_chars/edit_len hold the buffer being typed.
+editing_field: int
+edit_chars: [64]u8
+edit_len: int
+edit_begin :: proc(field: int, value: f32) {
+	editing_field = field
+	text := field == 3 ? fmt.aprintf("%.2f", value) : fmt.aprintf("%.0f", value)
+	edit_len = min(len(text), len(edit_chars))
+	copy(edit_chars[:edit_len], text[:edit_len])
+}
+
+edit_cancel :: proc() {
+	editing_field = 0
+	edit_len = 0
+}
+
+edit_commit :: proc() {
+	defer edit_cancel()
+	if sel, ok := transformable_selected(); ok {
+		value, ok := strconv.parse_f32(string(edit_chars[:edit_len]))
+		if !ok {
+			return
+		}
+		if editing_field == 1 {
+			sel.transform_x = value
+		} else if editing_field == 2 {
+			sel.transform_y = value
+		} else if editing_field == 3 {
+			sel.scale = max(value, 0.01)
+		}
+	}
+}
+
+edit_append :: proc(ch: u8) {
+	if edit_len < len(edit_chars) {
+		edit_chars[edit_len] = ch
+		edit_len += 1
+	}
+}
+
+edit_backspace :: proc() {
+	if edit_len > 0 {
+		edit_len -= 1
+	}
+}
+
 // selected_clip returns the currently selected track+clip and true, or
 // (nil, nil, false) when nothing is selected.
 selected_clip :: proc() -> (^Track, ^Clip, bool) {
@@ -87,6 +166,65 @@ preview: Preview_State
 preview_has_frame: bool
 last_decoded_playhead: i64
 last_requested_playhead: i64
+
+// Multi-clip compositing: one Preview_Slot per video clip covering the
+// playhead. Each slot owns a Clip_Decoder (with its own RAM frame cache), a
+// tightly-packed RGBA buffer, and (lazily) a GPU texture. Slots are reassigned
+// by index every frame; when the clip identity changes the decoder is reset and
+// reopened.
+MAX_PREVIEW_SLOTS :: 8
+
+Preview_Slot :: struct {
+	in_use:              bool,
+	asset_id:            u64,
+	path:                cstring,
+	timeline_start_frame: i64,
+	transform_x:         f32,
+	transform_y:         f32,
+	scale:               f32,
+	crop_l:              f32,
+	crop_r:              f32,
+	crop_t:              f32,
+	crop_b:              f32,
+	dec:                 Clip_Decoder,
+	buffer:              [PREVIEW_W * PREVIEW_H * 4]u8,
+	tex_dirty:           bool,
+	texture:             ^sdl.GPUTexture,
+}
+
+preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot
+
+// Preview camera: pan (in preview pixels, relative to the base canvas center)
+// and zoom. Pan/zoom is clamped so the view never travels more than one preview
+// axis from the origin, keeping the composited content near the window center.
+PREVIEW_CAM_MIN_ZOOM :: 0.25
+PREVIEW_CAM_MAX_ZOOM :: 8.0
+preview_cam_ox: f32
+preview_cam_oy: f32
+preview_cam_zoom: f32 = 1.0
+panning_preview: bool
+pan_last_x: f32
+pan_last_y: f32
+
+// Resize/crop handles shown around the selected clip's bounding box.
+PREVIEW_HANDLE_SIZE :: f32(9)
+// Handle indices: 0 TL, 1 T, 2 TR, 3 R, 4 BR, 5 B, 6 BL, 7 L.
+Handle_Kind :: enum { None, Scale, Crop }
+dragging_handle: int = -1
+handle_kind: Handle_Kind = .None
+handle_start_mx: f32
+handle_start_my: f32
+handle_start_scale: f32
+handle_start_crop_l: f32
+handle_start_crop_r: f32
+handle_start_crop_t: f32
+handle_start_crop_b: f32
+handle_start_box_w: f32
+handle_start_box_h: f32
+handle_start_center_x: f32
+handle_start_center_y: f32
+handle_start_tx: f32
+handle_start_ty: f32
 
 Timeline_Frame :: struct {
 	active_clip: ^Clip,
@@ -127,9 +265,8 @@ GPU_Renderer :: struct {
 	text_pipeline: ^sdl.GPUGraphicsPipeline,
 	preview_pipeline: ^sdl.GPUGraphicsPipeline,
 	font: Font_Atlas,
-	preview_texture: [2]^sdl.GPUTexture,
+	preview_textures: [MAX_PREVIEW_SLOTS]^sdl.GPUTexture,
 	preview_sampler: ^sdl.GPUSampler,
-	preview_tex_index: u32,
 	viewport: [2]f32,
 }
 
@@ -297,6 +434,13 @@ import_media :: proc(path: cstring) {
 			source_start_frame = 0,
 			source_length_frames = frame_count,
 			timeline_start_frame = 0,
+			transform_x = f32(project.width) / 2,
+			transform_y = f32(project.height) / 2,
+			scale = 1,
+			crop_l = 0,
+			crop_r = 0,
+			crop_t = 0,
+			crop_b = 0,
 		})
 		append(&timeline.tracks, track)
 		track_n += 1
@@ -343,34 +487,78 @@ timeline_frame_at :: proc(frame: i64) -> Timeline_Frame {
 	return {}
 }
 
-// decode_active_frame is non-blocking: video decode happens on the async
-// worker thread (vdecode.odin), so slow keyframe decodes never stall the
-// render loop or the audio feed. Each frame the render thread copies out any
-// finished RGBA frame and, if the playhead moved, requests the next decode.
-// Returns true when a fresh frame was copied out this call (=> upload it).
-decode_active_frame :: proc() -> bool {
-	ad := &async_decoder
-	tf := timeline_frame_at(playhead.frame)
-	if tf.active_clip == nil {
-		return false
+// update_preview_slots walks every video clip covering the current playhead and
+// ensures each has a Preview_Slot with its frame decoded (using the slot's RAM
+// frame cache). Slots are reassigned by index each frame; when a slot's clip
+// identity changes its decoder is reset and reopened. Returns true if any
+// frame changed (caller re-uploads textures).
+update_preview_slots :: proc() -> bool {
+	changed := false
+	next_slot := 0
+	for track_idx := 0; track_idx < len(timeline.tracks) && next_slot < MAX_PREVIEW_SLOTS; track_idx += 1 {
+		track := &timeline.tracks[track_idx]
+		for i := 0; i < len(track.clips) && next_slot < MAX_PREVIEW_SLOTS; i += 1 {
+			clip := &track.clips[i]
+			if clip.kind != .Video {
+				continue
+			}
+			frame := playhead.frame
+			if frame < clip.timeline_start_frame || frame >= clip.timeline_start_frame + clip.source_length_frames {
+				continue
+			}
+			slot := &preview_slots[next_slot]
+			next_slot += 1
+			if !slot.in_use || slot.asset_id != clip.asset_id || slot.timeline_start_frame != clip.timeline_start_frame {
+				if slot.in_use {
+					clip_decoder_reset(&slot.dec)
+				}
+				slot^ = {}
+				slot.in_use = true
+				slot.asset_id = clip.asset_id
+				slot.path = clip.path
+				slot.timeline_start_frame = clip.timeline_start_frame
+				slot.tex_dirty = true
+			}
+			slot.transform_x = clip.transform_x
+			slot.transform_y = clip.transform_y
+			slot.scale = clip.scale
+			slot.crop_l = clip.crop_l
+			slot.crop_r = clip.crop_r
+			slot.crop_t = clip.crop_t
+			slot.crop_b = clip.crop_b
+			clip_frame := clip.source_start_frame + frame - clip.timeline_start_frame
+			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+				slot.tex_dirty = true
+				changed = true
+			}
+		}
 	}
-	sdl.LockMutex(ad.mutex)
-	new_frame := false
-	if ad.display_dirty {
-		copy(preview.buffer[:], ad.display_buf[:])
-		ad.display_dirty = false
-		last_decoded_playhead = playhead.frame
-		new_frame = true
+	for i := next_slot; i < MAX_PREVIEW_SLOTS; i += 1 {
+		if preview_slots[i].in_use {
+			clip_decoder_reset(&preview_slots[i].dec)
+			preview_slots[i].in_use = false
+		}
 	}
-	if playhead.frame != last_requested_playhead {
-		ad.req_valid = true
-		ad.req_path = tf.active_clip.path
-		ad.req_clip_frame = tf.clip_frame
-		last_requested_playhead = playhead.frame
-		sdl.SignalCondition(ad.cond)
+	return changed
+}
+
+// find_preview_slot returns the slot and Clip* for a given clip identity
+// (asset_id + timeline_start_frame), or (nil, nil, false).
+find_preview_slot :: proc(asset_id: u64, timeline_start_frame: i64) -> (^Preview_Slot, ^Clip, bool) {
+	for i := 0; i < len(timeline.tracks); i += 1 {
+		track := &timeline.tracks[i]
+		for j := 0; j < len(track.clips); j += 1 {
+			clip := &track.clips[j]
+			if clip.asset_id == asset_id && clip.timeline_start_frame == timeline_start_frame {
+				for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+					if preview_slots[s].in_use && preview_slots[s].asset_id == asset_id && preview_slots[s].timeline_start_frame == timeline_start_frame {
+						return &preview_slots[s], clip, true
+					}
+				}
+			}
+		}
 	}
-	sdl.UnlockMutex(ad.mutex)
-	return new_frame
+	return nil, nil, false
 }
 
 open_file_picker :: proc() -> cstring {
@@ -523,6 +711,45 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					if tr, cl, ok := selected_clip(); ok {
 						clay.Text(fmt.aprintf("Track: %s", tr.name), clay.TextElementConfig{textColor = TEXT, fontSize = 15})
 						clay.Text(fmt.aprintf("File: %s", path_basename(cl.path)), clay.TextElementConfig{textColor = TEXT, fontSize = 15})
+						if cl.kind != .Audio {
+							x_val := fmt.aprintf("%.0f", cl.transform_x)
+							if editing_field == 1 {
+								x_val = string(edit_chars[:edit_len])
+							}
+							if clay.UI(clay.ID("PropFieldX"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(8)},
+								backgroundColor = BUTTON,
+								border = {color = editing_field == 1 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(2)},
+								cornerRadius = clay.CornerRadiusAll(6),
+							}) {
+								clay.Text(fmt.aprintf("X: %s", x_val), clay.TextElementConfig{textColor = editing_field == 1 ? BUTTON_BORDER_HOVER : TEXT, fontSize = 15})
+							}
+							y_val := fmt.aprintf("%.0f", cl.transform_y)
+							if editing_field == 2 {
+								y_val = string(edit_chars[:edit_len])
+							}
+							if clay.UI(clay.ID("PropFieldY"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(8)},
+								backgroundColor = BUTTON,
+								border = {color = editing_field == 2 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(2)},
+								cornerRadius = clay.CornerRadiusAll(6),
+							}) {
+								clay.Text(fmt.aprintf("Y: %s", y_val), clay.TextElementConfig{textColor = editing_field == 2 ? BUTTON_BORDER_HOVER : TEXT, fontSize = 15})
+							}
+							scl_val := fmt.aprintf("%.2f", cl.scale)
+							if editing_field == 3 {
+								scl_val = string(edit_chars[:edit_len])
+							}
+							if clay.UI(clay.ID("PropFieldS"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(8)},
+								backgroundColor = BUTTON,
+								border = {color = editing_field == 3 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(2)},
+								cornerRadius = clay.CornerRadiusAll(6),
+							}) {
+								clay.Text(fmt.aprintf("Scale: %s", scl_val), clay.TextElementConfig{textColor = editing_field == 3 ? BUTTON_BORDER_HOVER : TEXT, fontSize = 15})
+							}
+							clay.Text(fmt.aprintf("Crop: L %.0f%% R %.0f%% T %.0f%% B %.0f%%", cl.crop_l * 100, cl.crop_r * 100, cl.crop_t * 100, cl.crop_b * 100), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+						}
 					} else {
 						clay.Text("No clip selected", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
 					}
@@ -802,9 +1029,12 @@ render_sdf_rect :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
 
-// upload_preview_texture copies tightly-packed RGBA pixels into the preview
-// GPU texture using a transfer buffer + copy pass on the given command buffer.
-upload_preview_texture :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, data: []u8) {
+// upload_preview_slot copies tightly-packed RGBA pixels into a slot's GPU
+// texture using a transfer buffer + copy pass on the given command buffer.
+upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
+	if slot.texture == nil {
+		return
+	}
 	transfer := sdl.CreateGPUTransferBuffer(renderer.device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = PREVIEW_W * PREVIEW_H * 4})
 	if transfer == nil {
 		return
@@ -815,26 +1045,33 @@ upload_preview_texture :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPU
 		return
 	}
 	dst := ([^]u8)(mapped)[:PREVIEW_W * PREVIEW_H * 4]
-	copy(dst, data)
+	copy(dst, slot.buffer[:])
 	sdl.UnmapGPUTransferBuffer(renderer.device, transfer)
 	copy_pass := sdl.BeginGPUCopyPass(command_buffer)
 	source := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, pixels_per_row = PREVIEW_W, rows_per_layer = PREVIEW_H}
-	destination := sdl.GPUTextureRegion{texture = renderer.preview_texture[1 - renderer.preview_tex_index], w = PREVIEW_W, h = PREVIEW_H, d = 1}
+	destination := sdl.GPUTextureRegion{texture = slot.texture, w = PREVIEW_W, h = PREVIEW_H, d = 1}
 	sdl.UploadToGPUTexture(copy_pass, source, destination, false)
 	sdl.EndGPUCopyPass(copy_pass)
+	slot.tex_dirty = false
 }
 
-// draw_preview draws the composed preview as a textured quad in the given
-// bounds, reusing the sampled-texture text pipeline with a full UV quad.
-// The decode buffer is fixed 16:9 (PREVIEW_W x PREVIEW_H); it is fitted within
-// the bounds preserving aspect so a non-16:9 project resolution letterboxes
-// instead of distorting the video.
-draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox) {
-	if renderer.preview_pipeline == nil || renderer.preview_texture[0] == nil {
-		return
+// release_preview_textures releases a renderer's per-slot preview textures.
+release_preview_textures :: proc(device: ^sdl.GPUDevice, texs: []^sdl.GPUTexture) {
+	for t in texs {
+		sdl.ReleaseGPUTexture(device, t)
 	}
-	pw := f32(PREVIEW_W)
-	ph := f32(PREVIEW_H)
+}
+
+// preview_canvas returns the pixel-space rect of the project canvas fitted
+// (letterboxed, aspect preserved) inside the given preview bounds. The project
+// resolution maps linearly onto this rect: project (0..W, 0..H) -> rect.
+preview_canvas :: proc(bounds: clay.BoundingBox) -> clay.BoundingBox {
+	pw := f32(project.width)
+	ph := f32(project.height)
+	if pw <= 0 || ph <= 0 {
+		pw = f32(PREVIEW_W)
+		ph = f32(PREVIEW_H)
+	}
 	scale: f32
 	if bounds.width > 0 && bounds.height > 0 {
 		scale = min(bounds.width / pw, bounds.height / ph)
@@ -843,19 +1080,409 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 	}
 	w := pw * scale
 	h := ph * scale
-	x := bounds.x + (bounds.width - w) / 2
-	y := bounds.y + (bounds.height - h) / 2
-	vertex_uniforms := TextVertexUniforms{
-		bounds = {x, y, w, h},
-		viewport = renderer.viewport,
-		_padding = {},
-		uv = {0, 0, 1, 1},
+	return {
+		x = bounds.x + (bounds.width - w) / 2,
+		y = bounds.y + (bounds.height - h) / 2,
+		width = w,
+		height = h,
 	}
-	sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
-	binding := sdl.GPUTextureSamplerBinding{texture = renderer.preview_texture[renderer.preview_tex_index], sampler = renderer.preview_sampler}
-	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-	sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
-	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+}
+
+// clamp_preview_camera keeps the pan within one preview axis of the origin and
+// the zoom within its min/max range.
+clamp_preview_camera :: proc(canvas: clay.BoundingBox) {
+	preview_cam_zoom = clamp(preview_cam_zoom, PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
+	preview_cam_ox = clamp(preview_cam_ox, -canvas.width, canvas.width)
+	preview_cam_oy = clamp(preview_cam_oy, -canvas.height, canvas.height)
+}
+
+// preview_view applies the camera (pan + zoom, centered on the base canvas) to
+// produce the on-screen canvas rect used for drawing and hit-testing.
+preview_view :: proc(canvas: clay.BoundingBox) -> clay.BoundingBox {
+	clamp_preview_camera(canvas)
+	w := canvas.width * preview_cam_zoom
+	h := canvas.height * preview_cam_zoom
+	cx := canvas.x + canvas.width / 2 + preview_cam_ox
+	cy := canvas.y + canvas.height / 2 + preview_cam_oy
+	return {x = cx - w / 2, y = cy - h / 2, width = w, height = h}
+}
+
+// project_to_pixel converts a point in project-resolution coordinates to pixels
+// within the (camera-transformed) canvas rect.
+project_to_pixel :: proc(canvas: clay.BoundingBox, px, py: f32) -> (f32, f32) {
+	v := preview_view(canvas)
+	cx := v.x + (px / f32(project.width)) * v.width
+	cy := v.y + (py / f32(project.height)) * v.height
+	return cx, cy
+}
+
+// pixel_to_project converts a pixel position within the (camera-transformed)
+// canvas rect back to project-resolution coordinates, clamped to the project
+// bounds.
+pixel_to_project :: proc(canvas: clay.BoundingBox, x, y: f32) -> (f32, f32) {
+	v := preview_view(canvas)
+	px := (x - v.x) / v.width * f32(project.width)
+	py := (y - v.y) / v.height * f32(project.height)
+	px = clamp(px, 0, f32(project.width))
+	py = clamp(py, 0, f32(project.height))
+	return px, py
+}
+
+// pixel_to_project_unclamped is pixel_to_project without the clamp, used for
+// handle-drag math that must permit the pointer to leave the project bounds.
+pixel_to_project_unclamped :: proc(canvas: clay.BoundingBox, x, y: f32) -> (f32, f32) {
+	v := preview_view(canvas)
+	px := (x - v.x) / v.width * f32(project.width)
+	py := (y - v.y) / v.height * f32(project.height)
+	return px, py
+}
+
+// snap_margin converts a desired snap margin in rendered (preview) pixels into
+// project-resolution units for the current viewport scale.
+snap_margin :: proc(canvas: clay.BoundingBox, preview_px: f32) -> f32 {
+	v := preview_view(canvas)
+	if v.width <= 0 || v.height <= 0 {
+		return preview_px
+	}
+	return preview_px * f32(project.width) / v.width
+}
+
+// snap_transform snaps the clip's visible (cropped) box edges to the project
+// canvas borders when they come within the given margin (project units). Force
+// insets are normalized, so the visible half-extent from the center is
+// (0.5 - crop) * (project axis) * scale.
+snap_transform :: proc(clip: ^Clip, margin: f32) {
+	PW := f32(project.width)
+	PH := f32(project.height)
+	d_l := (0.5 - clip.crop_l) * PW * clip.scale
+	d_r := (0.5 - clip.crop_r) * PW * clip.scale
+	left := clip.transform_x - d_l
+	right := clip.transform_x + d_r
+	// Left edge to x=0, otherwise right edge to x=project.width.
+	if abs(left) <= margin {
+		clip.transform_x = d_l
+	} else if abs(right - PW) <= margin {
+		clip.transform_x = PW - d_r
+	}
+	d_t := (0.5 - clip.crop_t) * PH * clip.scale
+	d_b := (0.5 - clip.crop_b) * PH * clip.scale
+	top := clip.transform_y - d_t
+	bottom := clip.transform_y + d_b
+	// Top edge to y=0, otherwise bottom edge to y=project.height.
+	if abs(top) <= margin {
+		clip.transform_y = d_t
+	} else if abs(bottom - PH) <= margin {
+		clip.transform_y = PH - d_b
+	}
+}
+
+// clip_image_bounds returns the pixel-space rect the clip occupies in the
+// preview: the crop-adjusted (visible) box. Crop insets are normalized
+// fractions (0..1) of the scale box, so the visible box is the scale box
+// anchored at its top-left corner and trimmed by the per-edge crop insets. The
+// opposite edge stays fixed when cropping a single edge (crop is per-edge, not
+// centered). The cropped source fills it, so it matches the output.
+clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
+	v := preview_view(canvas)
+	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+	sw := v.width * clip.scale
+	sh := v.height * clip.scale
+	x := cx - sw / 2 + clip.crop_l * sw
+	y := cy - sh / 2 + clip.crop_t * sh
+	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
+}
+
+// transformable_clip reports whether the clip currently selected is one with a
+// (video/image) transform that can be previewed/moved.
+transformable_selected :: proc() -> (^Clip, bool) {
+	_, cl, ok := selected_clip()
+	if !ok || cl.kind == .Audio {
+		return nil, false
+	}
+	return cl, true
+}
+
+// preview_handles returns the 8 resize/crop handle rects around a clip's box in
+// screen pixels: 0 TL, 1 T, 2 TR, 3 R, 4 BR, 5 B, 6 BL, 7 L.
+preview_handles :: proc(b: clay.BoundingBox) -> [8]clay.BoundingBox {
+	cx := b.x + b.width / 2
+	cy := b.y + b.height / 2
+	s := PREVIEW_HANDLE_SIZE
+	return {
+		{x = b.x - s / 2, y = b.y - s / 2, width = s, height = s},
+		{x = cx - s / 2, y = b.y - s / 2, width = s, height = s},
+		{x = b.x + b.width - s / 2, y = b.y - s / 2, width = s, height = s},
+		{x = b.x + b.width - s / 2, y = cy - s / 2, width = s, height = s},
+		{x = b.x + b.width - s / 2, y = b.y + b.height - s / 2, width = s, height = s},
+		{x = cx - s / 2, y = b.y + b.height - s / 2, width = s, height = s},
+		{x = b.x - s / 2, y = b.y + b.height - s / 2, width = s, height = s},
+		{x = b.x - s / 2, y = cy - s / 2, width = s, height = s},
+	}
+}
+
+// preview_handle_at returns the index of the handle rect containing the point,
+// or -1.
+preview_handle_at :: proc(b: clay.BoundingBox, mx, my: f32) -> int {
+	handles := preview_handles(b)
+	for i in 0 ..< 8 {
+		h := handles[i]
+		if mx >= h.x && mx <= h.x + h.width && my >= h.y && my <= h.y + h.height {
+			return i
+		}
+	}
+	return -1
+}
+
+// begin_handle_drag captures the state needed to scale/crop the selected clip
+// from a handle drag. crop=true makes the drag adjust the source crop instead
+// of the scale.
+begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx, my: f32, crop: bool) {
+	dragging_handle = handle
+	handle_kind = crop ? .Crop : .Scale
+	handle_start_mx = mx
+	handle_start_my = my
+	handle_start_scale = clip.scale
+	handle_start_crop_l = clip.crop_l
+	handle_start_crop_r = clip.crop_r
+	handle_start_crop_t = clip.crop_t
+	handle_start_crop_b = clip.crop_b
+	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+	handle_start_center_x = cx
+	handle_start_center_y = cy
+	handle_start_tx = clip.transform_x
+	handle_start_ty = clip.transform_y
+	ib := clip_image_bounds(canvas, clip)
+	handle_start_box_w = ib.width
+	handle_start_box_h = ib.height
+}
+
+// update_handle_drag applies the current pointer to the active handle drag,
+// scaling the clip (default) or trimming its source crop (crop mode). Scaling
+// pins the handle opposite the one being dragged: the opposite edge/corner
+// stays fixed while the dragged handle tracks the pointer.
+update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
+	if dragging_handle < 0 || clip == nil {
+		return
+	}
+	cx := handle_start_center_x
+	cy := handle_start_center_y
+	bw := handle_start_box_w
+	bh := handle_start_box_h
+
+	switch handle_kind {
+	case .None:
+		return
+	case .Scale:
+		// Uniform (aspect-locked) scale, independent of crop. The visible
+		// (cropped) box scales by a uniform factor k about the pinned opposite
+		// visible edge/corner while crop fractions stay constant. The new
+		// transform is derived by anchoring the pinned visible edge with its
+		// scaled offset (0.5 - crop)*axis*new_scale, so scaling after a crop is
+		// stable. All in project units with the pointer unclamped.
+		PW := f32(project.width)
+		PH := f32(project.height)
+		scale0 := handle_start_scale
+		cl := handle_start_crop_l
+		cr := handle_start_crop_r
+		ct := handle_start_crop_t
+		cb := handle_start_crop_b
+		dl0 := (0.5 - cl) * PW * scale0
+		dr0 := (0.5 - cr) * PW * scale0
+		dt0 := (0.5 - ct) * PH * scale0
+		db0 := (0.5 - cb) * PH * scale0
+		vl0 := handle_start_tx - dl0
+		vr0 := handle_start_tx + dr0
+		vt0 := handle_start_ty - dt0
+		vb0 := handle_start_ty + db0
+		w0 := (1 - cl - cr) * PW * scale0
+		h0 := (1 - ct - cb) * PH * scale0
+		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+
+		k: f32 = 1
+		switch dragging_handle {
+		case 1: // top: pin bottom
+			k = (vb0 - pmy) / h0
+		case 5: // bottom: pin top
+			k = (pmy - vt0) / h0
+		case 7: // left: pin right
+			k = (vr0 - pmx) / w0
+		case 3: // right: pin left
+			k = (pmx - vl0) / w0
+		case 0, 2, 4, 6: // corners: pin opposite corner, dominant axis
+			kx: f32 = 1
+			ky: f32 = 1
+			switch dragging_handle {
+			case 0: // TL pins BR
+				kx = (vr0 - pmx) / w0
+				ky = (vb0 - pmy) / h0
+			case 2: // TR pins BL
+				kx = (pmx - vl0) / w0
+				ky = (vb0 - pmy) / h0
+			case 4: // BR pins TL
+				kx = (pmx - vl0) / w0
+				ky = (pmy - vt0) / h0
+			case 6: // BL pins TR
+				kx = (vr0 - pmx) / w0
+				ky = (pmy - vt0) / h0
+			}
+			if abs(handle_start_my-cy)/bh > abs(handle_start_mx-cx)/bw {
+				k = ky
+			} else {
+				k = kx
+			}
+		}
+
+		k = max(k, 0.01)
+		s := scale0 * k
+		dl := (0.5 - cl) * PW * s
+		dr := (0.5 - cr) * PW * s
+		dt := (0.5 - ct) * PH * s
+		db := (0.5 - cb) * PH * s
+		tx := handle_start_tx
+		ty := handle_start_ty
+		switch dragging_handle {
+		case 1: // top pins bottom
+			ty = vb0 - db
+		case 5: // bottom pins top
+			ty = vt0 + dt
+		case 7: // left pins right
+			tx = vr0 - dr
+		case 3: // right pins left
+			tx = vl0 + dl
+		case 0: // TL pins BR
+			tx = vr0 - dr
+			ty = vb0 - db
+		case 2: // TR pins BL
+			tx = vl0 + dl
+			ty = vb0 - db
+		case 4: // BR pins TL
+			tx = vl0 + dl
+			ty = vt0 + dt
+		case 6: // BL pins TR
+			tx = vr0 - dr
+			ty = vt0 + dt
+		}
+
+		clip.scale = clamp(s, 0.05, 100.0)
+		clip.transform_x = tx
+		clip.transform_y = ty
+		// Snap the resulting visible box edges to the project borders.
+		snap_transform(clip, snap_margin(canvas, 5))
+	case .Crop:
+		// Crop trims the visible box: dragging one edge moves that edge (and the
+		// adjacent edges for a corner) while the opposite visible edge stays
+		// fixed, revealing background. Insets are stored as normalized fractions
+		// of the scale box, and the scale/transform are not touched, so cropping
+		// only crops. Trim-only: each edge can only move toward the opposite edge.
+		PW := f32(project.width)
+		PH := f32(project.height)
+		scale0 := handle_start_scale
+		out_w := PW * scale0
+		out_h := PH * scale0
+		OX_L := handle_start_tx - out_w / 2
+		OX_R := handle_start_tx + out_w / 2
+		OX_T := handle_start_ty - out_h / 2
+		OX_B := handle_start_ty + out_h / 2
+		cl := handle_start_crop_l
+		cr := handle_start_crop_r
+		ct := handle_start_crop_t
+		cb := handle_start_crop_b
+		vl0 := OX_L + cl * out_w
+		vr0 := OX_R - cr * out_w
+		vt0 := OX_T + ct * out_h
+		vb0 := OX_B - cb * out_h
+		minsz := f32(0.5)
+		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+		switch dragging_handle {
+		case 1: // top: keep bottom edge fixed
+			clip.crop_t = (clamp(pmy, vt0, vb0 - minsz) - OX_T) / out_h
+		case 5: // bottom: keep top edge fixed
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, vb0)) / out_h
+		case 7: // left: keep right edge fixed
+			clip.crop_l = (clamp(pmx, vl0, vr0 - minsz) - OX_L) / out_w
+		case 3: // right: keep left edge fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, vr0)) / out_w
+		case 0: // TL: keep right+bottom edges fixed
+			clip.crop_l = (clamp(pmx, vl0, vr0 - minsz) - OX_L) / out_w
+			clip.crop_t = (clamp(pmy, vt0, vb0 - minsz) - OX_T) / out_h
+		case 2: // TR: keep left+bottom edges fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, vr0)) / out_w
+			clip.crop_t = (clamp(pmy, vt0, vb0 - minsz) - OX_T) / out_h
+		case 4: // BR: keep left+top edges fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, vr0)) / out_w
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, vb0)) / out_h
+		case 6: // BL: keep right+top edges fixed
+			clip.crop_l = (clamp(pmx, vl0, vr0 - minsz) - OX_L) / out_w
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, vb0)) / out_h
+		}
+	}
+}
+
+
+// draw_preview draws the active video clip's frame in the given bounds, placed
+// according to the clip's transform (fills the project canvas, centered at its
+// x/y), then overlays a selection border around the currently-selected clip's
+// image rect. The decode buffer is fixed 16:9 (PREVIEW_W x PREVIEW_H) and is
+// sampled with a full UV quad.
+draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox) {
+	if renderer.preview_pipeline == nil {
+		return
+	}
+	// Clip everything (zoomed content, background, border) to the preview window
+	// so zooming/panning behaves like a scrollable viewport.
+	scissor := sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)}
+	sdl.SetGPUScissor(pass, scissor)
+	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+
+	canvas := preview_canvas(bounds)
+	// The composited/canvas area has a completely black background.
+	view := preview_view(canvas)
+	render_sdf_rect(renderer, command_buffer, pass, view, clay.Color{0, 0, 0, 255}, 0, 0)
+
+	// Paint every clip covering the playhead with the top track on top. Slots
+	// are assigned in track order (track 0 = top = slot 0), so draw slots in
+	// reverse so the top track's clip is drawn last and appears on top.
+	for i := MAX_PREVIEW_SLOTS - 1; i >= 0; i -= 1 {
+		slot := &preview_slots[i]
+		if !slot.in_use || slot.texture == nil {
+			continue
+		}
+		cb := clip_image_bounds(canvas, &Clip{
+			transform_x = slot.transform_x,
+			transform_y = slot.transform_y,
+			scale = slot.scale,
+			crop_l = slot.crop_l,
+			crop_r = slot.crop_r,
+			crop_t = slot.crop_t,
+			crop_b = slot.crop_b,
+		})
+		// The cropped source sub-rect (normalized UV) equals the crop fractions.
+		u0 := slot.crop_l
+		u1 := 1 - slot.crop_r
+		v0 := slot.crop_t
+		v1 := 1 - slot.crop_b
+		vertex_uniforms := TextVertexUniforms{
+			bounds = {cb.x, cb.y, cb.width, cb.height},
+			viewport = renderer.viewport,
+			_padding = {},
+			uv = {u0, v0, u1, v1},
+		}
+		sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
+		binding := sdl.GPUTextureSamplerBinding{texture = slot.texture, sampler = renderer.preview_sampler}
+		sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
+		sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
+		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+	}
+	// Draw a border box around the currently-selected clip's image rect.
+	if selected_clip, ok := transformable_selected(); ok {
+		sb := clip_image_bounds(canvas, selected_clip)
+		render_sdf_rect(renderer, command_buffer, pass, sb, SELECT_BORDER, 0, 3)
+		// Draw the resize/crop handles on the box (only when not editing a field).
+		for h in preview_handles(sb) {
+			render_sdf_rect(renderer, command_buffer, pass, h, HANDLE_FILL, 0, 1)
+			render_sdf_rect(renderer, command_buffer, pass, h, HANDLE_BORDER, 0.5, 1)
+		}
+	}
 }
 
 create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat, width, height: c.int) -> (GPU_Renderer, bool) {
@@ -941,14 +1568,20 @@ create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat
 	}
 	font.texture = texture
 	font.sampler = sampler
-	preview_texture0 := sdl.CreateGPUTexture(device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = PREVIEW_W, height = PREVIEW_H, layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
-	preview_texture1 := sdl.CreateGPUTexture(device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = PREVIEW_W, height = PREVIEW_H, layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
+	preview_textures: [MAX_PREVIEW_SLOTS]^sdl.GPUTexture
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		preview_textures[i] = sdl.CreateGPUTexture(device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = PREVIEW_W, height = PREVIEW_H, layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
+		if preview_textures[i] == nil {
+			fmt.println("Preview texture creation failed:", sdl.GetError())
+			return {}, false
+		}
+	}
 	preview_sampler := sdl.CreateGPUSampler(device, sdl.GPUSamplerCreateInfo{min_filter = .LINEAR, mag_filter = .LINEAR, mipmap_mode = .NEAREST, address_mode_u = .CLAMP_TO_EDGE, address_mode_v = .CLAMP_TO_EDGE, address_mode_w = .CLAMP_TO_EDGE, max_lod = 1})
-	if preview_texture0 == nil || preview_texture1 == nil || preview_sampler == nil {
-		fmt.println("Preview texture or sampler creation failed:", sdl.GetError())
+	if preview_sampler == nil {
+		fmt.println("Preview sampler creation failed:", sdl.GetError())
 		return {}, false
 	}
-	return GPU_Renderer{device = device, pipeline = pipeline, text_pipeline = text_pipeline, preview_pipeline = preview_pipeline, font = font, preview_texture = {preview_texture0, preview_texture1}, preview_sampler = preview_sampler, viewport = {f32(width), f32(height)}}, true
+	return GPU_Renderer{device = device, pipeline = pipeline, text_pipeline = text_pipeline, preview_pipeline = preview_pipeline, font = font, preview_textures = preview_textures, preview_sampler = preview_sampler, viewport = {f32(width), f32(height)}}, true
 }
 
 upload_font_atlas :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer) -> bool {
@@ -1019,8 +1652,7 @@ main :: proc() {
 	defer sdl.ReleaseGPUGraphicsPipeline(device, renderer.preview_pipeline)
 	defer sdl.ReleaseGPUTexture(device, renderer.font.texture)
 	defer sdl.ReleaseGPUSampler(device, renderer.font.sampler)
-	defer sdl.ReleaseGPUTexture(device, renderer.preview_texture[0])
-	defer sdl.ReleaseGPUTexture(device, renderer.preview_texture[1])
+	defer release_preview_textures(device, renderer.preview_textures[:])
 	defer sdl.ReleaseGPUSampler(device, renderer.preview_sampler)
 	initial_upload := sdl.AcquireGPUCommandBuffer(device)
 	if initial_upload == nil || !upload_font_atlas(&renderer, initial_upload) || !sdl.SubmitGPUCommandBuffer(initial_upload) {
@@ -1049,6 +1681,45 @@ main :: proc() {
 			#partial switch event.type {
 			case .QUIT, .WINDOW_CLOSE_REQUESTED:
 				running = false
+			case .KEY_DOWN:
+				if editing_field != 0 {
+					switch event.key.key {
+					case sdl.K_BACKSPACE:
+						edit_backspace()
+					case sdl.K_RETURN, sdl.K_RETURN2:
+						edit_commit()
+					case sdl.K_ESCAPE:
+						edit_cancel()
+					}
+				}
+			case .TEXT_INPUT:
+				if editing_field != 0 {
+					for ch in string(event.text.text) {
+						// Only accept printable ASCII that makes sense in a number.
+						if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
+							edit_append(u8(ch))
+						}
+					}
+				}
+			case .MOUSE_WHEEL:
+				// Scroll over the preview zooms the camera, keeping the point under
+				// the cursor fixed.
+				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+				if event.wheel.mouse_x >= pb.x && event.wheel.mouse_x <= pb.x + pb.width &&
+					event.wheel.mouse_y >= pb.y && event.wheel.mouse_y <= pb.y + pb.height {
+					if event.wheel.y != 0 {
+						canvas := preview_canvas(pb)
+						mx_c := event.wheel.mouse_x - (canvas.x + canvas.width / 2)
+						my_c := event.wheel.mouse_y - (canvas.y + canvas.height / 2)
+						old_zoom := preview_cam_zoom
+						new_zoom := clamp(old_zoom * (1 + 0.1 * event.wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
+						if new_zoom != old_zoom {
+							preview_cam_ox = mx_c - (mx_c - preview_cam_ox) * (new_zoom / old_zoom)
+							preview_cam_oy = my_c - (my_c - preview_cam_oy) * (new_zoom / old_zoom)
+							preview_cam_zoom = new_zoom
+						}
+					}
+				}
 			}
 		}
 
@@ -1057,6 +1728,23 @@ main :: proc() {
 		mouse_x, mouse_y: f32
 		mouse_buttons := sdl.GetMouseState(&mouse_x, &mouse_y)
 		mouse_down := sdl.MouseButtonFlag.LEFT in mouse_buttons
+		middle_down := sdl.MouseButtonFlag.MIDDLE in mouse_buttons
+		mods := sdl.GetModState()
+		alt_down := sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods
+
+		// Middle-button drag over the preview pans the camera (limited to ±one
+		// preview axis from the origin via clamp_preview_camera at render time).
+		if middle_down && clay.PointerOver(clay.ID("Preview")) {
+			if panning_preview {
+				preview_cam_ox += mouse_x - pan_last_x
+				preview_cam_oy += mouse_y - pan_last_y
+			}
+			panning_preview = true
+			pan_last_x = mouse_x
+			pan_last_y = mouse_y
+		} else if panning_preview {
+			panning_preview = false
+		}
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
 		commands := build_page(width, height)
@@ -1068,15 +1756,68 @@ main :: proc() {
 			resizing_areas = true
 		} else if mouse_down && !was_mouse_down {
 			// A click handled here either inserts a track via a "+" gap or
-			// duplicates an existing track via its name-button, so no clip drag
-			// begins. (Both run full width / off the clip lane.)
+			// duplicates an existing track via its name-button, or starts dragging
+			// the selected clip within the preview, so no clip drag begins.
 			handled := false
+			// If a property field is being typed in and the user clicks away from
+			// it, commit the pending value first.
+			if editing_field != 0 {
+				still_on_field := (editing_field == 1 && clay.PointerOver(clay.ID("PropFieldX"))) || (editing_field == 2 && clay.PointerOver(clay.ID("PropFieldY"))) || (editing_field == 3 && clay.PointerOver(clay.ID("PropFieldS")))
+				if !still_on_field {
+					edit_commit()
+				}
+			}
+			// Clicking an X/Y property field focuses it for typing.
+			if sel, ok := transformable_selected(); ok {
+				if clay.PointerOver(clay.ID("PropFieldX")) {
+					edit_begin(1, sel.transform_x)
+					handled = true
+				} else if clay.PointerOver(clay.ID("PropFieldY")) {
+					edit_begin(2, sel.transform_y)
+					handled = true
+				} else if clay.PointerOver(clay.ID("PropFieldS")) {
+					edit_begin(3, sel.scale)
+					handled = true
+				}
+			}
+			// Grab one of the selected clip's resize/crop handles. Takes
+			// precedence over moving the clip. Default drag scales; holding Alt
+			// crops.
+			if !handled && clay.PointerOver(clay.ID("Preview")) {
+				if sel, ok := transformable_selected(); ok {
+					pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+					canvas := preview_canvas(pb)
+					ib := clip_image_bounds(canvas, sel)
+					if h := preview_handle_at(ib, mouse_x, mouse_y); h >= 0 {
+						begin_handle_drag(sel, canvas, h, mouse_x, mouse_y, alt_down)
+						handled = true
+					}
+				}
+			}
+			// Dragging the selected clip inside the preview moves its transform.
+			if !handled {
+				if sel, ok := transformable_selected(); ok && clay.PointerOver(clay.ID("Preview")) {
+					pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+					canvas := preview_canvas(pb)
+					ib := clip_image_bounds(canvas, sel)
+					if mouse_x >= ib.x && mouse_x <= ib.x + ib.width && mouse_y >= ib.y && mouse_y <= ib.y + ib.height {
+						// Offset between the click and the clip's center, in project coords.
+						pcx, pcy := pixel_to_project(canvas, mouse_x, mouse_y)
+						preview_drag_offset_x = pcx - sel.transform_x
+						preview_drag_offset_y = pcy - sel.transform_y
+						moving_preview_clip = true
+					handled = true
+				}
+			}
+			}
+			if !handled {
 			for i := 0; i <= len(timeline.tracks); i += 1 {
 				if clay.PointerOver(clay.ID("TrackGap", u32(i))) {
 					insert_track(i)
 					handled = true
 					break
 				}
+			}
 			}
 			if !handled {
 				for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
@@ -1110,7 +1851,16 @@ main :: proc() {
 		if !mouse_down {
 			resizing_areas = false
 			moving_clip = false
+			moving_preview_clip = false
+			dragging_handle = -1
+			handle_kind = .None
 			drag_clip = nil
+		} else if dragging_handle >= 0 {
+			if sel, ok := transformable_selected(); ok {
+				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+				canvas := preview_canvas(pb)
+				update_handle_drag(sel, canvas, mouse_x, mouse_y)
+			}
 		} else if resizing_areas {
 			upper_area_height = mouse_y - 8
 			if upper_area_height < 460 {
@@ -1118,6 +1868,18 @@ main :: proc() {
 			}
 			if upper_area_height > f32(height - 180) {
 				upper_area_height = f32(height - 180)
+			}
+		} else if moving_preview_clip {
+			if sel, ok := transformable_selected(); ok {
+				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+				canvas := preview_canvas(pb)
+				pcx, pcy := pixel_to_project(canvas, mouse_x, mouse_y)
+				sel.transform_x = pcx - preview_drag_offset_x
+				sel.transform_y = pcy - preview_drag_offset_y
+				sel.transform_x = clamp(sel.transform_x, 0, f32(project.width))
+				sel.transform_y = clamp(sel.transform_y, 0, f32(project.height))
+				// 5px snap margin (in rendered preview pixels) to the preview borders.
+				snap_transform(sel, snap_margin(canvas, 5))
 			}
 		} else if moving_clip {
 			if drag_clip != nil {
@@ -1153,13 +1915,22 @@ main :: proc() {
 		if command_buffer == nil {
 			continue
 		}
-		preview_visible := decode_active_frame()
-		if preview_visible {
-			preview_has_frame = true
-			upload_preview_texture(&renderer, command_buffer, preview.buffer[:])
-			renderer.preview_tex_index = 1 - renderer.preview_tex_index
+		changed := update_preview_slots()
+		any_frame := false
+		for i in 0..<MAX_PREVIEW_SLOTS {
+			slot := &preview_slots[i]
+			if !slot.in_use {
+				continue
+			}
+			any_frame = true
+			if slot.texture == nil {
+				slot.texture = renderer.preview_textures[i]
+			}
+			if slot.tex_dirty || changed {
+				upload_preview_slot(&renderer, command_buffer, slot)
+			}
 		}
-		preview_visible = preview_visible || preview_has_frame
+		preview_has_frame = any_frame
 		swapchain_texture: ^sdl.GPUTexture
 		pixel_width, pixel_height: sdl.Uint32
 		if !sdl.WaitAndAcquireGPUSwapchainTexture(command_buffer, window, &swapchain_texture, &pixel_width, &pixel_height) || swapchain_texture == nil {
@@ -1175,7 +1946,7 @@ main :: proc() {
 		pass := sdl.BeginGPURenderPass(command_buffer, &color_target, 1, nil)
 		if pass != nil {
 			render_clay(&renderer, command_buffer, pass, commands)
-			if preview_visible {
+			if preview_has_frame {
 				preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox
 				draw_preview(&renderer, command_buffer, pass, preview_bounds)
 			}
