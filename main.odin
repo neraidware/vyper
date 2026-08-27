@@ -1394,26 +1394,26 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		minsz := f32(0.5)
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
 		switch dragging_handle {
-		case 1: // top: keep bottom edge fixed
-			clip.crop_t = (clamp(pmy, vt0, vb0 - minsz) - OX_T) / out_h
-		case 5: // bottom: keep top edge fixed
-			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, vb0)) / out_h
-		case 7: // left: keep right edge fixed
-			clip.crop_l = (clamp(pmx, vl0, vr0 - minsz) - OX_L) / out_w
-		case 3: // right: keep left edge fixed
-			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, vr0)) / out_w
-		case 0: // TL: keep right+bottom edges fixed
-			clip.crop_l = (clamp(pmx, vl0, vr0 - minsz) - OX_L) / out_w
-			clip.crop_t = (clamp(pmy, vt0, vb0 - minsz) - OX_T) / out_h
-		case 2: // TR: keep left+bottom edges fixed
-			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, vr0)) / out_w
-			clip.crop_t = (clamp(pmy, vt0, vb0 - minsz) - OX_T) / out_h
-		case 4: // BR: keep left+top edges fixed
-			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, vr0)) / out_w
-			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, vb0)) / out_h
-		case 6: // BL: keep right+top edges fixed
-			clip.crop_l = (clamp(pmx, vl0, vr0 - minsz) - OX_L) / out_w
-			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, vb0)) / out_h
+		case 1: // top: keep bottom visible edge fixed, allow un-crop to outer top
+			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
+		case 5: // bottom: keep top visible edge fixed
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
+		case 7: // left: keep right visible edge fixed
+			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
+		case 3: // right: keep left visible edge fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
+		case 0: // TL: keep right+bottom visible edges fixed
+			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
+			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
+		case 2: // TR: keep left+bottom visible edges fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
+			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
+		case 4: // BR: keep left+top visible edges fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
+		case 6: // BL: keep right+top visible edges fixed
+			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
 		}
 	}
 }
