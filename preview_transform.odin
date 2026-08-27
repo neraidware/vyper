@@ -1,0 +1,361 @@
+package main
+
+import clay "clay-odin"
+
+// ---------------------------------------------------------------------------
+// Preview camera and clip transform math: project<->pixel conversions, camera
+// pan/zoom clamping, edge snapping, and the resize/crop handle drag logic.
+// ---------------------------------------------------------------------------
+
+preview_canvas :: proc(bounds: clay.BoundingBox) -> clay.BoundingBox {
+	pw := f32(project.width)
+	ph := f32(project.height)
+	if pw <= 0 || ph <= 0 {
+		pw = f32(PREVIEW_W)
+		ph = f32(PREVIEW_H)
+	}
+	scale: f32
+	if bounds.width > 0 && bounds.height > 0 {
+		scale = min(bounds.width / pw, bounds.height / ph)
+	} else {
+		scale = 1
+	}
+	w := pw * scale
+	h := ph * scale
+	return {
+		x = bounds.x + (bounds.width - w) / 2,
+		y = bounds.y + (bounds.height - h) / 2,
+		width = w,
+		height = h,
+	}
+}
+
+// clamp_preview_camera keeps the pan within one preview axis of the origin and
+// the zoom within its min/max range.
+clamp_preview_camera :: proc(canvas: clay.BoundingBox) {
+	preview_cam_zoom = clamp(preview_cam_zoom, PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
+	preview_cam_ox = clamp(preview_cam_ox, -canvas.width, canvas.width)
+	preview_cam_oy = clamp(preview_cam_oy, -canvas.height, canvas.height)
+}
+
+// preview_view applies the camera (pan + zoom, centered on the base canvas) to
+// produce the on-screen canvas rect used for drawing and hit-testing.
+preview_view :: proc(canvas: clay.BoundingBox) -> clay.BoundingBox {
+	clamp_preview_camera(canvas)
+	w := canvas.width * preview_cam_zoom
+	h := canvas.height * preview_cam_zoom
+	cx := canvas.x + canvas.width / 2 + preview_cam_ox
+	cy := canvas.y + canvas.height / 2 + preview_cam_oy
+	return {x = cx - w / 2, y = cy - h / 2, width = w, height = h}
+}
+
+// project_to_pixel converts a point in project-resolution coordinates to pixels
+// within the (camera-transformed) canvas rect.
+project_to_pixel :: proc(canvas: clay.BoundingBox, px, py: f32) -> (f32, f32) {
+	v := preview_view(canvas)
+	cx := v.x + (px / f32(project.width)) * v.width
+	cy := v.y + (py / f32(project.height)) * v.height
+	return cx, cy
+}
+
+// pixel_to_project converts a pixel position within the (camera-transformed)
+// canvas rect back to project-resolution coordinates, clamped to the project
+// bounds.
+pixel_to_project :: proc(canvas: clay.BoundingBox, x, y: f32) -> (f32, f32) {
+	v := preview_view(canvas)
+	px := (x - v.x) / v.width * f32(project.width)
+	py := (y - v.y) / v.height * f32(project.height)
+	px = clamp(px, 0, f32(project.width))
+	py = clamp(py, 0, f32(project.height))
+	return px, py
+}
+
+// pixel_to_project_unclamped is pixel_to_project without the clamp, used for
+// handle-drag math that must permit the pointer to leave the project bounds.
+pixel_to_project_unclamped :: proc(canvas: clay.BoundingBox, x, y: f32) -> (f32, f32) {
+	v := preview_view(canvas)
+	px := (x - v.x) / v.width * f32(project.width)
+	py := (y - v.y) / v.height * f32(project.height)
+	return px, py
+}
+
+// snap_margin converts a desired snap margin in rendered (preview) pixels into
+// project-resolution units for the current viewport scale.
+snap_margin :: proc(canvas: clay.BoundingBox, preview_px: f32) -> f32 {
+	v := preview_view(canvas)
+	if v.width <= 0 || v.height <= 0 {
+		return preview_px
+	}
+	return preview_px * f32(project.width) / v.width
+}
+
+// snap_transform snaps the clip's visible (cropped) box edges to the project
+// canvas borders when they come within the given margin (project units). Force
+// insets are normalized, so the visible half-extent from the center is
+// (0.5 - crop) * (project axis) * scale.
+snap_transform :: proc(clip: ^Clip, margin: f32) {
+	PW := f32(project.width)
+	PH := f32(project.height)
+	d_l := (0.5 - clip.crop_l) * PW * clip.scale
+	d_r := (0.5 - clip.crop_r) * PW * clip.scale
+	left := clip.transform_x - d_l
+	right := clip.transform_x + d_r
+	// Left edge to x=0, otherwise right edge to x=project.width.
+	if abs(left) <= margin {
+		clip.transform_x = d_l
+	} else if abs(right - PW) <= margin {
+		clip.transform_x = PW - d_r
+	}
+	d_t := (0.5 - clip.crop_t) * PH * clip.scale
+	d_b := (0.5 - clip.crop_b) * PH * clip.scale
+	top := clip.transform_y - d_t
+	bottom := clip.transform_y + d_b
+	// Top edge to y=0, otherwise bottom edge to y=project.height.
+	if abs(top) <= margin {
+		clip.transform_y = d_t
+	} else if abs(bottom - PH) <= margin {
+		clip.transform_y = PH - d_b
+	}
+}
+
+// clip_image_bounds returns the pixel-space rect the clip occupies in the
+// preview: the crop-adjusted (visible) box. Crop insets are normalized
+// fractions (0..1) of the scale box, so the visible box is the scale box
+// anchored at its top-left corner and trimmed by the per-edge crop insets. The
+// opposite edge stays fixed when cropping a single edge (crop is per-edge, not
+// centered). The cropped source fills it, so it matches the output.
+clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
+	v := preview_view(canvas)
+	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+	sw := v.width * clip.scale
+	sh := v.height * clip.scale
+	x := cx - sw / 2 + clip.crop_l * sw
+	y := cy - sh / 2 + clip.crop_t * sh
+	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
+}
+
+// transformable_clip reports whether the clip currently selected is one with a
+// (video/image) transform that can be previewed/moved.
+transformable_selected :: proc() -> (^Clip, bool) {
+	_, cl, ok := selected_clip()
+	if !ok || cl.kind == .Audio {
+		return nil, false
+	}
+	return cl, true
+}
+
+// preview_handles returns the 8 resize/crop handle rects around a clip's box in
+// screen pixels: 0 TL, 1 T, 2 TR, 3 R, 4 BR, 5 B, 6 BL, 7 L.
+preview_handles :: proc(b: clay.BoundingBox) -> [8]clay.BoundingBox {
+	cx := b.x + b.width / 2
+	cy := b.y + b.height / 2
+	s := PREVIEW_HANDLE_SIZE
+	return {
+		{x = b.x - s / 2, y = b.y - s / 2, width = s, height = s},
+		{x = cx - s / 2, y = b.y - s / 2, width = s, height = s},
+		{x = b.x + b.width - s / 2, y = b.y - s / 2, width = s, height = s},
+		{x = b.x + b.width - s / 2, y = cy - s / 2, width = s, height = s},
+		{x = b.x + b.width - s / 2, y = b.y + b.height - s / 2, width = s, height = s},
+		{x = cx - s / 2, y = b.y + b.height - s / 2, width = s, height = s},
+		{x = b.x - s / 2, y = b.y + b.height - s / 2, width = s, height = s},
+		{x = b.x - s / 2, y = cy - s / 2, width = s, height = s},
+	}
+}
+
+// preview_handle_at returns the index of the handle rect containing the point,
+// or -1.
+preview_handle_at :: proc(b: clay.BoundingBox, mx, my: f32) -> int {
+	handles := preview_handles(b)
+	for i in 0 ..< 8 {
+		h := handles[i]
+		if mx >= h.x && mx <= h.x + h.width && my >= h.y && my <= h.y + h.height {
+			return i
+		}
+	}
+	return -1
+}
+
+// begin_handle_drag captures the state needed to scale/crop the selected clip
+// from a handle drag. crop=true makes the drag adjust the source crop instead
+// of the scale.
+begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx, my: f32, crop: bool) {
+	dragging_handle = handle
+	handle_kind = crop ? .Crop : .Scale
+	handle_start_mx = mx
+	handle_start_my = my
+	handle_start_scale = clip.scale
+	handle_start_crop_l = clip.crop_l
+	handle_start_crop_r = clip.crop_r
+	handle_start_crop_t = clip.crop_t
+	handle_start_crop_b = clip.crop_b
+	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+	handle_start_center_x = cx
+	handle_start_center_y = cy
+	handle_start_tx = clip.transform_x
+	handle_start_ty = clip.transform_y
+	ib := clip_image_bounds(canvas, clip)
+	handle_start_box_w = ib.width
+	handle_start_box_h = ib.height
+}
+
+// update_handle_drag applies the current pointer to the active handle drag,
+// scaling the clip (default) or trimming its source crop (crop mode). Scaling
+// pins the handle opposite the one being dragged: the opposite edge/corner
+// stays fixed while the dragged handle tracks the pointer.
+update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
+	if dragging_handle < 0 || clip == nil {
+		return
+	}
+	cx := handle_start_center_x
+	cy := handle_start_center_y
+	bw := handle_start_box_w
+	bh := handle_start_box_h
+
+	switch handle_kind {
+	case .None:
+		return
+	case .Scale:
+		// Uniform (aspect-locked) scale, independent of crop. The visible
+		// (cropped) box scales by a uniform factor k about the pinned opposite
+		// visible edge/corner while crop fractions stay constant. The new
+		// transform is derived by anchoring the pinned visible edge with its
+		// scaled offset (0.5 - crop)*axis*new_scale, so scaling after a crop is
+		// stable. All in project units with the pointer unclamped.
+		PW := f32(project.width)
+		PH := f32(project.height)
+		scale0 := handle_start_scale
+		cl := handle_start_crop_l
+		cr := handle_start_crop_r
+		ct := handle_start_crop_t
+		cb := handle_start_crop_b
+		dl0 := (0.5 - cl) * PW * scale0
+		dr0 := (0.5 - cr) * PW * scale0
+		dt0 := (0.5 - ct) * PH * scale0
+		db0 := (0.5 - cb) * PH * scale0
+		vl0 := handle_start_tx - dl0
+		vr0 := handle_start_tx + dr0
+		vt0 := handle_start_ty - dt0
+		vb0 := handle_start_ty + db0
+		w0 := (1 - cl - cr) * PW * scale0
+		h0 := (1 - ct - cb) * PH * scale0
+		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+
+		k: f32 = 1
+		switch dragging_handle {
+		case 1: // top: pin bottom
+			k = (vb0 - pmy) / h0
+		case 5: // bottom: pin top
+			k = (pmy - vt0) / h0
+		case 7: // left: pin right
+			k = (vr0 - pmx) / w0
+		case 3: // right: pin left
+			k = (pmx - vl0) / w0
+		case 0, 2, 4, 6: // corners: pin opposite corner, dominant axis
+			kx: f32 = 1
+			ky: f32 = 1
+			switch dragging_handle {
+			case 0: // TL pins BR
+				kx = (vr0 - pmx) / w0
+				ky = (vb0 - pmy) / h0
+			case 2: // TR pins BL
+				kx = (pmx - vl0) / w0
+				ky = (vb0 - pmy) / h0
+			case 4: // BR pins TL
+				kx = (pmx - vl0) / w0
+				ky = (pmy - vt0) / h0
+			case 6: // BL pins TR
+				kx = (vr0 - pmx) / w0
+				ky = (pmy - vt0) / h0
+			}
+			if abs(handle_start_my-cy)/bh > abs(handle_start_mx-cx)/bw {
+				k = ky
+			} else {
+				k = kx
+			}
+		}
+
+		k = max(k, 0.01)
+		s := scale0 * k
+		dl := (0.5 - cl) * PW * s
+		dr := (0.5 - cr) * PW * s
+		dt := (0.5 - ct) * PH * s
+		db := (0.5 - cb) * PH * s
+		tx := handle_start_tx
+		ty := handle_start_ty
+		switch dragging_handle {
+		case 1: // top pins bottom
+			ty = vb0 - db
+		case 5: // bottom pins top
+			ty = vt0 + dt
+		case 7: // left pins right
+			tx = vr0 - dr
+		case 3: // right pins left
+			tx = vl0 + dl
+		case 0: // TL pins BR
+			tx = vr0 - dr
+			ty = vb0 - db
+		case 2: // TR pins BL
+			tx = vl0 + dl
+			ty = vb0 - db
+		case 4: // BR pins TL
+			tx = vl0 + dl
+			ty = vt0 + dt
+		case 6: // BL pins TR
+			tx = vr0 - dr
+			ty = vt0 + dt
+		}
+
+		clip.scale = clamp(s, 0.05, 100.0)
+		clip.transform_x = tx
+		clip.transform_y = ty
+		// Snap the resulting visible box edges to the project borders.
+		snap_transform(clip, snap_margin(canvas, 5))
+	case .Crop:
+		// Crop trims the visible box: dragging one edge moves that edge (and the
+		// adjacent edges for a corner) while the opposite visible edge stays
+		// fixed, revealing background. Insets are stored as normalized fractions
+		// of the scale box, and the scale/transform are not touched, so cropping
+		// only crops. Trim-only: each edge can only move toward the opposite edge.
+		PW := f32(project.width)
+		PH := f32(project.height)
+		scale0 := handle_start_scale
+		out_w := PW * scale0
+		out_h := PH * scale0
+		OX_L := handle_start_tx - out_w / 2
+		OX_R := handle_start_tx + out_w / 2
+		OX_T := handle_start_ty - out_h / 2
+		OX_B := handle_start_ty + out_h / 2
+		cl := handle_start_crop_l
+		cr := handle_start_crop_r
+		ct := handle_start_crop_t
+		cb := handle_start_crop_b
+		vl0 := OX_L + cl * out_w
+		vr0 := OX_R - cr * out_w
+		vt0 := OX_T + ct * out_h
+		vb0 := OX_B - cb * out_h
+		minsz := f32(0.5)
+		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+		switch dragging_handle {
+		case 1: // top: keep bottom visible edge fixed, allow un-crop to outer top
+			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
+		case 5: // bottom: keep top visible edge fixed
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
+		case 7: // left: keep right visible edge fixed
+			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
+		case 3: // right: keep left visible edge fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
+		case 0: // TL: keep right+bottom visible edges fixed
+			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
+			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
+		case 2: // TR: keep left+bottom visible edges fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
+			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
+		case 4: // BR: keep left+top visible edges fixed
+			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
+		case 6: // BL: keep right+top visible edges fixed
+			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
+			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
+		}
+	}
+}
