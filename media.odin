@@ -159,14 +159,29 @@ import_media :: proc(path: cstring) {
 		audio_frames = frame_count
 	}
 
+	// Video's own natural pixel size, used to (a) infer the canvas resolution
+	// for the very first import and (b) import the clip at native size rather
+	// than auto-fitting it to the canvas.
+	src_w, src_h: c.int
+	if probe.has_video {
+		src_w, src_h, _ = probe_video_size(path)
+	}
+
 	// If the user hasn't set a resolution/orientation yet, infer the canvas
 	// from this (first) file's own video dimensions.
-	if !resolution_locked && probe.has_video {
-		if w, h, ok := probe_video_size(path); ok {
-			project.width = w
-			project.height = h
-		}
+	if !resolution_locked && src_w > 0 {
+		project.width = src_w
+		project.height = src_h
 		resolution_locked = true
+	}
+
+	// Import at native size: 1 source pixel maps to 1 project-canvas pixel, so
+	// a clip bigger than the canvas arrives oversized (here, wider than the
+	// project) and the user transforms it themselves instead of the clip being
+	// auto-scaled to fill the canvas.
+	native_scale: f32 = 1
+	if src_w > 0 && f32(project.width) > 0 {
+		native_scale = f32(src_w) / f32(project.width)
 	}
 
 	asset_id := next_asset_id()
@@ -192,7 +207,7 @@ import_media :: proc(path: cstring) {
 			timeline_start_frame = 0,
 			transform_x = f32(project.width) / 2,
 			transform_y = f32(project.height) / 2,
-			scale = 1,
+			scale = native_scale,
 			crop_l = 0,
 			crop_r = 0,
 			crop_t = 0,
