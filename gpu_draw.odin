@@ -24,13 +24,19 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 		return
 	}
 	dur := timeline_duration()
-	minor, major := ruler_steps(dur)
+	// Adapt the tick spacing to the current zoom so labels stay ~70px apart.
+	major := nice_frame_step(timeline_zoom)
+	minor := max(major / 5, 1)
 
 	// Tick marks along the bottom edge of the ruler strip.
 	minor_h := ruler.height * 0.35
 	major_h := ruler.height * 0.6
-	for f := i64(0); f <= dur + 1; f += minor {
-		x := ruler.x + f32(f) * TIMELINE_ZOOM
+	start_f := i64(f32(i64(timeline_view_start / f32(minor))) * f32(minor))
+	for f := start_f; f <= dur + 1; f += minor {
+		x := ruler.x + (f32(f) - timeline_view_start) * timeline_zoom
+		if x < ruler.x {
+			continue
+		}
 		if x > ruler.x + ruler.width {
 			break
 		}
@@ -51,11 +57,30 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 
 	// Vertical playhead line spanning the ruler and all track rows, plus a grab
 	// handle sitting on top of the ruler strip.
-	line_x := ruler.x + f32(playhead.frame) * TIMELINE_ZOOM
+	line_x := ruler.x + (f32(playhead.frame) - timeline_view_start) * timeline_zoom
 	tracks := clay.GetElementData(clay.ID("TracksSection")).boundingBox
 	line_bottom := ruler.y + RULER_HEIGHT + tracks.height
 	render_sdf_rect(renderer, command_buffer, pass, {line_x, ruler.y, 2, line_bottom - ruler.y}, BUTTON_BORDER_HOVER, 0, 0)
 	render_sdf_rect(renderer, command_buffer, pass, {line_x - 4, ruler.y - 4, 10, 10}, BUTTON_BORDER_HOVER, 2, 0)
+}
+
+// nice_frame_step picks the ruler's label spacing (a round 1/2/5×10^k number)
+// so that labelled ticks stay about 70px apart at the current timeline zoom.
+nice_frame_step :: proc(zoom: f32) -> i64 {
+	target := 70.0 / zoom
+	if target <= 1 {
+		return 1
+	}
+	scale: i64 = 1
+	mults := [6]i64{1, 2, 5, 10, 20, 50}
+	for {
+		for m in mults {
+			if f32(m) * f32(scale) >= target {
+				return m * scale
+			}
+		}
+		scale *= 100
+	}
 }
 
 render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, commands: clay.ClayArray(clay.RenderCommand)) {
@@ -117,7 +142,7 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 			gap_bounds = gap
 			rows := [3]f32{5, 3, 1}
 			for m in clip.markers {
-				x := box.x + f32(m.source_frame - clip.source_start_frame) * TIMELINE_ZOOM
+				x := box.x + f32(m.source_frame - clip.source_start_frame) * timeline_zoom
 				y := box.y
 				for row, r in rows {
 					w := rows[r]

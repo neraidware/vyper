@@ -34,7 +34,12 @@ TEXT :: clay.Color{255, 255, 255, 255}
 RULER_HEIGHT :: f32(30)
 RULER_TICK_COLOR :: clay.Color{80, 90, 110, 255}
 RULER_LABEL_COLOR :: clay.Color{170, 180, 200, 255}
-TIMELINE_ZOOM :: f32(1) // px per timeline frame; no zoom yet
+// Timeline navigation: timeline_view_start is the first visible frame (pan),
+// timeline_zoom is horizontal pixels per frame.
+timeline_view_start: f32 = 0
+timeline_zoom: f32 = 1
+TIMELINE_MIN_ZOOM :: f32(0.05)
+TIMELINE_MAX_ZOOM :: f32(16)
 
 Project :: struct {
 	name: string,
@@ -178,6 +183,8 @@ preview_cam_zoom: f32 = 1.0
 panning_preview: bool
 pan_last_x: f32
 pan_last_y: f32
+panning_timeline: bool
+timeline_pan_last_x: f32
 
 // Resize/crop handles shown around the selected clip's bounding box.
 PREVIEW_HANDLE_SIZE :: f32(9)

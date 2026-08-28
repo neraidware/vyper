@@ -112,6 +112,23 @@ main :: proc() {
 					}
 				}
 			case .MOUSE_WHEEL:
+				// Scroll over the timeline zooms horizontally, anchored at the cursor.
+				tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
+				if len(timeline.tracks) > 0 && event.wheel.mouse_x >= tlb.x && event.wheel.mouse_x <= tlb.x + tlb.width &&
+					event.wheel.mouse_y >= tlb.y && event.wheel.mouse_y <= tlb.y + tlb.height {
+					if event.wheel.y != 0 {
+						ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+						anchor := event.wheel.mouse_x - ruler.x
+						anchor_frame := timeline_view_start + anchor / timeline_zoom
+						new_zoom := clamp(timeline_zoom * (1 + 0.1 * event.wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+						if new_zoom != timeline_zoom {
+							timeline_view_start = anchor_frame - anchor / new_zoom
+							timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
+							timeline_zoom = new_zoom
+						}
+					}
+					break
+				}
 				// Scroll over the preview zooms the camera, keeping the point under
 				// the cursor fixed.
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
@@ -154,6 +171,17 @@ main :: proc() {
 			pan_last_y = mouse_y
 		} else if panning_preview {
 			panning_preview = false
+		}
+		// Middle-drag over the timeline pans it horizontally, Blender-style.
+		if middle_down && len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("ClipTimeline")) {
+			if panning_timeline {
+				timeline_view_start -= (mouse_x - timeline_pan_last_x) / timeline_zoom
+				timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
+			}
+			panning_timeline = true
+			timeline_pan_last_x = mouse_x
+		} else if panning_timeline {
+			panning_timeline = false
 		}
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
@@ -316,7 +344,7 @@ main :: proc() {
 		} else if dragging_playhead {
 			// Scrub the playhead to the pointer's frame along the ruler bar.
 			ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
-			frame := i64((mouse_x - ruler.x) / TIMELINE_ZOOM)
+			frame := i64((mouse_x - ruler.x) / timeline_zoom + timeline_view_start)
 			frame = max(frame, 0)
 			frame = min(frame, timeline_duration())
 			playhead.frame = frame

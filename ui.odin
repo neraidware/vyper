@@ -301,12 +301,16 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										clip = {horizontal = true, vertical = true},
 									}) {
 for timeline_clip, index in track.clips {
-										if timeline_clip.timeline_start_frame > 0 {
+										// Translate each clip by the pan offset and scale it by the
+										// zoom so the timeline view (view_start frame at x=0) stays
+										// aligned with the ruler above it.
+										offset_frames := f32(timeline_clip.timeline_start_frame) - timeline_view_start
+										if offset_frames > 0 {
 											if clay.UI(clay.ID("ClipOffset", u32(track_idx * 1000 + index)))({
-												layout = {sizing = {width = clay.SizingFixed(f32(timeline_clip.timeline_start_frame)), height = clay.SizingGrow({})}},
+												layout = {sizing = {width = clay.SizingFixed(offset_frames * timeline_zoom), height = clay.SizingGrow({})}},
 											}) {}
 										}
-										clip_width := f32(max(timeline_clip.source_length_frames, 1))
+										clip_width := f32(max(timeline_clip.source_length_frames, 1)) * timeline_zoom
 										clip_color := BUTTON
 										clip_border := BUTTON_BORDER
 										clip_border_w: u16 = 2
