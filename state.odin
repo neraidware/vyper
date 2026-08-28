@@ -27,6 +27,7 @@ SELECT_BORDER :: clay.Color{120, 220, 120, 255}
 MARKER_COLOR :: clay.Color{255, 205, 70, 255}
 TOOLTIP_BG :: clay.Color{28, 35, 45, 255}
 TOOLTIP_TEXT :: clay.Color{240, 244, 248, 255}
+RANGE_COLOR :: clay.Color{130, 220, 150, 255}
 HANDLE_FILL :: clay.Color{30, 30, 30, 255}
 HANDLE_BORDER :: clay.Color{200, 200, 200, 255}
 TEXT :: clay.Color{255, 255, 255, 255}
@@ -45,8 +46,13 @@ Project :: struct {
 	name: string,
 	width: c.int,
 	height: c.int,
+	// Render range: the frames that would actually be exported. Set with the
+	// I (start) / O (end) hotkeys. -1 = unset; when both are unset the whole
+	// project is the render range. Setting both to the same frame clears it.
+	start_frame: i64,
+	end_frame: i64,
 }
-project: Project = {name = "Untitled Project", width = 1920, height = 1080}
+project: Project = {name = "Untitled Project", width = 1920, height = 1080, start_frame = -1, end_frame = -1}
 file_info_text: string
 
 // resolution_locked becomes true the moment the project resolution is set

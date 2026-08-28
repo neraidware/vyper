@@ -100,6 +100,20 @@ main :: proc() {
 					switch event.key.key {
 					case sdl.K_S:
 						split_clip_at_playhead()
+					case sdl.K_I:
+						// Set the render-range start at the playhead; collapsing the
+						// range to a single frame clears it.
+						project.start_frame = playhead.frame
+						if project.end_frame == playhead.frame {
+							project.start_frame = -1
+							project.end_frame = -1
+						}
+					case sdl.K_O:
+						project.end_frame = playhead.frame
+						if project.start_frame == playhead.frame {
+							project.start_frame = -1
+							project.end_frame = -1
+						}
 					}
 				}
 			case .TEXT_INPUT:
@@ -410,6 +424,7 @@ main :: proc() {
 			draw_clip_markers(&renderer, command_buffer, pass)
 			if len(timeline.tracks) > 0 {
 				draw_timeline_ruler(&renderer, command_buffer, pass)
+				draw_render_range(&renderer, command_buffer, pass)
 			}
 			if preview_has_frame {
 				preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox

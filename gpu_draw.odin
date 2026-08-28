@@ -64,6 +64,33 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	render_sdf_rect(renderer, command_buffer, pass, {line_x - 4, ruler.y - 4, 10, 10}, BUTTON_BORDER_HOVER, 2, 0)
 }
 
+// draw_render_range draws the project render range as a band sitting just below
+// the timeline ruler bar, from the range's start frame to its end frame (both
+// already set and ordered). Only the part inside the ruler's width is drawn.
+draw_render_range :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	if len(timeline.tracks) == 0 || project.start_frame < 0 || project.end_frame < 0 || project.start_frame >= project.end_frame {
+		return
+	}
+	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+	if ruler.width <= 0 {
+		return
+	}
+	x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
+	x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
+	if x1 >= ruler.x + ruler.width || x2 <= ruler.x {
+		return
+	}
+	y := ruler.y + ruler.height
+	band_x := max(x1, ruler.x)
+	band_w := min(x2, ruler.x + ruler.width) - band_x
+	if band_w > 0 {
+		render_sdf_rect(renderer, command_buffer, pass, {band_x, y, band_w, 4}, RANGE_COLOR, 0, 0)
+	}
+	// Edge caps make the range boundaries readable even when the band is thin.
+	render_sdf_rect(renderer, command_buffer, pass, {x1, y, 2, 8}, RANGE_COLOR, 0, 0)
+	render_sdf_rect(renderer, command_buffer, pass, {x2 - 2, y, 2, 8}, RANGE_COLOR, 0, 0)
+}
+
 // nice_frame_step picks the ruler's label spacing (a round 1/2/5×10^k number)
 // so that labelled ticks stay about 70px apart at the current timeline zoom.
 nice_frame_step :: proc(zoom: f32) -> i64 {
