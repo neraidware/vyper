@@ -85,6 +85,38 @@ render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuff
 	}
 }
 
+// draw_clip_markers paints each clip's embedded markers as a tiny downward
+// triangle at the top of its timeline tile, positioned by source frame. Drawn
+// as an overlay after the Clay command batch because a clip element's final
+// laid-out position is only available via GetElementData.
+draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	if len(timeline.tracks) == 0 {
+		return
+	}
+	for track, track_idx in timeline.tracks {
+		for clip, index in track.clips {
+			if len(clip.markers) == 0 {
+				continue
+			}
+			box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
+			if box.width <= 0 || box.height <= 0 {
+				continue
+			}
+			rows := [3]f32{5, 3, 1}
+			for m in clip.markers {
+				x := box.x + f32(m.source_frame - clip.source_start_frame) * TIMELINE_ZOOM
+				y := box.y
+				for row, r in rows {
+					w := rows[r]
+					bx := clamp(x - w * 0.5, box.x + 1, box.x + box.width - w - 1)
+					render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = bx, y = y, width = w, height = 3}, MARKER_COLOR, 0, 0)
+					y += 3
+				}
+			}
+		}
+	}
+}
+
 render_text :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox, text: clay.TextRenderData) {
 	if renderer.font.texture == nil || renderer.text_pipeline == nil {
 		return

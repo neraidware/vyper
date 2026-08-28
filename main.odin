@@ -379,6 +379,7 @@ main :: proc() {
 		pass := sdl.BeginGPURenderPass(command_buffer, &color_target, 1, nil)
 		if pass != nil {
 			render_clay(&renderer, command_buffer, pass, commands)
+			draw_clip_markers(&renderer, command_buffer, pass)
 			if len(timeline.tracks) > 0 {
 				draw_timeline_ruler(&renderer, command_buffer, pass)
 			}
