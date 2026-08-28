@@ -925,6 +925,10 @@ render_test_run :: proc(paths: [2]string) {
 	}
 	test_input_buf[n] = 0
 	import_media(cstring(&test_input_buf[0]))
+	if len(timeline.tracks) > 0 && len(timeline.tracks[0].clips) > 0 {
+		vclip := &timeline.tracks[0].clips[0]
+		fmt.println("render-test clip markers:", len(vclip.markers))
+	}
 	render_set_out_path(paths[1])
 	render_start()
 	for render_is_busy() {

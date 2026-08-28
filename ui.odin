@@ -377,14 +377,40 @@ for timeline_clip, index in track.clips {
 										bw := clip_border_w
 										border := clay.BorderWidth{left = bw, top = bw, bottom = bw}
 										border.right = next_touches ? 0 : bw
-										if clay.UI(clay.ID("TimelineClip", u32(track_idx * 1000 + index)))({
-											layout = {sizing = {width = clay.SizingFixed(clip_width), height = clay.SizingFixed(56)}, padding = clay.PaddingAll(8)},
-											backgroundColor = clip_color,
-											cornerRadius = clay.CornerRadiusAll(6),
-											border = {color = clip_border, width = border},
+if clay.UI(clay.ID("TimelineClip", u32(track_idx * 1000 + index)))({
+										layout = {sizing = {width = clay.SizingFixed(clip_width), height = clay.SizingFixed(56)}, padding = clay.Padding{left = 8, right = 8, bottom = 8}},
+										backgroundColor = clip_color,
+										cornerRadius = clay.CornerRadiusAll(6),
+										border = {color = clip_border, width = border},
+									}) {
+										// Markers render as amber ticks along the clip's top border,
+										// positioned at their source frame within the clip.
+										if len(timeline_clip.markers) > 0 && clip_width > 12 {
+											if clay.UI(clay.ID("MarkerStrip", u32(track_idx * 1000 + index)))({
+												layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(8)}, layoutDirection = .LeftToRight},
+											}) {
+												prev_px := 0
+												for m in 0 ..< len(timeline_clip.markers) {
+													mx := f32(timeline_clip.markers[m].source_frame) / f32(max(timeline_clip.source_length_frames, 1)) * clip_width
+													spine := clamp(mx, 0, clip_width)
+													gap := max(0, int(spine) - prev_px)
+													if clay.UI(clay.ID("MarkerGap", u32(track_idx * 1000 + index * 8 + m)))({
+														layout = {sizing = {width = clay.SizingFixed(f32(gap)), height = clay.SizingGrow({})}},
+													}) {}
+													if clay.UI(clay.ID("MarkerTick", u32(track_idx * 1000 + index * 8 + m)))({
+														layout = {sizing = {width = clay.SizingFixed(3), height = clay.SizingGrow({})}},
+														backgroundColor = MARKER_COLOR,
+													}) {}
+													prev_px = int(spine) + 3
+												}
+											}
+										}
+										if clay.UI(clay.ID("ClipLabelRow", u32(track_idx * 1000 + index)))({
+											layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, childAlignment = {x = .Center, y = .Center}},
 										}) {
 											clay.Text(clip_label, clay.TextElementConfig{textColor = TEXT, fontSize = 18})
 										}
+									}
 										}
 									}
 								}
