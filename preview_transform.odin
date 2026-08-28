@@ -89,15 +89,33 @@ snap_margin :: proc(canvas: clay.BoundingBox, preview_px: f32) -> f32 {
 	return preview_px * f32(project.width) / v.width
 }
 
+// clip_full_box_dims returns the uncropped full-image size (project units) for
+// a clip whose canvas scale box is out_w x out_h, constrained to the source's
+// own aspect (contain-fit, letterboxed). With an unknown source size (0) it is
+// the plain canvas box, preserving the old stretch-to-fill behavior.
+clip_full_box_dims :: proc(clip: ^Clip, out_w, out_h: f32) -> (f32, f32) {
+	if clip.source_w > 0 && clip.source_h > 0 {
+		src_ar := f32(clip.source_w) / f32(clip.source_h)
+		box_ar := out_w / out_h
+		if src_ar > box_ar {
+			return out_w, out_w / src_ar
+		}
+		return out_h * src_ar, out_h
+	}
+	return out_w, out_h
+}
+
 // snap_transform snaps the clip's visible (cropped) box edges to the project
 // canvas borders when they come within the given margin (project units). Force
 // insets are normalized, so the visible half-extent from the center is
-// (0.5 - crop) * (project axis) * scale.
+// (0.5 - crop) * (project axis) * scale. The full box honors the source aspect
+// (see clip_full_box_dims), so snapping matches the box the user actually sees.
 snap_transform :: proc(clip: ^Clip, margin: f32) {
 	PW := f32(project.width)
 	PH := f32(project.height)
-	d_l := (0.5 - clip.crop_l) * PW * clip.scale
-	d_r := (0.5 - clip.crop_r) * PW * clip.scale
+	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+	d_l := (0.5 - clip.crop_l) * cw
+	d_r := (0.5 - clip.crop_r) * cw
 	left := clip.transform_x - d_l
 	right := clip.transform_x + d_r
 	// Left edge to x=0, otherwise right edge to x=project.width.
@@ -106,8 +124,8 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 	} else if abs(right - PW) <= margin {
 		clip.transform_x = PW - d_r
 	}
-	d_t := (0.5 - clip.crop_t) * PH * clip.scale
-	d_b := (0.5 - clip.crop_b) * PH * clip.scale
+	d_t := (0.5 - clip.crop_t) * ch
+	d_b := (0.5 - clip.crop_b) * ch
 	top := clip.transform_y - d_t
 	bottom := clip.transform_y + d_b
 	// Top edge to y=0, otherwise bottom edge to y=project.height.
@@ -127,21 +145,11 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
 	v := preview_view(canvas)
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
-	sw := v.width * clip.scale
-	sh := v.height * clip.scale
 	// Preserve the source's own aspect inside the (canvas-shaped) scale box,
 	// letterboxing the excess instead of stretching, so a clip doesn't get
 	// squished when its aspect differs from the project canvas. With an
 	// unknown source size (0) behavior is unchanged (fill the box).
-	if clip.source_w > 0 && clip.source_h > 0 {
-		src_ar := f32(clip.source_w) / f32(clip.source_h)
-		box_ar := v.width / v.height
-		if src_ar > box_ar {
-			sh = sw / src_ar
-		} else {
-			sw = sh * src_ar
-		}
-	}
+	sw, sh := clip_full_box_dims(clip, v.width * clip.scale, v.height * clip.scale)
 	x := cx - sw / 2 + clip.crop_l * sw
 	y := cy - sh / 2 + clip.crop_t * sh
 	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
@@ -233,7 +241,8 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		// visible edge/corner while crop fractions stay constant. The new
 		// transform is derived by anchoring the pinned visible edge with its
 		// scaled offset (0.5 - crop)*axis*new_scale, so scaling after a crop is
-		// stable. All in project units with the pointer unclamped.
+		// stable. All in project units with the pointer unclamped. The full box
+		// honors the source aspect so the math matches the box the user sees.
 		PW := f32(project.width)
 		PH := f32(project.height)
 		scale0 := handle_start_scale
@@ -241,16 +250,17 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		cr := handle_start_crop_r
 		ct := handle_start_crop_t
 		cb := handle_start_crop_b
-		dl0 := (0.5 - cl) * PW * scale0
-		dr0 := (0.5 - cr) * PW * scale0
-		dt0 := (0.5 - ct) * PH * scale0
-		db0 := (0.5 - cb) * PH * scale0
+		cw0, ch0 := clip_full_box_dims(clip, PW * scale0, PH * scale0)
+		dl0 := (0.5 - cl) * cw0
+		dr0 := (0.5 - cr) * cw0
+		dt0 := (0.5 - ct) * ch0
+		db0 := (0.5 - cb) * ch0
 		vl0 := handle_start_tx - dl0
 		vr0 := handle_start_tx + dr0
 		vt0 := handle_start_ty - dt0
 		vb0 := handle_start_ty + db0
-		w0 := (1 - cl - cr) * PW * scale0
-		h0 := (1 - ct - cb) * PH * scale0
+		w0 := (1 - cl - cr) * cw0
+		h0 := (1 - ct - cb) * ch0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
 
 		k: f32 = 1
@@ -289,10 +299,11 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 
 		k = max(k, 0.01)
 		s := scale0 * k
-		dl := (0.5 - cl) * PW * s
-		dr := (0.5 - cr) * PW * s
-		dt := (0.5 - ct) * PH * s
-		db := (0.5 - cb) * PH * s
+		cw, ch := clip_full_box_dims(clip, PW * s, PH * s)
+		dl := (0.5 - cl) * cw
+		dr := (0.5 - cr) * cw
+		dt := (0.5 - ct) * ch
+		db := (0.5 - cb) * ch
 		tx := handle_start_tx
 		ty := handle_start_ty
 		switch dragging_handle {
@@ -327,13 +338,13 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		// Crop trims the visible box: dragging one edge moves that edge (and the
 		// adjacent edges for a corner) while the opposite visible edge stays
 		// fixed, revealing background. Insets are stored as normalized fractions
-		// of the scale box, and the scale/transform are not touched, so cropping
+		// of the full box, and the scale/transform are not touched, so cropping
 		// only crops. Trim-only: each edge can only move toward the opposite edge.
+		// The full box honors the source aspect so edges align with what is seen.
 		PW := f32(project.width)
 		PH := f32(project.height)
 		scale0 := handle_start_scale
-		out_w := PW * scale0
-		out_h := PH * scale0
+		out_w, out_h := clip_full_box_dims(clip, PW * scale0, PH * scale0)
 		OX_L := handle_start_tx - out_w / 2
 		OX_R := handle_start_tx + out_w / 2
 		OX_T := handle_start_ty - out_h / 2
