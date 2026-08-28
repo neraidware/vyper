@@ -194,10 +194,56 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							}
 							clay.Text(fmt.aprintf("Crop: L %.0f%% R %.0f%% T %.0f%% B %.0f%%", cl.crop_l * 100, cl.crop_r * 100, cl.crop_t * 100, cl.crop_b * 100), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
 						}
-					} else {
-						clay.Text("No clip selected", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
-					}
+} else {
+					clay.Text("No clip selected", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
 				}
+				if clay.UI(clay.ID("RenderPanel"))({
+					layout = {
+						layoutDirection = .TopToBottom,
+						sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+						padding = clay.PaddingAll(16),
+						childGap = 8,
+					},
+					backgroundColor = BUTTON,
+					border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+					cornerRadius = clay.CornerRadiusAll(8),
+				}) {
+					clay.Text("Render", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
+					if clay.UI(clay.ID("RenderButtonsRow"))({
+						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = 8},
+					}) {
+						if clay.UI(clay.ID("RenderPickButton"))({
+							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
+							backgroundColor = BUTTON,
+							border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+							cornerRadius = clay.CornerRadiusAll(4),
+						}) {
+							clay.Text("Pick file path", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+						}
+						if clay.UI(clay.ID("RenderRunButton"))({
+							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
+							backgroundColor = BUTTON,
+							border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+							cornerRadius = clay.CornerRadiusAll(4),
+						}) {
+							label := render_is_busy() ? "Rendering..." : "Render"
+							clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+						}
+						if render_is_busy() {
+							if clay.UI(clay.ID("RenderCancelButton"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
+								backgroundColor = BUTTON,
+								border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+								cornerRadius = clay.CornerRadiusAll(4),
+							}) {
+								clay.Text("Cancel", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+							}
+						}
+					}
+					clay.Text(fmt.aprintf("Output: %s", render_output_name()), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+					clay.Text(render_status_text(), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+				}
+			}
 			}
 			if clay.UI(clay.ID("EditorDivider"))({
 				layout = {

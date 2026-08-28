@@ -55,8 +55,17 @@ audio_decoder_reset :: proc(dec: ^Audio_Clip_Decoder) {
 	dec^ = {}
 }
 
-// open_audio_decoder opens the audio stream at stream_index for decoding.
+// open_audio_decoder opens the audio stream at stream_index for decoding,
+// converting to S16 PCM at the stream's native rate/channel count (playback).
 open_audio_decoder :: proc(dec: ^Audio_Clip_Decoder, path: cstring, stream_index: c.int) -> bool {
+	return open_audio_decoder_resampled(dec, path, stream_index, -1, -1)
+}
+
+// open_audio_decoder_resampled opens the audio stream at stream_index and
+// converts it to interleaved S16 PCM at the given output rate/channels. A
+// non-positive rate falls back to the stream's native rate (and channels).
+// Rendering uses this to get a fixed 48 kHz stereo mix bus.
+open_audio_decoder_resampled :: proc(dec: ^Audio_Clip_Decoder, path: cstring, stream_index: c.int, out_rate, out_channels: c.int) -> bool {
 	audio_decoder_reset(dec)
 
 	fmt_ctx: ^avfmt.FormatContext
@@ -123,6 +132,12 @@ open_audio_decoder :: proc(dec: ^Audio_Clip_Decoder, path: cstring, stream_index
 	if dec.out_channels < 1 {
 		dec.out_channels = 1
 	}
+	if out_rate > 0 {
+		dec.out_rate = out_rate
+	}
+	if out_channels > 0 {
+		dec.out_channels = out_channels
+	}
 
 	swr_ctx := swres.alloc()
 	if swr_ctx == nil {
@@ -132,7 +147,10 @@ open_audio_decoder :: proc(dec: ^Audio_Clip_Decoder, path: cstring, stream_index
 	dec.swr_ctx = swr_ctx
 	if ret := swres.alloc_set_opts2(
 		&dec.swr_ctx,
-		&dec_ctx.ch_layout, avutil.SampleFormat.S16, dec_ctx.sample_rate,
+		// Output: interleaved S16 at the target rate/channel count.
+		&(avutil.ChannelLayout{nb_channels = dec.out_channels, order = .Native}),
+		avutil.SampleFormat.S16, dec.out_rate,
+		// Input: the stream's native format.
 		&dec_ctx.ch_layout, dec_ctx.sample_fmt, dec_ctx.sample_rate,
 		0, nil,
 	); ret < 0 {

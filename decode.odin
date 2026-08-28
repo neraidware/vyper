@@ -129,7 +129,19 @@ cache_store :: proc(dec: ^Clip_Decoder, frame_idx: i64, data: []u8) {
 	dec.cache[evict].uses = 1
 }
 
+// open_clip_decoder opens the file's best video stream for interactive preview,
+// fitting it letterbox-style into the fixed PREVIEW_W x PREVIEW_H buffer.
 open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
+	return open_clip_decoder_ex(dec, path, -1, PREVIEW_W, PREVIEW_H, true)
+}
+
+// open_clip_decoder_ex opens a video stream (stream_index >= 0 selects the
+// stream_index-th video stream, -1 picks the best one) and scales every decoded
+// frame into a dst_w x dst_h RGBA buffer. When fit is true the source is
+// letterboxed (aspect-preserving) inside dst (preview path); otherwise the full
+// source is scaled to exactly dst (render path, where dst already matches the
+// clip's on-canvas display size).
+open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.int, dst_w, dst_h: c.int, fit: bool) -> bool {
 	if dec.opened {
 		clip_decoder_reset(dec)
 	}
@@ -144,7 +156,28 @@ open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
 		fmt.println("avformat_find_stream_info:", ff_err_str(ret))
 		return false
 	}
-	idx := avfmt.find_best_stream(fmt_ctx, .Video, -1, -1, nil, 0)
+	idx: c.int = -1
+	if stream_index >= 0 {
+		// Count video streams until the requested index is reached.
+		seen := c.int(0)
+		for i in 0 ..< int(fmt_ctx.nb_streams) {
+			s := fmt_ctx.streams[i]
+			if s == nil || s.codecpar == nil {
+				continue
+			}
+			if s.codecpar.codec_type != avutil.MediaType.Video {
+				continue
+			}
+			if seen == stream_index {
+				idx = c.int(i)
+				break
+			}
+			seen += 1
+		}
+	}
+	if idx < 0 {
+		idx = avfmt.find_best_stream(fmt_ctx, .Video, -1, -1, nil, 0)
+	}
 	if idx < 0 {
 		fmt.println("no video stream:", ff_err_str(idx))
 		return false
@@ -177,8 +210,15 @@ open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
 
 	// Fit the source into the fixed preview buffer preserving its aspect, so a
 	// video whose aspect differs from the project's canvas is letterboxed
-	// instead of stretched.
-	dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy = source_fit_in_buffer(dec.src_w, dec.src_h, PREVIEW_W, PREVIEW_H)
+	// instead of stretched. Render path (fit=false) uses the exact dst dims.
+	if fit {
+		dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy = source_fit_in_buffer(dec.src_w, dec.src_h, dst_w, dst_h)
+	} else {
+		dec.dst_w = dst_w
+		dec.dst_h = dst_h
+		dec.fit_ox = 0
+		dec.fit_oy = 0
+	}
 
 	fps := dec.stream.avg_frame_rate
 	if fps.num <= 0 || fps.den <= 0 {

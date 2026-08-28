@@ -11,6 +11,10 @@ import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 
 main :: proc() {
+	if test_path_ok, test_paths := render_test_env(); test_path_ok {
+		render_test_run(test_paths)
+		return
+	}
 	if !load_font_data() {
 		return
 	}
@@ -26,6 +30,7 @@ main :: proc() {
 		return
 	}
 	defer sdl.DestroyWindow(window)
+	app_window = window
 
 	device := sdl.CreateGPUDevice({.SPIRV}, true, "vulkan")
 	if device == nil {
@@ -69,6 +74,7 @@ main :: proc() {
 	defer audio_shutdown()
 	async_dec_init()
 	defer async_dec_shutdown()
+	render_init()
 
 	memory := make([^]u8, clay.MinMemorySize())
 	clay.Initialize(
@@ -214,6 +220,12 @@ main :: proc() {
 			toggle_project_orientation()
 		} else if clay.PointerOver(clay.ID("DividerHandle")) && mouse_down {
 			resizing_areas = true
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("RenderPickButton")) {
+			render_pick_output_path()
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("RenderRunButton")) {
+			render_start()
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("RenderCancelButton")) {
+			render_cancel()
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("Ruler")) {
 			// Clicking the timeline ruler starts a scrub (drag to seek).
 			dragging_playhead = true
@@ -385,6 +397,7 @@ main :: proc() {
 		last_tick_ns = now_ns
 		_ = timeline_frame_at(playhead.frame)
 		audio_update()
+		poll_completed_thread()
 		renderer.viewport = {f32(width), f32(height)}
 		command_buffer := sdl.AcquireGPUCommandBuffer(device)
 		if command_buffer == nil {
