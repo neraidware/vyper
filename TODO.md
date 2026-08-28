@@ -125,6 +125,12 @@ Not yet implemented (roadmap below):
   ruler bar. Default is unset start/end = the whole project. Setting start and
   end to the same frame clears the range. Persist as project fields
   (`project_in/out` frames, unset = full project).
+- **No auto-fit on import**: importing a video larger than the project canvas
+  must NOT auto-adapt it to fill the canvas. Drop the fixed automatic
+  scale-to-fit behavior; the clip imports at its native size and the user
+  transforms (scale/position/crop) it themselves afterwards. Revisit the
+  resolution/scale defaults set at import time (`import_media` in media.odin:
+  inferred canvas size, `scale = 1`, transform centered).
 
 ## Current Architecture
 
