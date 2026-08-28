@@ -42,6 +42,17 @@ timeline_zoom: f32 = 1
 TIMELINE_MIN_ZOOM :: f32(0.05)
 TIMELINE_MAX_ZOOM :: f32(16)
 
+// timeline_fps returns the timeline's frame rate (the source video's native
+// rate, set at import). The timeline grid is 1 frame == 1 source frame, so the
+// playhead and the render canvas must tick at this rate for 1:1 audio/video.
+// Falls back to 60 as a safe default before any media is open.
+timeline_fps :: proc() -> f64 {
+	if timeline.frame_rate > 0 {
+		return timeline.frame_rate
+	}
+	return 60
+}
+
 Project :: struct {
 	name: string,
 	width: c.int,
@@ -184,6 +195,14 @@ Preview_Slot :: struct {
 }
 
 preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot
+
+// preview_frontier is the highest timeline frame whose pixels were actually
+// decoded into a preview slot. The playhead is capped at frontier + 2 during
+// playback so the pipeline can never fall behind itself (which would force
+// frame re-seeks and collapse the loop); the audio producer in turn chases the
+// playhead, so the whole preview runs at whatever pace decode sustains.
+preview_frontier: i64
+ui_playhead_frame: i64 // published playhead frame for the audio producer (atomic)
 
 // Preview camera: pan (in preview pixels, relative to the base canvas center)
 // and zoom. Pan/zoom is clamped so the view never travels more than one preview

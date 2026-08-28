@@ -343,18 +343,27 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										}
 									}
 									if clay.UI(clay.ID("ClipsSection", u32(track_idx)))({
-										layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight, childGap = 16},
-										clip = {horizontal = true, vertical = true},
+										layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight},
+										clip = {horizontal = true, vertical = true, childOffset = {-timeline_view_start * timeline_zoom, 0}},
 									}) {
+										clips_content_x: f32 = 0
 for timeline_clip, index in track.clips {
-										// Translate each clip by the pan offset and scale it by the
-										// zoom so the timeline view (view_start frame at x=0) stays
-										// aligned with the ruler above it.
-										offset_frames := f32(timeline_clip.timeline_start_frame) - timeline_view_start
-										if offset_frames > 0 {
-											if clay.UI(clay.ID("ClipOffset", u32(track_idx * 1000 + index)))({
-												layout = {sizing = {width = clay.SizingFixed(offset_frames * timeline_zoom), height = clay.SizingGrow({})}},
-											}) {}
+										// Each clip is laid out at its true timeline frame position
+										// (start_frame pixels from the row's origin at frame 0); the
+										// ClipsSection's childOffset translates the whole row by
+										// -view_start*zoom so panning slides every clip together and
+										// clips starting before the view go off the left edge instead
+										// of pinning to it.
+										// A running x keeps real gaps between clips exactly one
+										// spacer wide, so multi-clip tracks don't drift right as
+										// later clips each add another full start-frame spacer.
+										target_x := f32(timeline_clip.timeline_start_frame) * timeline_zoom
+										if target_x > clips_content_x {
+											spacer_w := target_x - clips_content_x
+											clips_content_x = target_x
+											clay.UI(clay.ID("ClipOffset", u32(track_idx * 1000 + index)))({
+												layout = {sizing = {width = clay.SizingFixed(spacer_w), height = clay.SizingGrow({})}},
+											})
 										}
 										clip_width := f32(max(timeline_clip.source_length_frames, 1)) * timeline_zoom
 										clip_color := BUTTON
@@ -378,39 +387,14 @@ for timeline_clip, index in track.clips {
 										border := clay.BorderWidth{left = bw, top = bw, bottom = bw}
 										border.right = next_touches ? 0 : bw
 if clay.UI(clay.ID("TimelineClip", u32(track_idx * 1000 + index)))({
-										layout = {sizing = {width = clay.SizingFixed(clip_width), height = clay.SizingFixed(56)}, padding = clay.Padding{left = 8, right = 8, bottom = 8}},
+										layout = {sizing = {width = clay.SizingFixed(clip_width), height = clay.SizingFixed(56)}, padding = clay.PaddingAll(8)},
 										backgroundColor = clip_color,
 										cornerRadius = clay.CornerRadiusAll(6),
 										border = {color = clip_border, width = border},
 									}) {
-										// Markers render as amber ticks along the clip's top border,
-										// positioned at their source frame within the clip.
-										if len(timeline_clip.markers) > 0 && clip_width > 12 {
-											if clay.UI(clay.ID("MarkerStrip", u32(track_idx * 1000 + index)))({
-												layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(8)}, layoutDirection = .LeftToRight},
-											}) {
-												prev_px := 0
-												for m in 0 ..< len(timeline_clip.markers) {
-													mx := f32(timeline_clip.markers[m].source_frame) / f32(max(timeline_clip.source_length_frames, 1)) * clip_width
-													spine := clamp(mx, 0, clip_width)
-													gap := max(0, int(spine) - prev_px)
-													if clay.UI(clay.ID("MarkerGap", u32(track_idx * 1000 + index * 8 + m)))({
-														layout = {sizing = {width = clay.SizingFixed(f32(gap)), height = clay.SizingGrow({})}},
-													}) {}
-													if clay.UI(clay.ID("MarkerTick", u32(track_idx * 1000 + index * 8 + m)))({
-														layout = {sizing = {width = clay.SizingFixed(3), height = clay.SizingGrow({})}},
-														backgroundColor = MARKER_COLOR,
-													}) {}
-													prev_px = int(spine) + 3
-												}
-											}
-										}
-										if clay.UI(clay.ID("ClipLabelRow", u32(track_idx * 1000 + index)))({
-											layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, childAlignment = {x = .Center, y = .Center}},
-										}) {
-											clay.Text(clip_label, clay.TextElementConfig{textColor = TEXT, fontSize = 18})
-										}
+										clay.Text(clip_label, clay.TextElementConfig{textColor = TEXT, fontSize = 18})
 									}
+										clips_content_x += clip_width
 										}
 									}
 								}

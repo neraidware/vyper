@@ -2,8 +2,10 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -23,8 +25,10 @@ import sdl "vendor:sdl3"
 
 RENDER_FPS :: 60
 RENDER_AUDIO_RATE :: 48000
-// Audio frames per output video frame: 48000/60 = 800.
-AUDIO_PER_VIDEO :: 800
+// MAX_AUDIO_FRAME_SAMPLES caps the per-canvas-frame audio mix at the lowest
+// practical timeline rate (12 fps -> 4000 samples), leaving headroom for
+// step-downs above that.
+MAX_AUDIO_FRAME_SAMPLES :: 4096
 // AAC encodes in fixed 1024-sample frames.
 AAC_FRAME_SIZE :: 1024
 Render_Default_Path :: "render.mp4"
@@ -115,20 +119,22 @@ Render_Video_Src :: struct {
 	source_h:            c.int,
 	// Compositing state (computed once at open).
 	dec:                 Clip_Decoder,
-	rw, rh:              c.int, // display rect size in output pixels
+	rw, rh:              c.int, // display (cropped box) rect size in output pixels
 	ox, oy:              c.int, // rounded top-left offset on the canvas
-	blit:                []u8,  // rw*rh*4 scaled frame
+	fw, fh:              c.int, // full (pre-crop) box size the frame decodes into
+	blit:                []u8,  // fw*fh*4 scaled frame
 }
 
 Render_Audio_Src :: struct {
-	path:                cstring,
-	stream_index:        c.int,
+	path:                 cstring,
+	stream_index:         c.int,
 	timeline_start_frame: i64,
+	source_start_frame:   i64,
 	source_length_frames: i64,
-	dec:                 Audio_Clip_Decoder, // 48 kHz stereo S16
-	fifo:                [dynamic]f32,     // converted stereo f32, content-relative
-	first48:             i64,              // content 48 kHz frame of fifo[0]
-	have48:              i64,              // content frames produced so far (next un-produced)
+	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
+	fifo:                 [dynamic]f32,     // converted stereo f32, content-relative
+	first48:              i64,              // content 48 kHz frame of fifo[0]
+	have48:               i64,              // content frames produced so far (next un-produced)
 }
 
 render_job_videos: []Render_Video_Src
@@ -243,7 +249,7 @@ enc_drain :: proc(e: ^Render_Enc, ctx: ^avcodec.CodecContext, stream: ^avfmt.Str
 }
 
 // enc_open_video configures the H.264 encoder and its mux stream.
-enc_open_video :: proc(e: ^Render_Enc, width, height: c.int) -> bool {
+enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c.int) -> bool {
 	codec := avcodec.find_encoder_by_name("libx264")
 	if codec == nil {
 		fmt.println("no libx264 encoder")
@@ -257,8 +263,10 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int) -> bool {
 	e.vcodec_ctx = ctx
 	ctx.width = width
 	ctx.height = height
-	ctx.time_base = avutil.Rational{num = 1, den = RENDER_FPS}
-	ctx.framerate = avutil.Rational{num = RENDER_FPS, den = 1}
+	// The output canvas ticks the source/timeline frame rate, not a fixed 60,
+	// so the rendered video and its audio track stay 1:1 with the source.
+	ctx.time_base = avutil.Rational{num = fps_den, den = fps_num}
+	ctx.framerate = avutil.Rational{num = fps_num, den = fps_den}
 	ctx.pix_fmt = .YUV420P
 	ctx.gop_size = 120
 	ctx.max_b_frames = 2
@@ -351,7 +359,7 @@ enc_open_audio :: proc(e: ^Render_Enc) -> bool {
 	return true
 }
 
-render_open_output :: proc(e: ^Render_Enc, path: cstring, width, height: c.int, with_audio: bool) -> bool {
+render_open_output :: proc(e: ^Render_Enc, path: cstring, width, height: c.int, with_audio: bool, fps_num, fps_den: c.int) -> bool {
 	if ret := avfmt.alloc_output_context2(&e.fmt_ctx, nil, nil, path); ret < 0 {
 		// Fall back to guessing the format by name.
 		if ret2 := avfmt.alloc_output_context2(&e.fmt_ctx, nil, cstring("mp4"), path); ret2 < 0 {
@@ -363,7 +371,7 @@ render_open_output :: proc(e: ^Render_Enc, path: cstring, width, height: c.int, 
 		fmt.println("avio_open2:", ff_err_str(ret))
 		return false
 	}
-	if !enc_open_video(e, width, height) {
+	if !enc_open_video(e, width, height, fps_num, fps_den) {
 		return false
 	}
 	if with_audio && !enc_open_audio(e) {
@@ -465,9 +473,9 @@ render_audio_pull :: proc(a: ^Render_Audio_Src, up_to48: i64) {
 	}
 }
 
-render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64) -> bool {
+render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> bool {
 	overlap_start := max(a.timeline_start_frame, render_start)
-	content_sec := f64(overlap_start - a.timeline_start_frame) / f64(RENDER_FPS)
+	content_sec := f64(overlap_start - a.timeline_start_frame + a.source_start_frame) / fps
 	if !open_audio_decoder_resampled(&a.dec, a.path, a.stream_index, RENDER_AUDIO_RATE, 2) {
 		return false
 	}
@@ -544,25 +552,50 @@ render_worker_run :: proc() {
 		v.rh = max(1, c.int(b - t + 0.5))
 		v.ox = c.int(l + 0.5)
 		v.oy = c.int(t + 0.5)
-		v.blit = make([]u8, int(v.rw) * int(v.rh) * 4)
-		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.rw, v.rh, false) {
+		// Decode the frame at the full (pre-crop) box size so the cropped
+		// region can be sampled out of it (render_blit).
+		cw, ch := render_full_box_dims(
+			v.source_w, v.source_h,
+			f32(render_job_width) * v.scale, f32(render_job_height) * v.scale,
+		)
+		v.fw = max(1, c.int(cw + 0.5))
+		v.fh = max(1, c.int(ch + 0.5))
+		v.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
+		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
 			err_msg = "failed to open video source"
 			fail = true
 			return
 		}
 	}
 
+	// The output NTP-style frame rate comes from the first video source so the
+	// timeline frame grid (which is the source's own frame indices) renders 1:1
+	// with both the video and the 48 kHz audio bus.
+	rfps_num, rfps_den := c.int(60), c.int(1)
+	if len(render_job_videos) > 0 {
+		rfps_num = render_job_videos[0].dec.fps_num
+		rfps_den = render_job_videos[0].dec.fps_den
+		if rfps_num <= 0 || rfps_den <= 0 {
+			rfps_num, rfps_den = 60, 1
+		}
+	}
+	rfps := f64(rfps_num) / f64(rfps_den)
+	spf := int(MAX_AUDIO_FRAME_SAMPLES)
+	if rfps > 0 {
+		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(0, int(math.round(48000.0 / rfps))))
+	}
+
 	has_audio := len(render_job_audios) > 0
 	if has_audio {
 		for i in 0 ..< len(render_job_audios) {
 			a := &render_job_audios[i]
-			if !render_audio_open(a, render_job_start) {
+			if !render_audio_open(a, render_job_start, rfps) {
 				a.dec.opened = false
 			}
 		}
 	}
 
-	if !render_open_output(&e, render_job_out_path, render_job_width, render_job_height, has_audio) {
+	if !render_open_output(&e, render_job_out_path, render_job_width, render_job_height, has_audio, rfps_num, rfps_den) {
 		err_msg = "failed to open output"
 		fail = true
 		return
@@ -591,7 +624,7 @@ render_worker_run :: proc() {
 			if !decode_source_frame(&v.dec, src_frame) {
 				continue
 			}
-			decode_into_buffer(&v.dec, v.blit, v.rw, v.rh)
+			decode_into_buffer(&v.dec, v.blit, v.fw, v.fh)
 			render_blit(canvas, render_job_width, render_job_height, v)
 		}
 		if !rend_enc_video_frame(&e, canvas, render_job_width, render_job_height, frame_idx) {
@@ -600,8 +633,8 @@ render_worker_run :: proc() {
 			return
 		}
 
-		if has_audio {
-			mix: [AUDIO_PER_VIDEO * 2]f32
+		if has_audio && spf > 0 {
+			mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 			for aa in 0 ..< len(render_job_audios) {
 				a := &render_job_audios[aa]
 				if !a.dec.opened {
@@ -610,18 +643,18 @@ render_worker_run :: proc() {
 				if timeline_frame < a.timeline_start_frame || timeline_frame >= a.timeline_start_frame + a.source_length_frames {
 					continue
 				}
-				start48 := (timeline_frame - a.timeline_start_frame) * AUDIO_PER_VIDEO
-				render_audio_pull(a, start48 + AUDIO_PER_VIDEO)
-				if a.have48 < start48 + AUDIO_PER_VIDEO {
+				start48 := i64(f64(timeline_frame - a.timeline_start_frame + a.source_start_frame) * f64(RENDER_AUDIO_RATE) / rfps)
+				render_audio_pull(a, start48 + i64(spf))
+				if a.have48 < start48 + i64(spf) {
 					continue
 				}
 				base := int(start48 - a.first48)
-				for s in 0 ..< AUDIO_PER_VIDEO {
-					mix[s * 2 + 0] += a.fifo[base + s * 2 + 0]
-					mix[s * 2 + 1] += a.fifo[base + s * 2 + 1]
+				for s in 0 ..< spf {
+					mix[s * 2 + 0] += a.fifo[(base + s) * 2 + 0]
+					mix[s * 2 + 1] += a.fifo[(base + s) * 2 + 1]
 				}
 			}
-			if !rend_enc_push_audio(&e, mix[:]) {
+			if !rend_enc_push_audio(&e, mix[:spf * 2]) {
 				err_msg = "audio encoding failed"
 				fail = true
 				return
@@ -657,6 +690,8 @@ render_worker_run :: proc() {
 }
 
 // render_blit copies the clip's scaled frame onto the canvas, clipped to bounds.
+// The blit holds the full (pre-crop) frame; crop insets select the visible
+// source sub-region that fills the display box (matching the preview's UV crop).
 render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 	top := max(v.oy, 0)
 	bottom := min(v.oy + v.rh, draw_h)
@@ -665,14 +700,39 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 	if bottom <= top || right <= left {
 		return
 	}
-	scol := left - v.ox
-	srow := top - v.oy
-	rows := bottom - top
-	cols := right - left
-	for row in 0 ..< rows {
-		src := v.blit[uint(srow + row) * uint(v.rw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
-		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-		copy(dst, src)
+	if v.crop_l == 0 && v.crop_r == 0 && v.crop_t == 0 && v.crop_b == 0 {
+		scol := left - v.ox
+		srow := top - v.oy
+		rows := bottom - top
+		cols := right - left
+		for row in 0 ..< rows {
+			src := v.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
+			copy(dst, src)
+		}
+		return
+	}
+	// Cropped: sample the source sub-region
+	// [crop_l*fw, crop_t*fh) -> [(1-crop_r)*fw, (1-crop_b)*fh) and scale it to
+	// fill the display box. The source is a 1:1 region-to-box fit after crop
+	// (same math as the preview), so artifacts are minimal.
+	src_cols := f64(v.fw) * f64(1 - v.crop_l - v.crop_r)
+	src_rows := f64(v.fh) * f64(1 - v.crop_t - v.crop_b)
+	if src_cols <= 0 || src_rows <= 0 {
+		return
+	}
+	sx0 := f64(v.crop_l) * f64(v.fw)
+	sy0 := f64(v.crop_t) * f64(v.fh)
+	for row in 0 ..< bottom - top {
+		sy := int(sy0 + (f64(top - v.oy + row) + 0.5) * src_rows / f64(v.rh))
+		sy = max(0, min(int(v.fh) - 1, sy))
+		src_row := v.blit[uint(sy) * uint(v.fw) * 4:]
+		for col in 0 ..< right - left {
+			sx := int(sx0 + (f64(left - v.ox + col) + 0.5) * src_cols / f64(v.rw))
+			sx = max(0, min(int(v.fw) - 1, sx))
+			dst := canvas[(uint(top + row) * uint(draw_w) + uint(left + col)) * 4:][:4]
+			copy(dst, src_row[uint(sx) * 4:][:4])
+		}
 	}
 }
 
@@ -801,6 +861,7 @@ case .Audio:
 				path = strings.clone_to_cstring(string(clip.path)),
 				stream_index = clip.stream_index,
 				timeline_start_frame = clip.timeline_start_frame,
+				source_start_frame = clip.source_start_frame,
 				source_length_frames = clip.source_length_frames,
 			})
 		case .Other:
@@ -928,6 +989,21 @@ render_test_run :: proc(paths: [2]string) {
 	if len(timeline.tracks) > 0 && len(timeline.tracks[0].clips) > 0 {
 		vclip := &timeline.tracks[0].clips[0]
 		fmt.println("render-test clip markers:", len(vclip.markers))
+		// NERED_CROP="l,r,t,b" applies a crop to the first clip so the render
+		// output's crop behavior can be verified headlessly.
+		if cv, cv_ok := os.lookup_env_alloc("NERED_CROP", context.allocator); cv_ok && cv != "" {
+			parts := strings.split(cv, ",")
+			if len(parts) == 4 {
+				vals := [4]f64{}
+				for i in 0 ..< 4 {
+					vals[i], _ = strconv.parse_f64(parts[i])
+				}
+				vclip.crop_l = f32(vals[0])
+				vclip.crop_r = f32(vals[1])
+				vclip.crop_t = f32(vals[2])
+				vclip.crop_b = f32(vals[3])
+			}
+		}
 	}
 	render_set_out_path(paths[1])
 	render_start()

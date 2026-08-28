@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:sync"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
 
@@ -86,6 +87,9 @@ main :: proc() {
 
 	running := true
 	was_mouse_down := false
+	ui_report_tick := u64(0)
+	ui_frame_count := 0
+	ui_dec_us := i64(0)
 	for running {
 		event: sdl.Event
 		for sdl.PollEvent(&event) {
@@ -365,7 +369,11 @@ main :: proc() {
 			if drag_clip != nil {
 				clip_x := mouse_x - clip_drag_offset
 				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-				drag_clip.timeline_start_frame = i64(max(clip_x - track_start, 0))
+				frame := (clip_x - track_start) / timeline_zoom + timeline_view_start
+				sync.mutex_lock(&audio_timeline_mtx)
+				drag_clip.timeline_start_frame = i64(clamp(frame, 0, f32(timeline_duration())))
+				sync.mutex_unlock(&audio_timeline_mtx)
+				audio_note_edit()
 			}
 		} else if dragging_playhead {
 			// Scrub the playhead to the pointer's frame along the ruler bar.
@@ -377,6 +385,7 @@ main :: proc() {
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			playhead.playing = !playhead.playing
 			preview.playing = playhead.playing
+			preview_frontier = playhead.frame
 		}
 		was_mouse_down = mouse_down
 		now_ns := sdl.GetTicksNS()
@@ -385,9 +394,10 @@ main :: proc() {
 		}
 		if playhead.playing {
 			playhead_accumulator += f64(now_ns - last_tick_ns) / 1_000_000_000
-			for playhead_accumulator >= 1.0 / 60.0 {
+			playback_fps := timeline_fps()
+			for playhead_accumulator >= 1.0 / playback_fps {
 				playhead.frame += 1
-				playhead_accumulator -= 1.0 / 60.0
+				playhead_accumulator -= 1.0 / playback_fps
 			}
 			if timeline_frame_at(playhead.frame).active_clip == nil {
 				playhead.playing = false
@@ -398,12 +408,27 @@ main :: proc() {
 		_ = timeline_frame_at(playhead.frame)
 		audio_update()
 		poll_completed_thread()
+		ui_frame_count += 1
+		if ui_report_tick == 0 {
+			ui_report_tick = now_ns
+		} else if now_ns - ui_report_tick >= 2_000_000_000 {
+			elapsed := f64(now_ns - ui_report_tick) / 1e9
+			fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d\n",
+				f64(ui_frame_count) / elapsed,
+				f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
+				playhead.frame)
+			ui_report_tick = now_ns
+			ui_frame_count = 0
+			ui_dec_us = 0
+		}
 		renderer.viewport = {f32(width), f32(height)}
 		command_buffer := sdl.AcquireGPUCommandBuffer(device)
 		if command_buffer == nil {
 			continue
 		}
+		dec_t0 := sdl.GetTicksNS()
 		changed := update_preview_slots()
+		ui_dec_us += i64(sdl.GetTicksNS() - dec_t0)
 		any_frame := false
 		for i in 0..<MAX_PREVIEW_SLOTS {
 			slot := &preview_slots[i]

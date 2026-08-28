@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:strconv"
+import "core:sync"
 
 // ---------------------------------------------------------------------------
 // Timeline queries and structural edits: duration/ruler math, frame lookups,
@@ -28,6 +29,8 @@ timeline_duration :: proc() -> i64 {
 // left so the two touch.
 split_clip_at_playhead :: proc() {
 	frame := playhead.frame
+	sync.mutex_lock(&audio_timeline_mtx)
+	defer sync.mutex_unlock(&audio_timeline_mtx)
 	for ti := 0; ti < len(timeline.tracks); ti += 1 {
 		track := &timeline.tracks[ti]
 		for i := 0; i < len(track.clips); i += 1 {
@@ -46,6 +49,7 @@ split_clip_at_playhead :: proc() {
 			right.timeline_start_frame = frame
 			right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
 			inject_at_elem(&track.clips, i + 1, right)
+			audio_note_edit()
 			return
 		}
 	}

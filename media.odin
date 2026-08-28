@@ -4,6 +4,7 @@ import "core:c"
 import "core:fmt"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import posix "core:sys/posix"
 
 // ---------------------------------------------------------------------------
@@ -154,6 +155,9 @@ import_media :: proc(path: cstring) {
 	file_info_text = probe_media(path)
 	frame_count := media_frame_count(file_info_text)
 	probe := probe_streams(path)
+	if probe.has_video && probe.video_fps_num > 0 {
+		timeline.frame_rate = f64(probe.video_fps_num) / f64(probe.video_fps_den)
+	}
 	audio_frames := i64(probe.duration_sec * timeline.frame_rate)
 	if audio_frames < frame_count {
 		audio_frames = frame_count
@@ -193,6 +197,8 @@ import_media :: proc(path: cstring) {
 		frame_count = frame_count,
 	})
 
+	sync.mutex_lock(&audio_timeline_mtx)
+	defer sync.mutex_unlock(&audio_timeline_mtx)
 	clear(&timeline.tracks)
 	track_n := 1
 	if probe.has_video {

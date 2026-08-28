@@ -446,6 +446,8 @@ Stream_Probe :: struct {
 	duration_sec:  f64,
 	has_video:     bool,
 	has_audio:     bool,
+	video_fps_num: c.int,
+	video_fps_den: c.int,
 }
 
 // probe_streams opens a file in-process with avformat and counts video and
@@ -476,6 +478,17 @@ probe_streams :: proc(path: cstring) -> Stream_Probe {
 		case avutil.MediaType.Video:
 			probe.video_streams += 1
 			probe.has_video = true
+			if probe.video_fps_num <= 0 && stream.avg_frame_rate.num > 0 {
+				probe.video_fps_num = stream.avg_frame_rate.num
+				probe.video_fps_den = stream.avg_frame_rate.den
+			}
+			if probe.video_fps_num <= 0 && stream.r_frame_rate.num > 0 {
+				probe.video_fps_num = stream.r_frame_rate.num
+				probe.video_fps_den = stream.r_frame_rate.den
+			}
+			if probe.video_fps_den <= 0 {
+				probe.video_fps_den = 1
+			}
 		case avutil.MediaType.Audio:
 			probe.audio_streams += 1
 			probe.has_audio = true
@@ -485,11 +498,12 @@ probe_streams :: proc(path: cstring) -> Stream_Probe {
 	return probe
 }
 
-// import_obs_chapters reads the chapter markers OBS embeds in hybrid MP4/MOV
-// recordings: a QTFF 'text' sample-entry track (handler "OBS Chapter Handler")
-// that FFmpeg demuxes as a MOV_TEXT subtitle stream, one sample per chapter.
-// Returns the markers in stream order with each source_frame converted to the
-// video timeline via the video stream's average frame rate.
+// import_obs_chapters reads the chapter markers OBS links (hybrid MP4/MOV) embed
+// in QTFF: a 'text' sample-entry track (handler "OBS Chapter Handler") that
+// FFmpeg demuxes as a MOV_TEXT subtitle stream, one sample per chapter. Files
+// that expose plain FFmpeg chapters (Matroska, MP4 chapter atoms) are also
+// imported. Returns the markers in stream order with each source_frame
+// converted to the video timeline via the video stream's average frame rate.
 import_obs_chapters :: proc(path: cstring) -> [dynamic]Clip_Marker {
 	markers := make([dynamic]Clip_Marker)
 	fmt_ctx: ^avfmt.FormatContext
@@ -512,11 +526,20 @@ import_obs_chapters :: proc(path: cstring) -> [dynamic]Clip_Marker {
 		if stream.codecpar.codec_type == avutil.MediaType.Video && video_idx < 0 {
 			video_idx = c.int(i)
 		}
-		if stream.codecpar.codec_type == avutil.MediaType.Subtitle && stream.codecpar.codec_id == avcodec.CodecID.MovText && text_idx < 0 {
+		if stream.codecpar.codec_type != avutil.MediaType.Subtitle {
+			continue
+		}
+		// OBS chapter tracks demux as MOV_TEXT; plain QT 'text' entries as TEXT.
+		// Anything else still counts if the demuxer tagged it as OBS's handler.
+		is_obs := false
+		if entry := avutil.dict_get(stream.metadata, "handler_name", nil, {}); entry != nil && entry.value != nil {
+			is_obs = strings.contains(strings.to_lower(string(entry.value)), "obs")
+		}
+		if text_idx < 0 && (stream.codecpar.codec_id == avcodec.CodecID.MovText || stream.codecpar.codec_id == avcodec.CodecID.Text || is_obs) {
 			text_idx = c.int(i)
 		}
 	}
-	if text_idx < 0 || video_idx < 0 {
+	if video_idx < 0 {
 		return markers
 	}
 	fps := fmt_ctx.streams[video_idx].avg_frame_rate
@@ -526,40 +549,17 @@ import_obs_chapters :: proc(path: cstring) -> [dynamic]Clip_Marker {
 	if fps.num <= 0 || fps.den <= 0 {
 		fps = avutil.Rational{num = 25, den = 1}
 	}
-	tb := fmt_ctx.streams[text_idx].time_base
-	if tb.num <= 0 || tb.den <= 0 {
-		return markers
+	frame_from_seconds := proc(seconds: f64, fps: avutil.Rational) -> i64 {
+		f := i64(seconds * f64(fps.num) / f64(fps.den))
+		if f < 0 {
+			return 0
+		}
+		return f
 	}
-	// Rewind past any packets already buffered by find_stream_info so we read
-	// every text sample from the start.
-	if ret := avfmt.seek_frame(fmt_ctx, text_idx, 0, avfmt.SeekFlags{.Backward}); ret < 0 {
-		fmt.println("avformat_seek_file (chapters):", ff_err_str(ret))
-	}
-	pkt := avcodec.packet_alloc()
-	if pkt == nil {
-		return markers
-	}
-	defer avcodec.packet_free(&pkt)
-	last_frame := i64(-1)
-	for {
-		if ret := avfmt.read_frame(fmt_ctx, pkt); ret < 0 {
-			break
-		}
-		if pkt.stream_index != text_idx {
-			avcodec.packet_unref(pkt)
-			continue
-		}
-		seconds := f64(pkt.pts) * f64(tb.num) / f64(tb.den)
-		frame := i64(seconds * f64(fps.num) / f64(fps.den))
-		if frame < 0 {
-			frame = 0
-		}
-		name := chapter_text_from_sample(pkt.data, pkt.size)
-		if len(name) > 0 && frame != last_frame {
-			append(&markers, Clip_Marker{source_frame = frame, label = strings.clone(name)})
-			last_frame = frame
-		}
-		avcodec.packet_unref(pkt)
+	if text_idx >= 0 {
+		import_marker_text_stream(&markers, fmt_ctx, text_idx, fps, frame_from_seconds)
+	} else {
+		import_marker_chapters(&markers, fmt_ctx, fps, frame_from_seconds)
 	}
 	return markers
 }
@@ -578,4 +578,67 @@ chapter_text_from_sample :: proc(data: [^]u8, size: c.int) -> string {
 		}
 	}
 	return strings.trim_space(string(data[:int(size)]))
+}
+
+// import_marker_text_stream reads every sample of the OBS chapter subtitle
+// track and appends one marker per sample, deduped on source_frame.
+import_marker_text_stream :: proc(markers: ^[dynamic]Clip_Marker, fmt_ctx: ^avfmt.FormatContext, text_idx: c.int, fps: avutil.Rational, frame_from_seconds: proc(seconds: f64, fps: avutil.Rational) -> i64) {
+	tb := fmt_ctx.streams[text_idx].time_base
+	if tb.num <= 0 || tb.den <= 0 {
+		return
+	}
+	// Rewind past any packets already buffered by find_stream_info so we read
+	// every text sample from the start.
+	if ret := avfmt.seek_frame(fmt_ctx, text_idx, 0, avfmt.SeekFlags{.Backward}); ret < 0 {
+		fmt.println("avformat_seek_file (chapters):", ff_err_str(ret))
+	}
+	pkt := avcodec.packet_alloc()
+	if pkt == nil {
+		return
+	}
+	defer avcodec.packet_free(&pkt)
+	last_frame := i64(-1)
+	for {
+		if ret := avfmt.read_frame(fmt_ctx, pkt); ret < 0 {
+			break
+		}
+		if pkt.stream_index != text_idx {
+			avcodec.packet_unref(pkt)
+			continue
+		}
+		seconds := f64(pkt.pts) * f64(tb.num) / f64(tb.den)
+		frame := frame_from_seconds(seconds, fps)
+		name := chapter_text_from_sample(pkt.data, pkt.size)
+		if len(name) > 0 && frame != last_frame {
+			append(markers, Clip_Marker{source_frame = frame, label = strings.clone(name)})
+			last_frame = frame
+		}
+		avcodec.packet_unref(pkt)
+	}
+}
+
+// import_marker_chapters imports markers from a demuxer's native chapter atom
+// list (Matroska chapters, MP4/MOV chapter atoms), using each chapter's start
+// time and "title" metadata.
+import_marker_chapters :: proc(markers: ^[dynamic]Clip_Marker, fmt_ctx: ^avfmt.FormatContext, fps: avutil.Rational, frame_from_seconds: proc(seconds: f64, fps: avutil.Rational) -> i64) {
+	if fmt_ctx.nb_chapters == 0 || fmt_ctx.chapters == nil {
+		return
+	}
+	last_frame := i64(-1)
+	for i in 0 ..< int(fmt_ctx.nb_chapters) {
+		ch := fmt_ctx.chapters[i]
+		if ch == nil || ch.start == avutil.AV_NOPTS_VALUE {
+			continue
+		}
+		seconds := f64(ch.start) * f64(ch.time_base.num) / f64(ch.time_base.den)
+		frame := frame_from_seconds(seconds, fps)
+		name := ""
+		if entry := avutil.dict_get(ch.metadata, "title", nil, {}); entry != nil && entry.value != nil {
+			name = strings.trim_space(string(entry.value))
+		}
+		if len(name) > 0 && frame != last_frame {
+			append(markers, Clip_Marker{source_frame = frame, label = strings.clone(name)})
+			last_frame = frame
+		}
+	}
 }

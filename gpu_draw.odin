@@ -23,6 +23,13 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	if ruler.width <= 0 || ruler.height <= 0 {
 		return
 	}
+	// Everything this proc paints (ticks, labels, the playhead line, its grab
+	// handle) lives horizontally inside the ruler bar; clamp it there so the
+	// playhead handle can't render over the track-name gutter or off the right
+	// edge. Vertically the scissor spans the whole window since the playhead
+	// line runs down through every track row.
+	sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), c.int(ruler.y - 8), c.int(ruler.width), c.int(renderer.viewport.y)})
+	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 	dur := timeline_duration()
 	// Adapt the tick spacing to the current zoom so labels stay ~70px apart.
 	major := nice_frame_step(timeline_zoom)
@@ -75,6 +82,10 @@ draw_render_range :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	if ruler.width <= 0 {
 		return
 	}
+	// The band and its edge caps can stick out over the gutter when the range
+	// starts before the current view; keep them inside the ruler bar's width.
+	sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), 0, c.int(ruler.width), c.int(renderer.viewport.y)})
+	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 	x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
 	x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
 	if x1 >= ruler.x + ruler.width || x2 <= ruler.x {
@@ -112,37 +123,90 @@ nice_frame_step :: proc(zoom: f32) -> i64 {
 
 render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, commands: clay.ClayArray(clay.RenderCommand)) {
 	array := commands
+	full := sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)}
+	defer sdl.SetGPUScissor(pass, full)
+	// Clay emits ScissorStart/ScissorEnd around clip containers (each track's
+	// ClipsSection, whose childOffset slides the clip tiles horizontally).
+	// Mirror it with an intersection stack that becomes the GPU scissor, plus a
+	// "suppressed" flag that skips drawing while the enclosing clip region
+	// collapsed to nothing. Without this handling, scrolled clip tiles are
+	// drawn un-clipped over the track-name gutter and neighboring rows, which
+	// reads as the tracks moving around when panning.
+	stack: [16]struct { current: sdl.Rect, suppressed: bool }
+	depth := 0
+	current := full
+	suppressed := false
 	for i in 0..<commands.length {
 		command := clay.RenderCommandArray_Get(&array, i)
 		bounds := command.boundingBox
 
 		#partial switch command.commandType {
+		case .ScissorStart:
+			if depth < len(stack) {
+				stack[depth] = {current = current, suppressed = suppressed}
+				depth += 1
+			}
+			if !suppressed {
+				cr := scissor_intersect(bounds, current)
+				if cr.w > 0 && cr.h > 0 {
+					current = cr
+					sdl.SetGPUScissor(pass, current)
+				} else {
+					suppressed = true
+				}
+			}
+		case .ScissorEnd:
+			if depth > 0 {
+				depth -= 1
+				current = stack[depth].current
+				suppressed = stack[depth].suppressed
+				if !suppressed {
+					sdl.SetGPUScissor(pass, current)
+				}
+			}
 		case .Rectangle:
-			config := command.renderData.rectangle
-			color := config.backgroundColor
-			if command.id == clay.ID("OpenFileButton").id && clay.PointerOver(clay.ID("OpenFileButton")) {
-				color = BUTTON_HOVER
+			if !suppressed {
+				config := command.renderData.rectangle
+				color := config.backgroundColor
+				if command.id == clay.ID("OpenFileButton").id && clay.PointerOver(clay.ID("OpenFileButton")) {
+					color = BUTTON_HOVER
+				}
+				render_sdf_rect(renderer, command_buffer, pass, bounds, color, config.cornerRadius.topLeft, 0)
 			}
-			render_sdf_rect(renderer, command_buffer, pass, bounds, color, config.cornerRadius.topLeft, 0)
 		case .Border:
-			config := command.renderData.border
-			color := config.color
-			if command.id == clay.ID("OpenFileButton").id && clay.PointerOver(clay.ID("OpenFileButton")) {
-				color = BUTTON_BORDER_HOVER
+			if !suppressed {
+				config := command.renderData.border
+				color := config.color
+				if command.id == clay.ID("OpenFileButton").id && clay.PointerOver(clay.ID("OpenFileButton")) {
+					color = BUTTON_BORDER_HOVER
+				}
+				render_sdf_rect(renderer, command_buffer, pass, bounds, color, config.cornerRadius.topLeft, f32(config.width.left))
 			}
-			render_sdf_rect(renderer, command_buffer, pass, bounds, color, config.cornerRadius.topLeft, f32(config.width.left))
 		case .Text:
-			render_text(renderer, command_buffer, pass, bounds, command.renderData.text)
+			if !suppressed {
+				render_text(renderer, command_buffer, pass, bounds, command.renderData.text)
+			}
 		}
 	}
 }
 
-// draw_clip_markers paints each clip's embedded markers as a tiny downward
-// triangle at the top of its timeline tile, positioned by source frame, and
-// shows the hovered marker's label as a tooltip in the empty strip directly
-// above the tile (the same strip the "+ Add track" prompt uses). Drawn as an
-// overlay after the Clay command batch because a clip element's final laid-out
-// position is only available via GetElementData.
+// scissor_intersect clips a Clay command's bounds to the active scissor rect.
+scissor_intersect :: proc(bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect {
+	x := max(c.int(bounds.x), clip.x)
+	y := max(c.int(bounds.y), clip.y)
+	x2 := min(c.int(bounds.x + bounds.width), clip.x + clip.w)
+	y2 := min(c.int(bounds.y + bounds.height), clip.y + clip.h)
+	return sdl.Rect{x, y, x2 - x, y2 - y}
+}
+
+// draw_clip_markers paints each clip's embedded markers on its timeline tile:
+// a small downward-pointing triangle at the tile's top (in the tile's border
+// color, highlighted when the tile is selected) with a thin vertical line
+// running from the triangle down to the bottom of the tile, positioned at the
+// marker's source frame. Shows the hovered marker's label as a tooltip in the
+// empty strip directly above the tile. Drawn as an overlay after the Clay
+// command batch because a clip element's final laid-out position is only
+// available via GetElementData.
 draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
 	if len(timeline.tracks) == 0 {
 		return
@@ -154,7 +218,16 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	hover_x: f32
 	gap_bounds: clay.BoundingBox
 	best_dist := f32(1e9)
+	// Marker lines and triangles must stay inside their track's lane; a marker
+	// inside a tile that has slid under the track-name gutter (or off the right
+	// edge) would otherwise render on top of neighboring rows and headers.
+	restore_full := false
 	for track, track_idx in timeline.tracks {
+		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
+		if lane.width > 0 && lane.height > 0 {
+			sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
+			restore_full = true
+		}
 		for clip, index in track.clips {
 			if len(clip.markers) == 0 {
 				continue
@@ -167,26 +240,37 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 			// when the gap itself is hovered) is where the tooltip renders.
 			gap := clay.GetElementData(clay.ID("TrackGap", u32(track_idx))).boundingBox
 			gap_bounds = gap
+			color := BUTTON_BORDER
+			if selected_track == track_idx && selected_index == index {
+				color = BUTTON_BORDER_HOVER
+			}
 			rows := [3]f32{5, 3, 1}
 			for m in clip.markers {
-				x := box.x + f32(m.source_frame - clip.source_start_frame) * timeline_zoom
+				line_x := clamp(box.x + f32(m.source_frame - clip.source_start_frame) * timeline_zoom, box.x, box.x + box.width)
+				// Thin vertical line from just below the triangle to the tile bottom.
+				render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = line_x - 1, y = box.y, width = 2, height = box.height}, color, 0, 0)
+				// Downward-pointing triangle at the tile's top, at the marker's x.
 				y := box.y
 				for row, r in rows {
 					w := rows[r]
-					bx := clamp(x - w * 0.5, box.x + 1, box.x + box.width - w - 1)
-					render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = bx, y = y, width = w, height = 3}, MARKER_COLOR, 0, 0)
+					bx := clamp(line_x - w * 0.5, box.x, box.x + box.width - w)
+					render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = bx, y = y, width = w, height = 3}, color, 0, 0)
 					y += 3
 				}
 				// Hover hit box: the marker's column near the top of the tile.
 				if len(m.label) > 0 && mouse_y >= box.y && mouse_y <= box.y + 18 {
-					d := abs(mouse_x - x)
+					d := abs(mouse_x - line_x)
 					if d <= 6 && d < best_dist {
 						best_dist = d
 						hover_label = m.label
-						hover_x = x
+						hover_x = line_x
 					}
 				}
 			}
+		}
+		if restore_full {
+			sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+			restore_full = false
 		}
 	}
 	if hover_label != "" {
@@ -197,6 +281,13 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 // draw_marker_tooltip draws a small pill with the marker's label centered on
 // the marker's x position inside the reserved strip above the timeline rows.
 draw_marker_tooltip :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, label: string, at_x: f32, strip: clay.BoundingBox) {
+	// The strip spans the full tracks area including the name gutter; pin the
+	// pill to the clip-lane region so it can't drift over the headers.
+	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+	if ruler.width > 0 {
+		sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), c.int(ruler.y - 8), c.int(ruler.width), c.int(renderer.viewport.y)})
+		defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+	}
 	font_size: f32 = 12
 	text_w := f32(len(label)) * font_size * 0.6
 	text_x := clamp(at_x - text_w * 0.5, strip.x + 4, strip.x + strip.width - text_w - 4)
