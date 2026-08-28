@@ -196,8 +196,12 @@ import_media :: proc(path: cstring) {
 			crop_l = 0,
 			crop_r = 0,
 			crop_t = 0,
-			crop_b = 0,
-		})
+crop_b = 0,
+	})
+		// OBS hybrid MP4 recordings embed chapter markers as a text stream;
+		// surface them on the video clip as embedded clip markers.
+		video_clip := &track.clips[0]
+		video_clip.markers = import_obs_chapters(path)
 		append(&timeline.tracks, track)
 		track_n += 1
 	}

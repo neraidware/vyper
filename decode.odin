@@ -407,3 +407,98 @@ probe_streams :: proc(path: cstring) -> Stream_Probe {
 	}
 	return probe
 }
+
+// import_obs_chapters reads the chapter markers OBS embeds in hybrid MP4/MOV
+// recordings: a QTFF 'text' sample-entry track (handler "OBS Chapter Handler")
+// that FFmpeg demuxes as a MOV_TEXT subtitle stream, one sample per chapter.
+// Returns the markers in stream order with each source_frame converted to the
+// video timeline via the video stream's average frame rate.
+import_obs_chapters :: proc(path: cstring) -> [dynamic]Clip_Marker {
+	markers := make([dynamic]Clip_Marker)
+	fmt_ctx: ^avfmt.FormatContext
+	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
+		fmt.println("avformat_open_input (chapters):", ff_err_str(ret))
+		return markers
+	}
+	defer avfmt.close_input(&fmt_ctx)
+	if ret := avfmt.find_stream_info(fmt_ctx, nil); ret < 0 {
+		fmt.println("avformat_find_stream_info (chapters):", ff_err_str(ret))
+		return markers
+	}
+	text_idx := c.int(-1)
+	video_idx := c.int(-1)
+	for i in 0 ..< int(fmt_ctx.nb_streams) {
+		stream := fmt_ctx.streams[i]
+		if stream == nil || stream.codecpar == nil {
+			continue
+		}
+		if stream.codecpar.codec_type == avutil.MediaType.Video && video_idx < 0 {
+			video_idx = c.int(i)
+		}
+		if stream.codecpar.codec_type == avutil.MediaType.Subtitle && stream.codecpar.codec_id == avcodec.CodecID.MovText && text_idx < 0 {
+			text_idx = c.int(i)
+		}
+	}
+	if text_idx < 0 || video_idx < 0 {
+		return markers
+	}
+	fps := fmt_ctx.streams[video_idx].avg_frame_rate
+	if fps.num <= 0 || fps.den <= 0 {
+		fps = fmt_ctx.streams[video_idx].r_frame_rate
+	}
+	if fps.num <= 0 || fps.den <= 0 {
+		fps = avutil.Rational{num = 25, den = 1}
+	}
+	tb := fmt_ctx.streams[text_idx].time_base
+	if tb.num <= 0 || tb.den <= 0 {
+		return markers
+	}
+	// Rewind past any packets already buffered by find_stream_info so we read
+	// every text sample from the start.
+	if ret := avfmt.seek_frame(fmt_ctx, text_idx, 0, avfmt.SeekFlags{.Backward}); ret < 0 {
+		fmt.println("avformat_seek_file (chapters):", ff_err_str(ret))
+	}
+	pkt := avcodec.packet_alloc()
+	if pkt == nil {
+		return markers
+	}
+	defer avcodec.packet_free(&pkt)
+	last_frame := i64(-1)
+	for {
+		if ret := avfmt.read_frame(fmt_ctx, pkt); ret < 0 {
+			break
+		}
+		if pkt.stream_index != text_idx {
+			avcodec.packet_unref(pkt)
+			continue
+		}
+		seconds := f64(pkt.pts) * f64(tb.num) / f64(tb.den)
+		frame := i64(seconds * f64(fps.num) / f64(fps.den))
+		if frame < 0 {
+			frame = 0
+		}
+		name := chapter_text_from_sample(pkt.data, pkt.size)
+		if len(name) > 0 && frame != last_frame {
+			append(&markers, Clip_Marker{source_frame = frame, label = strings.clone(name)})
+			last_frame = frame
+		}
+		avcodec.packet_unref(pkt)
+	}
+	return markers
+}
+
+// chapter_text_from_sample strips the QTFF text-sample 2-byte big-endian length
+// prefix and padding, falling back to the raw packet bytes if the layout
+// doesn't match.
+chapter_text_from_sample :: proc(data: [^]u8, size: c.int) -> string {
+	if size <= 0 {
+		return ""
+	}
+	if size >= 2 {
+		ln := int(u16(data[0]) << 8 | u16(data[1]))
+		if ln > 0 && 2 + ln <= int(size) {
+			return strings.trim_space(string(data[2:][:ln]))
+		}
+	}
+	return strings.trim_space(string(data[:int(size)]))
+}
