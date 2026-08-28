@@ -308,8 +308,10 @@ release_preview_textures :: proc(device: ^sdl.GPUDevice, texs: []^sdl.GPUTexture
 // draw_preview draws the active video clip's frame in the given bounds, placed
 // according to the clip's transform (fills the project canvas, centered at its
 // x/y), then overlays a selection border around the currently-selected clip's
-// image rect. The decode buffer is fixed 16:9 (PREVIEW_W x PREVIEW_H) and is
-// sampled with a full UV quad.
+// image rect. The decode buffer is fixed PREVIEW_W x PREVIEW_H; the source is
+// fit (aspect-preserving, letterboxed) into it and the quad samples only the
+// fit region so the image is never stretched to the (possibly differently
+// shaped) project canvas.
 draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox) {
 	if renderer.preview_pipeline == nil {
 		return
@@ -353,12 +355,22 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 			crop_r = slot.crop_r,
 			crop_t = slot.crop_t,
 			crop_b = slot.crop_b,
+			source_w = slot.source_w,
+			source_h = slot.source_h,
 		})
-		// The cropped source sub-rect (normalized UV) equals the crop fractions.
-		u0 := slot.crop_l
-		u1 := 1 - slot.crop_r
-		v0 := slot.crop_t
-		v1 := 1 - slot.crop_b
+		// The decoded texture holds the source fit (letterboxed) inside the
+		// fixed PREVIEW_W x PREVIEW_H buffer. Start the quad from that fit
+		// region so the sampled area keeps the source's aspect, then apply the
+		// crop insets (normalized fractions of the full source image).
+		fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
+		u_base := f32(fox) / f32(PREVIEW_W)
+		v_base := f32(foy) / f32(PREVIEW_H)
+		u_span := f32(fw) / f32(PREVIEW_W)
+		v_span := f32(fh) / f32(PREVIEW_H)
+		u0 := u_base + slot.crop_l * u_span
+		u1 := u_base + (1 - slot.crop_r) * u_span
+		v0 := v_base + slot.crop_t * v_span
+		v1 := v_base + (1 - slot.crop_b) * v_span
 		vertex_uniforms := TextVertexUniforms{
 			bounds = {cb.x, cb.y, cb.width, cb.height},
 			viewport = renderer.viewport,

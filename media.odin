@@ -205,6 +205,8 @@ import_media :: proc(path: cstring) {
 			source_start_frame = 0,
 			source_length_frames = frame_count,
 			timeline_start_frame = 0,
+			source_w = src_w,
+			source_h = src_h,
 			transform_x = f32(project.width) / 2,
 			transform_y = f32(project.height) / 2,
 			scale = native_scale,

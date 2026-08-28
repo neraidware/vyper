@@ -49,6 +49,8 @@ update_preview_slots :: proc() -> bool {
 			slot.crop_r = clip.crop_r
 			slot.crop_t = clip.crop_t
 			slot.crop_b = clip.crop_b
+			slot.source_w = clip.source_w
+			slot.source_h = clip.source_h
 			clip_frame := clip.source_start_frame + frame - clip.timeline_start_frame
 			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 				slot.tex_dirty = true

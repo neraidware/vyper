@@ -81,6 +81,11 @@ Clip :: struct {
 	source_length_frames: i64,
 	timeline_start_frame: i64,
 	layer: i32,
+	// Native source pixel size (0 = unknown). The clip image is drawn keeping
+	// this aspect inside its transform box instead of stretching to the canvas,
+	// so a video imported into a differently-shaped project is letterboxed.
+	source_w: c.int,
+	source_h: c.int,
 	// Transform: center of the clip's image within the project canvas, in
 	// project-resolution pixels. Default (width/2, height/2) centers the clip so
 	// it fills the preview at scale 1.
@@ -170,6 +175,8 @@ Preview_Slot :: struct {
 	crop_r:              f32,
 	crop_t:              f32,
 	crop_b:              f32,
+	source_w:            c.int,
+	source_h:            c.int,
 	dec:                 Clip_Decoder,
 	buffer:              [PREVIEW_W * PREVIEW_H * 4]u8,
 	tex_dirty:           bool,

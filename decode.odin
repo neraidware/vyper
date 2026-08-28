@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:mem"
 import "core:strings"
 import avcodec "vendor/ffmpeg/avcodec"
 import avfmt "vendor/ffmpeg/avformat"
@@ -28,10 +29,13 @@ Clip_Decoder :: struct {
 	// Decoder owns these allocations.
 	frame:       ^avutil.Frame,
 	pkt:         ^avcodec.Packet,
-	// dst is the fixed-size RGBA console buffer written by sws.
+	// dst is the fixed-size RGBA console buffer written by sws. dst honors the
+	// source aspect ratio (the source is fit, not stretched, into PREVIEW_W x
+	// PREVIEW_H) and fit_ox/fit_oy are the letterbox offsets in buffer pixels.
 	dst:          [4][^]u8,
 	dst_linesize: [4]c.int,
 	dst_w, dst_h: c.int,
+	fit_ox, fit_oy: c.int,
 	// Index of the source frame last handed out. Requests for
 	// last_frame+1 continue forward; anything else re-seeks.
 	last_frame:   i64,
@@ -129,8 +133,6 @@ open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
 	if dec.opened {
 		clip_decoder_reset(dec)
 	}
-	dec.dst_w = PREVIEW_W
-	dec.dst_h = PREVIEW_H
 
 	fmt_ctx: ^avfmt.FormatContext
 	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
@@ -172,6 +174,11 @@ open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
 	}
 	dec.src_w = dec_ctx.width
 	dec.src_h = dec_ctx.height
+
+	// Fit the source into the fixed preview buffer preserving its aspect, so a
+	// video whose aspect differs from the project's canvas is letterboxed
+	// instead of stretched.
+	dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy = source_fit_in_buffer(dec.src_w, dec.src_h, PREVIEW_W, PREVIEW_H)
 
 	fps := dec.stream.avg_frame_rate
 	if fps.num <= 0 || fps.den <= 0 {
@@ -318,17 +325,47 @@ frame_data :: proc(dec: ^Clip_Decoder) -> []u8 {
 	return dec.dst[0][:uint(stride) * uint(dec.dst_h)]
 }
 
+// source_fit_in_buffer returns the largest source-aspect rect that fits inside
+// buf_w x buf_h, centered (letterboxed): the unscaled content rect and its
+// offsets. Used both to pick sws output dims and to map the visible source
+// region into the preview texture's UV space.
+source_fit_in_buffer :: proc(src_w, src_h, buf_w, buf_h: c.int) -> (fw, fh, ox, oy: c.int) {
+	if src_w <= 0 || src_h <= 0 || buf_w <= 0 || buf_h <= 0 {
+		return buf_w, buf_h, 0, 0
+	}
+	// Compare aspects without floating point: src_w/src_h vs buf_w/buf_h.
+	if i64(src_w) * i64(buf_h) > i64(src_h) * i64(buf_w) {
+		// Source is wider than the buffer: fix the width, derive the height.
+		fw = buf_w
+		fh = max(1, c.int(i64(buf_w) * i64(src_h) / i64(src_w)))
+	} else {
+		fh = buf_h
+		fw = max(1, c.int(i64(buf_h) * i64(src_w) / i64(src_h)))
+	}
+	ox = (buf_w - fw) / 2
+	oy = (buf_h - fh) / 2
+	return
+}
+
 // decode_into_buffer fills a caller-provided tightly-packed RGBA buffer
-// (w*h*4 bytes) with the decoded frame's pixels, stripping any row padding.
+// (w*h*4 bytes) with the decoded frame's pixels, stripping any row padding and
+// letterboxing (zero-filling) the area outside the fit rect.
 decode_into_buffer :: proc(dec: ^Clip_Decoder, out: []u8, w, h: c.int) {
 	stride := dec.dst_linesize[0]
 	if stride <= 0 {
 		return
 	}
-	row_bytes := int(w) * 4
-	for row in 0 ..< int(h) {
+	mem.zero(raw_data(out), len(out))
+	dw := int(dec.dst_w)
+	dh := int(dec.dst_h)
+	ox := int(dec.fit_ox)
+	oy := int(dec.fit_oy)
+	row_bytes := dw * 4
+	buf_w := int(w)
+	for row in 0 ..< dh {
 		src := dec.dst[0][uint(row) * uint(stride):][:uint(row_bytes)]
-		copy(out[uint(row) * uint(row_bytes):][:uint(row_bytes)], src)
+		dst := out[uint((oy + row) * buf_w + ox) * 4:][:uint(row_bytes)]
+		copy(dst, src)
 	}
 	return
 }

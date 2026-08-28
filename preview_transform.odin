@@ -129,6 +129,19 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
 	sw := v.width * clip.scale
 	sh := v.height * clip.scale
+	// Preserve the source's own aspect inside the (canvas-shaped) scale box,
+	// letterboxing the excess instead of stretching, so a clip doesn't get
+	// squished when its aspect differs from the project canvas. With an
+	// unknown source size (0) behavior is unchanged (fill the box).
+	if clip.source_w > 0 && clip.source_h > 0 {
+		src_ar := f32(clip.source_w) / f32(clip.source_h)
+		box_ar := v.width / v.height
+		if src_ar > box_ar {
+			sh = sw / src_ar
+		} else {
+			sw = sh * src_ar
+		}
+	}
 	x := cx - sw / 2 + clip.crop_l * sw
 	y := cy - sh / 2 + clip.crop_t * sh
 	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
