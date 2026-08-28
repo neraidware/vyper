@@ -145,10 +145,12 @@ open_audio_decoder_resampled :: proc(dec: ^Audio_Clip_Decoder, path: cstring, st
 		return false
 	}
 	dec.swr_ctx = swr_ctx
+	out_layout: avutil.ChannelLayout
+	avutil.channel_layout_default(&out_layout, dec.out_channels)
 	if ret := swres.alloc_set_opts2(
 		&dec.swr_ctx,
 		// Output: interleaved S16 at the target rate/channel count.
-		&(avutil.ChannelLayout{nb_channels = dec.out_channels, order = .Native}),
+		&out_layout,
 		avutil.SampleFormat.S16, dec.out_rate,
 		// Input: the stream's native format.
 		&dec_ctx.ch_layout, dec_ctx.sample_fmt, dec_ctx.sample_rate,
