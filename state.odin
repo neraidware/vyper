@@ -25,6 +25,8 @@ BUTTON_BORDER_HOVER :: clay.Color{64, 170, 194, 255}
 AUDIO_CLIP :: clay.Color{58, 44, 66, 255}
 SELECT_BORDER :: clay.Color{120, 220, 120, 255}
 MARKER_COLOR :: clay.Color{255, 205, 70, 255}
+TOOLTIP_BG :: clay.Color{28, 35, 45, 255}
+TOOLTIP_TEXT :: clay.Color{240, 244, 248, 255}
 HANDLE_FILL :: clay.Color{30, 30, 30, 255}
 HANDLE_BORDER :: clay.Color{200, 200, 200, 255}
 TEXT :: clay.Color{255, 255, 255, 255}

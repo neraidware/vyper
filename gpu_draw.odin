@@ -86,13 +86,22 @@ render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuff
 }
 
 // draw_clip_markers paints each clip's embedded markers as a tiny downward
-// triangle at the top of its timeline tile, positioned by source frame. Drawn
-// as an overlay after the Clay command batch because a clip element's final
-// laid-out position is only available via GetElementData.
+// triangle at the top of its timeline tile, positioned by source frame, and
+// shows the hovered marker's label as a tooltip in the empty strip directly
+// above the tile (the same strip the "+ Add track" prompt uses). Drawn as an
+// overlay after the Clay command batch because a clip element's final laid-out
+// position is only available via GetElementData.
 draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
 	if len(timeline.tracks) == 0 {
 		return
 	}
+	pointer := clay.GetPointerState()
+	mouse_x := pointer.position.x
+	mouse_y := pointer.position.y
+	hover_label: string
+	hover_x: f32
+	gap_bounds: clay.BoundingBox
+	best_dist := f32(1e9)
 	for track, track_idx in timeline.tracks {
 		for clip, index in track.clips {
 			if len(clip.markers) == 0 {
@@ -102,6 +111,10 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 			if box.width <= 0 || box.height <= 0 {
 				continue
 			}
+			// The strip directly above this tile (where "+ Add track" appears
+			// when the gap itself is hovered) is where the tooltip renders.
+			gap := clay.GetElementData(clay.ID("TrackGap", u32(track_idx))).boundingBox
+			gap_bounds = gap
 			rows := [3]f32{5, 3, 1}
 			for m in clip.markers {
 				x := box.x + f32(m.source_frame - clip.source_start_frame) * TIMELINE_ZOOM
@@ -112,9 +125,38 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 					render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = bx, y = y, width = w, height = 3}, MARKER_COLOR, 0, 0)
 					y += 3
 				}
+				// Hover hit box: the marker's column near the top of the tile.
+				if len(m.label) > 0 && mouse_y >= box.y && mouse_y <= box.y + 18 {
+					d := abs(mouse_x - x)
+					if d <= 6 && d < best_dist {
+						best_dist = d
+						hover_label = m.label
+						hover_x = x
+					}
+				}
 			}
 		}
 	}
+	if hover_label != "" {
+		draw_marker_tooltip(renderer, command_buffer, pass, hover_label, hover_x, gap_bounds)
+	}
+}
+
+// draw_marker_tooltip draws a small pill with the marker's label centered on
+// the marker's x position inside the reserved strip above the timeline rows.
+draw_marker_tooltip :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, label: string, at_x: f32, strip: clay.BoundingBox) {
+	font_size: f32 = 12
+	text_w := f32(len(label)) * font_size * 0.6
+	text_x := clamp(at_x - text_w * 0.5, strip.x + 4, strip.x + strip.width - text_w - 4)
+	pill := clay.BoundingBox{x = text_x - 4, y = strip.y + 2, width = text_w + 8, height = 14}
+	render_sdf_rect(renderer, command_buffer, pass, pill, TOOLTIP_BG, 3, 0)
+	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = text_x, y = pill.y + 1, width = text_w, height = 12}, clay.TextRenderData{
+		stringContents = clay.StringSlice{length = c.int32_t(len(label)), chars = ([^]c.char)(raw_data(label))},
+		textColor = TOOLTIP_TEXT,
+		fontSize = 12,
+		letterSpacing = 1,
+		lineHeight = 12,
+	})
 }
 
 render_text :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox, text: clay.TextRenderData) {
