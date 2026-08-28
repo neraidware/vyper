@@ -11,6 +11,50 @@ import posix "core:sys/posix"
 // entries, and the file-picker entry point.
 // ---------------------------------------------------------------------------
 
+// set_project_resolution applies an explicit resolution (preset button) and
+// locks the canvas so later imports won't resize it.
+set_project_resolution :: proc(w, h: c.int) {
+	project.width = w
+	project.height = h
+	resolution_locked = true
+}
+
+// toggle_project_orientation swaps width/height (portrait <-> landscape) and
+// locks the canvas.
+toggle_project_orientation :: proc() {
+	project.width, project.height = project.height, project.width
+	resolution_locked = true
+}
+
+// probe_video_size returns the first video stream's pixel dimensions, or
+// ok=false if the file has no video stream / ffprobe fails.
+probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
+	path_string := string(path)
+	quoted_path, _ := strings.replace_all(path_string, "'", "'\\''", context.temp_allocator)
+	command := fmt.aprintf("ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 '%s' 2>/dev/null", quoted_path)
+	pipe := posix.popen(strings.clone_to_cstring(command, context.temp_allocator), "r")
+	if pipe == nil {
+		return 0, 0, false
+	}
+	defer posix.pclose(pipe)
+	buffer: [256]byte
+	if posix.fgets(raw_data(buffer[:]), len(buffer), pipe) == nil {
+		return 0, 0, false
+	}
+	line, _ := strings.clone_from_cstring(cstring(raw_data(buffer[:])), context.temp_allocator)
+	line = strings.trim_space(line)
+	parts := strings.split(line, ",")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	width, wok := strconv.parse_int(parts[0])
+	height, hok := strconv.parse_int(parts[1])
+	if !wok || !hok || width <= 0 || height <= 0 {
+		return 0, 0, false
+	}
+	return c.int(width), c.int(height), true
+}
+
 probe_media :: proc(path: cstring) -> string {
 	path_string := string(path)
 	quoted_path, _ := strings.replace_all(path_string, "'", "'\\''", context.temp_allocator)
@@ -113,6 +157,16 @@ import_media :: proc(path: cstring) {
 	audio_frames := i64(probe.duration_sec * timeline.frame_rate)
 	if audio_frames < frame_count {
 		audio_frames = frame_count
+	}
+
+	// If the user hasn't set a resolution/orientation yet, infer the canvas
+	// from this (first) file's own video dimensions.
+	if !resolution_locked && probe.has_video {
+		if w, h, ok := probe_video_size(path); ok {
+			project.width = w
+			project.height = h
+		}
+		resolution_locked = true
 	}
 
 	asset_id := next_asset_id()

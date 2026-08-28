@@ -26,7 +26,12 @@ update_preview_slots :: proc() -> bool {
 			}
 			slot := &preview_slots[next_slot]
 			next_slot += 1
-			if !slot.in_use || slot.asset_id != clip.asset_id || slot.timeline_start_frame != clip.timeline_start_frame {
+			// Identity is the underlying asset only: moving a clip along the
+			// timeline changes its timeline_start_frame but not its pixels, so
+			// the decoder and its source-frame-keyed RAM cache stay intact.
+			// The clip_frame request below shifts with the new position and the
+			// cache still serves it (adjacent frames) or the decoder seeks once.
+			if !slot.in_use || slot.asset_id != clip.asset_id {
 				if slot.in_use {
 					clip_decoder_reset(&slot.dec)
 				}
@@ -34,9 +39,9 @@ update_preview_slots :: proc() -> bool {
 				slot.in_use = true
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
-				slot.timeline_start_frame = clip.timeline_start_frame
 				slot.tex_dirty = true
 			}
+			slot.timeline_start_frame = clip.timeline_start_frame
 			slot.transform_x = clip.transform_x
 			slot.transform_y = clip.transform_y
 			slot.scale = clip.scale

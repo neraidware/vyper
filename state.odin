@@ -24,6 +24,7 @@ BUTTON_HOVER :: clay.Color{15, 18, 25, 255}
 BUTTON_BORDER_HOVER :: clay.Color{64, 170, 194, 255}
 AUDIO_CLIP :: clay.Color{58, 44, 66, 255}
 SELECT_BORDER :: clay.Color{120, 220, 120, 255}
+MARKER_COLOR :: clay.Color{255, 205, 70, 255}
 HANDLE_FILL :: clay.Color{30, 30, 30, 255}
 HANDLE_BORDER :: clay.Color{200, 200, 200, 255}
 TEXT :: clay.Color{255, 255, 255, 255}
@@ -41,8 +42,23 @@ Project :: struct {
 project: Project = {name = "Untitled Project", width = 1920, height = 1080}
 file_info_text: string
 
+// resolution_locked becomes true the moment the project resolution is set
+// explicitly (a preset button or the orientation toggle) or inferred from the
+// first imported file. Once locked, importing more media never resizes the
+// canvas.
+resolution_locked: bool
+
 Media_Kind :: enum { Video, Audio, Image, Other }
 Media_Asset :: struct { id: u64, path: cstring, kind: Media_Kind, metadata: string, frame_count: i64 }
+
+// Clip_Marker is a point marker embedded in a clip (e.g. an imported chapter
+// marker): source_frame is the position within the source media, label a
+// human-readable name. Markers move/split with the clip.
+Clip_Marker :: struct {
+	source_frame: i64,
+	label:        string,
+}
+
 Clip :: struct {
 	asset_id: u64,
 	path: cstring,
@@ -67,6 +83,8 @@ Clip :: struct {
 	crop_r: f32,
 	crop_t: f32,
 	crop_b: f32,
+	// Markers embedded in the clip (chapter markers, etc.), source-relative.
+	markers: [dynamic]Clip_Marker,
 }
 
 Track :: struct {
@@ -86,6 +104,8 @@ Playhead :: struct {
 playhead: Playhead
 playhead_accumulator: f64
 last_tick_ns: sdl.Uint64
+// dragging the playhead by its ruler bar/handle scrubs to the pointer's frame.
+dragging_playhead: bool
 upper_area_height: f32 = 560
 resizing_areas: bool
 moving_clip: bool

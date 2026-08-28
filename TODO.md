@@ -92,6 +92,40 @@ Not yet implemented (roadmap below):
   works. Fix by filtering source to keep binaries or building those libs in the
   derivation.
 
+## Backlog (planned, in order)
+
+- **Preview render-safe area**: clip image must never render outside the final
+  project canvas area (the black view rectangle). Currently content is clipped
+  only to the whole preview widget; a clip dragged off-canvas paints over the
+  letterbox/GUI area around the canvas. Clip content scissor = canvas view ∩
+  widget bounds; selection border/handles stay clipped to the widget so handles
+  on off-canvas boxes remain grabbable.
+- **Clip slicing**: press `S` (no repeats, not while typing in a property field)
+  splits the clip under the playhead at the playhead frame. Right half is a new
+  clip with shifted `source_start_frame`/`timeline_start_frame`; both halves keep
+  their in-range clip markers. Split audio and video clips alike.
+- **Adjacent-clip visuals**: when two clips on the same track touch exactly
+  (end == next start), each clip keeps its rounded corners + top/bottom/left
+  borders but drops the shared right/left border; the intersection is drawn as a
+  thin 1px divider line (the untouched neighbor's border). Non-touching clips
+  keep current visuals.
+- **Clip markers**: markers live directly on the `Clip` (`markers:
+  [dynamic]Clip_Marker`, `source_frame` + label), drawn as a tiny downward
+  triangle at the top of the clip tile. Survive slicing (each half keeps
+  in-range markers) and timeline moves (they move with the clip).
+- **OBS hybrid MP4 chapter import**: OBS writes chapter markers as a QTFF `text`
+  track (`hdlr` handler `text`, "OBS Chapter Handler", `stsd` entry `text`) which
+  FFmpeg demuxes as a `MOV_TEXT` subtitle stream. On import, collect that
+  stream's packets, convert each PTS (text stream time base) to a source frame
+  via the video stream's average frame rate, strip the QTFF 2-byte length
+  prefix/padding, and attach the results to the video clip as markers.
+- **Project start/end (render range)**: define the area of the project that will
+  actually be rendered to a file when export lands. `I` hotkey sets the start,
+  `O` sets the end. Visually a range rectangle sits just below the timeline
+  ruler bar. Default is unset start/end = the whole project. Setting start and
+  end to the same frame clears the range. Persist as project fields
+  (`project_in/out` frames, unset = full project).
+
 ## Current Architecture
 
 - Odin owns application state, UI layout, timeline state, input, and rendering orchestration.

@@ -1,6 +1,7 @@
 package main
 
 import "core:c"
+import "core:fmt"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
 import stb "vendor:stb/truetype"
@@ -9,6 +10,53 @@ import stb "vendor:stb/truetype"
 // Per-frame GPU draw calls: translating Clay render commands into SDF rect/
 // text draws, uploading decoded preview frames, and compositing the preview.
 // ---------------------------------------------------------------------------
+
+// draw_timeline_ruler renders the timeline ruler's tick marks and frame labels
+// plus the vertical playhead line that runs from the ruler bar down through
+// every track row. The ruler strip itself is a Clay element ("Ruler"); this
+// proc only adds the detail Clay can't lay out cheaply.
+draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	if len(timeline.tracks) == 0 {
+		return
+	}
+	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+	if ruler.width <= 0 || ruler.height <= 0 {
+		return
+	}
+	dur := timeline_duration()
+	minor, major := ruler_steps(dur)
+
+	// Tick marks along the bottom edge of the ruler strip.
+	minor_h := ruler.height * 0.35
+	major_h := ruler.height * 0.6
+	for f := i64(0); f <= dur + 1; f += minor {
+		x := ruler.x + f32(f) * TIMELINE_ZOOM
+		if x > ruler.x + ruler.width {
+			break
+		}
+		is_major := f % major == 0
+		tick_h := is_major ? major_h : minor_h
+		render_sdf_rect(renderer, command_buffer, pass, {x, ruler.y + ruler.height - tick_h, is_major ? 2 : 1, tick_h}, RULER_TICK_COLOR, 0, 0)
+		// Frame label above each major tick.
+		if is_major {
+			label_buf: [20]u8
+			label := fmt.bprintf(label_buf[:], "%d", f)
+			chars := ([^]c.char)(raw_data(label))
+			slice := clay.StringSlice{length = c.int32_t(len(label)), chars = chars, baseChars = chars}
+			text_data := clay.TextRenderData{stringContents = slice, textColor = RULER_LABEL_COLOR, fontSize = 11, lineHeight = 11}
+			text_bounds := clay.BoundingBox{x = x + 3, y = ruler.y + 3, width = 64, height = 13}
+			render_text(renderer, command_buffer, pass, text_bounds, text_data)
+		}
+	}
+
+	// Vertical playhead line spanning the ruler and all track rows, plus a grab
+	// handle sitting on top of the ruler strip.
+	line_x := ruler.x + f32(playhead.frame) * TIMELINE_ZOOM
+	tracks := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	line_bottom := ruler.y + RULER_HEIGHT + tracks.height
+	render_sdf_rect(renderer, command_buffer, pass, {line_x, ruler.y, 2, line_bottom - ruler.y}, BUTTON_BORDER_HOVER, 0, 0)
+	render_sdf_rect(renderer, command_buffer, pass, {line_x - 4, ruler.y - 4, 10, 10}, BUTTON_BORDER_HOVER, 2, 0)
+}
 
 render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, commands: clay.ClayArray(clay.RenderCommand)) {
 	array := commands
@@ -151,6 +199,18 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 	view := preview_view(canvas)
 	render_sdf_rect(renderer, command_buffer, pass, view, clay.Color{0, 0, 0, 255}, 0, 0)
 
+	// The clip IMAGE must never paint outside the final rendered area (the
+	// project canvas). Clip it to the canvas rect ∩ the preview widget so a clip
+	// dragged off-canvas stays hidden in the letterbox/GUI margin even when
+	// zoomed past the widget edge.
+	ix := max(view.x, bounds.x)
+	iy := max(view.y, bounds.y)
+	ix2 := min(view.x + view.width, bounds.x + bounds.width)
+	iy2 := min(view.y + view.height, bounds.y + bounds.height)
+	if ix2 > ix && iy2 > iy {
+		sdl.SetGPUScissor(pass, sdl.Rect{c.int(ix), c.int(iy), c.int(ix2 - ix), c.int(iy2 - iy)})
+	}
+
 	// Paint every clip covering the playhead with the top track on top. Slots
 	// are assigned in track order (track 0 = top = slot 0), so draw slots in
 	// reverse so the top track's clip is drawn last and appears on top.
@@ -186,6 +246,9 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 	}
 	// Draw a border box around the currently-selected clip's image rect.
+	// Border/handles are editor affordances: restore the widget-level scissor so
+	// handles on an off-canvas box stay visible/grabbable.
+	sdl.SetGPUScissor(pass, sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)})
 	if selected_clip, ok := transformable_selected(); ok {
 		sb := clip_image_bounds(canvas, selected_clip)
 		render_sdf_rect(renderer, command_buffer, pass, sb, SELECT_BORDER, 0, 3)

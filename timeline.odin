@@ -22,6 +22,47 @@ timeline_duration :: proc() -> i64 {
 	return dur
 }
 
+// split_clip_at_playhead splits the first clip covering the playhead frame into
+// two adjacent clips at that frame (the frame stays with the left half). Both
+// halves keep their in-range markers; the right half is inserted right after the
+// left so the two touch.
+split_clip_at_playhead :: proc() {
+	frame := playhead.frame
+	for ti := 0; ti < len(timeline.tracks); ti += 1 {
+		track := &timeline.tracks[ti]
+		for i := 0; i < len(track.clips); i += 1 {
+			clip := &track.clips[i]
+			local := frame - clip.timeline_start_frame
+			if local <= 0 || local >= clip.source_length_frames {
+				continue
+			}
+			left_len := local
+			right_len := clip.source_length_frames - local
+			right := clip^
+			clip.source_length_frames = left_len
+			clip.markers = filter_markers_in_range(clip.markers[:], clip.source_start_frame, clip.source_length_frames)
+			right.source_start_frame += local
+			right.source_length_frames = right_len
+			right.timeline_start_frame = frame
+			right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
+			inject_at_elem(&track.clips, i + 1, right)
+			return
+		}
+	}
+}
+
+// filter_markers_in_range returns a new dynamic array with the markers whose
+// source_frame lies in [start, start+length).
+filter_markers_in_range :: proc(markers: []Clip_Marker, start, length: i64) -> [dynamic]Clip_Marker {
+	out := make([dynamic]Clip_Marker)
+	for m in markers {
+		if m.source_frame >= start && m.source_frame < start + length {
+			append(&out, m)
+		}
+	}
+	return out
+}
+
 // ruler_steps returns minor/major tick strides (in frames) for a timeline of the
 // given duration, roughly 10 minors per major and <= 100 majors total.
 ruler_steps :: proc(duration: i64) -> (minor, major: i64) {

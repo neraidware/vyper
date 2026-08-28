@@ -96,6 +96,11 @@ main :: proc() {
 					case sdl.K_ESCAPE:
 						edit_cancel()
 					}
+				} else if !event.key.repeat {
+					switch event.key.key {
+					case sdl.K_S:
+						split_clip_at_playhead()
+					}
 				}
 			case .TEXT_INPUT:
 				if editing_field != 0 {
@@ -157,8 +162,19 @@ main :: proc() {
 			if path := open_file_picker(); path != nil {
 				import_media(path)
 			}
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res720")) {
+			set_project_resolution(1280, 720)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res1080")) {
+			set_project_resolution(1920, 1080)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res4K")) {
+			set_project_resolution(3840, 2160)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("OrientToggle")) {
+			toggle_project_orientation()
 		} else if clay.PointerOver(clay.ID("DividerHandle")) && mouse_down {
 			resizing_areas = true
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("Ruler")) {
+			// Clicking the timeline ruler starts a scrub (drag to seek).
+			dragging_playhead = true
 		} else if mouse_down && !was_mouse_down {
 			// A click handled here either inserts a track via a "+" gap or
 			// duplicates an existing track via its name-button, or starts dragging
@@ -207,7 +223,8 @@ main :: proc() {
 					ib := clip_image_bounds(canvas, sel)
 					if mouse_x >= ib.x && mouse_x <= ib.x + ib.width && mouse_y >= ib.y && mouse_y <= ib.y + ib.height {
 						// Offset between the click and the clip's center, in project coords.
-						pcx, pcy := pixel_to_project(canvas, mouse_x, mouse_y)
+						// Unclamped so a grab near an off-canvas clip still offsets correctly.
+						pcx, pcy := pixel_to_project_unclamped(canvas, mouse_x, mouse_y)
 						preview_drag_offset_x = pcx - sel.transform_x
 						preview_drag_offset_y = pcy - sel.transform_y
 						moving_preview_clip = true
@@ -260,6 +277,7 @@ main :: proc() {
 			dragging_handle = -1
 			handle_kind = .None
 			drag_clip = nil
+			dragging_playhead = false
 		} else if dragging_handle >= 0 {
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
@@ -277,14 +295,17 @@ main :: proc() {
 		} else if moving_preview_clip {
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
-				canvas := preview_canvas(pb)
-				pcx, pcy := pixel_to_project(canvas, mouse_x, mouse_y)
-				sel.transform_x = pcx - preview_drag_offset_x
-				sel.transform_y = pcy - preview_drag_offset_y
-				sel.transform_x = clamp(sel.transform_x, 0, f32(project.width))
-				sel.transform_y = clamp(sel.transform_y, 0, f32(project.height))
-				// 5px snap margin (in rendered preview pixels) to the preview borders.
-				snap_transform(sel, snap_margin(canvas, 5))
+				// Freeze at the preview widget's edge once the cursor leaves it:
+				// otherwise free-move in unclamped project coords, so a cropped
+				// clip can slide fully off-canvas like an uncropped one.
+				if mouse_x >= pb.x && mouse_x <= pb.x + pb.width && mouse_y >= pb.y && mouse_y <= pb.y + pb.height {
+					canvas := preview_canvas(pb)
+					pcx, pcy := pixel_to_project_unclamped(canvas, mouse_x, mouse_y)
+					sel.transform_x = pcx - preview_drag_offset_x
+					sel.transform_y = pcy - preview_drag_offset_y
+					// 5px snap margin (in rendered preview pixels) to the preview borders.
+					snap_transform(sel, snap_margin(canvas, 5))
+				}
 			}
 		} else if moving_clip {
 			if drag_clip != nil {
@@ -292,6 +313,13 @@ main :: proc() {
 				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 				drag_clip.timeline_start_frame = i64(max(clip_x - track_start, 0))
 			}
+		} else if dragging_playhead {
+			// Scrub the playhead to the pointer's frame along the ruler bar.
+			ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+			frame := i64((mouse_x - ruler.x) / TIMELINE_ZOOM)
+			frame = max(frame, 0)
+			frame = min(frame, timeline_duration())
+			playhead.frame = frame
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			playhead.playing = !playhead.playing
 			preview.playing = playhead.playing
@@ -351,6 +379,9 @@ main :: proc() {
 		pass := sdl.BeginGPURenderPass(command_buffer, &color_target, 1, nil)
 		if pass != nil {
 			render_clay(&renderer, command_buffer, pass, commands)
+			if len(timeline.tracks) > 0 {
+				draw_timeline_ruler(&renderer, command_buffer, pass)
+			}
 			if preview_has_frame {
 				preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox
 				draw_preview(&renderer, command_buffer, pass, preview_bounds)
