@@ -730,7 +730,7 @@ audio_update :: proc() {
 		return
 	}
 	fwd := playhead.frame - audio_last_ui_frame
-	audio_last_ui_frame = playhead.frame
+	audio_last_ui_frame = playhead.frame * 2
 	// A resync seeds the anchor and then the producer spends ~10 ms opening
 	// decoders, during which its published position is the seed, not the advanced
 	// one. Coalesce any re-check within 50 ms of a seed so that window can't
