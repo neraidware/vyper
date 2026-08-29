@@ -13,6 +13,7 @@ import clay "clay-odin"
 build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	clay.SetLayoutDimensions({f32(width), f32(height)})
 	clay.BeginLayout()
+    DEFAULT_BORDER := clay.BorderOutside(1)
 
 	if clay.UI()({
 		layout = {
@@ -56,7 +57,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							layoutDirection = .TopToBottom,
 						},
 						backgroundColor = BUTTON,
-						border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+						border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 						cornerRadius = clay.CornerRadiusAll(8),
 					}) {
 						clay.Text("Project", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
@@ -71,7 +72,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							layoutDirection = .TopToBottom,
 						},
 						backgroundColor = BUTTON,
-						border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+						border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 						cornerRadius = clay.CornerRadiusAll(8),
 					}) {
 						clay.Text("Media Bin", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
@@ -93,7 +94,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 								layoutDirection = .TopToBottom,
 							},
 							backgroundColor = BUTTON,
-							border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 							cornerRadius = clay.CornerRadiusAll(8),
 						}) {
 							for line in strings.split_lines(file_info_text) {
@@ -103,13 +104,13 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					}
 				}
 				if clay.UI(clay.ID("PreviewColumn"))({
-					layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})}, layoutDirection = .TopToBottom, childGap = 12},
-					border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+					layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})}, layoutDirection = .TopToBottom},
+					border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 					cornerRadius = clay.CornerRadiusAll(6),
 				}) {
 					if len(timeline.tracks) == 0 {
 						if clay.UI(clay.ID("ResPresets"))({
-							layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = 8},
+							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom},
 						}) {
 							res_preset_button("Res720", "720p", 1280, 720)
 							res_preset_button("Res1080", "1080p", 1920, 1080)
@@ -129,7 +130,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						if clay.UI(clay.ID("PlayPause"))({
 							layout = {sizing = {width = clay.SizingFixed(96), height = clay.SizingFixed(28)}, childAlignment = {x = .Center, y = .Center}},
 							backgroundColor = BUTTON,
-							border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 							cornerRadius = clay.CornerRadiusAll(4),
 						}) {
 							if playhead.playing {
@@ -148,7 +149,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						layoutDirection = .TopToBottom,
 					},
 					backgroundColor = BUTTON,
-					border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+					border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 					cornerRadius = clay.CornerRadiusAll(8),
 				}) {
 					clay.Text("Clip Properties", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
@@ -163,7 +164,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							if clay.UI(clay.ID("PropFieldX"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(8)},
 								backgroundColor = BUTTON,
-								border = {color = editing_field == 1 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(2)},
+								border = {color = editing_field == 1 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = DEFAULT_BORDER},
 								cornerRadius = clay.CornerRadiusAll(6),
 							}) {
 								clay.Text(fmt.aprintf("X: %s", x_val), clay.TextElementConfig{textColor = editing_field == 1 ? BUTTON_BORDER_HOVER : TEXT, fontSize = 15})
@@ -175,7 +176,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							if clay.UI(clay.ID("PropFieldY"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(8)},
 								backgroundColor = BUTTON,
-								border = {color = editing_field == 2 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(2)},
+								border = {color = editing_field == 2 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = DEFAULT_BORDER},
 								cornerRadius = clay.CornerRadiusAll(6),
 							}) {
 								clay.Text(fmt.aprintf("Y: %s", y_val), clay.TextElementConfig{textColor = editing_field == 2 ? BUTTON_BORDER_HOVER : TEXT, fontSize = 15})
@@ -187,63 +188,63 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							if clay.UI(clay.ID("PropFieldS"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(8)},
 								backgroundColor = BUTTON,
-								border = {color = editing_field == 3 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(2)},
+								border = {color = editing_field == 3 ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = DEFAULT_BORDER},
 								cornerRadius = clay.CornerRadiusAll(6),
 							}) {
 								clay.Text(fmt.aprintf("Scale: %s", scl_val), clay.TextElementConfig{textColor = editing_field == 3 ? BUTTON_BORDER_HOVER : TEXT, fontSize = 15})
 							}
 							clay.Text(fmt.aprintf("Crop: L %.0f%% R %.0f%% T %.0f%% B %.0f%%", cl.crop_l * 100, cl.crop_r * 100, cl.crop_t * 100, cl.crop_b * 100), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
 						}
-} else {
-					clay.Text("No clip selected", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
-				}
-				if clay.UI(clay.ID("RenderPanel"))({
-					layout = {
-						layoutDirection = .TopToBottom,
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-						padding = clay.PaddingAll(16),
-						childGap = 8,
-					},
-					backgroundColor = BUTTON,
-					border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
-					cornerRadius = clay.CornerRadiusAll(8),
-				}) {
-					clay.Text("Render", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
-					if clay.UI(clay.ID("RenderButtonsRow"))({
-						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = 8},
-					}) {
-						if clay.UI(clay.ID("RenderPickButton"))({
-							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
-							backgroundColor = BUTTON,
-							border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
-							cornerRadius = clay.CornerRadiusAll(4),
-						}) {
-							clay.Text("Pick file path", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
-						}
-						if clay.UI(clay.ID("RenderRunButton"))({
-							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
-							backgroundColor = BUTTON,
-							border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
-							cornerRadius = clay.CornerRadiusAll(4),
-						}) {
-							label := render_is_busy() ? "Rendering..." : "Render"
-							clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = 13})
-						}
-						if render_is_busy() {
-							if clay.UI(clay.ID("RenderCancelButton"))({
-								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
-								backgroundColor = BUTTON,
-								border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
-								cornerRadius = clay.CornerRadiusAll(4),
-							}) {
-								clay.Text("Cancel", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
-							}
-						}
-					}
-					clay.Text(fmt.aprintf("Output: %s", render_output_name()), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
-					clay.Text(render_status_text(), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
-				}
-			}
+                    } else {
+					    clay.Text("No clip selected", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+				    }
+				    if clay.UI(clay.ID("RenderPanel"))({
+					    layout = {
+						    layoutDirection = .TopToBottom,
+						    sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+						    padding = clay.PaddingAll(16),
+						    childGap = 8,
+					    },
+					    backgroundColor = BUTTON,
+					    border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+					    cornerRadius = clay.CornerRadiusAll(8),
+				    }) {
+					    clay.Text("Render", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
+					    if clay.UI(clay.ID("RenderButtonsRow"))({
+						    layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = 8},
+					    }) {
+						    if clay.UI(clay.ID("RenderPickButton"))({
+							    layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
+							    backgroundColor = BUTTON,
+							    border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+							    cornerRadius = clay.CornerRadiusAll(4),
+						    }) {
+							    clay.Text("Pick file path", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+						    }
+						    if clay.UI(clay.ID("RenderRunButton"))({
+							    layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
+							    backgroundColor = BUTTON,
+							    border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+							    cornerRadius = clay.CornerRadiusAll(4),
+						    }) {
+							    label := render_is_busy() ? "Rendering..." : "Render"
+							    clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+						    }
+						    if render_is_busy() {
+							    if clay.UI(clay.ID("RenderCancelButton"))({
+								    layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Center, y = .Center}},
+								    backgroundColor = BUTTON,
+								    border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+								    cornerRadius = clay.CornerRadiusAll(4),
+							    }) {
+								    clay.Text("Cancel", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+							    }
+						    }
+					    }
+					    clay.Text(fmt.aprintf("Output: %s", render_output_name()), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+					    clay.Text(render_status_text(), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+				    }
+			    }
 			}
 			if clay.UI(clay.ID("EditorDivider"))({
 				layout = {
@@ -278,7 +279,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							},
 							backgroundColor = BUTTON,
 							cornerRadius = clay.CornerRadiusAll(10),
-							border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 						}) {
 							clay.Text("Open file", clay.TextElementConfig{textColor = TEXT, fontSize = 18, textAlignment = .Center})
 						}
@@ -288,7 +289,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(12), layoutDirection = .TopToBottom, childGap = 8},
 						backgroundColor = BUTTON,
 						cornerRadius = clay.CornerRadiusAll(8),
-						border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+						border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 					}) {
 						// Timeline ruler bar: a frame/time strip at the top that
 						// mirrors the track rows' left gutter so its x-origin
@@ -302,7 +303,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							if clay.UI(clay.ID("Ruler"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 								backgroundColor = EDITOR_BG,
-								border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+								border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 								cornerRadius = clay.CornerRadiusAll(4),
 							}) {}
 						}
@@ -336,7 +337,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										if clay.UI(clay.ID("DuplicateTrack", u32(track_idx)))({
 											layout = {sizing = {width = clay.SizingFixed(30), height = clay.SizingFixed(34)}, childAlignment = {x = .Center, y = .Center}},
 											backgroundColor = BUTTON,
-											border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+											border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 											cornerRadius = clay.CornerRadiusAll(4),
 										}) {
 											clay.Text("+\nv", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
@@ -347,54 +348,54 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										clip = {horizontal = true, vertical = true, childOffset = {-timeline_view_start * timeline_zoom, 0}},
 									}) {
 										clips_content_x: f32 = 0
-for timeline_clip, index in track.clips {
-										// Each clip is laid out at its true timeline frame position
-										// (start_frame pixels from the row's origin at frame 0); the
-										// ClipsSection's childOffset translates the whole row by
-										// -view_start*zoom so panning slides every clip together and
-										// clips starting before the view go off the left edge instead
-										// of pinning to it.
-										// A running x keeps real gaps between clips exactly one
-										// spacer wide, so multi-clip tracks don't drift right as
-										// later clips each add another full start-frame spacer.
-										target_x := f32(timeline_clip.timeline_start_frame) * timeline_zoom
-										if target_x > clips_content_x {
-											spacer_w := target_x - clips_content_x
-											clips_content_x = target_x
-											clay.UI(clay.ID("ClipOffset", u32(track_idx * 1000 + index)))({
-												layout = {sizing = {width = clay.SizingFixed(spacer_w), height = clay.SizingGrow({})}},
-											})
-										}
-										clip_width := f32(max(timeline_clip.source_length_frames, 1)) * timeline_zoom
-										clip_color := BUTTON
-										clip_border := BUTTON_BORDER
-										clip_border_w: u16 = 2
-										clip_label := "Clip"
-										if timeline_clip.kind == .Audio {
-											clip_color = AUDIO_CLIP
-											clip_label = "Audio"
-										}
-										if selected_track == track_idx && selected_index == index {
-											clip_border = BUTTON_BORDER_HOVER
-											clip_border_w = 3
-										}
-										// Adjacent clips keep their corner radius but drop the
-										// shared border where this clip's end touches the next
-										// clip's start exactly; the neighbor's left border stays as
-										// a thin divider line at the intersection.
-										next_touches := index + 1 < len(track.clips) && track.clips[index + 1].timeline_start_frame == clip_timeline_end(timeline_clip)
-										bw := clip_border_w
-										border := clay.BorderWidth{left = bw, top = bw, bottom = bw}
-										border.right = next_touches ? 0 : bw
-if clay.UI(clay.ID("TimelineClip", u32(track_idx * 1000 + index)))({
-										layout = {sizing = {width = clay.SizingFixed(clip_width), height = clay.SizingFixed(56)}, padding = clay.PaddingAll(8)},
-										backgroundColor = clip_color,
-										cornerRadius = clay.CornerRadiusAll(6),
-										border = {color = clip_border, width = border},
-									}) {
-										clay.Text(clip_label, clay.TextElementConfig{textColor = TEXT, fontSize = 18})
-									}
-										clips_content_x += clip_width
+                                        for timeline_clip, index in track.clips {
+										    // Each clip is laid out at its true timeline frame position
+										    // (start_frame pixels from the row's origin at frame 0); the
+										    // ClipsSection's childOffset translates the whole row by
+										    // -view_start*zoom so panning slides every clip together and
+										    // clips starting before the view go off the left edge instead
+										    // of pinning to it.
+										    // A running x keeps real gaps between clips exactly one
+										    // spacer wide, so multi-clip tracks don't drift right as
+										    // later clips each add another full start-frame spacer.
+										    target_x := f32(timeline_clip.timeline_start_frame) * timeline_zoom
+										    if target_x > clips_content_x {
+											    spacer_w := target_x - clips_content_x
+											    clips_content_x = target_x
+											    clay.UI(clay.ID("ClipOffset", u32(track_idx * 1000 + index)))({
+												    layout = {sizing = {width = clay.SizingFixed(spacer_w), height = clay.SizingGrow({})}},
+											    })
+										    }
+										    clip_width := f32(max(timeline_clip.source_length_frames, 1)) * timeline_zoom
+										    clip_color := BUTTON
+										    clip_border := BUTTON_BORDER
+										    clip_border_w: u16 = 2
+										    clip_label := "Clip"
+										    if timeline_clip.kind == .Audio {
+											    clip_color = AUDIO_CLIP
+											    clip_label = "Audio"
+										    }
+										    if selected_track == track_idx && selected_index == index {
+											    clip_border = BUTTON_BORDER_HOVER
+											    clip_border_w = 3
+										    }
+										    // Adjacent clips keep their corner radius but drop the
+										    // shared border where this clip's end touches the next
+										    // clip's start exactly; the neighbor's left border stays as
+										    // a thin divider line at the intersection.
+										    next_touches := index + 1 < len(track.clips) && track.clips[index + 1].timeline_start_frame == clip_timeline_end(timeline_clip)
+										    bw := clip_border_w
+										    border := clay.BorderWidth{left = bw, top = bw, bottom = bw}
+										    border.right = next_touches ? 0 : bw
+                                            if clay.UI(clay.ID("TimelineClip", u32(track_idx * 1000 + index)))({
+										        layout = {sizing = {width = clay.SizingFixed(clip_width), height = clay.SizingFixed(56)}, padding = clay.PaddingAll(8)},
+										        backgroundColor = clip_color,
+										        cornerRadius = clay.CornerRadiusAll(6),
+										        border = {color = clip_border, width = border},
+									        }) {
+										        clay.Text(clip_label, clay.TextElementConfig{textColor = TEXT, fontSize = 18})
+									        }
+										    clips_content_x += clip_width
 										}
 									}
 								}
@@ -440,14 +441,14 @@ orientation_toggle_button :: proc() {
 
 // kind_name returns a short label for a media kind (bin display).
 kind_name :: proc(kind: Media_Kind) -> string {
-#partial switch kind {
-case .Video:
-	return "video"
-case .Audio:
-	return "audio"
-case .Image:
-	return "image"
-case:
-	return "other"
-}
+    #partial switch kind {
+    case .Video:
+	    return "video"
+    case .Audio:
+	    return "audio"
+    case .Image:
+	    return "image"
+    case:
+	    return "other"
+    }
 }

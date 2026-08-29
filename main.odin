@@ -382,6 +382,7 @@ main :: proc() {
 			frame = max(frame, 0)
 			frame = min(frame, timeline_duration())
 			playhead.frame = frame
+			preview_frontier = frame
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			playhead.playing = !playhead.playing
 			preview.playing = playhead.playing
@@ -403,8 +404,16 @@ main :: proc() {
 				playhead.playing = false
 				preview.playing = false
 			}
+			// Keep the playhead at or under what has actually been decoded, so
+			// the loop never outruns itself into re-seek collapse. Decode
+			// delivers frontier then the next request is always frontier+1 (a
+			// forwarded decode, no seek).
+			if preview_frontier >= 0 && playhead.frame > preview_frontier + 2 {
+				playhead.frame = preview_frontier + 2
+			}
 		}
 		last_tick_ns = now_ns
+		sync.atomic_store(&ui_playhead_frame, playhead.frame)
 		_ = timeline_frame_at(playhead.frame)
 		audio_update()
 		poll_completed_thread()

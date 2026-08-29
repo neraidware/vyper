@@ -53,6 +53,7 @@ update_preview_slots :: proc() -> bool {
 			slot.source_h = clip.source_h
 			clip_frame := clip.source_start_frame + frame - clip.timeline_start_frame
 			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+				preview_frontier = frame
 				slot.tex_dirty = true
 				changed = true
 			}

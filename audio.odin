@@ -322,11 +322,9 @@ audio_resync_evt: i64  // bump forces clear + re-provision at the anchor (atomic
 audio_anchor_frame: i64 // playhead frame the UI last seeded for a resync (atomic)
 audio_anchor_now: i64   // sdl.GetTicksNS() when that frame was seeded (atomic)
 
-// Producer-local wall clock: content advances from the provision anchor on the
-// producer's own monotonic clock, so UI stalls can never freeze it.
-audio_prov_frame: i64 // provision anchor frame (producer-owned)
-audio_prov_now: u64   // provision anchor tick ns (producer-owned)
-audio_prod_frame: i64 // current content frame, published for the UI drift check (atomic)
+// audio_prod_frame is the producer's current content frame, published for the
+// UI's drift check (atomic).
+audio_prod_frame: i64
 
 audio_was_playing: bool
 audio_last_ui_frame: i64
@@ -555,11 +553,11 @@ audio_src_covers_frame :: proc(f: i64) -> bool {
 	return false
 }
 
-// audio_producer_feed mixes whole timeline frames until the provision-anchor
-// plus wall-clock-elapsed plus cushion target and pushes the downmix, bounded
-// by queue backpressure. The clock is producer-local, so the producer keeps
-// producing through UI stalls, and the queue ceiling caps how far the content
-// can lead the playhead.
+// audio_producer_feed mixes whole timeline frames up to the playhead plus
+// cushion and pushes the downmix, bounded by queue backpressure. The playhead
+// only advances as far as video frames were actually decoded, so audio chases
+// the presented video: A/V stay locked at whatever pace decode sustains, and
+// the queue ceiling caps how far the content can lead the playhead.
 audio_producer_feed :: proc() {
 	if !audio_device_ready || audio_stream == nil {
 		return
@@ -570,9 +568,8 @@ audio_producer_feed :: proc() {
 		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(48000.0 / fps + 0.5)))
 	}
 	max_queue := c.int(f64(48000) * AUDIO_CUSHION_SEC * 2 * 2)
-	elapsed_s := f64(sdl.GetTicksNS() - audio_prov_now) / 1_000_000_000
 	cushion_frames := i64(AUDIO_CUSHION_SEC * fps + 1)
-	target := i64(f64(audio_prov_frame) + elapsed_s * fps) + cushion_frames
+	target := sync.atomic_load(&ui_playhead_frame) + cushion_frames
 	if target <= audio_play_frame {
 		return
 	}
@@ -621,9 +618,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				had_evt = true
 				sdl.ResumeAudioDevice(audio_device)
 				audio_provision(sync.atomic_load(&audio_anchor_frame))
-				audio_prov_frame = sync.atomic_load(&audio_anchor_frame)
-				audio_prov_now = sdl.GetTicksNS()
-				fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", play_src_count, audio_prov_frame, f64(sdl.GetTicksNS()-open_start)/1e6)
+				fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", play_src_count, sync.atomic_load(&audio_anchor_frame), f64(sdl.GetTicksNS()-open_start)/1e6)
 			}
 			audio_producer_feed()
 			if now := sdl.GetTicksNS(); now - last_report >= 2_000_000_000 {
@@ -634,12 +629,12 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				spf := int(48000.0 / fps + 0.5)
 				queued_frames := int(queued_bytes) / (spf * 2 * 2)
 				cursor := audio_play_frame - i64(queued_frames)
-				fmt.printf("[audio] fps=%.2f ph=%d fed=%d cursor=%d rate=%.1ffps provage=%.3fs dev=%dHz/%dch\n",
+				fmt.printf("[audio] fps=%.2f ph=%d fed=%d cursor=%d rate=%.1ffps lead=%.2fs dev=%dHz/%dch\n",
 					fps,
 					playhead.frame,
 					audio_play_frame, cursor,
 					elapsed > 0 ? f64(delta) / elapsed : 0,
-					f64(now-audio_prov_now) / 1e9,
+					f64(audio_play_frame - playhead.frame) / fps,
 					audio_device_spec.freq, audio_device_spec.channels)
 				audio_report_tick = now
 				audio_report_frame = audio_play_frame
