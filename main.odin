@@ -2,6 +2,8 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:os"
+import "core:strings"
 import "core:sync"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
@@ -84,6 +86,19 @@ main :: proc() {
 		{handler = clay_error},
 	)
 	clay.SetMeasureTextFunction(measure_text, nil)
+
+	// DIAG: env-var autoplay for headless-ish diagnostics — autoloads a file and
+	// starts playback after a couple of seconds. Removed after diagnosis.
+	if autoplay := os.get_env_buf([]u8{}, "NERED_AUTOPLAY"); autoplay != "" {
+		import_media(strings.clone_to_cstring(autoplay, context.temp_allocator))
+		sdl.Delay(2500)
+		playhead.playing = true
+		preview.playing = true
+		playhead_accumulator = 0
+		preview_frontier = playhead.frame
+		last_tick_ns = sdl.GetTicksNS()
+		audio_note_edit()
+	}
 
 	running := true
 	was_mouse_down := false
@@ -404,13 +419,8 @@ main :: proc() {
 				playhead.playing = false
 				preview.playing = false
 			}
-			// Keep the playhead at or under what has actually been decoded, so
-			// the loop never outruns itself into re-seek collapse. Decode
-			// delivers frontier then the next request is always frontier+1 (a
-			// forwarded decode, no seek).
-			if preview_frontier >= 0 && playhead.frame > preview_frontier + 2 {
-				playhead.frame = preview_frontier + 2
-			}
+			// Playback is real-time: the playhead (and with it the audio) runs on
+			// the wall clock. Video decode is best-effort on top of that clock.
 		}
 		last_tick_ns = now_ns
 		sync.atomic_store(&ui_playhead_frame, playhead.frame)
@@ -422,10 +432,10 @@ main :: proc() {
 			ui_report_tick = now_ns
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
 			elapsed := f64(now_ns - ui_report_tick) / 1e9
-			fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d\n",
+			fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d frontier=%d gap=%d\n",
 				f64(ui_frame_count) / elapsed,
 				f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
-				playhead.frame)
+				playhead.frame, preview_frontier, playhead.frame - preview_frontier)
 			ui_report_tick = now_ns
 			ui_frame_count = 0
 			ui_dec_us = 0
@@ -476,6 +486,7 @@ main :: proc() {
 			if preview_has_frame {
 				preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox
 				draw_preview(&renderer, command_buffer, pass, preview_bounds)
+				draw_preview_hud(&renderer, command_buffer, pass, preview_bounds)
 			}
 			sdl.EndGPURenderPass(pass)
 		}

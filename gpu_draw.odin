@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:sync"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
 import stb "vendor:stb/truetype"
@@ -360,6 +361,36 @@ render_sdf_rect :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	sdl.PushGPUFragmentUniformData(command_buffer, 0, &fragment_uniforms, sdl.Uint32(size_of(fragment_uniforms)))
 	sdl.BindGPUGraphicsPipeline(pass, renderer.pipeline)
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+}
+
+// draw_preview_hud paints the audio-vs-video clock overlay in the corner of the
+// preview while playing. It answers the one question that has been argued from
+// two sides this whole session with a number everyone can see: does the audio
+// content position (A, from the device clock) fall behind the video content
+// position (V, the playhead) — and at what delta.
+draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, preview: clay.BoundingBox) {
+	if !sync.atomic_load(&audio_run_flag) {
+		return
+	}
+	fps := timeline_fps()
+	if fps <= 0 {
+		return
+	}
+	label := fmt.tprintf("A %6.2f  V %6.2f  d %+.2f",
+		f64(sync.atomic_load(&audio_dev_frame)) / fps,
+		f64(playhead.frame) / fps,
+		f64(sync.atomic_load(&audio_dev_frame)-playhead.frame) / fps)
+	fs: u16 = 13
+	text_w := f32(len(label)) * f32(fs) * 0.6
+	pill := clay.BoundingBox{x = preview.x + 8, y = preview.y + 8, width = text_w + 10, height = 17}
+	render_sdf_rect(renderer, command_buffer, pass, pill, TOOLTIP_BG, 4, 0)
+	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = pill.x + 5, y = pill.y + 2, width = text_w, height = f32(fs)}, clay.TextRenderData{
+		stringContents = clay.StringSlice{length = c.int32_t(len(label)), chars = ([^]c.char)(raw_data(label))},
+		textColor = TOOLTIP_TEXT,
+		fontSize = fs,
+		letterSpacing = 1,
+		lineHeight = fs,
+	})
 }
 
 // upload_preview_slot copies tightly-packed RGBA pixels into a slot's GPU

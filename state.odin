@@ -197,12 +197,16 @@ Preview_Slot :: struct {
 preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot
 
 // preview_frontier is the highest timeline frame whose pixels were actually
-// decoded into a preview slot. The playhead is capped at frontier + 2 during
-// playback so the pipeline can never fall behind itself (which would force
-// frame re-seeks and collapse the loop); the audio producer in turn chases the
-// playhead, so the whole preview runs at whatever pace decode sustains.
+// decoded into a preview slot. During playback the decoder always requests the
+// frame right after the frontier (never rewinds), so the image advances
+// best-effort at whatever decode sustains while the playhead stays on the wall
+// clock.
 preview_frontier: i64
-ui_playhead_frame: i64 // published playhead frame for the audio producer (atomic)
+ui_playhead_frame: i64 // published playhead frame for the audio producer (atomic; unused)
+// audio_dev_frame is the content frame the sound device has actually consumed
+// (everything the producer pushed minus what is still queued); published every
+// feed pass so the preview HUD can show the audio clock next to the video one.
+audio_dev_frame: i64
 
 // Preview camera: pan (in preview pixels, relative to the base canvas center)
 // and zoom. Pan/zoom is clamped so the view never travels more than one preview

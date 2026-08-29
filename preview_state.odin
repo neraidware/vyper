@@ -51,9 +51,22 @@ update_preview_slots :: proc() -> bool {
 			slot.crop_b = clip.crop_b
 			slot.source_w = clip.source_w
 			slot.source_h = clip.source_h
-			clip_frame := clip.source_start_frame + frame - clip.timeline_start_frame
+			// While playing, decode forward as fast as decode allows and show
+			// whatever the newest decoded frame is (dropped-frame preview: real
+			// speed, stutter when slow, never slow-motion). When paused, exact
+			// frames are requested for scrubbing.
+			req := frame
+			if playhead.playing {
+				if req > preview_frontier + 1 {
+					req = preview_frontier + 1
+				}
+				if req <= preview_frontier {
+					continue
+				}
+			}
+			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
-				preview_frontier = frame
+				preview_frontier = req
 				slot.tex_dirty = true
 				changed = true
 			}
