@@ -20,10 +20,27 @@ set_project_resolution :: proc(w, h: c.int) {
 	resolution_locked = true
 }
 
-// toggle_project_orientation swaps width/height (portrait <-> landscape) and
-// locks the canvas.
-toggle_project_orientation :: proc() {
-	project.width, project.height = project.height, project.width
+// set_project_resolution_auto clears the resolution lock so the next import
+// sets the canvas from the file's own dimensions.
+set_project_resolution_auto :: proc() {
+	resolution_locked = false
+}
+
+// set_project_fps applies an explicit project frame rate (preset button). The
+// timeline grid, playhead cadence, and audio producer all remap to this rate;
+// later imports no longer override it.
+set_project_fps :: proc(fps: f64) {
+	project.frame_rate = fps
+}
+
+// set_project_orientation forces the given canvas orientation (landscape when
+// vertical=false, portrait when vertical=true), swapping the dimensions only
+// when they already point the other way, and locks the canvas.
+set_project_orientation :: proc(vertical: bool) {
+	if vertical && project.height < project.width ||
+		!vertical && project.width < project.height {
+		project.width, project.height = project.height, project.width
+	}
 	resolution_locked = true
 }
 

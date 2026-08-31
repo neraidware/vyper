@@ -63,6 +63,11 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						clay.Text("Project", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 13})
 						clay.Text(fmt.aprintf("Name: %s", project.name), clay.TextElementConfig{textColor = TEXT, fontSize = 15})
 						clay.Text(fmt.aprintf("Resolution: %dx%d", project.width, project.height), clay.TextElementConfig{textColor = TEXT, fontSize = 15})
+						fps_label := "auto"
+						if project.frame_rate > 0 {
+							fps_label = fmt.aprintf("%g fps", project.frame_rate)
+						}
+						clay.Text(fmt.aprintf("FPS: %s", fps_label), clay.TextElementConfig{textColor = TEXT, fontSize = 15})
 					}
 					if clay.UI(clay.ID("MediaBin"))({
 						layout = {
@@ -109,13 +114,71 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					cornerRadius = clay.CornerRadiusAll(6),
 				}) {
 					if len(timeline.tracks) == 0 {
-						if clay.UI(clay.ID("ResPresets"))({
-							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom},
+						if clay.UI(clay.ID("ProjectSettings"))({
+							layout = {
+								sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+								padding = clay.PaddingAll(16),
+								childGap = 14,
+								layoutDirection = .TopToBottom,
+							},
+							backgroundColor = BUTTON,
+							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+							cornerRadius = clay.CornerRadiusAll(8),
 						}) {
-							res_preset_button("Res720", "720p", 1280, 720)
-							res_preset_button("Res1080", "1080p", 1920, 1080)
-							res_preset_button("Res4K", "4K", 3840, 2160)
-							orientation_toggle_button()
+							clay.Text("Project Settings", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = 14})
+							if clay.UI(clay.ID("ResolutionGroup"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, childGap = 6, layoutDirection = .TopToBottom},
+							}) {
+								clay.Text("Resolution", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+							    if clay.UI(clay.ID("ResRow"))({
+                                    layout = {
+                                        sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+                                        layoutDirection = .LeftToRight,
+                                        childGap = 6,
+                                    },
+                                }) {
+                                    res_auto_button()
+                                    res_preset_button("Res720", "720p", 1280, 720)
+                                    res_preset_button("Res1080", "1080p", 1920, 1080)
+                                    res_preset_button("Res4K", "4K", 3840, 2160)
+                                    vertical_toggle_button("OrientVertical", "Vertical")
+                                }
+							}
+							if clay.UI(clay.ID("FrameRateGroup"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, childGap = 6, layoutDirection = .TopToBottom},
+							}) {
+								clay.Text("Frame rate", clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+								// Instead of this:
+                                // if settings_row("FpsRow1") {
+                                //     fps_preset_button("Fps24", "24", 24)
+                                //     fps_preset_button("Fps25", "25", 25)
+                                //     fps_preset_button("Fps30", "30", 30)
+                                // }
+
+                                if clay.UI(clay.ID("FpsRow1"))({
+                                    layout = {
+                                        sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+                                        layoutDirection = .LeftToRight,
+                                        childGap = 6,
+                                    },
+                                }) {
+                                    fps_preset_button("Fps24", "24", 24)
+                                    fps_preset_button("Fps25", "25", 25)
+                                    fps_preset_button("Fps30", "30", 30)
+                                }
+
+                                if clay.UI(clay.ID("FpsRow2"))({
+                                    layout = {
+                                        sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+                                        layoutDirection = .LeftToRight,
+                                        childGap = 6,
+                                    },
+                                }) {
+                                    fps_preset_button("Fps48", "48", 48)
+                                    fps_preset_button("Fps60", "60", 60)
+                                    fps_preset_button("FpsAuto", "Auto", 0)
+                                }
+							}
 						}
 					}
 					pw, ph := project_preview_size()
@@ -286,10 +349,11 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					}
 				} else {
 					if clay.UI(clay.ID("ClipTimeline"))({
-						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, padding = clay.PaddingAll(12), layoutDirection = .TopToBottom, childGap = 8},
+						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, padding = clay.PaddingAll(12), layoutDirection = .TopToBottom, childGap = 8},
 						backgroundColor = BUTTON,
 						cornerRadius = clay.CornerRadiusAll(8),
 						border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+						clip = {vertical = true},
 					}) {
 						// Timeline ruler bar: a frame/time strip at the top that
 						// mirrors the track rows' left gutter so its x-origin
@@ -308,7 +372,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							}) {}
 						}
 						if clay.UI(clay.ID("TracksSection"))({
-							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .TopToBottom, childGap = 0},
+							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
+							clip = {vertical = true, childOffset = {0, -timeline_view_top}},
 						}) {
 							for track_idx := 0; track_idx <= len(timeline.tracks); track_idx += 1 {
 								// Gap indent where a new track can be inserted.
@@ -410,10 +475,11 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	return clay.EndLayout(0)
 }
 
-// res_preset_button renders a small resolution-preset button, highlighted
-// when it matches the project's current (orientation-aware) resolution.
-res_preset_button :: proc(name: string, label: string, w, h: c.int) {
-	active := (project.width == w && project.height == h) || (project.width == h && project.height == w)
+// settings_button renders the shared preset control: a fixed-height button that
+// stays held (highlighted border + label) when active reports true. This is
+// used for both mutually-exclusive presets (resolution/fps, where only the
+// matching one is held) and standalone toggles (orientation, held on its own).
+settings_button :: proc(name: string, label: string, active: bool) {
 	if clay.UI(clay.ID(name))({
 		layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(28)}, padding = clay.Padding{left = 12, right = 12}, childAlignment = {x = .Center, y = .Center}},
 		backgroundColor = BUTTON,
@@ -424,19 +490,37 @@ res_preset_button :: proc(name: string, label: string, w, h: c.int) {
 	}
 }
 
-// orientation_toggle_button shows/swaps between horizontal (landscape) and
-// vertical (portrait) orientation for the project canvas.
-orientation_toggle_button :: proc() {
-	vertical := project.height > project.width
-	label := vertical ? "Vertical" : "Horizontal"
-	if clay.UI(clay.ID("OrientToggle"))({
-		layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(28)}, padding = clay.Padding{left = 12, right = 12}, childAlignment = {x = .Center, y = .Center}},
-		backgroundColor = BUTTON,
-		border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
-		cornerRadius = clay.CornerRadiusAll(4),
-	}) {
-		clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+// res_preset_button renders a resolution preset, held when it matches the
+// project's current (orientation-aware) resolution.
+res_preset_button :: proc(name: string, label: string, w, h: c.int) {
+	active := (project.width == w && project.height == h) || (project.width == h && project.height == w)
+	if !resolution_locked && active {
+		// A preset shouldn't look held when the canvas just happens to match it
+		// but resolution is still on auto (picked up from the file, not chosen).
+		active = false
 	}
+	settings_button(name, label, active)
+}
+
+// res_auto_button is the "Auto" resolution control. It stays held while the
+// canvas is unlocked (resolution inferred from the next import).
+res_auto_button :: proc() {
+	settings_button("ResAuto", "Auto", !resolution_locked)
+}
+
+// vertical_toggle_button renders a single persistent toggle for canvas
+// orientation: held when the canvas is currently portrait (taller than
+// wide), unpressed when landscape. This is a toggle button in the proper
+// sense — its own pressed state IS the current orientation — rather than a
+// stateless button whose click merely fires a toggle action elsewhere.
+vertical_toggle_button :: proc(name: string, label: string) {
+	settings_button(name, label, project.height > project.width)
+}
+
+// fps_preset_button renders a frame-rate preset, held when it matches the
+// project's current fps (0 = auto).
+fps_preset_button :: proc(name: string, label: string, fps: f64) {
+	settings_button(name, label, project.frame_rate == fps)
 }
 
 // kind_name returns a short label for a media kind (bin display).

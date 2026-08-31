@@ -1,5 +1,7 @@
 package main
 
+import "core:fmt"
+
 // ---------------------------------------------------------------------------
 // Preview slot lifecycle: assigning a Preview_Slot to each video clip that
 // covers the playhead, driving decode, and looking slots up by clip identity.
@@ -41,7 +43,18 @@ update_preview_slots :: proc() -> bool {
 				slot.path = clip.path
 				slot.tex_dirty = true
 			}
+			// A position/source shift makes the slot's frontier (timeline-keyed
+			// forward splice point) invalid: if we keep it, a clip moved forward
+			// gets clamped to req = frontier+1 which maps BELOW its new start.
+			// Within EITHER mapping the exact-playhead frame shown is the right
+			// one, so decode exactly once without the forward-drop clamp (the
+			// source-frame cache still makes it cheap).
+			anchor_shifted := slot.timeline_start_frame != clip.timeline_start_frame || slot.source_start_frame != clip.source_start_frame
 			slot.timeline_start_frame = clip.timeline_start_frame
+			slot.source_start_frame = clip.source_start_frame
+			if anchor_shifted {
+				slot.have_frontier = false
+			}
 			slot.transform_x = clip.transform_x
 			slot.transform_y = clip.transform_y
 			slot.scale = clip.scale
@@ -54,22 +67,31 @@ update_preview_slots :: proc() -> bool {
 			// While playing, decode forward as fast as decode allows and show
 			// whatever the newest decoded frame is (dropped-frame preview: real
 			// speed, stutter when slow, never slow-motion). When paused, exact
-			// frames are requested for scrubbing.
+			// frames are requested for scrubbing. The frontier is per-slot so
+			// moving a clip to an earlier point (or switching clips) never gets
+			// frozen on stale content: skip only when the playhead sits AHEAD of
+			// this slot's own frontier, never behind it.
 			req := frame
 			if playhead.playing {
-				if req > preview_frontier + 1 {
-					req = preview_frontier + 1
-				}
-				if req <= preview_frontier {
-					continue
+				if slot.have_frontier && req > slot.frontier + 1 {
+					req = slot.frontier + 1
 				}
 			}
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
+			// if audio_trace {
+			// 	fmt.printf("[vf] req=%d clip_frame=%d ph=%d frontier=%d gap=%d playing=%v\n",
+			// 		req, clip_frame, playhead.frame, preview_frontier, playhead.frame-preview_frontier, playhead.playing)
+			// }
 			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+				slot.frontier = req
+				slot.have_frontier = true
+				slot.has_frame = true
 				preview_frontier = req
 				slot.tex_dirty = true
 				changed = true
-			}
+			}// else if audio_trace {
+				//fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+			//}
 		}
 	}
 	for i := next_slot; i < MAX_PREVIEW_SLOTS; i += 1 {

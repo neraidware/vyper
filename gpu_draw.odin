@@ -74,9 +74,11 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 
 // draw_render_range draws the project render range as a band sitting just below
 // the timeline ruler bar, from the range's start frame to its end frame (both
-// already set and ordered). Only the part inside the ruler's width is drawn.
+// set and ordered). Each boundary also gets a cap marker, drawn independently:
+// with only one boundary set its cap still appears so the I/O placement stays
+// visible. Only the part inside the ruler's width is drawn.
 draw_render_range :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
-	if len(timeline.tracks) == 0 || project.start_frame < 0 || project.end_frame < 0 || project.start_frame >= project.end_frame {
+	if len(timeline.tracks) == 0 || (project.start_frame < 0 && project.end_frame < 0) {
 		return
 	}
 	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
@@ -87,20 +89,33 @@ draw_render_range :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	// starts before the current view; keep them inside the ruler bar's width.
 	sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), 0, c.int(ruler.width), c.int(renderer.viewport.y)})
 	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
-	x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
-	x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
-	if x1 >= ruler.x + ruler.width || x2 <= ruler.x {
-		return
-	}
 	y := ruler.y + ruler.height
-	band_x := max(x1, ruler.x)
-	band_w := min(x2, ruler.x + ruler.width) - band_x
-	if band_w > 0 {
-		render_sdf_rect(renderer, command_buffer, pass, {band_x, y, band_w, 4}, RANGE_COLOR, 0, 0)
+	isect := ruler.x + ruler.width
+	if project.start_frame >= 0 && project.end_frame >= 0 && project.start_frame < project.end_frame {
+		x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
+		x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
+		if x2 > ruler.x && x1 < isect {
+			band_x := max(x1, ruler.x)
+			band_w := min(x2, isect) - band_x
+			if band_w > 0 {
+				render_sdf_rect(renderer, command_buffer, pass, {band_x, y, band_w, 4}, RANGE_COLOR, 0, 0)
+			}
+		}
 	}
-	// Edge caps make the range boundaries readable even when the band is thin.
-	render_sdf_rect(renderer, command_buffer, pass, {x1, y, 2, 8}, RANGE_COLOR, 0, 0)
-	render_sdf_rect(renderer, command_buffer, pass, {x2 - 2, y, 2, 8}, RANGE_COLOR, 0, 0)
+	// Edge caps make the range boundaries readable even when the band is thin;
+	// a lone start/end marker is drawn the same way so its placement is visible.
+	if project.start_frame >= 0 {
+		x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
+		if x1 >= ruler.x && x1 <= isect {
+			render_sdf_rect(renderer, command_buffer, pass, {x1, y, 2, 8}, RANGE_COLOR, 0, 0)
+		}
+	}
+	if project.end_frame >= 0 {
+		x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
+		if x2 >= ruler.x && x2 <= isect {
+			render_sdf_rect(renderer, command_buffer, pass, {x2 - 2, y, 2, 8}, RANGE_COLOR, 0, 0)
+		}
+	}
 }
 
 // nice_frame_step picks the ruler's label spacing (a round 1/2/5×10^k number)
@@ -277,6 +292,45 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	if hover_label != "" {
 		draw_marker_tooltip(renderer, command_buffer, pass, hover_label, hover_x, gap_bounds)
 	}
+}
+
+// draw_drag_ghost paints the translucent drop preview for a clip being dragged
+// onto another track: a ghost tile in the hovered lane at the nearest
+// non-overlapping slot. Same width as the dragged clip, positioned from
+// drag_ghost_start like regular clips (frame * zoom offset by the view).
+draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	if !moving_clip || drag_clip == nil {
+		return
+	}
+	if drag_hover_track < 0 || drag_hover_track >= len(timeline.tracks) {
+		return
+	}
+	if drag_hover_track == drag_source_track {
+		return
+	}
+	clip_len := drag_clip.source_length_frames
+	if clip_len <= 0 {
+		return
+	}
+	// The nearest valid non-overlap slot may differ per frame (it follows the
+	// mouse during the drag), but the ghost must never hide an overlap it would
+	// cause: clamp once more against the hovered track's live content.
+	placed := clip_place_in_track(&timeline.tracks[drag_hover_track], -1, clip_len, drag_ghost_start)
+	lane := clay.GetElementData(clay.ID("ClipsSection", u32(drag_hover_track))).boundingBox
+	if lane.width <= 0 || lane.height <= 0 {
+		return
+	}
+	// Lane origin is at frame 0 = ruler.x; tiles slide with the view offset.
+	x0 := lane.x + (f32(placed) - timeline_view_start) * timeline_zoom
+	w := f32(clip_len) * timeline_zoom
+	// Ghost tile height matches real clips (fixed 56, same as the layout).
+	h := f32(56)
+	bounds := clay.BoundingBox{x = x0, y = lane.y, width = w, height = h}
+	// Keep the ghost inside the lane (semi-transparent fill + strong border).
+	sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
+	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 80}, 6, 0)
+	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 220}, 6, 2)
+	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 }
 
 // draw_marker_tooltip draws a small pill with the marker's label centered on
@@ -466,7 +520,7 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 	// reverse so the top track's clip is drawn last and appears on top.
 	for i := MAX_PREVIEW_SLOTS - 1; i >= 0; i -= 1 {
 		slot := &preview_slots[i]
-		if !slot.in_use || slot.texture == nil {
+		if !slot.in_use || !slot.has_frame || slot.texture == nil {
 			continue
 		}
 		cb := clip_image_bounds(canvas, &Clip{

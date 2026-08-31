@@ -3,6 +3,7 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
 import "core:sync"
 import clay "clay-odin"
@@ -11,6 +12,46 @@ import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 // Entry point: window/device/pipeline setup, the SDL event loop (input
 // dispatch, drag-state machine, playback tick), and the per-frame render.
+
+// toggle_playback starts playback from the current playhead (wrapping to
+// frame 0 when already at/past the end) or pauses it. playback_stop_frame is
+// cleared so a normal run plays the whole timeline.
+toggle_playback :: proc() {
+	if playhead.playing {
+		playhead.playing = false
+		preview.playing = false
+		fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+		return
+	}
+	if playhead.frame >= timeline_duration() {
+		playhead.frame = 0
+	}
+	playback_stop_frame = -1
+	playhead_accumulator = 0
+	last_tick_ns = sdl.GetTicksNS()
+	preview_frontier = playhead.frame
+	playhead.playing = true
+	preview.playing = true
+	fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+}
+
+// play_project_area starts playback at the render range's start frame and
+// stops at its end frame (exclusive). With no range set it falls back to a
+// plain toggle.
+play_project_area :: proc() {
+	if project.start_frame < 0 || project.end_frame <= project.start_frame {
+		toggle_playback()
+		return
+	}
+	playhead.frame = project.start_frame
+	playback_stop_frame = project.end_frame
+	playhead_accumulator = 0
+	last_tick_ns = sdl.GetTicksNS()
+	preview_frontier = playhead.frame
+	playhead.playing = true
+	preview.playing = true
+	fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback_stop_frame)
+}
 // ---------------------------------------------------------------------------
 
 main :: proc() {
@@ -87,11 +128,31 @@ main :: proc() {
 	)
 	clay.SetMeasureTextFunction(measure_text, nil)
 
+	// DIAG (temporary): magic playhead-clock knobs.
+	if v := os.get_env_alloc("NERED_PLAYBACK_MAGIC_MS", context.temp_allocator); v != "" {
+		PLAYBACK_MAGIC_MS, _ = strconv.parse_f64(v)
+	}
+	if v := os.get_env_alloc("NERED_PLAYBACK_FPS", context.temp_allocator); v != "" {
+		PLAYBACK_MAGIC_FPS, _ = strconv.parse_f64(v)
+	}
+	if PLAYBACK_MAGIC_MS > 0 || PLAYBACK_MAGIC_FPS > 0 {
+		fmt.printf("[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n", PLAYBACK_MAGIC_MS, PLAYBACK_MAGIC_FPS)
+	}
+
 	// DIAG: env-var autoplay for headless-ish diagnostics — autoloads a file and
-	// starts playback after a couple of seconds. Removed after diagnosis.
-	if autoplay := os.get_env_buf([]u8{}, "NERED_AUTOPLAY"); autoplay != "" {
+	// starts playback after a couple of seconds. Refuses silently-failed imports
+	// (bad path, unreadable file, probe failure) instead of opening an empty
+	// project that immediately auto-stops without ever playing anything.
+	if autoplay := os.get_env_alloc("NERED_AUTOPLAY", context.temp_allocator); autoplay != "" {
+		fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 		import_media(strings.clone_to_cstring(autoplay, context.temp_allocator))
+		fmt.printf("[autoplay] env=\"%s\" imported tracks=%d step=delay\n", autoplay, len(timeline.tracks))
+		if len(timeline.tracks) == 0 {
+			fmt.printf("[autoplay] FATAL: NERED_AUTOPLAY=\"%s\" imported nothing (no audio track)\n", autoplay)
+			os.exit(1)
+		}
 		sdl.Delay(2500)
+		fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
 		playhead.playing = true
 		preview.playing = true
 		playhead_accumulator = 0
@@ -123,8 +184,24 @@ main :: proc() {
 					}
 				} else if !event.key.repeat {
 					switch event.key.key {
+					case sdl.K_SPACE:
+						mods := sdl.GetModState()
+						if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
+							play_project_area()
+						} else {
+							toggle_playback()
+						}
 					case sdl.K_S:
 						split_clip_at_playhead()
+					case sdl.K_BACKSPACE:
+						// Delete the selected clip's timeline area on every track
+						// and close the gap (ripple).
+						if tr, clip, ok := selected_clip(); ok {
+							ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+						}
+					case sdl.K_DELETE:
+						// Delete the clip raw, nothing else.
+						delete_selected_clip_raw()
 					case sdl.K_I:
 						// Set the render-range start at the playhead; collapsing the
 						// range to a single frame clears it.
@@ -151,13 +228,13 @@ main :: proc() {
 					}
 				}
 			case .MOUSE_WHEEL:
-				// Scroll over the timeline zooms horizontally, anchored at the cursor.
+				// Scroll over the timeline zooms horizontally, anchored at the playhead.
 				tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
 				if len(timeline.tracks) > 0 && event.wheel.mouse_x >= tlb.x && event.wheel.mouse_x <= tlb.x + tlb.width &&
 					event.wheel.mouse_y >= tlb.y && event.wheel.mouse_y <= tlb.y + tlb.height {
 					if event.wheel.y != 0 {
 						ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
-						anchor := event.wheel.mouse_x - ruler.x
+						anchor := f32(playhead.frame - i64(timeline_view_start)) * timeline_zoom
 						anchor_frame := timeline_view_start + anchor / timeline_zoom
 						new_zoom := clamp(timeline_zoom * (1 + 0.1 * event.wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
 						if new_zoom != timeline_zoom {
@@ -211,20 +288,34 @@ main :: proc() {
 		} else if panning_preview {
 			panning_preview = false
 		}
-		// Middle-drag over the timeline pans it horizontally, Blender-style.
+		// Middle-drag over the timeline pans it: horizontally along the frames,
+		// vertically across the track rows (when they overflow the view).
 		if middle_down && len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("ClipTimeline")) {
 			if panning_timeline {
 				timeline_view_start -= (mouse_x - timeline_pan_last_x) / timeline_zoom
 				timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
+				timeline_view_top += mouse_y - timeline_pan_last_y
+				// Clamp to the row area that overflows the visible tracks box.
+				sd := clay.GetScrollContainerData(clay.ID("TracksSection"))
+				if sd.found {
+					max_top := max(sd.contentDimensions.height - sd.scrollContainerDimensions.height, 0)
+					timeline_view_top = clamp(timeline_view_top, 0, max_top)
+				}
 			}
 			panning_timeline = true
 			timeline_pan_last_x = mouse_x
+			timeline_pan_last_y = mouse_y
 		} else if panning_timeline {
 			panning_timeline = false
 		}
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
 		commands := build_page(width, height)
+		if len(timeline.tracks) > 0 {
+			if sd := clay.GetScrollContainerData(clay.ID("TracksSection")); sd.found {
+				timeline_view_top = clamp(timeline_view_top, 0, max(sd.contentDimensions.height - sd.scrollContainerDimensions.height, 0))
+			}
+		}
 		if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OpenFileButton")) {
 			if path := open_file_picker(); path != nil {
 				import_media(path)
@@ -235,8 +326,22 @@ main :: proc() {
 			set_project_resolution(1920, 1080)
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res4K")) {
 			set_project_resolution(3840, 2160)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("OrientToggle")) {
-			toggle_project_orientation()
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("ResAuto")) {
+			set_project_resolution_auto()
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("OrientVertical")) {
+			set_project_orientation(!(project.height > project.width))
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps24")) {
+			set_project_fps(24)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps25")) {
+			set_project_fps(25)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps30")) {
+			set_project_fps(30)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps48")) {
+			set_project_fps(48)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps60")) {
+			set_project_fps(60)
+		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("FpsAuto")) {
+			set_project_fps(0)
 		} else if clay.PointerOver(clay.ID("DividerHandle")) && mouse_down {
 			resizing_areas = true
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("RenderPickButton")) {
@@ -332,6 +437,9 @@ main :: proc() {
 						selected_track = track_idx
 						selected_index = index
 						drag_clip = &track.clips[index]
+						drag_source_track = track_idx
+						drag_source_index = index
+						drag_hover_track = track_idx
 						moving_clip = true
 						clip_drag_offset = mouse_x - clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox.x
 						break
@@ -345,11 +453,21 @@ main :: proc() {
 		}
 		if !mouse_down {
 			resizing_areas = false
+			if moving_clip {
+				// Commit a vertical drop if the ghost hovers another track;
+				// horizontal drags already applied their new start live.
+				if drag_hover_track != drag_source_track && drag_hover_track >= 0 && drag_source_track >= 0 {
+					move_clip_to_track(drag_source_track, drag_source_index, drag_hover_track, drag_ghost_start)
+				}
+			}
 			moving_clip = false
 			moving_preview_clip = false
 			dragging_handle = -1
 			handle_kind = .None
 			drag_clip = nil
+			drag_source_track = -1
+			drag_source_index = -1
+			drag_hover_track = -1
 			dragging_playhead = false
 		} else if dragging_handle >= 0 {
 			if sel, ok := transformable_selected(); ok {
@@ -385,8 +503,36 @@ main :: proc() {
 				clip_x := mouse_x - clip_drag_offset
 				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 				frame := (clip_x - track_start) / timeline_zoom + timeline_view_start
+				frame = max(frame, 0)
+				// Determine which track lane the pointer hovers: that decides
+				// whether this is a horizontal move (same track) or a vertical
+				// drop staged on another track (ghost until release).
+				hover := drag_source_track
+				for ti := 0; ti < len(timeline.tracks); ti += 1 {
+					lane := clay.GetElementData(clay.ID("ClipsSection", u32(ti))).boundingBox
+					if lane.width > 0 && mouse_y >= lane.y && mouse_y <= lane.y + lane.height {
+						hover = ti
+						break
+					}
+				}
 				sync.mutex_lock(&audio_timeline_mtx)
-				drag_clip.timeline_start_frame = i64(clamp(frame, 0, f32(timeline_duration())))
+				if hover == drag_source_track {
+					// Horizontal move: keep the live-follow behavior but clamp so
+					// the clip can never overlap a neighbor on this track.
+					new_start := clip_slide_in_track(&timeline.tracks[drag_source_track], drag_source_index, drag_clip.source_length_frames, i64(max(frame, 0)), drag_clip.timeline_start_frame)
+					drag_hover_track = hover
+					if drag_clip.timeline_start_frame != new_start {
+						fmt.printf("[tl] drag clip src=%s len=%d start=%d -> %d\n",
+							drag_clip.path, drag_clip.source_length_frames,
+							drag_clip.timeline_start_frame, new_start)
+						drag_clip.timeline_start_frame = new_start
+					}
+				} else {
+					// Vertical: clamp to nearest valid slot on the hovered track
+					// and show it as a ghost (committed on release).
+					drag_hover_track = hover
+					drag_ghost_start = clip_place_in_track(&timeline.tracks[hover], -1, drag_clip.source_length_frames, i64(max(frame, 0)))
+				}
 				sync.mutex_unlock(&audio_timeline_mtx)
 				audio_note_edit()
 			}
@@ -396,12 +542,15 @@ main :: proc() {
 			frame := i64((mouse_x - ruler.x) / timeline_zoom + timeline_view_start)
 			frame = max(frame, 0)
 			frame = min(frame, timeline_duration())
+			if playhead.frame != frame {
+				fmt.printf("[pb] scrub ph=%d (was %d) playing=%v\n", frame, playhead.frame, playhead.playing)
+			}
 			playhead.frame = frame
 			preview_frontier = frame
+			sync.atomic_store(&audio_ph_src, 1)
+			sync.atomic_store(&audio_ph_catch, 0)
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
-			playhead.playing = !playhead.playing
-			preview.playing = playhead.playing
-			preview_frontier = playhead.frame
+			toggle_playback()
 		}
 		was_mouse_down = mouse_down
 		now_ns := sdl.GetTicksNS()
@@ -409,22 +558,39 @@ main :: proc() {
 			last_tick_ns = now_ns
 		}
 		if playhead.playing {
-			playhead_accumulator += f64(now_ns - last_tick_ns) / 1_000_000_000
+			// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
+			// delta so the cadence is perfectly jitter-free (or any fixed rate).
+			dt_s := PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
+			playhead_accumulator += dt_s
 			playback_fps := timeline_fps()
+			catchup := i64(0)
 			for playhead_accumulator >= 1.0 / playback_fps {
 				playhead.frame += 1
+				catchup += 1
 				playhead_accumulator -= 1.0 / playback_fps
 			}
-			if timeline_frame_at(playhead.frame).active_clip == nil {
+			if catchup > 0 {
+				sync.atomic_store(&audio_ph_src, 2)
+				sync.atomic_store(&audio_ph_catch, catchup)
+				if catchup > 1 {
+					fmt.printf("[pb] burst +%d ph=%d dt=%.1fms acc=%.3fs\n", catchup, playhead.frame, f64(now_ns-last_tick_ns)/1e6, playhead_accumulator)
+				}
+			}
+			stop_frame := playback_stop_frame
+			if stop_frame < 0 {
+				stop_frame = timeline_duration()
+			}
+			if playhead.frame >= stop_frame {
 				playhead.playing = false
 				preview.playing = false
+				playback_stop_frame = -1
+				fmt.printf("[pb] auto-stop ph=%d stop=%d\n", playhead.frame, stop_frame)
 			}
 			// Playback is real-time: the playhead (and with it the audio) runs on
 			// the wall clock. Video decode is best-effort on top of that clock.
 		}
 		last_tick_ns = now_ns
 		sync.atomic_store(&ui_playhead_frame, playhead.frame)
-		_ = timeline_frame_at(playhead.frame)
 		audio_update()
 		poll_completed_thread()
 		ui_frame_count += 1
@@ -432,10 +598,11 @@ main :: proc() {
 			ui_report_tick = now_ns
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
 			elapsed := f64(now_ns - ui_report_tick) / 1e9
-			fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d frontier=%d gap=%d\n",
+			fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d frontier=%d gap=%d acc=%.3fs src=%d catch=%d prod=%d\n",
 				f64(ui_frame_count) / elapsed,
 				f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
-				playhead.frame, preview_frontier, playhead.frame - preview_frontier)
+				playhead.frame, preview_frontier, playhead.frame - preview_frontier,
+				playhead_accumulator, sync.atomic_load(&audio_ph_src), sync.atomic_load(&audio_ph_catch), sync.atomic_load(&audio_prod_frame))
 			ui_report_tick = now_ns
 			ui_frame_count = 0
 			ui_dec_us = 0
@@ -479,6 +646,7 @@ main :: proc() {
 		if pass != nil {
 			render_clay(&renderer, command_buffer, pass, commands)
 			draw_clip_markers(&renderer, command_buffer, pass)
+			draw_drag_ghost(&renderer, command_buffer, pass)
 			if len(timeline.tracks) > 0 {
 				draw_timeline_ruler(&renderer, command_buffer, pass)
 				draw_render_range(&renderer, command_buffer, pass)

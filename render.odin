@@ -460,8 +460,12 @@ rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
 
 render_audio_pull :: proc(a: ^Render_Audio_Src, up_to48: i64) {
 	for a.have48 < up_to48 {
-		// at_seconds growing keeps the underlying decoder from re-seeking.
-		n := decode_audio_chunk(&a.dec, f64(a.have48) / f64(RENDER_AUDIO_RATE))
+		// Sequential continue (-1): render_audio_open already seeked to the
+		// content anchor, and re-targeting via have48 every chunk can look like
+		// a backward move against the resampled last_ts, triggering a backward
+		// re-seek that re-decodes and duplicates audio (stutter/desync in the
+		// rendered file). Same forward-only rule playback uses.
+		n := decode_audio_chunk(&a.dec, -1.0)
 		if n <= 0 {
 			break
 		}
@@ -482,8 +486,22 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 	if !seek_audio(&a.dec, content_sec) {
 		return false
 	}
-	a.first48 = i64(content_sec * f64(RENDER_AUDIO_RATE))
-	a.have48 = a.first48
+	// Align the fifo base to the decoder's real landing PTS, not the asked
+	// position: an AAC seek can land tens of ms off, and labeling the fifo with
+	// the asked time compounds that offset over the whole render. Same fix
+	// playback applied (audio.odin audio_provision).
+	n := decode_audio_chunk(&a.dec, content_sec)
+	if n <= 0 {
+		return false
+	}
+	src := &a.dec
+	real_sec := f64(avutil.rescale_q(src.first_ts, src.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
+	a.first48 = i64(real_sec * f64(RENDER_AUDIO_RATE))
+	a.have48 = a.first48 + i64(n)
+	for j in 0 ..< n {
+		append(&a.fifo, f32(a.dec.s16[j * 2 + 0]) / 32768.0)
+		append(&a.fifo, f32(a.dec.s16[j * 2 + 1]) / 32768.0)
+	}
 	return true
 }
 
@@ -568,11 +586,14 @@ render_worker_run :: proc() {
 		}
 	}
 
-	// The output NTP-style frame rate comes from the first video source so the
-	// timeline frame grid (which is the source's own frame indices) renders 1:1
-	// with both the video and the 48 kHz audio bus.
+	// The output frame rate: an explicit project fps wins; otherwise it comes
+	// from the first video source so the timeline frame grid (which is the
+	// source's own frame indices) renders 1:1 with both the video and the 48 kHz
+	// audio bus.
 	rfps_num, rfps_den := c.int(60), c.int(1)
-	if len(render_job_videos) > 0 {
+	if project.frame_rate > 0 {
+		rfps_num, rfps_den = 0, 1
+	} else if len(render_job_videos) > 0 {
 		rfps_num = render_job_videos[0].dec.fps_num
 		rfps_den = render_job_videos[0].dec.fps_den
 		if rfps_num <= 0 || rfps_den <= 0 {
@@ -580,6 +601,17 @@ render_worker_run :: proc() {
 		}
 	}
 	rfps := f64(rfps_num) / f64(rfps_den)
+	if project.frame_rate > 0 {
+		rfps = project.frame_rate
+		rfps_num, rfps_den = c.int(rfps), 1
+		if math.abs(rfps - 23.976) < 0.001 {
+			rfps_num, rfps_den = 24000, 1001
+		} else if math.abs(rfps - 29.97) < 0.001 {
+			rfps_num, rfps_den = 30000, 1001
+		} else if math.abs(rfps - 59.94) < 0.001 {
+			rfps_num, rfps_den = 60000, 1001
+		}
+	}
 	spf := int(MAX_AUDIO_FRAME_SAMPLES)
 	if rfps > 0 {
 		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(0, int(math.round(48000.0 / rfps))))
@@ -635,6 +667,17 @@ render_worker_run :: proc() {
 
 		if has_audio && spf > 0 {
 			mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+			// Exact per-frame sample count: difference of consecutive 48 kHz
+			// frame boundaries, not a fixed rounded 48000/fps. For fps that
+			// don't evenly divide 48000 (23.976/29.97/59.94) this alternates
+			// (e.g. 1601/1602 at 29.97) and averages to the true rate, so the
+			// rendered audio length matches the video instead of drifting.
+			cur_spf := spf
+			if rfps > 0 {
+				b0 := audio_frame_boundary48(timeline_frame, rfps)
+				b1 := audio_frame_boundary48(timeline_frame + 1, rfps)
+				cur_spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
+			}
 			for aa in 0 ..< len(render_job_audios) {
 				a := &render_job_audios[aa]
 				if !a.dec.opened {
@@ -644,17 +687,29 @@ render_worker_run :: proc() {
 					continue
 				}
 				start48 := i64(f64(timeline_frame - a.timeline_start_frame + a.source_start_frame) * f64(RENDER_AUDIO_RATE) / rfps)
-				render_audio_pull(a, start48 + i64(spf))
-				if a.have48 < start48 + i64(spf) {
+				render_audio_pull(a, start48 + i64(cur_spf))
+				if start48 < a.first48 || a.have48 < start48 + i64(cur_spf) {
 					continue
 				}
 				base := int(start48 - a.first48)
-				for s in 0 ..< spf {
+				for s in 0 ..< cur_spf {
 					mix[s * 2 + 0] += a.fifo[(base + s) * 2 + 0]
 					mix[s * 2 + 1] += a.fifo[(base + s) * 2 + 1]
 				}
+				// Trim the consumed fifo head so decode stays forward-only and
+				// long renders don't accumulate the whole clip in memory
+				// (mirrors playback's per-frame trim).
+				drop := int(start48 - a.first48) + cur_spf
+				if drop > 0 {
+					a.first48 += i64(drop)
+					remain := len(a.fifo) - drop * 2
+					if remain > 0 {
+						mem.copy(raw_data(a.fifo[0:]), raw_data(a.fifo[drop * 2:]), remain * size_of(f32))
+					}
+					resize(&a.fifo, remain)
+				}
 			}
-			if !rend_enc_push_audio(&e, mix[:spf * 2]) {
+			if !rend_enc_push_audio(&e, mix[:cur_spf * 2]) {
 				err_msg = "audio encoding failed"
 				fail = true
 				return
