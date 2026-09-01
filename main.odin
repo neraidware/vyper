@@ -90,6 +90,69 @@ effective_playback_rate :: proc() -> f64 {
 	return playback_rate * f64(1 + max(0, playback_boost))
 }
 
+// timeline_track_hit_test returns the timeline track whose empty (non-clip)
+// region the pointer is over, or -1 if the pointer is on a clip, the track
+// name, or outside the timeline. Only the clips region of a track (right of the
+// name column) counts as that track's empty space.
+timeline_track_hit_test :: proc(mx, my: f32) -> int {
+	if len(timeline.tracks) == 0 {
+		return -1
+	}
+	for ti in 0 ..< len(timeline.tracks) {
+		row := clay.GetElementData(clay.ID("TrackRow", u32(ti))).boundingBox
+		if my < row.y || my > row.y + row.height || mx <= row.x {
+			continue
+		}
+		// Over a clip is not empty space.
+		on_clip := false
+		for ci in 0 ..< len(timeline.tracks[ti].clips) {
+			if clay.PointerOver(clay.ID("TimelineClip", u32(ti * 1000 + ci))) {
+				on_clip = true
+				break
+			}
+		}
+		if on_clip {
+			continue
+		}
+		return ti
+	}
+	return -1
+}
+
+// open_track_context_menu shows the per-track right-click menu at the pointer.
+open_track_context_menu :: proc(mx, my: f32, track: int) {
+	ctx_menu.open = true
+	ctx_menu.x = mx
+	ctx_menu.y = my
+	ctx_menu.target_track = track
+}
+
+// close_context_menu dismisses the context menu, if open.
+close_context_menu :: proc() {
+	ctx_menu.open = false
+	ctx_menu.target_track = -1
+}
+
+// escape_dismiss closes any transient overlay (right-click context menu, the
+// playback-rate dropdown). Called on ESC while not editing a text field.
+escape_dismiss :: proc() {
+	close_context_menu()
+	playback_rate_open = false
+}
+
+// handle_ctx_option dispatches a context-menu option click. This first milestone
+// just closes the menu; the Add Text/Audio Clip actions are wired when the text
+// clip model lands.
+handle_ctx_option :: proc() {
+	if clay.PointerOver(clay.ID("CtxAddText")) {
+		close_context_menu()
+	} else if clay.PointerOver(clay.ID("CtxAddAudio")) {
+		close_context_menu()
+	} else {
+		close_context_menu()
+	}
+}
+
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
 // rate_clicked reports whether the collapsed rate button itself was clicked
 // (toggles the menu). Otherwise, if the menu is open, a click on one of its
@@ -295,6 +358,7 @@ main :: proc() {
 
 	running := true
 	was_mouse_down := false
+	was_right_down := false
 	ui_report_tick := u64(0)
 	ui_frame_count := 0
 	ui_dec_us := i64(0)
@@ -314,6 +378,8 @@ main :: proc() {
 					case sdl.K_ESCAPE:
 						edit_cancel()
 					}
+				} else if event.key.key == sdl.K_ESCAPE && !event.key.repeat {
+					escape_dismiss()
 				} else if !event.key.repeat {
 					switch event.key.key {
 					case sdl.K_SPACE:
@@ -409,6 +475,7 @@ main :: proc() {
 		mouse_x, mouse_y: f32
 		mouse_buttons := sdl.GetMouseState(&mouse_x, &mouse_y)
 		mouse_down := sdl.MouseButtonFlag.LEFT in mouse_buttons
+		right_down := sdl.MouseButtonFlag.RIGHT in mouse_buttons
 		middle_down := sdl.MouseButtonFlag.MIDDLE in mouse_buttons
 		mods := sdl.GetModState()
 		alt_down := sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods
@@ -721,7 +788,24 @@ if drag_clip.timeline_start_frame != new_start {
 		if was_click {
 			handle_playback_rate_click(rate_clicked)
 		}
+		// Right-click: open a context menu when the button goes down over a
+		// track's empty space. Any fresh left-click or a new right-click that
+		// lands elsewhere closes an open menu first.
+		if right_down && !was_right_down {
+			if track := timeline_track_hit_test(mouse_x, mouse_y); track >= 0 {
+				open_track_context_menu(mouse_x, mouse_y, track)
+			} else {
+				close_context_menu()
+			}
+		} else if was_click && ctx_menu.open {
+			if clay.PointerOver(clay.ID("CtxMenu")) {
+				handle_ctx_option()
+			} else {
+				close_context_menu()
+			}
+		}
 		was_mouse_down = mouse_down
+		was_right_down = right_down
 		now_ns := sdl.GetTicksNS()
 		if last_tick_ns == 0 {
 			last_tick_ns = now_ns

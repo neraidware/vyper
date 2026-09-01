@@ -483,6 +483,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			}
 		}
 	}
+	draw_context_menu()
 
 	return clay.EndLayout(0)
 }
@@ -618,6 +619,45 @@ jog_button :: proc(name: string, label: string, dir: int) {
 		cornerRadius = clay.CornerRadiusAll(4),
 	}) {
 		clay.Text(strings.concatenate({label, boost}), clay.TextElementConfig{textColor = active ? BUTTON_BORDER_HOVER : TEXT, fontSize = 14})
+	}
+}
+
+// ctx_option renders one row (option) of the floating timeline context menu.
+ctx_option :: proc(id_name: string, label: string) {
+	ctx_border := clay.BorderOutside(1)
+	if clay.UI(clay.ID(id_name))({
+		layout = {sizing = {width = clay.SizingFixed(180), height = clay.SizingFixed(30)}, padding = clay.Padding{left = 10, right = 10}, childAlignment = {x = .Left, y = .Center}},
+		backgroundColor = BUTTON,
+		border = {color = BUTTON_BORDER, width = ctx_border},
+		cornerRadius = clay.CornerRadiusAll(0),
+	}) {
+		clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+	}
+}
+
+// draw_context_menu renders the right-click menu over the timeline as a
+// floating overlay anchored at the pointer. Menu item clicks are dispatched by
+// the main loop (handle_ctx_option); the option set is what the coming text-clip
+// model will populate.
+draw_context_menu :: proc() {
+	if !ctx_menu.open {
+		return
+	}
+	ctx_border := clay.BorderOutside(1)
+	if clay.UI(clay.ID("CtxMenu"))({
+		layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})}, layoutDirection = .TopToBottom, childGap = 1, padding = clay.PaddingAll(2)},
+		backgroundColor = BUTTON,
+		border = {color = BUTTON_BORDER, width = ctx_border},
+		cornerRadius = clay.CornerRadiusAll(6),
+		floating = {
+			offset = {ctx_menu.x, ctx_menu.y},
+			zIndex = 2000,
+			attachTo = .Root,
+			pointerCaptureMode = .Capture,
+		},
+	}) {
+		ctx_option("CtxAddText", "Add Text Clip")
+		ctx_option("CtxAddAudio", "Add Audio Clip")
 	}
 }
 

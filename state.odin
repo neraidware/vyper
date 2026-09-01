@@ -323,3 +323,14 @@ Timeline_Frame :: struct {
 	active_clip: ^Clip,
 	clip_frame: i64,
 }
+
+// ContextMenu is the right-click menu over the timeline. Only one at a time.
+// open + target_track >= 0 means a per-track menu is showing; x/y are the
+// screen-space position to anchor the floating popup.
+ContextMenu :: struct {
+	open:         bool,
+	x:            f32,
+	y:            f32,
+	target_track: int, // -1 = none/between tracks
+}
+ctx_menu: ContextMenu
