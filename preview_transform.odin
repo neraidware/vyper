@@ -265,15 +265,18 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		case .Scale:
 		}
 		PW := f32(project.width)
-		PH := f32(project.height)
 		twpx := f32(clip.source_w)
 		thpx := f32(clip.source_h)
 		if twpx <= 0 || thpx <= 0 {
 			return
 		}
-		// Base project-unit size at scale=1.
+		// Base project-unit size at scale=1. clip_image_bounds renders the text
+		// box scaling BOTH axes by the same uniform factor (f = v.width/PREVIEW_W),
+		// so the drag math must use that same uniform factor (PW/PREVIEW_W) for w
+		// and h; otherwise the geometry the math pins differs from the drawn box
+		// and the opposite-handle pivot visibly drifts for non-16:9 projects.
 		bw0 := twpx * PW / f32(PREVIEW_W)
-		bh0 := thpx * PH / f32(PREVIEW_H)
+		bh0 := thpx * PW / f32(PREVIEW_W)
 		scale0 := handle_start_scale
 		tx0 := handle_start_tx
 		ty0 := handle_start_ty
