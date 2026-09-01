@@ -15,6 +15,7 @@ import avfmt "vendor/ffmpeg/avformat"
 import avutil "vendor/ffmpeg/avutil"
 import sws "vendor/ffmpeg/swscale"
 import sdl "vendor:sdl3"
+import stb "vendor:stb/truetype"
 
 // ---------------------------------------------------------------------------
 // Video export: composite the timeline (as shown in the preview) and encode it
@@ -125,6 +126,33 @@ Render_Video_Src :: struct {
 	blit:                []u8,  // fw*fh*4 scaled frame
 }
 
+// Render_Text_Src snapshots a .Text generator clip for the worker. It carries
+// the title plus the transform math needed to place it at output resolution:
+// box = text (source_w x source_h, in text px) * scale * (out_w / PREVIEW_W).
+Render_Text_Src :: struct {
+	name:               string, // owned copy, freed by the worker
+	timeline_start_frame: i64,
+	source_length_frames: i64,
+	transform_x:        f32, // top-left anchor
+	transform_y:        f32,
+	scale:              f32,
+	source_w:           c.int, // text_w (tight ink width, text px)
+	source_h:           c.int, // text_h (tight ink height, text px)
+}
+
+// The render worker rasterizes text with its own font + scratch so it never
+// races the UI thread's shared text_clip_font/text_clip_scratch globals (the
+// preview thread can be compositing a text slot while the worker renders).
+render_text_font:      stb.fontinfo
+render_text_font_init: bool
+render_text_scratch:   [8192]u8
+
+// render_text_clip_into_buffer_worker: render-thread wrapper for the shared
+// rasterize core, using the worker-local font/scratch above.
+render_text_clip_into_buffer_worker :: proc(title: string, buf: []u8, bw, bh: int) -> (ox: int, oy: int, ow: int, oh: int) {
+	return rasterize_title_into_buffer(title, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_scratch[:])
+}
+
 Render_Audio_Src :: struct {
 	path:                 cstring,
 	stream_index:         c.int,
@@ -139,6 +167,7 @@ Render_Audio_Src :: struct {
 
 render_job_videos: []Render_Video_Src
 render_job_audios: []Render_Audio_Src
+render_job_texts: []Render_Text_Src
 render_job_out_path: cstring
 render_job_width:  c.int
 render_job_height: c.int
@@ -546,10 +575,18 @@ render_worker_run :: proc() {
 				a.path = nil
 			}
 		}
+		for &t in render_job_texts {
+			if t.name != "" {
+				delete(t.name)
+				t.name = ""
+			}
+		}
 		delete(render_job_videos)
 		delete(render_job_audios)
+		delete(render_job_texts)
 		render_job_videos = nil
 		render_job_audios = nil
+		render_job_texts = nil
 		if render_job_out_path != nil {
 			mem.delete_cstring(render_job_out_path)
 			render_job_out_path = nil
@@ -639,6 +676,12 @@ render_worker_run :: proc() {
 	canvas := make([]u8, int(render_job_width) * int(render_job_height) * 4)
 	defer delete(canvas)
 
+	// Text compositing scratch: title rasterized at PREVIEW_W x PREVIEW_H (the
+	// preview's text-pixel scale), then scaled-blitted onto the canvas. Reused
+	// across frames and across text clips within a frame.
+	text_buf := make([]u8, PREVIEW_W * PREVIEW_H * 4)
+	defer delete(text_buf)
+
 	for frame_idx in 0 ..< render_job_nframes {
 		if poll_cancel() {
 			return
@@ -658,6 +701,22 @@ render_worker_run :: proc() {
 			}
 			decode_into_buffer(&v.dec, v.blit, v.fw, v.fh)
 			render_blit(canvas, render_job_width, render_job_height, v)
+		}
+		// Composite all text clips covering this frame (after the decodable
+		// clips, alpha-blended on top, matching the preview layering).
+		for i := 0; i < len(render_job_texts); i += 1 {
+			t := &render_job_texts[i]
+			if timeline_frame < t.timeline_start_frame || timeline_frame >= t.timeline_start_frame + t.source_length_frames {
+				continue
+			}
+			if t.name == "" {
+				continue
+			}
+			ox, oy, ow, oh := render_text_clip_into_buffer_worker(t.name, text_buf, PREVIEW_W, PREVIEW_H)
+			if ow <= 0 || oh <= 0 {
+				continue
+			}
+			render_text_blit(canvas, render_job_width, render_job_height, text_buf, ox, oy, ow, oh, t.transform_x, t.transform_y, t.scale)
 		}
 		if !rend_enc_video_frame(&e, canvas, render_job_width, render_job_height, frame_idx) {
 			err_msg = "video encoding failed"
@@ -791,6 +850,63 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 	}
 }
 
+// render_text_blit alpha-blends a rasterized text clip onto the canvas. text_buf
+// holds the title rasterized at PREVIEW_W x PREVIEW_H (the preview's text-pixel
+// scale); the tight ink rect [ox..ox+ow)x[oy..oy+oh) is scaled to the output box
+// anchored at the clip's top-left (tx, ty) in project/output pixels, matching the
+// preview's text box math: bw0 = ow * (out_w/PREVIEW_W), bh0 = oh * (out_h/PREVIEW_H),
+// box = bw0*scale x bh0*scale. White glyphs are alpha-blended over the frame.
+render_text_blit :: proc(
+	canvas: []u8, draw_w, draw_h: c.int,
+	text_buf: []u8, ox, oy, ow, oh: int,
+	tx, ty, scale: f32,
+) {
+	if ow <= 0 || oh <= 0 {
+		return
+	}
+	bw0 := f32(ow) * f32(draw_w) / f32(PREVIEW_W)
+	bh0 := f32(oh) * f32(draw_h) / f32(PREVIEW_H)
+	w := bw0 * scale
+	h := bh0 * scale
+	x0 := tx
+	y0 := ty
+	if w <= 0 || h <= 0 {
+		return
+	}
+	left := max(c.int(x0), 0)
+	top := max(c.int(y0), 0)
+	right := min(c.int(x0 + w), draw_w)
+	bottom := min(c.int(y0 + h), draw_h)
+	if bottom <= top || right <= left {
+		return
+	}
+	for row in 0 ..< bottom - top {
+		// Nearest-neighbor source sample within the tight text rect.
+		srow := oy + int((f64(top - c.int(y0) + row) + 0.5) * f64(oh) / f64(h))
+		srow = max(oy, min(oy + oh - 1, srow))
+		src_row := text_buf[uint(srow) * uint(PREVIEW_W) * 4:]
+		dst_row := canvas[(uint(top + row) * uint(draw_w) + uint(left)) * 4:]
+		for col in 0 ..< right - left {
+			scol := ox + int((f64(left - c.int(x0) + col) + 0.5) * f64(ow) / f64(w))
+			scol = max(ox, min(ox + ow - 1, scol))
+			s := src_row[uint(scol) * 4:]
+			d := dst_row[uint(col) * 4:]
+			a := int(s[3])
+			if a == 0 {
+				continue
+			}
+			ia := 255 - a
+			// Straight-alpha blend: out = src*a + dst*(1-a). Glyph is white
+			// (255,255,255), so keeping a the same for all channels tints the
+			// underlying frame with white by the glyph's coverage.
+			for ch in 0 ..< 3 {
+				d[ch] = u8((255 * a + int(d[ch]) * ia) / 255)
+			}
+			d[3] = 255
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Progress plumbing + job startup (main thread).
 // ---------------------------------------------------------------------------
@@ -889,6 +1005,7 @@ render_start :: proc() {
 	// Snapshots.
 	cls := [dynamic]Render_Video_Src{}
 	auds := [dynamic]Render_Audio_Src{}
+	txts := [dynamic]Render_Text_Src{}
 	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 		tr := &timeline.tracks[track_idx]
 		for i := 0; i < len(tr.clips); i += 1 {
@@ -924,12 +1041,22 @@ case .Audio:
 		case .Empty:
 			// no renderable content in this clip (placeholder for text later)
 		case .Text:
-			// generator clip — no decoded output yet; produced by the render task
+			append(&txts, Render_Text_Src{
+				name = strings.clone(clip.name),
+				timeline_start_frame = clip.timeline_start_frame,
+				source_length_frames = clip.source_length_frames,
+				transform_x = clip.transform_x,
+				transform_y = clip.transform_y,
+				scale = clip.scale,
+				source_w = clip.source_w,
+				source_h = clip.source_h,
+			})
 		}
 		}
 	}
 	render_job_videos = cls[:]
 	render_job_audios = auds[:]
+	render_job_texts = txts[:]
 	render_job_width = project.width
 	render_job_height = project.height
 	render_job_start = start_frame
@@ -980,10 +1107,18 @@ rising_thread_failed :: proc() {
 			mem.delete_cstring(a.path)
 		}
 	}
+	for &t in render_job_texts {
+		if t.name != "" {
+			delete(t.name)
+			t.name = ""
+		}
+	}
 	delete(render_job_videos)
 	delete(render_job_audios)
+	delete(render_job_texts)
 	render_job_videos = nil
 	render_job_audios = nil
+	render_job_texts = nil
 	if render_job_out_path != nil {
 		mem.delete_cstring(render_job_out_path)
 		render_job_out_path = nil
