@@ -562,36 +562,39 @@ playback_rate_name :: proc(rate: f64) -> string {
 // as 1x.
 playback_rate_dropdown :: proc() {
 	rate_border := clay.BorderOutside(1)
-	if clay.UI(clay.ID("PlayRateBox"))({
-		layout = {
-			sizing = {width = clay.SizingFixed(64), height = clay.SizingFit({})},
-			layoutDirection = .TopToBottom,
-			childGap = 2,
-		},
+	if clay.UI(clay.ID("PlayRateButton"))({
+		layout = {sizing = {width = clay.SizingFixed(64), height = clay.SizingFixed(28)}, padding = clay.Padding{left = 8, right = 8}, childAlignment = {x = .Center, y = .Center}},
+		backgroundColor = BUTTON,
+		border = {color = playback_rate_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = rate_border},
+		cornerRadius = clay.CornerRadiusAll(4),
 	}) {
-		if clay.UI(clay.ID("PlayRateButton"))({
-			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(28)}, padding = clay.Padding{left = 8, right = 8}, childAlignment = {x = .Center, y = .Center}},
+		clay.Text(playback_rate_label(playback_rate), clay.TextElementConfig{textColor = playback_rate_open ? BUTTON_BORDER_HOVER : TEXT, fontSize = 14})
+	}
+	if playback_rate_open {
+		// A proper floating dropdown: the menu overlays the UI anchored just
+		// below the rate button instead of expanding the surrounding layout.
+		if clay.UI(clay.ID("PlayRateMenu"))({
+			layout = {
+				sizing = {width = clay.SizingFixed(64), height = clay.SizingFit({})},
+				layoutDirection = .TopToBottom,
+				childGap = 2,
+				padding = clay.PaddingAll(4),
+			},
 			backgroundColor = BUTTON,
-			border = {color = playback_rate_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = rate_border},
+			border = {color = BUTTON_BORDER, width = rate_border},
 			cornerRadius = clay.CornerRadiusAll(4),
+			floating = {
+				offset = {0, 4},
+				parentId = clay.ID("PlayRateButton").id,
+				zIndex = 1000,
+				attachment = {element = .LeftTop, parent = .LeftBottom},
+				attachTo = .ElementWithId,
+				pointerCaptureMode = .Capture,
+				clipTo = .None,
+			},
 		}) {
-			clay.Text(playback_rate_label(playback_rate), clay.TextElementConfig{textColor = playback_rate_open ? BUTTON_BORDER_HOVER : TEXT, fontSize = 14})
-		}
-		if playback_rate_open {
-			if clay.UI(clay.ID("PlayRateMenu"))({
-				layout = {
-					sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-					layoutDirection = .TopToBottom,
-					childGap = 2,
-					padding = clay.PaddingAll(4),
-				},
-				backgroundColor = BUTTON,
-				border = {color = BUTTON_BORDER, width = rate_border},
-				cornerRadius = clay.CornerRadiusAll(4),
-			}) {
-				for rate in PLAYBACK_RATES {
-					settings_button(playback_rate_name(rate), playback_rate_label(rate), playback_rate == rate)
-				}
+			for rate in PLAYBACK_RATES {
+				settings_button(playback_rate_name(rate), playback_rate_label(rate), playback_rate == rate)
 			}
 		}
 	}
