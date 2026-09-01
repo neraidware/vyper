@@ -228,8 +228,12 @@ delete_selected_clip_raw :: proc() {
 	}
 	selected_track = -1
 	selected_index = -1
-	// The removed clip's decoded state lives on in the asset-keyed preview
-	// slots until invalidated: drop it so the deleted clip cannot keep painting.
+	// CRITICAL: invalidation MUST follow every delete. The timeline no longer
+	// references `removed`, but the per-clip preview slots still hold this
+	// clip's decoded frames, open decoder, and GPU texture. Without
+	// invalidate_preview_slots the deleted clip keeps painting at the playhead
+	// (classic "deleted clip still renders" bug). Do not remove this regardless
+	// of how the delete is wired — any new delete path must do the same.
 	moving_clip = false
 	moving_preview_clip = false
 	drag_clip = nil

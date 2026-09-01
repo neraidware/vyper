@@ -38,7 +38,10 @@ async_decoder: Async_Decoder
 
 // vdec_decode performs one decode (worker thread). It may open the decoder for
 // a new path, serves from the RAM frame cache, and on success fills
-// ad.wbuf (worker-private).
+// ad.wbuf (worker-private). WARNING: this is the ASYNC mirror of
+// decode_clip_frame_sync (same persistent-decoder + cache-hit guard). If you
+// change the cache-hit/last_frame logic in one, update the other to match, then
+// re-run NERED_CACHE_PROBE (0 mismatches).
 vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, frame_idx: i64) -> bool {
 	if !ad.dec.opened || ad.dec_path != path {
 		if !open_clip_decoder(&ad.dec, path) {

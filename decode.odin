@@ -13,6 +13,34 @@ import sws "vendor/ffmpeg/swscale"
 // source file open across calls so sequential playback decodes forward without
 // re-seeking; a jump to a non-consecutive frame triggers a keyframe seek.
 //
+// CRITICAL INVARIANT — READ BEFORE TOUCHING last_frame/have_last:
+//
+//   last_frame is supposed to mirror WHERE THE PHYSICAL FFMPEG DECODER IS
+//   PARKED, not merely "the newest frame index somebody rendered". The H.264
+//   decoder is inherently sequential: after it has produced frame N it will
+//   produce N+1 next from the exact in-file position it stopped at. The only
+//   way to read an earlier frame is a seek (avformat.seek_frame + flush).
+//
+//   The forward fast-path in decode_source_frame relies on this: it only
+//   decodes "the next frame" when frame_idx == last_frame + 1, ASSUMING the
+//   physical decoder is currently parked at last_frame. If you ever set
+//   last_frame to a value that is AHEAD of the physical decoder position, the
+//   next forward request will decode from the true (behind) position but LABEL
+//   the result with the requested (ahead) index — wrong pixels served and
+//   cached under a shifted key. That is exactly the classic bug where, at a
+//   flush (no-gap) clip boundary, a stable wrong image plays whose content
+//   belongs to an earlier/deleted clip region and only "fixes" for a frame
+//   or two whenever a re-seek lands.
+//
+//   RULES:
+//     * Only advance last_frame to a frame the decoder ACTUALLY produced
+//       (forward decode or a seek that landed on it).
+//     * A cache hit that does NOT reposition the decoder must therefore NOT
+//       advance last_frame past the decoder's true position. See the guard in
+//       decode_clip_frame_sync.
+//     * If you add a new write to last_frame/have_last, prove the physical
+//       decoder is consistent with it, or reuse the guard below.
+//
 // TODO(per TODO.md): promote this to a per-asset decoder cache with a bounded
 // rolling frame pool once real-time multi-track composition lands.
 Clip_Decoder :: struct {
@@ -36,9 +64,13 @@ Clip_Decoder :: struct {
 	dst_linesize: [4]c.int,
 	dst_w, dst_h: c.int,
 	fit_ox, fit_oy: c.int,
-	// Index of the source frame last handed out. Requests for
-	// last_frame+1 continue forward; anything else re-seeks.
+	// last_frame is the index of the source frame the physical FFmpeg decoder
+	// is CURRENTLY parked on (see the struct invariant above). A request for
+	// last_frame+1 decodes forward in place; anything else forces a re-seek.
+	// MUST track the physical decoder position — never over-claim it.
 	last_frame:   i64,
+	// have_last reports whether last_frame is valid (decoder has produced at
+	// least one frame since the last reset/seek). Mirrors last_frame's rule.
 	have_last:    bool,
 	// PTS (stream time base) of the most recently produced frame; used by the
 	// frame-check probe to verify the seek path lands on the requested index.
@@ -49,6 +81,9 @@ Clip_Decoder :: struct {
 	// Bounded RAM cache of decoded frames (RGBA, tightly packed). Keeps the
 	// decoded frame data resident in memory and avoids re-decoding recent
 	// frames when the playhead moves back a little. Evicts oldest on write.
+	// NOTE: the cache key is a frame index, UNRELATED to last_frame. A cache
+	// hit returns pixels WITHOUT moving the physical decoder — which is why
+	// cache hits must use the last_frame guard, never a blind assignment.
 	cache:         [dynamic]Frame_Cache_Entry,
 }
 
@@ -91,7 +126,12 @@ clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 
 FRAME_CACHE_CAPACITY :: 24
 
-// cache_find returns the cached RGBA data for a frame, or nil.
+// cache_find returns cached RGBA data for a frame, or nil.
+// IMPORTANT: a cache hit returns pixels WITHOUT moving the physical FFmpeg
+// decoder. That is the whole subtlety behind the last_frame guard in
+// decode_clip_frame_sync: the cache can legitimately hold a frame the decoder
+// has already played past, so finding pixels for frame_idx says NOTHING about
+// where the decoder is parked. Do not use a hit to reposition last_frame.
 cache_find :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> []u8 {
 	for i := 0; i < len(dec.cache); i += 1 {
 		if dec.cache[i].frame == frame_idx {
@@ -322,6 +362,9 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		return false
 	}
 	// Consecutive forward request: just decode the next frame in place.
+	// SAFE ONLY because dec.last_frame mirrors the physical decoder position
+	// (struct invariant). If last_frame were over-claimed by a caller, this
+	// would decode the true-next pixel but label it frame_idx -> wrong content.
 	if dec.have_last && frame_idx == dec.last_frame + 1 {
 		if !decode_one_forward(dec) {
 			return false
@@ -450,6 +493,14 @@ decode_into_buffer :: proc(dec: ^Clip_Decoder, out: []u8, w, h: c.int) {
 // (PREVIEW_W x PREVIEW_H RGBA), opening the decoder on first use and using the
 // decoder's RAM frame cache to avoid re-decoding. Returns true on success. Used
 // by the multi-clip preview compositor (one decoder per clip).
+//
+// This is a PERSISTENT decoder: dec survives across calls, so dec.last_frame
+// reflects the physical FFmpeg position left by the PREVIOUS request. The
+// cache-hit branch below is the delicate one — see the guard. A cache hit must
+// never advance last_frame past the decoder's real position, or the next
+// forward request serves wrong pixels (the flush-boundary bug). If you change
+// anything here, re-run: NERED_CACHE_PROBE and NERED_FRAME_PROBE must stay at
+// 0 mismatches.
 decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64, out: []u8) -> bool {
 	if !dec.opened || dec.path != path {
 		if dec.opened {

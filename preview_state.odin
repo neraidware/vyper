@@ -67,17 +67,19 @@ update_preview_slots :: proc() -> bool {
 			slot.timeline_start_frame = clip.timeline_start_frame
 			slot.source_start_frame = clip.source_start_frame
 			if anchor_shifted {
-				// The slot's decoded content (buffer + texture) belongs to the
-				// previous clip/position of this asset. Until a frame is decoded
-				// for the CURRENT position, has_frame must be false, or
-				// draw_preview keeps painting the old clip's image for every
-				// frame the decode takes (same-asset switches, e.g. split
-				// halves, don't reset the slot). Decode advances the frontier
-				// invalid too, so request the exact playhead frame.
+				// A clip was moved (drag) or its source window changed. The
+				// slot's decoded buffer + texture still hold the OLD position's
+				// pixels. Until a frame is decoded for the CURRENT position,
+				// has_frame must be false and the buffer zeroed, or
+				// draw_preview keeps painting the stale image (same-asset
+				// switches — e.g. split halves moving — don't reset the slot's
+				// decoder, so without this the old clip's face lingers).
+				// Decode advances the frontier invalid too, so request the
+				// exact playhead frame once, then normal dropped-frame resume.
 				slot.has_frame = false
 				slot.tex_dirty = false
 				slot.have_frontier = false
-				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))   // <-- ADD
+				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
 			slot.transform_x = clip.transform_x
 			slot.transform_y = clip.transform_y
@@ -125,10 +127,15 @@ update_preview_slots :: proc() -> bool {
 
 // invalidate_preview_slots drops every preview slot's decoder, RAM cache,
 // buffer and has_frame state so the next update_preview_slots re-derives it
-// entirely from the current timeline. Called after model edits that remove or
-// relocate clips (ripple delete, raw delete, cross-track move): slots are keyed
-// by asset only, so without this a slot would keep the removed clip's decoded
-// frames and GPU texture as a second state fighting the covering clip.
+// entirely from the current timeline.
+//
+// MUST be called after ANY model edit that removes clips (ripple delete, raw
+// delete) or otherwise invalidates clip identity. Slots hold decoded pixels and
+// an open decoder per clip_id; if you delete a clip and do NOT invalidate, the
+// slot keeps the removed clip's decoded frames + GPU texture alive as a second
+// state that can fight (and show) the removed clip at the playhead. This is the
+// other half of the "deleted clip keeps rendering" bug — the timeline and audio
+// drop the clip, but the preview slot must drop it too, explicitly.
 invalidate_preview_slots :: proc() {
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		slot := &preview_slots[i]
