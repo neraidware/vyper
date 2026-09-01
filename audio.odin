@@ -333,6 +333,11 @@ audio_device_ready: bool
 
 audio_stream: ^sdl.AudioStream
 
+// audio_freq_ratio is the last SetAudioStreamFrequencyRatio applied to
+// audio_stream. It mirrors playback_rate (0/Auto -> 1.0) so the device
+// reproduces audio at the chosen speed; changed only when playback_rate moves.
+audio_freq_ratio: f32 = 1.0
+
 // AUDIO_CUSHION_SEC is how far ahead of the playhead the producer keeps the
 // device, and the queue-fill ceiling. On the producer thread this absorbs the
 // whole UI frame cost; only stalls longer than this resync.
@@ -776,6 +781,22 @@ audio_producer_feed :: proc() {
 	defer audio_rpt_feed_us += u64(sdl.GetTicksNS() - feed_t0)
 	if !audio_device_ready || audio_stream == nil {
 		return
+	}
+	// Playback-rate: set the stream's frequency ratio so the device reproduces
+	// audio at the chosen speed (video already advances at playback_rate on the
+	// wall clock). 0 = Auto -> 1.0. Applied lazily — only when the rate changes —
+	// because the producer runs every ~2ms.
+	want_ratio := f32(max(0.0, playback_rate))
+	if want_ratio <= 0 {
+		want_ratio = 1.0
+	}
+	if want_ratio != audio_freq_ratio {
+		if sdl.SetAudioStreamFrequencyRatio(audio_stream, want_ratio) {
+			audio_freq_ratio = want_ratio
+			if audio_trace {
+				fmt.printf("[tr] stream frequency ratio -> %.2fx\n", want_ratio)
+			}
+		}
 	}
 	audio_pcm_dump_open()
 	audio_dec_dump_open()
