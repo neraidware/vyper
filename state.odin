@@ -340,6 +340,7 @@ ContextMenu :: struct {
 	x:            f32,
 	y:            f32,
 	target_track: int, // -1 = none/between tracks
+	frame:        i64, // timeline frame captured at right-click time
 	submenu:      bool, // the "Add >" flyout is showing
 }
 ctx_menu: ContextMenu

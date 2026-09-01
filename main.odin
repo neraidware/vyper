@@ -119,18 +119,24 @@ timeline_track_hit_test :: proc(mx, my: f32) -> int {
 	return -1
 }
 
-// open_track_context_menu shows the per-track right-click menu at the pointer.
+// open_track_context_menu shows the per-track right-click menu at the pointer,
+// snapshotting the click position (frame) so a later Add-text action inserts at
+// the original right-click location, not where the pointer ends up hovering
+// over the menu.
 open_track_context_menu :: proc(mx, my: f32, track: int) {
 	ctx_menu.open = true
 	ctx_menu.x = mx
 	ctx_menu.y = my
 	ctx_menu.target_track = track
+	track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
+	ctx_menu.frame = i64(max(f32(0), (mx - track_start) / timeline_zoom + timeline_view_start))
 }
 
 // close_context_menu dismisses the context menu, if open.
 close_context_menu :: proc() {
 	ctx_menu.open = false
 	ctx_menu.target_track = -1
+	ctx_menu.frame = 0
 	ctx_menu.submenu = false
 }
 
@@ -144,25 +150,23 @@ escape_dismiss :: proc() {
 // handle_ctx_option dispatches a click on a context-menu entry at (mx, my).
 // Selecting Add > Text Clip creates a Text generator clip on the right-clicked
 // track at the pointer's frame.
-handle_ctx_option :: proc(mx, my: f32) {
+handle_ctx_option :: proc() {
 	if clay.PointerOver(clay.ID("CtxTextClip")) {
-		add_text_clip_at(mx, my)
+		add_text_clip_at()
 	}
 	close_context_menu()
 }
 
-// add_text_clip_at inserts a Text generator clip on ctx_menu.target_track,
-// positioned at the pointer's timeline frame and one second long (shortened to
-// fit its free gap). After insert the new clip becomes the timeline selection.
-add_text_clip_at :: proc(mx, my: f32) {
+// add_text_clip_at inserts a Text generator clip on ctx_menu.target_track at
+// the frame captured when the context menu was opened (right-click), one second
+// long (shortened to fit its free gap). After insert the new clip becomes the
+// timeline selection.
+add_text_clip_at :: proc() {
 	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
 		return
 	}
-	track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-	frame := max(f32(0), (mx - track_start) / timeline_zoom + timeline_view_start)
-
 	sync.mutex_lock(&audio_timeline_mtx)
-	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], i64(frame))
+	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame)
 	sync.mutex_unlock(&audio_timeline_mtx)
 	audio_note_edit()
 
@@ -830,7 +834,7 @@ if drag_clip.timeline_start_frame != new_start {
 			}
 		} else if was_click && ctx_menu.open {
 			if pointer_over_context_menu() {
-				handle_ctx_option(mouse_x, mouse_y)
+				handle_ctx_option()
 			} else {
 				close_context_menu()
 			}
