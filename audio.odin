@@ -784,8 +784,8 @@ audio_producer_feed :: proc() {
 	}
 	// Playback-rate: set the stream's frequency ratio so the device reproduces
 	// audio at the chosen speed (video already advances at playback_rate on the
-	// wall clock). 0 = Auto -> 1.0. Applied lazily — only when the rate changes —
-	// because the producer runs every ~2ms.
+	// wall clock). Applied lazily — only when the rate changes — because the
+	// producer runs every ~2ms.
 	want_ratio := f32(max(0.0, playback_rate))
 	if want_ratio <= 0 {
 		want_ratio = 1.0

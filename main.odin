@@ -664,14 +664,10 @@ if drag_clip.timeline_start_frame != new_start {
 			// delta so the cadence is perfectly jitter-free (or any fixed rate).
 			dt_s := PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
 			// playback_rate scales the playhead against the wall clock: at 2x the
-			// playhead advances 2 frames per real-time frame budget. 0 (Auto)
-			// behaves as 1x. Affects the video/playhead only; audio pacing at
-			// non-1x is the producer's stream frequency ratio.
-			pb_rate := max(0.0, playback_rate)
-			if pb_rate <= 0 {
-				pb_rate = 1.0
-			}
-			playhead_accumulator += dt_s * pb_rate
+			// playhead advances 2 frames per real-time frame budget. Affects the
+			// video/playhead only; audio pacing at non-1x is the producer's
+			// stream frequency ratio.
+			playhead_accumulator += dt_s * max(0.0, playback_rate)
 			playback_fps := timeline_fps()
 			catchup := i64(0)
 			for playhead_accumulator >= 1.0 / playback_fps {
