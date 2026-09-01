@@ -6,38 +6,56 @@ and the composited result appears as a timeline clip for traditional editing.
 
 Example — text:
 ```
-text-input → track
+text-input → text-renderer → track
 ```
 
 Example — plain video:
 ```
-media-input → track
+media-input → media-renderer → track
 ```
 
 Example — video with transforms:
 ```
-media-input → crop → scale → move → rotate → track
+media-input → crop → scale → media-renderer → track
 ```
 
 Not a node graph; the *fast path* below.
 
-## Node taxonomy (keep it plain)
+## Node taxonomy
 
-Three node kinds only:
+Four node kinds:
 
-- **source** — emits data: media input, text input, numeric input.
-- **process** — data in → data out: crop, scale, move, rotate, color,
-  text→image rasterizer.
+- **input** — a reusable *data source*: media input, text input, numeric input.
+  Emits its native type. Reusable across many chains.
+- **renderer** — a *terminal* that consumes typed inputs and emits the
+  composited **image** a track needs. It is the type-promoting / rasterizing
+  step. Each renderer pairs conceptually with the data it promotes
+  (text-renderer rasterizes text→image; media-renderer emits the decoded
+  image).
+- **process** — data in → data out: crop, scale, move, rotate, color.
 - **sink / output** — the **track** node; where a composited result lands.
 
-There is **no separate "renderer" node**. A process node is already "data in →
-rendered image out"; a dedicated renderer added ceremony but no data. The sink
-*is* the output.
+## Why input and renderer stay separate
+
+They are different roles, not ceremony:
+
+- **Reusability / arity**: an input is a pure provider; one text (or media)
+  input can feed several different renderers or chains without duplicating the
+  source. A renderer is an aggregator/terminal — it has inputs for the data
+  plus its params, and exactly one output.
+- **Type promotion**: a process node and a track both consume an **image**. A
+  text input emits `text`, not an image, so it can only reach the track through
+  a renderer that rasterizes text→image. Merging input+renderer into "any node
+  that outputs an image" would force every text consumer to also do text→image
+  and would erase the reusable-data-source distinction.
+
+So: no two-node chain is "input → track"; every input reaches a track through a
+renderer that promotes its data to image. Only process nodes sit between.
 
 ## Node graph rules
 
-- Late-style evaluation. Sources evaluate; processes transform; sink evaluates
-  last and feeds the timeline.
+- Late-style evaluation. Inputs evaluate; processes transform; the renderer
+  emits the image; the sink evaluates last and feeds the timeline.
 - Detect and block cycles. Nodes form a DAG.
 - One sink is the boundary: the subgraph between sources and one sink defines a
   reusable **composited asset**. The timeline holds **instances** (reference +
