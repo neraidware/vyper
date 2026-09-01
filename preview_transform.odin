@@ -316,7 +316,12 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 				k = kx
 			}
 		}
-		s := max(scale0 * k, 0.01)
+		// The k factors divide by the BASE (scale=1) size bw0/bh0, so k is
+		// already the absolute target scale — not a multiplier relative to
+		// handle_start_scale. Applying it as `s := max(k, ...)` makes the
+		// dragged edge/corner land exactly under the mouse for any starting
+		// scale (scale0* would overshoot by scale0x once the text is pre-scaled).
+		s := max(k, 0.01)
 		new_w := bw0 * s
 		new_h := bh0 * s
 		tx := tx0
