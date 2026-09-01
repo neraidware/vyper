@@ -447,10 +447,14 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										    clip_color := BUTTON
 										    clip_border := BUTTON_BORDER
 										    clip_border_w: u16 = 2
-										    clip_label := "Clip"
+										    clip_label := timeline_clip.name
 										    if timeline_clip.kind == .Audio {
 											    clip_color = AUDIO_CLIP
-											    clip_label = "Audio"
+											    if clip_label == "" {
+												    clip_label = "Audio"
+											    }
+										    } else if clip_label == "" {
+											    clip_label = "Clip"
 										    }
 										    if selected_track == track_idx && selected_index == index {
 											    clip_border = BUTTON_BORDER_HOVER
