@@ -111,13 +111,33 @@ clip_full_box_dims :: proc(clip: ^Clip, out_w, out_h: f32) -> (f32, f32) {
 // (0.5 - crop) * (project axis) * scale. The full box honors the source aspect
 // (see clip_full_box_dims), so snapping matches the box the user actually sees.
 snap_transform :: proc(clip: ^Clip, margin: f32) {
-	// Text clips use a top-left transform anchor with no crop, so the
-	// center-anchored crop-aware math below doesn't apply; skip it.
-	if clip.kind == .Text {
-		return
-	}
 	PW := f32(project.width)
 	PH := f32(project.height)
+	// Text clips use a top-left transform anchor (no crop) and scale BOTH axes
+	// by a single uniform factor (source px -> project px via PW/PREVIEW_W), so
+	// the box is anchored at the transform and the usual center-anchored
+	// crop-aware math doesn't apply. Snap its four edges to the canvas borders.
+	if clip.kind == .Text {
+		if clip.source_w <= 0 || clip.source_h <= 0 {
+			return
+		}
+		f := clip.scale * PW / f32(PREVIEW_W)
+		w := f32(clip.source_w) * f
+		h := f32(clip.source_h) * f
+		left := clip.transform_x
+		top := clip.transform_y
+		if abs(left) <= margin {
+			clip.transform_x = 0
+		} else if abs(left + w - PW) <= margin {
+			clip.transform_x = PW - w
+		}
+		if abs(top) <= margin {
+			clip.transform_y = 0
+		} else if abs(top + h - PH) <= margin {
+			clip.transform_y = PH - h
+		}
+		return
+	}
 	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
 	d_l := (0.5 - clip.crop_l) * cw
 	d_r := (0.5 - clip.crop_r) * cw
