@@ -375,6 +375,14 @@ audio_anchor_now: i64   // sdl.GetTicksNS() when that frame was seeded (atomic)
 // UI's drift check (atomic).
 audio_prod_frame: i64
 
+// audio_src_count_ui is a UI-readable atomic mirror of the producer's current
+// play_src_count. The UI uses it to self-heal the producer: if audio is playing
+// but NO sources are provisioned while the timeline has audio covering the
+// playhead, the engine is silently dead — force a re-provision rather than play
+// muted for the rest of the run. (A transient open/seek failure in
+// audio_provision can otherwise drop the only clip and never recover.)
+audio_src_count_ui: i64
+
 // audio_jump_frame is a forward-only skip target (0 = none). The UI sets it when
 // the playhead outruns the audio producer; the producer trims its fifos and
 // advances in place instead of tearing the decoder down and relooping.
@@ -463,6 +471,7 @@ audio_reset_play :: proc() {
 		audio_src_reset(&play_srcs[i])
 	}
 	play_src_count = 0
+	sync.atomic_store(&audio_src_count_ui, 0)
 	audio_play_frame = 0
 }
 
@@ -530,6 +539,7 @@ real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.
 			play_src_count += 1
 		}
 	}
+	sync.atomic_store(&audio_src_count_ui, i64(play_src_count))
 }
 
 // audio_src_append converts n interleaved S16 frames from dec.s16 into
@@ -730,6 +740,26 @@ audio_src_covers_frame :: proc(f: i64) -> bool {
 		s := &play_srcs[k]
 		if s.dec.opened && f >= s.start_a && f < s.start_a + s.len_a {
 			return true
+		}
+	}
+	return false
+}
+
+// timeline_has_audio_at reports whether the CURRENT timeline has an audio clip
+// covering frame f. UI-thread only (takes audio_timeline_mtx). Used by the
+// self-heal in audio_update to detect "playing but the producer has no sources
+// even though the timeline still expects audio here" — the signal that the
+// engine silently died and must be re-seeded.
+timeline_has_audio_at :: proc(f: i64) -> bool {
+	sync.mutex_lock(&audio_timeline_mtx)
+	defer sync.mutex_unlock(&audio_timeline_mtx)
+	for tr in 0 ..< len(timeline.tracks) {
+		track := &timeline.tracks[tr]
+		for c in 0 ..< len(track.clips) {
+			clip := &track.clips[c]
+			if clip.kind == .Audio && f >= clip.timeline_start_frame && f < clip.timeline_start_frame + clip.source_length_frames {
+				return true
+			}
 		}
 	}
 	return false
@@ -1041,6 +1071,20 @@ audio_update :: proc() {
 	now := sdl.GetTicksNS()
 	last_seed := u64(sync.atomic_load(&audio_anchor_now))
 	if now - last_seed < 200_000_000 {
+		return
+	}
+	// Self-heal: the producer can silently go deaf if a provision drops every
+	// audio source (a transient open/seek failure on the only covering clip) and
+	// nothing ever re-provisions it — the playhead keeps advancing and video
+	// keeps playing but the device drains and stays muted. If we're playing, the
+	// producer has zero sources, yet the current timeline still has audio
+	// covering the playhead, force a re-seed. Coalesced above so a healthy
+	// producer (which always has >=1 source) never hits this.
+	if sync.atomic_load(&audio_src_count_ui) == 0 && timeline_has_audio_at(playhead.frame) {
+		if audio_trace {
+			fmt.printf("[ph] self-heal: playing but 0 audio sources at ph=%d -> re-seed\n", playhead.frame)
+		}
+		audio_seek(playhead.frame)
 		return
 	}
 	// The producer runs on its own clock from the last provision anchor, so
