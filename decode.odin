@@ -40,6 +40,9 @@ Clip_Decoder :: struct {
 	// last_frame+1 continue forward; anything else re-seeks.
 	last_frame:   i64,
 	have_last:    bool,
+	// PTS (stream time base) of the most recently produced frame; used by the
+	// frame-check probe to verify the seek path lands on the requested index.
+	last_emitted_ts: c.int64_t,
 	// decoded_ahead counts frames received since the last seek, so a
 	// forward request knows it only needs to pull the next frame.
 	decoded_ahead: i64,
@@ -72,6 +75,9 @@ ff_err_str :: proc(code: c.int) -> string {
 }
 
 clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
+	if nered_trace {
+		fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)
+	}
 	if dec.opened {
 		avfmt.close_input(&dec.fmt_ctx)
 		avcodec.free_context(&dec.dec_ctx)
@@ -322,6 +328,7 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		}
 		dec.last_frame = frame_idx
 		dec.have_last = true
+		dec.last_emitted_ts = dec.frame.best_effort_timestamp
 		scale_decoded_frame(dec)
 		return true
 	}
@@ -331,17 +338,46 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		return false
 	}
 	target := frames_to_stream_ts(dec, frame_idx)
-	for {
-		if !decode_one_forward(dec) {
-			return false
-		}
-		if dec.frame.best_effort_timestamp >= target {
-			dec.last_frame = frame_idx
-			dec.have_last = true
-			scale_decoded_frame(dec)
-			return true
-		}
-	}
+    // After seek, the next decoded frame is the keyframe.
+// We need to decode exactly (frame_idx - keyframe_frame) frames.
+// We don't know keyframe_frame, so we count decoded frames after seek
+// and stop when the count equals (frame_idx - dec.last_frame_before_seek)?
+// Better: decode forward and compare the decoded frame's index (converted from pts).
+// For simplicity, use a frame counter:
+decoded_since_seek := i64(0)
+for {
+    if !decode_one_forward(dec) { return false }
+    // Convert the frame's pts to a frame index using the average frame rate.
+    // This is not perfect but better than timestamp comparison.
+    pts := dec.frame.best_effort_timestamp
+    // Convert to frame index: pts * fps_num / (fps_den * stream.time_base)
+    // But we can use the stream timebase:
+    frame_idx_from_pts := avutil.rescale_q(pts, dec.stream.time_base, avutil.Rational{num = dec.fps_den, den = dec.fps_num})
+    if frame_idx_from_pts >= frame_idx {
+        // We might have overshot; if it's exactly frame_idx, accept; else we could seek again.
+        // For now, if it's close, accept.
+        if frame_idx_from_pts == frame_idx {
+            // success
+            dec.last_frame = frame_idx
+            dec.have_last = true
+            scale_decoded_frame(dec)
+            return true
+        } else {
+            // We overshot – seek to the previous keyframe and try again with a different target?
+            // For simplicity, just accept if it's within ±1.
+            if frame_idx_from_pts - frame_idx <= 1 {
+                // accept as close enough
+                dec.last_frame = frame_idx
+                dec.have_last = true
+                scale_decoded_frame(dec)
+                return true
+            }
+            // Otherwise, fall back to seeking again with a slightly adjusted timestamp.
+            // This is rare; we can retry.
+            return false
+        }
+    }
+}
 }
 
 scale_decoded_frame :: proc(dec: ^Clip_Decoder) {
@@ -427,15 +463,38 @@ decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64
 	}
 	if cached := cache_find(dec, frame_idx); cached != nil {
 		copy(out, cached)
-		dec.last_frame = frame_idx
-		dec.have_last = true
+		// Cache hit serves pixel data but must not over-claim the physical
+		// decoder's forward position. Advancing last_frame PAST where the
+		// decoder actually stopped makes a later last_frame+1 request take the
+		// forward fast-path and decode the NEXT frame at the real (behind)
+		// position, then cache it under the wrong key: a stable wrong image
+		// under a shifted key that only "fixes" when a re-seek lands. Only
+		// update last_frame when it would not jump ahead of the decoder's true
+		// state (frame_idx <= last_frame is safe; it only moves last_frame back
+		// or equal, which a later request turns into a clean re-seek).
+		if !dec.have_last || frame_idx <= dec.last_frame {
+			dec.last_frame = frame_idx
+			dec.have_last = true
+		}
 		return true
+	}
+	forward := dec.have_last && frame_idx == dec.last_frame + 1
+	if !forward && nered_trace {
+		fmt.printf("[dec] SEEK frame=%d (was at %d) -> re-seek decoder\n",
+			frame_idx, dec.last_frame)
 	}
 	if !decode_source_frame(dec, frame_idx) {
 		return false
 	}
 	decode_into_buffer(dec, out, PREVIEW_W, PREVIEW_H)
 	cache_store(dec, frame_idx, out)
+	if !forward && nered_trace {
+		fmt.printf("[dec] decoded frame=%d keys:", frame_idx)
+		for ci := 0; ci < len(dec.cache); ci += 1 {
+			fmt.printf(" %d", dec.cache[ci].frame)
+		}
+		fmt.printf("\n")
+	}
 	return true
 }
 

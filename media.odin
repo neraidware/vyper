@@ -221,6 +221,7 @@ import_media :: proc(path: cstring) {
 	if probe.has_video {
 		track := Track{name = fmt.aprintf("Track %d", track_n)}
 		append(&track.clips, Clip{
+			clip_id = new_clip_id(),
 			asset_id = asset_id,
 			path = path,
 			kind = .Video,
@@ -248,6 +249,7 @@ crop_b = 0,
 	for a := 0; a < probe.audio_streams; a += 1 {
 		track := Track{name = fmt.aprintf("Track %d", track_n)}
 		append(&track.clips, Clip{
+			clip_id = new_clip_id(),
 			asset_id = asset_id,
 			path = path,
 			kind = .Audio,

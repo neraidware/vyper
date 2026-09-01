@@ -183,7 +183,9 @@ open_audio_decoder_resampled :: proc(dec: ^Audio_Clip_Decoder, path: cstring, st
 	dec.pkt = avcodec.packet_alloc()
 	dec.s16 = make([]i16, AUDIO_CHUNK * AUDIO_MAX_CH)
 	dec.opened = true
-	fmt.printf("audio %dch @ %d Hz -> S16\n", dec.out_channels, dec.out_rate)
+	if audio_trace {
+		fmt.printf("audio %dch @ %d Hz -> S16\n", dec.out_channels, dec.out_rate)
+	}
 	return true
 }
 
@@ -232,7 +234,7 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 		target_ts := audio_to_stream_ts(dec, at_seconds)
 		if dec.have_last && target_ts < dec.last_ts {
 			last_sec := f64(avutil.rescale_q(dec.last_ts, dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
-			if audio_dbg_budget > 0 {
+			if audio_trace && audio_dbg_budget > 0 {
 				fmt.printf("[adbg] re-seek back: asked=%.3fs last_pts=%.3fs delta=%+.3fs\n", at_seconds, last_sec, at_seconds - last_sec)
 				audio_dbg_budget -= 1
 			}
@@ -287,7 +289,7 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 			}
 			dec.last_ts = frame_ts_at_decode
 			dec.have_last = true
-			if dbg_first && audio_dbg_budget > 0 {
+			if audio_trace && dbg_first && audio_dbg_budget > 0 {
 				pts_sec := f64(avutil.rescale_q(frame_ts_at_decode, dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
 				fmt.printf("[adbg] first frame after seek: asked=%.3fs pts=%.3fs delta=%+.3fs\n", at_seconds, pts_sec, pts_sec - at_seconds)
 				audio_dbg_budget -= 1
@@ -417,7 +419,7 @@ audio_dec_dump_open :: proc() {
 // 1000 ms); NERED_AUDIO_FULL=1 adds per-source fifo lines and playhead-jump
 // logging. audio_silence_holes counts fed frames that were silence while a
 // clip covered them (decode/seek holes, producer thread accumulates it).
-audio_log_ms: i64 = 1000
+audio_log_ms: i64 = 0
 audio_log_full: bool = false
 audio_trace: bool = false
 audio_thread_start_ns: u64
@@ -670,15 +672,17 @@ audio_init :: proc() -> bool {
 		audio_device_ready = false
 		return false
 	}
-	fmt.printf("audio device ready (%d Hz, %dch, fmt %d)\n", device_spec.freq, device_spec.channels, device_spec.format)
+	if audio_trace {
+		fmt.printf("audio device ready (%d Hz, %dch, fmt %d)\n", device_spec.freq, device_spec.channels, device_spec.format)
+	}
 	if interval := os.get_env_alloc("NERED_AUDIO_LOG", context.temp_allocator); interval != "" {
 		v, ok := strconv.parse_i64(interval)
 		if ok && v >= 50 {
 			audio_log_ms = v
 		}
 	}
-	audio_log_full = os.get_env_alloc("NERED_AUDIO_FULL", context.temp_allocator) != "0"
-	audio_trace = os.get_env_alloc("NERED_AUDIO_TRACE", context.temp_allocator) != "0"
+	audio_log_full = os.get_env_alloc("NERED_AUDIO_FULL", context.temp_allocator) == "1"
+	audio_trace = os.get_env_alloc("NERED_AUDIO_TRACE", context.temp_allocator) == "1"
 	sdl.PauseAudioDevice(dev)
 	sync.atomic_store(&audio_stop_flag, false)
 	sync.atomic_store(&audio_done_flag, false)
@@ -869,7 +873,9 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 	}
 	last_evt := i64(0)
 	had_evt := false
-	fmt.println("[audio] producer thread up")
+	if audio_trace {
+		fmt.println("[audio] producer thread up")
+	}
 	audio_thread_start_ns = sdl.GetTicksNS()
 	last_report := u64(0)
 	for !sync.atomic_load(&audio_stop_flag) {
@@ -883,11 +889,14 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				had_evt = true
 				sdl.ResumeAudioDevice(audio_device)
 				audio_provision(sync.atomic_load(&audio_anchor_frame))
-				fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", play_src_count, sync.atomic_load(&audio_anchor_frame), f64(sdl.GetTicksNS()-open_start)/1e6)
+				if audio_trace {
+					fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", play_src_count, sync.atomic_load(&audio_anchor_frame), f64(sdl.GetTicksNS()-open_start)/1e6)
+				}
 			}
 			audio_producer_feed()
-			if now := sdl.GetTicksNS(); now - last_report >= u64(audio_log_ms) * 1_000_000 {
-				elapsed := f64(now - audio_report_tick) / 1e9
+			if audio_log_ms > 0 {
+				if now := sdl.GetTicksNS(); now - last_report >= u64(audio_log_ms) * 1_000_000 {
+					elapsed := f64(now - audio_report_tick) / 1e9
 				delta := audio_play_frame - audio_report_frame
 				queued_bytes := sdl.GetAudioStreamQueued(audio_stream)
 				fps := timeline_fps()
@@ -968,6 +977,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				audio_rpt_min_q = i64(queued_bytes)
 				audio_rpt_max_q = i64(queued_bytes)
 				last_report = now
+				}
 			}
 		} else {
 			if had_evt {
@@ -1018,9 +1028,11 @@ audio_update :: proc() {
 	fwd := playhead.frame - audio_last_ui_frame
 	audio_last_ui_frame = playhead.frame
 	if fwd > 3 || fwd < -1 {
-		fmt.printf("[ph] t=%.2fs ph=%d fwd=%+d (last_ui=%d) -> jump/health check\n",
-			f64(sdl.GetTicksNS()-audio_thread_start_ns)/1e9,
-			playhead.frame, fwd, audio_last_ui_frame)
+		if audio_trace {
+			fmt.printf("[ph] t=%.2fs ph=%d fwd=%+d (last_ui=%d) -> jump/health check\n",
+				f64(sdl.GetTicksNS()-audio_thread_start_ns)/1e9,
+				playhead.frame, fwd, audio_last_ui_frame)
+		}
 	}
 	// A resync clears the stream, reopens every decoder (~16 ms) and then must
 	// refill a full cushion at device rate before it can race ahead again.
@@ -1045,18 +1057,22 @@ audio_update :: proc() {
 		src := sync.atomic_load(&audio_ph_src)
 		catch := sync.atomic_load(&audio_ph_catch)
 		src_name := src == 1 ? "mouse" : src == 2 ? "auto" : "?"
-		fmt.printf("[ph] t=%.2fs ph=%d prod=%d anchor=%d -> %s reseek (fwd=%+d, phsrc=%s catch=%d)\n",
-			f64(now-audio_thread_start_ns)/1e9,
-			playhead.frame, prod, sync.atomic_load(&audio_anchor_frame), reason, fwd, src_name, catch)
+		if audio_trace {
+			fmt.printf("[ph] t=%.2fs ph=%d prod=%d anchor=%d -> %s reseek (fwd=%+d, phsrc=%s catch=%d)\n",
+				f64(now-audio_thread_start_ns)/1e9,
+				playhead.frame, prod, sync.atomic_load(&audio_anchor_frame), reason, fwd, src_name, catch)
+		}
 		audio_seek(playhead.frame)
 	} else if playhead.frame > prod + i64(AUDIO_CUSHION_SEC * fps) + 6 {
 		// Producer (or device) fell behind the playhead. Skip forward in place —
 		// never reloop, that reads as slowed/stuttering audio against a correct
 		// video. The producer trims fifos and continues decoding forward.
 		sync.atomic_store(&audio_jump_frame, playhead.frame)
-		fmt.printf("[ph] t=%.2fs ph=%d prod=%d -> forward skip to ph (fwd=%+d)\n",
-			f64(now-audio_thread_start_ns)/1e9,
-			playhead.frame, prod, fwd)
+		if audio_trace {
+			fmt.printf("[ph] t=%.2fs ph=%d prod=%d -> forward skip to ph (fwd=%+d)\n",
+				f64(now-audio_thread_start_ns)/1e9,
+				playhead.frame, prod, fwd)
+		}
 	}
 }
 

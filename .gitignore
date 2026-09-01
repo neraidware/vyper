@@ -1,2 +1,5 @@
 # Build output
 /nered
+
+# Render / probe output artifacts
+/render.mp4

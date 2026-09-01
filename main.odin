@@ -20,7 +20,9 @@ toggle_playback :: proc() {
 	if playhead.playing {
 		playhead.playing = false
 		preview.playing = false
-		fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+		if nered_trace {
+			fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+		}
 		return
 	}
 	if playhead.frame >= timeline_duration() {
@@ -32,7 +34,9 @@ toggle_playback :: proc() {
 	preview_frontier = playhead.frame
 	playhead.playing = true
 	preview.playing = true
-	fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+	if nered_trace {
+		fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+	}
 }
 
 // play_project_area starts playback at the render range's start frame and
@@ -50,13 +54,32 @@ play_project_area :: proc() {
 	preview_frontier = playhead.frame
 	playhead.playing = true
 	preview.playing = true
-	fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback_stop_frame)
+	if nered_trace {
+		fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback_stop_frame)
+	}
 }
 // ---------------------------------------------------------------------------
 
 main :: proc() {
+	nered_trace = os.get_env_alloc("NERED_TRACE", context.temp_allocator) == "1"
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {
 		render_test_run(test_paths)
+		return
+	}
+	if fp, _ := os.lookup_env_alloc("NERED_FRAME_PROBE", context.temp_allocator); fp != "" {
+		preview_framecheck_run(fp)
+		return
+	}
+	if probe_path_ok, probe_paths := preview_probe_env(); probe_path_ok {
+		preview_probe_run(probe_paths)
+		return
+	}
+	if bp, _ := os.lookup_env_alloc("NERED_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
+		boundary_probe_run(bp)
+		return
+	}
+	if cp, _ := os.lookup_env_alloc("NERED_CACHE_PROBE", context.temp_allocator); cp != "" {
+		cache_probe_run(cp)
 		return
 	}
 	if !load_font_data() {
@@ -136,7 +159,9 @@ main :: proc() {
 		PLAYBACK_MAGIC_FPS, _ = strconv.parse_f64(v)
 	}
 	if PLAYBACK_MAGIC_MS > 0 || PLAYBACK_MAGIC_FPS > 0 {
-		fmt.printf("[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n", PLAYBACK_MAGIC_MS, PLAYBACK_MAGIC_FPS)
+		if nered_trace {
+			fmt.printf("[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n", PLAYBACK_MAGIC_MS, PLAYBACK_MAGIC_FPS)
+		}
 	}
 
 	// DIAG: env-var autoplay for headless-ish diagnostics — autoloads a file and
@@ -144,15 +169,23 @@ main :: proc() {
 	// (bad path, unreadable file, probe failure) instead of opening an empty
 	// project that immediately auto-stops without ever playing anything.
 	if autoplay := os.get_env_alloc("NERED_AUTOPLAY", context.temp_allocator); autoplay != "" {
-		fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
+		if nered_trace {
+			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
+		}
 		import_media(strings.clone_to_cstring(autoplay, context.temp_allocator))
-		fmt.printf("[autoplay] env=\"%s\" imported tracks=%d step=delay\n", autoplay, len(timeline.tracks))
+		if nered_trace {
+			fmt.printf("[autoplay] env=\"%s\" imported tracks=%d step=delay\n", autoplay, len(timeline.tracks))
+		}
 		if len(timeline.tracks) == 0 {
-			fmt.printf("[autoplay] FATAL: NERED_AUTOPLAY=\"%s\" imported nothing (no audio track)\n", autoplay)
+			if nered_trace {
+				fmt.printf("[autoplay] FATAL: NERED_AUTOPLAY=\"%s\" imported nothing (no audio track)\n", autoplay)
+			}
 			os.exit(1)
 		}
 		sdl.Delay(2500)
-		fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
+		if nered_trace {
+			fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
+		}
 		playhead.playing = true
 		preview.playing = true
 		playhead_accumulator = 0
@@ -521,12 +554,14 @@ main :: proc() {
 					// the clip can never overlap a neighbor on this track.
 					new_start := clip_slide_in_track(&timeline.tracks[drag_source_track], drag_source_index, drag_clip.source_length_frames, i64(max(frame, 0)), drag_clip.timeline_start_frame)
 					drag_hover_track = hover
-					if drag_clip.timeline_start_frame != new_start {
+if drag_clip.timeline_start_frame != new_start {
+					if nered_trace {
 						fmt.printf("[tl] drag clip src=%s len=%d start=%d -> %d\n",
 							drag_clip.path, drag_clip.source_length_frames,
 							drag_clip.timeline_start_frame, new_start)
-						drag_clip.timeline_start_frame = new_start
 					}
+					drag_clip.timeline_start_frame = new_start
+				}
 				} else {
 					// Vertical: clamp to nearest valid slot on the hovered track
 					// and show it as a ghost (committed on release).
@@ -543,12 +578,26 @@ main :: proc() {
 			frame = max(frame, 0)
 			frame = min(frame, timeline_duration())
 			if playhead.frame != frame {
-				fmt.printf("[pb] scrub ph=%d (was %d) playing=%v\n", frame, playhead.frame, playhead.playing)
+				if nered_trace {
+					fmt.printf("[pb] scrub ph=%d (was %d) playing=%v\n", frame, playhead.frame, playhead.playing)
+				}
 			}
 			playhead.frame = frame
 			preview_frontier = frame
+			// A playhead jump must anchor audio to the new position immediately:
+			// otherwise the producer keeps decoding from the pre-scrub position
+			// and the sound lags the video until its far-forward guard trips.
+			audio_seek(frame)
 			sync.atomic_store(&audio_ph_src, 1)
 			sync.atomic_store(&audio_ph_catch, 0)
+			// And the preview: drop every slot's decode frontier so the exact
+			// playhead frame is requested (the forward-clamp would otherwise walk
+			// the image toward the new position one frame per update).
+			for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+				if preview_slots[s].in_use {
+					preview_slots[s].have_frontier = false
+				}
+			}
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			toggle_playback()
 		}
@@ -573,7 +622,9 @@ main :: proc() {
 				sync.atomic_store(&audio_ph_src, 2)
 				sync.atomic_store(&audio_ph_catch, catchup)
 				if catchup > 1 {
-					fmt.printf("[pb] burst +%d ph=%d dt=%.1fms acc=%.3fs\n", catchup, playhead.frame, f64(now_ns-last_tick_ns)/1e6, playhead_accumulator)
+					if nered_trace {
+						fmt.printf("[pb] burst +%d ph=%d dt=%.1fms acc=%.3fs\n", catchup, playhead.frame, f64(now_ns-last_tick_ns)/1e6, playhead_accumulator)
+					}
 				}
 			}
 			stop_frame := playback_stop_frame
@@ -584,7 +635,9 @@ main :: proc() {
 				playhead.playing = false
 				preview.playing = false
 				playback_stop_frame = -1
-				fmt.printf("[pb] auto-stop ph=%d stop=%d\n", playhead.frame, stop_frame)
+				if nered_trace {
+					fmt.printf("[pb] auto-stop ph=%d stop=%d\n", playhead.frame, stop_frame)
+				}
 			}
 			// Playback is real-time: the playhead (and with it the audio) runs on
 			// the wall clock. Video decode is best-effort on top of that clock.
@@ -597,12 +650,14 @@ main :: proc() {
 		if ui_report_tick == 0 {
 			ui_report_tick = now_ns
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
-			elapsed := f64(now_ns - ui_report_tick) / 1e9
-			fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d frontier=%d gap=%d acc=%.3fs src=%d catch=%d prod=%d\n",
-				f64(ui_frame_count) / elapsed,
-				f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
-				playhead.frame, preview_frontier, playhead.frame - preview_frontier,
-				playhead_accumulator, sync.atomic_load(&audio_ph_src), sync.atomic_load(&audio_ph_catch), sync.atomic_load(&audio_prod_frame))
+			if nered_trace {
+				elapsed := f64(now_ns - ui_report_tick) / 1e9
+				fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d frontier=%d gap=%d acc=%.3fs src=%d catch=%d prod=%d\n",
+					f64(ui_frame_count) / elapsed,
+					f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
+					playhead.frame, preview_frontier, playhead.frame - preview_frontier,
+					playhead_accumulator, sync.atomic_load(&audio_ph_src), sync.atomic_load(&audio_ph_catch), sync.atomic_load(&audio_prod_frame))
+			}
 			ui_report_tick = now_ns
 			ui_frame_count = 0
 			ui_dec_us = 0
@@ -621,12 +676,23 @@ main :: proc() {
 			if !slot.in_use {
 				continue
 			}
-			any_frame = true
 			if slot.texture == nil {
 				slot.texture = renderer.preview_textures[i]
 			}
 			if slot.tex_dirty || changed {
 				upload_preview_slot(&renderer, command_buffer, slot)
+			}
+			// in_use only means the slot is claimed by some clip; it says
+			// nothing about whether THIS slot has actually decoded a frame
+			// for its CURRENT identity yet. Right after a clip_id change
+			// (anchor_shifted in update_preview_slots), in_use stays true
+			// but has_frame is deliberately false until a fresh decode
+			// lands -- gating on in_use here painted whatever was still
+			// sitting in the GPU texture from the PREVIOUS clip that owned
+			// this slot for every frame the new decode took, which is
+			// exactly the "old clip's image fighting the new one" bug.
+			if slot.has_frame {
+				any_frame = true
 			}
 		}
 		preview_has_frame = any_frame

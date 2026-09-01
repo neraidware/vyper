@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 
 // ---------------------------------------------------------------------------
 // Preview slot lifecycle: assigning a Preview_Slot to each video clip that
@@ -28,20 +29,29 @@ update_preview_slots :: proc() -> bool {
 			}
 			slot := &preview_slots[next_slot]
 			next_slot += 1
-			// Identity is the underlying asset only: moving a clip along the
-			// timeline changes its timeline_start_frame but not its pixels, so
-			// the decoder and its source-frame-keyed RAM cache stay intact.
-			// The clip_frame request below shifts with the new position and the
-			// cache still serves it (adjacent frames) or the decoder seeks once.
-			if !slot.in_use || slot.asset_id != clip.asset_id {
+			// Identity is the clip instance (clip_id), not its asset or its
+			// position: asset_id alone would conflate two different clips of
+			// the same source file, and timeline_start_frame changes under a
+			// drag, which is exactly the identity a dragged clip needs to KEEP.
+			// The decoder and its source-frame-keyed RAM cache stay intact
+			// across a same-clip position change (a drag): the clip_frame
+			// request below shifts with the new position and the cache still
+			// serves it (adjacent frames) or the decoder seeks once.
+			if !slot.in_use || slot.clip_id != clip.clip_id {
 				if slot.in_use {
 					clip_decoder_reset(&slot.dec)
 				}
 				slot^ = {}
 				slot.in_use = true
+				slot.clip_id = clip.clip_id
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
 				slot.tex_dirty = true
+				if nered_trace {
+					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v\n",
+						next_slot - 1, clip.asset_id, clip.timeline_start_frame, clip.source_start_frame, clip.source_length_frames, playhead.playing)
+				}
+				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
 			// A position/source shift makes the slot's frontier (timeline-keyed
 			// forward splice point) invalid: if we keep it, a clip moved forward
@@ -50,10 +60,24 @@ update_preview_slots :: proc() -> bool {
 			// one, so decode exactly once without the forward-drop clamp (the
 			// source-frame cache still makes it cheap).
 			anchor_shifted := slot.timeline_start_frame != clip.timeline_start_frame || slot.source_start_frame != clip.source_start_frame
+			if nered_trace && anchor_shifted {
+				fmt.printf("[vf] SHIFT asset=%d tl=%d->%d src=%d->%d playing=%v\n",
+					clip.asset_id, slot.timeline_start_frame, clip.timeline_start_frame, slot.source_start_frame, clip.source_start_frame, playhead.playing)
+			}
 			slot.timeline_start_frame = clip.timeline_start_frame
 			slot.source_start_frame = clip.source_start_frame
 			if anchor_shifted {
+				// The slot's decoded content (buffer + texture) belongs to the
+				// previous clip/position of this asset. Until a frame is decoded
+				// for the CURRENT position, has_frame must be false, or
+				// draw_preview keeps painting the old clip's image for every
+				// frame the decode takes (same-asset switches, e.g. split
+				// halves, don't reset the slot). Decode advances the frontier
+				// invalid too, so request the exact playhead frame.
+				slot.has_frame = false
+				slot.tex_dirty = false
 				slot.have_frontier = false
+				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))   // <-- ADD
 			}
 			slot.transform_x = clip.transform_x
 			slot.transform_y = clip.transform_y
@@ -78,10 +102,6 @@ update_preview_slots :: proc() -> bool {
 				}
 			}
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
-			// if audio_trace {
-			// 	fmt.printf("[vf] req=%d clip_frame=%d ph=%d frontier=%d gap=%d playing=%v\n",
-			// 		req, clip_frame, playhead.frame, preview_frontier, playhead.frame-preview_frontier, playhead.playing)
-			// }
 			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 				slot.frontier = req
 				slot.have_frontier = true
@@ -89,9 +109,9 @@ update_preview_slots :: proc() -> bool {
 				preview_frontier = req
 				slot.tex_dirty = true
 				changed = true
-			}// else if audio_trace {
-				//fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
-			//}
+			} else if nered_trace {
+				fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+			}
 		}
 	}
 	for i := next_slot; i < MAX_PREVIEW_SLOTS; i += 1 {
@@ -103,16 +123,36 @@ update_preview_slots :: proc() -> bool {
 	return changed
 }
 
-// find_preview_slot returns the slot and Clip* for a given clip identity
-// (asset_id + timeline_start_frame), or (nil, nil, false).
-find_preview_slot :: proc(asset_id: u64, timeline_start_frame: i64) -> (^Preview_Slot, ^Clip, bool) {
+// invalidate_preview_slots drops every preview slot's decoder, RAM cache,
+// buffer and has_frame state so the next update_preview_slots re-derives it
+// entirely from the current timeline. Called after model edits that remove or
+// relocate clips (ripple delete, raw delete, cross-track move): slots are keyed
+// by asset only, so without this a slot would keep the removed clip's decoded
+// frames and GPU texture as a second state fighting the covering clip.
+invalidate_preview_slots :: proc() {
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		slot := &preview_slots[i]
+		if slot.in_use {
+			clip_decoder_reset(&slot.dec)
+			slot^ = {}
+		}
+	}
+}
+
+// find_preview_slot returns the slot and Clip* for a given clip identity, or
+// (nil, nil, false). Keyed on clip_id: asset_id+timeline_start_frame is NOT
+// a valid key for a caller that holds it across more than one frame (e.g.
+// tracking a clip through a drag) since timeline_start_frame is exactly the
+// field a drag mutates every frame -- the old two-field key would stop
+// matching the instant the clip moved, silently returning not-found mid-drag.
+find_preview_slot :: proc(clip_id: u64) -> (^Preview_Slot, ^Clip, bool) {
 	for i := 0; i < len(timeline.tracks); i += 1 {
 		track := &timeline.tracks[i]
 		for j := 0; j < len(track.clips); j += 1 {
 			clip := &track.clips[j]
-			if clip.asset_id == asset_id && clip.timeline_start_frame == timeline_start_frame {
+			if clip.clip_id == clip_id {
 				for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
-					if preview_slots[s].in_use && preview_slots[s].asset_id == asset_id && preview_slots[s].timeline_start_frame == timeline_start_frame {
+					if preview_slots[s].in_use && preview_slots[s].clip_id == clip_id {
 						return &preview_slots[s], clip, true
 					}
 				}

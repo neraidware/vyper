@@ -152,34 +152,46 @@ timeline_duration :: proc() -> i64 {
 // halves keep their in-range markers; the right half is inserted right after the
 // left so the two touch.
 split_clip_at_playhead :: proc() {
+	tr: ^Track
+	clip: ^Clip
+	ok := false
+	tr, clip, ok = selected_clip()
+	if !ok {
+		return
+	}
 	frame := playhead.frame
+	local := frame - clip.timeline_start_frame
+	if local <= 0 || local >= clip.source_length_frames {
+		return
+	}
 	sync.mutex_lock(&audio_timeline_mtx)
 	defer sync.mutex_unlock(&audio_timeline_mtx)
-	for ti := 0; ti < len(timeline.tracks); ti += 1 {
-		track := &timeline.tracks[ti]
-		for i := 0; i < len(track.clips); i += 1 {
-			clip := &track.clips[i]
-			local := frame - clip.timeline_start_frame
-			if local <= 0 || local >= clip.source_length_frames {
-				continue
-			}
-			left_len := local
-			right_len := clip.source_length_frames - local
-			right := clip^
-			clip.source_length_frames = left_len
-			clip.markers = filter_markers_in_range(clip.markers[:], clip.source_start_frame, clip.source_length_frames)
-			right.source_start_frame += local
-			right.source_length_frames = right_len
-			right.timeline_start_frame = frame
-			right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
-			inject_at_elem(&track.clips, i + 1, right)
-			fmt.printf("[tl] split at ph=%d clip@%d start=%d len %d -> %d | %d..%d\n",
-				frame, clip.timeline_start_frame, clip.source_start_frame,
-				left_len, right_len, right.timeline_start_frame, right.timeline_start_frame+right_len)
-			audio_note_edit()
-			return
+	left_len := local
+	right_len := clip.source_length_frames - local
+	right := clip^
+	clip.source_length_frames = left_len
+	clip.markers = filter_markers_in_range(clip.markers[:], clip.source_start_frame, clip.source_length_frames)
+	right.source_start_frame += local
+	right.source_length_frames = right_len
+	right.timeline_start_frame = frame
+	right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
+	idx := -1
+	for i := 0; i < len(tr.clips); i += 1 {
+		if &tr.clips[i] == clip {
+			idx = i
+			break
 		}
 	}
+	if idx < 0 {
+		return
+	}
+	inject_at_elem(&tr.clips, idx + 1, right)
+	if nered_trace {
+		fmt.printf("[tl] split selected clip@%d src=%d len %d -> %d | %d..%d\n",
+			clip.timeline_start_frame, clip.source_start_frame,
+			left_len, right_len, right.timeline_start_frame, right.timeline_start_frame+right_len)
+	}
+	audio_note_edit()
 }
 
 // filter_markers_in_range returns a new dynamic array with the markers whose
@@ -210,10 +222,21 @@ delete_selected_clip_raw :: proc() {
 	ordered_remove(&track.clips, selected_index)
 	sync.mutex_unlock(&audio_timeline_mtx)
 	delete(removed.markers)
-	fmt.printf("[tl] deleted clip raw src=%s start=%d len=%d\n",
-		removed.path, removed.timeline_start_frame, removed.source_length_frames)
+	if nered_trace {
+		fmt.printf("[tl] deleted clip raw src=%s start=%d len=%d\n",
+			removed.path, removed.timeline_start_frame, removed.source_length_frames)
+	}
 	selected_track = -1
 	selected_index = -1
+	// The removed clip's decoded state lives on in the asset-keyed preview
+	// slots until invalidated: drop it so the deleted clip cannot keep painting.
+	moving_clip = false
+	moving_preview_clip = false
+	drag_clip = nil
+	drag_source_track = -1
+	drag_source_index = -1
+	drag_hover_track = -1
+	invalidate_preview_slots()
 	audio_note_edit()
 }
 
@@ -238,7 +261,8 @@ ripple_delete_region :: proc(start, length: i64) {
 			ce := clip_timeline_end(c)
 			switch {
 			case ce <= start:
-				// Entirely before the region: untouched.
+				// Entirely before the region: untouched (keeps the original
+				// markers slice: the new copy still references it).
 				append(&new_clips, c)
 			case cs >= end:
 				// Entirely after the region: slide left to close the gap.
@@ -256,25 +280,45 @@ ripple_delete_region :: proc(start, length: i64) {
 				right.timeline_start_frame = start
 				right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
 				append(&new_clips, right)
+				// Original markers array no longer referenced by any copy.
+				delete(c.markers)
 			case cs < start:
 				// Overlaps the left edge only: trim its tail.
+				old_markers := c.markers
 				c.source_length_frames = start - cs
-				c.markers = filter_markers_in_range(c.markers[:], c.source_start_frame, c.source_length_frames)
+				c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
 				append(&new_clips, c)
+				delete(old_markers)
 			case ce > end:
 				// Overlaps the right edge only: trim its head, shifted to start.
+				old_markers := c.markers
 				c.source_start_frame += cs - start
 				c.source_length_frames = ce - end
 				c.timeline_start_frame = start
-				c.markers = filter_markers_in_range(c.markers[:], c.source_start_frame, c.source_length_frames)
+				c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
 				append(&new_clips, c)
-			// Otherwise the clip is entirely inside the region: dropped.
+				delete(old_markers)
+			case cs >= start && ce <= end:
+				// Otherwise the clip is entirely inside the region: dropped.
 				delete(c.markers)
 			}
 		}
+		delete(track.clips)
 		track.clips = new_clips
 	}
-	fmt.printf("[tl] ripple delete region [%d, %d)\n", start, end)
+	// The edit may have removed/replaced the dragged clip and the decoded state
+	// cached for it: cancel any in-flight drag and drop the preview slots so the
+	// next update re-derives them purely from the edited timeline.
+	moving_clip = false
+	moving_preview_clip = false
+	drag_clip = nil
+	drag_source_track = -1
+	drag_source_index = -1
+	drag_hover_track = -1
+	invalidate_preview_slots()
+	if nered_trace {
+		fmt.printf("[tl] ripple delete region [%d, %d)\n", start, end)
+	}
 	selected_track = -1
 	selected_index = -1
 	audio_note_edit()
@@ -325,37 +369,42 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 	if src_track < 0 || src_track >= len(timeline.tracks) ||
 		dst_track < 0 || dst_track >= len(timeline.tracks) ||
 		src_track == dst_track {
-		return -1
-	}
-	src := &timeline.tracks[src_track]
-	if src_index < 0 || src_index >= len(src.clips) {
-		return -1
-	}
-	clip := src.clips[src_index]
-	dst := &timeline.tracks[dst_track]
-	sync.mutex_lock(&audio_timeline_mtx)
-	placed := clip_place_in_track(dst, -1, clip.source_length_frames, start)
-	ordered_remove(&src.clips, src_index)
-	append(&dst.clips, clip)
-	dst.clips[len(dst.clips)-1].timeline_start_frame = placed
-	// Keep dst sorted by start for stable rendering.
-	for i := len(dst.clips) - 1; i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i-1].timeline_start_frame; i -= 1 {
-		dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
-	}
-	sync.mutex_unlock(&audio_timeline_mtx)
-	// Refresh selection to the moved clip.
-	selected_track = dst_track
-	selected_index = len(dst.clips) - 1
-	for i in 0 ..< len(dst.clips) {
-		if dst.clips[i].timeline_start_frame == placed {
-			selected_index = i
-			break
-		}
-	}
-	fmt.printf("[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
-		clip.path, clip.source_length_frames, start, dst_track, placed)
-	audio_note_edit()
-	return selected_index
+		    return -1
+	    }
+	    src := &timeline.tracks[src_track]
+	    if src_index < 0 || src_index >= len(src.clips) {
+		    return -1
+	    }
+	    clip := src.clips[src_index]
+	    dst := &timeline.tracks[dst_track]
+	    sync.mutex_lock(&audio_timeline_mtx)
+	    placed := clip_place_in_track(dst, -1, clip.source_length_frames, start)
+	    ordered_remove(&src.clips, src_index)
+	    append(&dst.clips, clip)
+	    dst.clips[len(dst.clips)-1].timeline_start_frame = placed
+	    // Keep dst sorted by start for stable rendering.
+	    for i := len(dst.clips) - 1; i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i-1].timeline_start_frame; i -= 1 {
+		    dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
+	    }
+	    sync.mutex_unlock(&audio_timeline_mtx)
+	    // Refresh selection to the moved clip.
+	    selected_track = dst_track
+	    selected_index = len(dst.clips) - 1
+	    for i in 0 ..< len(dst.clips) {
+		    if dst.clips[i].timeline_start_frame == placed {
+			    selected_index = i
+			    break
+		    }
+	    }
+	    if nered_trace {
+		    fmt.printf("[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
+			    clip.path, clip.source_length_frames, start, dst_track, placed)
+	    }
+	    // Cross-track moves change which clip covers the playhead: re-derive the
+	    // slots from the edited timeline instead of reusing the old covering state.
+	    invalidate_preview_slots()
+	    audio_note_edit()
+	    return selected_index
 }
 
 // next_track_name returns "Track N" with N one greater than the largest "Track N"

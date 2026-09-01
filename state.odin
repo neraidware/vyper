@@ -10,27 +10,31 @@ import sdl "vendor:sdl3"
 // they all read and write.
 // ---------------------------------------------------------------------------
 
+// nered_trace enables the interactive debug traces ([pb]/[tl]/[ui]/[autoplay]).
+// Off by default; set NERED_TRACE=1 to turn on.
+nered_trace: bool = false
+
 WINDOW_WIDTH :: 1280
 WINDOW_HEIGHT :: 720
 
 PREVIEW_W :: 768
 PREVIEW_H :: 432
 
-BACKGROUND :: clay.Color{10, 11, 14, 255}
-EDITOR_BG :: clay.Color{15, 17, 21, 255}
-BUTTON :: clay.Color{20, 22, 27, 255}
-BUTTON_BORDER :: clay.Color{27, 48, 76, 255}
-BUTTON_HOVER :: clay.Color{15, 18, 25, 255}
-BUTTON_BORDER_HOVER :: clay.Color{64, 170, 194, 255}
-AUDIO_CLIP :: clay.Color{58, 44, 66, 255}
-SELECT_BORDER :: clay.Color{120, 220, 120, 255}
-MARKER_COLOR :: clay.Color{255, 205, 70, 255}
-TOOLTIP_BG :: clay.Color{28, 35, 45, 255}
-TOOLTIP_TEXT :: clay.Color{240, 244, 248, 255}
-RANGE_COLOR :: clay.Color{130, 220, 150, 255}
-HANDLE_FILL :: clay.Color{30, 30, 30, 255}
-HANDLE_BORDER :: clay.Color{200, 200, 200, 255}
-TEXT :: clay.Color{255, 255, 255, 255}
+BACKGROUND :: clay.Color{31, 31, 40, 255}          // sumi ink
+EDITOR_BG :: clay.Color{36, 36, 46, 255}
+BUTTON :: clay.Color{42, 42, 55, 255}
+BUTTON_BORDER :: clay.Color{84, 82, 105, 255}
+BUTTON_HOVER :: clay.Color{50, 50, 65, 255}
+BUTTON_BORDER_HOVER :: clay.Color{126, 180, 198, 255} // wave blue
+AUDIO_CLIP :: clay.Color{76, 58, 78, 255}
+SELECT_BORDER :: clay.Color{152, 187, 108, 255}      // spring green
+MARKER_COLOR :: clay.Color{226, 190, 101, 255}        // carp yellow
+TOOLTIP_BG :: clay.Color{43, 43, 53, 255}
+TOOLTIP_TEXT :: clay.Color{220, 215, 198, 255}
+RANGE_COLOR :: clay.Color{139, 173, 109, 255}
+HANDLE_FILL :: clay.Color{24, 24, 32, 255}
+HANDLE_BORDER :: clay.Color{115, 115, 125, 255}
+TEXT :: clay.Color{220, 215, 198, 255}
 
 RULER_HEIGHT :: f32(30)
 RULER_TICK_COLOR :: clay.Color{80, 90, 110, 255}
@@ -108,6 +112,13 @@ Clip_Marker :: struct {
 }
 
 Clip :: struct {
+	// clip_id is a stable identity assigned once at clip creation (import, or
+	// the new half produced by a split) via new_clip_id() -- never touched by
+	// moving/dragging/resizing the clip. asset_id+timeline_start_frame is NOT
+	// a valid identity key: timeline_start_frame is exactly the field a drag
+	// mutates continuously, so any code that captures that pair and looks it
+	// up again on a later frame is holding a key that's already gone stale.
+	clip_id: u64,
 	asset_id: u64,
 	path: cstring,
 	kind: Media_Kind,
@@ -212,6 +223,7 @@ MAX_PREVIEW_SLOTS :: 8
 
 Preview_Slot :: struct {
 	in_use:              bool,
+	clip_id:             u64,
 	asset_id:            u64,
 	path:                cstring,
 	timeline_start_frame: i64,

@@ -49,8 +49,13 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, frame_idx: i64) -> bool {
 	}
 	if cached := cache_find(&ad.dec, frame_idx); cached != nil {
 		copy(ad.wbuf[:], cached)
-		ad.dec.last_frame = frame_idx
-		ad.dec.have_last = true
+		// Same guard as decode_clip_frame_sync: a cache hit must not advance
+		// last_frame past the decoder's real physical position, or a later
+		// forward request decodes wrong content under a shifted key.
+		if !ad.dec.have_last || frame_idx <= ad.dec.last_frame {
+			ad.dec.last_frame = frame_idx
+			ad.dec.have_last = true
+		}
 		return true
 	}
 	if !decode_source_frame(&ad.dec, frame_idx) {

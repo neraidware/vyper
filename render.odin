@@ -1070,3 +1070,517 @@ render_test_run :: proc(paths: [2]string) {
 	fmt.println("render-test status:", st)
 	os.exit(render_status() == .Done ? 0 : 1)
 }
+
+// ---------------------------------------------------------------------------
+// Headless preview-decode probe (NERED_PREVIEW_PROBE="in.mp4|split_at").
+// Reproduces the split -> delete-one-half -> other-half-shifts-back edit (the
+// "moved back" bug) and dumps, per requested frame, what clip_frame the slot
+// computed, what the RAM cache keyed, and how the slot's decoded RGBA buffer
+// compares against a fresh ground-truth decode of the SAME clip_frame. If the
+// probe shows a mismatch, stale/cached content is reaching the buffer; if every
+// probe frame matches ground truth but the user still sees the old clip, the
+// leak is in a later stage (texture upload / draw), not decode.
+// ---------------------------------------------------------------------------
+
+probe_input_buf: [4096]u8
+max_slot_idx_used: int
+probe_gtbuf: [PREVIEW_W * PREVIEW_H * 4]u8
+
+preview_probe_env :: proc() -> (bool, [2]string) {
+	v, _ := os.lookup_env_alloc("NERED_PREVIEW_PROBE", context.allocator)
+	if v == "" {
+		return false, [2]string{}
+	}
+	parts := strings.split(v, "|")
+	res: [2]string
+	if len(parts) >= 2 {
+		res[0] = parts[0]
+		res[1] = parts[1]
+	}
+	return true, res
+}
+
+pixel_diff :: proc(a, b: []u8) -> (diff_count: int, max_delta: int) {
+	n := len(a)
+	if n > len(b) {
+		n = len(b)
+	}
+	for i := 0; i < n; i += 1 {
+		d := int(a[i]) - int(b[i])
+		if d < 0 {
+			d = -d
+		}
+		if d > 0 {
+			diff_count += 1
+			if d > max_delta {
+				max_delta = d
+			}
+		}
+	}
+	return
+}
+
+// probe_ground_truth decodes clip_frame from path with a fresh decoder and
+// returns how many bytes differ from got, plus the largest per-byte delta.
+// Kept as one proc so the probe loop stays short (the decode.odin/render.odin
+// macro-heavy status bar file trips Odin's statement parser when new local
+// declarations are interleaved with multi-line calls).
+probe_ground_truth :: proc(path: cstring, clip_frame: i64, got: []u8) -> (diffs: int, max_delta: int, ok: bool) {
+	gt: Clip_Decoder
+	if !open_clip_decoder(&gt, path) {
+		return 0, 0, false
+	}
+	defer clip_decoder_reset(&gt)
+	if !decode_clip_frame_sync(&gt, path, clip_frame, probe_gtbuf[:]) {
+		return 0, 0, false
+	}
+	diffs, max_delta = pixel_diff(got, probe_gtbuf[:])
+	return diffs, max_delta, true
+}
+
+preview_probe_run :: proc(paths: [2]string) {
+	if len(paths[0]) == 0 {
+		fmt.println("preview-probe: need NERED_PREVIEW_PROBE=\"<in>|<split_at>\"")
+		os.exit(2)
+	}
+	split_at: i64 = 120
+	if len(paths[1]) > 0 {
+		if sv, ok := strconv.parse_i64(paths[1]); ok {
+			split_at = sv
+		}
+	}
+	n := 0
+	for n < len(paths[0]) && n < len(probe_input_buf) - 1 {
+		probe_input_buf[n] = u8(paths[0][n])
+		n += 1
+	}
+	probe_input_buf[n] = 0
+	import_media(cstring(&probe_input_buf[0]))
+
+	total_frames := i64(0)
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			c := timeline.tracks[t].clips[ci]
+			if c.kind == .Video {
+				total_frames = c.source_length_frames
+			}
+		}
+	}
+	fmt.println("[probe] imported total_frames =", total_frames)
+
+	playhead.frame = split_at
+	// The probe bypasses the UI: split_clip_at_playhead now only splits the
+	// currently selected clip, so select track 0's first clip first.
+	selected_track = 0
+	selected_index = 0
+	split_clip_at_playhead()
+	fmt.println("[probe] after split at", split_at, "tracks:")
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			c := timeline.tracks[t].clips[ci]
+			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+		}
+	}
+
+	ripple_delete_region(0, split_at)
+	fmt.println("[probe] after ripple_delete_region(0,", split_at, ")")
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			c := timeline.tracks[t].clips[ci]
+			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+		}
+	}
+
+	// The ripple case shifted the video clip (source_start stays at the
+	// split point) but the audio track was never split — split only touches
+	// the selected clip — so ripple trimmed its head and left it at src=0.
+	// That is an A/V desync bug by itself (audio at tl=0 plays src 0 while the
+	// video at tl=0 shows src=split_at). Report it, then rebuild the scene the
+	// way the DRAG path does it: split, delete the left half raw, drag the right
+	// half back with clip_slide_in_track (gap-preserving move).
+	fmt.printf("[probe] AUDIO_DESYNC_CHECK: video_clip src_start=%d, audio_clip src_start=%d (should match for A/V glue)\n",
+		timeline.tracks[0].clips[0].source_start_frame,
+		timeline.tracks[1].clips[0].source_start_frame)
+
+	// Rebuild: fresh import, split, raw-delete left half, slide right half back.
+	track0 := &timeline.tracks[0]
+	clear(&track0.clips)
+	track1 := &timeline.tracks[1]
+	clear(&track1.clips)
+	import_media(cstring(&probe_input_buf[0]))
+	playhead.frame = split_at
+	selected_track = 0
+	selected_index = 0
+	split_clip_at_playhead()
+	// Raw delete of the LEFT half (clip[0]) leaves a gap; right half stays put.
+	selected_track = 0
+	selected_index = 0
+	delete_selected_clip_raw()
+	fmt.println("[probe] after raw-delete left, before drag-back:")
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			c := timeline.tracks[t].clips[ci]
+			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+		}
+	}
+	// Drag the right-half clip back to tl=0 on track 0 (gap-close move).
+	slide_to := clip_slide_in_track(&timeline.tracks[0], 0, timeline.tracks[0].clips[0].source_length_frames, 0, timeline.tracks[0].clips[0].timeline_start_frame)
+	timeline.tracks[0].clips[0].timeline_start_frame = slide_to
+	fmt.printf("[probe] slide right-half back -> tl=%d\n", slide_to)
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			c := timeline.tracks[t].clips[ci]
+			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+		}
+	}
+
+	// Header for the trace below (mirrors the re-enabled [vf] gate).
+	fmt.println("[probe] frame playhead_playing req clip_frame last_frame have_last cache_keys has_frame frontier  |  pixel_diff(ground_truth)")
+	max_slot_idx_used = 1
+	total_frames_run := int(total_frames + 4)
+	for f := 0; f < total_frames_run; f += 1 {
+		// Interleave paused and playing to exercise both the exact-request path
+		// and the playing frontier-clamp path.
+		playhead.frame = i64(f)
+		playhead.playing = false
+		update_preview_slots()
+		for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+			slot := &preview_slots[s]
+			if !slot.in_use {
+				continue
+			}
+			fmt.printf("  [probe paused f=%d] asset=%d tl=%d src=%d clip_frame=%d last=%d have_last=%v keys={",
+				f, slot.asset_id, slot.timeline_start_frame, slot.source_start_frame,
+				slot.source_start_frame + i64(f) - slot.timeline_start_frame, slot.dec.last_frame, slot.dec.have_last)
+			for ci := 0; ci < len(slot.dec.cache); ci += 1 {
+				if ci > 0 {
+					fmt.print(",")
+				}
+				fmt.print(slot.dec.cache[ci].frame)
+			}
+			fmt.printf("} has_frame=%v frontier=%d\n", slot.has_frame, slot.frontier)
+		}
+		if max_slot_idx_used > 0 {
+			playhead.playing = true
+			update_preview_slots()
+			for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+				slot := &preview_slots[s]
+				if !slot.in_use {
+					continue
+				}
+				expected := slot.source_start_frame + i64(f) - slot.timeline_start_frame
+				diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
+				fmt.printf("  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v frontier=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
+					f, expected, slot.dec.last_frame, slot.dec.have_last, slot.has_frame, slot.frontier,
+					gt_ok, diffs, maxd)
+			}
+		}
+	}
+	os.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// NERED_BOUNDARY_PROBE="<file>|<split1>|<split2>": reproduce the exact reported
+// scene — import, split at split1, split at split2, raw-delete the middle clip,
+// drag the tail back to sit flush against the left clip — then step the playhead
+// across the boundary, pixel-comparing every displayed slot buffer against
+// ground truth. The generic preview probe deletes the LEFT half (single clip, no
+// crossing); this one keeps the left clip so the playhead genuinely moves from
+// clip A into the dragged-back tail.
+// ---------------------------------------------------------------------------
+
+boundary_probe_print_clips :: proc() {
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			c := timeline.tracks[t].clips[ci]
+			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t, c.timeline_start_frame, c.timeline_start_frame+c.source_length_frames,
+				c.source_start_frame, c.source_start_frame+c.source_length_frames, c.source_length_frames)
+		}
+	}
+}
+
+boundary_probe_run :: proc(v: string) {
+	parts := strings.split(v, "|")
+	if len(parts) < 2 {
+		fmt.println("boundary-probe: need NERED_BOUNDARY_PROBE=\"<file>|<split1>[|<split2>]\"")
+		os.exit(2)
+	}
+	file := parts[0]
+	s1: i64 = 68
+	if sv, ok := strconv.parse_i64(parts[1]); ok {
+		s1 = sv
+	}
+	s2: i64 = 184
+	if sv, ok := strconv.parse_i64(parts[2]); ok {
+		s2 = sv
+	}
+	total_frames := i64(s2 + 400)
+	inp: [4096]u8
+	n := 0
+	for n < len(file) && n < len(inp)-1 {
+		inp[n] = u8(file[n])
+		n += 1
+	}
+	inp[n] = 0
+	path := cstring(&inp[0])
+	import_media(path)
+
+	// Split 1 at s1 on clip 0 (tl [0,total) src [0,total)).
+	selected_track = 0
+	selected_index = 0
+	playhead.frame = s1
+	split_clip_at_playhead()
+	// Split 2 at s2 on clip index 1 (the [s1,total) half).
+	selected_track = 0
+	selected_index = 1
+	playhead.frame = s2
+	split_clip_at_playhead()
+	fmt.println("[bprobe] after splits at", s1, s2)
+	boundary_probe_print_clips()
+	// Raw-delete the middle [s1,s2) clip.
+	selected_track = 0
+	selected_index = 1
+	delete_selected_clip_raw()
+	// Drag the tail back flush: nearest valid non-overlapping start near s1.
+	track := &timeline.tracks[0]
+	last := len(track.clips) - 1
+	slide_to := clip_slide_in_track(track, last, track.clips[last].source_length_frames, s1, track.clips[last].timeline_start_frame)
+	track.clips[last].timeline_start_frame = slide_to
+	fmt.println("[bprobe] after raw-delete middle + drag tail back")
+	boundary_probe_print_clips()
+
+	fmt.println("[bprobe] stepped play (playing=true, pixel-vs-ground-truth): tl/src cf last has_frame frontier | diff maxd")
+	for ph := i64(0); ph < total_frames; ph += 1 {
+		playhead.frame = ph
+		playhead.playing = true
+		update_preview_slots()
+		for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+			slot := &preview_slots[s]
+			if !slot.in_use {
+				continue
+			}
+			expected := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
+			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
+			fmt.printf("[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v fr=%d gt=%v diff=%d maxd=%d\n",
+				playhead.frame, slot.timeline_start_frame, slot.source_start_frame, expected,
+				slot.dec.last_frame, slot.dec.have_last, slot.has_frame, slot.frontier,
+				gt_ok, diffs, maxd)
+		}
+	}
+
+	// Live-cadence pass: the playhead runs on the wall clock while decode trails
+	// it (dropped-frame preview). Burst THROUGH the boundary and then keep the
+	// playhead a few frames ahead of the slot frontier, exactly like real-time
+	// playback where decode can't sustain 60fps. Every displayed buffer is
+	// compared to ground truth for the DECODED frame (slot.frontier), not the
+	// playhead.
+	fmt.println("[bprobe] live dropped-frame cadence (decode trails playhead, burst across boundary)")
+	invalidate_preview_slots()
+	ph: i64 = 40
+	for step_i in 0 ..< 30 {
+		playhead.frame = ph
+		playhead.playing = true
+		update_preview_slots()
+		for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+			slot := &preview_slots[s]
+			if !slot.in_use {
+				continue
+			}
+			shown := slot.source_start_frame + slot.frontier - slot.timeline_start_frame
+			diffs, maxd, gt_ok := probe_ground_truth(slot.path, shown, slot.buffer[:])
+			fmt.printf("[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v frontier=%d last=%d | gt=%v diff=%d maxd=%d\n",
+				ph, shown, slot.timeline_start_frame, slot.source_start_frame,
+				slot.has_frame, slot.frontier, slot.dec.last_frame, gt_ok, diffs, maxd)
+		}
+		if step_i == 7 {
+			ph += 10 // burst 61 -> 71: crosses the 68 boundary in a single tick
+		} else if ph < 100 {
+			ph += 3
+		} else {
+			ph += 1
+		}
+	}
+
+	// Replay pass: prime the tail's source frames in the decoder's RAM cache
+	// (first playthrough), then REPLAY from the head. Cache writes during the
+	// head replay can leave a tail frame receivable as a cache hit while the
+	// decoder is still physically parked inside clip A — at the boundary a hit
+	// for src184 does not reposition, so the very next forward request believes
+	// it can continue from "184" and decodes src68 (DELETE clip's region) while
+	// labeling it the tail's frame.
+	fmt.println("[bprobe] replay pass: prime tail cache, scrub to head, cross again")
+	invalidate_preview_slots()
+	for ph := i64(0); ph < 220; ph += 1 {
+		playhead.frame = ph
+		playhead.playing = true
+		update_preview_slots()
+	}
+	// Scrubbing back to the head costs only cache hits (paused: exact request).
+	playhead.playing = false
+	playhead.frame = 63
+	update_preview_slots()
+	fmt.printf("[bprobe replay] scrubbed to 63, crossing:= cache keys =")
+	for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+		if preview_slots[s].in_use {
+			for ci := 0; ci < len(preview_slots[s].dec.cache); ci += 1 {
+				fmt.printf(" %d", preview_slots[s].dec.cache[ci].frame)
+			}
+		}
+	}
+	fmt.print("\n")
+	for ph := i64(63); ph < 80; ph += 1 {
+		playhead.frame = ph
+		playhead.playing = true
+		update_preview_slots()
+		for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+			slot := &preview_slots[s]
+			if !slot.in_use {
+				continue
+			}
+			expected := slot.source_start_frame + ph - slot.timeline_start_frame
+			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
+			fmt.printf("[bprobe replay ph=%d] cf=%d tl=%d src=%d last=%d hv=%v has_frame=%v | gt=%v diff=%d maxd=%d\n",
+				ph, expected, slot.timeline_start_frame, slot.source_start_frame,
+				slot.dec.last_frame, slot.dec.have_last, slot.has_frame, gt_ok, diffs, maxd)
+		}
+	}
+	os.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// NERED_FRAME_PROBE="<file>|<start>-<end>|<stride>": ground-truth frame check.
+//
+// The preview probe's pixel_diff compares two decodes that use the SAME seek
+// logic, so a systematic seek bug (wrong frame delivered, offset the same way
+// both times) is invisible to it. This probe breaks that symmetry: it first
+// decodes every frame 0..end IN ORDER (forward path, never seeks), hashing each
+// PREVIEW-buffer, then requests each frame in [start,end) the way
+// decode_clip_frame_sync does (seek path) and compares hashes. Any mismatch is
+// decode returning the wrong source frame for the requested index.
+// ---------------------------------------------------------------------------
+
+probe_hash_buf: [PREVIEW_W * PREVIEW_H * 4]u8
+probe_hash_gt:  [PREVIEW_W * PREVIEW_H * 4]u8
+probe_hashes:   [dynamic]u64
+
+fnv64 :: proc(data: []u8) -> u64 {
+	h := u64(0xcbf29ce484222325)
+	prime := u64(0x100000001b3)
+	for b in data {
+		h = (h ~ u64(b)) * prime
+	}
+	return h
+}
+
+probe_hash_decode_sync :: proc(path: cstring, clip_frame: i64) -> (u64, bool) {
+	pc: Clip_Decoder
+	defer clip_decoder_reset(&pc)
+	if !open_clip_decoder(&pc, path) {
+		return 0, false
+	}
+	if !decode_clip_frame_sync(&pc, path, clip_frame, probe_hash_gt[:]) {
+		return 0, false
+	}
+	return fnv64(probe_hash_gt[:]), true
+}
+
+preview_framecheck_run :: proc(v: string) {
+	parts := strings.split(v, "|")
+	if len(parts) < 3 {
+		fmt.println("frame-probe: need NERED_FRAME_PROBE=\"<file>|<start>-<end>|<stride>\"")
+		os.exit(2)
+	}
+	file := parts[0]
+	range_s := parts[1]
+	stride_st, ok_stride := strconv.parse_i64(parts[2])
+	if !ok_stride || stride_st < 1 {
+		stride_st = 1
+	}
+	rb := strings.split(range_s, "-")
+	if len(rb) != 2 {
+		fmt.println("frame-probe: bad range", range_s)
+		os.exit(2)
+	}
+	f0, ok0 := strconv.parse_i64(rb[0])
+	f1, ok1 := strconv.parse_i64(rb[1])
+	if !ok0 || !ok1 || f0 < 0 || f1 < f0 {
+		fmt.println("frame-probe: bad range", range_s)
+		os.exit(2)
+	}
+
+	inp: [4096]u8
+	n := 0
+	for n < len(file) && n < len(inp) - 1 {
+		inp[n] = u8(file[n])
+		n += 1
+	}
+	inp[n] = 0
+	path := cstring(&inp[0])
+
+	// Pass 1: decode every frame in order and hash each PREVIEW buffer.
+	seq: Clip_Decoder
+	if !open_clip_decoder(&seq, path) {
+		fmt.println("frame-probe: open failed")
+		os.exit(2)
+	}
+	clear(&probe_hashes)
+	for fi := i64(0); fi <= f1; fi += 1 {
+		if !decode_source_frame(&seq, fi) {
+			fmt.printf("frame-probe: decode stopped at %d\n", fi)
+			break
+		}
+		decode_into_buffer(&seq, probe_hash_buf[:], PREVIEW_W, PREVIEW_H)
+		append(&probe_hashes, fnv64(probe_hash_buf[:]))
+	}
+	clip_decoder_reset(&seq)
+
+	bad := 0
+	checked := 0
+	buf: [4096]u8
+	n = 0
+	for n < len(file) && n < len(buf) - 1 {
+		buf[n] = u8(file[n])
+		n += 1
+	}
+	buf[n] = 0
+	fmt.println("[frame-probe] seq_count =", len(probe_hashes))
+	probe_t0: time.Time
+	max_ms: f64
+	slow_cnt := 0
+	for fi := f0; fi <= f1 && fi < i64(len(probe_hashes)); fi += stride_st {
+		probe_t0 = time.now()
+		h, ok := probe_hash_decode_sync(path, fi)
+		ms := time.duration_milliseconds(time.since(probe_t0))
+		if ms > max_ms {
+			max_ms = ms
+		}
+		checked += 1
+		if ms > 50 {
+			slow_cnt += 1
+			if slow_cnt <= 40 {
+				fmt.printf("  SLOW frame=%5d elapsed_ms=%.0f ok=%v\n", fi, ms, ok)
+			}
+		}
+		if !ok {
+			fmt.printf("  frame %5d: decode failed\n", fi)
+			continue
+		}
+		if h != probe_hashes[fi] {
+			bad += 1
+			if bad <= 40 {
+				fmt.printf("  MISMATCH frame=%5d sync=%016x seq=%016x\n", fi, h, probe_hashes[fi])
+			}
+		}
+	}
+	fmt.printf("[frame-probe] checked=%d mismatches=%d slow(>50ms)=%d max_ms=%.0f%s\n", checked, bad, slow_cnt, max_ms, bad > 40 ? " (rest suppressed)" : "")
+	os.exit(bad == 0 ? 0 : 1)
+}
