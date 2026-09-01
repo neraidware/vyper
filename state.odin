@@ -323,6 +323,11 @@ Preview_Slot :: struct {
 	// that size (text_tex_w x text_tex_h) and is owned by the slot: it must be
 	// released when the slot is freed or reused for a non-text clip.
 	text_buf:            []u8,
+	// text_base_buf is a small transient buffer used to measure the BASE tight
+	// ink dims at font 48 (the logical clip.source_w/h, which stay constant per
+	// title and are what the handle-drag scale math multiplies against). Kept on
+	// the slot so re-measuring on a rename doesn't reallocate every frame.
+	text_base_buf:       []u8,
 	text_tex_w:          c.int,
 	text_tex_h:          c.int,
 	// text_scratch is the per-glyph bitmap scratch for text rasterization,

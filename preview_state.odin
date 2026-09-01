@@ -52,6 +52,10 @@ update_preview_slots :: proc() -> bool {
 					delete(slot.text_buf)
 					slot.text_buf = nil
 				}
+				if slot.text_base_buf != nil {
+					delete(slot.text_base_buf)
+					slot.text_base_buf = nil
+				}
 				if slot.text_scratch != nil {
 					delete(slot.text_scratch)
 					slot.text_scratch = nil
@@ -111,23 +115,45 @@ update_preview_slots :: proc() -> bool {
 			// the buffer + GPU texture stay in sync with the clip's name and a
 			// rename (even unpaused) triggers one re-upload.
 			if clip.kind == .Text {
-				// The tight, top-left bounding box. The text bounds are kept in
-				// TEXT pixels (buffer space), NOT project units: clip_image_bounds
-				// maps them to screen with a single uniform scale so the title is
-				// never squished by the project's aspect or resolution. The clip's
-				// scale is BAKED into the raster: the title is rasterized at
-				// font = 48*scale so the glyphs scale crisply instead of upscaling
-				// a fixed 48px render, and clip.scale is reset to 1 (source_w/h
-				// now carry the scaled tight extents).
+				// The tight, top-left bounding box. Text size has TWO decoupled
+				// notions: clip.source_w/h are the BASE tight ink dims at font 48
+				// (constant per title), and clip.scale is the pure multiplier that
+				// drives both the logical box (source_w * f * scale) and the raster
+				// RESOLUTION (the title is re-rendered at font = 48*scale so the
+				// glyphs scale crisply instead of upscaling a fixed 48px frame).
+				// Keeping source_w/h as the scale-independent base is what lets the
+				// handle-drag math compute an absolute new scale from a fixed base —
+				// if source_w/h carried the baked size, the drag would double-count.
 				slot.is_text = true
 				slot.crop_l = 0
 				slot.crop_r = 0
 				slot.crop_t = 0
 				slot.crop_b = 0
+				name_hash := text_clip_hash(clip.name)
+				base_changed := slot.text_hash != name_hash
 				font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
-				if slot.text_hash != text_clip_hash(clip.name) || slot.text_font_px != font_px {
+				if base_changed {
+					// Re-measure the base tight dims at font 48 on rename.
+					base_bw, base_bh := text_buf_size_for(clip.name, TEXT_CLIP_FONT_PIXELS)
+					need_base := base_bw * base_bh * 4
+					if need_base > len(slot.text_base_buf) {
+						delete(slot.text_base_buf)
+						slot.text_base_buf = make([]u8, need_base)
+					}
+					if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
+						delete(slot.text_scratch)
+						slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
+					}
+					_, _, bw0, bh0 := rasterize_title_into_buffer(clip.name, slot.text_base_buf, base_bw, base_bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, TEXT_CLIP_FONT_PIXELS)
+					clip.source_w = c.int(bw0)
+					clip.source_h = c.int(bh0)
+					slot.source_w = c.int(bw0)
+					slot.source_h = c.int(bh0)
+					slot.text_hash = name_hash
+				}
+				if base_changed || slot.text_font_px != font_px {
+					// Re-render at the baked font (48*scale) for the texture.
 					slot.text_font_px = font_px
-					// Grow the per-glyph scratch + working buffer to the baked size.
 					need_sc := text_scratch_size_for(font_px)
 					if need_sc > len(slot.text_scratch) {
 						delete(slot.text_scratch)
@@ -140,17 +166,10 @@ update_preview_slots :: proc() -> bool {
 						slot.text_buf = make([]u8, need)
 					}
 					text_x, text_y, text_w, text_h := rasterize_title_into_buffer(clip.name, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px)
-					slot.text_hash = text_clip_hash(clip.name)
 					slot.text_x = text_x
 					slot.text_y = text_y
 					slot.text_w = text_w
 					slot.text_h = text_h
-					clip.source_w = c.int(text_w)
-					clip.source_h = c.int(text_h)
-					clip.scale = 1
-					slot.source_w = c.int(text_w)
-					slot.source_h = c.int(text_h)
-					slot.scale = 1
 					slot.text_tex_w = c.int(text_w)
 					slot.text_tex_h = c.int(text_h)
 					slot.has_frame = text_w > 0 && text_h > 0
@@ -220,6 +239,10 @@ update_preview_slots :: proc() -> bool {
 			if slot.text_buf != nil {
 				delete(slot.text_buf)
 				slot.text_buf = nil
+			}
+			if slot.text_base_buf != nil {
+				delete(slot.text_base_buf)
+				slot.text_base_buf = nil
 			}
 			if slot.text_scratch != nil {
 				delete(slot.text_scratch)

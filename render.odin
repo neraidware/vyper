@@ -163,28 +163,19 @@ Render_Text_Job :: struct {
 // font grows to 48*scale). Sized per setup via text_scratch_size_for.
 render_text_setup_scratch: []u8
 
-// setup_text_job rasterizes a text clip at the baked font matching its snapshot
-// (title + source_w/source_h, with clip.scale already baked to 1). Two passes:
-// first at font 48 to learn the base ink width, then at 48*(source_w/base_w) to
-// reproduce the baked tight extents. Returns the job or leaves raster empty on
-// failure (caller deletes raster via cleanup).
+// setup_text_job rasterizes a text clip at the baked font matching its snapshot.
+// source_w/source_h are the BASE tight dims (font 48, scale-independent) and
+// scale is the multiplier, so the raster is rendered at font = 48*scale to keep
+// the output crisp (consistent with the preview). The raster therefore carries
+// the scale, and blit_scale is 1 so the box = tight_dims * uniform_factor (no
+// double-scaling). Returns the job or leaves raster empty on failure (caller
+// deletes raster via cleanup).
 setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 	over^ = {}
 	if t.name == "" || t.source_w <= 0 || t.source_h <= 0 {
 		return
 	}
-	base_bw, base_bh := text_buf_size_for(t.name, TEXT_CLIP_FONT_PIXELS)
-	base := make([]u8, base_bw * base_bh * 4)
-	defer delete(base)
-	if len(render_text_setup_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
-		delete(render_text_setup_scratch)
-		render_text_setup_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
-	}
-	_, _, base_ow, _ := rasterize_title_into_buffer(t.name, base, base_bw, base_bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, TEXT_CLIP_FONT_PIXELS)
-	font_px := f32(TEXT_CLIP_FONT_PIXELS)
-	if base_ow > 0 {
-		font_px = f32(TEXT_CLIP_FONT_PIXELS) * (f32(t.source_w) / f32(base_ow))
-	}
+	font_px := f32(TEXT_CLIP_FONT_PIXELS) * t.scale
 	bw, bh := text_buf_size_for(t.name, font_px)
 	buf := make([]u8, bw * bh * 4)
 	if len(render_text_setup_scratch) < text_scratch_size_for(font_px) {
@@ -199,7 +190,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 	over.raster = buf
 	over.bw = bw
 	over.ox, over.oy, over.ow, over.oh = ox, oy, ow, oh
-	over.blit_scale = t.scale
+	over.blit_scale = 1
 }
 
 // cleanup_text_jobs frees the per-clip text rasters and the shared setup scratch.
