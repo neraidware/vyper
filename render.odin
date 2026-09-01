@@ -923,6 +923,8 @@ case .Audio:
 			// no renderable content in this clip
 		case .Empty:
 			// no renderable content in this clip (placeholder for text later)
+		case .Text:
+			// generator clip — no decoded output yet; produced by the render task
 		}
 		}
 	}

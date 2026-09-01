@@ -100,7 +100,12 @@ file_info_text: string
 // canvas.
 resolution_locked: bool
 
-Media_Kind :: enum { Video, Audio, Image, Other, Empty }
+Media_Kind :: enum { Video, Audio, Image, Other, Empty, Text }
+
+// Generator_Kind marks clips that synthesize their output programmatically
+// instead of decoding a backing media file (a "generator"). .None = a regular
+// file-backed clip.
+Generator_Kind :: enum { None, Text }
 Media_Asset :: struct { id: u64, path: cstring, kind: Media_Kind, metadata: string, frame_count: i64 }
 
 // Clip_Marker is a point marker embedded in a clip (e.g. an imported chapter
@@ -122,6 +127,9 @@ Clip :: struct {
 	asset_id: u64,
 	path: cstring,
 	kind: Media_Kind,
+	// generator identifies this clip as a generator (programmatic output).
+	// .None for ordinary file-backed clips; .Text for the text generator.
+	generator: Generator_Kind,
 	stream_index: c.int,
 	source_start_frame: i64,
 	source_length_frames: i64,

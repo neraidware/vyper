@@ -708,6 +708,8 @@ kind_name :: proc(kind: Media_Kind) -> string {
 	    return "image"
     case .Empty:
 	    return "empty"
+    case .Text:
+	    return "text"
     case:
 	    return "other"
     }
