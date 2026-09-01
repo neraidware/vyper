@@ -206,9 +206,12 @@ moving_clip: bool
 // resize_edge 0 = left (trim/extend head), 1 = right (trim/extend tail).
 resizing_clip: bool
 resize_edge: int = -1
-// _timeline_resize_cursor is the lazily-created horizontal-resize SDL cursor,
-// shown while dragging/hovering a clip's duration edge.
+// _timeline_resize_cursor and _timeline_arrow_cursor are lazily-created SDL
+// cursors: the horizontal-resize one is shown while dragging/hovering a clip's
+// duration edge, and the arrow is explicitly restored the rest of the time
+// (SDL doesn't reliably reset to the default pointer from SetCursor(nil)).
 _timeline_resize_cursor: ^sdl.Cursor
+_timeline_arrow_cursor: ^sdl.Cursor
 clip_drag_offset: f32
 drag_clip: ^Clip
 // Track the clip was grabbed from and the track its ghost currently hovers.

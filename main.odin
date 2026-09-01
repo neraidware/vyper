@@ -160,13 +160,13 @@ timeline_resize_hover :: proc(mx, my: f32) -> bool {
 }
 
 // update_timeline_cursor shows the horizontal-resize cursor while dragging or
-// hovering a clip's duration edge, restoring the default arrow otherwise.
+// hovering a clip's duration edge, restoring the arrow cursor otherwise.
 update_timeline_cursor :: proc(mx, my: f32) {
 	if !timeline_resize_hover(mx, my) {
-		if _timeline_resize_cursor != nil {
-			_ = sdl.SetCursor(nil)
-			_timeline_resize_cursor = nil
+		if _timeline_arrow_cursor == nil {
+			_timeline_arrow_cursor = sdl.CreateSystemCursor(.DEFAULT)
 		}
+		_ = sdl.SetCursor(_timeline_arrow_cursor)
 		return
 	}
 	if _timeline_resize_cursor == nil {
