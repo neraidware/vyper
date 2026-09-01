@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:slice"
 import "core:strconv"
 import "core:sync"
@@ -11,6 +12,53 @@ import "core:sync"
 // ---------------------------------------------------------------------------
 
 clip_timeline_end :: proc(clip: Clip) -> i64 { return clip.timeline_start_frame + clip.source_length_frames }
+
+// add_text_generator_clip inserts a 1-second Text generator clip on `track`,
+// starting at `start_frame` (timeline frames). The duration is one second at the
+// current timeline frame rate. If the free gap that contains start_frame can't
+// hold a full second, the clip is shortened to fit the neighbor (never shifted).
+// Returns the index of the inserted clip.
+add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
+	one_sec := i64(math.round(timeline_fps()))
+	start := max(start_frame, 0)
+	length := one_sec
+	if len(track.clips) > 0 {
+		gaps := clip_track_gaps(track, -1)
+		defer delete(gaps)
+		if gi := gap_for_start(gaps[:], start); gi >= 0 {
+			hi := gaps[gi][1]
+			if start + length > hi {
+				length = clamp(hi - start, 1, length)
+			}
+		}
+	}
+	clip := Clip{
+		clip_id = new_clip_id(),
+		asset_id = 0,
+		path = nil,
+		kind = .Text,
+		generator = .Text,
+		stream_index = -1,
+		source_start_frame = 0,
+		source_length_frames = length,
+		timeline_start_frame = start,
+		transform_x = f32(project.width) / 2,
+		transform_y = f32(project.height) / 2,
+		scale = 1,
+		crop_l = 0,
+		crop_r = 0,
+		crop_t = 0,
+		crop_b = 0,
+	}
+	append(&track.clips, clip)
+	// Keep the track's clips sorted ascending by timeline start.
+	idx := len(track.clips) - 1
+	for i := idx; i > 0 && track.clips[i].timeline_start_frame < track.clips[i-1].timeline_start_frame; i -= 1 {
+		track.clips[i], track.clips[i-1] = track.clips[i-1], track.clips[i]
+		idx = i - 1
+	}
+	return idx
+}
 
 // clip_track_gaps returns the free (non-covered) bands of `track`, ignoring the
 // clip at exclude_idx (-1 = include everything). The trailing band is unbounded

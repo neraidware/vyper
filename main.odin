@@ -141,11 +141,33 @@ escape_dismiss :: proc() {
 	playback_rate_open = false
 }
 
-// handle_ctx_option dispatches a click on a context-menu entry. Selecting a
-// submenu kind currently dismisses the menu; the clip creation itself is wired
-// when the model lands.
-handle_ctx_option :: proc() {
+// handle_ctx_option dispatches a click on a context-menu entry at (mx, my).
+// Selecting Add > Text Clip creates a Text generator clip on the right-clicked
+// track at the pointer's frame.
+handle_ctx_option :: proc(mx, my: f32) {
+	if clay.PointerOver(clay.ID("CtxTextClip")) {
+		add_text_clip_at(mx, my)
+	}
 	close_context_menu()
+}
+
+// add_text_clip_at inserts a Text generator clip on ctx_menu.target_track,
+// positioned at the pointer's timeline frame and one second long (shortened to
+// fit its free gap). After insert the new clip becomes the timeline selection.
+add_text_clip_at :: proc(mx, my: f32) {
+	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
+		return
+	}
+	track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
+	frame := max(f32(0), (mx - track_start) / timeline_zoom + timeline_view_start)
+
+	sync.mutex_lock(&audio_timeline_mtx)
+	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], i64(frame))
+	sync.mutex_unlock(&audio_timeline_mtx)
+	audio_note_edit()
+
+	selected_track = ctx_menu.target_track
+	selected_index = idx
 }
 
 // pointer_over_context_menu reports whether the cursor is over the context menu
@@ -808,7 +830,7 @@ if drag_clip.timeline_start_frame != new_start {
 			}
 		} else if was_click && ctx_menu.open {
 			if pointer_over_context_menu() {
-				handle_ctx_option()
+				handle_ctx_option(mouse_x, mouse_y)
 			} else {
 				close_context_menu()
 			}
