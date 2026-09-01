@@ -35,6 +35,7 @@ RANGE_COLOR :: clay.Color{139, 173, 109, 255}
 HANDLE_FILL :: clay.Color{24, 24, 32, 255}
 HANDLE_BORDER :: clay.Color{115, 115, 125, 255}
 TEXT :: clay.Color{220, 215, 198, 255}
+TEXT_INPUT_BG :: clay.Color{15, 17, 22, 255}
 
 RULER_HEIGHT :: f32(30)
 RULER_TICK_COLOR :: clay.Color{80, 90, 110, 255}
@@ -126,6 +127,9 @@ Clip :: struct {
 	clip_id: u64,
 	asset_id: u64,
 	path: cstring,
+	// name is the clip's editable label. For a Text generator clip it is the
+	// title that will be rendered; for file-backed clips it's a display name.
+	name: string,
 	kind: Media_Kind,
 	// generator identifies this clip as a generator (programmatic output).
 	// .None for ordinary file-backed clips; .Text for the text generator.
@@ -239,6 +243,22 @@ preview_drag_offset_y: f32
 editing_field: int
 edit_chars: [64]u8
 edit_len: int
+
+// Text_Input is the generic modal string field (used by clip rename, and any
+// future string input). UTF-8 safe: cursor/anchor are byte offsets into buf.
+// Selection spans [min(cursor,anchor), max(cursor,anchor)]. Enter commits, Esc
+// cancels. Copy/cut/paste talk to the system clipboard.
+Text_Input :: struct {
+	active:     bool,
+	buf:        [dynamic]u8,
+	cursor:     int,
+	anchor:     int,
+	input_type: int, // caller discriminator (1 = clip rename)
+	target:     u64, // caller target id (clip_id for rename)
+}
+ti: Text_Input
+// TI_RENAME is the input_type value for clip renaming.
+TI_RENAME :: 1
 
 Preview_State :: struct {
 	buffer: [PREVIEW_W * PREVIEW_H * 4]u8,

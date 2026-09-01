@@ -203,6 +203,26 @@ escape_dismiss :: proc() {
 	playback_rate_open = false
 }
 
+// begin_clip_rename opens the generic text field to edit the selected clip's
+// name. The value is applied on commit (see apply_rename).
+begin_clip_rename :: proc() {
+	if _, clip, ok := selected_clip(); ok {
+		text_input_begin(string(clip.name), TI_RENAME, clip.clip_id)
+	}
+}
+
+// apply_rename reads the committed text input and stores it on the clip that
+// was being renamed (ti.target is the clip_id).
+apply_rename :: proc() {
+	name := text_input_string()
+	if _, clip, ok := find_clip_by_id(ti.target); ok {
+		if clip.name != "" {
+			delete(clip.name)
+		}
+		clip.name = strings.clone(name)
+	}
+}
+
 // handle_ctx_option dispatches a click on a context-menu entry at (mx, my).
 // Selecting Add > Text Clip creates a Text generator clip on the right-clicked
 // track at the pointer's frame.
@@ -217,8 +237,7 @@ handle_ctx_option :: proc() {
 // the frame captured when the context menu was opened (right-click), one second
 // long (shortened to fit its free gap). After insert the new clip becomes the
 // timeline selection.
-add_text_clip_at :: proc() {
-	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
+add_text_clip_at :: proc() {	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
 		return
 	}
 	sync.mutex_lock(&audio_timeline_mtx)
@@ -351,6 +370,9 @@ main :: proc() {
 	}
 	defer sdl.DestroyWindow(window)
 	app_window = window
+	// Enable SDL text input so TEXT_INPUT events (typing) reach the app for the
+	// property/number fields and the generic rename text field.
+	_ = sdl.StartTextInput(window)
 
 	device := sdl.CreateGPUDevice({.SPIRV}, true, "vulkan")
 	if device == nil {
@@ -460,7 +482,15 @@ main :: proc() {
 			case .QUIT, .WINDOW_CLOSE_REQUESTED:
 				running = false
 			case .KEY_DOWN:
-				if editing_field != 0 {
+				if ti.active {
+					mods := sdl.GetModState()
+					shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
+					ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
+					r := text_input_handle_key(event.key.key, shift, ctrl)
+					if r == .Commit {
+						apply_rename()
+					}
+				} else if editing_field != 0 {
 					switch event.key.key {
 					case sdl.K_BACKSPACE:
 						edit_backspace()
@@ -488,6 +518,12 @@ main :: proc() {
 						jog_playback(1)
 					case sdl.K_S:
 						split_clip_at_playhead()
+					case sdl.K_R:
+						// Ctrl+R renames the selected clip.
+						mods := sdl.GetModState()
+						if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
+							begin_clip_rename()
+						}
 					case sdl.K_BACKSPACE:
 						// Delete the selected clip's timeline area on every track
 						// and close the gap (ripple).
@@ -514,7 +550,9 @@ main :: proc() {
 					}
 				}
 			case .TEXT_INPUT:
-				if editing_field != 0 {
+				if ti.active {
+					text_input_insert(string(event.text.text))
+				} else if editing_field != 0 {
 					for ch in string(event.text.text) {
 						// Only accept printable ASCII that makes sense in a number.
 						if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
@@ -1062,6 +1100,7 @@ if drag_clip.timeline_start_frame != new_start {
 		pass := sdl.BeginGPURenderPass(command_buffer, &color_target, 1, nil)
 		if pass != nil {
 			render_clay(&renderer, command_buffer, pass, commands)
+			draw_text_input_caret(&renderer, command_buffer, pass)
 			draw_clip_markers(&renderer, command_buffer, pass)
 			draw_timeline_resize_focus(&renderer, command_buffer, pass)
 			draw_drag_ghost(&renderer, command_buffer, pass)

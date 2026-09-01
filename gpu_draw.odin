@@ -215,6 +215,36 @@ scissor_intersect :: proc(bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect 
 	return sdl.Rect{x, y, x2 - x, y2 - y}
 }
 
+// draw_text_input_caret paints the text-input field's selection highlight and
+// blinking caret as an overlay (after Clay) because caret alignment depends on
+// the laid-out field box and per-character advance. The field font is the
+// monospace app font, so advance is a constant per codepoint (matching the
+// measure function).
+draw_text_input_caret :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	if !ti.active {
+		return
+	}
+	box := clay.GetElementData(clay.ID("TextInputField")).boundingBox
+	if box.width <= 0 || box.height <= 0 {
+		return
+	}
+	field_size: f32 = 18
+	adv := f32(0.55) * field_size
+	text_x := box.x + 8 // matches the field's left padding
+	sm, lg := text_input_sel()
+	if sm != lg {
+		x0 := text_x + f32(text_input_codepoints_before(sm)) * adv
+		x1 := text_x + f32(text_input_codepoints_before(lg)) * adv
+		render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = x0, y = box.y + 4, width = max(2, x1 - x0), height = box.height - 8}, clay.Color{56, 90, 170, 170}, 2, 0)
+	}
+	// Blinking caret.
+	blink := (sdl.GetTicks() / 500) % 2 == 0
+	if blink {
+		cx := text_x + f32(text_input_codepoints_before(ti.cursor)) * adv
+		render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = cx, y = box.y + 3, width = 2, height = box.height - 6}, BUTTON_BORDER_HOVER, 0, 0)
+	}
+}
+
 // draw_timeline_resize_focus paints a thin accent bar on the hovered (or
 // actively dragged) duration edge of the selected clip, making the edge-grab
 // area visible. Drawn as an overlay after Clay because a clip element's laid-out

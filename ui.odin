@@ -484,6 +484,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		}
 	}
 	draw_context_menu()
+	draw_text_input_popup(width, height)
 
 	return clay.EndLayout(0)
 }
@@ -693,6 +694,49 @@ draw_context_menu :: proc() {
 			},
 		}) {
 			ctx_option("CtxTextClip", "Text Clip")
+		}
+	}
+}
+
+// draw_text_input_popup renders the generic modal text-input dialog as a
+// floating overlay centered in the window when the text field is active. It is a
+// deliberately plain panel holding a raw input field; typing/selection/caret are
+// handled by the textinput module and drawn by draw_text_input_caret.
+draw_text_input_popup :: proc(width, height: c.int) {
+	if !ti.active {
+		return
+	}
+	PW :: f32(460)
+	PH :: f32(122)
+	px := (f32(width) - PW) / 2
+	py := (f32(height) - PH) / 4
+	title := "Edit Text"
+	if ti.input_type == TI_RENAME {
+		title = "Rename Clip"
+	}
+	if clay.UI(clay.ID("TextInputPopup"))({
+		layout = {sizing = {width = clay.SizingFixed(PW), height = clay.SizingFixed(PH)}, layoutDirection = .TopToBottom, childGap = 12, padding = clay.PaddingAll(16), childAlignment = {x = .Left, y = .Top}},
+		backgroundColor = BUTTON,
+		border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
+		cornerRadius = clay.CornerRadiusAll(8),
+		floating = {
+			offset = {px, py},
+			zIndex = 3000,
+			attachTo = .Root,
+			pointerCaptureMode = .Capture,
+		},
+	}) {
+		clay.Text(strings.concatenate({title, " — Enter to confirm, Esc to cancel"}), clay.TextElementConfig{textColor = TEXT, fontSize = 13})
+		field_size: u16 = 18
+		if clay.UI(clay.ID("TextInputField"))({
+			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(34)}, padding = clay.Padding{left = 8, right = 8}, childAlignment = {x = .Left, y = .Center}},
+			backgroundColor = TEXT_INPUT_BG,
+			border = {color = BUTTON_BORDER_HOVER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(4),
+		}) {
+			if len(ti.buf) > 0 {
+				clay.Text(text_input_string(), clay.TextElementConfig{textColor = TEXT, fontSize = field_size})
+			}
 		}
 	}
 }

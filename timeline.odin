@@ -478,6 +478,19 @@ selected_clip :: proc() -> (^Track, ^Clip, bool) {
 	return nil, nil, false
 }
 
+// find_clip_by_id locates the clip with the given clip_id across all tracks.
+find_clip_by_id :: proc(id: u64) -> (^Track, ^Clip, bool) {
+	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+		tr := &timeline.tracks[track_idx]
+		for i := 0; i < len(tr.clips); i += 1 {
+			if tr.clips[i].clip_id == id {
+				return tr, &tr.clips[i], true
+			}
+		}
+	}
+	return nil, nil, false
+}
+
 timeline_frame_at :: proc(frame: i64) -> Timeline_Frame {
 	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 		candidate_track := &timeline.tracks[track_idx]
