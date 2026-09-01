@@ -56,6 +56,11 @@ Clip_Decoder :: struct {
 	fps_den:     c.int,
 	// Decoder owns these allocations.
 	frame:       ^avutil.Frame,
+	// hold caches the most recently decoded frame whose PTS is still at/below
+	// the seek target, so the forward decode loop can hand back the LAST frame
+	// at/before the target instead of the first one past it (exact for VFR and
+	// for any rate-mapping one-frame overshoot).
+	hold:        ^avutil.Frame,
 	pkt:         ^avcodec.Packet,
 	// dst is the fixed-size RGBA console buffer written by sws. dst honors the
 	// source aspect ratio (the source is fit, not stretched, into PREVIEW_W x
@@ -118,6 +123,7 @@ clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 		avcodec.free_context(&dec.dec_ctx)
 		sws.freeContext(dec.sws_ctx)
 		avutil.frame_free(&dec.frame)
+		avutil.frame_free(&dec.hold)
 		avcodec.packet_free(&dec.pkt)
 	}
 	frame_cache_clear(dec)
@@ -266,9 +272,16 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		dec.fit_oy = 0
 	}
 
-	fps := dec.stream.avg_frame_rate
+	// Prefer the stream's r_frame_rate for index<->PTS mapping: it is the true
+	// constant frame rate for CFR content, whereas avg_frame_rate is a nominal
+	// container average that is frequently truncated/miscalculated (e.g. a
+	// 60fps file reporting 302/5 => 60.4). Using the exact rate keeps
+	// frames_to_stream_ts from drifting, which is what returned wrong source
+	// frames on scrub for odd files. r_frame_rate can be the max rate on true
+	// VFR, so only accept it when it looks constant; otherwise fall back to avg.
+	fps := dec.stream.r_frame_rate
 	if fps.num <= 0 || fps.den <= 0 {
-		fps = dec.stream.r_frame_rate
+		fps = dec.stream.avg_frame_rate
 	}
 	if fps.num <= 0 || fps.den <= 0 {
 		fps = {25, 1}
@@ -290,6 +303,7 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		return false
 	}
 	dec.frame = avutil.frame_alloc()
+	dec.hold = avutil.frame_alloc()
 	dec.pkt = avcodec.packet_alloc()
 	dec.opened = true
 	fmt.printf("decoded %dx%d (%dx%d) @ %d/%d fps\n", dec.src_w, dec.src_h, dec.dst_w, dec.dst_h, dec.fps_num, dec.fps_den)
@@ -376,51 +390,45 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		return true
 	}
 	// Discontiguous: re-seek to the keyframe before the target, then decode
-	// forward until a frame at/after the target timestamp is produced.
+	// forward until the emitted frame's PTS reaches the target timestamp. Stop at
+	// the LAST frame whose best_effort_timestamp is at/below the target (that is
+	// frame `frame_idx` for exact-rate CFR; for VFR or a one-frame overshoot it
+	// is the frame actually occupying the target's play position). Termination
+	// compares PTS directly against the target -- never a PTS->index back
+	// conversion through an assumed frame rate, which drifted on odd files.
 	if !seek_to_source_frame(dec, frame_idx) {
 		return false
 	}
 	target := frames_to_stream_ts(dec, frame_idx)
-    // After seek, the next decoded frame is the keyframe.
-// We need to decode exactly (frame_idx - keyframe_frame) frames.
-// We don't know keyframe_frame, so we count decoded frames after seek
-// and stop when the count equals (frame_idx - dec.last_frame_before_seek)?
-// Better: decode forward and compare the decoded frame's index (converted from pts).
-// For simplicity, use a frame counter:
-decoded_since_seek := i64(0)
-for {
-    if !decode_one_forward(dec) { return false }
-    // Convert the frame's pts to a frame index using the average frame rate.
-    // This is not perfect but better than timestamp comparison.
-    pts := dec.frame.best_effort_timestamp
-    // Convert to frame index: pts * fps_num / (fps_den * stream.time_base)
-    // But we can use the stream timebase:
-    frame_idx_from_pts := avutil.rescale_q(pts, dec.stream.time_base, avutil.Rational{num = dec.fps_den, den = dec.fps_num})
-    if frame_idx_from_pts >= frame_idx {
-        // We might have overshot; if it's exactly frame_idx, accept; else we could seek again.
-        // For now, if it's close, accept.
-        if frame_idx_from_pts == frame_idx {
-            // success
-            dec.last_frame = frame_idx
-            dec.have_last = true
-            scale_decoded_frame(dec)
-            return true
-        } else {
-            // We overshot – seek to the previous keyframe and try again with a different target?
-            // For simplicity, just accept if it's within ±1.
-            if frame_idx_from_pts - frame_idx <= 1 {
-                // accept as close enough
-                dec.last_frame = frame_idx
-                dec.have_last = true
-                scale_decoded_frame(dec)
-                return true
-            }
-            // Otherwise, fall back to seeking again with a slightly adjusted timestamp.
-            // This is rare; we can retry.
-            return false
-        }
-    }
-}
+	held := false
+	for {
+		if !decode_one_forward(dec) {
+			return false
+		}
+		pts := dec.frame.best_effort_timestamp
+		if pts >= target {
+			// Current frame reaches/exceeds the target. If it is exactly the
+			// target (normal CFR case) deliver it; if it overshot, the previous
+			// held frame (last pts < target) is the requested one.
+			if pts == target || !held {
+				dec.last_frame = frame_idx
+				dec.have_last = true
+				dec.last_emitted_ts = pts
+				scale_decoded_frame(dec)
+				return true
+			}
+			// Overshot: deliver the held (earlier) frame instead.
+			_ = avutil.frame_replace(dec.frame, dec.hold)
+			dec.last_frame = frame_idx
+			dec.have_last = true
+			dec.last_emitted_ts = dec.frame.best_effort_timestamp
+			scale_decoded_frame(dec)
+			return true
+		}
+		// Frame is before the target: remember it as the last acceptable one.
+		_ = avutil.frame_replace(dec.hold, dec.frame)
+		held = true
+	}
 }
 
 scale_decoded_frame :: proc(dec: ^Clip_Decoder) {
