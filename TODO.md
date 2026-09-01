@@ -125,6 +125,32 @@ Verification for this block: `NERED_CACHE_PROBE`, `NERED_FRAME_PROBE`, and
 `NERED_BOUNDARY_PROBE` all at 0 mismatches; interactive scrub/play across a
 no-gap clip boundary renders the correct frame and audio follows the playhead.
 
+- **Pitch-preserving playback rate**: playback >1x currently uses
+  `SDL_SetAudioStreamFrequencyRatio` (plain resample), so **pitch rises** at
+  2x+. Recommended approach (user-approved, not started): FFmpeg
+  `libavfilter` **`atempo`** time-stretch (WSOLA) applied to the final **post-mix
+  PCM** before it reaches the device, with the device left at 1x
+  (`SetAudioStreamFrequencyRatio` = 1.0). This keeps tone at source pitch while
+  advancing `rate`x through source content. Requirements/constraints:
+  - Persistent `atempo` filter graph per producer session (it is streaming
+    stateful), fed post-`audio_mix_frame`, with an output FIFO between the filter
+    and `PutAudioStreamData`.
+  - `atempo` only accepts `0.5..2.0`, so **chain** two filters for 3x/4x
+    (atempo=2.0 + atempo=2.0), and re-provision the chain when `playback_rate`
+    changes. Chain differs by rate, so tear down + rebuild the graph on rate
+    change (coalesced like the resync path).
+  - Must dispose the graph (avfilter_graph_free) on `audio_reset_play` /
+    shutdown to avoid leaking frames/state.
+  - Bookkeeping: mixing stays content-frame-driven (`audio_play_frame`); atempo
+    shrinks the fed sample count by 1/rate. Queue-depth (`max_queue`,
+    `queued_frames`) reporting must account for the post-mix rate change or the
+    drift/drain telemetry (`dev_ratio`) misreads.
+  - Requires linking `libavfilter` (`-lavfilter` in the extra linker flags)
+    and importing the vendored `vendor/ffmpeg/avfilter` package.
+  - Quality note: WSOLA atempo is high quality for music/speech at 1.5-2x;
+    expect some artifact at 4x (inherent to fast time-stretch). Backward playback
+    stays video-only regardless (no reverse audio in scope).
+
 - **Preview render-safe area**: clip image must never render outside the final
   project canvas area (the black view rectangle). Currently content is clipped
   only to the whole preview widget; a clip dragged off-canvas paints over the
