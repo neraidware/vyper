@@ -94,6 +94,37 @@ Not yet implemented (roadmap below):
 
 ## Backlog (planned, in order)
 
+### NEXT REQUEST — Playback/timeline quality regression + audio scrubbing
+
+Reported: playback, timeline interaction, clip-transition rendering, and
+scrubbing have all degraded. Fix this regressed core before any new features.
+These are the highest-priority items and should be the next work block:
+
+- **Playback quality regression**: playing shows wrong/stale frames, dropped or
+  desynced content, and generally feels bad. Re-baseline playhead advancement,
+  the dropped-frame preview path (`update_preview_slots` frontier logic), and A/V
+  sync after the recent clip-identity/invalidation/decode changes.
+- **Timeline interaction regression**: clicking/selecting/editing clips on the
+  timeline behaves poorly (verify clip hit-testing, selection identity by
+  `clip_id`, drag, and the boundary glue after the raw-delete + drag-back flush
+  bug fixes).
+- **Clip-transition rendering**: the boundary between two adjacent (flush) clips
+  is wrong — wrong frame shown at the seam (the lost-region bug). The
+  cache-desync guard fixed one path; audit the remaining no-gap-boundary seam
+  holistically and confirm the wrong-image cannot recur.
+- **Scrubbing regression**: scrubbing the playhead over the timeline is janky /
+  shows wrong frames. Verify the persistent-decoder cache + seek behavior under
+  rapid non-monotonic playhead moves.
+- **Audio scrubbing not implemented**: the playhead scrubs video but audio does
+  NOT follow the playhead while scrubbing (only on play start/stop/resync). When
+  the user drags the playhead, audio must seek to the scrubbed position and play
+  from there. Requires hooking `audio_seek`/the producer resync into the scrub
+  (mouse drag + auto catch-up) path in the UI.
+
+Verification for this block: `NERED_CACHE_PROBE`, `NERED_FRAME_PROBE`, and
+`NERED_BOUNDARY_PROBE` all at 0 mismatches; interactive scrub/play across a
+no-gap clip boundary renders the correct frame and audio follows the playhead.
+
 - **Preview render-safe area**: clip image must never render outside the final
   project canvas area (the black view rectangle). Currently content is clipped
   only to the whole preview widget; a clip dragged off-canvas paints over the
