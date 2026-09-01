@@ -332,5 +332,6 @@ ContextMenu :: struct {
 	x:            f32,
 	y:            f32,
 	target_track: int, // -1 = none/between tracks
+	submenu:      bool, // the "Add >" flyout is showing
 }
 ctx_menu: ContextMenu

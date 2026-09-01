@@ -635,10 +635,29 @@ ctx_option :: proc(id_name: string, label: string) {
 	}
 }
 
+// ctx_add_row renders the "Add >" row that opens the submenu when hovered (or
+// clicked). Held while the submenu is showing.
+ctx_add_row :: proc() {
+	ctx_border := clay.BorderOutside(1)
+	if clay.UI(clay.ID("CtxAdd"))({
+		layout = {sizing = {width = clay.SizingFixed(180), height = clay.SizingFixed(30)}, padding = clay.Padding{left = 10}, childAlignment = {x = .Left, y = .Center}},
+		backgroundColor = BUTTON,
+		border = {color = ctx_menu.submenu ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = ctx_border},
+		cornerRadius = clay.CornerRadiusAll(0),
+	}) {
+		clay.Text("Add", clay.TextElementConfig{textColor = ctx_menu.submenu ? BUTTON_BORDER_HOVER : TEXT, fontSize = 14})
+		if clay.UI(clay.ID("CtxAddChevron"))({
+			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(30)}, childAlignment = {x = .Right, y = .Center}},
+		}) {
+			clay.Text(">", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+		}
+	}
+}
+
 // draw_context_menu renders the right-click menu over the timeline as a
-// floating overlay anchored at the pointer. Menu item clicks are dispatched by
-// the main loop (handle_ctx_option); the option set is what the coming text-clip
-// model will populate.
+// floating overlay anchored at the pointer. The "Add >" row expands a flyout
+// submenu (attached right of it) listing the clip kinds. Menu item clicks are
+// dispatched by the main loop (handle_ctx_option).
 draw_context_menu :: proc() {
 	if !ctx_menu.open {
 		return
@@ -656,8 +675,26 @@ draw_context_menu :: proc() {
 			pointerCaptureMode = .Capture,
 		},
 	}) {
-		ctx_option("CtxAddText", "Add Text Clip")
-		ctx_option("CtxAddAudio", "Add Audio Clip")
+		ctx_add_row()
+	}
+	// Flyout submenu to the right of the "Add >" row, shown while hovered.
+	if ctx_menu.submenu {
+		if clay.UI(clay.ID("CtxSubmenu"))({
+			layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})}, layoutDirection = .TopToBottom, childGap = 1, padding = clay.PaddingAll(2)},
+			backgroundColor = BUTTON,
+			border = {color = BUTTON_BORDER, width = ctx_border},
+			cornerRadius = clay.CornerRadiusAll(6),
+			floating = {
+				parentId = clay.ID("CtxAdd").id,
+				zIndex = 2001,
+				attachment = {element = .LeftTop, parent = .RightTop},
+				attachTo = .ElementWithId,
+				clipTo = .None,
+			},
+		}) {
+			ctx_option("CtxTextClip", "Text Clip")
+			ctx_option("CtxAudioClip", "Audio Clip")
+		}
 	}
 }
 

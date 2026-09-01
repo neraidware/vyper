@@ -131,6 +131,7 @@ open_track_context_menu :: proc(mx, my: f32, track: int) {
 close_context_menu :: proc() {
 	ctx_menu.open = false
 	ctx_menu.target_track = -1
+	ctx_menu.submenu = false
 }
 
 // escape_dismiss closes any transient overlay (right-click context menu, the
@@ -140,17 +141,31 @@ escape_dismiss :: proc() {
 	playback_rate_open = false
 }
 
-// handle_ctx_option dispatches a context-menu option click. This first milestone
-// just closes the menu; the Add Text/Audio Clip actions are wired when the text
-// clip model lands.
+// handle_ctx_option dispatches a click on a context-menu entry. Selecting a
+// submenu kind currently dismisses the menu; the clip creation itself is wired
+// when the model lands.
 handle_ctx_option :: proc() {
-	if clay.PointerOver(clay.ID("CtxAddText")) {
+	if clay.PointerOver(clay.ID("CtxTextClip")) {
 		close_context_menu()
-	} else if clay.PointerOver(clay.ID("CtxAddAudio")) {
+	} else if clay.PointerOver(clay.ID("CtxAudioClip")) {
 		close_context_menu()
 	} else {
 		close_context_menu()
 	}
+}
+
+// pointer_over_context_menu reports whether the cursor is over the context menu
+// proper or its "Add >" submenu (both are part of the same transient UI).
+pointer_over_context_menu :: proc() -> bool {
+	if clay.PointerOver(clay.ID("CtxMenu")) {
+		return true
+	}
+	return pointer_over_submenu()
+}
+
+// pointer_over_submenu reports whether the cursor is over any submenu item.
+pointer_over_submenu :: proc() -> bool {
+	return clay.PointerOver(clay.ID("CtxTextClip")) || clay.PointerOver(clay.ID("CtxAudioClip"))
 }
 
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
@@ -798,11 +813,16 @@ if drag_clip.timeline_start_frame != new_start {
 				close_context_menu()
 			}
 		} else if was_click && ctx_menu.open {
-			if clay.PointerOver(clay.ID("CtxMenu")) {
+			if pointer_over_context_menu() {
 				handle_ctx_option()
 			} else {
 				close_context_menu()
 			}
+		}
+		// Submenu flyout follows the cursor: show while hovering the "Add >"
+		// row or the submenu itself, hide while hovering neither.
+		if ctx_menu.open {
+			ctx_menu.submenu = pointer_over_context_menu() && (clay.PointerOver(clay.ID("CtxAdd")) || pointer_over_submenu())
 		}
 		was_mouse_down = mouse_down
 		was_right_down = right_down
