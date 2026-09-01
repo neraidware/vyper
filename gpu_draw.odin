@@ -622,10 +622,10 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		// exactly that top-left region rather than a letterboxed fit.
 		u0, u1, v0, v1: f32
 		if is_text {
-			u0 = 0
-			v0 = 0
-			u1 = f32(slot.text_w) / f32(PREVIEW_W)
-			v1 = f32(slot.text_h) / f32(PREVIEW_H)
+			u0 = f32(slot.text_x) / f32(PREVIEW_W)
+			v0 = f32(slot.text_y) / f32(PREVIEW_H)
+			u1 = f32(slot.text_x + slot.text_w) / f32(PREVIEW_W)
+			v1 = f32(slot.text_y + slot.text_h) / f32(PREVIEW_H)
 		} else {
 			fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
 			u_base := f32(fox) / f32(PREVIEW_W)

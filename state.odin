@@ -304,6 +304,11 @@ Preview_Slot :: struct {
 	text_hash:           u64,
 	// Tight text bounds (buffer pixels) for a rendered text clip; used to size
 	// the clip's image box + UV sampling to the text instead of the full canvas.
+	// text_x/text_y are the ink's top-left origin in the buffer, so the sampled
+	// region matches where the glyphs actually are (avoids clipping the bottom
+	// of descenders).
+	text_x:              int,
+	text_y:              int,
 	text_w:              int,
 	text_h:              int,
 	tex_dirty:           bool,

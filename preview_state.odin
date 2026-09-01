@@ -106,8 +106,10 @@ update_preview_slots :: proc() -> bool {
 				slot.crop_t = 0
 				slot.crop_b = 0
 				if slot.text_hash != text_clip_hash(clip.name) {
-					text_w, text_h := render_text_clip_into_buffer(clip.name, slot.buffer[:], PREVIEW_W, PREVIEW_H)
+					text_x, text_y, text_w, text_h := render_text_clip_into_buffer(clip.name, slot.buffer[:], PREVIEW_W, PREVIEW_H)
 					slot.text_hash = text_clip_hash(clip.name)
+					slot.text_x = text_x
+					slot.text_y = text_y
 					slot.text_w = text_w
 					slot.text_h = text_h
 					clip.source_w = c.int(text_w)

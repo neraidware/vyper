@@ -31,16 +31,16 @@ text_clip_hash :: proc(s: string) -> u64 {
 	return h
 }
 
-// render_text_clip_into_buffer rasterizes `title` as white glyphs at the
-// top-left of an RGBA buffer bw x bh. Background is fully transparent so the
-// text composites over the canvas/video via the preview pipeline's alpha
-// blending. It returns the tight text extent (tw, th) in buffer pixels so the
-// caller can size the clip's bounding box to the text rather than the whole
-// buffer.
-render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (tw: int, th: int) {
+// render_text_clip_into_buffer rasterizes `title` as white glyphs at the top of
+// an RGBA buffer bw x bh. Background is fully transparent so the text composites
+// over the canvas/video via the preview pipeline's alpha blending. It returns
+// the tight text rect (ox, oy, w, h) in buffer pixels — the ink's top-left origin
+// and its extent — so the caller can sample exactly that region and size the
+// clip's bounding box to the text rather than the whole buffer.
+render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (ox: int, oy: int, ow: int, oh: int) {
 	mem.zero(raw_data(buf), len(buf))
 	if len(title) == 0 {
-		return 0, 0
+		return 0, 0, 0, 0
 	}
 	if !text_clip_font_init {
 		stb.InitFont(&text_clip_font, raw_data(font_data), 0)
@@ -52,6 +52,8 @@ render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (
 	baseline := f32(ascent) * scale
 	top := max(int)
 	bottom := -max(int)
+	left := max(int)
+	right := -max(int)
 	x_pen: f32 = 4.0
 	prev: rune = 0
 	for ch in title {
@@ -70,7 +72,7 @@ render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (
 		gh := int(iy1 - iy0)
 		start_x := cast(int)x_pen + ix0
 		start_y := cast(int)baseline + iy0
-		// Track the drawn ink so the returned bounds are the tight text rect.
+		// Track the drawn ink so the returned rect is the tight text bounds.
 		x0 := start_x
 		x1 := start_x + gw
 		y0 := start_y
@@ -81,7 +83,12 @@ render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (
 		if y1 > bottom {
 			bottom = y1
 		}
-		tw = max(tw, x1)
+		if x0 < left {
+			left = x0
+		}
+		if x1 > right {
+			right = x1
+		}
 		if gw > 0 && gh > 0 {
 			n := gw * gh
 			if n <= len(text_clip_scratch) {
@@ -110,9 +117,7 @@ render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (
 		x_pen += f32(adv) * scale
 		prev = ch
 	}
-	tw = max(0, tw)
-	if bottom > top {
-		th = int(bottom - top)
-	}
-	return tw, th
+	ow = max(0, right - left)
+	oh = max(0, bottom - top)
+	return left, top, ow, oh
 }
