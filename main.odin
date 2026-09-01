@@ -1090,11 +1090,11 @@ if drag_clip.timeline_start_frame != new_start {
 				continue
 			}
 			if slot.is_text {
-				// Text slots own a tight texture sized to the baked raster. If
-				// the size changed (text_recreate, set by update_preview_slots
-				// on a scale/name edit) or the slot is freshly text, release any
-				// stale owned texture and reallocate at the current tight size.
-				if slot.texture == nil || slot.text_tex_w != c.int(slot.text_w) || slot.text_tex_h != c.int(slot.text_h) {
+				// Text slots own a tightly-sized texture (full estimated buffer
+				// bw x bh, stored in text_tex_w/h). update_preview_slots sets
+				// text_recreate whenever it re-rasterizes (which is whenever the
+				// buffer size could change), so recreate on that flag + first use.
+				if slot.texture == nil || slot.text_recreate {
 					if slot.texture != nil {
 						sdl.ReleaseGPUTexture(device, slot.texture)
 					}

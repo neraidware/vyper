@@ -576,10 +576,11 @@ upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	slot.tex_dirty = false
 }
 
-// upload_text_slot uploads a text slot's tight text_buf into its texture.
+// upload_text_slot uploads a text slot's full raster buffer (text_tex_w x
+// text_tex_h, the estimated buffer size) into its texture.
 upload_text_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
-	w := u32(slot.text_w)
-	h := u32(slot.text_h)
+	w := u32(slot.text_tex_w)
+	h := u32(slot.text_tex_h)
 	if w <= 0 || h <= 0 || slot.text_buf == nil {
 		return
 	}
@@ -714,9 +715,14 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		// exactly that top-left region rather than a letterboxed fit.
 		u0, u1, v0, v1: f32
 		if is_text {
-			// The baked raster fills the whole tight texture; sample all of it.
-			u0, v0 = 0, 0
-			u1, v1 = 1, 1
+			// The texture holds the full estimated buffer; sample only the tight
+			// ink sub-rect (text_x/text_y/text_w/text_h) as a fractional region.
+			tw := f32(slot.text_tex_w)
+			th := f32(slot.text_tex_h)
+			u0 = f32(slot.text_x) / tw
+			v0 = f32(slot.text_y) / th
+			u1 = f32(slot.text_x + slot.text_w) / tw
+			v1 = f32(slot.text_y + slot.text_h) / th
 		} else {
 			fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
 			u_base := f32(fox) / f32(PREVIEW_W)

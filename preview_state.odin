@@ -170,8 +170,11 @@ update_preview_slots :: proc() -> bool {
 					slot.text_y = text_y
 					slot.text_w = text_w
 					slot.text_h = text_h
-					slot.text_tex_w = c.int(text_w)
-					slot.text_tex_h = c.int(text_h)
+					// The texture is the FULL estimated buffer (bw x bh), so the
+					// upload + UV sampling work against it; the draw samples only
+					// the tight ink sub-rect (text_x/text_y/text_w/text_h).
+					slot.text_tex_w = c.int(bw)
+					slot.text_tex_h = c.int(bh)
 					slot.has_frame = text_w > 0 && text_h > 0
 					slot.tex_dirty = true
 					slot.text_recreate = true
