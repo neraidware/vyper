@@ -327,17 +327,27 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		s := max(k, 0.01)
 		new_w := bw0 * s
 		new_h := bh0 * s
+		// For edge handles the pivot is the OPPOSITE edge, not the top-left
+		// corner: keep the box centered on the perpendicular axis so the whole
+		// opposite edge stays put (matching video's edge pivots). Corner handles
+		// pivot about the opposite corner.
+		center_x0 := left0 + bw0 * scale0 / 2
+		center_y0 := top0 + bh0 * scale0 / 2
 		tx := tx0
 		ty := ty0
 		switch dragging_handle {
-		case 1: // top pins bottom edge
+		case 1: // top pins bottom edge, x stays centered
 			ty = bottom0 - new_h
-		case 5: // bottom pins top edge
+			tx = center_x0 - new_w / 2
+		case 5: // bottom pins top edge, x stays centered
 			ty = top0
-		case 7: // left pins right edge
+			tx = center_x0 - new_w / 2
+		case 7: // left pins right edge, y stays centered
 			tx = right0 - new_w
-		case 3: // right pins left edge
+			ty = center_y0 - new_h / 2
+		case 3: // right pins left edge, y stays centered
 			tx = left0
+			ty = center_y0 - new_h / 2
 		case 0: // TL pins BR
 			tx = right0 - new_w
 			ty = bottom0 - new_h
