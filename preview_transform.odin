@@ -144,15 +144,19 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 // centered). The cropped source fills it, so it matches the output.
 clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
 	v := preview_view(canvas)
-	// A text clip is not a full-canvas image: its box is exactly the text
-	// extent (source_w x source_h, project units) centered at its transform,
-	// scaled by clip.scale — so the selection/transform box hugs the title text
-	// instead of filling the whole project canvas.
+	// A text clip is not a full-canvas image: its bounds are exactly the text
+	// extent. The text was rasterized into a buffer at tight text-pixel
+	// dimensions (clip.source_w x source_h are TEXT pixels, not project units),
+	// which must map to screen with ONE uniform scale so the title never gets
+	// squished (an aspect probe through project resolution would scale x and y
+	// differently for any project that isn't 16:9). Anchored at the canvas
+	// top-left, and sized by that uniform factor regardless of project
+	// resolution.
 	if clip.kind == .Text && clip.source_w > 0 && clip.source_h > 0 {
-		cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
-		pw := f32(clip.source_w) * clip.scale * v.width / f32(project.width)
-		ph := f32(clip.source_h) * clip.scale * v.height / f32(project.height)
-		return {x = cx - pw / 2, y = cy - ph / 2, width = pw, height = ph}
+		f := v.width / f32(PREVIEW_W)
+		w := f32(clip.source_w) * f
+		h := f32(clip.source_h) * f
+		return {x = v.x, y = v.y, width = w, height = h}
 	}
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
 	// Preserve the source's own aspect inside the (canvas-shaped) scale box,

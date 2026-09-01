@@ -97,10 +97,10 @@ update_preview_slots :: proc() -> bool {
 			// the buffer + GPU texture stay in sync with the clip's name and a
 			// rename (even unpaused) triggers one re-upload.
 			if clip.kind == .Text {
-				// The tight, top-left bounding box. transform_x/y is the text
-				// center placed at the project top-left region; clip_image_bounds
-				// has a .Text branch that sizes the box to source_w x source_h
-				// (project units) instead of the full canvas.
+				// The tight, top-left bounding box. The text bounds are kept in
+				// TEXT pixels (buffer space), NOT project units: clip_image_bounds
+				// maps them to screen with a single uniform scale so the title is
+				// never squished by the project's aspect or resolution.
 				slot.crop_l = 0
 				slot.crop_r = 0
 				slot.crop_t = 0
@@ -110,16 +110,10 @@ update_preview_slots :: proc() -> bool {
 					slot.text_hash = text_clip_hash(clip.name)
 					slot.text_w = text_w
 					slot.text_h = text_h
-					pw := max(1, int(f32(text_w) * f32(project.width) / f32(PREVIEW_W)))
-					ph := max(1, int(f32(text_h) * f32(project.height) / f32(PREVIEW_H)))
-					clip.source_w = c.int(pw)
-					clip.source_h = c.int(ph)
-					clip.transform_x = f32(pw) / 2
-					clip.transform_y = f32(ph) / 2
-					slot.source_w = c.int(pw)
-					slot.source_h = c.int(ph)
-					slot.transform_x = clip.transform_x
-					slot.transform_y = clip.transform_y
+					clip.source_w = c.int(text_w)
+					clip.source_h = c.int(text_h)
+					slot.source_w = c.int(text_w)
+					slot.source_h = c.int(text_h)
 					slot.has_frame = text_w > 0 && text_h > 0
 					slot.tex_dirty = true
 					changed = true
