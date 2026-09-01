@@ -706,6 +706,8 @@ kind_name :: proc(kind: Media_Kind) -> string {
 	    return "audio"
     case .Image:
 	    return "image"
+    case .Empty:
+	    return "empty"
     case:
 	    return "other"
     }

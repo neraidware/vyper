@@ -100,7 +100,7 @@ file_info_text: string
 // canvas.
 resolution_locked: bool
 
-Media_Kind :: enum { Video, Audio, Image, Other }
+Media_Kind :: enum { Video, Audio, Image, Other, Empty }
 Media_Asset :: struct { id: u64, path: cstring, kind: Media_Kind, metadata: string, frame_count: i64 }
 
 // Clip_Marker is a point marker embedded in a clip (e.g. an imported chapter

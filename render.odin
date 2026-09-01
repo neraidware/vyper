@@ -921,6 +921,8 @@ case .Audio:
 			})
 		case .Other:
 			// no renderable content in this clip
+		case .Empty:
+			// no renderable content in this clip (placeholder for text later)
 		}
 		}
 	}
