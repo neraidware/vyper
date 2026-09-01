@@ -523,10 +523,37 @@ draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComman
 	})
 }
 
+// create_text_texture creates a tight R8G8B8A8 texture (owned by the slot) for
+// a text clip's baked raster. A text slot owns its texture (unlike video slots,
+// which point at the shared fixed preview_textures); it must be released via
+// release_slot_owned_texture when the slot is freed or reused for a video clip.
+create_text_texture :: proc(device: ^sdl.GPUDevice, w, h: c.int) -> ^sdl.GPUTexture {
+	return sdl.CreateGPUTexture(device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = u32(w), height = u32(h), layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
+}
+
+// release_slot_owned_texture frees a text slot's owned texture + dynamic buffer.
+// No-op for video slots, whose texture points at the shared preview_textures.
+release_slot_owned_texture :: proc(device: ^sdl.GPUDevice, slot: ^Preview_Slot) {
+	if slot.is_text && slot.texture != nil {
+		sdl.ReleaseGPUTexture(device, slot.texture)
+	}
+	slot.texture = nil
+	if slot.text_buf != nil {
+		delete(slot.text_buf)
+		slot.text_buf = nil
+	}
+}
+
 // upload_preview_slot copies tightly-packed RGBA pixels into a slot's GPU
-// texture using a transfer buffer + copy pass on the given command buffer.
+// texture using a transfer buffer + copy pass on the given command buffer. A
+// text slot uploads its tight text_buf into its owned tight texture; a video
+// slot uploads the fixed PREVIEW buffer into the shared preview texture.
 upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
 	if slot.texture == nil {
+		return
+	}
+	if slot.is_text {
+		upload_text_slot(renderer, command_buffer, slot)
 		return
 	}
 	transfer := sdl.CreateGPUTransferBuffer(renderer.device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = PREVIEW_W * PREVIEW_H * 4})
@@ -549,11 +576,76 @@ upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	slot.tex_dirty = false
 }
 
+// upload_text_slot uploads a text slot's tight text_buf into its texture.
+upload_text_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
+	w := u32(slot.text_w)
+	h := u32(slot.text_h)
+	if w <= 0 || h <= 0 || slot.text_buf == nil {
+		return
+	}
+	n := int(w) * int(h) * 4
+	transfer := sdl.CreateGPUTransferBuffer(renderer.device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = u32(n)})
+	if transfer == nil {
+		return
+	}
+	defer sdl.ReleaseGPUTransferBuffer(renderer.device, transfer)
+	mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, false)
+	if mapped == nil {
+		return
+	}
+	src := ([^]u8)(raw_data(slot.text_buf))[:n]
+	dst := ([^]u8)(mapped)[:n]
+	copy(dst, src)
+	sdl.UnmapGPUTransferBuffer(renderer.device, transfer)
+	copy_pass := sdl.BeginGPUCopyPass(command_buffer)
+	source := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, pixels_per_row = w, rows_per_layer = h}
+	destination := sdl.GPUTextureRegion{texture = slot.texture, w = w, h = h, d = 1}
+	sdl.UploadToGPUTexture(copy_pass, source, destination, false)
+	sdl.EndGPUCopyPass(copy_pass)
+	slot.tex_dirty = false
+}
+
 // release_preview_textures releases a renderer's per-slot preview textures.
 release_preview_textures :: proc(device: ^sdl.GPUDevice, texs: []^sdl.GPUTexture) {
 	for t in texs {
 		sdl.ReleaseGPUTexture(device, t)
 	}
+}
+
+// release_slot_owned_textures frees every text slot's owned tight texture plus
+// any orphaned ones still in the pending queue. Called once at shutdown (video
+// slots only point at preview_textures, released separately).
+release_slot_owned_textures :: proc(device: ^sdl.GPUDevice) {
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		slot := &preview_slots[i]
+		if slot.is_text && slot.texture != nil {
+			sdl.ReleaseGPUTexture(device, slot.texture)
+			slot.texture = nil
+		}
+	}
+	drain_pending_text_releases(device)
+}
+
+// ---------------------------------------------------------------------------
+// Owned text-texture lifecycle. A text slot owns its tight texture (video
+// slots instead point at the shared renderer.preview_textures). When the
+// preview state reassigns a slot (it has no GPU device), it stashes the old
+// owned texture here; the render loop drains the queue each frame with the
+// device in hand, so a texture never leaks across a slot reassignment.
+// ---------------------------------------------------------------------------
+pending_text_release: [dynamic]^sdl.GPUTexture
+
+queue_text_texture_release :: proc(tex: ^sdl.GPUTexture) {
+	if tex != nil {
+		append(&pending_text_release, tex)
+	}
+}
+
+drain_pending_text_releases :: proc(device: ^sdl.GPUDevice) {
+	for t in pending_text_release {
+		sdl.ReleaseGPUTexture(device, t)
+	}
+	clear(&pending_text_release)
 }
 
 
@@ -622,10 +714,9 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		// exactly that top-left region rather than a letterboxed fit.
 		u0, u1, v0, v1: f32
 		if is_text {
-			u0 = f32(slot.text_x) / f32(PREVIEW_W)
-			v0 = f32(slot.text_y) / f32(PREVIEW_H)
-			u1 = f32(slot.text_x + slot.text_w) / f32(PREVIEW_W)
-			v1 = f32(slot.text_y + slot.text_h) / f32(PREVIEW_H)
+			// The baked raster fills the whole tight texture; sample all of it.
+			u0, v0 = 0, 0
+			u1, v1 = 1, 1
 		} else {
 			fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
 			u_base := f32(fox) / f32(PREVIEW_W)

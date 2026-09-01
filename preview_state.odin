@@ -42,6 +42,20 @@ update_preview_slots :: proc() -> bool {
 				if slot.in_use {
 					clip_decoder_reset(&slot.dec)
 				}
+				// A text slot owns its tight GPU texture; the zeroing below would
+				// orphan it (no device here to release it), so stash it for the
+				// render loop and free the CPU buffers now.
+				if slot.is_text && slot.texture != nil {
+					queue_text_texture_release(slot.texture)
+				}
+				if slot.text_buf != nil {
+					delete(slot.text_buf)
+					slot.text_buf = nil
+				}
+				if slot.text_scratch != nil {
+					delete(slot.text_scratch)
+					slot.text_scratch = nil
+				}
 				slot^ = {}
 				slot.in_use = true
 				slot.clip_id = clip.clip_id
@@ -100,13 +114,32 @@ update_preview_slots :: proc() -> bool {
 				// The tight, top-left bounding box. The text bounds are kept in
 				// TEXT pixels (buffer space), NOT project units: clip_image_bounds
 				// maps them to screen with a single uniform scale so the title is
-				// never squished by the project's aspect or resolution.
+				// never squished by the project's aspect or resolution. The clip's
+				// scale is BAKED into the raster: the title is rasterized at
+				// font = 48*scale so the glyphs scale crisply instead of upscaling
+				// a fixed 48px render, and clip.scale is reset to 1 (source_w/h
+				// now carry the scaled tight extents).
+				slot.is_text = true
 				slot.crop_l = 0
 				slot.crop_r = 0
 				slot.crop_t = 0
 				slot.crop_b = 0
-				if slot.text_hash != text_clip_hash(clip.name) {
-					text_x, text_y, text_w, text_h := render_text_clip_into_buffer(clip.name, slot.buffer[:], PREVIEW_W, PREVIEW_H)
+				font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
+				if slot.text_hash != text_clip_hash(clip.name) || slot.text_font_px != font_px {
+					slot.text_font_px = font_px
+					// Grow the per-glyph scratch + working buffer to the baked size.
+					need_sc := text_scratch_size_for(font_px)
+					if need_sc > len(slot.text_scratch) {
+						delete(slot.text_scratch)
+						slot.text_scratch = make([]u8, need_sc)
+					}
+					bw, bh := text_buf_size_for(clip.name, font_px)
+					need := bw * bh * 4
+					if need > len(slot.text_buf) {
+						delete(slot.text_buf)
+						slot.text_buf = make([]u8, need)
+					}
+					text_x, text_y, text_w, text_h := rasterize_title_into_buffer(clip.name, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px)
 					slot.text_hash = text_clip_hash(clip.name)
 					slot.text_x = text_x
 					slot.text_y = text_y
@@ -114,11 +147,19 @@ update_preview_slots :: proc() -> bool {
 					slot.text_h = text_h
 					clip.source_w = c.int(text_w)
 					clip.source_h = c.int(text_h)
+					clip.scale = 1
 					slot.source_w = c.int(text_w)
 					slot.source_h = c.int(text_h)
+					slot.scale = 1
+					slot.text_tex_w = c.int(text_w)
+					slot.text_tex_h = c.int(text_h)
 					slot.has_frame = text_w > 0 && text_h > 0
 					slot.tex_dirty = true
+					slot.text_recreate = true
 					changed = true
+				}
+				if !slot.has_frame || slot.text_w <= 0 || slot.text_h <= 0 {
+					continue
 				}
 				continue
 			}
@@ -168,11 +209,22 @@ update_preview_slots :: proc() -> bool {
 // state that can fight (and show) the removed clip at the playhead. This is the
 // other half of the "deleted clip keeps rendering" bug — the timeline and audio
 // drop the clip, but the preview slot must drop it too, explicitly.
-invalidate_preview_slots :: proc() {
+	invalidate_preview_slots :: proc() {
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		slot := &preview_slots[i]
 		if slot.in_use {
 			clip_decoder_reset(&slot.dec)
+			if slot.is_text && slot.texture != nil {
+				queue_text_texture_release(slot.texture)
+			}
+			if slot.text_buf != nil {
+				delete(slot.text_buf)
+				slot.text_buf = nil
+			}
+			if slot.text_scratch != nil {
+				delete(slot.text_scratch)
+				slot.text_scratch = nil
+			}
 			slot^ = {}
 		}
 	}

@@ -299,18 +299,41 @@ Preview_Slot :: struct {
 	dec:                 Clip_Decoder,
 	buffer:              [PREVIEW_W * PREVIEW_H * 4]u8,
 	// text_hash caches the rendered title for a text clip; the text buffer is
-	// only re-rasterized (and re-uploaded) when the clip's name changes. Text
-	// clips have no decoder, so dec is unused for them.
+	// only re-rasterized (and re-uploaded) when the clip's name changes or the
+	// baked font (48*scale) changes. Text clips have no decoder, so dec is
+	// unused for them.
 	text_hash:           u64,
+	text_font_px:        f32,
 	// Tight text bounds (buffer pixels) for a rendered text clip; used to size
 	// the clip's image box + UV sampling to the text instead of the full canvas.
 	// text_x/text_y are the ink's top-left origin in the buffer, so the sampled
 	// region matches where the glyphs actually are (avoids clipping the bottom
-	// of descenders).
+	// of descenders). Once clip.scale is baked into the raster, the text fills
+	// the whole tight buffer, so text_x/text_y are 0 and text_w/text_h equal the
+	// buffer size.
 	text_x:              int,
 	text_y:              int,
 	text_w:              int,
 	text_h:              int,
+	// is_text marks a slot holding a text clip's tight raster (own text_buf +
+	// tight texture) rather than a video decode into the fixed buffer.
+	is_text:             bool,
+	// text_buf is the tight RGBA raster for a text slot, dynamically sized to
+	// text_w x text_h (the baked text). The matching GPU texture is created at
+	// that size (text_tex_w x text_tex_h) and is owned by the slot: it must be
+	// released when the slot is freed or reused for a non-text clip.
+	text_buf:            []u8,
+	text_tex_w:          c.int,
+	text_tex_h:          c.int,
+	// text_scratch is the per-glyph bitmap scratch for text rasterization,
+	// sized for the current baked font (the shared text_clip_scratch is too
+	// small once clip.scale is baked into a larger font).
+	text_scratch:        []u8,
+	// text_recreate tells the render loop a text slot's tight texture must be
+	// reallocated at text_tex_w x text_tex_h (size changed or slot just became
+	// text). Only the render loop has the GPU device, so it does the release +
+	// recreation.
+	text_recreate:       bool,
 	tex_dirty:           bool,
 	texture:             ^sdl.GPUTexture,
 	// Per-slot decode frontier, not the global one: the global gate rewinds

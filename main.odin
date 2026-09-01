@@ -421,6 +421,7 @@ main :: proc() {
 	defer sdl.ReleaseGPUTexture(device, renderer.font.texture)
 	defer sdl.ReleaseGPUSampler(device, renderer.font.sampler)
 	defer release_preview_textures(device, renderer.preview_textures[:])
+	defer release_slot_owned_textures(device)
 	defer sdl.ReleaseGPUSampler(device, renderer.preview_sampler)
 	initial_upload := sdl.AcquireGPUCommandBuffer(device)
 	if initial_upload == nil || !upload_font_atlas(&renderer, initial_upload) || !sdl.SubmitGPUCommandBuffer(initial_upload) {
@@ -1088,7 +1089,19 @@ if drag_clip.timeline_start_frame != new_start {
 			if !slot.in_use {
 				continue
 			}
-			if slot.texture == nil {
+			if slot.is_text {
+				// Text slots own a tight texture sized to the baked raster. If
+				// the size changed (text_recreate, set by update_preview_slots
+				// on a scale/name edit) or the slot is freshly text, release any
+				// stale owned texture and reallocate at the current tight size.
+				if slot.texture == nil || slot.text_tex_w != c.int(slot.text_w) || slot.text_tex_h != c.int(slot.text_h) {
+					if slot.texture != nil {
+						sdl.ReleaseGPUTexture(device, slot.texture)
+					}
+					slot.texture = create_text_texture(device, slot.text_tex_w, slot.text_tex_h)
+				}
+				slot.text_recreate = false
+			} else if slot.texture == nil {
 				slot.texture = renderer.preview_textures[i]
 			}
 			if slot.tex_dirty || changed {
@@ -1108,6 +1121,10 @@ if drag_clip.timeline_start_frame != new_start {
 			}
 		}
 		preview_has_frame = any_frame
+		// Free text textures orphaned by slot reassignment/invalidation earlier
+		// this frame (they have no device in the preview state, so they wait
+		// here where the device is).
+		drain_pending_text_releases(device)
 		swapchain_texture: ^sdl.GPUTexture
 		pixel_width, pixel_height: sdl.Uint32
 		if !sdl.WaitAndAcquireGPUSwapchainTexture(command_buffer, window, &swapchain_texture, &pixel_width, &pixel_height) || swapchain_texture == nil {

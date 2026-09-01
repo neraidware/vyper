@@ -145,12 +145,75 @@ Render_Text_Src :: struct {
 // preview thread can be compositing a text slot while the worker renders).
 render_text_font:      stb.fontinfo
 render_text_font_init: bool
-render_text_scratch:   [8192]u8
 
-// render_text_clip_into_buffer_worker: render-thread wrapper for the shared
-// rasterize core, using the worker-local font/scratch above.
-render_text_clip_into_buffer_worker :: proc(title: string, buf: []u8, bw, bh: int) -> (ox: int, oy: int, ow: int, oh: int) {
-	return rasterize_title_into_buffer(title, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_scratch[:])
+// Render_Text_Job is a text clip's per-render precomputed raster + box, built
+// once in render_worker_run so each frame just blits it. Baking the clip's
+// scale into the raster (font = 48*clip_scale, clip_scale reset to 1) keeps the
+// output crisp and consistent with the preview; blit_scale is the clip's baked
+// scale (=1) so the box falls out of the tight dims times the uniform factor.
+Render_Text_Job :: struct {
+	raster: []u8,
+	bw:     int, // raster row stride
+	ox, oy, ow, oh: int, // tight ink rect in raster
+	blit_scale: f32,
+}
+
+// text_scratch: worker needs its own dynamic scratch for baked fonts (the
+// shared 8192 text_clip_scratch / render_text_scratch are too small once the
+// font grows to 48*scale). Sized per setup via text_scratch_size_for.
+render_text_setup_scratch: []u8
+
+// setup_text_job rasterizes a text clip at the baked font matching its snapshot
+// (title + source_w/source_h, with clip.scale already baked to 1). Two passes:
+// first at font 48 to learn the base ink width, then at 48*(source_w/base_w) to
+// reproduce the baked tight extents. Returns the job or leaves raster empty on
+// failure (caller deletes raster via cleanup).
+setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
+	over^ = {}
+	if t.name == "" || t.source_w <= 0 || t.source_h <= 0 {
+		return
+	}
+	base_bw, base_bh := text_buf_size_for(t.name, TEXT_CLIP_FONT_PIXELS)
+	base := make([]u8, base_bw * base_bh * 4)
+	defer delete(base)
+	if len(render_text_setup_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
+		delete(render_text_setup_scratch)
+		render_text_setup_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
+	}
+	_, _, base_ow, _ := rasterize_title_into_buffer(t.name, base, base_bw, base_bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, TEXT_CLIP_FONT_PIXELS)
+	font_px := f32(TEXT_CLIP_FONT_PIXELS)
+	if base_ow > 0 {
+		font_px = f32(TEXT_CLIP_FONT_PIXELS) * (f32(t.source_w) / f32(base_ow))
+	}
+	bw, bh := text_buf_size_for(t.name, font_px)
+	buf := make([]u8, bw * bh * 4)
+	if len(render_text_setup_scratch) < text_scratch_size_for(font_px) {
+		delete(render_text_setup_scratch)
+		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
+	}
+	ox, oy, ow, oh := rasterize_title_into_buffer(t.name, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, font_px)
+	if ow <= 0 || oh <= 0 {
+		delete(buf)
+		return
+	}
+	over.raster = buf
+	over.bw = bw
+	over.ox, over.oy, over.ow, over.oh = ox, oy, ow, oh
+	over.blit_scale = t.scale
+}
+
+// cleanup_text_jobs frees the per-clip text rasters and the shared setup scratch.
+cleanup_text_jobs :: proc(jobs: []Render_Text_Job) {
+	for i in 0 ..< len(jobs) {
+		if jobs[i].raster != nil {
+			delete(jobs[i].raster)
+		}
+	}
+	delete(jobs)
+	if render_text_setup_scratch != nil {
+		delete(render_text_setup_scratch)
+		render_text_setup_scratch = nil
+	}
 }
 
 Render_Audio_Src :: struct {
@@ -676,11 +739,14 @@ render_worker_run :: proc() {
 	canvas := make([]u8, int(render_job_width) * int(render_job_height) * 4)
 	defer delete(canvas)
 
-	// Text compositing scratch: title rasterized at PREVIEW_W x PREVIEW_H (the
-	// preview's text-pixel scale), then scaled-blitted onto the canvas. Reused
-	// across frames and across text clips within a frame.
-	text_buf := make([]u8, PREVIEW_W * PREVIEW_H * 4)
-	defer delete(text_buf)
+	// Text compositing: each text clip gets a precomputed raster (baked font)
+	// + blit box built once below, then alpha-blitted on the canvas each frame.
+	// Built before the frame loop (titles + transforms are static for a job).
+	text_jobs := make([]Render_Text_Job, max(len(render_job_texts), 1))
+	defer cleanup_text_jobs(text_jobs)
+	for i in 0 ..< len(render_job_texts) {
+		setup_text_job(&text_jobs[i], render_job_texts[i])
+	}
 
 	for frame_idx in 0 ..< render_job_nframes {
 		if poll_cancel() {
@@ -712,11 +778,11 @@ render_worker_run :: proc() {
 			if t.name == "" {
 				continue
 			}
-			ox, oy, ow, oh := render_text_clip_into_buffer_worker(t.name, text_buf, PREVIEW_W, PREVIEW_H)
-			if ow <= 0 || oh <= 0 {
+			j := &text_jobs[i]
+			if j.raster == nil || j.ow <= 0 || j.oh <= 0 {
 				continue
 			}
-			render_text_blit(canvas, render_job_width, render_job_height, text_buf, ox, oy, ow, oh, t.transform_x, t.transform_y, t.scale)
+			render_text_blit(canvas, render_job_width, render_job_height, j.raster, j.bw, j.ox, j.oy, j.ow, j.oh, t.transform_x, t.transform_y, j.blit_scale)
 		}
 		if !rend_enc_video_frame(&e, canvas, render_job_width, render_job_height, frame_idx) {
 			err_msg = "video encoding failed"
@@ -851,21 +917,24 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 }
 
 // render_text_blit alpha-blends a rasterized text clip onto the canvas. text_buf
-// holds the title rasterized at PREVIEW_W x PREVIEW_H (the preview's text-pixel
-// scale); the tight ink rect [ox..ox+ow)x[oy..oy+oh) is scaled to the output box
-// anchored at the clip's top-left (tx, ty) in project/output pixels, matching the
-// preview's text box math: bw0 = ow * (out_w/PREVIEW_W), bh0 = oh * (out_h/PREVIEW_H),
-// box = bw0*scale x bh0*scale. White glyphs are alpha-blended over the frame.
+// holds the title rasterized at the BAKED font (font = 48*clip_scale, and
+// clip.scale is reset to 1), so the raster already carries the scale. The tight
+// ink rect [ox..ox+ow)x[oy..oy+oh) is scaled to the output box anchored at the
+// clip's top-left (tx, ty) in project pixels, matching the preview's text box
+// math: a UNIFORM factor bw0 = ow * (out_w/PREVIEW_W) scales both axes (so text
+// is never squished by the project's aspect), box = bw0*scale x bh0*scale with
+// scale=1 post-bake. bw is the buffer's row stride (the raster's own width).
 render_text_blit :: proc(
 	canvas: []u8, draw_w, draw_h: c.int,
-	text_buf: []u8, ox, oy, ow, oh: int,
+	text_buf: []u8, bw: int, ox, oy, ow, oh: int,
 	tx, ty, scale: f32,
 ) {
 	if ow <= 0 || oh <= 0 {
 		return
 	}
-	bw0 := f32(ow) * f32(draw_w) / f32(PREVIEW_W)
-	bh0 := f32(oh) * f32(draw_h) / f32(PREVIEW_H)
+	factor := f32(draw_w) / f32(PREVIEW_W)
+	bw0 := f32(ow) * factor
+	bh0 := f32(oh) * factor
 	w := bw0 * scale
 	h := bh0 * scale
 	x0 := tx
@@ -884,7 +953,7 @@ render_text_blit :: proc(
 		// Nearest-neighbor source sample within the tight text rect.
 		srow := oy + int((f64(top - c.int(y0) + row) + 0.5) * f64(oh) / f64(h))
 		srow = max(oy, min(oy + oh - 1, srow))
-		src_row := text_buf[uint(srow) * uint(PREVIEW_W) * 4:]
+		src_row := text_buf[uint(srow) * uint(bw) * 4:]
 		dst_row := canvas[(uint(top + row) * uint(draw_w) + uint(left)) * 4:]
 		for col in 0 ..< right - left {
 			scol := ox + int((f64(left - c.int(x0) + col) + 0.5) * f64(ow) / f64(w))

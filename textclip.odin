@@ -31,24 +31,59 @@ text_clip_hash :: proc(s: string) -> u64 {
 	return h
 }
 
-// render_text_clip_into_buffer rasterizes `title` as white glyphs at the top of
-// an RGBA buffer bw x bh. Background is fully transparent so the text composites
-// over the canvas/video via the preview pipeline's alpha blending. It returns
-// the tight text rect (ox, oy, w, h) in buffer pixels — the ink's top-left origin
-// and its extent — so the caller can sample exactly that region and size the
-// clip's bounding box to the text rather than the whole buffer.
-render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (ox: int, oy: int, ow: int, oh: int) {
+// text_scratch_size_for returns a safe byte size for the per-glyph bitmap
+// scratch at a given glyph pixel height (a single codepoint bitmap can be up to
+// ~font_px x font_px, so the scratch must grow with the baked font).
+text_scratch_size_for :: proc(font_px: f32) -> int {
+	fp := int(font_px) + 1
+	return fp * fp + 4096
+}
+
+// text_buf_size_for estimates a tight RGBA buffer (bw x bh) large enough to
+// hold a title rasterized at the given glyph pixel height without clipping.
+// Generous estimate: ~1.2*font_px advance per codepoint, ~2.4*font_px tall.
+text_buf_size_for :: proc(title: string, font_px: f32) -> (bw: int, bh: int) {
+	fp := f32(1)
+	if font_px > 0 {
+		fp = font_px
+	}
+	bw = int(f32(len(title) + 1) * fp * 1.2) + 8
+	bh = int(fp * 2.4) + 8
+	return bw, bh
+}
+
+// rasterize_title_into_buffer is the shared core: rasterize `title` as white
+// glyphs at the top of an RGBA buffer bw x bh on a fully transparent background.
+// font_px is the glyph pixel height (TEXT_CLIP_FONT_PIXELS at scale 1) — callers
+// pass 48*clip.scale so baking the clip's scale into the raster keeps glyphs
+// crisp instead of upscaling a fixed-size render. Returns the tight ink rect
+// (ox, oy, w, h) in buffer pixels. Font state and the per-glyph scratch are
+// passed in so each caller owns them — the UI thread and the render worker each
+// keep their own, avoiding a data race on the shared preview font/scratch
+// globals.
+rasterize_title_into_buffer :: proc(
+	title: string,
+	buf: []u8, bw, bh: int,
+	font: ^stb.fontinfo,
+	font_init: ^bool,
+	scratch: []u8,
+	font_px: f32,
+) -> (ox: int, oy: int, ow: int, oh: int) {
 	mem.zero(raw_data(buf), len(buf))
 	if len(title) == 0 {
 		return 0, 0, 0, 0
 	}
-	if !text_clip_font_init {
-		stb.InitFont(&text_clip_font, raw_data(font_data), 0)
-		text_clip_font_init = true
+	px := font_px
+	if px <= 0 {
+		px = TEXT_CLIP_FONT_PIXELS
 	}
-	scale := stb.ScaleForPixelHeight(&text_clip_font, f32(TEXT_CLIP_FONT_PIXELS))
+	if !font_init^ {
+		stb.InitFont(font, raw_data(font_data), 0)
+		font_init^ = true
+	}
+	scale := stb.ScaleForPixelHeight(font, px)
 	ascent, descent, linegap: c.int
-	stb.GetFontVMetrics(&text_clip_font, &ascent, &descent, &linegap)
+	stb.GetFontVMetrics(font, &ascent, &descent, &linegap)
 	baseline := f32(ascent) * scale
 	top := max(int)
 	bottom := -max(int)
@@ -58,12 +93,12 @@ render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (
 	prev: rune = 0
 	for ch in title {
 		if prev > 0 {
-			x_pen += f32(stb.GetCodepointKernAdvance(&text_clip_font, prev, ch)) * scale
+			x_pen += f32(stb.GetCodepointKernAdvance(font, prev, ch)) * scale
 		}
 		adv: c.int
-		stb.GetCodepointHMetrics(&text_clip_font, ch, &adv, nil)
+		stb.GetCodepointHMetrics(font, ch, &adv, nil)
 		box_val: [4]c.int
-		stb.GetCodepointBitmapBox(&text_clip_font, ch, scale, scale, &box_val[0], &box_val[1], &box_val[2], &box_val[3])
+		stb.GetCodepointBitmapBox(font, ch, scale, scale, &box_val[0], &box_val[1], &box_val[2], &box_val[3])
 		ix0 := int(box_val[0])
 		iy0 := int(box_val[1])
 		ix1 := int(box_val[2])
@@ -91,12 +126,12 @@ render_text_clip_into_buffer :: proc(title: string, buf: []u8, bw, bh: int) -> (
 		}
 		if gw > 0 && gh > 0 {
 			n := gw * gh
-			if n <= len(text_clip_scratch) {
-				mem.zero(raw_data(text_clip_scratch[:n]), n)
-				stb.MakeCodepointBitmap(&text_clip_font, raw_data(text_clip_scratch[:]), c.int(gw), c.int(gh), c.int(gw), scale, scale, ch)
+			if n <= len(scratch) {
+				mem.zero(raw_data(scratch[:n]), n)
+				stb.MakeCodepointBitmap(font, raw_data(scratch[:]), c.int(gw), c.int(gh), c.int(gw), scale, scale, ch)
 				for gy in 0 ..< gh {
 					for gx in 0 ..< gw {
-						a := int(text_clip_scratch[gy * gw + gx])
+						a := int(scratch[gy * gw + gx])
 						if a == 0 {
 							continue
 						}
