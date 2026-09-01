@@ -34,7 +34,9 @@ foreign glib {
 	g_variant_ref :: proc(value: ^GVariant) -> ^GVariant ---
 	g_error_free :: proc(error: ^GError) ---
 	g_variant_get_child_value :: proc(value: ^GVariant, index: c.size_t) -> ^GVariant ---
+	g_variant_n_children :: proc(value: ^GVariant) -> c.size_t ---
 	g_variant_get_string :: proc(value: ^GVariant, length: ^c.size_t) -> cstring ---
+	g_variant_get_uint32 :: proc(value: ^GVariant) -> u32 ---
 	g_variant_lookup_value :: proc(value: ^GVariant, key: cstring, expected_type: ^GVariantType) -> ^GVariant ---
 	g_filename_from_uri :: proc(uri, hostname: cstring, error: ^^GError) -> cstring ---
 	g_main_loop_new :: proc(ctx: rawptr, is_running: bool) -> ^GMainLoop ---
@@ -130,7 +132,14 @@ portal_open_file_picker :: proc() -> cstring {
 		return nil
 	}
 
+	// The OpenFile reply is "(o)" — one child: the request object path. If the
+	// D-Bus service returns an error, `reply` may hold an error variant with
+	// zero children; guard it or g_variant_get_string(NULL) crashes.
 	request := g_variant_get_child_value(reply, 0)
+	if request == nil || g_variant_n_children(reply) < 1 {
+		g_variant_unref(reply)
+		return nil
+	}
 	request_path := g_variant_get_string(request, nil)
 	portal_loop = g_main_loop_new(nil, false)
 	subscription := g_dbus_connection_signal_subscribe(
@@ -153,18 +162,46 @@ portal_open_file_picker :: proc() -> cstring {
 	if portal_response_data == nil {
 		return nil
 	}
-	results := g_variant_get_child_value(portal_response_data, 1)
-	uris := g_variant_lookup_value(results, "uris", nil)
-	if uris == nil {
-		g_variant_unref(results)
+	// The Response signal parameters are a tuple "(u a{sv})":
+	//   child 0 = response code (0 = success, 1 = user cancelled, 2 = error)
+	//   child 1 = results dict (a{sv}).
+	// If the user closes the dialog without picking a file, the code is non-zero
+	// and/or the results dict may be EMPTY. On cancel/error we must return nil
+	// immediately without touching the empty results — parsing an empty (or
+	// NULL) results dict is exactly what segfaulted g_variant_get_string.
+	if g_variant_n_children(portal_response_data) < 2 {
 		g_variant_unref(portal_response_data)
 		return nil
 	}
+	code_child := g_variant_get_child_value(portal_response_data, 0)
+	response_code := g_variant_get_uint32(code_child)
+	g_variant_unref(code_child)
+	if response_code != 0 {
+		g_variant_unref(portal_response_data)
+		return nil
+	}
+	results := g_variant_get_child_value(portal_response_data, 1)
+	if results == nil {
+		g_variant_unref(portal_response_data)
+		return nil
+	}
+	uris := g_variant_lookup_value(results, "uris", nil)
+	g_variant_unref(results)
+	if uris == nil {
+		g_variant_unref(portal_response_data)
+		return nil
+	}
+	// uris is "as" (array of strings); on an empty array child 0 is NULL.
 	first_uri := g_variant_get_child_value(uris, 0)
-	path := g_filename_from_uri(g_variant_get_string(first_uri, nil), nil, nil)
+	if first_uri == nil {
+		g_variant_unref(uris)
+		g_variant_unref(portal_response_data)
+		return nil
+	}
+	uri := g_variant_get_string(first_uri, nil)
+	path := g_filename_from_uri(uri, nil, nil)
 	g_variant_unref(first_uri)
 	g_variant_unref(uris)
-	g_variant_unref(results)
 	g_variant_unref(portal_response_data)
 	return path
 }
