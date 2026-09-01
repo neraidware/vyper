@@ -111,6 +111,11 @@ clip_full_box_dims :: proc(clip: ^Clip, out_w, out_h: f32) -> (f32, f32) {
 // (0.5 - crop) * (project axis) * scale. The full box honors the source aspect
 // (see clip_full_box_dims), so snapping matches the box the user actually sees.
 snap_transform :: proc(clip: ^Clip, margin: f32) {
+	// Text clips use a top-left transform anchor with no crop, so the
+	// center-anchored crop-aware math below doesn't apply; skip it.
+	if clip.kind == .Text {
+		return
+	}
 	PW := f32(project.width)
 	PH := f32(project.height)
 	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
@@ -149,14 +154,16 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	// dimensions (clip.source_w x source_h are TEXT pixels, not project units),
 	// which must map to screen with ONE uniform scale so the title never gets
 	// squished (an aspect probe through project resolution would scale x and y
-	// differently for any project that isn't 16:9). Anchored at the canvas
-	// top-left, and sized by that uniform factor regardless of project
-	// resolution.
+	// differently for any project that isn't 16:9). transform_x/y is the text's
+	// TOP-LEFT in project coords (the drag + scale math below is written for a
+	// top-left anchor), and clip.scale multiplies the text's base pixel size so
+	// resizing via the handles works on the text's own bounding box.
 	if clip.kind == .Text && clip.source_w > 0 && clip.source_h > 0 {
 		f := v.width / f32(PREVIEW_W)
-		w := f32(clip.source_w) * f
-		h := f32(clip.source_h) * f
-		return {x = v.x, y = v.y, width = w, height = h}
+		w := f32(clip.source_w) * f * clip.scale
+		h := f32(clip.source_h) * f * clip.scale
+		tx, ty := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+		return {x = tx, y = ty, width = w, height = h}
 	}
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
 	// Preserve the source's own aspect inside the (canvas-shaped) scale box,
@@ -245,6 +252,102 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 	cy := handle_start_center_y
 	bw := handle_start_box_w
 	bh := handle_start_box_h
+
+	// Text clips use a different transform model than video: transform_x/y is
+	// the text's TOP-LEFT corner (in project units), not its center, and the box
+	// size is the text's base pixel extent scaled by clip.scale (in project
+	// units). The video math below anchors the transform as the center, so text
+	// scales through its own top-left-anchored math. No cropping for text.
+	if clip.kind == .Text {
+		switch handle_kind {
+		case .None, .Crop:
+			return
+		case .Scale:
+		}
+		PW := f32(project.width)
+		PH := f32(project.height)
+		twpx := f32(clip.source_w)
+		thpx := f32(clip.source_h)
+		if twpx <= 0 || thpx <= 0 {
+			return
+		}
+		// Base project-unit size at scale=1.
+		bw0 := twpx * PW / f32(PREVIEW_W)
+		bh0 := thpx * PH / f32(PREVIEW_H)
+		scale0 := handle_start_scale
+		tx0 := handle_start_tx
+		ty0 := handle_start_ty
+		left0 := tx0
+		right0 := tx0 + bw0 * scale0
+		top0 := ty0
+		bottom0 := ty0 + bh0 * scale0
+		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+
+		k: f32 = 1
+		switch dragging_handle {
+		case 1: // top pins bottom
+			k = (bottom0 - pmy) / bh0
+		case 5: // bottom pins top
+			k = (pmy - top0) / bh0
+		case 7: // left pins right
+			k = (right0 - pmx) / bw0
+		case 3: // right pins left
+			k = (pmx - left0) / bw0
+		case 0, 2, 4, 6:
+			kx: f32 = 1
+			ky: f32 = 1
+			switch dragging_handle {
+			case 0: // TL pins BR
+				kx = (right0 - pmx) / bw0
+				ky = (bottom0 - pmy) / bh0
+			case 2: // TR pins BL
+				kx = (pmx - left0) / bw0
+				ky = (bottom0 - pmy) / bh0
+			case 4: // BR pins TL
+				kx = (pmx - left0) / bw0
+				ky = (pmy - top0) / bh0
+			case 6: // BL pins TR
+				kx = (right0 - pmx) / bw0
+				ky = (pmy - top0) / bh0
+			}
+			if abs(handle_start_my-cy)/bh > abs(handle_start_mx-cx)/bw {
+				k = ky
+			} else {
+				k = kx
+			}
+		}
+		s := max(scale0 * k, 0.01)
+		new_w := bw0 * s
+		new_h := bh0 * s
+		tx := tx0
+		ty := ty0
+		switch dragging_handle {
+		case 1: // top pins bottom edge
+			ty = bottom0 - new_h
+		case 5: // bottom pins top edge
+			ty = top0
+		case 7: // left pins right edge
+			tx = right0 - new_w
+		case 3: // right pins left edge
+			tx = left0
+		case 0: // TL pins BR
+			tx = right0 - new_w
+			ty = bottom0 - new_h
+		case 2: // TR pins BL
+			tx = left0
+			ty = bottom0 - new_h
+		case 4: // BR pins TL
+			tx = left0
+			ty = top0
+		case 6: // BL pins TR
+			tx = right0 - new_w
+			ty = top0
+		}
+		clip.scale = clamp(s, 0.05, 100.0)
+		clip.transform_x = tx
+		clip.transform_y = ty
+		return
+	}
 
 	switch handle_kind {
 	case .None:

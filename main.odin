@@ -745,7 +745,7 @@ main :: proc() {
 					canvas := preview_canvas(pb)
 					ib := clip_image_bounds(canvas, sel)
 					if h := preview_handle_at(ib, mouse_x, mouse_y); h >= 0 {
-						begin_handle_drag(sel, canvas, h, mouse_x, mouse_y, alt_down)
+						begin_handle_drag(sel, canvas, h, mouse_x, mouse_y, alt_down && sel.kind != .Text)
 						handled = true
 					}
 				}
