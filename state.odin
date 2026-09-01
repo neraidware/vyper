@@ -171,14 +171,16 @@ playhead_accumulator: f64
 // (pretend 1.0 = 1x real time). 1.5/2/2.5/3/3.5/4 speed the playhead up;
 // 0 = "Auto" (currently identical to 1x — the rate dropdown's Auto option does
 // nothing for now, per spec). Audio pacing at rates != 1.0 is a follow-up.
-playback_rate: f64 = 1.0
+// playback_rate is the selected playback rate (0 = Auto, currently behaves as
+// 1x; otherwise Nx real time). Defaults to Auto.
+playback_rate: f64 = 0.0
 // playback_rate_open tracks whether the playback-rate dropdown is shown.
 playback_rate_open: bool
 // PLAYBACK_RATES are the selectable playback-rate values offered by the rate
 // dropdown. 0 is "Auto" (currently behaves as 1x); the rest are multiples of
 // real time (e.g. 2 = 2x). Iterating this list is what the dropdown draws and
 // the click handler resolves against.
-PLAYBACK_RATES :: []f64{1.5, 2, 2.5, 3, 3.5, 4, 0}
+PLAYBACK_RATES :: []f64{0, 1.5, 2, 2.5, 3, 3.5, 4}
 last_tick_ns: sdl.Uint64
 // playback_stop_frame is the exclusive end of the active playback run; -1
 // means the whole timeline (timeline_duration). Ctrl+Space sets it to the
