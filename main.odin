@@ -212,9 +212,17 @@ begin_clip_rename :: proc() {
 }
 
 // apply_rename reads the committed text input and stores it on the clip that
-// was being renamed (ti.target is the clip_id).
+// was being edited (ti.target is the clip_id). In "create" mode a committed
+// empty/whitespace name removes the just-created clip instead of capturing it.
 apply_rename :: proc() {
 	name := text_input_string()
+	if ti.is_create {
+		ti.is_create = false
+		if strings.trim_space(name) == "" {
+			delete_selected_clip_raw()
+			return
+		}
+	}
 	if _, clip, ok := find_clip_by_id(ti.target); ok {
 		if clip.name != "" {
 			delete(clip.name)
@@ -247,6 +255,14 @@ add_text_clip_at :: proc() {	if ctx_menu.target_track < 0 || ctx_menu.target_tra
 
 	selected_track = ctx_menu.target_track
 	selected_index = idx
+
+	// A text clip is defined by its title, so creating one requires a name: open
+	// the rename field in "create" mode. If the user commits an empty name (or
+	// cancels) the just-inserted clip is removed (see apply_rename and the cancel
+	// routing), so "Add > Text Clip" never leaves a nameless clip on the track.
+	clip := &timeline.tracks[selected_track].clips[selected_index]
+	text_input_begin("", TI_RENAME, clip.clip_id)
+	ti.is_create = true
 }
 
 // pointer_over_context_menu reports whether the cursor is over the context menu
@@ -489,6 +505,13 @@ main :: proc() {
 					r := text_input_handle_key(event.key.key, shift, ctrl)
 					if r == .Commit {
 						apply_rename()
+					} else if r == .Cancel {
+						if ti.is_create {
+							// Aborted a clip-create dialog: drop the clip that was
+							// temporarily inserted so no nameless clip remains.
+							delete_selected_clip_raw()
+							ti.is_create = false
+						}
 					}
 				} else if editing_field != 0 {
 					switch event.key.key {

@@ -69,6 +69,7 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 	ti.anchor = ti.cursor
 	ti.input_type = input_type
 	ti.target = target
+	ti.is_create = false
 	ti.active = true
 }
 

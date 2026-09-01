@@ -599,7 +599,9 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		if !slot.in_use || !slot.has_frame || slot.texture == nil {
 			continue
 		}
+		is_text := slot.text_w > 0 && slot.text_h > 0
 		cb := clip_image_bounds(canvas, &Clip{
+			kind = is_text ? Media_Kind.Text : .Video,
 			transform_x = slot.transform_x,
 			transform_y = slot.transform_y,
 			scale = slot.scale,
@@ -614,15 +616,27 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		// fixed PREVIEW_W x PREVIEW_H buffer. Start the quad from that fit
 		// region so the sampled area keeps the source's aspect, then apply the
 		// crop insets (normalized fractions of the full source image).
-		fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
-		u_base := f32(fox) / f32(PREVIEW_W)
-		v_base := f32(foy) / f32(PREVIEW_H)
-		u_span := f32(fw) / f32(PREVIEW_W)
-		v_span := f32(fh) / f32(PREVIEW_H)
-		u0 := u_base + slot.crop_l * u_span
-		u1 := u_base + (1 - slot.crop_r) * u_span
-		v0 := v_base + slot.crop_t * v_span
-		v1 := v_base + (1 - slot.crop_b) * v_span
+		//
+		// A text slot is different: its buffer is the full canvas with the text
+		// rasterized at the top-left (tight text_w x text_h), so the quad samples
+		// exactly that top-left region rather than a letterboxed fit.
+		u0, u1, v0, v1: f32
+		if is_text {
+			u0 = 0
+			v0 = 0
+			u1 = f32(slot.text_w) / f32(PREVIEW_W)
+			v1 = f32(slot.text_h) / f32(PREVIEW_H)
+		} else {
+			fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
+			u_base := f32(fox) / f32(PREVIEW_W)
+			v_base := f32(foy) / f32(PREVIEW_H)
+			u_span := f32(fw) / f32(PREVIEW_W)
+			v_span := f32(fh) / f32(PREVIEW_H)
+			u0 = u_base + slot.crop_l * u_span
+			u1 = u_base + (1 - slot.crop_r) * u_span
+			v0 = v_base + slot.crop_t * v_span
+			v1 = v_base + (1 - slot.crop_b) * v_span
+		}
 		vertex_uniforms := TextVertexUniforms{
 			bounds = {cb.x, cb.y, cb.width, cb.height},
 			viewport = renderer.viewport,

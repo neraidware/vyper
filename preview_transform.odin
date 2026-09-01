@@ -144,6 +144,16 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 // centered). The cropped source fills it, so it matches the output.
 clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
 	v := preview_view(canvas)
+	// A text clip is not a full-canvas image: its box is exactly the text
+	// extent (source_w x source_h, project units) centered at its transform,
+	// scaled by clip.scale — so the selection/transform box hugs the title text
+	// instead of filling the whole project canvas.
+	if clip.kind == .Text && clip.source_w > 0 && clip.source_h > 0 {
+		cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+		pw := f32(clip.source_w) * clip.scale * v.width / f32(project.width)
+		ph := f32(clip.source_h) * clip.scale * v.height / f32(project.height)
+		return {x = cx - pw / 2, y = cy - ph / 2, width = pw, height = ph}
+	}
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
 	// Preserve the source's own aspect inside the (canvas-shaped) scale box,
 	// letterboxing the excess instead of stretching, so a clip doesn't get

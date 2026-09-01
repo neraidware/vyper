@@ -255,6 +255,10 @@ Text_Input :: struct {
 	anchor:     int,
 	input_type: int, // caller discriminator (1 = clip rename)
 	target:     u64, // caller target id (clip_id for rename)
+	// is_create marks an in-progress text-editing session that is CREATING a
+	// clip (rather than renaming an existing one): the clip only survives if a
+	// non-empty name is committed. Applies both to renamed (commit) and cancel.
+	is_create:  bool,
 }
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.
@@ -298,6 +302,10 @@ Preview_Slot :: struct {
 	// only re-rasterized (and re-uploaded) when the clip's name changes. Text
 	// clips have no decoder, so dec is unused for them.
 	text_hash:           u64,
+	// Tight text bounds (buffer pixels) for a rendered text clip; used to size
+	// the clip's image box + UV sampling to the text instead of the full canvas.
+	text_w:              int,
+	text_h:              int,
 	tex_dirty:           bool,
 	texture:             ^sdl.GPUTexture,
 	// Per-slot decode frontier, not the global one: the global gate rewinds
