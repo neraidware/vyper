@@ -119,6 +119,62 @@ timeline_track_hit_test :: proc(mx, my: f32) -> int {
 	return -1
 }
 
+// timeline_resize_edge_at returns 0/1 if (mx,my) is inside the grab area on the
+// clip's left/right edge, else -1. The grab band is a fixed few pixels wide on
+// each side; the pointer must be over this specific clip.
+timeline_resize_edge_at :: proc(track_idx, index: int, mx, my: f32) -> int {
+	if !clay.PointerOver(clay.ID("TimelineClip", u32(track_idx * 1000 + index))) {
+		return -1
+	}
+	box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
+	GRAB :: f32(7)
+	if my < box.y || my > box.y + box.height {
+		return -1
+	}
+	if mx >= box.x && mx <= box.x + GRAB {
+		return 0
+	}
+	if mx >= box.x + box.width - GRAB && mx <= box.x + box.width {
+		return 1
+	}
+	return -1
+}
+
+// timeline_resize_hover reports whether a duration resize is in progress or the
+// pointer is over the selected clip's edge grab area (drives the resize cursor).
+timeline_resize_hover :: proc(mx, my: f32) -> bool {
+	if resizing_clip {
+		return true
+	}
+	if tr, cl, ok := selected_clip(); ok {
+		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+			track := &timeline.tracks[track_idx]
+			for index := 0; index < len(track.clips); index += 1 {
+				if &track.clips[index] == cl {
+					return timeline_resize_edge_at(track_idx, index, mx, my) >= 0
+				}
+			}
+		}
+	}
+	return false
+}
+
+// update_timeline_cursor shows the horizontal-resize cursor while dragging or
+// hovering a clip's duration edge, restoring the default arrow otherwise.
+update_timeline_cursor :: proc(mx, my: f32) {
+	if !timeline_resize_hover(mx, my) {
+		if _timeline_resize_cursor != nil {
+			_ = sdl.SetCursor(nil)
+			_timeline_resize_cursor = nil
+		}
+		return
+	}
+	if _timeline_resize_cursor == nil {
+		_timeline_resize_cursor = sdl.CreateSystemCursor(.EW_RESIZE)
+	}
+	_ = sdl.SetCursor(_timeline_resize_cursor)
+}
+
 // open_track_context_menu shows the per-track right-click menu at the pointer,
 // snapshotting the click position (frame) so a later Add-text action inserts at
 // the original right-click location, not where the pointer ends up hovering
@@ -669,6 +725,32 @@ main :: proc() {
 				}
 			}
 			if !handled {
+				// Resizing the selected clip's duration: grab its left/right edge.
+				// Takes precedence over selecting/dragging a clip, and only the
+				// currently-selected clip can be resized.
+				if sel_tr, sel_cl, ok := selected_clip(); ok {
+					for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+						track := &timeline.tracks[track_idx]
+						for index := 0; index < len(track.clips); index += 1 {
+							if &track.clips[index] != sel_cl {
+								continue
+							}
+							if edge := timeline_resize_edge_at(track_idx, index, mouse_x, mouse_y); edge >= 0 {
+								selected_track = track_idx
+								selected_index = index
+								resizing_clip = true
+								resize_edge = edge
+								handled = true
+								break
+							}
+						}
+						if resizing_clip {
+							break
+						}
+					}
+				}
+			}
+			if !handled {
 			// Find which (if any) clip the pointer is over and start dragging it.
 			for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 				track := &timeline.tracks[track_idx]
@@ -709,6 +791,8 @@ main :: proc() {
 			drag_source_index = -1
 			drag_hover_track = -1
 			dragging_playhead = false
+			resizing_clip = false
+			resize_edge = -1
 		} else if dragging_handle >= 0 {
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
@@ -737,6 +821,19 @@ main :: proc() {
 					// 5px snap margin (in rendered preview pixels) to the preview borders.
 					snap_transform(sel, snap_margin(canvas, 5))
 				}
+			}
+		} else if resizing_clip {
+			if selected_track >= 0 && selected_index >= 0 && selected_track < len(timeline.tracks) && selected_index < len(timeline.tracks[selected_track].clips) {
+				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
+				frame := max(f32(0), (mouse_x - track_start) / timeline_zoom + timeline_view_start)
+				sync.mutex_lock(&audio_timeline_mtx)
+				if resize_edge == 0 {
+					resize_clip_left(&timeline.tracks[selected_track], selected_index, i64(frame))
+				} else if resize_edge == 1 {
+					resize_clip_right(&timeline.tracks[selected_track], selected_index, i64(frame))
+				}
+				sync.mutex_unlock(&audio_timeline_mtx)
+				audio_note_edit()
 			}
 		} else if moving_clip {
 			if drag_clip != nil {
@@ -844,6 +941,7 @@ if drag_clip.timeline_start_frame != new_start {
 		if ctx_menu.open {
 			ctx_menu.submenu = pointer_over_context_menu() && (clay.PointerOver(clay.ID("CtxAdd")) || pointer_over_submenu())
 		}
+		update_timeline_cursor(mouse_x, mouse_y)
 		was_mouse_down = mouse_down
 		was_right_down = right_down
 		now_ns := sdl.GetTicksNS()
@@ -965,6 +1063,7 @@ if drag_clip.timeline_start_frame != new_start {
 		if pass != nil {
 			render_clay(&renderer, command_buffer, pass, commands)
 			draw_clip_markers(&renderer, command_buffer, pass)
+			draw_timeline_resize_focus(&renderer, command_buffer, pass)
 			draw_drag_ghost(&renderer, command_buffer, pass)
 			if len(timeline.tracks) > 0 {
 				draw_timeline_ruler(&renderer, command_buffer, pass)

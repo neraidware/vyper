@@ -182,6 +182,87 @@ clip_slide_in_track :: proc(track: ^Track, exclude_idx: int, clip_len: i64, desi
 	}
 	return clamp(desired, lo, hi)
 }
+
+// asset_source_frames returns the total source frame count for a clip's asset,
+// or -1 when unknown (no asset / generator clip). Used to cap lengthening so a
+// clip never references past the end of its source media.
+asset_source_frames :: proc(asset_id: u64) -> i64 {
+	for &a in media_assets {
+		if a.id == asset_id {
+			return a.frame_count
+		}
+	}
+	return -1
+}
+
+// clip_next_start returns the timeline start of the nearest clip after `idx` on
+// `track` (or a large sentinel if none), so a right-edge resize never overlaps.
+clip_next_start :: proc(track: ^Track, idx: int) -> i64 {
+	for i := idx + 1; i < len(track.clips); i += 1 {
+		return track.clips[i].timeline_start_frame
+	}
+	return i64(1) << 50
+}
+
+// clip_prev_end returns the timeline end of the nearest clip before `idx` on
+// `track` (or a large negative sentinel if none), so a left-edge resize never
+// overlaps.
+clip_prev_end :: proc(track: ^Track, idx: int) -> i64 {
+	for i := idx - 1; i >= 0; i -= 1 {
+		return clip_timeline_end(track.clips[i])
+	}
+	return -(i64(1) << 50)
+}
+
+// resize_clip_right sets the clip's tail (timeline end) to new_tail, trimming
+// or extending the tail. Length is clamped to >= 1 frame, to the source frames
+// available after the head (so a file-backed clip never overruns its media), and
+// so the tail never passes the next clip's start. Generator clips (no source
+// cap) grow freely until a neighbor. Returns the applied length.
+resize_clip_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
+	c := &track.clips[idx]
+	start := c.timeline_start_frame
+	max_len := i64(1) << 50
+	if src_total := asset_source_frames(c.asset_id); src_total > 0 {
+		max_len = max(1, src_total - c.source_start_frame)
+	}
+	next := clip_next_start(track, idx)
+	lo := start + 1
+	hi := min(start + max_len, next)
+	if hi < lo {
+		hi = lo
+	}
+	tail := clamp(new_tail, lo, hi)
+	c.source_length_frames = tail - start
+	return c.source_length_frames
+}
+
+// resize_clip_left moves the clip's head (timeline start) to new_head while
+// keeping the tail anchored. The head shifts source_start_frame with it, and is
+// clamped so the clip never overlaps the previous neighbor, never drops below 1
+// frame, and never extends before the source (source_start_frame >= 0). Returns
+// the applied length.
+resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
+	c := &track.clips[idx]
+	start := c.timeline_start_frame
+	ssrc := c.source_start_frame
+	end := start + c.source_length_frames
+	// The head may extend left only as far as source frames precede the head.
+	min_start := start - ssrc
+	prev := clip_prev_end(track, idx)
+	lo := max(min_start, prev)
+	hi := end - 1
+	if lo > hi {
+		lo = hi
+	}
+	head := clamp(new_head, lo, hi)
+	delta := head - start
+	c.source_start_frame += delta
+	c.timeline_start_frame = head
+	c.source_length_frames = end - head
+	return c.source_length_frames
+}
+
 timeline_duration :: proc() -> i64 {
 	dur := i64(0)
 	for track in timeline.tracks {

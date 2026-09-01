@@ -151,25 +151,21 @@ no-gap clip boundary renders the correct frame and audio follows the playhead.
     expect some artifact at 4x (inherent to fast time-stretch). Backward playback
     stays video-only regardless (no reverse audio in scope).
 
-### NEXT — Clip resizing (shorten / lengthen)
+### Clip resizing (shorten / lengthen) — implemented
 
 Timeline clip resize: drag a clip's left/right edge to shorten or lengthen it.
 
-- **Right-edge resize**: change `source_length_frames` (trim tail / extend).
-  Lengthening is capped by source frames available after `source_start_frame`
-  (need the source total, via `Media_Asset.frame_count` for `asset_id`).
-- **Left-edge resize**: move `source_start_frame` AND `timeline_start_frame`
-  together (anchor the right edge); lengthening backward capped by source frames
-  before `source_start_frame`. Clips on the same track must never overlap a
-  neighbor.
-- **Generator (Text) clips**: no source frame cap yet — a synthetic clip can grow
-  freely (length is its only extent) until bounded by a neighbor.
-- Interaction: edge-grab area on the selected clip, cursor change on hover, drag
-  applies live. Selection/clip_id identity must follow the edit.
+- Implemented: right-edge drag trims/extends the tail (`source_length_frames`);
+  left-edge drag trims/extends the head, moving `source_start_frame` and
+  `timeline_start_frame` together so the tail stays anchored. Lengths are
+  clamped to >= 1 frame, never overlap a neighbor, and never overrun the asset's
+  source total (`Media_Asset.frame_count`), so lengthening can undo a shorten but
+  not exceed the media's end. Text/generator clips (no source cap) grow freely.
+  Edge hover shows the horizontal-resize cursor + an accent bar on the edge.
 - **TODO: Time warping (deferred)**: eventually a clip's playback speed can be
   rescaled independently of its timeline length (a 1s clip stretched to 2s plays
   at half speed). This step only shortens/elongates — changing timeline length
-  with a fixed source frame budget (trim) — no speed change yet.
+  within a fixed source frame budget (trim) — no speed change yet.
 
 - **Preview render-safe area**: clip image must never render outside the final
   project canvas area (the black view rectangle). Currently content is clipped

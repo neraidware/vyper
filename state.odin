@@ -202,6 +202,13 @@ dragging_playhead: bool
 upper_area_height: f32 = 560
 resizing_areas: bool
 moving_clip: bool
+// resizing_clip + resize_edge track a timeline clip duration-edge drag:
+// resize_edge 0 = left (trim/extend head), 1 = right (trim/extend tail).
+resizing_clip: bool
+resize_edge: int = -1
+// _timeline_resize_cursor is the lazily-created horizontal-resize SDL cursor,
+// shown while dragging/hovering a clip's duration edge.
+_timeline_resize_cursor: ^sdl.Cursor
 clip_drag_offset: f32
 drag_clip: ^Clip
 // Track the clip was grabbed from and the track its ghost currently hovers.

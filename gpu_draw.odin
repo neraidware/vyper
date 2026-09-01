@@ -215,6 +215,52 @@ scissor_intersect :: proc(bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect 
 	return sdl.Rect{x, y, x2 - x, y2 - y}
 }
 
+// draw_timeline_resize_focus paints a thin accent bar on the hovered (or
+// actively dragged) duration edge of the selected clip, making the edge-grab
+// area visible. Drawn as an overlay after Clay because a clip element's laid-out
+// box is only available via GetElementData.
+draw_timeline_resize_focus :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	_, cl, ok := selected_clip()
+	if !ok {
+		return
+	}
+	edge := -1
+	if resizing_clip {
+		edge = resize_edge
+	} else {
+		pointer := clay.GetPointerState()
+		mx, my := pointer.position.x, pointer.position.y
+		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+			track := &timeline.tracks[track_idx]
+			for index := 0; index < len(track.clips); index += 1 {
+				if &track.clips[index] == cl {
+					edge = timeline_resize_edge_at(track_idx, index, mx, my)
+					break
+				}
+			}
+		}
+	}
+	if edge < 0 {
+		return
+	}
+	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+		track := &timeline.tracks[track_idx]
+		for index := 0; index < len(track.clips); index += 1 {
+			if &track.clips[index] != cl {
+				continue
+			}
+			box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
+			color := BUTTON_BORDER_HOVER
+			if edge == 0 {
+				render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = box.x, y = box.y, width = 3, height = box.height}, color, 0, 0)
+			} else {
+				render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = box.x + box.width - 3, y = box.y, width = 3, height = box.height}, color, 0, 0)
+			}
+			return
+		}
+	}
+}
+
 // draw_clip_markers paints each clip's embedded markers on its timeline tile:
 // a small downward-pointing triangle at the tile's top (in the tile's border
 // color, highlighted when the tile is selected) with a thin vertical line
