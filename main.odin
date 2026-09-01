@@ -145,13 +145,7 @@ escape_dismiss :: proc() {
 // submenu kind currently dismisses the menu; the clip creation itself is wired
 // when the model lands.
 handle_ctx_option :: proc() {
-	if clay.PointerOver(clay.ID("CtxTextClip")) {
-		close_context_menu()
-	} else if clay.PointerOver(clay.ID("CtxAudioClip")) {
-		close_context_menu()
-	} else {
-		close_context_menu()
-	}
+	close_context_menu()
 }
 
 // pointer_over_context_menu reports whether the cursor is over the context menu
@@ -165,7 +159,7 @@ pointer_over_context_menu :: proc() -> bool {
 
 // pointer_over_submenu reports whether the cursor is over any submenu item.
 pointer_over_submenu :: proc() -> bool {
-	return clay.PointerOver(clay.ID("CtxTextClip")) || clay.PointerOver(clay.ID("CtxAudioClip"))
+	return clay.PointerOver(clay.ID("CtxTextClip"))
 }
 
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
