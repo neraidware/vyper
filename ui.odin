@@ -198,6 +198,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 								childGap = 6,
 							},
 						}) {
+							jog_button("PlayBack", "◀◀", -1)
 							if clay.UI(clay.ID("PlayPause"))({
 								layout = {sizing = {width = clay.SizingFixed(96), height = clay.SizingFixed(28)}, childAlignment = {x = .Center, y = .Center}},
 								backgroundColor = BUTTON,
@@ -210,6 +211,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 									clay.Text("Play", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
 								}
 							}
+							jog_button("PlayFwd", "▶▶", 1)
 							playback_rate_dropdown()
 						}
 					}
@@ -597,6 +599,25 @@ playback_rate_dropdown :: proc() {
 				settings_button(playback_rate_name(rate), playback_rate_label(rate), playback_rate == rate)
 			}
 		}
+	}
+}
+
+// jog_button renders a forward/backward jog control around the play button. It
+// is held (highlighted) while playing in that direction; the label shows the
+// temporary speed boost when active. dir is +1 (forward) or -1 (backward).
+jog_button :: proc(name: string, label: string, dir: int) {
+	active := playhead.playing && playback_dir == dir
+	boost := " "
+	if active && playback_boost > 0 {
+		boost = fmt.aprintf("%+d", playback_boost)
+	}
+	if clay.UI(clay.ID(name))({
+		layout = {sizing = {width = clay.SizingFixed(56), height = clay.SizingFixed(28)}, childAlignment = {x = .Center, y = .Center}},
+		backgroundColor = BUTTON,
+		border = {color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(active ? 2 : 1)},
+		cornerRadius = clay.CornerRadiusAll(4),
+	}) {
+		clay.Text(strings.concatenate({label, boost}), clay.TextElementConfig{textColor = active ? BUTTON_BORDER_HOVER : TEXT, fontSize = 14})
 	}
 }
 

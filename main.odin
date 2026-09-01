@@ -20,23 +20,74 @@ toggle_playback :: proc() {
 	if playhead.playing {
 		playhead.playing = false
 		preview.playing = false
+		// A pause drops the jog speed boost so the next play uses the selected
+		// rate again.
+		playback_boost = 0
 		if nered_trace {
 			fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
 		}
 		return
 	}
-	if playhead.frame >= timeline_duration() {
+	if playback_dir == 1 && playhead.frame >= timeline_duration() {
 		playhead.frame = 0
 	}
 	playback_stop_frame = -1
 	playhead_accumulator = 0
 	last_tick_ns = sdl.GetTicksNS()
 	preview_frontier = playhead.frame
+	audio_was_playing = false
 	playhead.playing = true
 	preview.playing = true
 	if nered_trace {
-		fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+		fmt.printf("[pb] toggle playing=%v ph=%d dir=%d\n", playhead.playing, playhead.frame, playback_dir)
 	}
+}
+
+// jog_playback implements the forward/backward jog controls (and h/l keys):
+//   - not playing -> start playing in the given direction,
+//   - already playing in that direction -> bump the temporary speed boost,
+//   - playing the other way -> flip direction (and reset the boost).
+// Audio only plays forward; going backward (dir == -1) mutes audio via
+// audio_update.
+jog_playback :: proc(dir: int) {
+	if !playhead.playing {
+		playback_dir = dir
+		playback_boost = 0
+		if playback_stop_frame < 0 && dir == -1 && playhead.frame <= 0 {
+			// Nothing to show backward from frame 0.
+			return
+		}
+		playback_stop_frame = -1
+		playhead_accumulator = 0
+		last_tick_ns = sdl.GetTicksNS()
+		preview_frontier = playhead.frame
+		audio_was_playing = false
+		playhead.playing = true
+		preview.playing = true
+		if nered_trace {
+			fmt.printf("[pb] jog start dir=%d ph=%d\n", dir, playhead.frame)
+		}
+		return
+	}
+	// Already playing.
+	if playback_dir == dir {
+		playback_boost += 1
+		if nered_trace {
+			fmt.printf("[pb] jog boost dir=%d boost=%d eff=%.2fx\n", dir, playback_boost, effective_playback_rate())
+		}
+	} else {
+		playback_dir = dir
+		playback_boost = 0
+		if nered_trace {
+			fmt.printf("[pb] jog flip dir=%d ph=%d\n", dir, playhead.frame)
+		}
+	}
+}
+
+// effective_playback_rate is the rate the playhead actually advances at: the
+// selected rate scaled by the temporary jog boost.
+effective_playback_rate :: proc() -> f64 {
+	return playback_rate * f64(1 + max(0, playback_boost))
 }
 
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
@@ -94,9 +145,12 @@ play_project_area :: proc() {
 	}
 	playhead.frame = project.start_frame
 	playback_stop_frame = project.end_frame
+	playback_dir = 1
+	playback_boost = 0
 	playhead_accumulator = 0
 	last_tick_ns = sdl.GetTicksNS()
 	preview_frontier = playhead.frame
+	audio_was_playing = false
 	playhead.playing = true
 	preview.playing = true
 	if nered_trace {
@@ -269,6 +323,12 @@ main :: proc() {
 						} else {
 							toggle_playback()
 						}
+					case sdl.K_H:
+						// Jog backward (mirrors the backward button).
+						jog_playback(-1)
+					case sdl.K_L:
+						// Jog forward (mirrors the forward button).
+						jog_playback(1)
 					case sdl.K_S:
 						split_clip_at_playhead()
 					case sdl.K_BACKSPACE:
@@ -646,6 +706,13 @@ if drag_clip.timeline_start_frame != new_start {
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			toggle_playback()
 		}
+		// Jog controls: backward/forward around play (and h/l keys), handled
+		// independently of the chain above since they're distinct elements.
+		if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayBack")) {
+			jog_playback(-1)
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayFwd")) {
+			jog_playback(1)
+		}
 		// Playback-rate dropdown: clicking the rate button toggles the menu;
 		// clicking a menu option selects that rate and closes it. Any other new
 		// click while open dismisses the menu without changing the rate.
@@ -663,15 +730,14 @@ if drag_clip.timeline_start_frame != new_start {
 			// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
 			// delta so the cadence is perfectly jitter-free (or any fixed rate).
 			dt_s := PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
-			// playback_rate scales the playhead against the wall clock: at 2x the
-			// playhead advances 2 frames per real-time frame budget. Affects the
-			// video/playhead only; audio pacing at non-1x is the producer's
-			// stream frequency ratio.
-			playhead_accumulator += dt_s * max(0.0, playback_rate)
+			// The playhead advances +dir frames at effective_playback_rate against
+			// the wall clock (rate * jog boost). Audio pacing at non-1x is the
+			// producer's stream frequency ratio; audio is muted going backward.
+			playhead_accumulator += dt_s * max(0.0, effective_playback_rate())
 			playback_fps := timeline_fps()
 			catchup := i64(0)
 			for playhead_accumulator >= 1.0 / playback_fps {
-				playhead.frame += 1
+				playhead.frame += i64(playback_dir)
 				catchup += 1
 				playhead_accumulator -= 1.0 / playback_fps
 			}
@@ -680,20 +746,26 @@ if drag_clip.timeline_start_frame != new_start {
 				sync.atomic_store(&audio_ph_catch, catchup)
 				if catchup > 1 {
 					if nered_trace {
-						fmt.printf("[pb] burst +%d ph=%d dt=%.1fms acc=%.3fs\n", catchup, playhead.frame, f64(now_ns-last_tick_ns)/1e6, playhead_accumulator)
+						fmt.printf("[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n", i64(playback_dir) * catchup, playhead.frame, f64(now_ns-last_tick_ns)/1e6, playhead_accumulator)
 					}
 				}
 			}
+			// Directional boundary: stop at the run end going forward, at frame 0
+			// going backward. Resetting the boost on auto-stop so a later play
+			// starts from the selected rate.
 			stop_frame := playback_stop_frame
 			if stop_frame < 0 {
 				stop_frame = timeline_duration()
 			}
-			if playhead.frame >= stop_frame {
+			at_end := (playback_dir == 1 && playhead.frame >= stop_frame) || (playback_dir == -1 && playhead.frame <= 0)
+			if at_end {
+				playback_stop_frame = -1
+				playback_boost = 0
+				playhead.frame = clamp(playhead.frame, 0, max(0, stop_frame - 1))
 				playhead.playing = false
 				preview.playing = false
-				playback_stop_frame = -1
 				if nered_trace {
-					fmt.printf("[pb] auto-stop ph=%d stop=%d\n", playhead.frame, stop_frame)
+					fmt.printf("[pb] auto-stop dir=%d ph=%d stop=%d\n", playback_dir, playhead.frame, stop_frame)
 				}
 			}
 			// Playback is real-time: the playhead (and with it the audio) runs on

@@ -98,7 +98,7 @@ update_preview_slots :: proc() -> bool {
 			// frozen on stale content: skip only when the playhead sits AHEAD of
 			// this slot's own frontier, never behind it.
 			req := frame
-			if playhead.playing {
+			if playhead.playing && playback_dir == 1 {
 				if slot.have_frontier && req > slot.frontier + 1 {
 					req = slot.frontier + 1
 				}

@@ -1063,7 +1063,10 @@ audio_update :: proc() {
 	if !audio_device_ready {
 		return
 	}
-	if !playhead.playing {
+	// Backward playback runs video only: the audio producer/decoders/stream are
+	// forward-only, so while playback_dir is -1 treat audio as paused (muted).
+	// audio_was_playing is cleared so a later flip to forward re-seeks cleanly.
+	if !playhead.playing || playback_dir == -1 {
 		sync.atomic_store(&audio_run_flag, false)
 		audio_was_playing = false
 		audio_last_ui_frame = playhead.frame

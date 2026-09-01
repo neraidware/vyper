@@ -167,10 +167,6 @@ Playhead :: struct {
 }
 playhead: Playhead
 playhead_accumulator: f64
-// playback_rate scales how fast the playhead advances during playback
-// (pretend 1.0 = 1x real time). 1.5/2/2.5/3/3.5/4 speed the playhead up;
-// 0 = "Auto" (currently identical to 1x — the rate dropdown's Auto option does
-// nothing for now, per spec). Audio pacing at rates != 1.0 is a follow-up.
 // playback_rate is the selected playback rate (Nx real time). Defaults to 1x.
 playback_rate: f64 = 1.0
 // playback_rate_open tracks whether the playback-rate dropdown is shown.
@@ -179,6 +175,15 @@ playback_rate_open: bool
 // dropdown, in display order (1x first). Iterating this list is what the
 // dropdown draws and the click handler resolves against.
 PLAYBACK_RATES :: []f64{1, 1.5, 2, 2.5, 3, 3.5, 4}
+// playback_dir is the playback direction: +1 forward, -1 backward. Set by the
+// forward/backward jog controls (and h/l keys); playback advances the playhead
+// by +dir each step.
+playback_dir: int = 1
+// playback_boost is a temporary speed boost accumulated by repeatedly pressing
+// the forward/backward jog control while already playing in that direction.
+// Effective playback rate = playback_rate * (1 + playback_boost). Reset to 0 on
+// pause so playback returns to the selected rate.
+playback_boost: int = 0
 last_tick_ns: sdl.Uint64
 // playback_stop_frame is the exclusive end of the active playback run; -1
 // means the whole timeline (timeline_duration). Ctrl+Space sets it to the
