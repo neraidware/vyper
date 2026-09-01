@@ -190,17 +190,27 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					if clay.UI(clay.ID("ActionsArea"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, childAlignment = {x = .Center, y = .Top}},
 					}) {
-						if clay.UI(clay.ID("PlayPause"))({
-							layout = {sizing = {width = clay.SizingFixed(96), height = clay.SizingFixed(28)}, childAlignment = {x = .Center, y = .Center}},
-							backgroundColor = BUTTON,
-							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-							cornerRadius = clay.CornerRadiusAll(4),
+						if clay.UI(clay.ID("PlayRow"))({
+							layout = {
+								sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})},
+								layoutDirection = .LeftToRight,
+								childAlignment = {x = .Center, y = .Center},
+								childGap = 6,
+							},
 						}) {
-							if playhead.playing {
-								clay.Text("Pause", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
-							} else {
-								clay.Text("Play", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+							if clay.UI(clay.ID("PlayPause"))({
+								layout = {sizing = {width = clay.SizingFixed(96), height = clay.SizingFixed(28)}, childAlignment = {x = .Center, y = .Center}},
+								backgroundColor = BUTTON,
+								border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+								cornerRadius = clay.CornerRadiusAll(4),
+							}) {
+								if playhead.playing {
+									clay.Text("Pause", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+								} else {
+									clay.Text("Play", clay.TextElementConfig{textColor = TEXT, fontSize = 14})
+								}
 							}
+							playback_rate_dropdown()
 						}
 					}
 				}
@@ -521,6 +531,70 @@ vertical_toggle_button :: proc(name: string, label: string) {
 // project's current fps (0 = auto).
 fps_preset_button :: proc(name: string, label: string, fps: f64) {
 	settings_button(name, label, project.frame_rate == fps)
+}
+
+// playback_rate_label returns the display text for a playback rate value:
+// "Auto" for 0, otherwise "<rate>x".
+playback_rate_label :: proc(rate: f64) -> string {
+	if rate <= 0 {
+		return "Auto"
+	}
+	if rate == f64(int(rate)) {
+		return fmt.aprintf("%dx", int(rate))
+	}
+	return fmt.aprintf("%.1fx", rate)
+}
+
+// playback_rate_name returns the unique element id string for a rate value
+// (used both to render its button and to hit-test it on click). Rates are
+// encoded by tenths: 1.5 -> "PlayRate15", 2 -> "PlayRate20", 0 -> "Auto".
+playback_rate_name :: proc(rate: f64) -> string {
+	if rate <= 0 {
+		return "PlayRateAuto"
+	}
+	return fmt.aprintf("PlayRate%d", int(rate * 10))
+}
+
+// playback_rate_dropdown renders the rate selector beside the play button. The
+// collapsed control is a button showing the current rate; clicking it toggles a
+// small menu of the available rates that drops below it. Picking one sets
+// playback_rate and closes the menu. Auto (0) is offered but currently behaves
+// as 1x.
+playback_rate_dropdown :: proc() {
+	rate_border := clay.BorderOutside(1)
+	if clay.UI(clay.ID("PlayRateBox"))({
+		layout = {
+			sizing = {width = clay.SizingFixed(64), height = clay.SizingFit({})},
+			layoutDirection = .TopToBottom,
+			childGap = 2,
+		},
+	}) {
+		if clay.UI(clay.ID("PlayRateButton"))({
+			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(28)}, padding = clay.Padding{left = 8, right = 8}, childAlignment = {x = .Center, y = .Center}},
+			backgroundColor = BUTTON,
+			border = {color = playback_rate_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = rate_border},
+			cornerRadius = clay.CornerRadiusAll(4),
+		}) {
+			clay.Text(playback_rate_label(playback_rate), clay.TextElementConfig{textColor = playback_rate_open ? BUTTON_BORDER_HOVER : TEXT, fontSize = 14})
+		}
+		if playback_rate_open {
+			if clay.UI(clay.ID("PlayRateMenu"))({
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+					layoutDirection = .TopToBottom,
+					childGap = 2,
+					padding = clay.PaddingAll(4),
+				},
+				backgroundColor = BUTTON,
+				border = {color = BUTTON_BORDER, width = rate_border},
+				cornerRadius = clay.CornerRadiusAll(4),
+			}) {
+				for rate in PLAYBACK_RATES {
+					settings_button(playback_rate_name(rate), playback_rate_label(rate), playback_rate == rate)
+				}
+			}
+		}
+	}
 }
 
 // kind_name returns a short label for a media kind (bin display).

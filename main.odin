@@ -39,6 +39,51 @@ toggle_playback :: proc() {
 	}
 }
 
+// handle_playback_rate_click resolves a click for the playback-rate dropdown.
+// rate_clicked reports whether the collapsed rate button itself was clicked
+// (toggles the menu). Otherwise, if the menu is open, a click on one of its
+// options sets playback_rate and closes the menu; any other click dismisses the
+// menu. Clicks elsewhere in the UI go through the normal input chain and simply
+// close the open menu here.
+handle_playback_rate_click :: proc(rate_clicked: bool) {
+	if rate_clicked {
+		playback_rate_open = !playback_rate_open
+		return
+	}
+	if !playback_rate_open {
+		return
+	}
+	if in_playback_rate_menu() {
+		playback_rate = rate_from_element()
+		playback_rate_open = false
+	} else {
+		playback_rate_open = false
+	}
+}
+
+// in_playback_rate_menu reports whether the pointer is over the open dropdown
+// menu (any option). The menu only exists while open, so every candidate id is
+// from a currently-rendered element.
+in_playback_rate_menu :: proc() -> bool {
+	for rate in PLAYBACK_RATES {
+		if clay.PointerOver(clay.ID(playback_rate_name(rate))) {
+			return true
+		}
+	}
+	return false
+}
+
+// rate_from_element returns the playback rate whose dropdown option is under
+// the pointer (the selection just made). Only valid inside an open menu.
+rate_from_element :: proc() -> f64 {
+	for rate in PLAYBACK_RATES {
+		if clay.PointerOver(clay.ID(playback_rate_name(rate))) {
+			return rate
+		}
+	}
+	return playback_rate
+}
+
 // play_project_area starts playback at the render range's start frame and
 // stops at its end frame (exclusive). With no range set it falls back to a
 // plain toggle.
@@ -601,6 +646,14 @@ if drag_clip.timeline_start_frame != new_start {
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			toggle_playback()
 		}
+		// Playback-rate dropdown: clicking the rate button toggles the menu;
+		// clicking a menu option selects that rate and closes it. Any other new
+		// click while open dismisses the menu without changing the rate.
+		was_click := mouse_down && !was_mouse_down
+		rate_clicked := was_click && clay.PointerOver(clay.ID("PlayRateButton"))
+		if was_click {
+			handle_playback_rate_click(rate_clicked)
+		}
 		was_mouse_down = mouse_down
 		now_ns := sdl.GetTicksNS()
 		if last_tick_ns == 0 {
@@ -610,7 +663,10 @@ if drag_clip.timeline_start_frame != new_start {
 			// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
 			// delta so the cadence is perfectly jitter-free (or any fixed rate).
 			dt_s := PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
-			playhead_accumulator += dt_s
+			// playback_rate scales the playhead against the wall clock: at 2x the
+			// playhead advances 2 frames per real-time frame budget. Affects the
+			// video/playhead only; audio pacing at non-1x is a separate follow-up.
+			playhead_accumulator += dt_s * max(0.0, playback_rate)
 			playback_fps := timeline_fps()
 			catchup := i64(0)
 			for playhead_accumulator >= 1.0 / playback_fps {
