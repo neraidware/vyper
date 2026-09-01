@@ -318,26 +318,30 @@ Preview_Slot :: struct {
 	// is_text marks a slot holding a text clip's tight raster (own text_buf +
 	// tight texture) rather than a video decode into the fixed buffer.
 	is_text:             bool,
-	// text_buf is the tight RGBA raster for a text slot, dynamically sized to
-	// text_w x text_h (the baked text). The matching GPU texture is created at
-	// that size (text_tex_w x text_tex_h) and is owned by the slot: it must be
-	// released when the slot is freed or reused for a non-text clip.
+	// text_buf is the RGBA raster for a text slot, dynamically sized to the
+	// estimated buffer bw x bh (which fits the baked text at font 48*scale; the
+	// tight ink sub-rect is text_x/text_y/text_w/text_h within it. The matching
+	// GPU texture is created at that buffer size (text_tex_w x text_tex_h) and
+	// is owned by the slot: it must be released when the slot is freed or reused
+	// for a non-text clip.
 	text_buf:            []u8,
 	// text_base_buf is a small transient buffer used to measure the BASE tight
 	// ink dims at font 48 (the logical clip.source_w/h, which stay constant per
 	// title and are what the handle-drag scale math multiplies against). Kept on
 	// the slot so re-measuring on a rename doesn't reallocate every frame.
 	text_base_buf:       []u8,
+	// text_tex_w/h are the text raster BUFFER dims (bw x bh) at which the slot's
+	// GPU texture is created + uploaded.
 	text_tex_w:          c.int,
 	text_tex_h:          c.int,
 	// text_scratch is the per-glyph bitmap scratch for text rasterization,
 	// sized for the current baked font (the shared text_clip_scratch is too
 	// small once clip.scale is baked into a larger font).
 	text_scratch:        []u8,
-	// text_recreate tells the render loop a text slot's tight texture must be
-	// reallocated at text_tex_w x text_tex_h (size changed or slot just became
-	// text). Only the render loop has the GPU device, so it does the release +
-	// recreation.
+	// text_recreate tells the render loop a text slot's texture must be
+	// reallocated at text_tex_w x text_tex_h (buffer size changed or the slot
+	// just became text). Only the render loop has the GPU device, so it does the
+	// release + recreation.
 	text_recreate:       bool,
 	tex_dirty:           bool,
 	texture:             ^sdl.GPUTexture,
