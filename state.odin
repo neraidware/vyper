@@ -294,6 +294,10 @@ Preview_Slot :: struct {
 	source_h:            c.int,
 	dec:                 Clip_Decoder,
 	buffer:              [PREVIEW_W * PREVIEW_H * 4]u8,
+	// text_hash caches the rendered title for a text clip; the text buffer is
+	// only re-rasterized (and re-uploaded) when the clip's name changes. Text
+	// clips have no decoder, so dec is unused for them.
+	text_hash:           u64,
 	tex_dirty:           bool,
 	texture:             ^sdl.GPUTexture,
 	// Per-slot decode frontier, not the global one: the global gate rewinds

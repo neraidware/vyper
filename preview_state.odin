@@ -20,7 +20,7 @@ update_preview_slots :: proc() -> bool {
 		track := &timeline.tracks[track_idx]
 		for i := 0; i < len(track.clips) && next_slot < MAX_PREVIEW_SLOTS; i += 1 {
 			clip := &track.clips[i]
-			if clip.kind != .Video {
+			if clip.kind != .Video && clip.kind != .Text {
 				continue
 			}
 			frame := playhead.frame
@@ -90,6 +90,30 @@ update_preview_slots :: proc() -> bool {
 			slot.crop_b = clip.crop_b
 			slot.source_w = clip.source_w
 			slot.source_h = clip.source_h
+			// Text clips have no decoder or source frame: the buffer is the
+			// whole preview canvas with the title rasterized at its top-left by
+			// textclip.odin. Re-render only when the title (its hash) changes so
+			// the buffer + GPU texture stay in sync with the clip's name and a
+			// rename (even unpaused) triggers one re-upload.
+			if clip.kind == .Text {
+				slot.source_w = PREVIEW_W
+				slot.source_h = PREVIEW_H
+				slot.transform_x = 0
+				slot.transform_y = 0
+				slot.scale = 1
+				slot.crop_l = 0
+				slot.crop_r = 0
+				slot.crop_t = 0
+				slot.crop_b = 0
+				if slot.text_hash != text_clip_hash(clip.name) {
+					render_text_clip_into_buffer(clip.name, slot.buffer[:], PREVIEW_W, PREVIEW_H)
+					slot.text_hash = text_clip_hash(clip.name)
+					slot.has_frame = true
+					slot.tex_dirty = true
+					changed = true
+				}
+				continue
+			}
 			// While playing, decode forward as fast as decode allows and show
 			// whatever the newest decoded frame is (dropped-frame preview: real
 			// speed, stutter when slow, never slow-motion). When paused, exact
