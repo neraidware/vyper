@@ -214,6 +214,16 @@ import_media :: proc(path: cstring) {
 		frame_count = frame_count,
 	})
 
+	// Editing-time preview can decode a low-res all-intra proxy of a video for
+	// fluid scrubbing instead of re-decoding whole groups-of-pictures from the
+	// original. Build it now, at import, so the preview is ready immediately;
+	// the render pass always uses the original (fidelity). Non-fatal: a video
+	// with no proxy just previews from the source.
+	if probe.has_video {
+		proxy_buf: [4096]u8
+		_ = proxy_transcode(path, frame_count, src_w, src_h, proxy_buf[:])
+	}
+
 	sync.mutex_lock(&audio_timeline_mtx)
 	defer sync.mutex_unlock(&audio_timeline_mtx)
 	clear(&timeline.tracks)

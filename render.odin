@@ -1338,6 +1338,7 @@ probe_ground_truth :: proc(path: cstring, clip_frame: i64, got: []u8) -> (diffs:
 }
 
 preview_probe_run :: proc(paths: [2]string) {
+	preview_proxy_enabled = false // ground truth vs the original decode path
 	if len(paths[0]) == 0 {
 		fmt.println("preview-probe: need NERED_PREVIEW_PROBE=\"<in>|<split_at>\"")
 		os.exit(2)
@@ -1508,6 +1509,7 @@ boundary_probe_print_clips :: proc() {
 }
 
 boundary_probe_run :: proc(v: string) {
+	preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 2 {
 		fmt.println("boundary-probe: need NERED_BOUNDARY_PROBE=\"<file>|<split1>[|<split2>]\"")
@@ -1693,6 +1695,7 @@ probe_hash_decode_sync :: proc(path: cstring, clip_frame: i64) -> (u64, bool) {
 }
 
 preview_framecheck_run :: proc(v: string) {
+	preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 3 {
 		fmt.println("frame-probe: need NERED_FRAME_PROBE=\"<file>|<start>-<end>|<stride>\"")

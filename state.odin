@@ -187,6 +187,13 @@ playback_rate_open: bool
 // dropdown, in display order (1x first). Iterating this list is what the
 // dropdown draws and the click handler resolves against.
 PLAYBACK_RATES :: []f64{1, 1.5, 2, 2.5, 3, 3.5, 4}
+// preview_proxy_enabled gates the editing-time proxy: when true (normal
+// editing), the live preview decodes low-res all-intra proxies for fluid
+// scrubbing. Probes set it false so headless ground-truth checks exercise the
+// ORIGINAL decode path (proxy pixels are lossy by design and would show up as
+// spurious diffs).
+preview_proxy_enabled: bool = true
+
 // playback_dir is the playback direction: +1 forward, -1 backward. Set by the
 // forward/backward jog controls (and h/l keys); playback advances the playhead
 // by +dir each step.
@@ -285,6 +292,16 @@ Preview_Slot :: struct {
 	clip_id:             u64,
 	asset_id:            u64,
 	path:                cstring,
+	// preview_path is the file the slot's decoder actually opens for LIVE
+	// playback: the low-res all-intra proxy when one exists and is
+	// frame-count-valid, else the source (`path`). Resolved once at slot
+	// assignment (never per-frame) and passed to the decoder by
+	// update_preview_slots. Render and probe paths never use it.
+	preview_path:        cstring,
+	// preview_path_buf owns the storage preview_path points at (proxy paths
+	// are built once per assignment, then keep their bytes for the slot's
+	// lifetime instead of re-probing the filesystem every frame).
+	preview_path_buf:    [4096]u8,
 	timeline_start_frame: i64,
 	source_start_frame:  i64,
 	transform_x:         f32,

@@ -46,6 +46,14 @@ import sws "vendor/ffmpeg/swscale"
 Clip_Decoder :: struct {
 	opened:      bool,
 	path:        cstring,
+	// preview_path is the actual file opened by open_clip_decoder (the proxy
+	// when one exists and is parity-valid, or `path` itself when no proxy is
+	// present). `path` is always the SOURCE path and used as the identity key
+	// for the no-reopen guard in decode_clip_frame_sync. preview_path is never
+	// used as an identity -- it is purely the decode target. preview_path_buf
+	// owns the bytes so the decoder survives the caller's stack going away.
+	preview_path:      cstring,
+	preview_path_buf:  [4096]u8,
 	fmt_ctx:     ^avfmt.FormatContext,
 	dec_ctx:     ^avcodec.CodecContext,
 	video_idx:   c.int,
@@ -127,6 +135,10 @@ clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 		avcodec.packet_free(&dec.pkt)
 	}
 	frame_cache_clear(dec)
+	// Wipe fully: neither path nor preview_path survives a reset. Callers that
+	// want a proxy re-supply it via decoder_set_preview_path before the next
+	// decode; every caller that leaves preview_path nil decodes the source
+	// (probes, ground-truth checks, render), preserving test symmetry.
 	dec^ = {}
 }
 
@@ -198,8 +210,19 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		clip_decoder_reset(dec)
 	}
 
+	// Which physical file to open. For the PREVIEW path (fit=true) the caller
+	// may have pre-resolved dec.preview_path to a low-res all-intra proxy for
+	// fast scrubbing; when set, open that instead of the source. The render
+	// path (fit=false) and every direct caller that leaves preview_path == path
+	// (probes, ground-truth checks) always decode the ORIGINAL so fidelity and
+	// test symmetry are preserved.
+	open_path := path
+	if fit && dec.preview_path != "" && dec.preview_path != path {
+		open_path = dec.preview_path
+	}
+
 	fmt_ctx: ^avfmt.FormatContext
-	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
+	if ret := avfmt.open_input(&fmt_ctx, open_path, nil, nil); ret < 0 {
 		fmt.println("avformat_open_input:", ff_err_str(ret))
 		return false
 	}
@@ -472,6 +495,21 @@ source_fit_in_buffer :: proc(src_w, src_h, buf_w, buf_h: c.int) -> (fw, fh, ox, 
 	ox = (buf_w - fw) / 2
 	oy = (buf_h - fh) / 2
 	return
+}
+
+// decoder_set_preview_path copies `path` into the decoder's own preview_path_buf
+// and points preview_path at it, so the decoder's decode target stays valid
+// independent of the caller's stack. Identity (`dec.path`) is untouched -- the
+// caller passes the source path normally.
+decoder_set_preview_path :: proc(dec: ^Clip_Decoder, path: cstring) {
+	if dec.preview_path != nil && string(dec.preview_path) == string(path) {
+		return
+	}
+	src_s := string(path)
+	nbytes := min(len(src_s), len(dec.preview_path_buf) - 1)
+	copy(dec.preview_path_buf[:nbytes], src_s[:nbytes])
+	dec.preview_path_buf[nbytes] = 0
+	dec.preview_path = cstring(&dec.preview_path_buf[0])
 }
 
 // decode_into_buffer fills a caller-provided tightly-packed RGBA buffer

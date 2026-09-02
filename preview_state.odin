@@ -88,6 +88,12 @@ prewarm_next_clip :: proc() {
 				clip_decoder_reset(&warm_decoder)
 				warm_valid = false
 			}
+			warm_proxy_buf: [4096]u8
+			if proxy := proxy_pick(next.path, next.source_length_frames, warm_proxy_buf[:]); proxy != nil {
+				decoder_set_preview_path(&warm_decoder, proxy)
+			} else {
+				decoder_set_preview_path(&warm_decoder, next.path)
+			}
 			if !decode_clip_frame_sync(&warm_decoder, next.path, next.source_start_frame, warm_buf[:]) {
 				return
 			}
@@ -187,6 +193,17 @@ update_preview_slots :: proc() -> bool {
 				slot.clip_id = clip.clip_id
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
+				// Live preview decodes the low-res all-intra proxy when one is
+				// ready (frame-count parity verified against the source); the
+				// decoder only honors it inside the fit/letterbox path, so the
+				// render pipeline and probes are untouched. Resolution happens
+				// once per assignment -- not per decoded frame.
+				slot.preview_path_buf = {}
+				if proxy := proxy_pick(clip.path, clip.source_length_frames, slot.preview_path_buf[:]); proxy != nil {
+					slot.preview_path = proxy
+				} else {
+					slot.preview_path = slot.path
+				}
 				slot.tex_dirty = true
 				if nered_trace {
 					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
@@ -321,6 +338,7 @@ update_preview_slots :: proc() -> bool {
 				}
 			}
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
+			decoder_set_preview_path(&slot.dec, slot.preview_path)
 			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 				slot.frontier = req
 				slot.have_frontier = true

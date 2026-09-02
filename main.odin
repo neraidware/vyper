@@ -370,6 +370,10 @@ main :: proc() {
 		cache_probe_run(cp)
 		return
 	}
+	if xp, _ := os.lookup_env_alloc("NERED_PROXY_PROBE", context.temp_allocator); xp != "" {
+		proxy_probe_run(xp)
+		return
+	}
 	if !load_font_data() {
 		return
 	}

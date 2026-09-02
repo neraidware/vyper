@@ -25,6 +25,7 @@ import "core:strings"
 // Ground truth for key k is the hash of the k-th in-order decoded frame.
 // ---------------------------------------------------------------------------
 cache_probe_run :: proc(v: string) {
+	preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 4 {
 		fmt.println("cache-probe: need NERED_CACHE_PROBE=\"<file>|<step>|<back>|<count>\"")
