@@ -55,7 +55,7 @@ proxy_probe_run :: proc(v: string) {
 	}
 
 	// 2. proxy_pick resolves it (frame-suffcient check passes).
-	picked := proxy_pick(path, frame_count, pbuf[:])
+	picked, _ := proxy_pick(path, frame_count, pbuf[:])
 	if picked == nil {
 		fmt.println("[proxy-probe] FAIL: proxy_pick rejected the built proxy")
 		os.exit(1)

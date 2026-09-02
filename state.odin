@@ -309,6 +309,13 @@ Preview_Slot :: struct {
 	// are built once per assignment, then keep their bytes for the slot's
 	// lifetime instead of re-probing the filesystem every frame).
 	preview_path_buf:    [4096]u8,
+	// decodable_frames is the total number of frames the medium actually
+	// decoded by this slot can produce: the proxy's frame count when
+	// preview_path is a proxy (which is up to PROXY_FRAME_TOLERANCE shorter
+	// than the source), else the source asset's frame count. Clip frames at
+	// index >= decodable_frames have no reachable media and must render empty,
+	// never the previous frame held across a failed EOF border decode.
+	decodable_frames:    i64,
 	timeline_start_frame: i64,
 	source_start_frame:  i64,
 	transform_x:         f32,
