@@ -433,6 +433,9 @@ main :: proc() {
 	defer audio_shutdown()
 	async_dec_init()
 	defer async_dec_shutdown()
+	defer if warm_valid {
+		clip_decoder_reset(&warm_decoder)
+	}
 	render_init()
 
 	memory := make([^]u8, clay.MinMemorySize())

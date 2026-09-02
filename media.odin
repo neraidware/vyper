@@ -269,6 +269,11 @@ crop_b = 0,
 	preview.playing = false
 	last_decoded_playhead = -1
 	async_dec_reset()
+	if warm_valid {
+		clip_decoder_reset(&warm_decoder)
+		warm_valid = false
+		warm_clip_id = 0
+	}
 	last_requested_playhead = -1
 	audio_reset_for_load()
 }

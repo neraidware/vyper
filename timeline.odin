@@ -298,6 +298,11 @@ split_clip_at_playhead :: proc() {
 	left_len := local
 	right_len := clip.source_length_frames - local
 	right := clip^
+	// The new half is a distinct clip instance: re-mint its identity instead of
+	// inheriting the left half's id. Two clips sharing one clip_id breaks every
+	// clip_id-keyed path (preview slot identity, find_preview_slot, the prewarm
+	// decoder handoff), which would surface as wrong-slot reuse.
+	right.clip_id = new_clip_id()
 	clip.source_length_frames = left_len
 	clip.markers = filter_markers_in_range(clip.markers[:], clip.source_start_frame, clip.source_length_frames)
 	right.source_start_frame += local

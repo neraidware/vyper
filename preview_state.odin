@@ -9,6 +9,101 @@ import "core:mem"
 // covers the playhead, driving decode, and looking slots up by clip identity.
 // ---------------------------------------------------------------------------
 
+// WARM_LOOKAHEAD is how many frames before the end of the current front clip
+// the prewarm kicks in (in timeline frames). At 60fps, 120 frames = 2s.
+WARM_LOOKAHEAD :: 120
+
+// warm_decoder pre-opens the clip that will play next (the one starting flush
+// at -- or first after -- the current front video clip's end) and pre-decodes
+// its first few frames while the current clip is still playing. When the
+// playhead crosses the boundary, update_preview_slots hands this warm decoder
+// to the slot so the transition is a cache hit instead of a cold
+// reopen + keyframe-to-target seek that stalls the render loop exactly at the
+// cut. The cold seek itself is absorbed earlier, during the tail of the
+// current clip, where the dropped-frame preview tolerates a skip.
+warm_decoder: Clip_Decoder
+warm_buf: [PREVIEW_W * PREVIEW_H * 4]u8
+warm_clip_id: u64
+warm_valid: bool
+
+// next_clip_on_track returns the clip on `track` at/after `at_or_after`
+// timeline frames (the earliest such), or nil.
+next_clip_on_track :: proc(track: ^Track, start_idx: int, at_or_after: i64) -> ^Clip {
+	best: ^Clip
+	best_start := max(i64)
+	for i := start_idx; i < len(track.clips); i += 1 {
+		c := &track.clips[i]
+		if c.timeline_start_frame < at_or_after {
+			continue
+		}
+		if c.timeline_start_frame < best_start {
+			best_start = c.timeline_start_frame
+			best = c
+		}
+	}
+	return best
+}
+
+// prewarm_next_clip warms the decoder for the clip that will play after the
+// current front video clip, but only during forward playback and only within
+// WARM_LOOKAHEAD frames of the boundary. No-op while paused/scrubbing (no
+// wasted seeks) and when no upcoming clip exists.
+prewarm_next_clip :: proc() {
+	if !playhead.playing || playback_dir != 1 {
+		return
+	}
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		track := &timeline.tracks[t]
+		for i := 0; i < len(track.clips); i += 1 {
+			c := &track.clips[i]
+			if c.kind != .Video {
+				continue
+			}
+			if playhead.frame < c.timeline_start_frame || playhead.frame >= c.timeline_start_frame + c.source_length_frames {
+				continue
+			}
+			// c is the frontmost active video clip; warm what plays next on this track.
+			end := c.timeline_start_frame + c.source_length_frames
+			if end - playhead.frame > WARM_LOOKAHEAD {
+				return
+			}
+			next := next_clip_on_track(track, i, end)
+			if next == nil {
+				return
+			}
+			// Adjacent same-asset hop (split halves, duplicated clips): the slot's
+			// decoder-preserve path (update_preview_slots) already turns it into a
+			// single cheap forward decode, so a pre-open here would be wasted work
+			// (an extra open + keyframe seek into the file during the current
+			// clip's tail). Only pre-warm when the boundary is a source-index gap
+			// or a cross-asset leap -- the cases that would otherwise cold-seek.
+			if next.path == c.path && next.source_start_frame == c.source_start_frame + c.source_length_frames {
+				return
+			}
+			if warm_valid && warm_clip_id == next.clip_id {
+				// Target unchanged; nothing new to decode (cached frames persist).
+				return
+			}
+			if warm_valid {
+				clip_decoder_reset(&warm_decoder)
+				warm_valid = false
+			}
+			if !decode_clip_frame_sync(&warm_decoder, next.path, next.source_start_frame, warm_buf[:]) {
+				return
+			}
+			// Buttress the cache with a few following frames (cheap forward steps).
+			for kf in i64(1) ..< 4 {
+				if !decode_clip_frame_sync(&warm_decoder, next.path, next.source_start_frame + kf, warm_buf[:]) {
+					break
+				}
+			}
+			warm_clip_id = next.clip_id
+			warm_valid = true
+			return
+		}
+	}
+}
+
 // update_preview_slots walks every video clip covering the current playhead and
 // ensures each has a Preview_Slot with its frame decoded (using the slot's RAM
 // frame cache). Slots are reassigned by index each frame; when a slot's clip
@@ -17,6 +112,9 @@ import "core:mem"
 update_preview_slots :: proc() -> bool {
 	changed := false
 	next_slot := 0
+	// Warm the upcoming clip's decoder before the playhead crosses the
+	// boundary, so the transition hands over a warm decoder (no cut stall).
+	prewarm_next_clip()
 	for track_idx := 0; track_idx < len(timeline.tracks) && next_slot < MAX_PREVIEW_SLOTS; track_idx += 1 {
 		track := &timeline.tracks[track_idx]
 		for i := 0; i < len(track.clips) && next_slot < MAX_PREVIEW_SLOTS; i += 1 {
@@ -47,8 +145,13 @@ update_preview_slots :: proc() -> bool {
 				// adjacent frame, which is then a single fast forward decode
 				// instead of a reset + reopen + keyframe-to-target seek that
 				// spikes the render loop (the transition lag). Only a genuinely
-				// different source file needs the decoder torn down.
-				same_asset := slot.in_use && slot.path == clip.path
+				// different source file needs the decoder torn down. A warm
+				// decoder prepared by prewarm_next_clip for EXACTLY this clip
+				// takes precedence -- it already holds this clip's first frames
+				// decoded (instant boundary), whereas the preserved decoder would
+				// still have to seek across a source gap.
+				warm_hit := warm_valid && warm_clip_id == clip.clip_id
+				same_asset := slot.in_use && !warm_hit && slot.path == clip.path
 				saved_dec := slot.dec
 				if slot.in_use && !same_asset {
 					clip_decoder_reset(&slot.dec)
@@ -74,6 +177,11 @@ update_preview_slots :: proc() -> bool {
 				slot^ = {}
 				if same_asset {
 					slot.dec = saved_dec
+				} else if warm_hit {
+					slot.dec = warm_decoder
+					warm_decoder = {}
+					warm_valid = false
+					warm_clip_id = 0
 				}
 				slot.in_use = true
 				slot.clip_id = clip.clip_id
@@ -81,8 +189,8 @@ update_preview_slots :: proc() -> bool {
 				slot.path = clip.path
 				slot.tex_dirty = true
 				if nered_trace {
-					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v\n",
-						next_slot - 1, clip.asset_id, clip.timeline_start_frame, clip.source_start_frame, clip.source_length_frames, playhead.playing, same_asset)
+					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
+						next_slot - 1, clip.asset_id, clip.timeline_start_frame, clip.source_start_frame, clip.source_length_frames, playhead.playing, same_asset, warm_hit, clip.clip_id, warm_clip_id)
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
@@ -246,6 +354,13 @@ update_preview_slots :: proc() -> bool {
 // other half of the "deleted clip keeps rendering" bug — the timeline and audio
 // drop the clip, but the preview slot must drop it too, explicitly.
 	invalidate_preview_slots :: proc() {
+	// The warm decoder targets a clip that no longer exists; drop it so a
+	// stale hand-in can never occur.
+	if warm_valid {
+		clip_decoder_reset(&warm_decoder)
+		warm_valid = false
+		warm_clip_id = 0
+	}
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		slot := &preview_slots[i]
 		if slot.in_use {
