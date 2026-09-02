@@ -24,21 +24,21 @@ win32_picked_path: [1024]byte
 win32_open_file_picker :: proc() -> cstring {
 	filters := strings.concatenate({
 		"Video",
-		"\0",
+		"\x00",
 		"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.mpeg;*.mpg;*.ts;*.m2ts;*.flv;*.wmv;*.3gp",
-		"\0",
+		"\x00",
 		"Audio",
-		"\0",
+		"\x00",
 		"*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac",
-		"\0",
+		"\x00",
 		"Images",
-		"\0",
+		"\x00",
 		"*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp;*.tiff",
-		"\0",
+		"\x00",
 		"All Files",
-		"\0",
+		"\x00",
 		"*.*",
-		"\0\0",
+		"\x00\x00",
 	}, context.temp_allocator)
 
 	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
@@ -57,8 +57,8 @@ win32_open_file_picker :: proc() -> cstring {
 		return nil // user cancelled or error
 	}
 
-	path_utf8, ok := win32.utf16_to_utf8(file_buf[:], context.temp_allocator)
-	if !ok {
+	path_utf8, err := win32.utf16_to_utf8(file_buf[:], context.temp_allocator)
+	if err != nil {
 		return nil
 	}
 	path_utf8 = strings.trim_right_null(path_utf8)
