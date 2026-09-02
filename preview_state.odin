@@ -26,13 +26,19 @@ warm_buf: [PREVIEW_W * PREVIEW_H * 4]u8
 warm_clip_id: u64
 warm_valid: bool
 
-// next_clip_on_track returns the clip on `track` at/after `at_or_after`
-// timeline frames (the earliest such), or nil.
+// next_clip_on_track returns the next VIDEO clip on `track` starting at
+// `start_idx` whose timeline kickoff is at/after `at_or_after` (the earliest
+// such). Non-video clips (text, generators) are excluded: they have no
+// decodable source file, so warming "into" one is meaningless -- and their
+// path is legitimately nil, which would make the decode open a NULL filename.
 next_clip_on_track :: proc(track: ^Track, start_idx: int, at_or_after: i64) -> ^Clip {
 	best: ^Clip
 	best_start := max(i64)
 	for i := start_idx; i < len(track.clips); i += 1 {
 		c := &track.clips[i]
+		if c.kind != .Video || c.path == nil {
+			continue
+		}
 		if c.timeline_start_frame < at_or_after {
 			continue
 		}
