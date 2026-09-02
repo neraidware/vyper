@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=nered
+Comment=Live clip editor
+Exec=nered
+Icon=nered
+Terminal=false
+Categories=AudioVideo;VideoEditor;
+StartupNotify=false

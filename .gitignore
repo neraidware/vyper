@@ -3,3 +3,6 @@
 
 # Render / probe output artifacts
 /render.mp4
+
+# nix build result symlink
+/result
