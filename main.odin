@@ -959,13 +959,7 @@ if drag_clip.timeline_start_frame != new_start {
 			ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
 			frame := i64((mouse_x - ruler.x) / timeline_zoom + timeline_view_start)
 			frame = max(frame, 0)
-			// Clamp to the last REAL frame of the timeline. timeline_duration()
-			// is the exclusive content end, so frame == timeline_duration() is a
-			// sheet empty slot past every clip; letting the playhead sit there
-			// rendered (and scrubbed) a void after the last clip. The playhead
-			// must stop at the final content frame; dragging further right pins
-			// it there.
-			frame = clamp(frame, 0, max(0, timeline_duration() - 1))
+			frame = min(frame, timeline_duration())
 			if playhead.frame != frame {
 				if nered_trace {
 					fmt.printf("[pb] scrub ph=%d (was %d) playing=%v\n", frame, playhead.frame, playhead.playing)
