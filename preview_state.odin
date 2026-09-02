@@ -39,7 +39,18 @@ update_preview_slots :: proc() -> bool {
 			// request below shifts with the new position and the cache still
 			// serves it (adjacent frames) or the decoder seeks once.
 			if !slot.in_use || slot.clip_id != clip.clip_id {
-				if slot.in_use {
+				// Reassigning the slot to a different clip identity. When the new
+				// clip references the SAME source asset as the one the slot was
+				// decoding, keep the decoder open and its RAM cache warm: a flush
+				// boundary between two clips of one file (split halves,
+				// duplicates) transitions into the next clip at the file's
+				// adjacent frame, which is then a single fast forward decode
+				// instead of a reset + reopen + keyframe-to-target seek that
+				// spikes the render loop (the transition lag). Only a genuinely
+				// different source file needs the decoder torn down.
+				same_asset := slot.in_use && slot.path == clip.path
+				saved_dec := slot.dec
+				if slot.in_use && !same_asset {
 					clip_decoder_reset(&slot.dec)
 				}
 				// A text slot owns its tight GPU texture; the zeroing below would
@@ -61,14 +72,17 @@ update_preview_slots :: proc() -> bool {
 					slot.text_scratch = nil
 				}
 				slot^ = {}
+				if same_asset {
+					slot.dec = saved_dec
+				}
 				slot.in_use = true
 				slot.clip_id = clip.clip_id
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
 				slot.tex_dirty = true
 				if nered_trace {
-					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v\n",
-						next_slot - 1, clip.asset_id, clip.timeline_start_frame, clip.source_start_frame, clip.source_length_frames, playhead.playing)
+					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v\n",
+						next_slot - 1, clip.asset_id, clip.timeline_start_frame, clip.source_start_frame, clip.source_length_frames, playhead.playing, same_asset)
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
