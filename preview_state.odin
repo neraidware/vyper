@@ -50,37 +50,6 @@ next_clip_on_track :: proc(track: ^Track, start_idx: int, at_or_after: i64) -> ^
 	return best
 }
 
-// preview_slot_blank drops a slot's displayed frame: drawing then yields a
-// clean empty canvas for the position instead of whatever the slot's GPU
-// texture still holds.
-preview_slot_blank :: proc(slot: ^Preview_Slot) {
-	slot.has_frame = false
-	slot.have_frontier = false
-	slot.frontier = 0
-	mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
-}
-
-// preview_slot_unreachable reports whether `clip_frame` can never be decoded
-// from the medium this slot casts: at/past the metadata-declared frame count,
-// OR within PROXY_FRAME_TOLERANCE+1 of it (the metadata overstates truly
-// decodable frames by one or two on odd files, so a failure that close to the
-// declared end is EOF, not a transient seek miss).
-preview_slot_unreachable :: proc(slot: ^Preview_Slot, clip_frame: i64) -> bool {
-	return clip_frame >= slot.decodable_frames || clip_frame >= slot.decodable_frames - (PROXY_FRAME_TOLERANCE + 1)
-}
-
-// slot_asset_frame_count returns the imported frame count of the media asset
-// `asset_id` (the bound for want-decoding slots decoded from the source), or
-// a huge number if the asset can't be found (never spuriously blank).
-slot_asset_frame_count :: proc(asset_id: u64) -> i64 {
-	for &a in media_assets {
-		if a.id == asset_id {
-			return a.frame_count
-		}
-	}
-	return max(i64)
-}
-
 // prewarm_next_clip warms the decoder for the clip that will play after the
 // current front video clip, but only during forward playback and only within
 // WARM_LOOKAHEAD frames of the boundary. No-op while paused/scrubbing (no
@@ -126,7 +95,7 @@ prewarm_next_clip :: proc() {
 				warm_valid = false
 			}
 			warm_proxy_buf: [4096]u8
-			if proxy, _ := proxy_pick(next.path, next.source_length_frames, warm_proxy_buf[:]); proxy != nil {
+			if proxy := proxy_pick(next.path, next.source_length_frames, warm_proxy_buf[:]); proxy != nil {
 				decoder_set_preview_path(&warm_decoder, proxy)
 			} else {
 				decoder_set_preview_path(&warm_decoder, next.path)
@@ -248,12 +217,10 @@ update_preview_slots :: proc() -> bool {
 				// render pipeline and probes are untouched. Resolution happens
 				// once per assignment -- not per decoded frame.
 				slot.preview_path_buf = {}
-				if proxy, pf := proxy_pick(clip.path, clip.source_length_frames, slot.preview_path_buf[:]); proxy != nil {
+				if proxy := proxy_pick(clip.path, clip.source_length_frames, slot.preview_path_buf[:]); proxy != nil {
 					slot.preview_path = proxy
-					slot.decodable_frames = pf
 				} else {
 					slot.preview_path = slot.path
-					slot.decodable_frames = slot_asset_frame_count(clip.asset_id)
 				}
 				slot.tex_dirty = true
 				if nered_trace {
@@ -396,19 +363,6 @@ update_preview_slots :: proc() -> bool {
 			// tick so a clip crossing the playhead mid-drag shows immediately.
 			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
-			// clip_frame >= decodable_frames marks a clip position whose source
-			// window exceeds the reachable media (a clip dragged/extended past the
-			// end of the file, or the proxy being up to tolerance frames short).
-			// That spot genuinely has no content: blank it instead of letting the
-			// previously decoded frame linger here (a failed EOF-border decode
-			// leaves has_frame true with the prior frame's pixels, so the last
-			// "empty" stretch of the timeline kept rendering the last frame).
-			// Judge on the exact playhead frame, not the forward-clamped req, so a
-			// mid-lag frontier never mislabels.
-			if clip.source_start_frame + frame - clip.timeline_start_frame >= slot.decodable_frames {
-				preview_slot_blank(slot)
-				continue
-			}
 			if !scrub_skip || !slot.has_frame {
 				if slot_idx == front_video_slot && async_has_worker() {
 					// Foreground clip decodes on the async worker: the render
@@ -427,8 +381,6 @@ update_preview_slots :: proc() -> bool {
 						preview_frontier = req
 						slot.tex_dirty = true
 						changed = true
-					} else if preview_slot_unreachable(slot, clip_frame) {
-						preview_slot_blank(slot)
 					} else if nered_trace {
 						fmt.printf("[vf] async miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
 					}
@@ -441,8 +393,6 @@ update_preview_slots :: proc() -> bool {
 						preview_frontier = req
 						slot.tex_dirty = true
 						changed = true
-					} else if preview_slot_unreachable(slot, clip_frame) {
-						preview_slot_blank(slot)
 					} else if nered_trace {
 						fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
 					}

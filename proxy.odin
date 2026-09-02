@@ -108,7 +108,7 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, out_
 	if !ok {
 		return nil
 	}
-	if hit, _ := proxy_valid_cache_hit(proxy, src_frames); hit {
+	if proxy_valid_cache_hit(proxy, src_frames) {
 		return proxy
 	}
 	w, h := proxy_scale(src_w, src_h)
@@ -128,7 +128,7 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, out_
 	for posix.fgets(raw_data(buffer[:]), len(buffer), pipe) != nil {
 	}
 	posix.pclose(pipe)
-	if ok, _ := proxy_valid_cache_hit(proxy, src_frames); !ok {
+	if !proxy_valid_cache_hit(proxy, src_frames) {
 		return nil
 	}
 	return proxy
@@ -144,39 +144,35 @@ PROXY_FRAME_TOLERANCE :: 2
 // for the source: it must carry at least (src_frames - tolerance) decodable
 // frames so every requested source index can be served. If the proxy is
 // missing it returns false; if it is present but too short, the stale proxy is
-// removed (it will be rebuilt) and false is returned. The probe result is
-// returned alongside so callers can bound decode requests against what the
-// proxy can actually serve (proxy clip frames past pf decode into EOF).
-proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> (bool, i64) {
+// removed (it will be rebuilt) and false is returned.
+proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 	if !os.exists(string(proxy)) {
-		return false, 0
+		return false
 	}
 	pf := proxy_probe_frame_count(proxy)
 	if pf < src_frames - PROXY_FRAME_TOLERANCE {
 		if pf != -1 {
 			os.remove(string(proxy))
 		}
-		return false, 0
+		return false
 	}
-	return true, pf
+	return true
 }
 
 // proxy_pick returns a usable proxy path for a source if one already exists and
 // is frame-count-valid; nil otherwise. Never transcodes (that is the import-
 // time job via proxy_transcode); merely selects the ready artifact so the
-// preview decoder can use it. The verified decodable frame count of the proxy
-// is returned alongside it.
-proxy_pick :: proc(src: cstring, src_frames: i64, out_buf: []u8) -> (cstring, i64) {
+// preview decoder can use it.
+proxy_pick :: proc(src: cstring, src_frames: i64, out_buf: []u8) -> cstring {
 	if !preview_proxy_enabled {
-		return nil, 0
+		return nil
 	}
 	proxy, ok := proxy_path_for(src, out_buf)
 	if !ok {
-		return nil, 0
+		return nil
 	}
-	hit, pf := proxy_valid_cache_hit(proxy, src_frames)
-	if !hit {
-		return nil, 0
+	if !proxy_valid_cache_hit(proxy, src_frames) {
+		return nil
 	}
-	return proxy, pf
+	return proxy
 }
