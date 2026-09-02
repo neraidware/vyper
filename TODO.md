@@ -78,7 +78,9 @@ Not yet implemented (roadmap below):
   one source). The RAM frame cache on a single decoder is done; sharing one
   decoder + pool across clips is not.
 - Decode off the render thread (async worker), so a slow decode never stalls the
-  frame loop.
+  frame loop. **Done** (`4a8d8ae`): the foreground clip decodes on a dedicated
+  SDL thread (latest-wins), honored by the preview proxy; probes that step the
+  playhead run the worker deterministically.
 - Multi-track/multi-clip composition and blending (currently renders the single
   active clip at the playhead).
 - Overlapping-audio clip mixing (currently plays the first active audio clip).
@@ -114,7 +116,12 @@ These are the highest-priority items and should be the next work block:
   holistically and confirm the wrong-image cannot recur.
 - **Scrubbing regression**: scrubbing the playhead over the timeline is janky /
   shows wrong frames. Verify the persistent-decoder cache + seek behavior under
-  rapid non-monotonic playhead moves.
+  rapid non-monotonic playhead moves. **Fluidity addressed** (sessions `fe8ed1e`
+  → `4a8d8ae`): low-res all-intra preview proxies transcoded at import (render
+  keeps the original), decimated exact-frame decodes during a drag
+  (`SCRUB_DECIMATION`, cheap when release lands on an already-decoded face), and
+  the async worker for the foreground clip. The remaining wrong-frame/stale-frame
+  audit at no-gap boundaries is still open.
 - **Audio scrubbing not implemented**: the playhead scrubs video but audio does
   NOT follow the playhead while scrubbing (only on play start/stop/resync). When
   the user drags the playhead, audio must seek to the scrubbed position and play
