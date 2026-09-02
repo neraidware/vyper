@@ -1,3 +1,7 @@
+// Linux-only xdg-desktop-portal file picker. Excluded from non-Linux builds;
+// Windows gets `portal_windows.odin` (`win32_open_file_picker`), dispatched by
+// `media.open_file_picker`.
+#+build !windows
 package main
 
 import "core:c"

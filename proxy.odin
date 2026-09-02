@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
-import posix "core:sys/posix"
 // ---------------------------------------------------------------------------
 // Preview proxies.
 //
@@ -80,21 +79,17 @@ proxy_scale :: proc(src_w, src_h: c.int) -> (w, h: c.int) {
 // proxy_probe_frame_count returns the number of frames ffprobe attributes to
 // the proxy's video stream (for parity checking against the source).
 proxy_probe_frame_count :: proc(path: cstring) -> i64 {
-	path_string := string(path)
-	quoted, _ := strings.replace_all(path_string, "'", "'\\''", context.temp_allocator)
-	command := fmt.aprintf("ffprobe -v error -select_streams v:0 -count_packets -show_entries stream=nb_read_packets -of csv=p=0 '%s' 2>/dev/null", quoted)
-	pipe := posix.popen(strings.clone_to_cstring(command, context.temp_allocator), "r")
-	if pipe == nil {
+	out, code, okin := run_capture({
+		"ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-count_packets", "-show_entries", "stream=nb_read_packets",
+		"-of", "csv=p=0",
+		string(path),
+	})
+	defer delete(out)
+	if !okin || code != 0 {
 		return -1
 	}
-	defer posix.pclose(pipe)
-	buffer: [64]byte
-	if posix.fgets(raw_data(buffer[:]), len(buffer), pipe) == nil {
-		return -1
-	}
-	line_str, _ := strings.clone_from_cstring(cstring(raw_data(buffer[:])), context.temp_allocator)
-	line_str = strings.trim_space(line_str)
-	v, ok := strconv.parse_i64(line_str)
+	v, ok := strconv.parse_i64(strings.trim_space(out))
 	if !ok {
 		return -1
 	}
@@ -117,22 +112,22 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, out_
 		return proxy
 	}
 	w, h := proxy_scale(src_w, src_h)
-	src_str := string(src)
-	proxy_str := string(proxy)
-	q_src, _ := strings.replace_all(src_str, "'", "'\\''", context.temp_allocator)
-	q_proxy, _ := strings.replace_all(proxy_str, "'", "'\\''", context.temp_allocator)
 	filter := fmt.aprintf("scale=%d:%d", w, h)
-	command := fmt.aprintf("ffmpeg -y -i '%s' -an -vf '%s' -c:v libx264 -preset veryfast -tune fastdecode -crf 18 -g 1 -pix_fmt yuv420p '%s' 2>/dev/null",
-		q_src, filter, q_proxy)
-	// Pop the pipe and drain to force completion; ignore the content.
-	pipe := posix.popen(strings.clone_to_cstring(command, context.temp_allocator), "r")
-	if pipe == nil {
-		return nil
-	}
-	buffer: [256]byte
-	for posix.fgets(raw_data(buffer[:]), len(buffer), pipe) != nil {
-	}
-	posix.pclose(pipe)
+	// Run ffmpeg with an argv (no shell), capturing (and discarding) its output.
+	run_capture({
+		"ffmpeg",
+		"-y",
+		"-i", string(src),
+		"-an",
+		"-vf", filter,
+		"-c:v", "libx264",
+		"-preset", "veryfast",
+		"-tune", "fastdecode",
+		"-crf", "18",
+		"-g", "1",
+		"-pix_fmt", "yuv420p",
+		string(proxy),
+	})
 	if !proxy_valid_cache_hit(proxy, src_frames) {
 		return nil
 	}

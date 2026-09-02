@@ -2,7 +2,7 @@ package main
 
 import "core:fmt"
 import "core:os"
-import posix "core:sys/posix"
+import "core:strings"
 import clay "clay-odin"
 
 // ---------------------------------------------------------------------------
@@ -25,22 +25,26 @@ load_font_data :: proc() -> bool {
 system_font_path: [1024]byte
 
 system_monospace_font :: proc() -> cstring {
-	// Ask Fontconfig for configured monospace family instead of hard-coding font.
-	pipe := posix.popen("fc-match -f '%{file}' monospace", "r")
-	if pipe != nil {
-		posix.fgets(raw_data(system_font_path[:]), len(system_font_path), pipe)
-		posix.pclose(pipe)
-		for i in 0..<len(system_font_path) {
-			if system_font_path[i] == '\n' {
-				system_font_path[i] = 0
-				break
+	when ODIN_OS == .Windows {
+		// Windows ships Consolas in %SystemRoot%\Fonts on every install; use it
+		// directly (no fontconfig on Windows).
+		computed := "C:\\Windows\\Fonts\\consola.ttf"
+		n := copy(system_font_path[:], computed)
+		system_font_path[n] = 0
+		return cstring(&system_font_path[0])
+	} else {
+		// Ask Fontconfig for configured monospace family instead of hard-coding font.
+		out, _, okin := run_capture({"fc-match", "-f", "%{file}", "monospace"})
+		defer delete(out)
+		if okin && len(out) > 0 {
+			n := copy(system_font_path[:], strings.trim_space(out))
+			system_font_path[n] = 0
+			if system_font_path[0] != 0 {
+				return cstring(&system_font_path[0])
 			}
 		}
-		if system_font_path[0] != 0 {
-			return cstring(raw_data(system_font_path[:]))
-		}
+		return "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 	}
-	return "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 }
 
 measure_text :: proc "c" (

@@ -5,7 +5,6 @@ import "core:fmt"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
-import posix "core:sys/posix"
 
 // ---------------------------------------------------------------------------
 // Media import: probing files with ffprobe, building Media_Asset/Track/Clip
@@ -47,20 +46,16 @@ set_project_orientation :: proc(vertical: bool) {
 // probe_video_size returns the first video stream's pixel dimensions, or
 // ok=false if the file has no video stream / ffprobe fails.
 probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
-	path_string := string(path)
-	quoted_path, _ := strings.replace_all(path_string, "'", "'\\''", context.temp_allocator)
-	command := fmt.aprintf("ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 '%s' 2>/dev/null", quoted_path)
-	pipe := posix.popen(strings.clone_to_cstring(command, context.temp_allocator), "r")
-	if pipe == nil {
+	out, code, okin := run_capture({
+		"ffprobe", "-v", "error", "-select_streams", "v:0",
+		"-show_entries", "stream=width,height", "-of", "csv=p=0",
+		string(path),
+	})
+	defer delete(out)
+	if !okin || code != 0 {
 		return 0, 0, false
 	}
-	defer posix.pclose(pipe)
-	buffer: [256]byte
-	if posix.fgets(raw_data(buffer[:]), len(buffer), pipe) == nil {
-		return 0, 0, false
-	}
-	line, _ := strings.clone_from_cstring(cstring(raw_data(buffer[:])), context.temp_allocator)
-	line = strings.trim_space(line)
+	line := strings.trim_space(out)
 	parts := strings.split(line, ",")
 	if len(parts) != 2 {
 		return 0, 0, false
@@ -74,21 +69,21 @@ probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
 }
 
 probe_media :: proc(path: cstring) -> string {
-	path_string := string(path)
-	quoted_path, _ := strings.replace_all(path_string, "'", "'\\''", context.temp_allocator)
-	command := fmt.aprintf("ffprobe -v error -show_entries format=format_name,duration,size:stream=codec_name,nb_frames,avg_frame_rate -of default=noprint_wrappers=1 '%s' 2>/dev/null", quoted_path)
-	pipe := posix.popen(strings.clone_to_cstring(command, context.temp_allocator), "r")
-	if pipe == nil {
+	out, _, okin := run_capture({
+		"ffprobe", "-v", "error",
+		"-show_entries", "format=format_name,duration,size:stream=codec_name,nb_frames,avg_frame_rate",
+		"-of", "default=noprint_wrappers=1",
+		string(path),
+	})
+	if !okin {
 		return "Length: unavailable\nFormat: unavailable\nCodecs: unavailable\nSize: unavailable"
 	}
-	buffer: [4096]byte
-	output := ""
-	for posix.fgets(raw_data(buffer[:]), len(buffer), pipe) != nil {
-		line, _ := strings.clone_from_cstring(cstring(raw_data(buffer[:])), context.temp_allocator)
-		output = fmt.aprintf("%s%s", output, line)
-	}
-	posix.pclose(pipe)
-	return strings.trim_space(output)
+	// Ignore the exit code explicitly: ffprobe can return non-zero on files it
+	// can partially inspect but still rejects at the end; we want whatever it
+	// printed. Clone into an owned string (the captured buffer is freed).
+	result := strings.clone(strings.trim_space(out))
+	delete(out)
+	return result
 }
 
 media_frame_count :: proc(metadata: string) -> i64 {
@@ -289,5 +284,9 @@ crop_b = 0,
 }
 
 open_file_picker :: proc() -> cstring {
-	return portal_open_file_picker()
+	when ODIN_OS == .Windows {
+		return win32_open_file_picker()
+	} else {
+		return portal_open_file_picker()
+	}
 }

@@ -1,0 +1,87 @@
+name: windows
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ODIN_VERSION: dev-2026-04
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: ${{ env.ODIN_VERSION }}
+
+      # vcpkg is preinstalled on windows runners. Install SDL3 + ffmpeg
+      # (dynamic): provides the import libs (SDL3.lib, avformat.lib, ...) Odin's
+      # vendored bindings link against, and the matching DLLs to ship beside the
+      # exe at runtime.
+      - name: Install SDL3 + ffmpeg (vcpkg)
+        shell: pwsh
+        run: |
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT"
+          & "$vcpkg\vcpkg" install "sdl3:x64-windows" "ffmpeg:x64-windows" --triplet x64-windows
+          echo "VCPKG_ROOT=$vcpkg" >> $env:GITHUB_ENV
+          $installed = "$vcpkg\installed\x64-windows"
+          echo "VCPKG_INSTALLED=x64-windows" >> $env:GITHUB_ENV
+          Get-ChildItem "$installed\lib\*.lib" | Where-Object { $_.Name -match 'SDL3|avcodec|avformat|avutil|swresample|swscale' } | Select-Object -ExpandProperty Name
+
+      - name: Compile shaders (best-effort, .spv are committed)
+        shell: pwsh
+        run: |
+          # Shader .spv artifacts are already committed; recompile here when a
+          # glslangValidator is available (e.g. Vulkan SDK on the runner) so a
+          # shader change gets caught, but do not fail the build without it.
+          if (Get-Command glslangValidator -ErrorAction SilentlyContinue) {
+            foreach ($src in @("rounded_rect.vert","rounded_rect.frag","text.vert","text.frag","preview.frag")) {
+              glslangValidator -V "shaders\$src" -o "shaders\$src.spv"
+              if ($LASTEXITCODE -ne 0) { throw "glslang failed on $src" }
+            }
+          } else {
+            Write-Host "glslangValidator not found; using committed .spv files"
+          }
+
+      - name: Build nered
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_INSTALLED"
+          # Pass XPATH:CFLAGS so odin's clang/link finds the vcpkg .lib import
+          # libs referenced by the SDL3 / ffmpeg vendored bindings.
+          odin build . -out:nered.exe `
+            -define:FFMPEG_LINK=system `
+            -extra-linker-flags:"/LIBPATH:$vcpkg\lib" `
+            -show-timings
+
+      - name: Stage runtime DLLs + exe
+        shell: pwsh
+        run: |
+          $vcpkg = "$env:VCPKG_INSTALLATION_ROOT\installed\$env:VCPKG_INSTALLED"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item nered.exe dist\nered.exe -Force
+          # SDL3 + ffmpeg runtime DLLs must sit beside the exe.
+          foreach ($dll in @("SDL3.dll","avcodec-*.dll","avformat-*.dll","avutil-*.dll","swresample-*.dll","swscale-*.dll")) {
+            Get-ChildItem "$vcpkg\bin\$dll" -ErrorAction SilentlyContinue | Copy-Item -Destination dist\ -Force
+          }
+          Get-ChildItem dist | Select-Object Name,Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nered-windows
+          path: dist/
+          if-no-files-found: error
