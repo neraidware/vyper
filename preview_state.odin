@@ -207,6 +207,9 @@ update_preview_slots :: proc() -> bool {
 					warm_valid = false
 					warm_clip_id = 0
 				}
+				if warm_hit {
+					slot.prime_from_warm = true
+				}
 				slot.in_use = true
 				slot.clip_id = clip.clip_id
 				slot.asset_id = clip.asset_id
@@ -367,27 +370,58 @@ update_preview_slots :: proc() -> bool {
 			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0 && (slot_idx != front_video_slot || !async_has_worker())
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			if !scrub_skip || !slot.has_frame {
-				if slot_idx == front_video_slot && async_has_worker() {
-					// Foreground clip decodes on the async worker: the render
-					// loop never blocks on its seek/decode, so scrubbing the top
-					// layer stays fluid even on a slow keyframe seek. The worker
-					// resolves its own proxy (preview path passed through); probe
-					// mode waits for the decode so asserts are deterministic.
-					async_post_request(slot.path, slot.preview_path, clip_frame)
-					if !async_live_mode {
-						async_wait_idle()
-					}
-					if async_try_consume(slot.path, clip_frame, slot.buffer[:]) {
-						slot.frontier = req
-						slot.have_frontier = true
+if slot_idx == front_video_slot && async_has_worker() {
+					if slot.prime_from_warm {
+						// Transition frame: the decoder handed over by prewarm
+						// already holds this clip's first frames in its RAM cache,
+						// so serve this one synchronously (a pure cache hit) and
+						// set has_frame immediately. Posting to the worker here
+						// would leave the freshly-reassigned slot dark while its
+						// cold decoder opens+seeks -- the flash. The flag is
+						// consumed; later frames decode on the worker.
+						slot.prime_from_warm = false
+						decoder_set_preview_path(&slot.dec, slot.preview_path)
+						if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+							slot.frontier = req
+							slot.have_frontier = true
+							slot.has_frame = true
+							preview_frontier = req
+							slot.tex_dirty = true
+							changed = true
+						}
+					} else {
+						// Foreground clip decodes on the async worker: the render
+						// loop never blocks on its seek/decode, so scrubbing the top
+						// layer stays fluid even on a slow keyframe seek. The worker
+						// resolves its own proxy (preview path passed through); probe
+						// mode waits for the decode so asserts are deterministic.
+						async_post_request(slot.path, slot.preview_path, clip_frame)
+						if !async_live_mode {
+							async_wait_idle()
+						}
+						if async_try_consume(slot.path, clip_frame, slot.buffer[:]) {
+					slot.frontier = req
+					slot.have_frontier = true
+					slot.has_frame = true
+					preview_frontier = req
+					slot.tex_dirty = true
+					changed = true
+				} else if dragging_playhead {
+					// Exact-consume missed because the frontier outran the
+					// worker. While scrubbing show the newest decoded face
+					// instead of the pre-drag one, but leave the frontier
+					// untouched so release still requests the exact frame.
+					if ok, _ := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
 						slot.has_frame = true
 						preview_frontier = req
 						slot.tex_dirty = true
 						changed = true
-					} else if nered_trace {
+					}
+				} else if nered_trace {
 						fmt.printf("[vf] async miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
 					}
-				} else {
+				}
+			} else {
 					decoder_set_preview_path(&slot.dec, slot.preview_path)
 					if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 						slot.frontier = req

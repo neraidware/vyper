@@ -375,6 +375,14 @@ Preview_Slot :: struct {
 	// pre-move content). Each slot only caps how far AHEAD of itself it decodes.
 	frontier:            i64,
 	have_frontier:       bool,
+	// prime_from_warm is set when this slot's decoder was handed over by the
+	// warm prewarm (its RAM cache already holds the new clip's first frames).
+	// On that frame the front slot decodes synchronously from the warm cache
+	// instead of posting to the async worker (which only owns a cold decoder
+	// and would render the freshly-assigned slot dark until its open+seek
+	// lands -- the transition flash). The flag is consumed by that prime and
+	// never set again; every later frame decodes async as usual.
+	prime_from_warm:     bool,
 	// has_frame is false until this slot has decoded a frame for its current
 	// clip identity; draw_preview skips slots without it so a reassigned slot
 	// never flashes the previous clip's image while the new decoder opens.

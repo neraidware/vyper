@@ -253,6 +253,29 @@ async_try_consume :: proc(path: cstring, clip_frame: i64, out: []u8) -> bool {
 	return true
 }
 
+// async_try_consume_latest copies the worker's most recently completed frame
+// into `out` even when it does not match the requested clip_frame, returning
+// the decoded frame. Used while scrubbing: the frontier races ahead of the
+// worker, so exact-consume would only ever succeed on release; this shows the
+// newest completed decode so the preview chases the pointer in real time.
+// Only honored when the result belongs to the same source path. Returns false
+// when no completed result is present yet (caller keeps its last good frame).
+async_try_consume_latest :: proc(path: cstring, clip_frame: i64, out: []u8) -> (bool, i64) {
+	ad := &async_decoder
+	if ad.thread == nil {
+		return false, clip_frame
+	}
+	sdl.LockMutex(ad.mutex)
+	defer sdl.UnlockMutex(ad.mutex)
+	if !ad.res_valid || ad.res_path != path {
+		return false, clip_frame
+	}
+	copy(out, ad.display_buf[:])
+	frame := ad.res_frame
+	ad.res_valid = false
+	return true, frame
+}
+
 // async_has_worker reports whether the async worker is initialized (render
 // thread should fall back to synchronous decode when it is not, e.g. probes).
 async_has_worker :: proc() -> bool {

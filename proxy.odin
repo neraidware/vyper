@@ -69,6 +69,11 @@ proxy_scale :: proc(src_w, src_h: c.int) -> (w, h: c.int) {
 		return PREVIEW_W, PREVIEW_H
 	}
 	fw, fh, _, _ := source_fit_in_buffer(src_w, src_h, PREVIEW_W, PREVIEW_H)
+	// yuv420p requires even width and height; an odd fitted dim (common for
+	// portrait sources, e.g. fit width 243) makes ffmpeg fail and leave a
+	// 0-byte proxy. Snap to even so transcoding always succeeds.
+	fw = c.int((fw / 2) * 2)
+	fh = c.int((fh / 2) * 2)
 	return fw, fh
 }
 
@@ -151,9 +156,10 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 	}
 	pf := proxy_probe_frame_count(proxy)
 	if pf < src_frames - PROXY_FRAME_TOLERANCE {
-		if pf != -1 {
-			os.remove(string(proxy))
-		}
+		// A corrupt/empty proxy (ffprobe returns -1) must be removed too, or
+		// it lingers forever and proxy_pick keeps declining it while proxy_transcode
+		// never rebuilds (the 0-byte portrait case). Remove any invalid artifact.
+		os.remove(string(proxy))
 		return false
 	}
 	return true
