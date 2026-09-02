@@ -210,6 +210,13 @@ last_tick_ns: sdl.Uint64
 playback_stop_frame: i64 = -1
 // dragging the playhead by its ruler bar/handle scrubs to the pointer's frame.
 dragging_playhead: bool
+// Scrub decimation: while dragging_playhead, exact-frame preview decodes run
+// on every SCRUB_DECIMATION-th update (scrub_tick counts update_preview_slots
+// calls during a drag) instead of on every mousemove. The last decoded frame
+// stays on-screen between throttled decodes; releasing the drag lifts the
+// throttle so the final position decodes exactly once.
+scrub_tick: i32
+SCRUB_DECIMATION :: 4
 upper_area_height: f32 = 560
 resizing_areas: bool
 moving_clip: bool

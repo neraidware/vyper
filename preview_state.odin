@@ -118,6 +118,9 @@ prewarm_next_clip :: proc() {
 update_preview_slots :: proc() -> bool {
 	changed := false
 	next_slot := 0
+	if dragging_playhead {
+		scrub_tick += 1
+	}
 	// Warm the upcoming clip's decoder before the playhead crosses the
 	// boundary, so the transition hands over a warm decoder (no cut stall).
 	prewarm_next_clip()
@@ -337,17 +340,26 @@ update_preview_slots :: proc() -> bool {
 					req = slot.frontier + 1
 				}
 			}
+			// Scrub throttle: a drag fires many mousemoves, and dropping the
+			// frontier below forces an exact-seek decode per UI frame per slot.
+			// Decimate: decode exact frames on every SCRUB_DECIMATION-th update
+			// only, showing the last decoded face between. A slot that has not
+			// yet covered its current frame still decodes on the first throttled
+			// tick so a clip crossing the playhead mid-drag shows immediately.
+			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
-			decoder_set_preview_path(&slot.dec, slot.preview_path)
-			if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
-				slot.frontier = req
-				slot.have_frontier = true
-				slot.has_frame = true
-				preview_frontier = req
-				slot.tex_dirty = true
-				changed = true
-			} else if nered_trace {
-				fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+			if !scrub_skip || !slot.has_frame {
+				decoder_set_preview_path(&slot.dec, slot.preview_path)
+				if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+					slot.frontier = req
+					slot.have_frontier = true
+					slot.has_frame = true
+					preview_frontier = req
+					slot.tex_dirty = true
+					changed = true
+				} else if nered_trace {
+					fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+				}
 			}
 		}
 	}
