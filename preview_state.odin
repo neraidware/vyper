@@ -118,6 +118,11 @@ prewarm_next_clip :: proc() {
 update_preview_slots :: proc() -> bool {
 	changed := false
 	next_slot := 0
+	// front_video_slot is the lowest-index slot holding a non-text clip at the
+	// playhead: the foreground face. Only it is decoded on the async worker
+	// (probe mode below waits for the result); all other slots decode
+	// synchronously.
+	front_video_slot := -1
 	if dragging_playhead {
 		scrub_tick += 1
 	}
@@ -136,7 +141,11 @@ update_preview_slots :: proc() -> bool {
 				continue
 			}
 			slot := &preview_slots[next_slot]
+			slot_idx := next_slot
 			next_slot += 1
+			if clip.kind != .Text && front_video_slot < 0 {
+				front_video_slot = slot_idx
+			}
 			// Identity is the clip instance (clip_id), not its asset or its
 			// position: asset_id alone would conflate two different clips of
 			// the same source file, and timeline_start_frame changes under a
@@ -349,16 +358,38 @@ update_preview_slots :: proc() -> bool {
 			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			if !scrub_skip || !slot.has_frame {
-				decoder_set_preview_path(&slot.dec, slot.preview_path)
-				if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
-					slot.frontier = req
-					slot.have_frontier = true
-					slot.has_frame = true
-					preview_frontier = req
-					slot.tex_dirty = true
-					changed = true
-				} else if nered_trace {
-					fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+				if slot_idx == front_video_slot && async_has_worker() {
+					// Foreground clip decodes on the async worker: the render
+					// loop never blocks on its seek/decode, so scrubbing the top
+					// layer stays fluid even on a slow keyframe seek. The worker
+					// resolves its own proxy (preview path passed through); probe
+					// mode waits for the decode so asserts are deterministic.
+					async_post_request(slot.path, slot.preview_path, clip_frame)
+					if !async_live_mode {
+						async_wait_idle()
+					}
+					if async_try_consume(slot.path, clip_frame, slot.buffer[:]) {
+						slot.frontier = req
+						slot.have_frontier = true
+						slot.has_frame = true
+						preview_frontier = req
+						slot.tex_dirty = true
+						changed = true
+					} else if nered_trace {
+						fmt.printf("[vf] async miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+					}
+				} else {
+					decoder_set_preview_path(&slot.dec, slot.preview_path)
+					if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+						slot.frontier = req
+						slot.have_frontier = true
+						slot.has_frame = true
+						preview_frontier = req
+						slot.tex_dirty = true
+						changed = true
+					} else if nered_trace {
+						fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+					}
 				}
 			}
 		}

@@ -359,10 +359,20 @@ main :: proc() {
 		return
 	}
 	if probe_path_ok, probe_paths := preview_probe_env(); probe_path_ok {
+		// These probes step the playhead through update_preview_slots, which
+		// routes the foreground clip through the async worker. Start it in
+		// probe mode (deterministic: every step waits for the decode) and tear
+		// it down before asserting.
+		async_live_mode = false
+		async_dec_init()
+		defer async_dec_shutdown()
 		preview_probe_run(probe_paths)
 		return
 	}
 	if bp, _ := os.lookup_env_alloc("NERED_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
+		async_live_mode = false
+		async_dec_init()
+		defer async_dec_shutdown()
 		boundary_probe_run(bp)
 		return
 	}

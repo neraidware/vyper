@@ -500,8 +500,15 @@ source_fit_in_buffer :: proc(src_w, src_h, buf_w, buf_h: c.int) -> (fw, fh, ox, 
 // decoder_set_preview_path copies `path` into the decoder's own preview_path_buf
 // and points preview_path at it, so the decoder's decode target stays valid
 // independent of the caller's stack. Identity (`dec.path`) is untouched -- the
-// caller passes the source path normally.
+// caller passes the source path normally. Passing nil clears the preview so the
+// decoder decodes the source itself (used by the async worker when no proxy is
+// ready for the requested file).
 decoder_set_preview_path :: proc(dec: ^Clip_Decoder, path: cstring) {
+	if path == nil {
+		dec.preview_path = nil
+		dec.preview_path_buf = {}
+		return
+	}
 	if dec.preview_path != nil && string(dec.preview_path) == string(path) {
 		return
 	}
