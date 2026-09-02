@@ -358,10 +358,13 @@ update_preview_slots :: proc() -> bool {
 			// Scrub throttle: a drag fires many mousemoves, and dropping the
 			// frontier below forces an exact-seek decode per UI frame per slot.
 			// Decimate: decode exact frames on every SCRUB_DECIMATION-th update
-			// only, showing the last decoded face between. A slot that has not
-			// yet covered its current frame still decodes on the first throttled
-			// tick so a clip crossing the playhead mid-drag shows immediately.
-			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0
+			// only, showing the last decoded face between. The foreground slot
+			// is exempt when its decode runs on the async worker: that path is
+			// non-blocking, so it chases the pointer every update and scrubbing
+			// the visible face stays live. A slot that has not yet covered its
+			// current frame still decodes on the first throttled tick so a clip
+			// crossing the playhead mid-drag shows immediately.
+			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0 && (slot_idx != front_video_slot || !async_has_worker())
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			if !scrub_skip || !slot.has_frame {
 				if slot_idx == front_video_slot && async_has_worker() {
