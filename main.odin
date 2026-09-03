@@ -349,6 +349,9 @@ play_project_area :: proc() {
 // ---------------------------------------------------------------------------
 
 main :: proc() {
+	when ODIN_OS == .Windows {
+		crash_handler_install()
+	}
 	nered_trace = os.get_env_alloc("NERED_TRACE", context.temp_allocator) == "1"
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {
 		render_test_run(test_paths)
