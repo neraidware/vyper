@@ -44,16 +44,27 @@ jobs:
       # Prebuilt shared ffmpeg (BtbN auto-build). Provides the import libs
       # (avformat.lib, avcodec.lib, ...) Odin's binding links, plus the runtime
       # dlls and the ffmpeg.exe / ffprobe.exe nered shells out to.
+      # NOTE: vendor:ffmpeg declares its Windows import as a bare relative name
+      # `foreign import "<lib>.lib"`, which Odin resolves *relative to the source
+      # file dir* (vendor/ffmpeg/<lib>/<lib>.lib), then passes as an absolute file
+      # to link.exe so /LIBPATH does NOT apply. So we must drop each import lib in
+      # the exact vendor slot Odin expects, in addition to deps\lib (for SDL3).
       - name: Download ffmpeg (prebuilt shared)
         shell: pwsh
         run: |
           curl.exe -sL -o ffmpeg.zip `
             "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl-shared.zip"
           Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg
-          Copy-Item "ffmpeg\ffmpeg-master-latest-win64-gpl-shared\lib\*.lib" deps\lib\ -Force
-          Copy-Item "ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\*.dll" deps\ -Force
-          Copy-Item "ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffmpeg.exe" deps\ -Force
-          Copy-Item "ffmpeg\ffmpeg-master-latest-win64-gpl-shared\bin\ffprobe.exe" deps\ -Force
+          $src = "ffmpeg\ffmpeg-master-latest-win64-gpl-shared"
+          Copy-Item "$src\lib\*.lib" deps\lib\ -Force
+          Copy-Item "$src\bin\*.dll" deps\ -Force
+          Copy-Item "$src\bin\ffmpeg.exe" deps\ -Force
+          Copy-Item "$src\bin\ffprobe.exe" deps\ -Force
+          # Drop import libs into vendor/ffmpeg/<lib>/<lib>.lib for the libs the
+          # app actually binds (relative foreign-import resolution).
+          foreach ($l in @("avcodec","avformat","avutil","swresample","swscale")) {
+            Copy-Item "deps\lib\$l.lib" "vendor\ffmpeg\$l\$l.lib" -Force
+          }
 
       - name: Compile shaders (best-effort, .spv are committed)
         shell: pwsh
@@ -74,9 +85,9 @@ jobs:
         shell: pwsh
         run: |
           # Odin's vendored SDL3 / ffmpeg bindings reference the .lib import libs
-          # by bare name (SDL3.lib, avformat.lib); MSVC link.exe resolves them via
-          # /LIBPATH. Point it at both extracted lib dirs so no `-local`/renaming
-          # hacks are needed.
+          # Run odin. SDL3 is imported via the `{ "SDL3.lib" }` form, which is passed to
+          # link.exe as a name and resolved via /LIBPATH -> deps\lib. ffmpeg import
+          # libs were dropped into vendor/ffmpeg/<lib>/ by the previous step.
           odin build . -out:nered.exe `
             -define:FFMPEG_LINK=system `
             -extra-linker-flags:"/LIBPATH:$PWD\deps\lib" `
