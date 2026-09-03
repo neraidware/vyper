@@ -101,7 +101,7 @@ jobs:
           # SDL3 + ffmpeg runtime dlls, plus ffmpeg.exe/ffprobe.exe that nered
           # shells out to, must sit beside the exe.
           Get-ChildItem deps\*.dll | Copy-Item -Destination dist -Force
-          Copy-Item deps\ffmpeg.exe deps\ffprobe.exe dist\ -Force
+          Copy-Item -Path deps\ffmpeg.exe, deps\ffprobe.exe -Destination dist -Force
           Get-ChildItem dist | Select-Object Name,Length
 
       - name: Upload artifact
