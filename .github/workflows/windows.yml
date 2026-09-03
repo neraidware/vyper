@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  ODIN_VERSION: dev-2026-04
+  ODIN_VERSION: dev-2026-07a
   SDL3_VER: 3.4.14
 
 jobs:

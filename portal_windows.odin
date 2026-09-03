@@ -46,14 +46,14 @@ win32_open_file_picker :: proc() -> cstring {
 
 	ofn := win32.OPENFILENAMEW{
 		lStructSize  = size_of(win32.OPENFILENAMEW),
-		lpstrFile    = wstring(&file_buf[0]),
+		lpstrFile    = win32.wstring(&file_buf[0]),
 		nMaxFile     = win32.MAX_PATH_WIDE,
 		lpstrTitle   = win32.utf8_to_wstring("Open media file", context.temp_allocator),
 		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
 		Flags        = win32.OPEN_FLAGS,
 	}
 
-	if win32.GetOpenFileNameW(&ofn) == 0 {
+	if win32.GetOpenFileNameW(&ofn) == win32.FALSE {
 		return nil // user cancelled or error
 	}
 
