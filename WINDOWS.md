@@ -1,104 +1,91 @@
 # Building & Running nered on Windows
 
-Window for cross-building: it is **not possible to cross-compile a Windows
-binary from the Linux box** — nered's build uses host odin + host C toolchain
-for post-processing (glslang), and the vendor libs/ffmpeg path differ per-OS. A
-Windows build must run **on Windows** under `odin build . -o:speed` targeting
-`windows/amd64`. This file lists what has to exist/change for that build to
-work and for the app to run.
+## CI
 
-## What already portables
+A GitHub Actions workflow (`/.github/workflows/windows.yml`) builds a Windows
+executable on every push. The runner is `windows-latest` (VS 2022 + MSVC).
+The artifact `nered-windows` contains the exe + all required DLLs + ffmpeg/ffprobe.
 
-Most of the render/runtime stack is SDL3 and thus portable — SDL3 abstracts the
-GPU backend (Vulkan on Windows), swapchain, window, and audio internally, so no
-`VK_KHR_win32_surface`-style code is needed:
+Download: https://github.com/neraidware/nered/actions → latest successful `windows` run → `nered-windows` artifact.
 
-- `main.odin` window/GPU/swapchain init: `sdl.CreateWindow`, `sdl.CreateGPUDevice`,
-  `sdl.WaitAndAcquireGPUSwapchainTexture` — cross-platform (`main.odin:396,407,1153`).
-- `vendor:sdl3` bindings resolve on Windows from Odin's vendor collection.
-- `stb/truetype` font rasterization — portable (the odin vendor tree ships a
-  Windows lib).
-- Clay UI — `clay-odin` already selects `windows/clay.lib` for `.Windows`
-  (`clay-odin/clay.odin:6`).
+## Dependencies (provided by CI; listed here for local dev)
 
-## WONTFIX / out of scope
+| Dep | Source | Layout |
+|-----|--------|--------|
+| Odin `dev-2026-07a` | [laytan/setup-odin](https://github.com/laytan/setup-odin) or [releases](https://github.com/odin-lang/Odin/releases) | System-wide |
+| SDL3 3.4.14 | `SDL3-devel-3.4.14-VC.zip` from [SDL3 releases](https://github.com/libsdl-org/SDL/releases) | `lib/x64/SDL3.lib` + `lib/x64/SDL3.dll` |
+| ffmpeg (shared, BtbN) | [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/latest) | `lib/*.lib` (import) + `bin/*.dll` + `bin/ffmpeg.exe` + `bin/ffprobe.exe` |
 
-The `core:sys/posix` `popen/fgets/pclose` shell-outs to `ffmpeg`/`ffprobe`,
-`fc-match`, and the single-quote path quoting / `2>/dev/null` redirection in:
-
-- `media.odin` — `probe_video_size`, `probe_media`
-- `proxy.odin` — `proxy_probe_frame_count`, `proxy_transcode`,
-  `proxy_valid_cache_hit`
-- `font.odin` — `system_monospace_font` (`fc-match`)
-
-These assume a POSIX `/bin/sh`. They cannot be exercised from this Linux repo
-(no cross-build), so **leave them as-is**; they are only a concern if/when a
-Windows port of the media/proxy path is actually attempted on a Windows machine.
-
-## Changes required for a Windows build
-
-### 1. File picker — `portal.odin` is Linux-only
-
-`portal.odin` foreign-imports `system:glib-2.0` / `system:gio-2.0` and drives
-the xdg-desktop-portal FileChooser D-Bus API. This is the only path feeding
-`media.open_file_picker` (`media.odin:291`). It will not compile or link on
-Windows.
-
-Needed: gate it behind `when ODIN_OS == .Linux` and provide a Windows
-`open_file_picker` (e.g. `GetOpenFileNameW` Win32 common dialog, or `IFileOpenDialog`).
-Treat `portal.odin` as Linux-only; do not include it in a Windows build.
-
-### 2. Font loading — `font.odin` hardcodes fontconfig
-
-`system_monospace_font` shells out to `fc-match` (fontconfig, absent on
-Windows) and falls back to `/usr/share/fonts/.../DejaVuSansMono.ttf`, which
-does not exist on Windows (`font.odin:27-44`).
-
-Needed: branch `system_monospace_font` per-OS — on Windows resolve a system
-font via the registry (`SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts`, e.g.
-`Consola.ttf`) or bundle a monospace TTF and read it directly. `load_font_data`
-(`font.odin:14`) then works unchanged.
-
-### 3. ffmpeg bindings — prebuilt libs are NOT in the tree
-
-The `vendor/ffmpeg/*` bindings already have `.Windows` branches pointing at
-`../windows_x64/avformat.lib` etc. (e.g. `avformat.odin:9-27`), controlled by
-`LINK :: #config(FFMPEG_LINK, "system")`. But **no `windows_x64/` prebuilt
-archives exist in the repo** — only the `.odin` bindings. `FFMPEG_LINK=system`
-resolves to `avformat.lib` by name, which must be present.
-
-Needed (pick one):
-- `-define:FFMPEG_LINK=shared` and place ffmpeg import libs (`avformat.lib`,
-  `avcodec.lib`, `avutil.lib`, `swresample.lib`, `swscale.lib`) in the working
-  dir / on the search path, shipping the matching ffmpeg DLLs next to `nered.exe`, or
-- Drop prebuilt `windows_x64/*.lib` into each `vendor/ffmpeg/<lib>/` (from a
-  Windows ffmpeg binary build) and build with `FFMPEG_LINK=static`.
-
-The Linux Nix build sidesteps this via `system:avformat` + `-L`. Windows has no
-Nix, so the libs must be sourced manually.
-
-### 4. Build loop / packaging
-
-There is no Windows build script (the `flake.nix` Nix derivation is
-Linux-only). On Windows the flow is a manual odin invocation:
+## Build command
 
 ```
-odin build . -out:nered.exe -define:FFMPEG_LINK=shared
+odin build . -out:nered.exe -define:FFMPEG_LINK=system -extra-linker-flags:"/LIBPATH:C:\path\to\sdl3\lib\x64;C:\path\to\ffmpeg\lib"
 ```
-plus placing ffmpeg DLLs (and SDL3.dll) beside `nered.exe`. A
-`build.bat`/`build.ps1` mirroring the flake's shader compile
-(`glslangValidator -V shaders/*.(vert|frag) -> .spv`) + odin build would replace
-`buildPhase` from `flake.nix`.
 
-### 5. Shader backend note
+### Critical: ffmpeg import libs must be in vendor/ffmpeg/\<lib\>/
 
-`main.odin:407` requests the SDL3 GPU device with `{.SPIRV}`. On Windows with a
-Vulkan driver SPIR-V is fine; if targeting D3D12 you would switch to `{.DXIL}`
-and recompile shaders. Not required for a Vulkan-backed Windows build.
+The vendored `vendor:ffmpeg` bindings declare Windows imports as bare relative
+names (`foreign import "avcodec.lib"`), which Odin resolves relative to the
+binding source file dir (`vendor/ffmpeg/<lib>/<lib>.lib`) and passes as an
+absolute file path to `link.exe`. **`/LIBPATH` does not apply** for these.
 
-## Test hooks that already work cross-platform
+The CI copies the BtbN import libs into the correct vendor slots before
+building. If building locally, you must do the same:
 
-The probe/headless entry points use only `core:os`/env (`NERED_FRAME_PROBE`,
-`NERED_CACHE_PROBE`, `NERED_PROXY_PROBE`, `NERED_RENDER_TEST`, etc.) and do not
-touch the POSIX shell-outs — they are the way to sanity-check a Windows build
-without a display/ffmpeg-on-PATH.
+```powershell
+Copy-Item deps\lib\avcodec.lib   vendor\ffmpeg\avcodec\avcodec.lib -Force
+Copy-Item deps\lib\avformat.lib  vendor\ffmpeg\avformat\avformat.lib -Force
+Copy-Item deps\lib\avutil.lib    vendor\ffmpeg\avutil\avutil.lib -Force
+Copy-Item deps\lib\swresample.lib vendor\ffmpeg\swresample\swresample.lib -Force
+Copy-Item deps\lib\swscale.lib   vendor\ffmpeg\swscale\swscale.lib -Force
+```
+
+SDL3 is different: `vendor:sdl3` uses `{ "SDL3.lib" }` (name form), resolved
+via `/LIBPATH`.
+
+## Runtime
+
+All files must be co-located (`dist/`):
+
+```
+nered.exe
+SDL3.dll
+ffmpeg.exe        ← nered shells out to this for transcoding
+ffprobe.exe       ← nered shells out to this for probing
+avcodec-63.dll    ← ffmpeg runtime DLLs (version numbers vary by BtbN build)
+avformat-63.dll
+avutil-61.dll
+swresample-7.dll
+swscale-10.dll
+```
+
+## What was ported
+
+- **Shell-outs** (`posix.popen/fgets/pclose`) → `run_capture()` via
+  `core:os.process_exec` (argv, no shell — works on both Windows and Unix).
+  Files: `subprocess.odin` (new), `media.odin`, `proxy.odin`, `font.odin`.
+- **File picker** (`portal.odin` xdg-desktop-portal) → Win32
+  `GetOpenFileNameW` common dialog (`portal_windows.odin`, gated with
+  `#+build windows`). `portal.odin` gated with `#+build !windows`.
+- **System font**: Windows → `C:\Windows\Fonts\consola.ttf` (Consolas); Linux
+  → `fc-match` via `run_capture`. File: `font.odin`.
+- **Shader compilation**: `.spv` files are committed in the repo; the CI
+  recompiles them when `glslangValidator` is available (best-effort).
+
+## Architecture notes
+
+- `vendor:sdl3` on `ODIN_OS == .Windows` links `SDL3.lib` (static import lib)
+  from the vendored `SDL3.dll`; no SDL3_ttf at runtime.
+- `vendor:ffmpeg` uses `FFMPEG_LINK :: #config(FFMPEG_LINK, "system")`. On
+  Windows this resolves to bare `<lib>.lib` by name (vendor-dir-relative), as
+  opposed to the `static`/`shared` modes that point at `windows_x64/*.lib`.
+- `clay-odin` selects `windows/clay.lib` for `.Windows` (`clay-odin/clay.odin`).
+- The Odin release **must be `dev-2026-07a` or later** (dev-2026-04 is missing
+  `sdl.Condition`/`sdl.CreateCondition` which `vdecode.odin` requires).
+
+## Not working yet
+
+- `win32_open_file_picker` returns a `cstring` into a `[1024]byte` global;
+  very long paths may be truncated. Acceptable for typical media files.
+- No `build.bat`/`build.ps1` for local Windows dev (the CI workflow is the
+  canonical build script).
