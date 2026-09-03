@@ -3,7 +3,6 @@
 package main
 
 import "core:fmt"
-import "core:os"
 
 import win32 "core:sys/windows"
 
@@ -16,23 +15,45 @@ import win32 "core:sys/windows"
 // (e.g. 0xC0000005 access violation, 0xC00000FD stack overflow). Without a
 // PDB / full minidump this can't walk the stack, but code+address is what
 // separates a bug in nered from a fault inside a loaded DLL.
+//
+// The handler itself uses only raw Win32 (CreateFileW/WriteFile) and a stack
+// buffer for formatting: no Odin heap allocator, so it stays safe even when
+// the heap state is what crashed the process - a "system" calling-convention
+// proc has no Odin context and must not allocate.
 // ---------------------------------------------------------------------------
 
 crash_handler_installed: bool
 
+crash_log_name: [win32.MAX_PATH]u16
+crash_log_wide_len: int
+
+crash_log_write :: proc(code: u32, addr: uintptr) {
+	buf: [256]u8
+	n := fmt.bprintf(buf[:], "nered crash\nexception_code=0x%08X\nfault_address=0x%p\n", code, addr)
+
+	log_name := crash_log_name[:crash_log_wide_len]
+	log_handle := win32.CreateFileW(
+		cast(win32.LPCWSTR)log_name,
+		win32.GENERIC_WRITE,
+		win32.FILE_SHARE_READ,
+		nil,
+		win32.CREATE_ALWAYS,
+		win32.FILE_ATTRIBUTE_NORMAL,
+		nil,
+	)
+	if log_handle == win32.INVALID_HANDLE_VALUE { return }
+
+	written: win32.DWORD
+	win32.WriteFile(log_handle, &buf[0], u32(n), &written, nil)
+	win32.CloseHandle(log_handle)
+}
+
 crash_filter :: proc "system" (ep: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 	if ep != nil && ep.ExceptionRecord != nil {
-		code := ep.ExceptionRecord.ExceptionCode
-		addr := uintptr(ep.ExceptionRecord.ExceptionAddress)
-
-		f, ferr := os.open("nered_crash.log", os.O_CREATE | os.O_WRONLY | os.O_TRUNC)
-		if ferr == nil {
-			defer os.close(f)
-			fmt.fprintln(f, "nered crash")
-			fmt.fprintf(f, "exception_code=0x%08X\n", u32(code))
-			fmt.fprintf(f, "fault_address=0x%p\n", addr)
-			fmt.fprintf(f, "fault_below_4G=%v\n", addr < 0x100000000)
-		}
+		crash_log_write(
+			u32(ep.ExceptionRecord.ExceptionCode),
+			uintptr(ep.ExceptionRecord.ExceptionAddress),
+		)
 	}
 	// Let the OS also show its own error dialog.
 	return win32.EXCEPTION_CONTINUE_SEARCH
@@ -40,6 +61,8 @@ crash_filter :: proc "system" (ep: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 
 crash_handler_install :: proc() {
 	if !crash_handler_installed {
+		w := win32.utf8_to_utf16_buf(crash_log_name[:], "nered_crash.log")
+		crash_log_wide_len = len(w)
 		win32.SetUnhandledExceptionFilter(crash_filter)
 		crash_handler_installed = true
 	}
