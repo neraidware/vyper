@@ -144,14 +144,19 @@ open_audio_decoder_resampled :: proc(dec: ^Audio_Clip_Decoder, path: cstring, st
 	dec.out_channels = dec_ctx.ch_layout.nb_channels
 	dec.input_rate = dec_ctx.sample_rate
 	dec.input_channels = dec_ctx.ch_layout.nb_channels
-	if dec.out_channels < 1 {
-		dec.out_channels = 1
-	}
 	if out_rate > 0 {
 		dec.out_rate = out_rate
 	}
 	if out_channels > 0 {
 		dec.out_channels = out_channels
+	}
+	// Keep the output channel count within the fixed [AUDIO_MAX_CH] scratch
+	// contract so decode_audio_chunk's interleaved S16 write never overflows
+	// (swr below is configured with this clamped count).
+	if dec.out_channels < 1 {
+		dec.out_channels = 1
+	} else if dec.out_channels > AUDIO_MAX_CH {
+		dec.out_channels = AUDIO_MAX_CH
 	}
 
 	swr_ctx := swres.alloc()
@@ -181,7 +186,10 @@ open_audio_decoder_resampled :: proc(dec: ^Audio_Clip_Decoder, path: cstring, st
 
 	dec.frame = avutil.frame_alloc()
 	dec.pkt = avcodec.packet_alloc()
-	dec.s16 = make([]i16, AUDIO_CHUNK * AUDIO_MAX_CH)
+	// Size the interleaved S16 scratch by the actual channel count (not a fixed
+	// 8ch cap). out_channels was clamped to AUDIO_MAX_CH before swr setup, so a
+	// >8ch file decodes into a buffer sized for what swr writes.
+	dec.s16 = make([]i16, AUDIO_CHUNK * dec.out_channels)
 	dec.opened = true
 	if audio_trace {
 		fmt.printf("audio %dch @ %d Hz -> S16\n", dec.out_channels, dec.out_rate)

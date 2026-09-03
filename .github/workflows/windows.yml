@@ -90,7 +90,7 @@ jobs:
           # libs were dropped into vendor/ffmpeg/<lib>/ by the previous step.
           odin build . -out:nered.exe `
             -define:FFMPEG_LINK=system `
-            -extra-linker-flags:"/LIBPATH:$PWD\deps\lib" `
+            -extra-linker-flags:"/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup" `
             -show-timings
 
       - name: Stage dist
