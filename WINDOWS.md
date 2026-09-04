@@ -59,11 +59,28 @@ swresample-7.dll
 swscale-10.dll
 ```
 
+`ffmpeg.exe`/`ffprobe.exe` must live next to `nered.exe` — nered resolves them
+by exe directory, not `PATH`. On a crash, nered writes `nered_crash.log`
+(exception code + fault address) in this same directory.
+
 ## What was ported
 
 - **Shell-outs** (`posix.popen/fgets/pclose`) → `run_capture()` via
   `core:os.process_exec` (argv, no shell — works on both Windows and Unix).
   Files: `subprocess.odin` (new), `media.odin`, `proxy.odin`, `font.odin`.
+- **ffprobe/ffmpeg exe-dir resolution** (`subprocess.odin`): on Windows,
+  `CreateProcessW` does not search the running exe's directory for a bare
+  argv0. `resolve_tool_argv()` rewrites a bare `ffprobe`/`ffmpeg` argv0 to
+  `<exe_dir>\ffprobe.exe` / `<exe_dir>\ffmpeg.exe` via
+  `os.get_executable_directory`, so nered finds its co-located tools regardless
+  of the CWD that launched it.
+- **Crash logger** (`crash_windows.odin`, gated `#+build windows`): installs a
+  `SetUnhandledExceptionFilter` via `crash_handler_install()` (called from
+  `main.odin` under `when ODIN_OS == .Windows`) that writes `nered_crash.log`
+  next to the exe with `exception_code` + `fault_address` on an unhandled
+  exception. Uses only raw `CreateFileW`/`WriteFile` + a stack buffer and
+  `proc "system"` bindings, so it works with no Odin `context`/allocator. This
+  is how crashes (e.g. on file open) are diagnosed on Windows.
 - **File picker** (`portal.odin` xdg-desktop-portal) → Win32
   `GetOpenFileNameW` common dialog (`portal_windows.odin`, gated with
   `#+build windows`). `portal.odin` gated with `#+build !windows`.

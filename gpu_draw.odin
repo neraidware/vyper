@@ -57,7 +57,7 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 			label := fmt.bprintf(label_buf[:], "%d", f)
 			chars := ([^]c.char)(raw_data(label))
 			slice := clay.StringSlice{length = c.int32_t(len(label)), chars = chars, baseChars = chars}
-			text_data := clay.TextRenderData{stringContents = slice, textColor = RULER_LABEL_COLOR, fontSize = 11, lineHeight = 11}
+			text_data := clay.TextRenderData{stringContents = slice, textColor = RULER_LABEL_COLOR, fontSize = FONT_RULER, lineHeight = FONT_RULER}
 			text_bounds := clay.BoundingBox{x = x + 3, y = ruler.y + 3, width = 64, height = 13}
 			render_text(renderer, command_buffer, pass, text_bounds, text_data)
 		}
@@ -228,9 +228,9 @@ draw_text_input_caret :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 	if box.width <= 0 || box.height <= 0 {
 		return
 	}
-	field_size: f32 = 18
+	field_size: f32 = f32(TEXT_INPUT_FONT)
 	adv := f32(0.55) * field_size
-	text_x := box.x + 8 // matches the field's left padding
+	text_x := box.x + CARD_GAP // matches the field's left padding
 	sm, lg := text_input_sel()
 	if sm != lg {
 		x0 := text_x + f32(text_input_codepoints_before(sm)) * adv
@@ -241,7 +241,7 @@ draw_text_input_caret :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 	blink := (sdl.GetTicks() / 500) % 2 == 0
 	if blink {
 		cx := text_x + f32(text_input_codepoints_before(ti.cursor)) * adv
-		render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = cx, y = box.y + 3, width = 2, height = box.height - 6}, BUTTON_BORDER_HOVER, 0, 0)
+		render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = cx, y = box.y + 4, width = 2, height = box.height - 8}, BUTTON_BORDER_HOVER, 0, 0)
 	}
 }
 
@@ -399,8 +399,8 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	// Lane origin is at frame 0 = ruler.x; tiles slide with the view offset.
 	x0 := lane.x + (f32(placed) - timeline_view_start) * timeline_zoom
 	w := f32(clip_len) * timeline_zoom
-	// Ghost tile height matches real clips (fixed 56, same as the layout).
-	h := f32(56)
+	// Ghost tile height matches real clips (CLIP_TILE_HEIGHT, same as the layout).
+	h := CLIP_TILE_HEIGHT
 	bounds := clay.BoundingBox{x = x0, y = lane.y, width = w, height = h}
 	// Keep the ghost inside the lane (semi-transparent fill + strong border).
 	sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
@@ -419,7 +419,7 @@ draw_marker_tooltip :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 		sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), c.int(ruler.y - 8), c.int(ruler.width), c.int(renderer.viewport.y)})
 		defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 	}
-	font_size: f32 = 12
+	font_size: f32 = FONT_TOOLTIP
 	text_w := f32(len(label)) * font_size * 0.6
 	text_x := clamp(at_x - text_w * 0.5, strip.x + 4, strip.x + strip.width - text_w - 4)
 	pill := clay.BoundingBox{x = text_x - 4, y = strip.y + 2, width = text_w + 8, height = 14}
@@ -427,9 +427,9 @@ draw_marker_tooltip :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = text_x, y = pill.y + 1, width = text_w, height = 12}, clay.TextRenderData{
 		stringContents = clay.StringSlice{length = c.int32_t(len(label)), chars = ([^]c.char)(raw_data(label))},
 		textColor = TOOLTIP_TEXT,
-		fontSize = 12,
+		fontSize = FONT_TOOLTIP,
 		letterSpacing = 1,
-		lineHeight = 12,
+		lineHeight = FONT_TOOLTIP,
 	})
 }
 
@@ -510,7 +510,7 @@ draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComman
 		f64(sync.atomic_load(&audio_dev_frame)) / fps,
 		f64(playhead.frame) / fps,
 		f64(sync.atomic_load(&audio_dev_frame)-playhead.frame) / fps)
-	fs: u16 = 13
+	fs: u16 = FONT_SMALL
 	text_w := f32(len(label)) * f32(fs) * 0.6
 	pill := clay.BoundingBox{x = preview.x + 8, y = preview.y + 8, width = text_w + 10, height = 17}
 	render_sdf_rect(renderer, command_buffer, pass, pill, TOOLTIP_BG, 4, 0)

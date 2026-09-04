@@ -127,14 +127,13 @@ timeline_resize_edge_at :: proc(track_idx, index: int, mx, my: f32) -> int {
 		return -1
 	}
 	box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
-	GRAB :: f32(7)
 	if my < box.y || my > box.y + box.height {
 		return -1
 	}
-	if mx >= box.x && mx <= box.x + GRAB {
+	if mx >= box.x && mx <= box.x + CLIP_GRAB {
 		return 0
 	}
-	if mx >= box.x + box.width - GRAB && mx <= box.x + box.width {
+	if mx >= box.x + box.width - CLIP_GRAB && mx <= box.x + box.width {
 		return 1
 	}
 	return -1
@@ -181,8 +180,18 @@ update_timeline_cursor :: proc(mx, my: f32) {
 // over the menu.
 open_track_context_menu :: proc(mx, my: f32, track: int) {
 	ctx_menu.open = true
-	ctx_menu.x = mx
-	ctx_menu.y = my
+	// Keep the floating menu fully on-screen: it's about 180px wide and one
+	// row tall (+padding), so clamp the anchor so a right-click near a window
+	// edge doesn't push the menu past it.
+	if app_window != nil {
+		w, h: c.int
+		sdl.GetWindowSize(app_window, &w, &h)
+		ctx_menu.x = clamp(mx, 0, f32(w) - 190)
+		ctx_menu.y = clamp(my, 0, f32(h) - 60)
+	} else {
+		ctx_menu.x = mx
+		ctx_menu.y = my
+	}
 	ctx_menu.target_track = track
 	track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 	ctx_menu.frame = i64(max(f32(0), (mx - track_start) / timeline_zoom + timeline_view_start))
@@ -643,6 +652,15 @@ main :: proc() {
 			}
 		}
 
+		// A close/quit event sets running=false inside the poll loop above. If we
+		// fall through into the render+present, the blocking GPU swapchain acquire
+		// (WaitAndAcquireGPUSwapchainTexture) never returns once the window is
+		// going away, so the loop would never re-check running and the process
+		// would hang instead of exiting. Break now so the deferred shutdown runs.
+		if !running {
+			break
+		}
+
 		width, height: c.int
 		sdl.GetWindowSize(window, &width, &height)
 		mouse_x, mouse_y: f32
@@ -883,12 +901,12 @@ main :: proc() {
 			}
 		} else if resizing_areas {
 			upper_area_height = mouse_y - 8
-			if upper_area_height < 460 {
-				upper_area_height = 460
-			}
-			if upper_area_height > f32(height - 180) {
-				upper_area_height = f32(height - 180)
-			}
+			// Keep a lower-bound that scales with the window so a short window
+			// never lets the upper and lower areas collide (the old hardcoded
+			// 460/180 bounds collapsed on windows shorter than ~640px).
+			min_h := min(460.0, f32(height) * 0.35)
+			max_h := max(min_h, f32(height) - 140)
+			upper_area_height = clamp(upper_area_height, min_h, max_h)
 		} else if moving_preview_clip {
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
