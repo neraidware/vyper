@@ -67,3 +67,59 @@ win32_open_file_picker :: proc() -> cstring {
 	win32_picked_path[n] = 0
 	return cstring(&win32_picked_path[0])
 }
+
+win32_save_picked_path: [1024]byte
+
+// win32_save_file_picker opens the Win32 common Save-As dialog for the render
+// output path, pre-filtered to .mp4 with an overwrite prompt. Mirror of
+// win32_open_file_picker using GetSaveFileNameW.
+win32_save_file_picker :: proc() -> cstring {
+	filters := strings.concatenate({
+		"MP4 video",
+		"\x00",
+		"*.mp4",
+		"\x00",
+		"All Files",
+		"\x00",
+		"*.*",
+		"\x00\x00",
+	}, context.temp_allocator)
+
+	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
+	defer delete(file_buf)
+	if render_out_path_len > 0 {
+		n := 0
+		for n < len(file_buf)-1 && n < render_out_path_len {
+			c := u8(render_out_path_buf[n])
+			if c == 0 {
+				break
+			}
+			file_buf[n] = u16(c)
+			n += 1
+		}
+		file_buf[n] = 0
+	}
+
+	ofn := win32.OPENFILENAMEW{
+		lStructSize  = size_of(win32.OPENFILENAMEW),
+		lpstrFile    = win32.wstring(&file_buf[0]),
+		nMaxFile     = win32.MAX_PATH_WIDE,
+		lpstrTitle   = win32.utf8_to_wstring("Save render output", context.temp_allocator),
+		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
+		lpstrDefExt  = win32.utf8_to_wstring("mp4", context.temp_allocator),
+		Flags        = win32.SAVE_FLAGS,
+	}
+
+	if win32.GetSaveFileNameW(&ofn) == win32.FALSE {
+		return nil // user cancelled or error
+	}
+
+	path_utf8, err := win32.utf16_to_utf8(file_buf[:], context.temp_allocator)
+	if err != nil {
+		return nil
+	}
+	path_utf8 = strings.trim_right_null(path_utf8)
+	n := copy(win32_save_picked_path[:], path_utf8)
+	win32_save_picked_path[n] = 0
+	return cstring(&win32_save_picked_path[0])
+}

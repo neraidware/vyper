@@ -6,6 +6,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:strings"
 
 GError :: struct {
 	domain: u32,
@@ -145,6 +146,26 @@ portal_open_file_picker :: proc() -> cstring {
 		return nil
 	}
 	request_path := g_variant_get_string(request, nil)
+	path := portal_wait_response_path(connection, request_path)
+	g_variant_unref(request)
+	g_variant_unref(reply)
+	return path
+}
+
+// portal_wait_response_path runs the portal dialog to completion (blocking the
+// calling thread until the request resolves) and returns the first picked file's
+// local path as a cstring into glib-owned memory (kept alive for the program's
+// lifetime, matching the win32 picker's persistent buffer). Returns nil on any
+// error, user cancel, or empty pick.
+//
+// The Request.Response signal parameters are a tuple "(u a{sv})":
+//   child 0 = response code (0 = success, 1 = user cancelled, 2 = error)
+//   child 1 = results dict (a{sv}).
+// If the user closes the dialog without picking a file the code is non-zero
+// and/or the results dict is EMPTY. On cancel/error we must return nil
+// immediately without touching the empty results — parsing an empty (or NULL)
+// results dict is exactly what segfaulted g_variant_get_string.
+portal_wait_response_path :: proc(connection: ^GDBusConnection, request_path: cstring) -> cstring {
 	portal_loop = g_main_loop_new(nil, false)
 	subscription := g_dbus_connection_signal_subscribe(
 		connection,
@@ -161,18 +182,9 @@ portal_open_file_picker :: proc() -> cstring {
 	g_main_loop_run(portal_loop)
 	g_dbus_connection_signal_unsubscribe(connection, subscription)
 	g_main_loop_unref(portal_loop)
-	g_variant_unref(request)
-	g_variant_unref(reply)
 	if portal_response_data == nil {
 		return nil
 	}
-	// The Response signal parameters are a tuple "(u a{sv})":
-	//   child 0 = response code (0 = success, 1 = user cancelled, 2 = error)
-	//   child 1 = results dict (a{sv}).
-	// If the user closes the dialog without picking a file, the code is non-zero
-	// and/or the results dict may be EMPTY. On cancel/error we must return nil
-	// immediately without touching the empty results — parsing an empty (or
-	// NULL) results dict is exactly what segfaulted g_variant_get_string.
 	if g_variant_n_children(portal_response_data) < 2 {
 		g_variant_unref(portal_response_data)
 		return nil
@@ -207,5 +219,77 @@ portal_open_file_picker :: proc() -> cstring {
 	g_variant_unref(first_uri)
 	g_variant_unref(uris)
 	g_variant_unref(portal_response_data)
+	return path
+}
+
+// portal_save_file_picker opens the portal SaveFile dialog for the render output
+// path. Same request/Response plumbing as open, but through the SaveFile method
+// and seeded with the current default output name so the dialog opens on it.
+portal_save_file_picker :: proc() -> cstring {
+	portal_response_data = nil
+	connection := g_bus_get_sync(2, nil, nil) // G_BUS_TYPE_SESSION
+	if connection == nil {
+		fmt.println("Could not connect to session bus")
+		return nil
+	}
+
+	default_name := "out.mp4"
+	if render_out_path_len > 0 {
+		default_name = path_basename(cstring(&render_out_path_buf[0]))
+	}
+	variant_text := fmt.aprintf(
+		"('', 'Save render output', {" +
+			"'handle_token': <'nered_save'>, " +
+			"'current_name': <%q>, " +
+			"'filters': <[('MP4 video', [(uint32 0, '*.mp4')])]>" +
+			"})",
+		default_name)
+	defer delete(variant_text)
+	parameters := g_variant_parse(
+		nil,
+		strings.clone_to_cstring(variant_text),
+		nil,
+		nil,
+		nil,
+	)
+	if parameters == nil {
+		fmt.println("Could not create portal save parameters")
+		return nil
+	}
+
+	error: ^GError
+	reply := g_dbus_connection_call_sync(
+		connection,
+		"org.freedesktop.portal.Desktop",
+		"/org/freedesktop/portal/desktop",
+		"org.freedesktop.portal.FileChooser",
+		"SaveFile",
+		parameters,
+		nil,
+		0,
+		-1,
+		nil,
+		&error,
+	)
+	g_variant_unref(parameters)
+	if reply == nil {
+		if error != nil {
+			fmt.println("Portal save request failed:", string(error.message))
+			g_error_free(error)
+		} else {
+			fmt.println("Portal save request failed")
+		}
+		return nil
+	}
+
+	request := g_variant_get_child_value(reply, 0)
+	if request == nil || g_variant_n_children(reply) < 1 {
+		g_variant_unref(reply)
+		return nil
+	}
+	request_path := g_variant_get_string(request, nil)
+	path := portal_wait_response_path(connection, request_path)
+	g_variant_unref(request)
+	g_variant_unref(reply)
 	return path
 }

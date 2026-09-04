@@ -1014,27 +1014,23 @@ render_out_path :: proc() -> string {
 	return string(render_out_path_buf[:render_out_path_len])
 }
 
-// SDL save-file dialog callback: copies the chosen path into the fixed buffer.
-render_save_cb :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: c.int) {
-	if filelist == nil || filelist[0] == nil {
+// render_pick_output_path opens the platform save-as dialog (XDG portal on
+// Linux, Win32 common dialog on Windows) and stores the chosen path. The Linux
+// SDL3 native dialog shells out to zenity, which is broken against current
+// zenity (kills the dialog), so we use the portal path the open-file picker
+// already uses.
+render_pick_output_path :: proc() {
+	path := save_file_picker()
+	if path == nil {
 		return
 	}
-	src := string(filelist[0])
+	src := string(path)
 	render_out_path_len = min(len(src), len(render_out_path_buf) - 1)
 	for i in 0 ..< render_out_path_len {
 		render_out_path_buf[i] = u8(src[i])
 	}
 	render_out_path_buf[render_out_path_len] = 0
 	render_out_path_set = true
-}
-
-render_pick_output_path :: proc() {
-	filters := [1]sdl.DialogFileFilter{{name = "MP4 video", pattern = "*.mp4"}}
-	sdl.ShowSaveFileDialog(
-		render_save_cb, nil, app_window,
-		&filters[0], 1,
-		cstring(&render_out_path_buf[0]),
-	)
 }
 
 // render_start snapshots the timeline and launches the worker thread.

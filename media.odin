@@ -290,3 +290,14 @@ open_file_picker :: proc() -> cstring {
 		return portal_open_file_picker()
 	}
 }
+
+// save_file_picker opens a save-as dialog (render output) and returns the chosen
+// path (or nil on cancel). Linux uses the XDG portal SaveFile; Windows uses the
+// Win32 common save dialog.
+save_file_picker :: proc() -> cstring {
+	when ODIN_OS == .Windows {
+		return win32_save_file_picker()
+	} else {
+		return portal_save_file_picker()
+	}
+}
