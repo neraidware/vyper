@@ -350,28 +350,27 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 			// full window first: whatever clay's last command (or the previous
 			// lane's clip rect) left would clip the name column out of frame.
 			rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
+			// Gutter column: one SECTION_GAP + GUTTER_WIDTH left of the lane box
+			// (TrackRow lays out TrackName + gap + ClipsSection). Derived from the
+			// lane geometry instead of GetElementData, whose RulerGutter box can
+			// come back zero-size and hides the header completely.
+			gx := lane_box.x - SECTION_GAP - GUTTER_WIDTH
 			row := lane_box
-			if rg.width > 0 && rg.x < lane_box.x {
-				row = clay.BoundingBox{x = rg.x, y = lane_box.y, width = lane_box.x + lane_box.width - rg.x, height = lane_box.height}
+			if gx >= 0 {
+				row = clay.BoundingBox{x = gx, y = lane_box.y, width = lane_box.x + lane_box.width - gx, height = lane_box.height}
 			}
 			sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 			render_sdf_rect(renderer, command_buffer, pass, row, clay.Color{52, 66, 84, 110}, 4, 0)
 			// Name-gutter overlay: the dark row ghost is nearly invisible against
 			// the lighter TRACK_GUTTER_BG, so paint the gutter column with a bold
-			// cyan wash + outline that cannot blend into the background. For a
-			// timeline with no tracks there is no RulerGutter column yet — paint
-			// a synthesized gutter just left of the lane.
-			header := clay.BoundingBox{x = rg.x, y = lane_box.y, width = rg.width, height = lane_box.height}
-			if rg.width > 0 && rg.x < lane_box.x {
+			// cyan wash + outline that cannot blend into the background.
+			if gx >= 0 {
+				header := clay.BoundingBox{x = gx, y = lane_box.y, width = GUTTER_WIDTH, height = lane_box.height}
 				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 120}, 0, 0)
 				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 255}, 0, 2)
-			} else if lane_box.x > GUTTER_WIDTH + SECTION_GAP {
-				synth := clay.BoundingBox{x = lane_box.x - GUTTER_WIDTH - SECTION_GAP, y = lane_box.y, width = GUTTER_WIDTH, height = lane_box.height}
-				render_sdf_rect(renderer, command_buffer, pass, synth, clay.Color{140, 200, 255, 120}, 0, 0)
-				render_sdf_rect(renderer, command_buffer, pass, synth, clay.Color{140, 200, 255, 255}, 0, 2)
 			}
 			if media_drag_trace_once {
-				fmt.printf("[md] rg={%.0f,%.0f %.0fx%.0f} lane=%d created=%v row={%.0f,%.0f %.0fx%.0f} lane_box={%.0f,%.0f %.0fx%.0f}\n", rg.x, rg.y, rg.width, rg.height, lane.track_idx, lane.created, row.x, row.y, row.width, row.height, lane_box.x, lane_box.y, lane_box.width, lane_box.height)
+				fmt.printf("[md] lane=%d created=%v gx=%.1f rg=%v row=%v lane_box=%v\n", lane.track_idx, lane.created, gx, rg, row, lane_box)
 				media_drag_trace_once = false
 			}
 			b := clay.BoundingBox{
