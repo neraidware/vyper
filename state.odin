@@ -336,6 +336,7 @@ media_drag_pick_dy: f32
 // tile needs the live position; the draw pass runs after the event handling).
 media_drag_mx: f32
 media_drag_my: f32
+media_drag_trace_once: bool = true // one-shot [md] ghost geometry dump per drag
 
 // Vertical scroll offset of the media-bin grid (manual childOffset scroll, the
 // same pattern TracksSection uses) and its vertical wheel stride.
