@@ -599,9 +599,10 @@ main :: proc() {
 							begin_clip_rename()
 						}
 					case sdl.K_U:
-						// Unlink the selected clip from its group: video + audio
-						// become independent clips under later cuts/moves/deletes.
-						unlink_selected_clips()
+						// Toggle link state across the selection: a lone clip
+						// unlinks its group; several Shift+clicked clips join into
+						// one link group (or all split apart when already linked).
+						toggle_links_for_selection()
 					case sdl.K_BACKSPACE:
 						// Delete the selected clip's timeline area on every track
 						// and close the gap (ripple).
@@ -705,6 +706,7 @@ main :: proc() {
 		middle_down := sdl.MouseButtonFlag.MIDDLE in mouse_buttons
 		mods := sdl.GetModState()
 		alt_down := sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods
+		shift_down := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
 
 		// Middle-button drag over the preview pans the camera (limited to ±one
 		// preview axis from the origin via clamp_preview_camera at render time).
@@ -896,6 +898,21 @@ main :: proc() {
 					if clay.PointerOver(clay.ID("TimelineClip", u32(track_idx * 1000 + index))) {
 						selected_track = track_idx
 						selected_index = index
+						if shift_down {
+							// Shift+click toggles the clip into/out of the
+							// multi-selection (for U linking) without dragging.
+							cid := track.clips[index].clip_id
+							if cid in selected_set {
+								delete_key(&selected_set, cid)
+							} else {
+								selected_set[cid] = true
+							}
+							handled = true
+							break
+						}
+						// Plain click = single selection: drop any earlier
+						// Shift+clicked extras and grab the clip.
+						clear(&selected_set)
 						drag_clip = &track.clips[index]
 						drag_source_track = track_idx
 						drag_source_index = index
@@ -906,7 +923,7 @@ main :: proc() {
 						break
 					}
 				}
-				if moving_clip {
+				if moving_clip || handled {
 					break
 				}
 			}

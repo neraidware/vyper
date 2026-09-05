@@ -410,6 +410,108 @@ unlink_selected_clips :: proc() {
 	}
 }
 
+// toggle_links_for_selection links or unlinks the current selection: the anchor
+// clip plus every Shift+clicked clip in selected_set. A lone selection unlinks
+// that clip's whole link group (video + audio become independent). With several
+// clips the action toggles: if they already share one link_id every selected
+// member is unlinked, otherwise they all join a fresh link group so later
+// cuts/moves/deletes treat them as one unit.
+toggle_links_for_selection :: proc() {
+	_, anchor, ok := selected_clip()
+	ids := make([dynamic]u64, 0, len(selected_set) + 1)
+	defer delete(ids)
+	if ok && anchor != nil {
+		append(&ids, anchor.clip_id)
+	}
+	for id in selected_set {
+		dup := false
+		for o in ids {
+			if o == id {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			append(&ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	resolved := make([dynamic]^Clip, 0, len(ids))
+	defer delete(resolved)
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+			c := &timeline.tracks[t].clips[i]
+			for id in ids {
+				if c.clip_id == id {
+					append(&resolved, c)
+				}
+			}
+		}
+	}
+	if len(resolved) == 0 {
+		return
+	}
+	if len(resolved) == 1 {
+		// Sole selection: sever its own link group, mirroring the original U.
+		c := resolved[0]
+		if c.link_id == 0 {
+			return
+		}
+		link := c.link_id
+		sync.mutex_lock(&audio_timeline_mtx)
+		count := 0
+		for t := 0; t < len(timeline.tracks); t += 1 {
+			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+				if timeline.tracks[t].clips[i].link_id == link {
+					timeline.tracks[t].clips[i].link_id = 0
+					count += 1
+				}
+			}
+		}
+		sync.mutex_unlock(&audio_timeline_mtx)
+		if count == 0 {
+			return
+		}
+		audio_note_edit()
+		if nered_trace {
+			fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
+		}
+		return
+	}
+	common := resolved[0].link_id
+	same_group := common != 0
+	for c in resolved {
+		if c.link_id != common {
+			same_group = false
+			break
+		}
+	}
+	sync.mutex_lock(&audio_timeline_mtx)
+	clear(&drag_group_orig)
+	if same_group {
+		for c in resolved {
+			c.link_id = 0
+		}
+		sync.mutex_unlock(&audio_timeline_mtx)
+		audio_note_edit()
+		if nered_trace {
+			fmt.printf("[tl] unlinked %d selected clips\n", len(resolved))
+		}
+		return
+	}
+	new_link := new_clip_id()
+	for c in resolved {
+		c.link_id = new_link
+	}
+	sync.mutex_unlock(&audio_timeline_mtx)
+	audio_note_edit()
+	if nered_trace {
+		fmt.printf("[tl] linked %d selected clips (link=%d)\n", len(resolved), new_link)
+	}
+}
+
 // filter_markers_in_range returns a new dynamic array with the markers whose
 // source_frame lies in [start, start+length).
 filter_markers_in_range :: proc(markers: []Clip_Marker, start, length: i64) -> [dynamic]Clip_Marker {
@@ -620,6 +722,9 @@ is_clip_selected :: proc(track_idx, index: int) -> bool {
 		return false
 	}
 	candidate := &timeline.tracks[track_idx].clips[index]
+	if candidate.clip_id in selected_set {
+		return true
+	}
 	_, sel, ok := selected_clip()
 	if !ok || sel == nil || sel.link_id == 0 || candidate.link_id == 0 {
 		return false

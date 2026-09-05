@@ -339,6 +339,11 @@ selected_asset_id: u64 = 0
 selected_track: int = -1
 selected_index: int = -1
 
+// selected_set holds extra clip ids added to the selection with Shift+click
+// (the anchor clip stays tracked by selected_track/selected_index). Used to
+// link/unlink a deliberate multi-clip set with U.
+selected_set: map[u64]bool
+
 // Transform dragging: moving the selected clip around within the preview.
 moving_preview_clip: bool
 preview_drag_offset_x: f32
