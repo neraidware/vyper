@@ -60,6 +60,18 @@ add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
 	return idx
 }
 
+// lane_blocked reports whether [start, start+length) overlaps any clip already on
+// the track. Used to refuse an aligned multi-lane import when a partner lane is
+// occupied at the anchor frame (a per-lane clamp would desync the group).
+lane_blocked :: proc(track: ^Track, start, length: i64) -> bool {
+	for c in track.clips {
+		if start < clip_timeline_end(c) && start + length > c.timeline_start_frame {
+			return true
+		}
+	}
+	return false
+}
+
 // clip_track_gaps returns the free (non-covered) bands of `track`, ignoring the
 // clip at exclude_idx (-1 = include everything). The trailing band is unbounded
 // so clips may still extend the timeline. Caller must delete the result.
@@ -277,9 +289,12 @@ timeline_duration :: proc() -> i64 {
 }
 
 // split_clip_at_playhead splits the first clip covering the playhead frame into
-// two adjacent clips at that frame (the frame stays with the left half). Both
-// halves keep their in-range markers; the right half is inserted right after the
-// left so the two touch.
+// two adjacent clips at that frame (the frame stays with the left half). When
+// the clip belongs to a link group, EVERY member whose span covers the playhead
+// is split at the same frame: the left halves keep the original group and the
+// right halves mint one fresh link group (they still time-align with each other,
+// just no longer glued to the left halves). Both halves keep their in-range
+// markers; each right half is inserted right after its left so the two touch.
 split_clip_at_playhead :: proc() {
 	tr: ^Track
 	clip: ^Clip
@@ -295,37 +310,104 @@ split_clip_at_playhead :: proc() {
 	}
 	sync.mutex_lock(&audio_timeline_mtx)
 	defer sync.mutex_unlock(&audio_timeline_mtx)
-	left_len := local
-	right_len := clip.source_length_frames - local
-	right := clip^
-	// The new half is a distinct clip instance: re-mint its identity instead of
-	// inheriting the left half's id. Two clips sharing one clip_id breaks every
-	// clip_id-keyed path (preview slot identity, find_preview_slot, the prewarm
-	// decoder handoff), which would surface as wrong-slot reuse.
-	right.clip_id = new_clip_id()
-	clip.source_length_frames = left_len
-	clip.markers = filter_markers_in_range(clip.markers[:], clip.source_start_frame, clip.source_length_frames)
-	right.source_start_frame += local
-	right.source_length_frames = right_len
-	right.timeline_start_frame = frame
-	right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
-	idx := -1
-	for i := 0; i < len(tr.clips); i += 1 {
-		if &tr.clips[i] == clip {
-			idx = i
-			break
-		}
+	link := clip.link_id
+	right_link := u64(0)
+	if link != 0 {
+		right_link = new_clip_id()
 	}
-	if idx < 0 {
+	SplitTarget :: struct { track, index: int }
+	targets := make([dynamic]SplitTarget, 0, 4)
+	defer delete(targets)
+	if link != 0 {
+		for t := 0; t < len(timeline.tracks); t += 1 {
+			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+				c := &timeline.tracks[t].clips[i]
+				if c.link_id == link && frame >= c.timeline_start_frame && frame < clip_timeline_end(c^) {
+					append(&targets, SplitTarget{t, i})
+				}
+			}
+		}
+	} else {
+		append(&targets, SplitTarget{selected_track, selected_index})
+	}
+	if len(targets) == 0 {
 		return
 	}
-	inject_at_elem(&tr.clips, idx + 1, right)
+	// Descending index order per track so injecting a right half never
+	// invalidates a still-pending target's index on the same track.
+	for t in 0 ..< len(targets) {
+		for i := t + 1; i < len(targets); i += 1 {
+			if targets[i].track > targets[t].track || (targets[i].track == targets[t].track && targets[i].index > targets[t].index) {
+				targets[t], targets[i] = targets[i], targets[t]
+			}
+		}
+	}
+	for target in targets {
+		if target.track < 0 || target.track >= len(timeline.tracks) {
+			continue
+		}
+		tt := &timeline.tracks[target.track]
+		if target.index < 0 || target.index >= len(tt.clips) {
+			continue
+		}
+		c := &tt.clips[target.index]
+		left_len := frame - c.timeline_start_frame
+		right_len := c.source_length_frames - left_len
+		if left_len <= 0 || right_len <= 0 {
+			continue
+		}
+		right := c^
+		// The new half is a distinct clip instance: re-mint its identity instead
+		// of inheriting the left half's id (two clips sharing one clip_id breaks
+		// every clip_id-keyed path -- preview slot identity, find_preview_slot,
+		// the prewarm decoder handoff).
+		right.clip_id = new_clip_id()
+		right.link_id = right_link
+		right.source_start_frame += left_len
+		right.source_length_frames = right_len
+		right.timeline_start_frame = frame
+		old_markers := c.markers
+		c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, left_len)
+		c.source_length_frames = left_len
+		right.markers = filter_markers_in_range(old_markers[:], right.source_start_frame, right_len)
+		delete(old_markers)
+		inject_at_elem(&tt.clips, target.index + 1, right)
+	}
 	if nered_trace {
-		fmt.printf("[tl] split selected clip@%d src=%d len %d -> %d | %d..%d\n",
-			clip.timeline_start_frame, clip.source_start_frame,
-			left_len, right_len, right.timeline_start_frame, right.timeline_start_frame+right_len)
+		fmt.printf("[tl] split group link=%d (%d clips) @ %d\n", link, len(targets), frame)
 	}
 	audio_note_edit()
+}
+
+// unlink_selected_clips severs the selected clip's link group: every clip that
+// shared its link_id becomes independent (link_id = 0), so later cuts, moves and
+// deletes touch only the clip you grabbed. The selection stays on that clip.
+unlink_selected_clips :: proc() {
+	_, clip, ok := selected_clip()
+	if !ok || clip == nil || clip.link_id == 0 {
+		return
+	}
+	link := clip.link_id
+	sync.mutex_lock(&audio_timeline_mtx)
+	count := 0
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+			if timeline.tracks[t].clips[i].link_id == link {
+				timeline.tracks[t].clips[i].link_id = 0
+				count += 1
+			}
+		}
+	}
+	sync.mutex_unlock(&audio_timeline_mtx)
+	if count == 0 {
+		return
+	}
+	// Any group drag math captured earlier is now invalid: members are free.
+	clear(&drag_group_orig)
+	audio_note_edit()
+	if nered_trace {
+		fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
+	}
 }
 
 // filter_markers_in_range returns a new dynamic array with the markers whose
@@ -340,9 +422,11 @@ filter_markers_in_range :: proc(markers: []Clip_Marker, start, length: i64) -> [
 	return out
 }
 
-// delete_selected_clip_raw removes just the selected clip from its track. No
-// ripple, no region removal, no other clips/tracks affected: the timeline
-// simply stops showing this clip (a gap stays where it was).
+// delete_selected_clip_raw removes the selected clip (and, when it belongs to a
+// link group, EVERY member of that group) from the timeline. No ripple, no
+// region removal, no other clips/tracks affected: the timeline simply stops
+// showing the clip(s) (a gap stays where they were). The group scope keeps a cut
+// from leaving its video behind with no audio (or vice versa).
 delete_selected_clip_raw :: proc() {
 	if selected_track < 0 || selected_track >= len(timeline.tracks) {
 		return
@@ -351,14 +435,55 @@ delete_selected_clip_raw :: proc() {
 	if selected_index < 0 || selected_index >= len(track.clips) {
 		return
 	}
+	link := track.clips[selected_index].link_id
 	sync.mutex_lock(&audio_timeline_mtx)
-	removed := track.clips[selected_index]
-	ordered_remove(&track.clips, selected_index)
+	Target :: struct { track, index: int }
+	targets := make([dynamic]Target, 0, 4)
+	defer delete(targets)
+	if link != 0 {
+		for t := 0; t < len(timeline.tracks); t += 1 {
+			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+				if timeline.tracks[t].clips[i].link_id == link {
+					append(&targets, Target{t, i})
+				}
+			}
+		}
+	} else {
+		append(&targets, Target{selected_track, selected_index})
+	}
+	// Descending (track, index) so a removal on one track never invalidates a
+	// still-pending target's index on the same track.
+	for t in 0 ..< len(targets) {
+		for i := t + 1; i < len(targets); i += 1 {
+			if targets[i].track > targets[t].track || (targets[i].track == targets[t].track && targets[i].index > targets[t].index) {
+				targets[t], targets[i] = targets[i], targets[t]
+			}
+		}
+	}
+	removed_any := false
+	for target in targets {
+		if target.track < 0 || target.track >= len(timeline.tracks) {
+			continue
+		}
+		tt := &timeline.tracks[target.track]
+		if target.index < 0 || target.index >= len(tt.clips) {
+			continue
+		}
+		removed := tt.clips[target.index]
+		ordered_remove(&tt.clips, target.index)
+		delete(removed.markers)
+		if nered_trace {
+			fmt.printf("[tl] deleted clip raw src=%s start=%d len=%d\n",
+				removed.path, removed.timeline_start_frame, removed.source_length_frames)
+		}
+		removed_any = true
+	}
 	sync.mutex_unlock(&audio_timeline_mtx)
-	delete(removed.markers)
+	if !removed_any {
+		return
+	}
 	if nered_trace {
-		fmt.printf("[tl] deleted clip raw src=%s start=%d len=%d\n",
-			removed.path, removed.timeline_start_frame, removed.source_length_frames)
+		fmt.printf("[tl] deleted clip group link=%d (%d clips)\n", link, len(targets))
 	}
 	selected_track = -1
 	selected_index = -1
@@ -483,6 +608,25 @@ selected_clip :: proc() -> (^Track, ^Clip, bool) {
 	return nil, nil, false
 }
 
+// is_clip_selected reports whether the clip at (track_idx, index) is part of the
+// current selection: the anchor clip itself, or any member of the selected
+// clip's link group. Highlighting every linked member makes a linked cut/move
+// read as one unit instead of a lone border on the grabbed clip.
+is_clip_selected :: proc(track_idx, index: int) -> bool {
+	if track_idx == selected_track && index == selected_index {
+		return true
+	}
+	if track_idx < 0 || track_idx >= len(timeline.tracks) || index < 0 || index >= len(timeline.tracks[track_idx].clips) {
+		return false
+	}
+	candidate := &timeline.tracks[track_idx].clips[index]
+	_, sel, ok := selected_clip()
+	if !ok || sel == nil || sel.link_id == 0 || candidate.link_id == 0 {
+		return false
+	}
+	return candidate.link_id == sel.link_id
+}
+
 // find_clip_by_id locates the clip with the given clip_id across all tracks.
 find_clip_by_id :: proc(id: u64) -> (^Track, ^Clip, bool) {
 	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
@@ -558,6 +702,195 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 	    return selected_index
 }
 
+// clip_index_by_id returns the index of the clip with the given clip_id on the
+// track, or -1. Edits elsewhere never invalidate this index (it is only stale if
+// this same track's clip list changed).
+clip_index_by_id :: proc(track: ^Track, id: u64) -> int {
+	for i in 0 ..< len(track.clips) {
+		if track.clips[i].clip_id == id {
+			return i
+		}
+	}
+	return -1
+}
+
+// capture_link_group snapshots the original (track, start, length) of every clip
+// sharing clip's link_id into drag_group_orig, anchor first. Non-linked clips
+// leave the array empty (len 0 = single-clip edit; len 1 = linked clip that is
+// its own whole group, e.g. single-lane media). Call at gesture start, before any
+// mutation: the captured originals are the invariant the group delta is computed
+// against on every following frame.
+capture_link_group :: proc(clip: ^Clip, track: int) {
+	clear(&drag_group_orig)
+	if clip.link_id == 0 {
+		return
+	}
+	append(&drag_group_orig, Drag_Group_Orig{clip_id = clip.clip_id, track = track, start = clip.timeline_start_frame, length = clip.source_length_frames})
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+			c := &timeline.tracks[t].clips[i]
+			if c.link_id == clip.link_id && c.clip_id != clip.clip_id {
+				append(&drag_group_orig, Drag_Group_Orig{clip_id = c.clip_id, track = t, start = c.timeline_start_frame, length = c.source_length_frames})
+			}
+		}
+	}
+}
+
+// apply_group_drag_to_members shifts every non-anchor member by the anchor's
+// live drag delta (anchor_delta = new anchor start - original anchor start),
+// each clamped to its own lane so no member overlaps a neighbor. Horizontal
+// moves of a link group keep all members time-aligned with the anchor.
+apply_group_drag_to_members :: proc(anchor_delta: i64) {
+	if len(drag_group_orig) <= 1 {
+		return
+	}
+	anchor_id := drag_group_orig[0].clip_id
+	for m in drag_group_orig {
+		if m.clip_id == anchor_id {
+			continue
+		}
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			continue
+		}
+		track := &timeline.tracks[m.track]
+		idx := clip_index_by_id(track, m.clip_id)
+		if idx < 0 {
+			continue
+		}
+		clip := &track.clips[idx]
+		gaps := clip_track_gaps(track, idx)
+		gi := gap_for_start(gaps[:], m.start)
+		if gi >= 0 {
+			lo, hi := gaps[gi][0], gaps[gi][1] - m.length
+			if hi < lo {
+				hi = lo
+			}
+			clip.timeline_start_frame = clamp(m.start + anchor_delta, lo, hi)
+		}
+		delete(gaps)
+	}
+}
+
+// move_linked_group relocates every clip captured in drag_group_orig by
+// track_delta tracks (the anchor's vertical drop), preserving each member's
+// horizontal position clamped to the destination lane, then re-selects the
+// anchor in its new home. Returns false (nothing moved) if any member's
+// destination track is out of range.
+move_linked_group :: proc(track_delta: int) -> bool {
+	if track_delta == 0 || len(drag_group_orig) == 0 {
+		return false
+	}
+	for m in drag_group_orig {
+		dst := m.track + track_delta
+		if dst < 0 || dst >= len(timeline.tracks) {
+			return false
+		}
+	}
+	PlannedMove :: struct { src_track, src_index, dst_track: int, start: i64, clip: Clip }
+	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig))
+	defer delete(planned)
+	sync.mutex_lock(&audio_timeline_mtx)
+	for m in drag_group_orig {
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			sync.mutex_unlock(&audio_timeline_mtx)
+			return false
+		}
+		src := &timeline.tracks[m.track]
+		idx := clip_index_by_id(src, m.clip_id)
+		if idx < 0 {
+			continue
+		}
+		clip := src.clips[idx]
+		dst_track := m.track + track_delta
+		if dst_track < 0 || dst_track >= len(timeline.tracks) {
+			sync.mutex_unlock(&audio_timeline_mtx)
+			return false
+		}
+		start := clip_place_in_track(&timeline.tracks[dst_track], -1, clip.source_length_frames, clip.timeline_start_frame)
+		append(&planned, PlannedMove{src_track = m.track, src_index = idx, dst_track = dst_track, start = start, clip = clip})
+	}
+	// Group members each live on their own lane, so planned src_tracks are
+	// distinct; the removal order cannot collide.
+	for p in planned {
+		ordered_remove(&timeline.tracks[p.src_track].clips, p.src_index)
+		clip := p.clip
+		clip.timeline_start_frame = p.start
+		dst := &timeline.tracks[p.dst_track]
+		append(&dst.clips, clip)
+		for i := len(dst.clips) - 1; i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i-1].timeline_start_frame; i -= 1 {
+			dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
+		}
+	}
+	sync.mutex_unlock(&audio_timeline_mtx)
+	invalidate_preview_slots()
+	audio_note_edit()
+	// Re-select the anchor in its new home.
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
+			if timeline.tracks[t].clips[i].clip_id == drag_group_orig[0].clip_id {
+				selected_track = t
+				selected_index = i
+			}
+		}
+	}
+	return true
+}
+
+// resize_group_right resizes the whole link group's right edge to new_tail: the
+// anchor clip is resized exactly as a single clip, then every other member's
+// tail moves by the same delta, each clamped to its own lane/source. Returns the
+// anchor's applied length. No-op for unlinked clips (drag_group_orig empty).
+resize_group_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
+	applied := resize_clip_right(track, idx, new_tail)
+	if len(drag_group_orig) == 0 || drag_group_orig[0].clip_id != track.clips[idx].clip_id {
+		return applied
+	}
+	delta := applied - drag_group_orig[0].length
+	for m in drag_group_orig {
+		if m.clip_id == drag_group_orig[0].clip_id {
+			continue
+		}
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			continue
+		}
+		dst := &timeline.tracks[m.track]
+		mi := clip_index_by_id(dst, m.clip_id)
+		if mi < 0 {
+			continue
+		}
+		resize_clip_right(dst, mi, m.start + m.length + delta)
+	}
+	return applied
+}
+
+// resize_group_left moves the whole link group's head: the anchor clip's head is
+// moved exactly as a single clip, then every other member's head shifts by the
+// same delta, each clamped to its own lane/source. The tail stays anchored, so
+// members don't drift relative to each other. Returns the anchor's applied
+// length. No-op for unlinked clips.
+resize_group_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
+	applied := resize_clip_left(track, idx, new_head)
+	if len(drag_group_orig) == 0 || drag_group_orig[0].clip_id != track.clips[idx].clip_id {
+		return applied
+	}
+	delta := track.clips[idx].timeline_start_frame - drag_group_orig[0].start
+	for m in drag_group_orig {
+		if m.clip_id == drag_group_orig[0].clip_id {
+			continue
+		}
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			continue
+		}
+		dst := &timeline.tracks[m.track]
+		mi := clip_index_by_id(dst, m.clip_id)
+		if mi < 0 {
+			continue
+		}
+		resize_clip_left(dst, mi, m.start + delta)
+	}
+	return applied
+}
+
 // next_track_name returns "Track N" with N one greater than the largest "Track N"
 // number already present, so names stay unique.
 next_track_name :: proc() -> string {
@@ -590,7 +923,10 @@ duplicate_track :: proc(index: int) {
 		layer = src.layer,
 		clips = make([dynamic]Clip, 0, len(src.clips)),
 	}
-	for c in src.clips {
+	for &c in src.clips {
+		// A duplicated clip is an independent copy: sever its link group so
+		// selecting it never drags the original's partner tracks along.
+		c.link_id = 0
 		append(&new_track.clips, c)
 	}
 	inject_at_elem(&timeline.tracks, index + 1, new_track)

@@ -43,8 +43,10 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			}) {
 				if clay.UI(clay.ID("MediaBin"))({
 					layout = {
-						// Left-most column: lists the imported media assets.
-						sizing = {width = clay.SizingGrow({min = 200, max = 280}), height = clay.SizingGrow({})},
+						// Left-most column: file-manager grid of imported media,
+						// with an import button on top. Media can be dragged
+						// from here onto the timeline (see mediabin.odin).
+						sizing = {width = clay.SizingGrow({min = MEDIA_BIN_MIN_W, max = MEDIA_BIN_MAX_W}), height = clay.SizingGrow({})},
 						padding = clay.PaddingAll(PANEL_PADDING),
 						childGap = CARD_GAP,
 						layoutDirection = .TopToBottom,
@@ -53,15 +55,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 					cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
 				}) {
-					clay.Text("Media Bin", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL})
-					if len(media_assets) == 0 {
-						clay.Text("No media imported", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
-					} else {
-						for asset in media_assets {
-							label := fmt.aprintf("%s  [%s]  %d frames", path_basename(asset.path), kind_name(asset.kind), asset.frame_count)
-							clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
-						}
-					}
+					media_bin_header()
+					media_bin_grid()
 				}
 				if clay.UI(clay.ID("LeftPanel"))({
 					layout = {
@@ -190,7 +185,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					// becomes. preview_canvas derives the on-screen canvas from the
 					// widget bounds, so this is responsive on resize with no decode
 					// change.
-					if clay.UI(clay.ID("Preview"))({
+if clay.UI(clay.ID("Preview"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({min = 216})}},
 						image = {imageData = nil},
 					}) {
@@ -468,10 +463,10 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										    } else if clip_label == "" {
 											    clip_label = "Clip"
 										    }
-										    if selected_track == track_idx && selected_index == index {
-											    clip_border = BUTTON_BORDER_HOVER
-											    clip_border_w = 3
-										    }
+if is_clip_selected(track_idx, index) {
+										    clip_border = BUTTON_BORDER_HOVER
+										    clip_border_w = 3
+									    }
 										    // Adjacent clips keep their corner radius but drop the
 										    // shared border where this clip's end touches the next
 										    // clip's start exactly; the neighbor's left border stays as
@@ -774,4 +769,103 @@ kind_name :: proc(kind: Media_Kind) -> string {
     case:
 	    return "other"
     }
+}
+
+// ---------------------------------------------------------------------------
+// Media bin panel: header (title + Import button) and the scrollable,
+// file-manager-style thumbnail grid. Grid cells are drawn over in gpu_draw /
+// mediabin.odin (thumbs via MediaItemThumb<i>); selection + drag start are
+// wired in main.odin.
+// ---------------------------------------------------------------------------
+
+// media_bin_header renders the "Media Bin" title and the Import button.
+media_bin_header :: proc() {
+	if clay.UI(clay.ID("MediaBinHeader"))({
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+			layoutDirection = .LeftToRight,
+			childGap = BUTTON_ROW_GAP,
+			childAlignment = {x = .Center, y = .Center},
+		},
+	}) {
+		clay.Text("Media Bin", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL})
+		if clay.UI(clay.ID("BinImportButton"))({
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(f32(BUTTON_HEIGHT))},
+				childAlignment = {x = .Center, y = .Center},
+			},
+			backgroundColor = clay.Hovered() ? BUTTON_HOVER : EDITOR_BG,
+			border = {color = clay.Hovered() ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+		}) {
+		}
+		clay.Text("Import", clay.TextElementConfig{textColor = clay.Hovered() ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_NORMAL})
+	}
+}
+
+// media_bin_grid lays out the imported assets as a wrapped thumbnail grid
+// inside a manually-scrolled clip (childOffset = -media_bin_scroll, matching
+// the TracksSection pattern). Column count derives from the bin width; rows
+// wrap once the cells exceed it.
+media_bin_grid :: proc() {
+	if len(media_assets) == 0 {
+		clay.Text("No media imported", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
+		clay.Text("Import, or drop media onto the timeline", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+		return
+	}
+	cols := media_bin_cols()
+	total_rows := (len(media_assets) + cols - 1) / cols
+	if clay.UI(clay.ID("MediaBinScroll"))({
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+			layoutDirection = .TopToBottom,
+			childGap = CARD_GAP,
+		},
+		clip = {vertical = true, childOffset = {0, -media_bin_scroll}},
+	}) {
+		for row in 0 ..< total_rows {
+			if clay.UI(clay.ID("MediaRow", u32(row)))({
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(media_bin_row_height())},
+					layoutDirection = .LeftToRight,
+					childGap = CARD_GAP,
+				},
+			}) {
+				base := row * cols
+				for i in base ..< min(base + cols, len(media_assets)) {
+					media_bin_item(i)
+				}
+			}
+		}
+	}
+}
+
+// media_bin_item renders one grid cell: a thumbnail area (drawn over by
+// mediabin.odin after layout) plus the asset basename. Selection shows a
+// spring-green border.
+media_bin_item :: proc(index: int) {
+	asset := &media_assets[index]
+	selected := asset.id == selected_asset_id
+	if clay.UI(clay.ID("MediaItem", u32(index)))({
+		layout = {
+			sizing = {width = clay.SizingFixed(MEDIA_CELL_W), height = clay.SizingGrow({})},
+			padding = clay.PaddingAll(u16(MEDIA_ITEM_PAD)),
+			layoutDirection = .TopToBottom,
+			childGap = u16(4),
+			childAlignment = {x = .Center, y = .Center},
+		},
+		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
+		border = {color = selected ? SELECT_BORDER : BUTTON_BORDER, width = clay.BorderOutside(selected ? 2 : 1)},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_WIDGET),
+	}) {
+		if !clay.UI(clay.ID("MediaItemThumb", u32(index)))({
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(MEDIA_THUMB_H)},
+			},
+			backgroundColor = clay.Color{21, 24, 27, 255},
+			cornerRadius = clay.CornerRadiusAll(4),
+		}) {
+		}
+		clay.Text(path_basename(asset.path), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+	}
 }

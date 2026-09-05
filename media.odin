@@ -161,9 +161,76 @@ next_asset_id :: proc() -> u64 {
 	return _next_asset_id
 }
 
-// import_media loads a media file: probes it, adds a Media_Asset (reference) to
-// the bin, and auto-creates the timeline tracks/clips that reference it.
-import_media :: proc(path: cstring) {
+// find_asset returns the media-bin entry with the given id, or nil. The
+// returned pointer is only valid until the next append to media_assets (the
+// dynamic array can reallocate); callers that hold it across time must
+// re-resolve by id each frame (the drag code does exactly that).
+find_asset :: proc(asset_id: u64) -> ^Media_Asset {
+	for &a in media_assets {
+		if a.id == asset_id {
+			return &a
+		}
+	}
+	return nil
+}
+
+// downscale_rgba box-filters a tightly-packed RGBA image into dst (dst must be
+// dw*dh*4 bytes). Used to shrink the PREVIEW decode into the bin thumbnail.
+downscale_rgba :: proc(src: []u8, sw, sh: int, dst: []u8, dw, dh: int) {
+	if dw <= 0 || dh <= 0 || len(src) < sw * sh * 4 || len(dst) < dw * dh * 4 {
+		return
+	}
+	for y in 0 ..< dh {
+		sy0 := y * sh / dh
+		sy1 := (y + 1) * sh / dh
+		for x in 0 ..< dw {
+			sx0 := x * sw / dw
+			sx1 := (x + 1) * sw / dw
+			r, g, b, a, n := 0, 0, 0, 0, 0
+			for sy in sy0 ..< sy1 {
+				for sx in sx0 ..< sx1 {
+					o := (sy * sw + sx) * 4
+					r += int(src[o + 0])
+					g += int(src[o + 1])
+					b += int(src[o + 2])
+					a += int(src[o + 3])
+					n += 1
+				}
+			}
+			if n == 0 {
+				continue
+			}
+			o := (y * dw + x) * 4
+			dst[o + 0] = u8(r / n)
+			dst[o + 1] = u8(g / n)
+			dst[o + 2] = u8(b / n)
+			dst[o + 3] = u8(a / n)
+		}
+	}
+}
+
+// decode_asset_thumbnail decodes frame 0 of the asset into its tiny CPU
+// thumbnail buffer (via the fixed PREVIEW decode, box-downscaled). Non-fatal:
+// an asset without a decodable frame (e.g. audio-only) simply keeps
+// has_thumb = false and gets a placeholder in the bin.
+decode_asset_thumbnail :: proc(asset: ^Media_Asset) {
+	if asset.kind != .Video && asset.kind != .Image {
+		return
+	}
+	scratch := make([]u8, PREVIEW_W * PREVIEW_H * 4, context.temp_allocator)
+	dec: Clip_Decoder
+	defer clip_decoder_reset(&dec)
+	if decode_clip_frame_sync(&dec, asset.path, 0, scratch) {
+		downscale_rgba(scratch, PREVIEW_W, PREVIEW_H, asset.thumb_buf[:], THUMB_W, THUMB_H)
+		asset.has_thumb = true
+		asset.thumb_tex_dirty = true
+	}
+}
+
+// import_media_to_bin probes a media file and adds it to the media bin as a
+// Media_Asset (thumbnail + proxy built, no timeline change). Returns the new
+// asset's id, or 0 if the file could not be probed.
+import_media_to_bin :: proc(path: cstring) -> u64 {
 	file_info_text = probe_media(path)
 	frame_count := media_frame_count(file_info_text)
 	probe := probe_streams(path)
@@ -191,15 +258,6 @@ import_media :: proc(path: cstring) {
 		resolution_locked = true
 	}
 
-	// Import at native size: 1 source pixel maps to 1 project-canvas pixel, so
-	// a clip bigger than the canvas arrives oversized (here, wider than the
-	// project) and the user transforms it themselves instead of the clip being
-	// auto-scaled to fill the canvas.
-	native_scale: f32 = 1
-	if src_w > 0 && f32(project.width) > 0 {
-		native_scale = f32(src_w) / f32(project.width)
-	}
-
 	asset_id := next_asset_id()
 	append(&media_assets, Media_Asset{
 		id = asset_id,
@@ -207,7 +265,13 @@ import_media :: proc(path: cstring) {
 		kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
 		metadata = file_info_text,
 		frame_count = frame_count,
+		src_w = src_w,
+		src_h = src_h,
+		audio_streams = c.int(probe.audio_streams),
+		audio_frames = audio_frames,
+		thumb_tex_dirty = true,
 	})
+	decode_asset_thumbnail(&media_assets[len(media_assets) - 1])
 
 	// Editing-time preview can decode a low-res all-intra proxy of a video for
 	// fluid scrubbing instead of re-decoding whole groups-of-pictures from the
@@ -218,69 +282,150 @@ import_media :: proc(path: cstring) {
 		proxy_buf: [4096]u8
 		_ = proxy_transcode(path, frame_count, src_w, src_h, proxy_buf[:])
 	}
+	return asset_id
+}
+
+// add_asset_to_timeline places one clip per stream of an imported asset onto
+// the timeline, starting at track `target_track`: a video clip on lane 0, then
+// one audio clip per audio stream on the lanes below (lane = target_track + s).
+// Missing lanes append new tracks at the bottom ("media with more tracks than
+// available creates them"). Every lane clamps placement to the nearest
+// non-overlapping slot for its own clips. Returns the placed start frame of the
+// first stream's clip.
+add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64) -> i64 {
+	asset := find_asset(asset_id)
+	if asset == nil {
+		return start_frame
+	}
+	n_lanes := int(asset.audio_streams)
+	if asset.kind == .Video {
+		n_lanes += 1
+	}
+	if n_lanes <= 0 {
+		return start_frame
+	}
+	base := max(target_track, 0)
 
 	sync.mutex_lock(&audio_timeline_mtx)
-	defer sync.mutex_unlock(&audio_timeline_mtx)
-	clear(&timeline.tracks)
-	track_n := 1
-	if probe.has_video {
-		track := Track{name = fmt.aprintf("Track %d", track_n)}
-		append(&track.clips, Clip{
-			clip_id = new_clip_id(),
-			asset_id = asset_id,
-			path = path,
-			kind = .Video,
-			stream_index = 0,
-			source_start_frame = 0,
-			source_length_frames = frame_count,
-			timeline_start_frame = 0,
-			source_w = src_w,
-			source_h = src_h,
-			transform_x = f32(project.width) / 2,
-			transform_y = f32(project.height) / 2,
-			scale = native_scale,
-			crop_l = 0,
-			crop_r = 0,
-			crop_t = 0,
-crop_b = 0,
-	})
-		// OBS hybrid MP4 recordings embed chapter markers as a text stream;
-		// surface them on the video clip as embedded clip markers.
-		video_clip := &track.clips[0]
-		video_clip.markers = import_obs_chapters(path)
-		append(&timeline.tracks, track)
-		track_n += 1
+	// Aligned placement: every lane (video + each audio stream) lands on the SAME
+	// frame so an import never desyncs its own streams. The first lane anchors the
+	// placement; an existing partner lane that cannot host that exact frame
+	// refuses the whole drop rather than silently clamp to a different frame.
+	anchor_len := asset.frame_count
+	if asset.kind != .Video {
+		anchor_len = asset.audio_frames
 	}
-	for a := 0; a < probe.audio_streams; a += 1 {
-		track := Track{name = fmt.aprintf("Track %d", track_n)}
-		append(&track.clips, Clip{
-			clip_id = new_clip_id(),
-			asset_id = asset_id,
-			path = path,
-			kind = .Audio,
-			stream_index = c.int(a),
-			source_start_frame = 0,
-			source_length_frames = audio_frames,
-			timeline_start_frame = 0,
-		})
-		append(&timeline.tracks, track)
-		track_n += 1
+	anchor_placed := max(start_frame, 0)
+	if base < len(timeline.tracks) {
+		anchor_placed = clip_place_in_track(&timeline.tracks[base], -1, anchor_len, anchor_placed)
 	}
+	for offset in 1 ..< n_lanes {
+		lane := base + offset
+		if lane < len(timeline.tracks) && lane_blocked(&timeline.tracks[lane], anchor_placed, asset.audio_frames) {
+			sync.mutex_unlock(&audio_timeline_mtx)
+			return start_frame
+		}
+	}
+	// One import that lands on several lanes ships one link group: the video
+	// clip plus one clip per audio stream are cut/moved/selected/deleted as a
+	// unit, so a video edit never leaves its audio behind.
+	link := new_clip_id()
+	first_placed := anchor_placed
+	video_placed: i64 = -1
+	for offset in 0 ..< n_lanes {
+		is_video := asset.kind == .Video && offset == 0
+		lane_len := is_video ? asset.frame_count : asset.audio_frames
+		lane := base + offset
+		for len(timeline.tracks) <= lane {
+			append(&timeline.tracks, Track{name = next_track_name()})
+		}
+		track := &timeline.tracks[lane]
+		placed := anchor_placed
+		clip := Clip{
+			clip_id = new_clip_id(),
+			link_id = link,
+			asset_id = asset.id,
+			path = asset.path,
+			kind = is_video ? .Video : .Audio,
+			stream_index = c.int(offset - (asset.kind == .Video ? 1 : 0)),
+			source_start_frame = 0,
+			source_length_frames = lane_len,
+			timeline_start_frame = placed,
+		}
+		if is_video {
+			// Import at native size: 1 source pixel maps to 1 project-canvas
+			// pixel, so a clip bigger than the canvas arrives oversized (here,
+			// wider than the project) and the user transforms it themselves.
+			clip.source_w = asset.src_w
+			clip.source_h = asset.src_h
+			clip.transform_x = f32(project.width) / 2
+			clip.transform_y = f32(project.height) / 2
+			native_scale: f32 = 1
+			if asset.src_w > 0 && f32(project.width) > 0 {
+				native_scale = f32(asset.src_w) / f32(project.width)
+			}
+			clip.scale = native_scale
+			// OBS hybrid MP4 recordings embed chapter markers as a text stream;
+			// surface them on the video clip as embedded clip markers.
+			clip.markers = import_obs_chapters(asset.path)
+			video_placed = placed
+		}
+		append(&track.clips, clip)
+		// Keep the track's clips sorted ascending by timeline start.
+		for j := len(track.clips) - 1; j > 0 && track.clips[j].timeline_start_frame < track.clips[j-1].timeline_start_frame; j -= 1 {
+			track.clips[j], track.clips[j-1] = track.clips[j-1], track.clips[j]
+		}
+		if offset == 0 {
+			first_placed = placed
+		} else if placed < first_placed {
+			first_placed = placed
+		}
+	}
+	sync.mutex_unlock(&audio_timeline_mtx)
 
-	timeline.playhead_frame = 0
-	playhead.frame = 0
+	// Post-edit: point the playhead at the placed content, select the video
+	// clip, and tear down stale decode/playback state like every other timeline
+	// edit.
+	timeline.playhead_frame = first_placed
+	playhead.frame = first_placed
 	playhead.playing = false
 	playhead_accumulator = 0
 	preview.playing = false
 	last_decoded_playhead = -1
+	last_requested_playhead = -1
 	async_dec_reset()
 	if warm_valid {
 		clip_decoder_reset(&warm_decoder)
 		warm_valid = false
 		warm_clip_id = 0
 	}
-	last_requested_playhead = -1
 	audio_reset_for_load()
+	invalidate_preview_slots()
+	audio_note_edit()
+	if video_placed >= 0 {
+		for ti in 0 ..< len(timeline.tracks) {
+			for ci in 0 ..< len(timeline.tracks[ti].clips) {
+				c := &timeline.tracks[ti].clips[ci]
+				if c.asset_id == asset_id && c.kind == .Video && c.timeline_start_frame == video_placed {
+					selected_track = ti
+					selected_index = ci
+				}
+			}
+		}
+	}
+	return first_placed
+}
+
+// import_media loads a media file into the bin AND auto-places it at the top of
+// the timeline at frame 0 (legacy behavior kept for the probe/test/autoplay
+// paths). The interactive flow (bin "Import" button / empty-timeline "Open
+// file") calls import_media_to_bin alone so the user drags media onto tracks
+// themselves.
+import_media :: proc(path: cstring) {
+	id := import_media_to_bin(path)
+	if id != 0 {
+		add_asset_to_timeline(id, 0, 0)
+	}
 }
 
 open_file_picker :: proc() -> cstring {

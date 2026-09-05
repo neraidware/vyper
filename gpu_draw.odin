@@ -384,6 +384,31 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	if drag_hover_track == drag_source_track {
 		return
 	}
+	// Linked group: paint a ghost for every member in its destination lane so a
+	// vertical drop shows the whole unit (video + every audio stream) before
+	// release commits it.
+	if len(drag_group_orig) > 1 {
+		track_delta := drag_hover_track - drag_source_track
+		for m in drag_group_orig {
+			dst := m.track + track_delta
+			if dst < 0 || dst >= len(timeline.tracks) {
+				continue
+			}
+			lane := clay.GetElementData(clay.ID("ClipsSection", u32(dst))).boundingBox
+			if lane.width <= 0 || lane.height <= 0 {
+				continue
+			}
+			placed := clip_place_in_track(&timeline.tracks[dst], -1, m.length, m.start)
+			x0 := lane.x + (f32(placed) - timeline_view_start) * timeline_zoom
+			w := f32(m.length) * timeline_zoom
+			bounds := clay.BoundingBox{x = x0, y = lane.y, width = w, height = CLIP_TILE_HEIGHT}
+			sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
+			render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 80}, 6, 0)
+			render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 220}, 6, 2)
+		}
+		sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+		return
+	}
 	clip_len := drag_clip.source_length_frames
 	if clip_len <= 0 {
 		return

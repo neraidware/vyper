@@ -38,5 +38,13 @@ GUTTER_WIDTH :: 140        // Track-name / ruler-gutter column width.
 CLIP_TILE_HEIGHT :: f32(56) // Height of one timeline clip tile.
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 
+// Media bin grid (file-manager style thumbnail cells).
+MEDIA_CELL_W :: f32(120)  // Base cell width; columns derive from the bin width.
+MEDIA_ITEM_PAD :: f32(4)  // Inner padding of a cell.
+MEDIA_THUMB_H :: 68       // Thumbnail area height inside a cell (16:9 box above the label).
+MEDIA_LABEL_H :: f32(16)  // Basename line height under the thumbnail.
+MEDIA_BIN_MIN_W :: 210    // MediaBin column sizing bounds (wider than before so the
+MEDIA_BIN_MAX_W :: 360    // grid can reach 2 columns without cramping).
+
 // Text input field glyph size (shared by the popup layout and the caret draw).
 TEXT_INPUT_FONT :: u16(18)

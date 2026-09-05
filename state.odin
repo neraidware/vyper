@@ -107,7 +107,36 @@ Media_Kind :: enum { Video, Audio, Image, Other, Empty, Text }
 // instead of decoding a backing media file (a "generator"). .None = a regular
 // file-backed clip.
 Generator_Kind :: enum { None, Text }
-Media_Asset :: struct { id: u64, path: cstring, kind: Media_Kind, metadata: string, frame_count: i64 }
+
+// Thumbnail size for the media bin grid. Decoded once at import (frame 0 of the
+// source, downsclaled from PREVIEW_W x PREVIEW_H into these dims, letterboxed)
+// and uploaded to a per-asset GPU texture on first render.
+THUMB_W :: 160
+THUMB_H :: 90
+
+Media_Asset :: struct {
+	id: u64,
+	path: cstring,
+	kind: Media_Kind,
+	metadata: string,
+	frame_count: i64,
+	// Native source pixel size (video clips land on the timeline at native
+	// scale, and the aspect drives fitting).
+	src_w: c.int,
+	src_h: c.int,
+	// audio_streams is the number of audio tracks this media would create when
+	// dropped (each stream becomes its own timeline clip on its own lane).
+	audio_streams: c.int,
+	// audio_frames is the clip length for the audio stream(s), derived from the
+	// duration at import (never shorter than the video frame count).
+	audio_frames: i64,
+	// Thumbnail: CPU RGBA + lazily-created GPU texture (uploaded by the render
+	// loop once; thumb_tex_dirty set at import).
+	thumb_buf:          [THUMB_W * THUMB_H * 4]u8,
+	has_thumb:          bool,
+	thumb_tex:          ^sdl.GPUTexture,
+	thumb_tex_dirty:    bool,
+}
 
 // Clip_Marker is a point marker embedded in a clip (e.g. an imported chapter
 // marker): source_frame is the position within the source media, label a
@@ -126,6 +155,13 @@ Clip :: struct {
 	// up again on a later frame is holding a key that's already gone stale.
 	clip_id: u64,
 	asset_id: u64,
+	// link_id groups the clips that came from one imported media file (its
+	// video clip plus one clip per audio stream). Spent on selection (selecting
+	// one selects all), cuts (all covering members split together), moves (the
+	// group drags as a unit) and raw deletes. Splits keep the left halves in the
+	// original group and mint a fresh link_id for the right halves. 0 = not
+	// linked (generator clips, single-stream media, duplicated-track copies).
+	link_id: u64,
 	path: cstring,
 	// name is the clip's editable label. For a Text generator clip it is the
 	// title that will be rendered; for file-backed clips it's a display name.
@@ -240,6 +276,59 @@ drag_source_track: int = -1
 drag_source_index: int = -1
 drag_hover_track: int = -1
 drag_ghost_start: i64 = 0
+// drag_group_orig snapshots the original (track, start, length) of every clip
+// sharing the dragged/resized clip's link_id, so a linked-group edit applies one
+// shared delta to all members (each clamped to its own lane). Invariant: when
+// non-empty its FIRST entry is the anchor clip (the one the user grabbed).
+Drag_Group_Orig :: struct {
+	clip_id: u64,
+	track:   int,
+	start:   i64,
+	length:  i64,
+}
+drag_group_orig: [dynamic]Drag_Group_Orig
+
+// Media-bin drag state: dragging a bin asset onto the timeline, showing a
+// ghost of every lane the media would occupy (one per stream). Distinct from
+// clip dragging (timeline clips being moved around).
+Media_Lane :: struct {
+	// Lane the stream would land on (target_track + stream ordinal).
+	track_idx: int,
+	// created is true when the lane does not exist yet (a new track that a
+	// drop would append).
+	created: bool,
+	// placed is the clamped non-overlapping start frame for this lane.
+	placed:        i64,
+	// blocked marks an import drop whose ALIGNED anchor frame overlaps existing
+	// content on this lane: the whole drop is refused, so the lane never gets a
+	// clamped position that would desync the media's streams.
+	blocked:       bool,
+	clip_len:      i64,
+	kind:          Media_Kind,
+	stream_index:  c.int,
+	video_thumb_id: u64, // asset id whose thumbnail paints the video lane
+	has_video_thumb: bool,
+}
+dragging_media_from_bin: bool
+media_drag_asset_id: u64
+media_drag_asset_index: int = -1
+media_drag_lanes: [dynamic]Media_Lane
+media_drag_target: int = -1
+media_drag_frame: i64
+media_drag_pick_dx: f32
+media_drag_pick_dy: f32
+// Current pointer while a bin drag is in flight (the cursor-following drag
+// tile needs the live position; the draw pass runs after the event handling).
+media_drag_mx: f32
+media_drag_my: f32
+
+// Vertical scroll offset of the media-bin grid (manual childOffset scroll, the
+// same pattern TracksSection uses) and its vertical wheel stride.
+media_bin_scroll: f32 = 0
+MEDIA_BIN_SCROLL_STEP :: 44
+
+// selected_asset_id is the media-bin item currently highlighted. 0 = none.
+selected_asset_id: u64 = 0
 
 // Clip selection (for the clip properties panel). Stored as track/clip indices
 // so it isn't invalidated by dynamic-array reallocation; -1 means nothing

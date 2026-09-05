@@ -449,6 +449,8 @@ main :: proc() {
 	defer release_preview_textures(device, renderer.preview_textures[:])
 	defer release_slot_owned_textures(device)
 	defer sdl.ReleaseGPUSampler(device, renderer.preview_sampler)
+	// Media-bin thumbnails own per-asset GPU textures; free them at shutdown.
+	defer release_media_asset_textures(device)
 	initial_upload := sdl.AcquireGPUCommandBuffer(device)
 	if initial_upload == nil || !upload_font_atlas(&renderer, initial_upload) || !sdl.SubmitGPUCommandBuffer(initial_upload) {
 		fmt.println("Could not upload font atlas:", sdl.GetError())
@@ -577,6 +579,10 @@ main :: proc() {
 						if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
 							begin_clip_rename()
 						}
+					case sdl.K_U:
+						// Unlink the selected clip from its group: video + audio
+						// become independent clips under later cuts/moves/deletes.
+						unlink_selected_clips()
 					case sdl.K_BACKSPACE:
 						// Delete the selected clip's timeline area on every track
 						// and close the gap (ripple).
@@ -614,6 +620,16 @@ main :: proc() {
 					}
 				}
 			case .MOUSE_WHEEL:
+				// Scroll over the media bin scrolls its thumbnail grid (manual
+				// clip scroll, like the tracks section).
+				mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
+				if mb.width > 0 && event.wheel.mouse_x >= mb.x && event.wheel.mouse_x <= mb.x + mb.width &&
+					event.wheel.mouse_y >= mb.y && event.wheel.mouse_y <= mb.y + mb.height {
+					if len(media_assets) > 0 && event.wheel.y != 0 {
+						media_bin_scroll = clamp(media_bin_scroll - f32(event.wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
+						break
+					}
+				}
 				// Scroll over the timeline zooms horizontally, anchored at the playhead.
 				tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
 				if len(timeline.tracks) > 0 && event.wheel.mouse_x >= tlb.x && event.wheel.mouse_x <= tlb.x + tlb.width &&
@@ -712,9 +728,17 @@ main :: proc() {
 				timeline_view_top = clamp(timeline_view_top, 0, max(sd.contentDimensions.height - sd.scrollContainerDimensions.height, 0))
 			}
 		}
-		if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OpenFileButton")) {
+		if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
 			if path := open_file_picker(); path != nil {
-				import_media(path)
+				import_media_to_bin(path)
+			}
+		} else if mouse_down && !was_mouse_down && len(media_assets) > 0 && media_bin_item_at(mouse_x, mouse_y) >= 0 {
+			// Pressing a bin cell selects the media and starts the drag-to-timeline
+			// gesture (ghost while down, committed on release over a lane).
+			begin_media_drag(media_bin_item_at(mouse_x, mouse_y), mouse_x, mouse_y)
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OpenFileButton")) {
+			if path := open_file_picker(); path != nil {
+				import_media_to_bin(path)
 			}
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res720")) {
 			set_project_resolution(1280, 720)
@@ -836,13 +860,14 @@ main :: proc() {
 								continue
 							}
 							if edge := timeline_resize_edge_at(track_idx, index, mouse_x, mouse_y); edge >= 0 {
-								selected_track = track_idx
-								selected_index = index
-								resizing_clip = true
-								resize_edge = edge
-								handled = true
-								break
-							}
+									selected_track = track_idx
+									selected_index = index
+									resizing_clip = true
+									resize_edge = edge
+									capture_link_group(&track.clips[index], track_idx)
+									handled = true
+									break
+								}
 						}
 						if resizing_clip {
 							break
@@ -864,6 +889,7 @@ main :: proc() {
 						drag_hover_track = track_idx
 						moving_clip = true
 						clip_drag_offset = mouse_x - clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox.x
+						capture_link_group(drag_clip, track_idx)
 						break
 					}
 				}
@@ -874,12 +900,21 @@ main :: proc() {
 			}
 		}
 		if !mouse_down {
+			if dragging_media_from_bin {
+				// Releasing a bin drag commits the media (creates tracks as
+				// needed); releasing nowhere cancels it.
+				end_media_drag(mouse_x, mouse_y)
+			}
 			resizing_areas = false
 			if moving_clip {
 				// Commit a vertical drop if the ghost hovers another track;
 				// horizontal drags already applied their new start live.
 				if drag_hover_track != drag_source_track && drag_hover_track >= 0 && drag_source_track >= 0 {
-					move_clip_to_track(drag_source_track, drag_source_index, drag_hover_track, drag_ghost_start)
+					if len(drag_group_orig) > 1 {
+						move_linked_group(drag_hover_track - drag_source_track)
+					} else {
+						move_clip_to_track(drag_source_track, drag_source_index, drag_hover_track, drag_ghost_start)
+					}
 				}
 			}
 			moving_clip = false
@@ -890,9 +925,13 @@ main :: proc() {
 			drag_source_track = -1
 			drag_source_index = -1
 			drag_hover_track = -1
+			clear(&drag_group_orig)
 			dragging_playhead = false
 			resizing_clip = false
 			resize_edge = -1
+		} else if dragging_media_from_bin {
+			// A bin drag in flight: recompute the hovered lane + ghost each frame.
+			update_media_drag_lanes(mouse_x, mouse_y)
 		} else if dragging_handle >= 0 {
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
@@ -928,9 +967,19 @@ main :: proc() {
 				frame := max(f32(0), (mouse_x - track_start) / timeline_zoom + timeline_view_start)
 				sync.mutex_lock(&audio_timeline_mtx)
 				if resize_edge == 0 {
-					resize_clip_left(&timeline.tracks[selected_track], selected_index, i64(frame))
+					if len(drag_group_orig) > 0 {
+						// Linked group: shift every member's head by the same delta.
+						resize_group_left(&timeline.tracks[selected_track], selected_index, i64(frame))
+					} else {
+						resize_clip_left(&timeline.tracks[selected_track], selected_index, i64(frame))
+					}
 				} else if resize_edge == 1 {
-					resize_clip_right(&timeline.tracks[selected_track], selected_index, i64(frame))
+					if len(drag_group_orig) > 0 {
+						// Linked group: move every member's tail by the same delta.
+						resize_group_right(&timeline.tracks[selected_track], selected_index, i64(frame))
+					} else {
+						resize_clip_right(&timeline.tracks[selected_track], selected_index, i64(frame))
+					}
 				}
 				sync.mutex_unlock(&audio_timeline_mtx)
 				audio_note_edit()
@@ -965,6 +1014,11 @@ if drag_clip.timeline_start_frame != new_start {
 							drag_clip.timeline_start_frame, new_start)
 					}
 					drag_clip.timeline_start_frame = new_start
+				}
+				// Linked group: every member rides the same delta, clamped to its
+				// own lane, so the video and its audio stay time-aligned.
+				if len(drag_group_orig) > 1 {
+					apply_group_drag_to_members(new_start - drag_group_orig[0].start)
 				}
 				} else {
 					// Vertical: clamp to nearest valid slot on the hovered track
@@ -1169,6 +1223,10 @@ if drag_clip.timeline_start_frame != new_start {
 		// this frame (they have no device in the preview state, so they wait
 		// here where the device is).
 		drain_pending_text_releases(device)
+		// Upload decoded media-bin thumbnails (once per asset, after import).
+		for &a in media_assets {
+			upload_asset_thumbnail(&renderer, command_buffer, &a)
+		}
 		swapchain_texture: ^sdl.GPUTexture
 		pixel_width, pixel_height: sdl.Uint32
 		if !sdl.WaitAndAcquireGPUSwapchainTexture(command_buffer, window, &swapchain_texture, &pixel_width, &pixel_height) || swapchain_texture == nil {
@@ -1188,6 +1246,8 @@ if drag_clip.timeline_start_frame != new_start {
 			draw_clip_markers(&renderer, command_buffer, pass)
 			draw_timeline_resize_focus(&renderer, command_buffer, pass)
 			draw_drag_ghost(&renderer, command_buffer, pass)
+			draw_media_bin_thumbnails(&renderer, command_buffer, pass)
+			draw_media_drag_ghost(&renderer, command_buffer, pass)
 			if len(timeline.tracks) > 0 {
 				draw_timeline_ruler(&renderer, command_buffer, pass)
 				draw_render_range(&renderer, command_buffer, pass)
