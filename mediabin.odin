@@ -194,8 +194,14 @@ lane_box_for :: proc(lane: Media_Lane) -> clay.BoundingBox {
 		if empty.width <= 0 {
 			return {}
 		}
-		x0 = empty.x + f32(TIMELINE_PADDING)
-		w = empty.width - f32(TIMELINE_PADDING) * 2
+		// Layout the ghost at the geometry the first created track will have:
+		// its gutter column + gap occupy the left of the body, and the clip
+		// lane starts after them. Without this the ghost clips appear where
+		// the track-name column will be (and the gutter ghost goes off the
+		// left edge of the window).
+		row_left := empty.x + f32(TIMELINE_PADDING)
+		x0 = row_left + GUTTER_WIDTH + SECTION_GAP
+		w = empty.width - f32(TIMELINE_PADDING) * 2 - GUTTER_WIDTH - SECTION_GAP
 		y0 = empty.y + f32(TIMELINE_PADDING) + RULER_HEIGHT + f32(lane.track_idx) * (CLIP_TILE_HEIGHT + TRACK_GAP_H)
 	}
 	return {x = x0, y = y0, width = w, height = CLIP_TILE_HEIGHT}
