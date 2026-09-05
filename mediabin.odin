@@ -341,14 +341,15 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 				// create it. Paint a faint row across the whole lane so the
 				// upcoming track is visible as a track (not just a floating
 				// tile), with the tile drawn on top below.
-				sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 				render_sdf_rect(renderer, command_buffer, pass, lane_box, clay.Color{52, 66, 84, 90}, 6, 1)
 			}
 			// Name-gutter header: the left column of the lane (where the track
 			// name lives) so a hovered lane reads as a full track, not a tile
-			// floating past the clips. Painted for every lane under a full
-			// scissor — the previous lane's clip scissor would otherwise clip
-			// it out.
+			// floating past the clips. The scissor is reset to the full window
+			// for every lane first: what was onscreen afterwards is whatever
+			// clay's last command scissor (or the previous lane's clip rect)
+			// left, which clips the row grid and its gutter header out of frame.
+			sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 			if rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox; rg.width > 0 && rg.x < lane_box.x {
 				header := clay.BoundingBox{x = rg.x, y = lane_box.y, width = rg.width, height = lane_box.height}
 				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 55}, 0, 0)
