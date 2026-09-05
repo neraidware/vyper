@@ -650,6 +650,17 @@ main :: proc() {
 						break
 					}
 				}
+				// Vertical wheel over the track LANES scrolls the track list (like
+				// the media bin) once the rows overflow the panel. The ruler strip
+				// above still zooms on wheel.
+				sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+				if sec.height > 0 && event.wheel.mouse_x >= sec.x && event.wheel.mouse_x <= sec.x + sec.width &&
+					event.wheel.mouse_y >= sec.y && event.wheel.mouse_y <= sec.y + sec.height {
+					if event.wheel.y != 0 {
+						timeline_view_top = clamp(timeline_view_top - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
+						break
+					}
+				}
 				// Scroll over the timeline zooms horizontally, anchored at the playhead.
 				tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
 				if len(timeline.tracks) > 0 && event.wheel.mouse_x >= tlb.x && event.wheel.mouse_x <= tlb.x + tlb.width &&
@@ -722,8 +733,14 @@ main :: proc() {
 			panning_preview = false
 		}
 		// Middle-drag over the timeline pans it: horizontally along the frames,
-		// vertically across the track rows (when they overflow the view).
-		if middle_down && len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("ClipTimeline")) {
+		// vertically across the track rows (when they overflow the view). The
+		// hit test is a raw box check on the panel's bounding box rather than
+		// clay's PointerOver so panning never depends on the pointer-over flag
+		// machinery.
+		tltl := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
+		if middle_down && len(timeline.tracks) > 0 && tltl.width > 0 &&
+			mouse_x >= tltl.x && mouse_x <= tltl.x + tltl.width &&
+			mouse_y >= tltl.y && mouse_y <= tltl.y + tltl.height {
 			if panning_timeline {
 				timeline_view_start -= (mouse_x - timeline_pan_last_x) / timeline_zoom
 				timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
@@ -844,6 +861,15 @@ main :: proc() {
 					handled = true
 				}
 			}
+			}
+			if !handled {
+				if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapClipToPh")) {
+					snap_clips_to_playhead = !snap_clips_to_playhead
+					handled = true
+				} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapPhToClip")) {
+					snap_playhead_to_clips = !snap_playhead_to_clips
+					handled = true
+				}
 			}
 			if !handled {
 			for i := 0; i <= len(timeline.tracks); i += 1 {
@@ -1022,6 +1048,12 @@ main :: proc() {
 				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 				frame := (clip_x - track_start) / timeline_zoom + timeline_view_start
 				frame = max(frame, 0)
+				// Clip→playhead toggle: latch the drag target onto the playhead
+				// once it comes within the pixel snap margin. Applied to the
+				// whole linked group, since every member follows the anchor.
+				if snap_clips_to_playhead {
+					frame = f32(snap_to_playhead(i64(max(frame, 0))))
+				}
 				// Determine which track lane the pointer hovers: that decides
 				// whether this is a horizontal move (same track) or a vertical
 				// drop staged on another track (ghost until release).
@@ -1091,6 +1123,11 @@ main :: proc() {
 			// must stop at the final content frame; dragging further right pins
 			// it there.
 			frame = clamp(frame, 0, max(0, timeline_duration() - 1))
+			// Playhead→clip toggle: when a clip's start or end is within the
+			// snap margin, pin the scrubbed playhead onto that exact edge.
+			if snap_playhead_to_clips {
+				frame = snap_playhead_to_clip_edge(frame)
+			}
 			if playhead.frame != frame {
 				if nered_trace {
 					fmt.printf("[pb] scrub ph=%d (was %d) playing=%v\n", frame, playhead.frame, playhead.playing)

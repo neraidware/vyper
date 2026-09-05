@@ -49,6 +49,13 @@ RULER_LABEL_COLOR :: clay.Color{170, 180, 200, 255}
 timeline_view_start: f32 = 0
 timeline_zoom: f32 = 1
 timeline_view_top: f32 = 0
+
+// Snap toggles for the timeline-gutter buttons: dragging a clip onto the
+// playhead snaps it there; scrubbing the playhead onto a clip's start/end
+// snaps it to the edge. Both default on.
+snap_clips_to_playhead: bool = true
+snap_playhead_to_clips: bool = true
+SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.01)
 TIMELINE_MAX_ZOOM :: f32(16)
 
@@ -334,6 +341,7 @@ media_drag_my: f32
 // same pattern TracksSection uses) and its vertical wheel stride.
 media_bin_scroll: f32 = 0
 MEDIA_BIN_SCROLL_STEP :: 44
+TIMELINE_SCROLL_STEP :: 44  // Wheel scroll per notch over the track lanes.
 
 // selected_asset_id is the media-bin item currently highlighted. 0 = none.
 selected_asset_id: u64 = 0

@@ -72,6 +72,52 @@ lane_blocked :: proc(track: ^Track, start, length: i64) -> bool {
 	return false
 }
 
+// snap_margin_frames is how close a target frame must be to a snap point
+// (playhead, clip start/end) for the drag/scrub to latch, expressed in frames
+// from the fixed pixel margin so it scales with zoom.
+snap_margin_frames :: proc() -> i64 {
+	return max(i64(SNAP_PIXELS / timeline_zoom), 1)
+}
+
+// snap_to_playhead latches a clip-drag target onto the playhead when it comes
+// within the snap margin. Used by the clip→playhead toggle.
+snap_to_playhead :: proc(frame: i64) -> i64 {
+	if frame == playhead.frame {
+		return frame
+	}
+	if abs(frame - playhead.frame) <= snap_margin_frames() {
+		return playhead.frame
+	}
+	return frame
+}
+
+// snap_playhead_to_clip_edge latches a scrubbed playhead onto the nearest clip
+// start or end frame that falls within the snap margin. Used by the
+// playhead→clip toggle.
+snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
+	best := frame
+	best_dist := i64(0)
+	m := snap_margin_frames()
+	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+		for index := 0; index < len(timeline.tracks[track_idx].clips); index += 1 {
+			c := &timeline.tracks[track_idx].clips[index]
+			start := c.timeline_start_frame
+			end := start + c.source_length_frames
+			dist := abs(frame - start)
+			if dist <= m && (best == frame || dist < best_dist) {
+				best = start
+				best_dist = dist
+			}
+			dist = abs(frame - end)
+			if dist <= m && (best == frame || dist < best_dist) {
+				best = end
+				best_dist = dist
+			}
+		}
+	}
+	return best
+}
+
 // clip_track_gaps returns the free (non-covered) bands of `track`, ignoring the
 // clip at exclude_idx (-1 = include everything). The trailing band is unbounded
 // so clips may still extend the timeline. Caller must delete the result.

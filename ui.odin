@@ -381,9 +381,12 @@ if clay.UI(clay.ID("Preview"))({
 							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(RULER_HEIGHT)}, layoutDirection = .LeftToRight, childGap = SECTION_GAP},
 						}) {
 							if clay.UI(clay.ID("RulerGutter"))({
-								layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}},
+								layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight, childGap = 6, childAlignment = {x = .Left, y = .Center}},
 								backgroundColor = TRACK_GUTTER_BG,
-							}) {}
+							}) {
+								timeline_snap_button("SnapClipToPh", "Clip ▶", snap_clips_to_playhead)
+								timeline_snap_button("SnapPhToClip", "▶ Clip", snap_playhead_to_clips)
+							}
 							if clay.UI(clay.ID("Ruler"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 								backgroundColor = EDITOR_BG,
@@ -554,6 +557,20 @@ vertical_toggle_button :: proc(name: string, label: string) {
 // project's current fps (0 = auto).
 fps_preset_button :: proc(name: string, label: string, fps: f64) {
 	settings_button(name, label, project.frame_rate == fps)
+}
+
+// timeline_snap_button renders one of the two snap toggles living in the
+// track-gutter strip above the track names, to the left of the ruler. Held
+// (highlighted border) while its snap behavior is active.
+timeline_snap_button :: proc(name: string, label: string, active: bool) {
+	if clay.UI(clay.ID(name))({
+		layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(26)}, padding = clay.Padding{left = 6, right = 6}, childAlignment = {x = .Center, y = .Center}},
+		backgroundColor = BUTTON,
+		border = {color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(active ? 2 : 1)},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	}) {
+		clay.Text(label, clay.TextElementConfig{textColor = active ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_SMALL})
+	}
 }
 
 // playback_rate_label returns the display text for a playback rate value:
