@@ -382,6 +382,7 @@ if clay.UI(clay.ID("Preview"))({
 						}) {
 							if clay.UI(clay.ID("RulerGutter"))({
 								layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}},
+								backgroundColor = TRACK_GUTTER_BG,
 							}) {}
 							if clay.UI(clay.ID("Ruler"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
@@ -399,7 +400,7 @@ if clay.UI(clay.ID("Preview"))({
 								gap_id := clay.ID("TrackGap", u32(track_idx))
 								gap_hovered := clay.PointerOver(gap_id)
 								if clay.UI(gap_id)({
-									layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(18)}, childAlignment = {x = .Left, y = .Center}, padding = clay.Padding{left = 4}},
+									layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(TRACK_GAP_H)}, childAlignment = {x = .Left, y = .Center}, padding = clay.Padding{left = 4}},
 									backgroundColor = gap_hovered ? clay.Color{36, 60, 84, 255} : EDITOR_BG,
 									cornerRadius = clay.CornerRadiusAll(3),
 								}) {
@@ -415,7 +416,8 @@ if clay.UI(clay.ID("Preview"))({
 									layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = SECTION_GAP},
 								}) {
 									if clay.UI(clay.ID("TrackName", u32(track_idx)))({
-										layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingFit({})}, layoutDirection = .TopToBottom, childGap = 4, childAlignment = {x = .Left, y = .Top}},
+										layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 4, childAlignment = {x = .Left, y = .Top}},
+										backgroundColor = TRACK_GUTTER_BG,
 									}) {
 										clay.Text(track.name, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_HEADING})
 										if clay.UI(clay.ID("DuplicateTrack", u32(track_idx)))({
@@ -429,6 +431,7 @@ if clay.UI(clay.ID("Preview"))({
 									}
 									if clay.UI(clay.ID("ClipsSection", u32(track_idx)))({
 										layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight},
+										backgroundColor = EDITOR_BG,
 										clip = {horizontal = true, vertical = true, childOffset = {-timeline_view_start * timeline_zoom, 0}},
 									}) {
 										clips_content_x: f32 = 0

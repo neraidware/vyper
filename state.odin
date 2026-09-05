@@ -22,6 +22,9 @@ PREVIEW_H :: 432
 
 BACKGROUND :: clay.Color{31, 31, 40, 255}          // sumi ink
 EDITOR_BG :: clay.Color{36, 36, 46, 255}
+// TRACK_GUTTER_BG paints the left track-name column (and its ruler header strip)
+// so the name gutter reads as a distinct panel from the clip lane area.
+TRACK_GUTTER_BG :: clay.Color{46, 49, 62, 255}
 BUTTON :: clay.Color{42, 42, 55, 255}
 BUTTON_BORDER :: clay.Color{84, 82, 105, 255}
 BUTTON_HOVER :: clay.Color{50, 50, 65, 255}

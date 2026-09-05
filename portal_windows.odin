@@ -23,17 +23,9 @@ win32_picked_path: [1024]byte
 
 win32_open_file_picker :: proc() -> cstring {
 	filters := strings.concatenate({
-		"Video",
+		"Media files",
 		"\x00",
-		"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.mpeg;*.mpg;*.ts;*.m2ts;*.flv;*.wmv;*.3gp",
-		"\x00",
-		"Audio",
-		"\x00",
-		"*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac",
-		"\x00",
-		"Images",
-		"\x00",
-		"*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp;*.tiff",
+		"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.mpeg;*.mpg;*.ts;*.m2ts;*.flv;*.wmv;*.3gp;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac;*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp;*.tiff",
 		"\x00",
 		"All Files",
 		"\x00",

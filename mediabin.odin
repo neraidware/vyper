@@ -181,8 +181,11 @@ lane_box_for :: proc(lane: Media_Lane) -> clay.BoundingBox {
 		if last.width > 0 {
 			x0 = last.x
 			w = last.width
-			below := lane.track_idx - (len(timeline.tracks) - 1)
-			y0 = last.y + last.height + f32(below) * (CLIP_TILE_HEIGHT + 18)
+			// An appended track renders as its own leading insert gap + row, so
+			// the first created lane sits one TRACK_GAP_H below the last row and
+			// consecutive created rows pitch by CLIP_TILE_HEIGHT + TRACK_GAP_H.
+			below := lane.track_idx - len(timeline.tracks)
+			y0 = last.y + last.height + TRACK_GAP_H + f32(below) * (CLIP_TILE_HEIGHT + TRACK_GAP_H)
 		}
 	}
 	if w <= 0 {
@@ -192,7 +195,7 @@ lane_box_for :: proc(lane: Media_Lane) -> clay.BoundingBox {
 		}
 		x0 = empty.x + f32(TIMELINE_PADDING)
 		w = empty.width - f32(TIMELINE_PADDING) * 2
-		y0 = empty.y + f32(TIMELINE_PADDING) + RULER_HEIGHT + f32(lane.track_idx) * (CLIP_TILE_HEIGHT + 18)
+		y0 = empty.y + f32(TIMELINE_PADDING) + RULER_HEIGHT + f32(lane.track_idx) * (CLIP_TILE_HEIGHT + TRACK_GAP_H)
 	}
 	return {x = x0, y = y0, width = w, height = CLIP_TILE_HEIGHT}
 }

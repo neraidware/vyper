@@ -158,6 +158,25 @@ timeline_resize_hover :: proc(mx, my: f32) -> bool {
 	return false
 }
 
+// timeline_tracks_max_top returns how far the track list can scroll vertically:
+// the content height (first row top through last row bottom, un-shifted by the
+// current scroll) minus the visible tracks area. 0 when the rows fit, so
+// vertical panning only scrolls once there are more tracks than room.
+timeline_tracks_max_top :: proc() -> f32 {
+	if len(timeline.tracks) == 0 {
+		return 0
+	}
+	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	first := clay.GetElementData(clay.ID("TrackRow", 0)).boundingBox
+	last := clay.GetElementData(clay.ID("TrackRow", u32(len(timeline.tracks) - 1))).boundingBox
+	if sec.height <= 0 || first.width <= 0 || last.width <= 0 {
+		return 0
+	}
+	// Recover the un-scrolled row extent: rows are shifted up by timeline_view_top.
+	content := (last.y + last.height + timeline_view_top) - (first.y + timeline_view_top)
+	return max(content - sec.height, 0)
+}
+
 // update_timeline_cursor shows the horizontal-resize cursor while dragging or
 // hovering a clip's duration edge, restoring the arrow cursor otherwise.
 update_timeline_cursor :: proc(mx, my: f32) {
@@ -708,11 +727,7 @@ main :: proc() {
 				timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
 				timeline_view_top += mouse_y - timeline_pan_last_y
 				// Clamp to the row area that overflows the visible tracks box.
-				sd := clay.GetScrollContainerData(clay.ID("TracksSection"))
-				if sd.found {
-					max_top := max(sd.contentDimensions.height - sd.scrollContainerDimensions.height, 0)
-					timeline_view_top = clamp(timeline_view_top, 0, max_top)
-				}
+				timeline_view_top = clamp(timeline_view_top, 0, timeline_tracks_max_top())
 			}
 			panning_timeline = true
 			timeline_pan_last_x = mouse_x
@@ -724,9 +739,7 @@ main :: proc() {
 
 		commands := build_page(width, height)
 		if len(timeline.tracks) > 0 {
-			if sd := clay.GetScrollContainerData(clay.ID("TracksSection")); sd.found {
-				timeline_view_top = clamp(timeline_view_top, 0, max(sd.contentDimensions.height - sd.scrollContainerDimensions.height, 0))
-			}
+			timeline_view_top = clamp(timeline_view_top, 0, timeline_tracks_max_top())
 		}
 		if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
 			if path := open_file_picker(); path != nil {

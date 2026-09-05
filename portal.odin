@@ -98,11 +98,9 @@ portal_open_file_picker :: proc() -> cstring {
 		nil,
 		"('', 'Open media file', {" +
 			"'handle_token': <'nered_open'>, " +
-			"'filters': <[" +
-				"('Video', [(uint32 0, '*.mp4'), (uint32 0, '*.m4v'), (uint32 0, '*.mov'), (uint32 0, '*.mkv'), (uint32 0, '*.webm'), (uint32 0, '*.avi'), (uint32 0, '*.mpeg'), (uint32 0, '*.mpg'), (uint32 0, '*.ts'), (uint32 0, '*.m2ts'), (uint32 0, '*.flv'), (uint32 0, '*.wmv'), (uint32 0, '*.3gp')]), " +
-				"('Audio', [(uint32 0, '*.mp3'), (uint32 0, '*.wav'), (uint32 0, '*.flac'), (uint32 0, '*.ogg'), (uint32 0, '*.opus'), (uint32 0, '*.m4a'), (uint32 0, '*.aac')]), " +
-				"('Images', [(uint32 0, '*.png'), (uint32 0, '*.jpg'), (uint32 0, '*.jpeg'), (uint32 0, '*.webp'), (uint32 0, '*.gif'), (uint32 0, '*.bmp'), (uint32 0, '*.tiff')])" +
-			"]>})",
+			"'filters': <[(" +
+				"'Media files', [(uint32 0, '*.mp4'), (uint32 0, '*.m4v'), (uint32 0, '*.mov'), (uint32 0, '*.mkv'), (uint32 0, '*.webm'), (uint32 0, '*.avi'), (uint32 0, '*.mpeg'), (uint32 0, '*.mpg'), (uint32 0, '*.ts'), (uint32 0, '*.m2ts'), (uint32 0, '*.flv'), (uint32 0, '*.wmv'), (uint32 0, '*.3gp'), (uint32 0, '*.mp3'), (uint32 0, '*.wav'), (uint32 0, '*.flac'), (uint32 0, '*.ogg'), (uint32 0, '*.opus'), (uint32 0, '*.m4a'), (uint32 0, '*.aac'), (uint32 0, '*.png'), (uint32 0, '*.jpg'), (uint32 0, '*.jpeg'), (uint32 0, '*.webp'), (uint32 0, '*.gif'), (uint32 0, '*.bmp'), (uint32 0, '*.tiff')]" +
+			")]>})",
 		nil,
 		nil,
 		nil,
