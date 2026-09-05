@@ -913,6 +913,7 @@ main :: proc() {
 						// Plain click = single selection: drop any earlier
 						// Shift+clicked extras and grab the clip.
 						clear(&selected_set)
+						drag_group_delta = 0
 						drag_clip = &track.clips[index]
 						drag_source_track = track_idx
 						drag_source_index = index
@@ -955,6 +956,7 @@ main :: proc() {
 			drag_source_track = -1
 			drag_source_index = -1
 			drag_hover_track = -1
+			drag_group_delta = 0
 			clear(&drag_group_orig)
 			dragging_playhead = false
 			resizing_clip = false
@@ -1033,28 +1035,46 @@ main :: proc() {
 				}
 				sync.mutex_lock(&audio_timeline_mtx)
 				if hover == drag_source_track {
-					// Horizontal move: keep the live-follow behavior but clamp so
-					// the clip can never overlap a neighbor on this track.
-					new_start := clip_slide_in_track(&timeline.tracks[drag_source_track], drag_source_index, drag_clip.source_length_frames, i64(max(frame, 0)), drag_clip.timeline_start_frame)
 					drag_hover_track = hover
-if drag_clip.timeline_start_frame != new_start {
-					if nered_trace {
-						fmt.printf("[tl] drag clip src=%s len=%d start=%d -> %d\n",
-							drag_clip.path, drag_clip.source_length_frames,
-							drag_clip.timeline_start_frame, new_start)
+					if len(drag_group_orig) > 1 {
+						// Linked group: the whole unit shifts by deltas every
+						// member can honor exactly -- the anchor never moves into
+						// a slot a partner can't reach. It sticks at the last
+						// feasible position when the mouse keeps dragging past a
+						// blocked slot.
+						delta := i64(max(frame, 0)) - drag_group_orig[0].start
+						if group_delta_feasible(delta) {
+							if drag_clip.timeline_start_frame != drag_group_orig[0].start + delta {
+								if nered_trace {
+									fmt.printf("[tl] drag group link=%d (%d clips) delta=%d\n", drag_clip.link_id, len(drag_group_orig), delta)
+								}
+								drag_clip.timeline_start_frame = drag_group_orig[0].start + delta
+							}
+							apply_group_drag_to_members(delta)
+						}
+					} else {
+						// Horizontal move: keep the live-follow behavior but clamp so
+						// the clip can never overlap a neighbor on this track.
+						new_start := clip_slide_in_track(&timeline.tracks[drag_source_track], drag_source_index, drag_clip.source_length_frames, i64(max(frame, 0)), drag_clip.timeline_start_frame)
+						if drag_clip.timeline_start_frame != new_start {
+							if nered_trace {
+								fmt.printf("[tl] drag clip src=%s len=%d start=%d -> %d\n",
+									drag_clip.path, drag_clip.source_length_frames,
+									drag_clip.timeline_start_frame, new_start)
+							}
+							drag_clip.timeline_start_frame = new_start
+						}
 					}
-					drag_clip.timeline_start_frame = new_start
-				}
-				// Linked group: every member rides the same delta, clamped to its
-				// own lane, so the video and its audio stay time-aligned.
-				if len(drag_group_orig) > 1 {
-					apply_group_drag_to_members(new_start - drag_group_orig[0].start)
-				}
 				} else {
 					// Vertical: clamp to nearest valid slot on the hovered track
-					// and show it as a ghost (committed on release).
+					// and show it as a ghost (committed on release). Linked
+					// groups slide the whole unit with the mouse's horizontal
+					// offset (drag_group_delta) on every member's lane.
 					drag_hover_track = hover
 					drag_ghost_start = clip_place_in_track(&timeline.tracks[hover], -1, drag_clip.source_length_frames, i64(max(frame, 0)))
+					if len(drag_group_orig) > 1 {
+						drag_group_delta = i64(max(frame, 0)) - drag_group_orig[0].start
+					}
 				}
 				sync.mutex_unlock(&audio_timeline_mtx)
 				audio_note_edit()

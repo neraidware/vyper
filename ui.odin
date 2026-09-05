@@ -467,8 +467,13 @@ if clay.UI(clay.ID("Preview"))({
 											    clip_label = "Clip"
 										    }
 if is_clip_selected(track_idx, index) {
+										    // Selected linked clips (video + audio moving as one unit)
+										    // outline yellow so the group is distinct from a lone clip.
 										    clip_border = BUTTON_BORDER_HOVER
 										    clip_border_w = 3
+										    if timeline_clip.link_id != 0 {
+											    clip_border = MARKER_COLOR
+										    }
 									    }
 										    // Adjacent clips keep their corner radius but drop the
 										    // shared border where this clip's end touches the next

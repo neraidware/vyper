@@ -876,13 +876,83 @@ apply_group_drag_to_members :: proc(anchor_delta: i64) {
 	}
 }
 
+// group_delta_feasible reports whether every captured link-group member can
+// land on its OWN lane at exactly m.start + delta (all moving together by
+// delta, members vacating their originals simultaneously) without overlapping
+// any NON-member clip. A group drag only ever advances to deltas that are
+// feasible for every member: the anchor must never move into a slot a partner
+// cannot reach.
+group_delta_feasible :: proc(delta: i64) -> bool {
+	if len(drag_group_orig) <= 1 {
+		return true
+	}
+	members := make(map[u64]bool, len(drag_group_orig))
+	defer delete(members)
+	for m in drag_group_orig {
+		members[m.clip_id] = true
+	}
+	for m in drag_group_orig {
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			return false
+		}
+		t := &timeline.tracks[m.track]
+		ts := m.start + delta
+		for &c in t.clips {
+			if c.clip_id in members {
+				continue
+			}
+			if ts < clip_timeline_end(c) && c.timeline_start_frame < ts + m.length {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// group_vertical_feasible reports whether every captured link-group member can
+// land on dst lane = m.track + track_delta at the mouse-aligned position
+// m.start + delta (clamped to >= 0) without overlapping a non-member clip there.
+// This is the same rule group_delta_feasible applies horizontally, shifted to
+// the destination lanes a vertical drop targets.
+group_vertical_feasible :: proc(track_delta: int, delta: i64) -> bool {
+	if len(drag_group_orig) == 0 {
+		return false
+	}
+	members := make(map[u64]bool, len(drag_group_orig))
+	defer delete(members)
+	for m in drag_group_orig {
+		members[m.clip_id] = true
+	}
+	for m in drag_group_orig {
+		dst := m.track + track_delta
+		if dst < 0 || dst >= len(timeline.tracks) {
+			return false
+		}
+		ts := max(m.start + delta, 0)
+		for &c in timeline.tracks[dst].clips {
+			if c.clip_id in members {
+				continue
+			}
+			if ts < clip_timeline_end(c) && c.timeline_start_frame < ts + m.length {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // move_linked_group relocates every clip captured in drag_group_orig by
-// track_delta tracks (the anchor's vertical drop), preserving each member's
-// horizontal position clamped to the destination lane, then re-selects the
-// anchor in its new home. Returns false (nothing moved) if any member's
-// destination track is out of range.
+// track_delta tracks (the anchor's vertical drop), keeping each member
+// laid-out at the same mouse-aligned horizontal offset the ghost showed:
+// start = m.start + drag_group_delta. Refused (returns false, nothing moves)
+// unless EVERY member can land at that exact spot on its destination lane
+// without overlapping a non-member clip, then re-selects the anchor in its new
+// home.
 move_linked_group :: proc(track_delta: int) -> bool {
 	if track_delta == 0 || len(drag_group_orig) == 0 {
+		return false
+	}
+	if !group_vertical_feasible(track_delta, drag_group_delta) {
 		return false
 	}
 	for m in drag_group_orig {
@@ -911,7 +981,10 @@ move_linked_group :: proc(track_delta: int) -> bool {
 			sync.mutex_unlock(&audio_timeline_mtx)
 			return false
 		}
-		start := clip_place_in_track(&timeline.tracks[dst_track], -1, clip.source_length_frames, clip.timeline_start_frame)
+		// group_vertical_feasible already proved every member fits at the
+		// mouse-aligned slot; commit exactly there (no per-member clamping,
+		// which would silently split the group).
+		start := max(m.start + drag_group_delta, 0)
 		append(&planned, PlannedMove{src_track = m.track, src_index = idx, dst_track = dst_track, start = start, clip = clip})
 	}
 	// Group members each live on their own lane, so planned src_tracks are

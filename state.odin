@@ -279,6 +279,11 @@ drag_source_track: int = -1
 drag_source_index: int = -1
 drag_hover_track: int = -1
 drag_ghost_start: i64 = 0
+// drag_group_delta is the group's mouse-driven horizontal offset while a LINKED
+// group is staged on another track (delta = hovered pointer frame - anchor's
+// original start). The vertical ghost follows it so the unit keeps sliding with
+// the mouse; on release move_linked_group commits members at m.start + delta.
+drag_group_delta: i64 = 0
 // drag_group_orig snapshots the original (track, start, length) of every clip
 // sharing the dragged/resized clip's link_id, so a linked-group edit applies one
 // shared delta to all members (each clamped to its own lane). Invariant: when

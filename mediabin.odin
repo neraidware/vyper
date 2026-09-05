@@ -340,8 +340,18 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 				// Ghost track: this lane doesn't exist yet; a drop here would
 				// create it. Paint a faint row across the whole lane so the
 				// upcoming track is visible as a track (not just a floating
-				// tile), with the tile drawn on top below.
+				// tile), with the tile drawn on top below. The name-gutter
+				// header is painted too so the row reads as a full track. The
+				// scissor is reset to the full window first: an earlier lane in
+				// the loop may have left it clamped to its own box, which clips
+				// this row (and its gutter header) out of frame.
+				sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 				render_sdf_rect(renderer, command_buffer, pass, lane_box, clay.Color{52, 66, 84, 90}, 6, 1)
+				rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
+				if rg.width > 0 {
+					header := clay.BoundingBox{x = rg.x, y = lane_box.y, width = rg.width, height = lane_box.height}
+					render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{52, 66, 84, 90}, 0, 0)
+				}
 			}
 			b := clay.BoundingBox{
 				x = lane_box.x + (f32(lane.placed) - timeline_view_start) * timeline_zoom,
