@@ -777,7 +777,13 @@ main :: proc() {
 			begin_media_drag(media_bin_item_at(mouse_x, mouse_y), mouse_x, mouse_y)
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OpenFileButton")) {
 			if path := open_file_picker(); path != nil {
-				import_media_to_bin(path)
+				// Classic Open File flow: probe the file and drop it straight
+				// onto the timeline (appended at the end), keeping its bin
+				// entry. A bin-only import forced an extra pick-and-drag step
+				// the old direct-load behavior didn't have.
+				if asset_id := import_media_to_bin(path); asset_id != 0 {
+					add_asset_to_timeline(asset_id, 0, timeline_duration())
+				}
 			}
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res720")) {
 			set_project_resolution(1280, 720)
