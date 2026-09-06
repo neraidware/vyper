@@ -468,10 +468,15 @@ main :: proc() {
 	defer release_preview_textures(device, renderer.preview_textures[:])
 	defer release_slot_owned_textures(device)
 	defer sdl.ReleaseGPUSampler(device, renderer.preview_sampler)
+	defer for id in Icon_Id {
+		if renderer.icon_textures[id] != nil {
+			sdl.ReleaseGPUTexture(device, renderer.icon_textures[id])
+		}
+	}
 	// Media-bin thumbnails own per-asset GPU textures; free them at shutdown.
 	defer release_media_asset_textures(device)
 	initial_upload := sdl.AcquireGPUCommandBuffer(device)
-	if initial_upload == nil || !upload_font_atlas(&renderer, initial_upload) || !sdl.SubmitGPUCommandBuffer(initial_upload) {
+	if initial_upload == nil || !upload_font_atlas(&renderer, initial_upload) || !upload_icons(&renderer, initial_upload) || !sdl.SubmitGPUCommandBuffer(initial_upload) {
 		fmt.println("Could not upload font atlas:", sdl.GetError())
 		return
 	}
@@ -1347,6 +1352,7 @@ main :: proc() {
 			draw_timeline_resize_focus(&renderer, command_buffer, pass)
 			draw_drag_ghost(&renderer, command_buffer, pass)
 			draw_media_bin_thumbnails(&renderer, command_buffer, pass)
+			draw_ui_icons(&renderer, command_buffer, pass)
 			draw_media_drag_ghost(&renderer, command_buffer, pass)
 			if len(timeline.tracks) > 0 {
 				draw_timeline_ruler(&renderer, command_buffer, pass)

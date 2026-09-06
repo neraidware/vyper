@@ -526,6 +526,75 @@ render_sdf_rect :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
 
+// render_icon draws one rasterized SVG icon through the text pipeline: the
+// icon texture's R channel is the alpha mask, tinted by `color`. The texture
+// covers the full [0,1] uv range (one icon per texture).
+render_icon :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox, id: Icon_Id, color: clay.Color) {
+	if renderer.icon_textures[id] == nil || renderer.text_pipeline == nil {
+		return
+	}
+	sdl.BindGPUGraphicsPipeline(pass, renderer.text_pipeline)
+	binding := sdl.GPUTextureSamplerBinding{texture = renderer.icon_textures[id], sampler = renderer.preview_sampler}
+	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
+	vertex_uniforms := TextVertexUniforms{
+		bounds = {bounds.x, bounds.y, bounds.width, bounds.height},
+		viewport = renderer.viewport,
+		_padding = {},
+		uv = {0, 0, 1, 1},
+	}
+	fragment_uniforms := TextFragmentUniforms{color = {f32(color[0]) / 255, f32(color[1]) / 255, f32(color[2]) / 255, f32(color[3]) / 255}}
+	sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
+	sdl.PushGPUFragmentUniformData(command_buffer, 0, &fragment_uniforms, sdl.Uint32(size_of(fragment_uniforms)))
+	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+}
+
+// icon_box returns the box for a `size`px icon centered in the layout box of
+// the element `id`, if that element was laid out this frame.
+icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBox, bool) {
+	id: clay.ElementId
+	if len(hash) > 0 {
+		id = clay.ID(element_id, hash[0])
+	} else {
+		id = clay.ID(element_id)
+	}
+	data := clay.GetElementData(id)
+	if !data.found || data.boundingBox.width <= 0 || data.boundingBox.height <= 0 {
+		return {}, false
+	}
+	b := data.boundingBox
+	return clay.BoundingBox{x = b.x + (b.width - size) / 2, y = b.y + (b.height - size) / 2, width = size, height = size}, true
+}
+
+// draw_ui_icons overlays the vector icons for the exercise/duplicate/jog and
+// snap toggles. The clay elements are hit-test targets (main.odin) with ids
+// unchanged; only the visuals move from baked glyphs to embedded icons. Active
+// toggles and the highlighted jog direction tint brighter, mirroring the text
+// labels they replace.
+draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+	draw_icon_in_element(renderer, command_buffer, pass, "PlayBack", .SkipBack, playhead.playing && playback_dir == -1, 15)
+	draw_icon_in_element(renderer, command_buffer, pass, "PlayFwd", .SkipForward, playhead.playing && playback_dir == 1, 15)
+	draw_icon_in_element(renderer, command_buffer, pass, "SnapClipToPh", .SnapClipToPlayhead, snap_clips_to_playhead, 14)
+	draw_icon_in_element(renderer, command_buffer, pass, "SnapPhToClip", .SnapPlayheadToClip, snap_playhead_to_clips, 14)
+	for ti in 0..<len(timeline.tracks) {
+		track_id := clay.ID("DuplicateTrack", u32(ti))
+		dup_color := clay.PointerOver(track_id) ? BUTTON_BORDER_HOVER : TEXT
+		draw_icon_in_element_color(renderer, command_buffer, pass, "DuplicateTrack", .Duplicate, dup_color, 16, u32(ti))
+	}
+}
+
+draw_icon_in_element :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, element_id: string, id: Icon_Id, active: bool, size: f32, hash: ..u32) {
+	color := active ? BUTTON_BORDER_HOVER : TEXT
+	draw_icon_in_element_color(renderer, command_buffer, pass, element_id, id, color, size, ..hash)
+}
+
+draw_icon_in_element_color :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, element_id: string, id: Icon_Id, color: clay.Color, size: f32, hash: ..u32) {
+	box, ok := icon_box(element_id, size, ..hash)
+	if !ok {
+		return
+	}
+	render_icon(renderer, command_buffer, pass, box, id, color)
+}
+
 // draw_preview_hud paints the audio-vs-video clock overlay in the corner of the
 // preview while playing. It answers the one question that has been argued from
 // two sides this whole session with a number everyone can see: does the audio

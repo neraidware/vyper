@@ -203,7 +203,7 @@ if clay.UI(clay.ID("Preview"))({
 								childGap = BUTTON_ROW_GAP,
 							},
 						}) {
-							jog_button("PlayBack", "◀◀", -1)
+							jog_button("PlayBack", -1)
 							if clay.UI(clay.ID("PlayPause"))({
 								layout = {sizing = {width = clay.SizingFixed(96), height = clay.SizingFixed(BUTTON_HEIGHT)}, childAlignment = {x = .Center, y = .Center}},
 								backgroundColor = BUTTON,
@@ -216,7 +216,7 @@ if clay.UI(clay.ID("Preview"))({
 									clay.Text("Play", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
 								}
 							}
-							jog_button("PlayFwd", "▶▶", 1)
+							jog_button("PlayFwd", 1)
 							playback_rate_dropdown()
 						}
 					}
@@ -384,8 +384,8 @@ if clay.UI(clay.ID("Preview"))({
 								layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight, childGap = 6, childAlignment = {x = .Left, y = .Center}},
 								backgroundColor = TRACK_GUTTER_BG,
 							}) {
-								timeline_snap_button("SnapClipToPh", "Clip ▶", snap_clips_to_playhead)
-								timeline_snap_button("SnapPhToClip", "▶ Clip", snap_playhead_to_clips)
+								timeline_snap_button("SnapClipToPh", snap_clips_to_playhead)
+								timeline_snap_button("SnapPhToClip", snap_playhead_to_clips)
 							}
 							if clay.UI(clay.ID("Ruler"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
@@ -425,11 +425,11 @@ if clay.UI(clay.ID("Preview"))({
 										clay.Text(track.name, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_HEADING})
 										if clay.UI(clay.ID("DuplicateTrack", u32(track_idx)))({
 											layout = {sizing = {width = clay.SizingFixed(30), height = clay.SizingFixed(34)}, childAlignment = {x = .Center, y = .Center}},
-											backgroundColor = BUTTON,
-											border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
+											backgroundColor = clay.PointerOver(clay.ID("DuplicateTrack", u32(track_idx))) ? BUTTON_HOVER : BUTTON,
+											border = {color = clay.PointerOver(clay.ID("DuplicateTrack", u32(track_idx))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
 											cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 										}) {
-											clay.Text("+\nv", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+											// Duplicate glyph is drawn as an embedded icon overlay.
 										}
 									}
 									if clay.UI(clay.ID("ClipsSection", u32(track_idx)))({
@@ -561,15 +561,15 @@ fps_preset_button :: proc(name: string, label: string, fps: f64) {
 
 // timeline_snap_button renders one of the two snap toggles living in the
 // track-gutter strip above the track names, to the left of the ruler. Held
-// (highlighted border) while its snap behavior is active.
-timeline_snap_button :: proc(name: string, label: string, active: bool) {
+// (highlighted border) while its snap behavior is active; the icon is an
+// embedded overlay (draw_ui_icons), so this element only claims button visuals.
+timeline_snap_button :: proc(name: string, active: bool) {
 	if clay.UI(clay.ID(name))({
-		layout = {sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(26)}, padding = clay.Padding{left = 6, right = 6}, childAlignment = {x = .Center, y = .Center}},
+		layout = {sizing = {width = clay.SizingFixed(26), height = clay.SizingFixed(26)}, childAlignment = {x = .Center, y = .Center}},
 		backgroundColor = BUTTON,
 		border = {color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(active ? 2 : 1)},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	}) {
-		clay.Text(label, clay.TextElementConfig{textColor = active ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_SMALL})
 	}
 }
 
@@ -643,19 +643,15 @@ playback_rate_dropdown :: proc() {
 // jog_button renders a forward/backward jog control around the play button. It
 // is held (highlighted) while playing in that direction; the label shows the
 // temporary speed boost when active. dir is +1 (forward) or -1 (backward).
-jog_button :: proc(name: string, label: string, dir: int) {
+jog_button :: proc(name: string, dir: int) {
 	active := playhead.playing && playback_dir == dir
-	boost := " "
-	if active && playback_boost > 0 {
-		boost = fmt.aprintf("%+d", playback_boost)
-	}
 	if clay.UI(clay.ID(name))({
 		layout = {sizing = {width = clay.SizingFixed(56), height = clay.SizingFixed(BUTTON_HEIGHT)}, childAlignment = {x = .Center, y = .Center}},
 		backgroundColor = BUTTON,
 		border = {color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(active ? 2 : 1)},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	}) {
-		clay.Text(strings.concatenate({label, boost}), clay.TextElementConfig{textColor = active ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_NORMAL})
+		// The skip glyph is drawn as an embedded icon over this element.
 	}
 }
 
@@ -816,15 +812,15 @@ media_bin_header :: proc() {
 		clay.Text("Media Bin", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL})
 		if clay.UI(clay.ID("BinImportButton"))({
 			layout = {
-				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(f32(BUTTON_HEIGHT))},
+				sizing = {width = clay.SizingFixed(f32(BUTTON_HEIGHT) * 2), height = clay.SizingFixed(f32(BUTTON_HEIGHT))},
 				childAlignment = {x = .Center, y = .Center},
 			},
-			backgroundColor = clay.Hovered() ? BUTTON_HOVER : EDITOR_BG,
+			backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
 			border = {color = clay.Hovered() ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
 			cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 		}) {
+			clay.Text("Import", clay.TextElementConfig{textColor = clay.Hovered() ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_NORMAL})
 		}
-		clay.Text("Import", clay.TextElementConfig{textColor = clay.Hovered() ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_NORMAL})
 	}
 }
 

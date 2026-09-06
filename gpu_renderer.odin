@@ -46,6 +46,7 @@ GPU_Renderer :: struct {
 	font: Font_Atlas,
 	preview_textures: [MAX_PREVIEW_SLOTS]^sdl.GPUTexture,
 	preview_sampler: ^sdl.GPUSampler,
+	icon_textures: [Icon_Id]^sdl.GPUTexture,
 	viewport: [2]f32,
 }
 
@@ -173,5 +174,47 @@ upload_font_atlas :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	sdl.UploadToGPUTexture(copy_pass, source, destination, false)
 	sdl.EndGPUCopyPass(copy_pass)
 	sdl.ReleaseGPUTransferBuffer(renderer.device, transfer)
+	return true
+}
+
+// upload_icons rasterizes every embedded SVG icon into its own small R8
+// texture (uploaded together on the initial command buffer, before any frame).
+upload_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer) -> bool {
+	for id in Icon_Id {
+		{
+			rasterized, ok := rasterize_icon_svg(get_icon_svg(id))
+			if !ok {
+				fmt.println("Could not rasterize icon:", id)
+				return false
+			}
+			defer delete(rasterized)
+			texture := sdl.CreateGPUTexture(renderer.device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8_UNORM, usage = {.SAMPLER}, width = ICON_RASTER, height = ICON_RASTER, layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
+			if texture == nil {
+				fmt.println("Could not create icon texture:", sdl.GetError())
+				return false
+			}
+			transfer := sdl.CreateGPUTransferBuffer(renderer.device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = ICON_RASTER * ICON_RASTER})
+			if transfer == nil {
+				sdl.ReleaseGPUTexture(renderer.device, texture)
+				return false
+			}
+			mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, false)
+			if mapped == nil {
+				sdl.ReleaseGPUTexture(renderer.device, texture)
+				sdl.ReleaseGPUTransferBuffer(renderer.device, transfer)
+				return false
+			}
+			mapped_bytes := (cast([^]u8)mapped)[:ICON_RASTER * ICON_RASTER]
+			copy(mapped_bytes, rasterized)
+			sdl.UnmapGPUTransferBuffer(renderer.device, transfer)
+			copy_pass := sdl.BeginGPUCopyPass(command_buffer)
+			source := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, pixels_per_row = ICON_RASTER, rows_per_layer = ICON_RASTER}
+			destination := sdl.GPUTextureRegion{texture = texture, w = ICON_RASTER, h = ICON_RASTER, d = 1}
+			sdl.UploadToGPUTexture(copy_pass, source, destination, false)
+			sdl.EndGPUCopyPass(copy_pass)
+			sdl.ReleaseGPUTransferBuffer(renderer.device, transfer)
+			renderer.icon_textures[id] = texture
+		}
+	}
 	return true
 }
