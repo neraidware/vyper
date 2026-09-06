@@ -231,6 +231,15 @@ decode_asset_thumbnail :: proc(asset: ^Media_Asset) {
 // Media_Asset (thumbnail + proxy built, no timeline change). Returns the new
 // asset's id, or 0 if the file could not be probed.
 import_media_to_bin :: proc(path: cstring) -> u64 {
+	// One bin entry per file path: importing a file that's already in the bin
+	// is a no-op returning the existing asset's id, so re-imports don't stack
+	// duplicate rows (the open-file flow also places the asset on the timeline,
+	// which still happens with the returned id).
+	for &a in media_assets {
+		if strings.compare(string(a.path), string(path)) == 0 {
+			return a.id
+		}
+	}
 	file_info_text = probe_media(path)
 	frame_count := media_frame_count(file_info_text)
 	probe := probe_streams(path)
