@@ -41,6 +41,7 @@ buildPhase = ''
             glslangValidator -V shaders/text.vert -o shaders/text.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
+            clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
             odin build . -out:nered -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
           '';
           # The binary is linked against SDL3/SDL3_ttf/vulkan-loader + the

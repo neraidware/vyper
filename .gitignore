@@ -6,3 +6,7 @@
 
 # nix build result symlink
 /result
+
+# Compile-time outputs (nanosvg C TU), produced by flake.nix / CI / local build
+/vendor/nanosvg/*.o
+/vendor/nanosvg/*.obj

@@ -81,6 +81,13 @@ jobs:
             Write-Host "glslangValidator not found; using committed .spv files"
           }
 
+      - name: Compile nanosvg (SVG renderer)
+        shell: pwsh
+        run: |
+          # Instantiate the vendored parser+rasterizer. Mirrors the .o step in
+          # flake.nix; nerd receives it through foreign import (vendor/nanosvg).
+          cl /nologo /O2 /c vendor\nanosvg\nanosvg.c /Fovendor\nanosvg\nanosvg.obj
+
       - name: Build nered
         shell: pwsh
         run: |
