@@ -604,10 +604,17 @@ main :: proc() {
 						// one link group (or all split apart when already linked).
 						toggle_links_for_selection()
 					case sdl.K_BACKSPACE:
-						// Delete the selected clip's timeline area on every track
-						// and close the gap (ripple).
+						// Delete the selected clip's timeline area and close the
+						// gap (ripple). A linked clip rips the WHOLE group: every
+						// member's own span on its own track, so a ripple cut
+						// never leaves the partner clip behind (rippling only the
+						// selected member's region would strand the rest).
 						if tr, clip, ok := selected_clip(); ok {
-							ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+							if clip.link_id != 0 {
+								ripple_delete_linked_group(clip.link_id)
+							} else {
+								ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+							}
 						}
 					case sdl.K_DELETE:
 						// Delete the clip raw, nothing else.

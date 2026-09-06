@@ -651,6 +651,71 @@ delete_selected_clip_raw :: proc() {
 	audio_note_edit()
 }
 
+// ripple_delete_track_region removes the timeline region [start, start+length)
+// from a single track and closes that track's gap: clips fully after the region
+// shift left by `length`, clips straddling the edges get trimmed/split around
+// it, and clips entirely inside it are dropped. Shared by the all-tracks ripple
+// (ripple_delete_region) and the whole-link-group ripple so a linked cut can
+// rip each member's OWN span on its OWN lane. Caller holds audio_timeline_mtx.
+ripple_delete_track_region :: proc(ti: int, start, length: i64) {
+	if length <= 0 {
+		return
+	}
+	end := start + length
+	track := &timeline.tracks[ti]
+	new_clips := make([dynamic]Clip, 0, len(track.clips))
+	for i in 0 ..< len(track.clips) {
+		c := track.clips[i]
+		cs := c.timeline_start_frame
+		ce := clip_timeline_end(c)
+		switch {
+		case ce <= start:
+			// Entirely before the region: untouched (keeps the original
+			// markers slice: the new copy still references it).
+			append(&new_clips, c)
+		case cs >= end:
+			// Entirely after the region: slide left to close the gap.
+			c.timeline_start_frame -= length
+			append(&new_clips, c)
+		case cs < start && ce > end:
+			// Straddles the whole region: split into left + right pieces.
+			left := c
+			left.source_length_frames = start - cs
+			left.markers = filter_markers_in_range(left.markers[:], left.source_start_frame, left.source_length_frames)
+			append(&new_clips, left)
+			right := c
+			right.source_start_frame += end - cs
+			right.source_length_frames = ce - end
+			right.timeline_start_frame = start
+			right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
+			append(&new_clips, right)
+			// Original markers array no longer referenced by any copy.
+			delete(c.markers)
+		case cs < start:
+			// Overlaps the left edge only: trim its tail.
+			old_markers := c.markers
+			c.source_length_frames = start - cs
+			c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
+			append(&new_clips, c)
+			delete(old_markers)
+		case ce > end:
+			// Overlaps the right edge only: trim its head, shifted to start.
+			old_markers := c.markers
+			c.source_start_frame += cs - start
+			c.source_length_frames = ce - end
+			c.timeline_start_frame = start
+			c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
+			append(&new_clips, c)
+			delete(old_markers)
+		case cs >= start && ce <= end:
+			// Otherwise the clip is entirely inside the region: dropped.
+			delete(c.markers)
+		}
+	}
+	delete(track.clips)
+	track.clips = new_clips
+}
+
 // ripple_delete_region removes the timeline region [start, start+length) from
 // EVERY track at once (the "delete the clip area for all tracks" edit) and then
 // closes the gap: clips fully after the region shift left by `length`, clips
@@ -660,62 +725,10 @@ ripple_delete_region :: proc(start, length: i64) {
 	if length <= 0 {
 		return
 	}
-	end := start + length
 	sync.mutex_lock(&audio_timeline_mtx)
 	defer sync.mutex_unlock(&audio_timeline_mtx)
 	for ti in 0 ..< len(timeline.tracks) {
-		track := &timeline.tracks[ti]
-		new_clips := make([dynamic]Clip, 0, len(track.clips))
-		for i in 0 ..< len(track.clips) {
-			c := track.clips[i]
-			cs := c.timeline_start_frame
-			ce := clip_timeline_end(c)
-			switch {
-			case ce <= start:
-				// Entirely before the region: untouched (keeps the original
-				// markers slice: the new copy still references it).
-				append(&new_clips, c)
-			case cs >= end:
-				// Entirely after the region: slide left to close the gap.
-				c.timeline_start_frame -= length
-				append(&new_clips, c)
-			case cs < start && ce > end:
-				// Straddles the whole region: split into left + right pieces.
-				left := c
-				left.source_length_frames = start - cs
-				left.markers = filter_markers_in_range(left.markers[:], left.source_start_frame, left.source_length_frames)
-				append(&new_clips, left)
-				right := c
-				right.source_start_frame += end - cs
-				right.source_length_frames = ce - end
-				right.timeline_start_frame = start
-				right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
-				append(&new_clips, right)
-				// Original markers array no longer referenced by any copy.
-				delete(c.markers)
-			case cs < start:
-				// Overlaps the left edge only: trim its tail.
-				old_markers := c.markers
-				c.source_length_frames = start - cs
-				c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
-				append(&new_clips, c)
-				delete(old_markers)
-			case ce > end:
-				// Overlaps the right edge only: trim its head, shifted to start.
-				old_markers := c.markers
-				c.source_start_frame += cs - start
-				c.source_length_frames = ce - end
-				c.timeline_start_frame = start
-				c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
-				append(&new_clips, c)
-				delete(old_markers)
-			case cs >= start && ce <= end:
-				// Otherwise the clip is entirely inside the region: dropped.
-				delete(c.markers)
-			}
-		}
-		delete(track.clips)
-		track.clips = new_clips
+		ripple_delete_track_region(ti, start, length)
 	}
 	// The edit may have removed/replaced the dragged clip and the decoded state
 	// cached for it: cancel any in-flight drag and drop the preview slots so the
@@ -728,7 +741,61 @@ ripple_delete_region :: proc(start, length: i64) {
 	drag_hover_track = -1
 	invalidate_preview_slots()
 	if nered_trace {
-		fmt.printf("[tl] ripple delete region [%d, %d)\n", start, end)
+		fmt.printf("[tl] ripple delete region [%d, %d)\n", start, start + length)
+	}
+	selected_track = -1
+	selected_index = -1
+	audio_note_edit()
+}
+
+// ripple_delete_linked_group ripple-deletes a whole link group: EVERY member's
+// own region is removed on its own track and that track's gap is closed by the
+// member's span there, so a linked ripple cut leaves no partner clip behind
+// (the all-tracks region edit only ever rips the SELECTED member's span, which
+// is usually elsewhere on other members' lanes). Members are processed per
+// track from rightmost to leftmost: an earlier ripple shifts only clips AFTER
+// its region, so the recorded spans of members still pending stay valid.
+ripple_delete_linked_group :: proc(link: u64) {
+	if link == 0 {
+		return
+	}
+	MemberSpan :: struct { track: int, start, length: i64 }
+	spans := make([dynamic]MemberSpan, 0, 4)
+	defer delete(spans)
+	for ti in 0 ..< len(timeline.tracks) {
+		for &c in timeline.tracks[ti].clips {
+			if c.link_id == link {
+				append(&spans, MemberSpan{ti, c.timeline_start_frame, c.source_length_frames})
+			}
+		}
+	}
+	if len(spans) == 0 {
+		return
+	}
+	// Sort by (track asc, start DESC).
+	for a in 0 ..< len(spans) {
+		for b := a + 1; b < len(spans); b += 1 {
+			later := spans[b].track < spans[a].track ||
+				(spans[b].track == spans[a].track && spans[b].start > spans[a].start)
+			if later {
+				spans[a], spans[b] = spans[b], spans[a]
+			}
+		}
+	}
+	sync.mutex_lock(&audio_timeline_mtx)
+	defer sync.mutex_unlock(&audio_timeline_mtx)
+	for s in spans {
+		ripple_delete_track_region(s.track, s.start, s.length)
+	}
+	moving_clip = false
+	moving_preview_clip = false
+	drag_clip = nil
+	drag_source_track = -1
+	drag_source_index = -1
+	drag_hover_track = -1
+	invalidate_preview_slots()
+	if nered_trace {
+		fmt.printf("[tl] ripple delete linked group link=%d (%d members)\n", link, len(spans))
 	}
 	selected_track = -1
 	selected_index = -1
