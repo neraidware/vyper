@@ -908,6 +908,15 @@ main :: proc() {
 				}
 			}
 			if !handled {
+				for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+					if clay.PointerOver(clay.ID("RemoveTrack", u32(track_idx))) {
+						remove_track(track_idx)
+						handled = true
+						break
+					}
+				}
+			}
+			if !handled {
 				// Resizing the selected clip's duration: grab its left/right edge.
 				// Takes precedence over selecting/dragging a clip, and only the
 				// currently-selected clip can be resized.

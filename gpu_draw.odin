@@ -565,8 +565,8 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 	return clay.BoundingBox{x = b.x + (b.width - size) / 2, y = b.y + (b.height - size) / 2, width = size, height = size}, true
 }
 
-// draw_ui_icons overlays the vector icons for the exercise/duplicate/jog and
-// snap toggles. The clay elements are hit-test targets (main.odin) with ids
+// draw_ui_icons overlays the vector icons for the duplicate/remove-track, jog
+// and snap toggles. The clay elements are hit-test targets (main.odin) with ids
 // unchanged; only the visuals move from baked glyphs to embedded icons. Active
 // toggles and the highlighted jog direction tint brighter, mirroring the text
 // labels they replace.
@@ -579,6 +579,9 @@ draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBu
 		track_id := clay.ID("DuplicateTrack", u32(ti))
 		dup_color := clay.PointerOver(track_id) ? BUTTON_BORDER_HOVER : TEXT
 		draw_icon_in_element_color(renderer, command_buffer, pass, "DuplicateTrack", .Duplicate, dup_color, 16, u32(ti))
+		remove_id := clay.ID("RemoveTrack", u32(ti))
+		remove_color := clay.PointerOver(remove_id) ? BUTTON_BORDER_HOVER : TEXT
+		draw_icon_in_element_color(renderer, command_buffer, pass, "RemoveTrack", .RemoveTrack, remove_color, 16, u32(ti))
 	}
 }
 

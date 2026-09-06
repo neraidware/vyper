@@ -1231,3 +1231,41 @@ duplicate_track :: proc(index: int) {
 	}
 	inject_at_elem(&timeline.tracks, index + 1, new_track)
 }
+
+// remove_track deletes the track at index (and all of its clips) from the
+// timeline. Frees per-clip markers and the track's owned arrays, clears or
+// adjusts the saved selection (clips on other tracks keep their indices, so
+// selected_index is preserved), and invalidates the preview/audio state the
+// way every clip-delete path must (see delete_selected_clip_raw).
+remove_track :: proc(index: int) {
+	if index < 0 || index >= len(timeline.tracks) {
+		return
+	}
+	removed := timeline.tracks[index]
+	sync.mutex_lock(&audio_timeline_mtx)
+	for &c in removed.clips {
+		delete(c.markers)
+	}
+	delete(removed.clips)
+	delete(removed.name)
+	ordered_remove(&timeline.tracks, index)
+	sync.mutex_unlock(&audio_timeline_mtx)
+	switch {
+	case selected_track == index:
+		selected_track = -1
+		selected_index = -1
+	case selected_track > index:
+		selected_track -= 1
+	}
+	moving_clip = false
+	moving_preview_clip = false
+	drag_clip = nil
+	drag_source_track = -1
+	drag_source_index = -1
+	drag_hover_track = -1
+	// CRITICAL: the removed clips' decoded frames/decoders/GPU textures must be
+	// dropped or they keep painting at the playhead. Same rule as any delete.
+	invalidate_preview_slots()
+	audio_note_edit()
+	return
+}

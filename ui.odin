@@ -431,6 +431,14 @@ if clay.UI(clay.ID("Preview"))({
 										}) {
 											// Duplicate glyph is drawn as an embedded icon overlay.
 										}
+										if clay.UI(clay.ID("RemoveTrack", u32(track_idx)))({
+											layout = {sizing = {width = clay.SizingFixed(30), height = clay.SizingFixed(34)}, childAlignment = {x = .Center, y = .Center}},
+											backgroundColor = clay.PointerOver(clay.ID("RemoveTrack", u32(track_idx))) ? BUTTON_HOVER : BUTTON,
+											border = {color = clay.PointerOver(clay.ID("RemoveTrack", u32(track_idx))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
+											cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+										}) {
+											// Remove glyph is drawn as an embedded icon overlay.
+										}
 									}
 									if clay.UI(clay.ID("ClipsSection", u32(track_idx)))({
 										layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight},
