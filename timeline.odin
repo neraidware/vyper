@@ -1007,7 +1007,7 @@ move_linked_group :: proc(track_delta: int) -> bool {
 			return false
 		}
 	}
-	PlannedMove :: struct { src_track, src_index, dst_track: int, start: i64, clip: Clip }
+	PlannedMove :: struct { src_track, dst_track: int, start: i64, clip: Clip }
 	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig))
 	defer delete(planned)
 	sync.mutex_lock(&audio_timeline_mtx)
@@ -1031,12 +1031,21 @@ move_linked_group :: proc(track_delta: int) -> bool {
 		// mouse-aligned slot; commit exactly there (no per-member clamping,
 		// which would silently split the group).
 		start := max(m.start + drag_group_delta, 0)
-		append(&planned, PlannedMove{src_track = m.track, src_index = idx, dst_track = dst_track, start = start, clip = clip})
+		append(&planned, PlannedMove{src_track = m.track, dst_track = dst_track, start = start, clip = clip})
 	}
-	// Group members each live on their own lane, so planned src_tracks are
-	// distinct; the removal order cannot collide.
+	// Commit every relocation. Source indices captured at planning time are NOT
+	// reusable here: appending one member into another member's destination lane
+	// re-sorts that track and shifts its clips, so a cached src_index would make
+	// ordered_remove delete the wrong clip (the member it displaced kept its
+	// place while the anchor vanished). Always re-locate each member's source by
+	// clip_id immediately before removal -- same rule resize_group_* already use.
 	for p in planned {
-		ordered_remove(&timeline.tracks[p.src_track].clips, p.src_index)
+		src := &timeline.tracks[p.src_track]
+		idx := clip_index_by_id(src, p.clip.clip_id)
+		if idx < 0 {
+			continue
+		}
+		ordered_remove(&src.clips, idx)
 		clip := p.clip
 		clip.timeline_start_frame = p.start
 		dst := &timeline.tracks[p.dst_track]

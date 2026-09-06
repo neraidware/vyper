@@ -162,7 +162,13 @@ timeline_frame_from_x :: proc(mx: f32) -> i64 {
 	}
 	empty := clay.GetElementData(clay.ID("EmptyTimeline")).boundingBox
 	if empty.width > 0 {
-		return max(0, i64((mx - empty.x) / timeline_zoom + timeline_view_start))
+		// Frame 0 sits at the left of the first track's clip lane, NOT at the
+		// left of the empty body: lane_box_for lays the ghost (and the first
+		// real track) out with a gutter column + gap before the clips, so an
+		// unshifted origin puts both the ghost tile and the committed clip
+		// ~GUTTER_WIDTH + SECTION_GAP pixels right of the cursor.
+		origin := empty.x + f32(TIMELINE_PADDING) + GUTTER_WIDTH + SECTION_GAP
+		return max(0, i64((mx - origin) / timeline_zoom + timeline_view_start))
 	}
 	return 0
 }
@@ -344,18 +350,6 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 			if lane_box.width <= 0 || lane_box.height <= 0 {
 				continue
 			}
-			if lane.created {
-				// Ghost track: this lane doesn't exist yet; a drop here would
-				// create it. Painted below as a full row anyway — the row ghost
-				// below spans the whole on-screen lane for every lane, so an
-				// appended track reads as a track even before it exists.
-			}
-			// Row ghost: a single translucent strip across the WHOLE lane — the
-			// name-gutter column (before the clips) plus the clip area — so a
-			// hovered lane reads as a full track. The scissor is reset to the
-			// full window first: whatever clay's last command (or the previous
-			// lane's clip rect) left would clip the name column out of frame.
-			rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
 			// Gutter column: one SECTION_GAP + GUTTER_WIDTH left of the lane box
 			// (TrackRow lays out TrackName + gap + ClipsSection). Derived from the
 			// lane geometry instead of GetElementData, whose RulerGutter box can
@@ -365,17 +359,28 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 			if gx >= 0 {
 				row = clay.BoundingBox{x = gx, y = lane_box.y, width = lane_box.x + lane_box.width - gx, height = lane_box.height}
 			}
-			sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
-			render_sdf_rect(renderer, command_buffer, pass, row, clay.Color{52, 66, 84, 110}, 4, 0)
-			// Name-gutter overlay: the dark row ghost is nearly invisible against
-			// the lighter TRACK_GUTTER_BG, so paint the gutter column with a bold
-			// cyan wash + outline that cannot blend into the background.
-			if gx >= 0 {
-				header := clay.BoundingBox{x = gx, y = lane_box.y, width = GUTTER_WIDTH, height = lane_box.height}
-				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 120}, 0, 0)
-				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 255}, 0, 2)
+			if lane.created {
+				// A ghost track's lane doesn't exist yet: a drop here creates it.
+				// A full-row ghost — name column + clip area — makes the pending
+				// track read as a track before it exists. Existing lanes must NOT
+				// get this: the translucent dark strip would bury their live
+				// clips. The scissor is reset to the full window first: whatever
+				// clay's last command (or the previous lane's clip rect) left
+				// would clip the name column out of frame.
+				sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+				render_sdf_rect(renderer, command_buffer, pass, row, clay.Color{52, 66, 84, 110}, 4, 0)
+				// Name-gutter overlay: the dark row ghost is nearly invisible
+				// against the lighter TRACK_GUTTER_BG, so paint the gutter column
+				// with a bold cyan wash + outline that cannot blend into the
+				// background.
+				if gx >= 0 {
+					header := clay.BoundingBox{x = gx, y = lane_box.y, width = GUTTER_WIDTH, height = lane_box.height}
+					render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 120}, 0, 0)
+					render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 255}, 0, 2)
+				}
 			}
 			if media_drag_trace_once {
+				rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
 				fmt.printf("[md] lane=%d created=%v gx=%.1f rg=%v row=%v lane_box=%v\n", lane.track_idx, lane.created, gx, rg, row, lane_box)
 				media_drag_trace_once = false
 			}
