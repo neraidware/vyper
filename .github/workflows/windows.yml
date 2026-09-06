@@ -81,6 +81,9 @@ jobs:
             Write-Host "glslangValidator not found; using committed .spv files"
           }
 
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Compile nanosvg (SVG renderer)
         shell: pwsh
         run: |
