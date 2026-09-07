@@ -206,6 +206,36 @@ snap_center :: proc(clip: ^Clip, margin: f32) -> bool {
 	return snapped
 }
 
+// handle_center_pivot_scale returns the scale factor for a handle drag pivoted
+// about the box center (Shift held): the dragged edge/corner tracks the pointer
+// while the whole box grows/shrinks about its center, so both sides move
+// together instead of pinning the opposite edge. bw/bh are the box dimensions
+// in whatever units the caller uses (visible box for video, base text size for
+// text); for video the return is a multiplier on scale0, for text (where the
+// units are the scale=1 base size) it is already the absolute target scale.
+handle_center_pivot_scale :: proc(handle: int, cx, cy, pmx, pmy, bw, bh: f32) -> f32 {
+	half_w := max(bw / 2, 0.0001)
+	half_h := max(bh / 2, 0.0001)
+	switch handle {
+	case 1: // top
+		return (cy - pmy) / half_h
+	case 5: // bottom
+		return (pmy - cy) / half_h
+	case 7: // left
+		return (cx - pmx) / half_w
+	case 3: // right
+		return (pmx - cx) / half_w
+	}
+	kx := (pmx - cx) / half_w
+	ky := (pmy - cy) / half_h
+	// Corner: keep the aspect lock via the dominant axis, same rule as the
+	// opposite-pivot path.
+	if abs(pmy - cy) / half_h > abs(pmx - cx) / half_w {
+		return ky
+	}
+	return kx
+}
+
 // clip_image_bounds returns the pixel-space rect the clip occupies in the
 // preview: the crop-adjusted (visible) box. Crop insets are normalized
 // fractions (0..1) of the scale box, so the visible box is the scale box
@@ -309,7 +339,7 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx
 // scaling the clip (default) or trimming its source crop (crop mode). Scaling
 // pins the handle opposite the one being dragged: the opposite edge/corner
 // stays fixed while the dragged handle tracks the pointer.
-update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
+update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, from_center := false) {
 	if dragging_handle < 0 || clip == nil {
 		return
 	}
@@ -350,6 +380,18 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		top0 := ty0
 		bottom0 := ty0 + bh0 * scale0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+
+		if from_center {
+			cpx := left0 + bw0 * scale0 / 2
+			cpy := top0 + bh0 * scale0 / 2
+			s := max(handle_center_pivot_scale(dragging_handle, cpx, cpy, pmx, pmy, bw0, bh0), 0.01)
+			w := bw0 * s
+			h := bh0 * s
+			clip.scale = clamp(s, 0.05, 100.0)
+			clip.transform_x = cpx - w / 2
+			clip.transform_y = cpy - h / 2
+			return
+		}
 
 		k: f32 = 1
 		switch dragging_handle {
@@ -463,6 +505,28 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		h0 := (1 - ct - cb) * ch0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
 
+		if from_center {
+			// Shift held: pivot about the visible box center — both edges move,
+			// the box never drifts. The center is the transform shifted by the
+			// crop asymmetry ((dr-dl)/2), so a cropped clip still resizes about
+			// what the user sees.
+			cx := handle_start_tx + (dl0 - dr0) / 2
+			cy := handle_start_ty + (dt0 - db0) / 2
+			k := max(handle_center_pivot_scale(dragging_handle, cx, cy, pmx, pmy, w0, h0), 0.01)
+			s := scale0 * k
+			cw, ch := clip_full_box_dims(clip, PW * s, PH * s)
+			dl := (0.5 - cl) * cw
+			dr := (0.5 - cr) * cw
+			dt := (0.5 - ct) * ch
+			db := (0.5 - cb) * ch
+			clip.scale = clamp(s, 0.05, 100.0)
+			clip.transform_x = cx + (dl - dr) / 2
+			clip.transform_y = cy + (dt - db) / 2
+			snap_center(clip, snap_margin(canvas, 5))
+			snap_transform(clip, snap_margin(canvas, 5))
+			return
+		}
+
 		k: f32 = 1
 		switch dragging_handle {
 		case 1: // top: pin bottom
@@ -533,10 +597,10 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		clip.transform_x = tx
 		clip.transform_y = ty
 		// Snap the resulting visible box to the canvas center (when near it)
-		// or to the project borders.
-		if !snap_center(clip, snap_margin(canvas, 5)) {
-			snap_transform(clip, snap_margin(canvas, 5))
-		}
+		// and/or to the project borders; running both means a clip near the
+		// center still edge-snaps (the center gate used to skip it entirely).
+		snap_center(clip, snap_margin(canvas, 5))
+		snap_transform(clip, snap_margin(canvas, 5))
 	case .Crop:
 		// Crop trims the visible box: dragging one edge moves that edge (and the
 		// adjacent edges for a corner) while the opposite visible edge stays

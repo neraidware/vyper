@@ -1031,7 +1031,7 @@ main :: proc() {
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
 				canvas := preview_canvas(pb)
-				update_handle_drag(sel, canvas, mouse_x, mouse_y)
+				update_handle_drag(sel, canvas, mouse_x, mouse_y, shift_down)
 			}
 		} else if resizing_areas {
 			upper_area_height = mouse_y - 8
@@ -1053,10 +1053,10 @@ main :: proc() {
 					sel.transform_x = pcx - preview_drag_offset_x
 					sel.transform_y = pcy - preview_drag_offset_y
 					// 5px snap margin (in rendered preview pixels): to the canvas
-					// center when near it, otherwise to the canvas borders.
-					if !snap_center(sel, snap_margin(canvas, 5)) {
-						snap_transform(sel, snap_margin(canvas, 5))
-					}
+					// center when near it, and/or to the canvas borders (edge
+					// snap runs regardless, so a centered clip still snaps).
+					snap_center(sel, snap_margin(canvas, 5))
+					snap_transform(sel, snap_margin(canvas, 5))
 				}
 			}
 		} else if resizing_clip {
