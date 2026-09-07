@@ -240,6 +240,13 @@ PLAYBACK_RATES :: []f64{1, 1.5, 2, 2.5, 3, 3.5, 4}
 // spurious diffs).
 preview_proxy_enabled: bool = true
 
+// async_import_mode gates the background proxy builder (import_bg.odin): live
+// editing (default) enqueues proxy encodes on a worker with progress + cancel
+// so importing never blocks; probes switch it off to keep the synchronous build
+// so the proxy exists on disk the moment import_media returns (the proxy-probe
+// asserts that exactly).
+async_import_mode: bool = true
+
 // playback_dir is the playback direction: +1 forward, -1 backward. Set by the
 // forward/backward jog controls (and h/l keys); playback advances the playhead
 // by +dir each step.

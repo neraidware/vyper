@@ -415,6 +415,10 @@ main :: proc() {
 		proxy_probe_run(xp)
 		return
 	}
+	if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); xb != "" {
+		proxy_bg_probe_run(xb)
+		return
+	}
 	if !load_font_data() {
 		return
 	}
@@ -485,6 +489,8 @@ main :: proc() {
 	defer audio_shutdown()
 	async_dec_init()
 	defer async_dec_shutdown()
+	import_bg_init()
+	defer import_bg_shutdown()
 	defer if warm_valid {
 		clip_decoder_reset(&warm_decoder)
 	}
@@ -772,7 +778,9 @@ main :: proc() {
 		if len(timeline.tracks) > 0 {
 			timeline_view_top = clamp(timeline_view_top, 0, timeline_tracks_max_top())
 		}
-		if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
+		if mouse_down && !was_mouse_down && import_bg_active() && box_contains(import_cancel_box, mouse_x, mouse_y) {
+			import_bg_cancel()
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
 			if path := open_file_picker(); path != nil {
 				import_media_to_bin(path)
 			}
@@ -1271,6 +1279,7 @@ main :: proc() {
 		sync.atomic_store(&ui_playhead_frame, playhead.frame)
 		audio_update()
 		poll_completed_thread()
+		import_bg_consume_done()
 		ui_frame_count += 1
 		if ui_report_tick == 0 {
 			ui_report_tick = now_ns
@@ -1372,6 +1381,7 @@ main :: proc() {
 				draw_preview(&renderer, command_buffer, pass, preview_bounds)
 				draw_preview_hud(&renderer, command_buffer, pass, preview_bounds)
 			}
+			draw_import_progress(&renderer, command_buffer, pass, f32(width), f32(height))
 			sdl.EndGPURenderPass(pass)
 		}
 		if !sdl.SubmitGPUCommandBuffer(command_buffer) {

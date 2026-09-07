@@ -289,7 +289,7 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	// with no proxy just previews from the source.
 	if probe.has_video {
 		proxy_buf: [4096]u8
-		_ = proxy_transcode(path, frame_count, src_w, src_h, proxy_buf[:])
+		_ = proxy_transcode(path, frame_count, src_w, src_h, i64(probe.duration_sec * 1_000_000), proxy_buf[:])
 	}
 	return asset_id
 }

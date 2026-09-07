@@ -628,6 +628,94 @@ draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComman
 	})
 }
 
+// import_cancel_box is the modal's Cancel button hit-box, set by
+// draw_import_progress each frame while the overlay is visible (main.odin uses
+// it for manual click dispatch).
+import_cancel_box: clay.BoundingBox
+
+// draw_import_progress paints the modal overlay for a background proxy build:
+// a dimmed full-window veil, a panel with the source name, phase label,
+// progress bar (indeterminate while ffmpeg estimates), percent, and a Cancel
+// button. Drawn last so it sits above every clay/gpu layer.
+draw_import_progress :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, win_w, win_h: f32) {
+	active, frac, phase, src := import_bg_status()
+	if !active {
+		return
+	}
+	render_sdf_rect(renderer, command_buffer, pass, {0, 0, win_w, win_h}, {6, 7, 10, 215}, 0, 0)
+
+	W: f32 = 440
+	H: f32 = 180
+	panel := clay.BoundingBox{x = (win_w - W) / 2, y = (win_h - H) / 2, width = W, height = H}
+	render_sdf_rect(renderer, command_buffer, pass, panel, EDITOR_BG, 10, 0)
+	render_sdf_rect(renderer, command_buffer, pass, {panel.x, panel.y, panel.width, 3}, BUTTON_BORDER_HOVER, 0, 0)
+
+	title := "Building preview proxy…"
+	if phase == .Building {
+		title = "Building preview proxy…"
+	} else if phase == .Verifying {
+		title = "Verifying proxy…"
+	} else {
+		title = "Preparing proxy…"
+	}
+	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 22, width = panel.width - 48, height = f32(FONT_NORMAL)}, clay.TextRenderData{
+		stringContents = clay.StringSlice{length = c.int32_t(len(title)), chars = ([^]c.char)(raw_data(title))},
+		textColor = TEXT,
+		fontSize = FONT_NORMAL,
+		letterSpacing = 1,
+		lineHeight = FONT_NORMAL,
+	})
+
+	// Source name, truncated to the panel (raw byte clamp; typical files are ASCII).
+	name := string(src)
+	name_len := min(len(name), 52)
+	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 50, width = panel.width - 48, height = f32(FONT_SMALL)}, clay.TextRenderData{
+		stringContents = clay.StringSlice{length = c.int32_t(name_len), chars = ([^]c.char)(raw_data(name))},
+		textColor = TOOLTIP_TEXT,
+		fontSize = FONT_SMALL,
+		letterSpacing = 1,
+		lineHeight = FONT_SMALL,
+	})
+
+	fill_frac := f32(frac)
+	if fill_frac < 0 {
+		fill_frac = 0.25 // indeterminate while ffmpeg estimates
+	}
+	if fill_frac > 1 {
+		fill_frac = 1
+	}
+	track := clay.BoundingBox{x = panel.x + 24, y = panel.y + 84, width = panel.width - 48, height = 12}
+	render_sdf_rect(renderer, command_buffer, pass, track, HANDLE_FILL, 6, 0)
+	if phase == .Building && fill_frac > 0 {
+		fill := clay.BoundingBox{x = track.x, y = track.y, width = track.width * fill_frac, height = track.height}
+		render_sdf_rect(renderer, command_buffer, pass, fill, BUTTON_BORDER_HOVER, 6, 0)
+	}
+
+	if frac >= 0 && phase == .Building {
+		pct := fmt.tprintf("%d%%", int(frac * 100 + 0.5))
+		render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 102, width = panel.width - 48, height = f32(FONT_SMALL)}, clay.TextRenderData{
+			stringContents = clay.StringSlice{length = c.int32_t(len(pct)), chars = ([^]c.char)(raw_data(pct))},
+			textColor = TOOLTIP_TEXT,
+			fontSize = FONT_SMALL,
+			letterSpacing = 1,
+			lineHeight = FONT_SMALL,
+		})
+	}
+
+	cancel := clay.BoundingBox{x = panel.x + panel.width - 104, y = panel.y + panel.height - 40, width = 80, height = 26}
+	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON, 6, 0)
+	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON_BORDER, 6, 1)
+	import_cancel_box = cancel
+	cancel_label := "Cancel"
+	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = cancel.x + 6, y = cancel.y + 6, width = cancel.width - 12, height = f32(FONT_NORMAL)}, clay.TextRenderData{
+		stringContents = clay.StringSlice{length = c.int32_t(len(cancel_label)), chars = ([^]c.char)(raw_data(cancel_label))},
+		textColor = TEXT,
+		fontSize = FONT_NORMAL,
+		letterSpacing = 1,
+		lineHeight = FONT_NORMAL,
+	})
+}
+
 // create_text_texture creates a tight R8G8B8A8 texture (owned by the slot) for
 // a text clip's baked raster. A text slot owns its texture (unlike video slots,
 // which point at the shared fixed preview_textures); it must be released via

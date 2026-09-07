@@ -97,10 +97,16 @@ proxy_probe_frame_count :: proc(path: cstring) -> i64 {
 }
 
 // proxy_transcode builds (or rebuilds) the all-intra low-res proxy for a source
-// video. Returns the proxy path on success (when the produced proxy is
-// frame-count-equivalent to the source), or cstring(nil) on any failure or
-// parity mismatch. `src_frames` is the source's own frame count.
-proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, out_buf: []u8) -> cstring {
+// video. In live editing (async_import_mode) it enqueues the build on the
+// background worker and returns immediately -- `src_dur_us` (the source
+// duration) becomes the progress denominator -- so importing never blocks on
+// the transcode; the proxy appears once the worker finishes + verifies it. In
+// probe/CI mode (async_import_mode=false) it keeps the historical synchronous
+// build so the proxy exists on disk when import returns. Returns the proxy path
+// when one is ready right now (fast disk-cache hit, or the sync build), or
+// cstring(nil) when the build is deferred (async) or failed. `src_frames` is the
+// source's own frame count.
+proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, src_dur_us: i64, out_buf: []u8) -> cstring {
 	if !preview_proxy_enabled {
 		return nil
 	}
@@ -111,6 +117,16 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, out_
 	if proxy_valid_cache_hit(proxy, src_frames) {
 		return proxy
 	}
+	if async_import_mode {
+		// Defer the encode to the worker: import returns immediately and the
+		// clip previews from the ORIGINAL until the proxy lands. proxy_pick
+		// refuses a half-written proxy while this is in flight (see
+		// import_bg_building_for).
+		import_bg_request(src, src_frames, src_dur_us, src_w, src_h)
+		return nil
+	}
+	// Synchronous build (probe/CI determinism). Encode settings must stay in
+	// lockstep with import_bg_build's background argv.
 	w, h := proxy_scale(src_w, src_h)
 	filter := fmt.aprintf("scale=%d:%d", w, h)
 	// Run ffmpeg with an argv (no shell), capturing (and discarding) its output.
@@ -166,6 +182,12 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 // preview decoder can use it.
 proxy_pick :: proc(src: cstring, src_frames: i64, out_buf: []u8) -> cstring {
 	if !preview_proxy_enabled {
+		return nil
+	}
+	// A proxy build is in flight for this source: the file on disk is partial.
+	// Never validate (file size/count check) it -- the parity check would
+	// conclude "too short" and delete the artifact from under ffmpeg.
+	if import_bg_building_for(string(src)) {
 		return nil
 	}
 	proxy, ok := proxy_path_for(src, out_buf)

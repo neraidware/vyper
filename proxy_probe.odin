@@ -2,7 +2,10 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:strings"
+import "core:time"
+import sdl "vendor:sdl3"
 
 // Large probe buffers live at package scope to avoid stack pressure.
 gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
@@ -23,6 +26,10 @@ gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
 
 proxy_probe_run :: proc(v: string) {
 	preview_proxy_enabled = true
+	// The proxy-probe asserts the proxy exists on disk right after import_media
+	// returns, so it needs the historical SYNCHRONOUS build, not the background
+	// worker (which would still be transcoding at that point).
+	async_import_mode = false
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
 		fmt.println("proxy-probe: need NERED_PROXY_PROBE=\"<file>\"")
@@ -103,6 +110,118 @@ proxy_probe_run :: proc(v: string) {
 	os.remove(string(proxy))
 	fmt.println("[proxy-probe] OK: proxy transcoded, picked, decoded, matches source content")
 	os.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// NERED_PROXY_BG_TEST="<file>[|<cancel_pct>]": exercise the BACKGROUND proxy
+// builder (import_bg.odin) without a window.
+//
+// Imports `file` with async_import_mode=true like the live editor, then polls
+// the worker until it either:
+//   - verifies a valid proxy (Done_Ok) -> exit 0; or
+//   - with <cancel_pct> given (e.g. "30"): issues import_bg_cancel once the
+//     reported progress crosses that percent and expects Done_Cancelled with the
+//     partial proxy removed -> exit 0.
+// Anything else (Done_Fail, timeout, spawn/progress oddity) exits 1.
+// ---------------------------------------------------------------------------
+proxy_bg_probe_run :: proc(v: string) {
+	import_bg_init()
+	defer import_bg_shutdown()
+
+	preview_proxy_enabled = true
+	async_import_mode = true
+
+	parts := strings.split(v, "|")
+	if len(parts) < 1 {
+		fmt.println("proxy-bg-test: need NERED_PROXY_BG_TEST=\"<file>[|<cancel_pct>]\"")
+		os.exit(2)
+	}
+	file := parts[0]
+	cancel_pct: f64 = -1
+	if len(parts) > 1 {
+		cancel_pct, _ = strconv.parse_f64(parts[1])
+	}
+
+	inp: [4096]u8
+	n := 0
+	for n < len(file) && n < len(inp) - 1 {
+		inp[n] = file[n]
+		n += 1
+	}
+	inp[n] = 0
+	path := cstring(&inp[0])
+
+	// Full import: bin + timeline, mirroring the GUI's Open File flow. The
+	// proxy build must NOT block this call.
+	import_media(path)
+
+	deadline := sdl.GetTicksNS() + 300_000_000_000
+	last_report := sdl.GetTicksNS()
+	cancel_sent := false
+	reported: int = -1
+	for {
+		active, frac, phase, src := import_bg_status()
+		now := sdl.GetTicksNS()
+
+		pct := int(frac * 100)
+		if frac >= 0 && pct != reported && now - last_report > 200_000_000 {
+			fmt.printf("[proxy-bg-test] progress=%d%% phase=%v\n", pct, phase)
+			reported = pct
+			last_report = now
+		}
+
+		if !cancel_sent && cancel_pct >= 0 && frac >= cancel_pct / 100.0 && phase == .Building {
+			fmt.printf("[proxy-bg-test] sending cancel at %d%%\n", pct)
+			import_bg_cancel()
+			cancel_sent = true
+		}
+
+		switch phase {
+		case .Done_Ok:
+			if nered_trace {
+				fmt.printf("[proxy-bg-test] worker finished, verifying on-disk artifact\n")
+			}
+			pbuf: [4096]u8
+			proxy, got := proxy_path_for(path, pbuf[:])
+			if !got || !os.exists(string(proxy)) {
+				fmt.println("[proxy-bg-test] FAIL: Done_Ok but proxy missing")
+				os.exit(1)
+			}
+			if !proxy_valid_cache_hit(proxy, media_frame_count(file_info_text)) {
+				fmt.println("[proxy-bg-test] FAIL: Done_Ok but parity check rejects proxy")
+				os.exit(1)
+			}
+			os.remove(string(proxy))
+			fmt.println("[proxy-bg-test] OK: async proxy built and verified")
+			os.exit(0)
+
+		case .Done_Cancelled:
+			if !cancel_sent {
+				fmt.println("[proxy-bg-test] FAIL: done-cancelled without a cancel request")
+				os.exit(1)
+			}
+			pbuf: [4096]u8
+			proxy, got := proxy_path_for(path, pbuf[:])
+			if got && os.exists(string(proxy)) {
+				fmt.println("[proxy-bg-test] FAIL: cancelled but partial proxy left on disk")
+				os.exit(1)
+			}
+			fmt.println("[proxy-bg-test] OK: cancelled, partial proxy cleaned up")
+			os.exit(0)
+
+		case .Done_Fail:
+			fmt.println("[proxy-bg-test] FAIL: proxy build errored")
+			os.exit(1)
+
+		case .Building, .Verifying, .Idle:
+		}
+
+		if now > deadline {
+			fmt.println("[proxy-bg-test] FAIL: timed out waiting for the background build")
+			os.exit(1)
+		}
+		time.sleep(50 * time.Millisecond)
+	}
 }
 
 // buffer_diff_metrics computes mean and max |gt - px| per channel (RGBA packed).
