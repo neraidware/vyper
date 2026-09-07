@@ -88,6 +88,28 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							fps_label = fmt.aprintf("%g fps", project.frame_rate)
 						}
 						clay.Text(fmt.aprintf("FPS: %s", fps_label), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+					clay.Text("Resolution", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+					if clay.UI(clay.ID("InfoResRow"))({
+						layout = {
+							sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+							layoutDirection = .LeftToRight,
+							childGap = BUTTON_ROW_GAP,
+						},
+					}) {
+						res_auto_button()
+						res_preset_button("Res720", "720p", 1280, 720)
+						res_preset_button("Res1080", "1080p", 1920, 1080)
+						res_preset_button("Res4K", "4K", 3840, 2160)
+					}
+					if clay.UI(clay.ID("InfoOrientRow"))({
+						layout = {
+							sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+							layoutDirection = .LeftToRight,
+							childGap = BUTTON_ROW_GAP,
+						},
+					}) {
+						vertical_toggle_button("OrientVertical", "Vertical")
+					}
 					}
 					if len(file_info_text) > 0 {
 						if clay.UI(clay.ID("FileInfo"))({
@@ -125,24 +147,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
 						}) {
 							clay.Text("Project Settings", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_NORMAL})
-							if clay.UI(clay.ID("ResolutionGroup"))({
-								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, childGap = BUTTON_ROW_GAP, layoutDirection = .TopToBottom},
-							}) {
-								clay.Text("Resolution", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
-							    if clay.UI(clay.ID("ResRow"))({
-                                    layout = {
-                                        sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-                                        layoutDirection = .LeftToRight,
-                                        childGap = BUTTON_ROW_GAP,
-                                    },
-                                }) {
-                                    res_auto_button()
-                                    res_preset_button("Res720", "720p", 1280, 720)
-                                    res_preset_button("Res1080", "1080p", 1920, 1080)
-                                    res_preset_button("Res4K", "4K", 3840, 2160)
-                                    vertical_toggle_button("OrientVertical", "Vertical")
-                                }
-							}
 							if clay.UI(clay.ID("FrameRateGroup"))({
 								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, childGap = BUTTON_ROW_GAP, layoutDirection = .TopToBottom},
 							}) {

@@ -96,6 +96,78 @@ Not yet implemented (roadmap below):
 
 ## Backlog (planned, in order)
 
+### Project settings / canvas configuration
+
+Single place for everything a `Project` can be configured with. The Project Info
+panel (left sidebar) is the always-visible home for these controls.
+
+Status: **resolution + orientation are done** — the resolution preset buttons
+(Auto / 720p / 1080p / 4K) and the orientation toggle (portrait vs landscape)
+live in the Project Info panel and work at any time, empty timeline or not. The
+old empty-state settings panel now only holds the frame-rate presets.
+
+Planned, in detail:
+
+- **Frame rate in the info panel**: presets 24/25/30/48/60/Auto already exist
+  (`fps_preset_button`) but only render in the empty-timeline Project Settings
+  panel, so they are unreachable once the timeline has clips. Move them into the
+  Project Info panel next to resolution; the click handlers in `main.odin` are
+  still gated on `len(timeline.tracks) == 0`. Also allow a **custom** frame rate
+  (arbitrary number, not just presets). Remap considerations on change: timeline
+  grid, playhead cadence, audio producer (see `set_project_fps`), and any audio
+  that is already queued (resync path).
+- **Custom resolution entry**: an arbitrary WxH field (not just the presets),
+  with validation, replacing the current preset-only buttons. Dimensions drive
+  the canvas aspect ratio and the preview fit.
+- **Aspect-ratio presets / orientation model**: today orientation is just a
+  width/height swap (`vertical_toggle_button` + `set_project_orientation`).
+  Richer model wanted: aspect presets (16:9, 9:16, 1:1, 4:3, 21:9, custom) that
+  pick resolution pair from a base dimension, plus a separate explicit
+  pixel-aspect-ratio field. Orientation should survive resolution changes
+  (currently Auto + swap can fight: buttons re-arm when `resolution_locked`
+  flips).
+- **Mid-project resolution change semantics**: what happens to existing timeline
+  clips when the canvas resizes?
+  - Clip transforms (`transform_x/y`, `scale`): keep pixel-relative values
+    (anchored) or rescale proportionally? Decide + document.
+  - Preview proxies are encoded at a fixed low resolution (`proxy_transcode`);
+    a canvas shrink/grow may need proxy re-encode or acceptable GPU up/down
+    scale until rebuilt. Currently proxies are per-source, not per-project, so
+    this affects the preview pipeline (`draw_preview`, `preview_transform`).
+  - Letterboxing for non-canvas-aspect source material.
+- **Render/export codecs and settings** (all future, none implemented):
+  - Video codec choice: H.264, HEVC/H.265, AV1, ProRes, (Motion JPEG?), with
+    per-codec option sets (profile, level, tune) surfaced only when the codec is
+    selected.
+  - Rate control: constant vs constrained vs target bitrate, CRF/quality slider,
+    GOP/keyframe interval, max-bitrate, buffer size, multi-pass.
+  - Hardware encoders: NVENC / AMF / VA-API / VideoToolbox where available
+    (detect at runtime; fall back to software x264/265).
+  - Pixel format / color range (`yuv420p`, `yuv444p`, limited vs full range),
+    color space primaries/transfer/metadata (Rec.709, Rec.2020, PQ/HLG for HDR),
+    tonemapping on export.
+  - Audio codec: AAC, Opus, MP3, PCM/WAV (FLAC) + sample rate + channel layout;
+    audio sample-rate conversion at export, not at import.
+  - Container: MP4, MOV, MKV; chapter markers (see OBS chapter import) embedded
+    on export when present.
+  - Encoder presets/speed vs quality tradeoff, and a "fast rough cut" vs "final"
+    mode.
+- **Other project info / metadata**:
+  - Project name editing (currently read-only text).
+  - Template presets that set several fields at once (e.g. "YouTube 1080p60",
+    "Instagram Reels 9:16 30fps") as a quick-start in the info panel.
+  - Defaults for new/empty projects (start resolution, fps).
+  - Color management workspace choice (sRGB / Rec.709 / Rec.2020 / HDR) driving
+    both preview and export, once compositing supports it.
+  - Track-level settings worth exposing later (per-track mute/solo/lock/opacity)
+    are out of scope for the project-info panel; they belong to the track
+    headers.
+- **Project persistence**: none today — everything is in-memory, so none of the
+  above survives a restart. On the roadmap: a project-file format
+  (`project.name`, `width/height`, `frame_rate`, in/out render range, and later
+  export/render presets) with save/load, so settings live in `Project` struct +
+  disk, not in UI globals.
+
 ### NEXT REQUEST — Playback/timeline quality regression + audio scrubbing
 
 Reported: playback, timeline interaction, clip-transition rendering, and

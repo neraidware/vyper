@@ -798,15 +798,15 @@ main :: proc() {
 					add_asset_to_timeline(asset_id, 0, timeline_duration())
 				}
 			}
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res720")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Res720")) {
 			set_project_resolution(1280, 720)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res1080")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Res1080")) {
 			set_project_resolution(1920, 1080)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Res4K")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Res4K")) {
 			set_project_resolution(3840, 2160)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("ResAuto")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("ResAuto")) {
 			set_project_resolution_auto()
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("OrientVertical")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OrientVertical")) {
 			set_project_orientation(!(project.height > project.width))
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps24")) {
 			set_project_fps(24)
