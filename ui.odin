@@ -488,8 +488,9 @@ if clay.UI(clay.ID("Preview"))({
 										    }
 if is_clip_selected(track_idx, index) {
 										    // Selected linked clips (video + audio moving as one unit)
-										    // outline yellow so the group is distinct from a lone clip.
-										    clip_border = BUTTON_BORDER_HOVER
+										    // outline yellow so the group is distinct from a lone clip;
+										    // a lone selected clip gets the blue selection border.
+										    clip_border = SELECT_BORDER
 										    clip_border_w = 3
 										    if timeline_clip.link_id != 0 {
 											    clip_border = MARKER_COLOR
