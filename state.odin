@@ -55,6 +55,11 @@ timeline_view_top: f32 = 0
 // snaps it to the edge. Both default on.
 snap_clips_to_playhead: bool = true
 snap_playhead_to_clips: bool = true
+// snap_center_to_canvas makes a clip dragged/scaled in the preview snap to the
+// project canvas center when its visible center comes within the snap margin.
+// Defaults on, like the other snap toggles; driven by the "Center" toggle in the
+// project info panel.
+snap_center_to_canvas: bool = true
 SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.01)
 TIMELINE_MAX_ZOOM :: f32(16)

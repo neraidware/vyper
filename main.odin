@@ -808,6 +808,8 @@ main :: proc() {
 			set_project_resolution_auto()
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OrientVertical")) {
 			set_project_orientation(!(project.height > project.width))
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapCenter")) {
+			snap_center_to_canvas = !snap_center_to_canvas
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps24")) {
 			set_project_fps(24)
 		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps25")) {
@@ -1050,8 +1052,11 @@ main :: proc() {
 					pcx, pcy := pixel_to_project_unclamped(canvas, mouse_x, mouse_y)
 					sel.transform_x = pcx - preview_drag_offset_x
 					sel.transform_y = pcy - preview_drag_offset_y
-					// 5px snap margin (in rendered preview pixels) to the preview borders.
-					snap_transform(sel, snap_margin(canvas, 5))
+					// 5px snap margin (in rendered preview pixels): to the canvas
+					// center when near it, otherwise to the canvas borders.
+					if !snap_center(sel, snap_margin(canvas, 5)) {
+						snap_transform(sel, snap_margin(canvas, 5))
+					}
 				}
 			}
 		} else if resizing_clip {

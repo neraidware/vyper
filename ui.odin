@@ -109,6 +109,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					}) {
 						vertical_toggle_button("OrientVertical", "Vertical")
+						settings_button("SnapCenter", "Center", snap_center_to_canvas)
 					}
 					}
 					if len(file_info_text) > 0 {

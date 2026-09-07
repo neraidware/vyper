@@ -161,6 +161,51 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 	}
 }
 
+// snap_center snaps a dragged/scaled clip so its visible box center lands on
+// the project canvas center when it comes within the given margin (project
+// units), mirroring the per-axis margin semantics of snap_transform. Active
+// only while snap_center_to_canvas is on; returns whether the clip snapped.
+snap_center :: proc(clip: ^Clip, margin: f32) -> bool {
+	if !snap_center_to_canvas {
+		return false
+	}
+	PW := f32(project.width)
+	PH := f32(project.height)
+	if clip.kind == .Text {
+		if clip.source_w <= 0 || clip.source_h <= 0 {
+			return false
+		}
+		f := clip.scale * PW / f32(PREVIEW_W)
+		w := f32(clip.source_w) * f
+		h := f32(clip.source_h) * f
+		cx := clip.transform_x + w / 2
+		cy := clip.transform_y + h / 2
+		snapped := false
+		if abs(cx - PW / 2) <= margin {
+			clip.transform_x = PW / 2 - w / 2
+			snapped = true
+		}
+		if abs(cy - PH / 2) <= margin {
+			clip.transform_y = PH / 2 - h / 2
+			snapped = true
+		}
+		return snapped
+	}
+	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+	cx := clip.transform_x + (clip.crop_l - clip.crop_r) * cw / 2
+	cy := clip.transform_y + (clip.crop_t - clip.crop_b) * ch / 2
+	snapped := false
+	if abs(cx - PW / 2) <= margin {
+		clip.transform_x = PW / 2 - (clip.crop_l - clip.crop_r) * cw / 2
+		snapped = true
+	}
+	if abs(cy - PH / 2) <= margin {
+		clip.transform_y = PH / 2 - (clip.crop_t - clip.crop_b) * ch / 2
+		snapped = true
+	}
+	return snapped
+}
+
 // clip_image_bounds returns the pixel-space rect the clip occupies in the
 // preview: the crop-adjusted (visible) box. Crop insets are normalized
 // fractions (0..1) of the scale box, so the visible box is the scale box
@@ -487,8 +532,11 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32) {
 		clip.scale = clamp(s, 0.05, 100.0)
 		clip.transform_x = tx
 		clip.transform_y = ty
-		// Snap the resulting visible box edges to the project borders.
-		snap_transform(clip, snap_margin(canvas, 5))
+		// Snap the resulting visible box to the canvas center (when near it)
+		// or to the project borders.
+		if !snap_center(clip, snap_margin(canvas, 5)) {
+			snap_transform(clip, snap_margin(canvas, 5))
+		}
 	case .Crop:
 		// Crop trims the visible box: dragging one edge moves that edge (and the
 		// adjacent edges for a corner) while the opposite visible edge stays
