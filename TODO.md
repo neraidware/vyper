@@ -204,6 +204,39 @@ Verification for this block: `NERED_CACHE_PROBE`, `NERED_FRAME_PROBE`, and
 `NERED_BOUNDARY_PROBE` all at 0 mismatches; interactive scrub/play across a
 no-gap clip boundary renders the correct frame and audio follows the playhead.
 
+### Proxy recode speed / background-builder responsiveness
+
+The background proxy builder (`import_bg.odin`) transcodes a large source to a
+768x432 all-intra preview. Done so far:
+
+- **`-preset ultrafast`** (was `veryfast`) in BOTH the background builder and
+  the synchronous `proxy_transcode` path: ~1.8x faster encode on a 10-min
+  1080p test source with the same `-crf 18` output quality, settings still in
+  lockstep between the two builders.
+- **`-threads` capped to half the logical cores** (`proxy_encode_threads`,
+  `sdl.GetNumLogicalCPUCores`): a default-threaded transcode saturates every
+  core (decode + x264), starving the SDL loop so the editor looks frozen while
+  the worker runs. Half leaves the interactive side air; wall time barely moves
+  because frame DECODE is the bottleneck, not x264.
+
+Remaining (real lever for hours-long sources):
+
+- **Hardware decode + encode** (NVENC / AMD AMF / VA-API / VideoToolbox): detect
+  the encoder at runtime from `ffmpeg -encoders` (already enumerated; this dev
+  box has none usable — no render node/CUDA), pick `h264_nvenc` /
+  `h264_videotoolbox` / `h264_vaapi` / `h264_qsv` / `h264_amf` / fallback
+  libx264-ultrafast, and mirror the input side with `-hwaccel` decode
+  (decode-bound when the source is huge). Expect near-real-time proxy builds
+  with near-zero CPU. Encoder-specific quality args (`-cq`/`-qp`, `-g 1`,
+  `-bf 0`) must keep both builders in lockstep and still pass the frame-count
+  parity check + decode-content probe.
+- **`nice`/low-priority ffmpeg** on POSIX so even a capped software encode yields
+  to interaction on small-core machines.
+- **Chunked/lazy proxy**: build only the range near the playhead first, extend
+  in the background — avoids multi-minute first-edit setup on giant imports.
+- **Proxy re-encode on project resolution change** (see mid-project resolution
+  semantics above): a canvas shrink/grow may want a fresh proxy resolution.
+
 - **Pitch-preserving playback rate**: playback >1x currently uses
   `SDL_SetAudioStreamFrequencyRatio` (plain resample), so **pitch rises** at
   2x+. Recommended approach (user-approved, not started): FFmpeg

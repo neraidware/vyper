@@ -273,8 +273,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 	}
 	scale_w, scale_h := proxy_scale(w, h)
 	filter := fmt.aprintf("scale=%d:%d", scale_w, scale_h)
+	threads := proxy_encode_threads()
 	progress_file := strings.concatenate({string(proxy), ".progress"})
 	defer delete(filter)
+	defer delete(threads)
 	defer delete(progress_file)
 
 	argv := []string{
@@ -283,10 +285,11 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		"-an",
 		"-vf", filter,
 		"-c:v", "libx264",
-		"-preset", "veryfast",
+		"-preset", "ultrafast",
 		"-tune", "fastdecode",
-		"-crf", "18",
+		"-crf", "26",
 		"-g", "1",
+		"-threads", threads,
 		"-pix_fmt", "yuv420p",
 		"-progress", progress_file,
 		"-nostats", "-loglevel", "error", "-hide_banner",

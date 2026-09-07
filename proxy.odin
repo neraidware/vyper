@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 // Preview proxies.
 //
@@ -96,6 +97,20 @@ proxy_probe_frame_count :: proc(path: cstring) -> i64 {
 	return v
 }
 
+// proxy_encode_threads picks how many ffmpeg threads a proxy encode may use: at
+// most half the logical cores. A full-resolution libx264 encode of a long
+// source saturates every core (decode + encode), starving the SDL loop and
+// making the editor look frozen while the background builder runs. Half leaves
+// the interactive side air; the wall-clock cost is small (frame decode is the
+// bottleneck, not x264).
+proxy_encode_threads :: proc() -> string {
+	threads := sdl.GetNumLogicalCPUCores()
+	if threads > 0 {
+		threads = max(threads / 2, 2)
+	}
+	return fmt.aprintf("%d", threads)
+}
+
 // proxy_transcode builds (or rebuilds) the all-intra low-res proxy for a source
 // video. In live editing (async_import_mode) it enqueues the build on the
 // background worker and returns immediately -- `src_dur_us` (the source
@@ -129,6 +144,8 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, src_
 	// lockstep with import_bg_build's background argv.
 	w, h := proxy_scale(src_w, src_h)
 	filter := fmt.aprintf("scale=%d:%d", w, h)
+	threads := proxy_encode_threads()
+	defer delete(threads)
 	// Run ffmpeg with an argv (no shell), capturing (and discarding) its output.
 	run_capture({
 		"ffmpeg",
@@ -137,10 +154,11 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, src_
 		"-an",
 		"-vf", filter,
 		"-c:v", "libx264",
-		"-preset", "veryfast",
+		"-preset", "ultrafast",
 		"-tune", "fastdecode",
-		"-crf", "18",
+		"-crf", "26",
 		"-g", "1",
+		"-threads", threads,
 		"-pix_fmt", "yuv420p",
 		string(proxy),
 	})
