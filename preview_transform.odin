@@ -236,6 +236,38 @@ handle_center_pivot_scale :: proc(handle: int, cx, cy, pmx, pmy, bw, bh: f32) ->
 	return kx
 }
 
+// corner_snap_both snaps a dragged corner so BOTH of its edges land on the
+// canvas borders at once when the corner comes within the margin of the canvas
+// corner on both axes. Aspect-locked scaling tracks the dominant axis only, so
+// a source whose aspect differs from the canvas otherwise leaves the
+// perpendicular edge beyond the margin and just one side snaps; this brings the
+// box corner flush against the canvas corner (a side and the ceiling/floor
+// together). Returns the transform delta and whether it snapped.
+corner_snap_both :: proc(
+	handle: int,
+	left, right, top, bottom, margin, pw, ph: f32,
+) -> (tx_delta, ty_delta: f32, snapped: bool) {
+	switch handle {
+	case 0: // TL corner -> canvas (0,0)
+		if abs(left) <= margin && abs(top) <= margin {
+			return -left, -top, true
+		}
+	case 2: // TR corner -> canvas (pw,0)
+		if abs(right - pw) <= margin && abs(top) <= margin {
+			return pw - right, -top, true
+		}
+	case 4: // BR corner -> canvas (pw,ph)
+		if abs(right - pw) <= margin && abs(bottom - ph) <= margin {
+			return pw - right, ph - bottom, true
+		}
+	case 6: // BL corner -> canvas (0,ph)
+		if abs(left) <= margin && abs(bottom - ph) <= margin {
+			return -left, ph - bottom, true
+		}
+	}
+	return 0, 0, false
+}
+
 // clip_image_bounds returns the pixel-space rect the clip occupies in the
 // preview: the crop-adjusted (visible) box. Crop insets are normalized
 // fractions (0..1) of the scale box, so the visible box is the scale box
@@ -335,6 +367,54 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx
 	handle_start_box_h = ib.height
 }
 
+// clip_visible_box_project returns the clip's current visible (crop-adjusted)
+// box edges in project-resolution units, mirroring clip_image_bounds but in
+// project space (no camera/pixel mapping).
+clip_visible_box_project :: proc(clip: ^Clip) -> (l, r, t, b: f32) {
+	PW := f32(project.width)
+	PH := f32(project.height)
+	if clip.kind == .Text && clip.source_w > 0 && clip.source_h > 0 {
+		f := clip.scale * PW / f32(PREVIEW_W)
+		w := f32(clip.source_w) * f
+		h := f32(clip.source_h) * f
+		return clip.transform_x, clip.transform_x + w, clip.transform_y, clip.transform_y + h
+	}
+	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+	dl := (0.5 - clip.crop_l) * cw
+	dr := (0.5 - clip.crop_r) * cw
+	dt := (0.5 - clip.crop_t) * ch
+	db := (0.5 - clip.crop_b) * ch
+	return clip.transform_x - dl, clip.transform_x + dr, clip.transform_y - dt, clip.transform_y + db
+}
+
+// handle_drag_frozen reports whether an edge-handle drag must hold its current
+// box instead of resizing. Once the edge being dragged (the "driven" edge) has
+// snapped onto a canvas border, moving the cursor BEYOND that border would keep
+// rescaling the box on the opposite (pinned) edge -- the overflow reported as
+// "resizing on the other handle". Instead the box freezes at its snapped
+// geometry until the pointer comes back inside the border threshold, then the
+// driven edge re-detaches and resize resumes. Corners pivot the opposite corner
+// by design, so only the four edge handles freeze.
+handle_drag_frozen :: proc(clip: ^Clip, pmx, pmy, margin: f32) -> bool {
+	if clip == nil {
+		return false
+	}
+	PW := f32(project.width)
+	PH := f32(project.height)
+	l, r, t, b := clip_visible_box_project(clip)
+	switch dragging_handle {
+	case 1: // top: driven top edge pins at y=0
+		return abs(t) <= margin && pmy < -margin
+	case 5: // bottom: driven bottom edge pins at y=PH
+		return abs(b - PH) <= margin && pmy > PH + margin
+	case 7: // left: driven left edge pins at x=0
+		return abs(l) <= margin && pmx < -margin
+	case 3: // right: driven right edge pins at x=PW
+		return abs(r - PW) <= margin && pmx > PW + margin
+	}
+	return false
+}
+
 // update_handle_drag applies the current pointer to the active handle drag,
 // scaling the clip (default) or trimming its source crop (crop mode). Scaling
 // pins the handle opposite the one being dragged: the opposite edge/corner
@@ -360,6 +440,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		case .Scale:
 		}
 		PW := f32(project.width)
+		PH := f32(project.height)
 		twpx := f32(clip.source_w)
 		thpx := f32(clip.source_h)
 		if twpx <= 0 || thpx <= 0 {
@@ -471,6 +552,21 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		clip.scale = clamp(s, 0.05, 100.0)
 		clip.transform_x = tx
 		clip.transform_y = ty
+		if dragging_handle == 0 || dragging_handle == 2 || dragging_handle == 4 || dragging_handle == 6 {
+			dtx, dty, snapped := corner_snap_both(
+				dragging_handle,
+				clip.transform_x, clip.transform_x + new_w,
+				clip.transform_y, clip.transform_y + new_h,
+				snap_margin(canvas, 5), PW, PH,
+			)
+			if snapped {
+				clip.transform_x += dtx
+				clip.transform_y += dty
+			}
+		}
+		// Text clips are top-left anchored with a uniform scale; the box is only
+		// nudged to a canvas corner via corner_snap_both when the whole corner
+		// arrives there, and text may legitimately spill off-canvas otherwise.
 		return
 	}
 
@@ -504,6 +600,9 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		w0 := (1 - cl - cr) * cw0
 		h0 := (1 - ct - cb) * ch0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+		if handle_drag_frozen(clip, pmx, pmy, snap_margin(canvas, 5)) {
+			return
+		}
 
 		if from_center {
 			// Shift held: pivot about the visible box center — both edges move,
@@ -596,6 +695,27 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		clip.scale = clamp(s, 0.05, 100.0)
 		clip.transform_x = tx
 		clip.transform_y = ty
+		// Corner handles snap BOTH edges to the canvas corner at once when the
+		// corner reaches it on both axes (the dominant-axis scale alone would
+		// leave the perpendicular edge beyond the margin for aspect-mismatched
+		// sources).
+		if dragging_handle == 0 || dragging_handle == 2 || dragging_handle == 4 || dragging_handle == 6 {
+			cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+			dl := (0.5 - clip.crop_l) * cw
+			dr := (0.5 - clip.crop_r) * cw
+			dt := (0.5 - clip.crop_t) * ch
+			db := (0.5 - clip.crop_b) * ch
+			dtx, dty, snapped := corner_snap_both(
+				dragging_handle,
+				clip.transform_x - dl, clip.transform_x + dr,
+				clip.transform_y - dt, clip.transform_y + db,
+				snap_margin(canvas, 5), PW, PH,
+			)
+			if snapped {
+				clip.transform_x += dtx
+				clip.transform_y += dty
+			}
+		}
 		// Snap the resulting visible box to the canvas center (when near it)
 		// and/or to the project borders; running both means a clip near the
 		// center still edge-snaps (the center gate used to skip it entirely).

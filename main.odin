@@ -411,6 +411,10 @@ main :: proc() {
 		cache_probe_run(cp)
 		return
 	}
+	if tp, _ := os.lookup_env_alloc("NERED_TRANSFORM_PROBE", context.temp_allocator); tp != "" {
+		transform_probe_run(tp)
+		return
+	}
 	if xp, _ := os.lookup_env_alloc("NERED_PROXY_PROBE", context.temp_allocator); xp != "" {
 		proxy_probe_run(xp)
 		return
