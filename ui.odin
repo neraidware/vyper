@@ -109,7 +109,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					}) {
 						vertical_toggle_button("OrientVertical", "Vertical")
-						settings_button("SnapCenter", "Center", snap_center_to_canvas)
 					}
 					}
 					if len(file_info_text) > 0 {
@@ -223,6 +222,7 @@ if clay.UI(clay.ID("Preview"))({
 							}
 							jog_button("PlayFwd", 1)
 							playback_rate_dropdown()
+						settings_button("SnapCenter", "Center", snap_center_to_canvas)
 						}
 					}
 				}
