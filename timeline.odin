@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:math"
 import "core:slice"
 import "core:strconv"
+import "core:strings"
 import "core:sync"
 
 // ---------------------------------------------------------------------------
@@ -1240,6 +1241,50 @@ duplicate_track :: proc(index: int) {
 		append(&new_track.clips, c)
 	}
 	inject_at_elem(&timeline.tracks, index + 1, new_track)
+}
+
+// duplicate_clip inserts an independent copy of the clip at (track_idx,index)
+// on the same track, placed in the nearest free slot directly after the
+// original, and returns the new clip's index. The copy is a fresh clip (new
+// clip_id, link_id 0) with cloned name and markers, so the two never share
+// state -- mirroring duplicate_track's copy-by-value semantics.
+duplicate_clip :: proc(track_idx, index: int) -> int {
+	track := &timeline.tracks[track_idx]
+	src := &track.clips[index]
+	c := Clip{
+		clip_id                = new_clip_id(),
+		asset_id               = src.asset_id,
+		link_id                = 0,
+		path                   = src.path,
+		name                   = strings.clone(src.name),
+		kind                   = src.kind,
+		generator              = src.generator,
+		stream_index           = src.stream_index,
+		source_start_frame     = src.source_start_frame,
+		source_length_frames   = src.source_length_frames,
+		timeline_start_frame   = src.timeline_start_frame,
+		layer                  = src.layer,
+		source_w               = src.source_w,
+		source_h               = src.source_h,
+		transform_x            = src.transform_x,
+		transform_y            = src.transform_y,
+		scale                  = src.scale,
+		crop_l                 = src.crop_l,
+		crop_r                 = src.crop_r,
+		crop_t                 = src.crop_t,
+		crop_b                 = src.crop_b,
+	}
+	for m in src.markers {
+		append(&c.markers, Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)})
+	}
+	place := clip_timeline_end(src^)
+	c.timeline_start_frame = clip_place_in_track(track, index, c.source_length_frames, place)
+	insert_at := index + 1
+	for insert_at < len(track.clips) && track.clips[insert_at].timeline_start_frame < c.timeline_start_frame {
+		insert_at += 1
+	}
+	inject_at_elem(&track.clips, insert_at, c)
+	return insert_at
 }
 
 // remove_track deletes the track at index (and all of its clips) from the

@@ -39,6 +39,15 @@ CLIP_TILE_HEIGHT :: f32(56) // Height of one timeline clip tile.
 TRACK_GAP_H :: 18          // Height of the insert gap above each track row.
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 
+// App chrome: the top app bar and the editor column band that sits between it
+// and the timeline (Media | Preview | Inspector).
+APP_BAR_H :: f32(44)       // Top app bar strip (app name, project, help).
+TIMELINE_BAR_H :: f32(36)  // Timeline toolbar above the ruler (snaps, zoom).
+INSPECTOR_MIN_W :: 296     // Right inspector column width bounds.
+INSPECTOR_MAX_W :: 356
+FIELD_H :: f32(30)         // Inline property field (X/Y/Scale/crop) height.
+LABEL_W :: f32(58)         // Text label width inside a property field.
+
 // Media bin grid (file-manager style thumbnail cells).
 MEDIA_CELL_W :: f32(120)  // Base cell width; columns derive from the bin width.
 MEDIA_ITEM_PAD :: f32(4)  // Inner padding of a cell.

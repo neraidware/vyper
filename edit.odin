@@ -2,15 +2,24 @@ package main
 
 import "core:fmt"
 import "core:strconv"
+import clay "clay-odin"
 
 // ---------------------------------------------------------------------------
-// Inline editing of a clip property text field (X/Y/Scale in the properties
-// panel). editing_field/edit_chars/edit_len live in state.odin.
-// ---------------------------------------------------------------------------
-
+// Inline editing of a clip property text field. editing_field is 1 (X), 2 (Y),
+// 3 (Scale), 4..7 (crop L/R/T/B). Scale and the crop fields are normalized
+// values but edit in percent-scale text (crop % of the box, Scale ×1), so both
+// format/parse by the same 10^decimals factor.
 edit_begin :: proc(field: int, value: f32) {
 	editing_field = field
-	text := field == 3 ? fmt.aprintf("%.2f", value) : fmt.aprintf("%.0f", value)
+	prec := 0
+	scaled := value
+	switch field {
+	case 3:
+		prec = 2
+	case 4, 5, 6, 7:
+		scaled = value * 100
+	}
+	text := fmt.aprintf("%.*f", prec, scaled)
 	edit_len = min(len(text), len(edit_chars))
 	copy(edit_chars[:edit_len], text[:edit_len])
 }
@@ -20,6 +29,28 @@ edit_cancel :: proc() {
 	edit_len = 0
 }
 
+// edit_field_over reports whether the pointer is still over the property field
+// currently being edited (so a click-away outside it commits).
+edit_field_over :: proc() -> bool {
+	#partial switch editing_field {
+	case 1:
+		return clay.PointerOver(clay.ID("PropFieldX"))
+	case 2:
+		return clay.PointerOver(clay.ID("PropFieldY"))
+	case 3:
+		return clay.PointerOver(clay.ID("PropFieldS"))
+	case 4:
+		return clay.PointerOver(clay.ID("PropCropL"))
+	case 5:
+		return clay.PointerOver(clay.ID("PropCropR"))
+	case 6:
+		return clay.PointerOver(clay.ID("PropCropT"))
+	case 7:
+		return clay.PointerOver(clay.ID("PropCropB"))
+	}
+	return false
+}
+
 edit_commit :: proc() {
 	defer edit_cancel()
 	if sel, ok := transformable_selected(); ok {
@@ -27,12 +58,21 @@ edit_commit :: proc() {
 		if !ok {
 			return
 		}
-		if editing_field == 1 {
+		switch editing_field {
+		case 1:
 			sel.transform_x = value
-		} else if editing_field == 2 {
+		case 2:
 			sel.transform_y = value
-		} else if editing_field == 3 {
+		case 3:
 			sel.scale = max(value, 0.01)
+		case 4:
+			sel.crop_l = clamp(value / 100, 0, 1)
+		case 5:
+			sel.crop_r = clamp(value / 100, 0, 1)
+		case 6:
+			sel.crop_t = clamp(value / 100, 0, 1)
+		case 7:
+			sel.crop_b = clamp(value / 100, 0, 1)
 		}
 	}
 }

@@ -234,6 +234,9 @@ playhead_accumulator: f64
 playback_rate: f64 = 1.0
 // playback_rate_open tracks whether the playback-rate dropdown is shown.
 playback_rate_open: bool
+// help_open shows the always-available keyboard-shortcut overlay ("?" button or
+// F1). Closed by ESC / a click outside / toggling it again.
+help_open: bool
 // PLAYBACK_RATES are the selectable playback-rate values offered by the rate
 // dropdown, in display order (1x first). Iterating this list is what the
 // dropdown draws and the click handler resolves against.
@@ -558,7 +561,9 @@ Timeline_Frame :: struct {
 
 // ContextMenu is the right-click menu over the timeline. Only one at a time.
 // open + target_track >= 0 means a per-track menu is showing; x/y are the
-// screen-space position to anchor the floating popup.
+// screen-space position to anchor the floating popup. When the right-click
+// landed ON a clip, target_clip_track/index hold it (else -1) so the menu can
+// offer clip-specific actions (rename/duplicate/delete/link).
 ContextMenu :: struct {
 	open:         bool,
 	x:            f32,
@@ -566,5 +571,7 @@ ContextMenu :: struct {
 	target_track: int, // -1 = none/between tracks
 	frame:        i64, // timeline frame captured at right-click time
 	submenu:      bool, // the "Add >" flyout is showing
+	target_clip_track: int, // right-click ON a clip; -1 = empty space
+	target_clip_index: int, // index within target_clip_track
 }
 ctx_menu: ContextMenu

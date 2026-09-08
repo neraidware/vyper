@@ -212,6 +212,8 @@ open_track_context_menu :: proc(mx, my: f32, track: int) {
 		ctx_menu.y = my
 	}
 	ctx_menu.target_track = track
+	ctx_menu.target_clip_track = -1
+	ctx_menu.target_clip_index = -1
 	track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 	ctx_menu.frame = i64(max(f32(0), (mx - track_start) / timeline_zoom + timeline_view_start))
 }
@@ -222,13 +224,17 @@ close_context_menu :: proc() {
 	ctx_menu.target_track = -1
 	ctx_menu.frame = 0
 	ctx_menu.submenu = false
+	ctx_menu.target_clip_track = -1
+	ctx_menu.target_clip_index = -1
 }
 
 // escape_dismiss closes any transient overlay (right-click context menu, the
-// playback-rate dropdown). Called on ESC while not editing a text field.
+// playback-rate dropdown, the help overlay). Called on ESC while not editing a
+// text field.
 escape_dismiss :: proc() {
 	close_context_menu()
 	playback_rate_open = false
+	help_open = false
 }
 
 // begin_clip_rename opens the generic text field to edit the selected clip's
@@ -259,14 +265,116 @@ apply_rename :: proc() {
 	}
 }
 
-// handle_ctx_option dispatches a click on a context-menu entry at (mx, my).
-// Selecting Add > Text Clip creates a Text generator clip on the right-clicked
-// track at the pointer's frame.
+// handle_ctx_option dispatches a click on a context-menu entry. Selecting
+// Add > Text Clip creates a Text generator clip on the right-clicked track at
+// the pointer's frame; the clip-action rows (Rename/Duplicate/Delete/Link)
+// act on the clip that was right-clicked (ctx_menu.target_clip_*), which is
+// selected first so every later action sees the same selection.
 handle_ctx_option :: proc() {
+	ct := ctx_menu.target_clip_track
+	ci := ctx_menu.target_clip_index
 	if clay.PointerOver(clay.ID("CtxTextClip")) {
 		add_text_clip_at()
+	} else if ct >= 0 && ct < len(timeline.tracks) && ci >= 0 && ci < len(timeline.tracks[ct].clips) {
+		select_clip(ct, ci)
+		if clay.PointerOver(clay.ID("CtxRename")) {
+			begin_clip_rename()
+		} else if clay.PointerOver(clay.ID("CtxDuplicate")) {
+			new_i := duplicate_clip(ct, ci)
+			// Select the fresh copy so the user immediately sees what appeared.
+			select_clip(ct, new_i)
+		} else if clay.PointerOver(clay.ID("CtxDelete")) {
+			delete_clip_at(ct, ci)
+		} else if clay.PointerOver(clay.ID("CtxLink")) {
+			toggle_links_for_selection()
+		}
 	}
 	close_context_menu()
+}
+
+// select_clip makes (track_idx,index) the sole timeline selection.
+select_clip :: proc(track_idx, index: int) {
+	if track_idx < 0 || track_idx >= len(timeline.tracks) {
+		return
+	}
+	if index < 0 || index >= len(timeline.tracks[track_idx].clips) {
+		return
+	}
+	selected_track = track_idx
+	selected_index = index
+	clear(&selected_set)
+	selected_set[timeline.tracks[track_idx].clips[index].clip_id] = true
+}
+
+// clip_under_pointer returns the (track_idx, index) of the clip currently under
+// the pointer, or (-1,-1) when the pointer is over empty timeline space.
+clip_under_pointer :: proc() -> (int, int) {
+	for track_idx in 0 ..< len(timeline.tracks) {
+		for index in 0 ..< len(timeline.tracks[track_idx].clips) {
+			if clay.PointerOver(clay.ID("TimelineClip", u32(track_idx * 1000 + index))) {
+				return track_idx, index
+			}
+		}
+	}
+	return -1, -1
+}
+
+// open_clip_context_menu opens the right-click menu anchored at (mx,my) for the
+// clip at (track_idx,index): the menu gains the clip-action rows. The clip is
+// selected too, so the menu's target is also the visible selection.
+open_clip_context_menu :: proc(mx, my: f32, track_idx, index: int) {
+	if track_idx < 0 || track_idx >= len(timeline.tracks) {
+		return
+	}
+	if index < 0 || index >= len(timeline.tracks[track_idx].clips) {
+		return
+	}
+	select_clip(track_idx, index)
+	open_track_context_menu(mx, my, track_idx)
+	ctx_menu.target_clip_track = track_idx
+	ctx_menu.target_clip_index = index
+}
+
+// delete_clip_at deletes the clip at (track_idx,index), rippling the whole link
+// group when the clip is linked (matching Backspace behavior). The region-based
+// ripple selects/clears whatever the existing helpers expect.
+delete_clip_at :: proc(track_idx, index: int) {
+	if track_idx < 0 || track_idx >= len(timeline.tracks) {
+		return
+	}
+	if index < 0 || index >= len(timeline.tracks[track_idx].clips) {
+		return
+	}
+	clip := &timeline.tracks[track_idx].clips[index]
+	if clip.link_id != 0 {
+		ripple_delete_linked_group(clip.link_id)
+	} else {
+		ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+	}
+}
+
+// timeline_zoom_about_playhead multiplies the timeline zoom by factor, keeping
+// the playhead's visible frame fixed (same math as the ruler wheel handler).
+timeline_zoom_about_playhead :: proc(factor: f32) {
+	anchor := f32(playhead.frame - i64(timeline_view_start)) * timeline_zoom
+	anchor_frame := timeline_view_start + anchor / max(timeline_zoom, 0.0001)
+	new_zoom := clamp(timeline_zoom * factor, TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+	if new_zoom != timeline_zoom {
+		timeline_view_start = clamp(anchor_frame - anchor / max(new_zoom, 0.0001), 0, f32(timeline_duration()))
+		timeline_zoom = new_zoom
+	}
+}
+
+// timeline_zoom_fit scales the timeline so the whole content fits the ruler
+// width, returning to frame 0.
+timeline_zoom_fit :: proc() {
+	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+	if ruler.width <= 0 {
+		return
+	}
+	new_zoom := clamp(ruler.width / f32(max(timeline_duration(), 1)), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+	timeline_zoom = new_zoom
+	timeline_view_start = 0
 }
 
 // add_text_clip_at inserts a Text generator clip on ctx_menu.target_track at
@@ -592,6 +700,9 @@ main :: proc() {
 					escape_dismiss()
 				} else if !event.key.repeat {
 					switch event.key.key {
+					case sdl.K_F1:
+						// Always-available shortcut reference.
+						help_open = !help_open
 					case sdl.K_SPACE:
 						mods := sdl.GetModState()
 						if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
@@ -814,18 +925,26 @@ main :: proc() {
 			set_project_orientation(!(project.height > project.width))
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapCenter")) {
 			snap_center_to_canvas = !snap_center_to_canvas
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps24")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Fps24")) {
 			set_project_fps(24)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps25")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Fps25")) {
 			set_project_fps(25)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps30")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Fps30")) {
 			set_project_fps(30)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps48")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Fps48")) {
 			set_project_fps(48)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("Fps60")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Fps60")) {
 			set_project_fps(60)
-		} else if mouse_down && !was_mouse_down && len(timeline.tracks) == 0 && clay.PointerOver(clay.ID("FpsAuto")) {
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("FpsAuto")) {
 			set_project_fps(0)
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PropRename")) {
+			begin_clip_rename()
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("TimelineZoomIn")) {
+			timeline_zoom_about_playhead(1.5)
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("TimelineZoomOut")) {
+			timeline_zoom_about_playhead(1 / 1.5)
+		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("TimelineZoomFit")) {
+			timeline_zoom_fit()
 		} else if clay.PointerOver(clay.ID("DividerHandle")) && mouse_down {
 			resizing_areas = true
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("RenderPickButton")) {
@@ -845,12 +964,11 @@ main :: proc() {
 			// If a property field is being typed in and the user clicks away from
 			// it, commit the pending value first.
 			if editing_field != 0 {
-				still_on_field := (editing_field == 1 && clay.PointerOver(clay.ID("PropFieldX"))) || (editing_field == 2 && clay.PointerOver(clay.ID("PropFieldY"))) || (editing_field == 3 && clay.PointerOver(clay.ID("PropFieldS")))
-				if !still_on_field {
+				if !edit_field_over() {
 					edit_commit()
 				}
 			}
-			// Clicking an X/Y property field focuses it for typing.
+			// Clicking an X/Y/Scale/crop property field focuses it for typing.
 			if sel, ok := transformable_selected(); ok {
 				if clay.PointerOver(clay.ID("PropFieldX")) {
 					edit_begin(1, sel.transform_x)
@@ -860,6 +978,18 @@ main :: proc() {
 					handled = true
 				} else if clay.PointerOver(clay.ID("PropFieldS")) {
 					edit_begin(3, sel.scale)
+					handled = true
+				} else if clay.PointerOver(clay.ID("PropCropL")) {
+					edit_begin(4, sel.crop_l * 100)
+					handled = true
+				} else if clay.PointerOver(clay.ID("PropCropR")) {
+					edit_begin(5, sel.crop_r * 100)
+					handled = true
+				} else if clay.PointerOver(clay.ID("PropCropT")) {
+					edit_begin(6, sel.crop_t * 100)
+					handled = true
+				} else if clay.PointerOver(clay.ID("PropCropB")) {
+					edit_begin(7, sel.crop_b * 100)
 					handled = true
 				}
 			}
@@ -1211,11 +1341,22 @@ main :: proc() {
 		if was_click {
 			handle_playback_rate_click(rate_clicked)
 		}
-		// Right-click: open a context menu when the button goes down over a
-		// track's empty space. Any fresh left-click or a new right-click that
-		// lands elsewhere closes an open menu first.
+		// Help overlay: the "?" button toggles it; any other click outside the
+		// panel dismisses it.
+		if was_click {
+			if clay.PointerOver(clay.ID("HelpButton")) {
+				help_open = !help_open
+			} else if help_open && !clay.PointerOver(clay.ID("HelpPanel")) {
+				help_open = false
+			}
+		}
+		// Right-click: a clip gets a clip menu; empty space gets the track menu.
+		// Any fresh left-click or a new right-click that lands elsewhere closes
+		// an open menu first.
 		if right_down && !was_right_down {
-			if track := timeline_track_hit_test(mouse_x, mouse_y); track >= 0 {
+			if ct, ci := clip_under_pointer(); ct >= 0 {
+				open_clip_context_menu(mouse_x, mouse_y, ct, ci)
+			} else if track := timeline_track_hit_test(mouse_x, mouse_y); track >= 0 {
 				open_track_context_menu(mouse_x, mouse_y, track)
 			} else {
 				close_context_menu()
