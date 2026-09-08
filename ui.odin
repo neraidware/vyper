@@ -929,9 +929,10 @@ draw_help_overlay :: proc(width, height: c.int) {
 			if clay.UI()({
 				layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = SECTION_GAP},
 			}) {
-				help_entry(HELP_SHORTCUTS[i])
-				if i + 1 < len(HELP_SHORTCUTS) {
-					help_entry(HELP_SHORTCUTS[i + 1])
+				shortcuts := HELP_SHORTCUTS
+				help_entry(shortcuts[i])
+				if i + 1 < len(shortcuts) {
+					help_entry(shortcuts[i + 1])
 				}
 			}
 		}

@@ -32,7 +32,7 @@ edit_cancel :: proc() {
 // edit_field_over reports whether the pointer is still over the property field
 // currently being edited (so a click-away outside it commits).
 edit_field_over :: proc() -> bool {
-	#partial switch editing_field {
+	switch editing_field {
 	case 1:
 		return clay.PointerOver(clay.ID("PropFieldX"))
 	case 2:
