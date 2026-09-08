@@ -183,22 +183,69 @@ timeline_tracks_max_top :: proc() -> f32 {
 	return max(timeline_tracks_content_height() - sec.height, 0)
 }
 
-// timeline_scrollbar_proportion returns the vertical thumb size and reach for
-// the timeline's scrollbar, given the viewport height. A zero viewport (or no
-// overflow) means no scrollbar.
-timeline_scrollbar_geometry :: proc() -> (thumb_h, travel, max_top: f32) {
-	max_top = timeline_tracks_max_top()
-	if max_top <= 0 {
-		return 0, 0, max_top
-	}
-	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
-	view := sec.height
-	if view <= 0 {
+// scrollbar_geometry turns a container's content and viewport heights into its
+// vertical scrollbar geometry: how far the content can travel (max_top), the
+// thumb size (proportional to the visible share, never below
+// TSCROLLBAR_MIN_H), and the thumb's travel distance within the strip. Zero
+// when there is no overflow.
+scrollbar_geometry :: proc(content_h, view_h: f32) -> (max_top, thumb_h, travel: f32) {
+	if content_h <= view_h {
 		return 0, 0, 0
 	}
-	thumb_h = clamp(view * view / timeline_tracks_content_height(), TSCROLLBAR_MIN_H, view)
-	travel = view - thumb_h
+	max_top = content_h - view_h
+	thumb_h = clamp(view_h * view_h / content_h, TSCROLLBAR_MIN_H, view_h)
+	travel = view_h - thumb_h
 	return
+}
+
+// scroll_press starts a scrollbar drag: pressing the thumb drags it directly;
+// pressing anywhere else on the strip jumps the thumb to the cursor (grabbed at
+// its center so a movement continues the jump). Returns whether the press hit a
+// scrollbar, and tags this stack's thumb/strip ids with the container's tag.
+scroll_press :: proc(tag: string, drag: ^bool, grab: ^f32) -> bool {
+	thumb_id := clay.ID(fmt.aprintf("%sSbThumb", tag))
+	strip_id := clay.ID(fmt.aprintf("%sScrollbar", tag))
+	if clay.PointerOver(thumb_id) {
+		drag^ = true
+		grab^ = mouse_y - clay.GetElementData(thumb_id).boundingBox.y
+		return true
+	}
+	if clay.PointerOver(strip_id) {
+		drag^ = true
+		grab^ = clay.GetElementData(thumb_id).boundingBox.height / 2
+		return true
+	}
+	return false
+}
+
+// scroll_drag_update moves a scroll value while its scrollbar drag is active,
+// mapping the cursor's position within the strip onto the scroll range. Ends
+// the drag the moment the button lifts.
+scroll_drag_update :: proc(tag: string, drag: ^bool, grab: ^f32, scroll: ^f32, content_h, view_h: f32) {
+	if !drag^ {
+		return
+	}
+	if !mouse_down {
+		drag^ = false
+		return
+	}
+	strip := clay.GetElementData(clay.ID(fmt.aprintf("%sScrollbar", tag))).boundingBox
+	max_top, _, travel := scrollbar_geometry(content_h, view_h)
+	if strip.height > 0 && travel > 0 {
+		pos := (mouse_y - strip.y - grab) / travel
+		scroll^ = clamp(pos * max_top, 0, max_top)
+	}
+}
+
+// Inspector scroll metrics, measured from the scrollport and its content stack.
+inspector_content_height :: proc() -> f32 {
+	return clay.GetElementData(clay.ID("InspectorContent")).boundingBox.height
+}
+inspector_view_height :: proc() -> f32 {
+	return clay.GetElementData(clay.ID("Inspector")).boundingBox.height
+}
+inspector_max_scroll :: proc() -> f32 {
+	return max(inspector_content_height() - inspector_view_height(), 0)
 }
 
 // update_timeline_cursor shows the horizontal-resize cursor while dragging or
@@ -797,6 +844,16 @@ main :: proc() {
 					}
 				}
 			case .MOUSE_WHEEL:
+				// Scroll over the inspector column scrolls its card stack when
+				// the cards outgrow the viewport.
+				ic := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
+				if ic.height > 0 && event.wheel.mouse_x >= ic.x && event.wheel.mouse_x <= ic.x + ic.width &&
+					event.wheel.mouse_y >= ic.y && event.wheel.mouse_y <= ic.y + ic.height {
+					if event.wheel.y != 0 {
+						inspector_scroll = clamp(inspector_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
+						break
+					}
+				}
 				// Scroll over the media bin scrolls its thumbnail grid (manual
 				// clip scroll, like the tracks section).
 				mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
@@ -911,27 +968,19 @@ main :: proc() {
 		} else if panning_timeline {
 			panning_timeline = false
 		}
-		// Vertical scrollbar drag: the thumb position maps directly onto
-		// timeline_view_top, using the same data-derived geometry that draws the
-		// thumb. Ends the moment the button lifts.
-		if timeline_scroll_dragging {
-			if !mouse_down {
-				timeline_scroll_dragging = false
-			} else {
-				sb := clay.GetElementData(clay.ID("TimelineVScrollbar")).boundingBox
-				thumb_h, travel, max_top := timeline_scrollbar_geometry()
-				if sb.height > 0 && travel > 0 {
-					pos := (mouse_y - sb.y - timeline_scroll_grab) / travel
-					timeline_view_top = clamp(pos * max_top, 0, max_top)
-				}
-			}
-		}
+		// Vertical scrollbar drags: the thumb position maps directly onto the
+		// container's scroll value, using the same geometry that draws the
+		// thumb. Active for both scrollable columns (timeline lanes, inspector
+		// cards); each ends the moment the button lifts.
+		scroll_drag_update("TimelineV", &timeline_scroll_dragging, &timeline_scroll_grab, &timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
+		scroll_drag_update("InspectorV", &inspector_scroll_dragging, &inspector_scroll_grab, &inspector_scroll, inspector_content_height(), inspector_view_height())
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
 		commands := build_page(width, height)
 		if len(timeline.tracks) > 0 {
 			timeline_view_top = clamp(timeline_view_top, 0, timeline_tracks_max_top())
 		}
+		inspector_scroll = clamp(inspector_scroll, 0, inspector_max_scroll())
 		if mouse_down && !was_mouse_down && import_bg_active() && box_contains(import_cancel_box, mouse_x, mouse_y) {
 			import_bg_cancel()
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
@@ -1007,16 +1056,13 @@ main :: proc() {
 					edit_commit()
 				}
 			}
-			// Timeline scrollbar: pressing the thumb starts a drag; pressing
-			// anywhere else on the strip jumps the thumb to the cursor.
+			// Scrollbars: pressing the thumb starts a drag; pressing anywhere
+			// else on the strip jumps the thumb to the cursor. One stack per
+			// scrollable column (timeline lanes, inspector cards).
 			if !handled {
-				if clay.PointerOver(clay.ID("VSbThumb")) {
-					timeline_scroll_dragging = true
-					timeline_scroll_grab = mouse_y - clay.GetElementData(clay.ID("VSbThumb")).boundingBox.y
+				if scroll_press("TimelineV", &timeline_scroll_dragging, &timeline_scroll_grab) {
 					handled = true
-				} else if clay.PointerOver(clay.ID("TimelineVScrollbar")) {
-					timeline_scroll_dragging = true
-					timeline_scroll_grab = clay.GetElementData(clay.ID("VSbThumb")).boundingBox.height / 2
+				} else if scroll_press("InspectorV", &inspector_scroll_dragging, &inspector_scroll_grab) {
 					handled = true
 				}
 			}

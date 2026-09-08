@@ -146,19 +146,30 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					clay.Text(fmt.aprintf("%d / %d  ·  %gfps", playhead.frame, timeline_duration(), timeline_fps()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 				}
 			}
-			// Column 3: Inspector -- Project / Clip / Render, stacked and
-			// scrollable if the cards outgrow the column.
-			if clay.UI(clay.ID("Inspector"))({
+			// Column 3: Inspector -- Project / Clip / Render cards. The cards
+			// stack in their own scrollport (InspectorContent) with a draggable
+			// vertical strip when they outgrow the column.
+			if clay.UI(clay.ID("InspectorColumn"))({
 				layout = {
 					sizing = {width = clay.SizingGrow({min = INSPECTOR_MIN_W, max = INSPECTOR_MAX_W}), height = clay.SizingGrow({})},
-					layoutDirection = .TopToBottom,
-					childGap = SECTION_GAP,
+					layoutDirection = .LeftToRight,
+					childGap = 0,
 				},
-				clip = {vertical = true},
+				backgroundColor = PANEL_BG,
 			}) {
-				project_card()
-				clip_card()
-				render_card()
+				if clay.UI(clay.ID("Inspector"))({
+					layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
+					clip = {vertical = true, childOffset = {0, -inspector_scroll}},
+				}) {
+					if clay.UI(clay.ID("InspectorContent"))({
+						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .TopToBottom, childGap = SECTION_GAP},
+					}) {
+						project_card()
+						clip_card()
+						render_card()
+					}
+				}
+				v_scrollbar("InspectorV", inspector_scroll, inspector_content_height(), inspector_view_height())
 			}
 		}
 		if clay.UI(clay.ID("EditorDivider"))({
@@ -367,8 +378,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							}
 						}
 					}
-						timeline_v_scrollbar()
-					}
+v_scrollbar("TimelineV", timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
+				}
 				}
 			}
 		}
@@ -636,27 +647,28 @@ tool_button :: proc(name: string, label: string) {
 	}
 }
 
-// timeline_v_scrollbar renders the track-list vertical scrollbar strip: a thin
-// column beside the lanes that only appears when the rows overflow the viewport
-// (timeline_scrollbar_geometry reports a drawable thumb). Thumb size/position
-// mirror that same data-driven geometry, so what's drawn is always what
-// dragging produces (press = jump, hold = drag; main.odin).
-timeline_v_scrollbar :: proc() {
-	thumb_h, travel, max_top := timeline_scrollbar_geometry()
+// v_scrollbar renders a vertical scrollbar strip for a scrollable container,
+// derived from the container's scroll position plus its data/measured content
+// and viewport heights (scrollbar_geometry). The strip only appears when the
+// content overflows; the thumb's size and position mirror the exact geometry
+// that dragging produces, so what's drawn is always what dragging yields (press
+// = jump, hold = drag; main.odin routes both).
+v_scrollbar :: proc(tag: string, scroll, content_h, view_h: f32) {
+	max_top, thumb_h, travel := scrollbar_geometry(content_h, view_h)
 	if thumb_h <= 0 || travel <= 0 {
 		return
 	}
-	thumb_top := timeline_view_top / max_top * travel
-	if clay.UI(clay.ID("TimelineVScrollbar"))({
+	thumb_top := scroll / max_top * travel
+	if clay.UI(clay.ID(fmt.aprintf("%sScrollbar", tag)))({
 		layout = {sizing = {width = clay.SizingFixed(TSCROLLBAR_W), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
 		backgroundColor = TRACK_GUTTER_BG,
 	}) {
-		if clay.UI(clay.ID("VSbPad"))({
+		if clay.UI(clay.ID(fmt.aprintf("%sSbPad", tag)))({
 			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_top)}},
 		}) {}
-		if clay.UI(clay.ID("VSbThumb"))({
+		if clay.UI(clay.ID(fmt.aprintf("%sSbThumb", tag)))({
 			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_h)}},
-			backgroundColor = clay.PointerOver(clay.ID("VSbThumb")) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			backgroundColor = clay.PointerOver(clay.ID(fmt.aprintf("%sSbThumb", tag))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			cornerRadius = clay.CornerRadiusAll(4),
 		}) {}
 	}

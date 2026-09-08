@@ -538,6 +538,11 @@ timeline_pan_last_y: f32
 // offset within the thumb so a click+hold anywhere on it drags smoothly.
 timeline_scroll_dragging: bool
 timeline_scroll_grab: f32
+// Inspector-card scrollbar drag (same mechanics as the timeline's): the
+// inspector column scrolls when the cards overflow their viewport.
+inspector_scroll: f32
+inspector_scroll_dragging: bool
+inspector_scroll_grab: f32
 
 // Resize/crop handles shown around the selected clip's bounding box.
 PREVIEW_HANDLE_SIZE :: f32(9)

@@ -1214,9 +1214,9 @@ insert_track :: proc(index: int) {
 	inject_at_elem(&timeline.tracks, index, track)
 }
 
-// duplicate_track inserts a copy of the track at index directly below the
-// original (index + 1), deep-copying every clip into a new dynamic array so the
-// two tracks are fully independent.
+// duplicate_track inserts a copy of the track directly ABOVE the original (at
+// index, pushing the original down one row), deep-copying every clip into a new
+// dynamic array so the two tracks are fully independent.
 duplicate_track :: proc(index: int) {
 	src := &timeline.tracks[index]
 	new_track := Track{
@@ -1240,7 +1240,7 @@ duplicate_track :: proc(index: int) {
 		}
 		append(&new_track.clips, c)
 	}
-	inject_at_elem(&timeline.tracks, index + 1, new_track)
+	inject_at_elem(&timeline.tracks, index, new_track)
 }
 
 // duplicate_clip inserts an independent copy of the clip at (track_idx,index)
