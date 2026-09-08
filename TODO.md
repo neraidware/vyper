@@ -324,6 +324,164 @@ Timeline clip resize: drag a clip's left/right edge to shorten or lengthen it.
   resolution/scale defaults set at import time (`import_media` in media.odin:
   inferred canvas size, `scale = 1`, transform centered).
 
+### Subtitle generator clip (.srt) — planned
+
+A subtitle "generator" clip: one contiguous timeline clip that renders the SRT
+file's cues as its output, in sequence. It behaves like a Kdenlive "Sequence"
+made of text clips, but is simply a generator clip whose input is an `.srt`
+file that we parse and rasterize ourselves. Unlike Kdenlive/Resolve (which bolt
+subtitles onto a separate subtitle system), this is just another generator —
+so it inherits the normal clip model: position, scale, trimming, selection,
+link/duplicate/delete, and the preview/export pipelines.
+
+**Core design (user-confirmed)**
+
+- **Context menu entry:** a new row in the right-click "Add >" flyout, labeled
+  **"Subtitle Clip (.srt)"** (user's wording: *"New subtitle clip"*). Clicking it
+  **immediately opens a file picker for the `.srt` file**; only on a successful
+  pick does a clip get created. Cancel → no clip.
+- **Placement/geometry:** the generated text is always **centered** in the
+  clip's preview bounding box. The box is sized to the *currently generated
+  cue's* tight ink proportions (`source_w/h`, like text clips) and is centered
+  on a user-controlled anchor (`transform_x/y`, default = canvas center). The
+  user drags the box anywhere on the canvas; each cue change re-sizes the box
+  to that cue's proportions while the box stays centered on the anchor. This
+  satisfies "the next generated text is centered relative to the bounding box
+  which is always relative to the currently generated text."
+- **Timing:** cue timings are **relative to the clip's start** (sequence
+  semantics) — cue at `t` seconds fires at `clip_start + round(t*fps)`. Moving
+  the clip moves all its cues.
+- **Trimmable:** edge-drag crop works; cues outside the trimmed window are
+  skipped (a range check in the lookup).
+- **Styling v1:** none. Raw, centered, white text with the normal transform
+  handles. Alignment/background/color/outline are explicitly LATER.
+- **SRT reactivity:** **static snapshot** — parse once at clip creation. No
+  mtime watching in v1; an explicit "Reload subtitles" action is later.
+
+**Data model**
+
+- `Generator_Kind` grows `.Subtitles` (beside `.Text`); the clip keeps
+  `kind = .Text` (rendered like text) or a new `Media_Kind.Subtitle` — decide
+  at implementation. Mirror how `.Text` clips are authored in
+  `add_text_generator_clip` (new `add_subtitle_generator_clip(track, start)`).
+- `clip.path` = absolute `.srt` path (cstring, clone-on-duplicate, freed on
+  delete — mirror the file-backed clip lifecycle).
+- `clip.name` = display label only (basename of the srt). **Crucially, unlike
+  the text generator, `name` is NOT the rendered text** — the preview/render
+  paths must branch on `generator` (`.Subtitles` ⇒ look up the active cue),
+  never on kind alone.
+- `source_start_frame`/`source_length_frames`: relative cue-frame window; the
+  clip's length defaults to the full SRT span. Trimming edits this window.
+- No media-bin asset entry in v1: the srt is a generator *input*, not media.
+  (Revisit if users want it listed.)
+
+**SRT parsing — new `srt.odin`**
+
+- Parse blocks separated by blank lines: numeric index (ignored), an
+  `HH:MM:SS,mmm --> HH:MM:SS,mmm` range, then one or more text lines.
+- Tolerate CRLF, a leading BOM, trailing blank lines, and malformed blocks
+  (skip + warn, keep going). Parse timestamps to **milliseconds**; convert to
+  frames **on demand** at the project fps (fps can change → recompute, never
+  re-parse). `round(ms/1000*fps)`.
+- Produce `[]Srt_Cue { start_ms, end_ms, text, lines: [dynamic]string }`
+  (split on `\n`). Offsets: first cue's start defines relative frame 0? No —
+  cues are absolute srt times; relative = cue_time − srt_start is NOT applied
+  unless the user trimmed the head. Keep v1 semantics: clip start == srt 0:00;
+  cues play per their stamps, clipped by the clip window.
+- **Shared cache:** one parsed-cue array per srt path, reference-counted by the
+  clips that reference it (`srt_load(path) -> ^Shared_Srt`, unref on clip
+  delete). Same cache feeds preview + export, split by nothing — it is
+  read-only after load.
+- UTF-8: text may be non-ASCII; the rasterizer already iterates runes and the
+  atlas path is rune-based — verify a ≥128 non-ASCII codepoint end-to-end and
+  note shaping limits (no Arabic/Indic shaping; FFmpeg/UI text is monospace).
+
+**Context menu + picker**
+
+- Add `ctx_option("CtxSubtitleClip", "Subtitle Clip (.srt)")` beside
+  `CtxTextClip` in the Add flyout (ui.odin `draw_context_menu`).
+- Dispatch in `handle_ctx_option` (main.odin): call the srt picker **before**
+  closing the menu. On a path: parse → create clip on `ctx_menu.target_track`
+  at `ctx_menu.frame` with length = full srt span → select it. On parse
+  failure: leave an error surface (status line / toast) and create nothing.
+- Picker: extend `open_file_picker()` with an optional filter, or add a second
+  portal proc; the portal call currently hardcodes a media-extension filter
+  tuple (portal.odin `portal_open_file_picker`) — build a `'*.srt'`-only filter
+  for this call, and a matching Win32 `.srt` filter. Guard: silently accept a
+  non-srt too (portal pickers ignore filters), parse + error if invalid.
+
+**Preview rendering (UI thread — preview_state.odin slots)**
+
+- For a `.Subtitles` clip slot: at each update, `rel = playhead.frame -
+  clip.timeline_start_frame`; pick the active cue (binary search over cue
+  start frames, intersection check with the trimmed window). No cue →
+  transparent slot (nothing drawn), like a gap.
+- Rerasterize **only when the cue's cache key changes** (cue text hash,
+  `text_clip_hash`, + `font_px = 48*scale`) — same stale-detection pattern the
+  text clip already uses, but the key is the *active cue* not `clip.name`.
+- Cache the last N cue rasters per slot (v1: 1; bump to a small LRU so
+  scrubbing back-and-forth doesn't reraster every crossing) — this is the
+  "cache the generated text outputs" requirement.
+- On cue change: re-measure base tight dims at font 48 → update
+  `clip.source_w/h` (the box that drives the handle/transform math re-sizes
+  automatically). Raster at `48*scale` for crispness, exactly like text clips.
+- Center-anchored box: existing preview math treats `transform_x/y` as the
+  top-left; subtitle boxes need center anchoring (`box.x = anchor.x - box.w/2`,
+  etc.). Handle/drag code in preview_transform must move the anchor (center) and
+  scale about the center; verify handle grabbing above/below the text still
+  works when the box is smaller than the text's ink (take the box, not the ink,
+  as the grab target).
+- **Multi-line, v1 (simplest):** render each line of a cue stacked vertically
+  (≈1.2× font line advance), centered horizontally, composited into one buffer
+  — split the rasterize helper into "one line into a sub-buffer" reuse, or add
+  a multi-line variant that calls the existing single-line core per line.
+  **No word wrap in v1** (a long single line overflows the box width — accepted
+  for now).
+- **LATER (recommended, not now):** word-wrap long single lines at ≈75% of
+  canvas width; text-align (left/center/right); optional background box;
+  font color + outline; explicit "Reload subtitles" + mtime watch.
+
+**Export rendering (render worker — render.odin)**
+
+- Snapshots: for a `.Subtitles` clip, the `Render_Text_Src` equivalent must
+  carry the **shared cue array copy** (or path + a worker-side parse), relative
+  start, fps, transforms, and `scale`. It is NOT the `name`.
+- At render start, pre-rasterize **every cue once** into a per-cue `Render_Text_Job`
+  (mirroring `setup_text_job`, same worker-owned font/scratch) — one
+  `make`/raster loop, no per-frame font work. Each frame then binary-searches
+  the active cue and just blits its cached raster (O(log n) per frame, zero
+  rasterization during the render run). Cleanup frees all cue rasters
+  (`cleanup_text_jobs` already does this shape of work).
+- Multi-line cue compositing (stack + center) applies equally here; render two
+  buffers only if the cue is multi-line.
+
+**Clip interactions**
+
+- `duplicate_clip` / `duplicate_track`: clone `path` (`strings.clone_to_cstring`),
+  clone `name`, share the parsed-cue cache (**refcount up**); never deep-copy
+  the cue array.
+- Remove/delete: `remove_track` and the clip-delete paths must `delete(path)`
+  and unref the shared srt cache.
+- Split (`S`): allowed; both halves share the srt/cache; each half's window
+  check crops cues. Verify the split bookkeeping (paths/clip own nothing new).
+- Rename: label only; content unaffected (this is the documented split from the
+  text generator, where rename edits the title).
+- Timeline clip visuals: single strip colored like text/generator clips; maybe
+  an `*.srt` glyph later.
+
+**Verification**
+
+- Existing probes stay green (`nered-probe`, transform probe).
+- A test `.srt` covering: multi-cue sequencing, a cue with explicit `\n` (2–3
+  lines), ms-level timestamps, non-zero first timestamp, CRLF line endings, a
+  leading BOM, trailing blank lines, and a deliberately malformed block (skip + warn).
+- Manual: "Add > Subtitle Clip (.srt)" → picker opens first → clip lands at the
+  click frame/full length → text appears centered on the canvas → drag the box
+  around, scale up (crisp at 48×scale) → scrub: each cue swaps in, box resizes
+  to that cue's proportions but stays anchored → trim edges: out-of-window cues
+  vanish → duplicate/delete refcount the cue cache → export renders cues
+  statically correct (frame-step the output file).
+
 ## Current Architecture
 
 - Odin owns application state, UI layout, timeline state, input, and rendering orchestration.
