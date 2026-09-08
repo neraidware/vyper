@@ -218,6 +218,15 @@ The background proxy builder (`import_bg.odin`) transcodes a large source to a
   core (decode + x264), starving the SDL loop so the editor looks frozen while
   the worker runs. Half leaves the interactive side air; wall time barely moves
   because frame DECODE is the bottleneck, not x264.
+- **Segmented (chunked/progressive) proxy**: the background builder encodes the
+  proxy as independent all-intra `PROXY_SEG_FRAMES`-sized segments in
+  source-time order, republishing a sidecar `.idx` after each one, so the head
+  of the timeline goes proxy-fast ~1s after import while the tail still encodes
+  and uncovered ranges decode the source. `proxy_pick_for_frame` resolves a
+  proxy file PER SOURCE FRAME (segment / legacy whole proxy / nil); decoders
+  translate source indices to each file's local timebase and reopen on a
+  physical-file switch. Cancel keeps completed segments and only drops the
+  in-flight one.
 
 Remaining (real lever for hours-long sources):
 
@@ -232,8 +241,6 @@ Remaining (real lever for hours-long sources):
   parity check + decode-content probe.
 - **`nice`/low-priority ffmpeg** on POSIX so even a capped software encode yields
   to interaction on small-core machines.
-- **Chunked/lazy proxy**: build only the range near the playhead first, extend
-  in the background — avoids multi-minute first-edit setup on giant imports.
 - **Proxy re-encode on project resolution change** (see mid-project resolution
   semantics above): a canvas shrink/grow may want a fresh proxy resolution.
 
