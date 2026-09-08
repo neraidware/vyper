@@ -232,7 +232,7 @@ scroll_drag_update :: proc(tag: string, down: bool, my: f32, drag: ^bool, grab: 
 	strip := clay.GetElementData(clay.ID(fmt.aprintf("%sScrollbar", tag))).boundingBox
 	max_top, _, travel := scrollbar_geometry(content_h, view_h)
 	if strip.height > 0 && travel > 0 {
-		pos := (my - strip.y - grab) / travel
+		pos := (my - strip.y - grab^) / travel
 		scroll^ = clamp(pos * max_top, 0, max_top)
 	}
 }
