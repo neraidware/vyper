@@ -202,12 +202,12 @@ scrollbar_geometry :: proc(content_h, view_h: f32) -> (max_top, thumb_h, travel:
 // pressing anywhere else on the strip jumps the thumb to the cursor (grabbed at
 // its center so a movement continues the jump). Returns whether the press hit a
 // scrollbar, and tags this stack's thumb/strip ids with the container's tag.
-scroll_press :: proc(tag: string, drag: ^bool, grab: ^f32) -> bool {
+scroll_press :: proc(tag: string, my: f32, drag: ^bool, grab: ^f32) -> bool {
 	thumb_id := clay.ID(fmt.aprintf("%sSbThumb", tag))
 	strip_id := clay.ID(fmt.aprintf("%sScrollbar", tag))
 	if clay.PointerOver(thumb_id) {
 		drag^ = true
-		grab^ = mouse_y - clay.GetElementData(thumb_id).boundingBox.y
+		grab^ = my - clay.GetElementData(thumb_id).boundingBox.y
 		return true
 	}
 	if clay.PointerOver(strip_id) {
@@ -221,18 +221,18 @@ scroll_press :: proc(tag: string, drag: ^bool, grab: ^f32) -> bool {
 // scroll_drag_update moves a scroll value while its scrollbar drag is active,
 // mapping the cursor's position within the strip onto the scroll range. Ends
 // the drag the moment the button lifts.
-scroll_drag_update :: proc(tag: string, drag: ^bool, grab: ^f32, scroll: ^f32, content_h, view_h: f32) {
+scroll_drag_update :: proc(tag: string, down: bool, my: f32, drag: ^bool, grab: ^f32, scroll: ^f32, content_h, view_h: f32) {
 	if !drag^ {
 		return
 	}
-	if !mouse_down {
+	if !down {
 		drag^ = false
 		return
 	}
 	strip := clay.GetElementData(clay.ID(fmt.aprintf("%sScrollbar", tag))).boundingBox
 	max_top, _, travel := scrollbar_geometry(content_h, view_h)
 	if strip.height > 0 && travel > 0 {
-		pos := (mouse_y - strip.y - grab) / travel
+		pos := (my - strip.y - grab) / travel
 		scroll^ = clamp(pos * max_top, 0, max_top)
 	}
 }
@@ -972,8 +972,8 @@ main :: proc() {
 		// container's scroll value, using the same geometry that draws the
 		// thumb. Active for both scrollable columns (timeline lanes, inspector
 		// cards); each ends the moment the button lifts.
-		scroll_drag_update("TimelineV", &timeline_scroll_dragging, &timeline_scroll_grab, &timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
-		scroll_drag_update("InspectorV", &inspector_scroll_dragging, &inspector_scroll_grab, &inspector_scroll, inspector_content_height(), inspector_view_height())
+		scroll_drag_update("TimelineV", mouse_down, mouse_y, &timeline_scroll_dragging, &timeline_scroll_grab, &timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
+		scroll_drag_update("InspectorV", mouse_down, mouse_y, &inspector_scroll_dragging, &inspector_scroll_grab, &inspector_scroll, inspector_content_height(), inspector_view_height())
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
 		commands := build_page(width, height)
@@ -1060,9 +1060,9 @@ main :: proc() {
 			// else on the strip jumps the thumb to the cursor. One stack per
 			// scrollable column (timeline lanes, inspector cards).
 			if !handled {
-				if scroll_press("TimelineV", &timeline_scroll_dragging, &timeline_scroll_grab) {
+				if scroll_press("TimelineV", mouse_y, &timeline_scroll_dragging, &timeline_scroll_grab) {
 					handled = true
-				} else if scroll_press("InspectorV", &inspector_scroll_dragging, &inspector_scroll_grab) {
+				} else if scroll_press("InspectorV", mouse_y, &inspector_scroll_dragging, &inspector_scroll_grab) {
 					handled = true
 				}
 			}

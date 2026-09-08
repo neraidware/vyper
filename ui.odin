@@ -155,7 +155,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					layoutDirection = .LeftToRight,
 					childGap = 0,
 				},
-				backgroundColor = PANEL_BG,
+				backgroundColor = EDITOR_BG,
 			}) {
 				if clay.UI(clay.ID("Inspector"))({
 					layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
