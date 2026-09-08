@@ -54,6 +54,18 @@ Clip_Decoder :: struct {
 	// owns the bytes so the decoder survives the caller's stack going away.
 	preview_path:      cstring,
 	preview_path_buf:  [4096]u8,
+	// opened_path is the PHYSICAL file the format context actually has open --
+	// the proxy (possibly one segment of a segmented proxy) or the source. A
+	// segmented proxy serves each source frame from a different file, so the
+	// reopen guard must compare against what is REALLY open, not just the
+	// source identity in `path`.
+	opened_path:       cstring,
+	opened_path_buf:   [4096]u8,
+	// frame_base is the SOURCE index this file's frame 0 corresponds to: 0 for
+	// the source or a whole-file proxy, k*PROXY_SEG_FRAMES for a proxy segment.
+	// Requests carry SOURCE indices; they are translated to file-local before
+	// seeking/caching in decode_clip_frame_sync / vdec_decode.
+	frame_base:        i64,
 	fmt_ctx:     ^avfmt.FormatContext,
 	dec_ctx:     ^avcodec.CodecContext,
 	video_idx:   c.int,
@@ -81,6 +93,9 @@ Clip_Decoder :: struct {
 	// is CURRENTLY parked on (see the struct invariant above). A request for
 	// last_frame+1 decodes forward in place; anything else forces a re-seek.
 	// MUST track the physical decoder position — never over-claim it.
+	// NOTE: physically the decoder parks at FILE-LOCAL index (frame_idx -
+	// frame_base); last_frame stores the LOCAL index so forward steps are one
+	// frame unit apart regardless of which segment is open.
 	last_frame:   i64,
 	// have_last reports whether last_frame is valid (decoder has produced at
 	// least one frame since the last reset/seek). Mirrors last_frame's rule.
@@ -136,7 +151,7 @@ clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 	}
 	frame_cache_clear(dec)
 	// Wipe fully: neither path nor preview_path survives a reset. Callers that
-	// want a proxy re-supply it via decoder_set_preview_path before the next
+	// want a proxy re-supply it via decoder_set_preview before the next
 	// decode; every caller that leaves preview_path nil decodes the source
 	// (probes, ground-truth checks, render), preserving test symmetry.
 	dec^ = {}
@@ -329,6 +344,11 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	dec.hold = avutil.frame_alloc()
 	dec.pkt = avcodec.packet_alloc()
 	dec.opened = true
+	ops := string(open_path)
+	on := min(len(ops), len(dec.opened_path_buf) - 1)
+	copy(dec.opened_path_buf[:on], ops[:on])
+	dec.opened_path_buf[on] = 0
+	dec.opened_path = cstring(&dec.opened_path_buf[0])
 	fmt.printf("decoded %dx%d (%dx%d) @ %d/%d fps\n", dec.src_w, dec.src_h, dec.dst_w, dec.dst_h, dec.fps_num, dec.fps_den)
 	return true
 }
@@ -519,6 +539,17 @@ decoder_set_preview_path :: proc(dec: ^Clip_Decoder, path: cstring) {
 	dec.preview_path = cstring(&dec.preview_path_buf[0])
 }
 
+// decoder_set_preview is the per-frame companion to decoder_set_preview_path:
+// it sets the physical decode target AND the source-frame base that target's
+// frame 0 corresponds to. A segmented proxy resolves each source frame to a
+// DIFFERENT file (segment k covers [k*SEG_FRAMES, ...) with its own 0-based
+// timestamps), so the base must travel with every resolution, never just once
+// per clip assignment. Base 0 (source / whole-file proxy) is the identity.
+decoder_set_preview :: proc(dec: ^Clip_Decoder, path: cstring, frame_base: i64) {
+	decoder_set_preview_path(dec, path)
+	dec.frame_base = frame_base
+}
+
 // decode_into_buffer fills a caller-provided tightly-packed RGBA buffer
 // (w*h*4 bytes) with the decoded frame's pixels, stripping any row padding and
 // letterboxing (zero-filling) the area outside the fit rect.
@@ -555,8 +586,21 @@ decode_into_buffer :: proc(dec: ^Clip_Decoder, out: []u8, w, h: c.int) {
 // anything here, re-run: NERED_CACHE_PROBE and NERED_FRAME_PROBE must stay at
 // 0 mismatches.
 decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64, out: []u8) -> bool {
-	if !dec.opened || dec.path != path {
+	// A proxy segment is keyed by LOCAL index (its stream restarts at 0); the
+	// request is always a SOURCE index, so translate before seeking/caching.
+	frame_local := frame_idx - dec.frame_base
+	want := path
+	if dec.preview_path != nil && dec.preview_path != path {
+		want = dec.preview_path
+	}
+	if !dec.opened || dec.path != path || string(dec.opened_path) != string(want) {
 		if dec.opened {
+			// Reopening discards the RAM cache too: a cache kept across a
+			// physical-file switch (e.g. into the next proxy segment) would
+			// let a cache hit re-claim the decoder's forward position while
+			// the physical decoder is actually parked on a DIFFERENT file --
+			// the exact over-claim that corrupted previews. Cache (24 frames,
+			// ~29ms/frame fill) is cheap; wrong pixels are not.
 			clip_decoder_reset(dec)
 		}
 		if !open_clip_decoder(dec, path) {
@@ -565,7 +609,7 @@ decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64
 		}
 		dec.path = path
 	}
-	if cached := cache_find(dec, frame_idx); cached != nil {
+	if cached := cache_find(dec, frame_local); cached != nil {
 		copy(out, cached)
 		// Cache hit serves pixel data but must not over-claim the physical
 		// decoder's forward position. Advancing last_frame PAST where the
@@ -574,26 +618,26 @@ decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64
 		// position, then cache it under the wrong key: a stable wrong image
 		// under a shifted key that only "fixes" when a re-seek lands. Only
 		// update last_frame when it would not jump ahead of the decoder's true
-		// state (frame_idx <= last_frame is safe; it only moves last_frame back
-		// or equal, which a later request turns into a clean re-seek).
-		if !dec.have_last || frame_idx <= dec.last_frame {
-			dec.last_frame = frame_idx
+		// state (frame_local <= last_frame is safe; it only moves last_frame
+		// back or equal, which a later request turns into a clean re-seek).
+		if !dec.have_last || frame_local <= dec.last_frame {
+			dec.last_frame = frame_local
 			dec.have_last = true
 		}
 		return true
 	}
-	forward := dec.have_last && frame_idx == dec.last_frame + 1
+	forward := dec.have_last && frame_local == dec.last_frame + 1
 	if !forward && nered_trace {
 		fmt.printf("[dec] SEEK frame=%d (was at %d) -> re-seek decoder\n",
-			frame_idx, dec.last_frame)
+			frame_local, dec.last_frame)
 	}
-	if !decode_source_frame(dec, frame_idx) {
+	if !decode_source_frame(dec, frame_local) {
 		return false
 	}
 	decode_into_buffer(dec, out, PREVIEW_W, PREVIEW_H)
-	cache_store(dec, frame_idx, out)
+	cache_store(dec, frame_local, out)
 	if !forward && nered_trace {
-		fmt.printf("[dec] decoded frame=%d keys:", frame_idx)
+		fmt.printf("[dec] decoded frame=%d keys:", frame_local)
 		for ci := 0; ci < len(dec.cache); ci += 1 {
 			fmt.printf(" %d", dec.cache[ci].frame)
 		}

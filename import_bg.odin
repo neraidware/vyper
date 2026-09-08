@@ -12,28 +12,32 @@ import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 // Background proxy builder.
 //
-// A full-length all-intra proxy transcode of a large source (hours at
-// -preset veryfast) MUST NOT block the editor: importing footage is supposed to
-// be instant, and the render-loop-driven decoders can't pause while ffmpeg runs
-// on the calling thread. So the proxy encode runs on this dedicated worker:
+// A source's proxy is encoded as independent all-intra SEGMENTS in source-time
+// order, so the head of the timeline goes proxy-fast almost immediately while
+// the tail still encodes (see proxy.odin's progressive-proxy design). The
+// worker's export loop does NOT block the editor: importing footage is supposed
+// to be instant, and the render-loop-driven decoders can't pause while ffmpeg
+// runs on the calling thread. So the proxy encode runs on this dedicated worker:
 //   - the import thread (`proxy_transcode`) enqueues a request and returns at
 //     once -- the clip is on the timeline and previews from the ORIGINAL until
-//     the proxy lands;
-//   - the worker spawns ffmpeg with `-progress <file>` and polls the file every
-//     50ms while it encodes, exposing a 0..1 fraction;
+//     the opening segment lands (~1s in);
+//   - the worker encodes PROXY_SEG_FRAMES-sized segments head-first, each
+//     writing to its own `-progress` file, polling every 50ms and publishing a
+//     0..1 cumulative fraction;
 //   - ffmpeg's stdout/stderr are attached to nothing (`nil` handles = shut
 //     down) and the noise flags are dropped, so nothing can block on a full
 //     pipe;
 //   - the user can cancel from the modal progress overlay; the worker
-//     terminates ffmpeg and removes the partial proxy;
-//   - after a clean exit the worker re-runs the normal frame-count parity check
-//     (proxy_valid_cache_hit) so a broken output is deleted, never selected;
+//     terminates ffmpeg and removes ONLY the in-flight segment -- completed
+//     segments (and their .idx entries) stay usable;
+//   - after each segment exits cleanly the worker verifies its frame count and
+//     republishes the sidecar .idx so the resolver serves it immediately;
 //   - exactly one build runs at a time; a request posted while a build is
 //     running is kept as the next job (latest request wins, older are dropped).
 //
 // `async_import_mode` (state.odin) switches this off for probe/CI runs: those
 // assert the proxy exists on disk immediately after import_media returns, so
-// they keep the historical synchronous `proxy_transcode` build.
+// they keep the historical synchronous whole-file `proxy_transcode` build.
 // ---------------------------------------------------------------------------
 
 // Build_Phase is the worker's coarse state, read by the modal progress overlay.
@@ -100,10 +104,10 @@ import_bg_request :: proc(src: cstring, frames: i64, dur_us: i64, w, h: c.int) {
 }
 
 // import_bg_building_for reports whether a proxy build is in flight (or queued)
-// for `src`. proxy_pick uses it to refuse a half-written proxy: validating a
-// partial file against the source's frame count would delete it while ffmpeg is
-// still writing (a lost artifact + a removed artifact from under its open
-// handle).
+// for `src`. proxy_pick_for_frame uses it to refuse latching a half-written whole
+// proxy while segmentation is being established: validating a partial file
+// against the source's frame count would delete it while ffmpeg is still
+// writing (a lost artifact + a removed artifact from under its open handle).
 import_bg_building_for :: proc(src: string) -> bool {
 	ib := &import_builder
 	sdl.LockMutex(ib.mutex)
@@ -257,120 +261,213 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 	return 0
 }
 
-// import_bg_build transcodes one source to its low-res all-intra proxy, polling
-// ffmpeg's `-progress` file for a percentage and honoring cancel_pending. The
-// encode settings mirror proxy_transcode's synchronous build so a proxied file
-// is identical whether it took the background or the probe/CI path.
+// import_bg_build transcodes one source to its low-res all-intra proxy,
+// encoding it as independent PROXY_SEG_FRAMES-sized segments in SOURCE-TIME
+// ORDER so the head of the timeline goes proxy-fast almost immediately while
+// the tail still encodes. Each segment's completed + verified frame count is
+// written to the sidecar .idx (the single writer for that file); the resolver
+// (proxy_pick_for_frame) reads it to serve frames inside finished segments.
+// Cancelling keeps every completed segment and only drops the in-flight one.
+// The encode settings mirror proxy_transcode's synchronous whole-file build so
+// a proxied frame is pixel-identical on either path.
 import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i64, w, h: c.int) {
-	px: [4096]u8
-	proxy, proxy_ok := proxy_path_for(src, px[:])
-	if !proxy_ok || proxy == nil {
-		if nered_trace {
-			fmt.printf("[bg] proxy path derivation failed for %q\n", string(src))
-		}
-		import_bg_set_phase(ib, .Done_Fail)
-		return
-	}
 	scale_w, scale_h := proxy_scale(w, h)
 	filter := fmt.aprintf("scale=%d:%d", scale_w, scale_h)
 	threads := proxy_encode_threads()
-	progress_file := strings.concatenate({string(proxy), ".progress"})
 	defer delete(filter)
 	defer delete(threads)
-	defer delete(progress_file)
 
-	argv := []string{
-		"ffmpeg", "-y",
-		"-i", string(src),
-		"-an",
-		"-vf", filter,
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-tune", "fastdecode",
-		"-crf", "26",
-		"-g", "1",
-		"-threads", threads,
-		"-pix_fmt", "yuv420p",
-		"-progress", progress_file,
-		"-nostats", "-loglevel", "error", "-hide_banner",
-		string(proxy),
-	}
-	rargv, free_path, free_argv := resolve_tool_argv(argv)
-	defer if free_argv {
-		delete(rargv)
-	}
-	defer if free_path != "" {
-		delete(free_path)
-	}
-
-	// No stdout/stderr handles: ffmpeg's log is silenced (-loglevel error) and
-	// progress goes to the -progress file, so nothing can block on a full pipe.
-	proc_handle, spawn_err := os.process_start({command = rargv, stdout = nil, stderr = nil})
-	if spawn_err != nil {
+	seg_total := proxy_seg_count(frames)
+	fps := f64(frames) * 1e6 / f64(max(dur_us, 1))
+	if seg_total <= 0 || fps <= 0 {
 		if nered_trace {
-			fmt.printf("[bg] spawn ffmpeg failed: %v\n", spawn_err)
+			fmt.printf("[bg] bad segment plan for %q: frames=%d dur_us=%d\n", string(src), frames, dur_us)
 		}
-		os.remove(progress_file)
 		import_bg_set_phase(ib, .Done_Fail)
 		return
 	}
 
-	total_us := max(dur_us, 1)
-	last_frac: f64 = -1
-	for {
-		// Cancellation wins over encoding: terminate ffmpeg and drop the
-		// partial artifact immediately (the parity check can never see it).
-		sdl.LockMutex(ib.mutex)
-		cancelled := ib.cancel_pending
-		sdl.UnlockMutex(ib.mutex)
-		if cancelled {
-			_ = os.process_terminate(proc_handle)
-			_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
-			os.remove(string(proxy))
-			os.remove(progress_file)
-			import_bg_set_phase(ib, .Done_Cancelled)
-			import_bg_clear_cancel(ib)
-			return
-		}
+	idx: Proxy_Idx
+	defer delete(idx.segs)
+	idx.seg_frames = PROXY_SEG_FRAMES
 
-		st, werr := os.process_wait(proc_handle, 0)
-		if werr != nil && werr != os.General_Error.Timeout {
-			if nered_trace {
-				fmt.printf("[bg] process wait poll failed: %v\n", werr)
-			}
-			_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
-			os.remove(string(proxy))
-			os.remove(progress_file)
+	// Completed frames so far, as a cumulative fraction of the source: the
+	// playhead sees a fully-proxied region equal to `completed*fps` seconds.
+	last_frac: f64 = -1
+	completed_frames: i64
+	for k in 0 ..< seg_total {
+		seg_start := i64(k) * PROXY_SEG_FRAMES
+		seg_want := min(PROXY_SEG_FRAMES, frames - seg_start)
+		if seg_want <= 0 {
+			break
+		}
+		t0_sec := f64(seg_start) / fps
+
+		seg_buf: [4096]u8
+		seg, sok := proxy_segment_path_for(src, k, seg_buf[:])
+		if !sok {
 			import_bg_set_phase(ib, .Done_Fail)
 			return
 		}
-		if werr == nil && st.exited {
-			break
+		progress_file := strings.concatenate({string(seg), ".progress"})
+		defer delete(progress_file)
+
+		// A cancel between segments keeps everything built so far (the head is
+		// still fully usable); only the untouched tail is forgone.
+		{
+			sdl.LockMutex(ib.mutex)
+			pending := ib.cancel_pending
+			sdl.UnlockMutex(ib.mutex)
+			if pending {
+				if nered_trace {
+					fmt.printf("[bg] cancel between segments; keeping %d completed frames\n", completed_frames)
+				}
+				import_bg_set_phase(ib, .Done_Cancelled)
+				import_bg_clear_cancel(ib)
+				return
+			}
 		}
 
-		frac := proxy_progress_frac(progress_file, total_us)
-		if frac >= 0 && (frac - last_frac) > 0.002 {
+		t0_str := fmt.aprintf("%.3f", t0_sec)
+		want_str := fmt.aprintf("%d", seg_want)
+		argv := []string{
+			"ffmpeg", "-y",
+			"-ss", t0_str,
+			"-i", string(src),
+			"-an",
+			"-vf", filter,
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-tune", "fastdecode",
+			"-crf", "26",
+			"-g", "1",
+			"-threads", threads,
+			"-frames:v", want_str,
+			"-pix_fmt", "yuv420p",
+			"-progress", progress_file,
+			"-nostats", "-loglevel", "error", "-hide_banner",
+			string(seg),
+		}
+		defer delete(t0_str)
+		defer delete(want_str)
+		rargv, free_path, free_argv := resolve_tool_argv(argv)
+		defer if free_argv {
+			delete(rargv)
+		}
+		defer if free_path != "" {
+			delete(free_path)
+		}
+
+		// No stdout/stderr handles: ffmpeg's log is silenced (-loglevel error)
+		// and progress goes to the -progress file, so nothing can block on a
+		// full pipe.
+		proc_handle, spawn_err := os.process_start({command = rargv, stdout = nil, stderr = nil})
+		if spawn_err != nil {
+			if nered_trace {
+				fmt.printf("[bg] spawn ffmpeg failed: %v\n", spawn_err)
+			}
+			os.remove(progress_file)
+			os.remove(string(seg))
+			import_bg_set_phase(ib, .Done_Fail)
+			return
+		}
+
+		for {
+			// Cancellation wins over encoding: terminate ffmpeg and drop the
+			// in-flight segment immediately -- completed segments (and their
+			// .idx entries) must never be touched by a cancel.
+			sdl.LockMutex(ib.mutex)
+			cancelled := ib.cancel_pending
+			sdl.UnlockMutex(ib.mutex)
+			if cancelled {
+				_ = os.process_terminate(proc_handle)
+				_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
+				os.remove(string(seg))
+				os.remove(progress_file)
+				import_bg_set_phase(ib, .Done_Cancelled)
+				import_bg_clear_cancel(ib)
+				return
+			}
+
+			st, werr := os.process_wait(proc_handle, 0)
+			if werr != nil && werr != os.General_Error.Timeout {
+				if nered_trace {
+					fmt.printf("[bg] process wait poll failed: %v\n", werr)
+				}
+				_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
+				os.remove(string(seg))
+				os.remove(progress_file)
+				import_bg_set_phase(ib, .Done_Fail)
+				return
+			}
+			if werr == nil && st.exited {
+				break
+			}
+
+			// Cumulative progress: completed segments + this segment's local
+			// frame counter (resets per process), over the source's own count.
+			if n := proxy_progress_frames(progress_file); n >= 0 {
+				frac := clamp(f64(completed_frames + n) / f64(frames), 0, 1)
+				if frac > last_frac {
+					import_bg_set_progress(ib, frac)
+					last_frac = frac
+				}
+			}
+			time.sleep(50 * time.Millisecond)
+		}
+
+		// Clean exit for this segment: it must carry what we asked for (the
+		// final segment may legitimately be short when the source's estimated
+		// frame count overstates reality -- same PROXY_FRAME_TOLERANCE the
+		// whole-file path allows).
+		os.remove(progress_file)
+		count := proxy_probe_frame_count(seg)
+		tol: i64
+		if k == seg_total - 1 {
+			tol = PROXY_FRAME_TOLERANCE
+		}
+		if count < seg_want - tol {
+			if nered_trace {
+				fmt.printf("[bg] segment %d short: wanted %d frames, got %d\n", k, seg_want, count)
+			}
+			os.remove(string(seg))
+			import_bg_set_phase(ib, .Done_Fail)
+			import_bg_set_progress(ib, -1)
+			return
+		}
+
+		// Register the segment and publish the index so the resolver can start
+		// serving it immediately.
+		for len(idx.segs) <= k {
+			append(&idx.segs, 0)
+		}
+		idx.segs[k] = count
+		proxy_idx_store(src, &idx)
+		completed_frames += count
+		frac := clamp(f64(completed_frames) / f64(frames), 0, 1)
+		if frac > last_frac {
 			import_bg_set_progress(ib, frac)
 			last_frac = frac
 		}
-		time.sleep(50 * time.Millisecond)
+		if nered_trace {
+			fmt.printf("[bg] segment %d/%d done: %d frames -> %.1f%%\n", k + 1, seg_total, count, frac * 100)
+		}
 	}
 
-	// Clean ffmpeg exit: verify the produced proxy like the synchronous path.
-	os.remove(progress_file)
 	import_bg_set_phase(ib, .Verifying)
-	ok_valid := proxy_valid_cache_hit(proxy, frames)
-	phase: Build_Phase
-	if ok_valid {
-		phase = .Done_Ok
-	} else {
+	phase: Build_Phase = .Done_Ok
+	sum: i64
+	for c in idx.segs {
+		sum += c
+	}
+	if sum < frames - PROXY_FRAME_TOLERANCE {
 		phase = .Done_Fail
 		import_bg_set_progress(ib, -1)
 	}
 	import_bg_set_phase(ib, phase)
 	import_bg_clear_cancel(ib)
 	if nered_trace {
-		fmt.printf("[bg] proxy %s -> %v (exit verified=%v)\n", string(src), phase, ok_valid)
+		fmt.printf("[bg] proxy %s -> %v (segments=%d, %d frames)\n", string(src), phase, seg_total, sum)
 	}
 }
 
@@ -431,4 +528,25 @@ proxy_progress_micros :: proc(s: string) -> i64 {
 		v = v * 10 + i64(c - '0')
 	}
 	return v
+}
+
+// proxy_progress_frames parses the `frame=` field out of an ffmpeg `-progress`
+// file tail: the count of frames encoded so far in the CURRENT process.
+// Unlike out_time (whose timestamps depend on whether an input seek rebases
+// them), the frame counter always resets to 0 per invocation, so the segment
+// builder can derive EXACT cumulative progress as (completed + local) / total.
+// Returns -1 when no usable count is present yet.
+proxy_progress_frames :: proc(path: string) -> i64 {
+	data, err := os.read_entire_file_from_path(path, context.allocator)
+	if err != nil || len(data) == 0 {
+		return -1
+	}
+	defer delete(data)
+	text := string(data)
+	idx := strings.last_index(text, "frame=")
+	marker_len := len("frame=")
+	if idx < 0 {
+		return -1
+	}
+	return proxy_progress_micros(text[idx + marker_len:])
 }

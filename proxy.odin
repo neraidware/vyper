@@ -134,9 +134,9 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, src_
 	}
 	if async_import_mode {
 		// Defer the encode to the worker: import returns immediately and the
-		// clip previews from the ORIGINAL until the proxy lands. proxy_pick
-		// refuses a half-written proxy while this is in flight (see
-		// import_bg_building_for).
+		// clip previews from the ORIGINAL until the opening segment lands.
+		// proxy_pick_for_frame refuses to latch a half-written artifact while
+		// a build is in flight (see import_bg_building_for).
 		import_bg_request(src, src_frames, src_dur_us, src_w, src_h)
 		return nil
 	}
@@ -194,26 +194,330 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 	return true
 }
 
-// proxy_pick returns a usable proxy path for a source if one already exists and
-// is frame-count-valid; nil otherwise. Never transcodes (that is the import-
-// time job via proxy_transcode); merely selects the ready artifact so the
-// preview decoder can use it.
-proxy_pick :: proc(src: cstring, src_frames: i64, out_buf: []u8) -> cstring {
-	if !preview_proxy_enabled {
-		return nil
+// ---------------------------------------------------------------------------
+// Progressive (segmented) proxies.
+//
+// A proxy no longer has to be one monolithic file trained in a single blocking
+// full-length pass: the background builder encodes it as independent all-intra
+// segments in SOURCE-TIME ORDER (a few seconds of footage each), so the first
+// segment lands almost immediately after import and every frame inside a
+// completed segment decodes as fast as a whole-file proxy. Segments the user
+// has not reached yet fall back to the source until their segment lands --
+// exactly how Premiere/Resolve/Kdenlive previews behave. A completed build is
+// just the full segment set.
+//
+// Layout (all next to the source, named after the whole-proxy naming scheme):
+//   <src>.neredproxy.mp4      legacy WHOLE proxy (pre-segment builds / the
+//                             synchronous probe path) -- still served as a
+//                             fast path when present and no segmentation exists
+//   <src>.neredproxy.segNNNN.mp4   segment N, covering source frames
+//                             [N*seg_frames, (N+1)*seg_frames)
+//   <src>.neredproxy.idx       text index: "seg_frames <n>" then "k <count>"
+//                             per COMPLETED segment k (count = frames inside)
+// ---------------------------------------------------------------------------
+
+// PROXY_SEG_FRAMES is how many SOURCE frames each proxy segment covers (30s at
+// the project's typical 30fps). Bigger segments amortize per-encode overhead
+// and index churn; smaller ones make the head of the timeline usable sooner.
+PROXY_SEG_FRAMES :: i64(900)
+
+// proxy_segment_path_for writes the segment-<k> proxy path into buf (NUL
+// terminated) and returns a cstring into it, or ("", false) on overflow.
+proxy_segment_path_for :: proc(src: cstring, k: int, buf: []u8) -> (cstring, bool) {
+	src_str := string(src)
+	base := path_basename(src)
+	dir_len := len(src_str) - len(base)
+	fixed := ".neredproxy.seg"
+	tail := ".mp4"
+	n := dir_len + len(base) + len(fixed) + 4 + len(tail)
+	if n >= len(buf) {
+		return "", false
 	}
-	// A proxy build is in flight for this source: the file on disk is partial.
-	// Never validate (file size/count check) it -- the parity check would
-	// conclude "too short" and delete the artifact from under ffmpeg.
-	if import_bg_building_for(string(src)) {
-		return nil
+	s := 0
+	for i in 0 ..< dir_len {
+		buf[s] = src_str[i]
+		s += 1
 	}
-	proxy, ok := proxy_path_for(src, out_buf)
+	for i in 0 ..< len(base) {
+		buf[s] = base[i]
+		s += 1
+	}
+	for i in 0 ..< len(fixed) {
+		buf[s] = fixed[i]
+		s += 1
+	}
+	buf[s + 0] = u8('0' + (k / 1000) % 10)
+	buf[s + 1] = u8('0' + (k / 100) % 10)
+	buf[s + 2] = u8('0' + (k / 10) % 10)
+	buf[s + 3] = u8('0' + (k / 1) % 10)
+	s += 4
+	for i in 0 ..< len(tail) {
+		buf[s] = tail[i]
+		s += 1
+	}
+	buf[s] = 0
+	return cstring(&buf[0]), true
+}
+
+// proxy_idx_path_for writes the segment index path into buf (NUL terminated).
+proxy_idx_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
+	src_str := string(src)
+	base := path_basename(src)
+	dir_len := len(src_str) - len(base)
+	fixed := ".neredproxy.idx"
+	n := dir_len + len(base) + len(fixed)
+	if n >= len(buf) {
+		return "", false
+	}
+	s := 0
+	for i in 0 ..< dir_len {
+		buf[s] = src_str[i]
+		s += 1
+	}
+	for i in 0 ..< len(base) {
+		buf[s] = base[i]
+		s += 1
+	}
+	for i in 0 ..< len(fixed) {
+		buf[s] = fixed[i]
+		s += 1
+	}
+	buf[s] = 0
+	return cstring(&buf[0]), true
+}
+
+// proxy_seg_for_frame returns the segment index that covers source frame.
+proxy_seg_for_frame :: proc(frame: i64) -> int {
+	if frame < 0 {
+		return 0
+	}
+	return int(frame / PROXY_SEG_FRAMES)
+}
+
+// proxy_seg_count returns how many segments (at PROXY_SEG_FRAMES each) fully
+// cover `frames` source frames.
+proxy_seg_count :: proc(frames: i64) -> int {
+	if frames <= 0 {
+		return 0
+	}
+	return int((frames + PROXY_SEG_FRAMES - 1) / PROXY_SEG_FRAMES)
+}
+
+// Proxy_Idx is the parsed form of a .idx file: the segment size plus one frame
+// count per COMPLETED segment (count==0 means "segment never built"). Only
+// segments 0..len(segs)-1 exist; segment k covers [k*seg_frames, ...).
+Proxy_Idx :: struct {
+	seg_frames: i64,
+	segs:       [dynamic]i64,
+}
+
+// proxy_idx_load parses a source's .idx file into `idx`. Returns false when no
+// usable index exists (no file, unparseable, or seg size mismatch).
+proxy_idx_load :: proc(src: cstring, idx: ^Proxy_Idx) -> bool {
+	idx_path_buf: [4096]u8
+	idx_path, ok := proxy_idx_path_for(src, idx_path_buf[:])
+	if !ok || !os.exists(string(idx_path)) {
+		return false
+	}
+	data, err := os.read_entire_file_from_path(string(idx_path), context.temp_allocator)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	idx^ = {}
+	sf: i64
+	got_header := false
+	for line in strings.split_lines(string(data), context.temp_allocator) {
+		if !got_header {
+			if strings.has_prefix(line, "seg_frames ") {
+				if v, pok := strconv.parse_i64(line[len("seg_frames "):]); pok && v > 0 {
+					sf = v
+					got_header = true
+					idx.seg_frames = v
+				}
+			}
+			continue
+		}
+		// "<k> <count>"
+		sp := strings.index_byte(line, ' ')
+		if sp < 0 {
+			continue
+		}
+		ki, kok := strconv.parse_int(line[:sp])
+		ci, cok := strconv.parse_i64(line[sp + 1:])
+		if !kok || !cok || ci < 0 {
+			continue
+		}
+		for len(idx.segs) <= ki {
+			append(&idx.segs, 0)
+		}
+		idx.segs[ki] = ci
+	}
+	if !got_header {
+		return false
+	}
+	return true
+}
+
+// proxy_idx_store writes `idx` for a source (called by the background builder
+// after each completed segment, on its worker thread -- the single writer).
+proxy_idx_store :: proc(src: cstring, idx: ^Proxy_Idx) {
+	buf: [4096]u8
+	idx_path, ok := proxy_idx_path_for(src, buf[:])
 	if !ok {
-		return nil
+		return
 	}
-	if !proxy_valid_cache_hit(proxy, src_frames) {
-		return nil
+	sb := strings.builder_make()
+	defer strings.builder_destroy(&sb)
+	fmt.sbprintf(&sb, "seg_frames %d\n", idx.seg_frames)
+	for k in 0 ..< len(idx.segs) {
+		fmt.sbprintf(&sb, "%d %d\n", k, idx.segs[k])
 	}
-	return proxy
+	// Best-effort: the segments themselves remain the source of truth, and a
+	// partial/crashing write only costs a re-scan when a missing entry is hit.
+	_ = os.write_entire_file(string(idx_path), sb.buf[:])
+}
+
+// proxy_resolver_entry is the single-slot destination cache kept between decodes
+// so a scrub does not re-probe the on-disk index (and never re-runs ffprobe)
+// for the actively scrubbed file. One slot is enough: the playhead is in ONE
+// clip at a time, and a slow crossfade opens both slots over the same source.
+// The whole_proxy leg preserves old monolithic artifacts (and the synchronous
+// probe builds) as a fast path.
+proxy_resolver_entry :: struct {
+	src:         [4096]u8,
+	idx:         Proxy_Idx,
+	idx_valid:   bool,
+	whole_proxy: [4096]u8,
+	whole_valid: bool,
+}
+
+proxy_resolver_cache: proxy_resolver_entry
+
+// proxy_pick_for_frame returns the prebuilt proxy file the preview decoder
+// should serve source `frame` of `src` from, or nil to decode the source
+// itself. Unlike the old whole-file proxy_pick (one resolution per clip), this
+// resolves PER SOURCE FRAME: completed segments are used immediately, uncovered
+// ranges revert to the source while their segment is still encoding. Never
+// transcodes (import-time job) -- parity was established when the segment/index
+// was written and is never re-validated per call. When no segmentation exists,
+// falls back to a legacy whole proxy (validated once, latched).
+//
+// The second return is the file's frame_base: the SOURCE index its frame 0
+// corresponds to (0 for a source or whole-file proxy, k*PROXY_SEG_FRAMES for a
+// segment). The decoder translates the SOURCE request index by this before
+// seeking/caching, since a segment's stream timestamps restart at 0.
+proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf: []u8) -> (cstring, i64) {
+	if !preview_proxy_enabled {
+		return nil, 0
+	}
+	// Resolution per frame: source frame -> segment index.
+	k := proxy_seg_for_frame(frame)
+
+	rc := &proxy_resolver_cache
+	same_src := string(rc.src[:]) == string(src)
+	if !same_src {
+		if rc.idx_valid {
+			delete(rc.idx.segs)
+		}
+		rc^ = {}
+		src_str := string(src)
+		n := min(len(src_str), len(rc.src) - 1)
+		copy(rc.src[:n], src_str[:n])
+		rc.src[n] = 0
+	}
+
+	if rc.idx_valid {
+		if k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
+			seg, sok := proxy_segment_path_for(src, k, out_buf)
+			if sok {
+				return seg, i64(k) * PROXY_SEG_FRAMES
+			}
+			return nil, 0
+		}
+		if nered_trace {
+			fmt.printf("[pick] seg index %d not covered: len=%d segs=%v\n", k, len(rc.idx.segs), rc.idx.segs)
+		}
+		// Not covered yet: the on-disk index may have grown since we read it,
+		// so fall through and re-consult it when the needed segment might
+		// newly exist.
+	}
+
+	// (Re)consult the on-disk index when it may have grown past what we know
+	// (fresh import, or the worker finished more segments since the last read).
+	idx_path_buf: [4096]u8
+	idx_path, idx_ok := proxy_idx_path_for(src, idx_path_buf[:])
+	if idx_ok && os.exists(string(idx_path)) && (!rc.idx_valid || k >= len(rc.idx.segs)) {
+		delete(rc.idx.segs)
+		rc.idx = {}
+		rc.idx_valid = proxy_idx_load(src, &rc.idx)
+		if nered_trace {
+			fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
+		}
+		if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
+			seg, sok := proxy_segment_path_for(src, k, out_buf)
+			if sok {
+				return seg, i64(k) * PROXY_SEG_FRAMES
+			}
+			return nil, 0
+		}
+	}
+
+	if rc.idx_valid {
+		// Segmented source, frame beyond what is built yet (still encoding, or
+		// a cancelled tail): decode the source until the worker closes the gap.
+		// Nothing else can serve this frame while segmentation is authoritative.
+		return nil, 0
+	}
+
+	// No segmentation at all: legacy whole-proxy fast path (old mono builds +
+	// the sync probe path). A background build in flight means this source is
+	// transitioning to segments -- never latch onto a half-written artifact.
+	if import_bg_building_for(string(src)) {
+		return nil, 0
+	}
+	if rc.whole_valid {
+		return cstring(&rc.whole_proxy[0]), 0
+	}
+	if wp, wok := proxy_path_for(src, rc.whole_proxy[:]); wok && os.exists(string(wp)) {
+		if proxy_valid_cache_hit(wp, src_frames) {
+			rc.whole_valid = true
+			return wp, 0
+		}
+		rc.whole_valid = false
+	}
+	return nil, 0
+}
+
+// proxy_cleanup_artifacts removes every proxy artifact for a source: the legacy
+// whole file (if any), the index, and every known segment. Best-effort; used by
+// probe cleanup and by a source re-import that must start fresh.
+proxy_cleanup_artifacts :: proc(src: cstring) {
+	buf: [4096]u8
+	if p, ok := proxy_path_for(src, buf[:]); ok {
+		os.remove(string(p))
+	}
+	ibuf: [4096]u8
+	idx: Proxy_Idx
+	if proxy_idx_load(src, &idx) {
+		defer delete(idx.segs)
+		seg_buf: [4096]u8
+		for k in 0 ..< len(idx.segs) {
+			if p, sok := proxy_segment_path_for(src, k, seg_buf[:]); sok {
+				os.remove(string(p))
+			}
+		}
+		if ip, iok := proxy_idx_path_for(src, ibuf[:]); iok {
+			os.remove(string(ip))
+		}
+	} else if ip, iok := proxy_idx_path_for(src, ibuf[:]); iok {
+		os.remove(string(ip))
+	}
+	// Drop cache references so a re-import of the same path re-derives state.
+	rc := &proxy_resolver_cache
+	if string(rc.src[:]) == string(src) {
+		if rc.idx_valid {
+			delete(rc.idx.segs)
+		}
+		rc^ = {}
+	}
 }

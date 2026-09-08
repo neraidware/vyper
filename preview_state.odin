@@ -95,17 +95,21 @@ prewarm_next_clip :: proc() {
 				warm_valid = false
 			}
 			warm_proxy_buf: [4096]u8
-			if proxy := proxy_pick(next.path, next.source_length_frames, warm_proxy_buf[:]); proxy != nil {
-				decoder_set_preview_path(&warm_decoder, proxy)
-			} else {
-				decoder_set_preview_path(&warm_decoder, next.path)
-			}
+			// Resolve the preview target PER FRAME (segmented proxies grow as
+			// the background builder lands more segments); each decoded warm
+			// frame may come from a different segment than the last, and the
+			// decoder reopens when the physical file changes.
+			warm_pick, warm_base := proxy_pick_for_frame(next.path, next.source_length_frames, next.source_start_frame, warm_proxy_buf[:])
+			decoder_set_preview(&warm_decoder, warm_pick, warm_base)
 			if !decode_clip_frame_sync(&warm_decoder, next.path, next.source_start_frame, warm_buf[:]) {
 				return
 			}
 			// Buttress the cache with a few following frames (cheap forward steps).
 			for kf in i64(1) ..< 4 {
-				if !decode_clip_frame_sync(&warm_decoder, next.path, next.source_start_frame + kf, warm_buf[:]) {
+				wf := next.source_start_frame + kf
+				warm_pick, warm_base = proxy_pick_for_frame(next.path, next.source_length_frames, wf, warm_proxy_buf[:])
+				decoder_set_preview(&warm_decoder, warm_pick, warm_base)
+				if !decode_clip_frame_sync(&warm_decoder, next.path, wf, warm_buf[:]) {
 					break
 				}
 			}
@@ -214,17 +218,6 @@ update_preview_slots :: proc() -> bool {
 				slot.clip_id = clip.clip_id
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
-				// Live preview decodes the low-res all-intra proxy when one is
-				// ready (frame-count parity verified against the source); the
-				// decoder only honors it inside the fit/letterbox path, so the
-				// render pipeline and probes are untouched. Resolution happens
-				// once per assignment -- not per decoded frame.
-				slot.preview_path_buf = {}
-				if proxy := proxy_pick(clip.path, clip.source_length_frames, slot.preview_path_buf[:]); proxy != nil {
-					slot.preview_path = proxy
-				} else {
-					slot.preview_path = slot.path
-				}
 				slot.tex_dirty = true
 				if nered_trace {
 					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
@@ -369,6 +362,14 @@ update_preview_slots :: proc() -> bool {
 			// crossing the playhead mid-drag shows immediately.
 			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0 && (slot_idx != front_video_slot || !async_has_worker())
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
+			// Resolve the preview target PER FRAME: a segmented proxy grows as
+			// the background builder lands more segments, so the frame the
+			// decoder serves may switch files (segment N -> source, or N -> N+1)
+			// as the playhead crosses a segment boundary mid-build. The decoder
+			// reopens on the physical-file change; render/probe paths are
+			// unaffected because they never set a preview target.
+			pick_buf: [4096]u8
+			slot_pick, slot_base := proxy_pick_for_frame(clip.path, clip.source_length_frames, clip_frame, pick_buf[:])
 			if !scrub_skip || !slot.has_frame {
 if slot_idx == front_video_slot && async_has_worker() {
 					if slot.prime_from_warm {
@@ -380,7 +381,7 @@ if slot_idx == front_video_slot && async_has_worker() {
 						// cold decoder opens+seeks -- the flash. The flag is
 						// consumed; later frames decode on the worker.
 						slot.prime_from_warm = false
-						decoder_set_preview_path(&slot.dec, slot.preview_path)
+						decoder_set_preview(&slot.dec, slot_pick, slot_base)
 						if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 							slot.frontier = req
 							slot.have_frontier = true
@@ -395,7 +396,7 @@ if slot_idx == front_video_slot && async_has_worker() {
 						// layer stays fluid even on a slow keyframe seek. The worker
 						// resolves its own proxy (preview path passed through); probe
 						// mode waits for the decode so asserts are deterministic.
-						async_post_request(slot.path, slot.preview_path, clip_frame)
+						async_post_request(slot.path, slot_pick, slot_base, clip_frame)
 						if !async_live_mode {
 							async_wait_idle()
 						}
@@ -422,7 +423,7 @@ if slot_idx == front_video_slot && async_has_worker() {
 					}
 				}
 			} else {
-					decoder_set_preview_path(&slot.dec, slot.preview_path)
+					decoder_set_preview(&slot.dec, slot_pick, slot_base)
 					if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 						slot.frontier = req
 						slot.have_frontier = true

@@ -17,7 +17,7 @@ gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
 // ORIGINAL decode path (proxy pixels are lossy by design). This probe flips the
 // flag back on exactly like the live editor, then checks:
 //   1. import_media builds a frame-suffcient proxy on disk;
-//   2. proxy_pick resolves it for a live slot;
+//   2. proxy_pick_for_frame resolves it for a live slot;
 //   3. decoding through the proxy yields real pixels that approximate the
 //      source's content (frame-index mapping + not garbage), at the index that
 //      would be requested by a scrub;
@@ -61,10 +61,11 @@ proxy_probe_run :: proc(v: string) {
 		os.exit(1)
 	}
 
-	// 2. proxy_pick resolves it (frame-suffcient check passes).
-	picked := proxy_pick(path, frame_count, pbuf[:])
+	// 2. proxy_pick_for_frame resolves frame 0 (whole proxy path, no .idx):
+	// the legacy fast path runs the frame-suffcient check once and latches it.
+	picked, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf[:])
 	if picked == nil {
-		fmt.println("[proxy-probe] FAIL: proxy_pick rejected the built proxy")
+		fmt.println("[proxy-probe] FAIL: proxy_pick_for_frame rejected the built proxy")
 		os.exit(1)
 	}
 
@@ -154,6 +155,8 @@ proxy_bg_probe_run :: proc(v: string) {
 	// Full import: bin + timeline, mirroring the GUI's Open File flow. The
 	// proxy build must NOT block this call.
 	import_media(path)
+	frame_count := media_frame_count(file_info_text)
+	pbuf0: [4096]u8
 
 	deadline := sdl.GetTicksNS() + 300_000_000_000
 	last_report := sdl.GetTicksNS()
@@ -179,20 +182,63 @@ proxy_bg_probe_run :: proc(v: string) {
 		switch phase {
 		case .Done_Ok:
 			if nered_trace {
-				fmt.printf("[proxy-bg-test] worker finished, verifying on-disk artifact\n")
+				fmt.printf("[proxy-bg-test] worker finished, verifying on-disk artifacts\n")
 			}
-			pbuf: [4096]u8
-			proxy, got := proxy_path_for(path, pbuf[:])
-			if !got || !os.exists(string(proxy)) {
-				fmt.println("[proxy-bg-test] FAIL: Done_Ok but proxy missing")
+			// The head and tail frames must both resolve to a built segment (a
+			// fully-built background proxy is the complete segment set -- there
+			// is no whole-file artifact to check).
+			pfirst, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf0[:])
+			plast_buf: [4096]u8
+			plast, _ := proxy_pick_for_frame(path, frame_count, frame_count - 1, plast_buf[:])
+			if pfirst == nil || plast == nil {
+				fmt.println("[proxy-bg-test] FAIL: Done_Ok but frames not covered by segments")
 				os.exit(1)
 			}
-			if !proxy_valid_cache_hit(proxy, media_frame_count(file_info_text)) {
-				fmt.println("[proxy-bg-test] FAIL: Done_Ok but parity check rejects proxy")
+			idx: Proxy_Idx
+			if !proxy_idx_load(path, &idx) {
+				fmt.println("[proxy-bg-test] FAIL: Done_Ok but no usable .idx")
 				os.exit(1)
 			}
-			os.remove(string(proxy))
-			fmt.println("[proxy-bg-test] OK: async proxy built and verified")
+			total: i64
+			for c in idx.segs {
+				total += c
+			}
+			if total < frame_count - PROXY_FRAME_TOLERANCE {
+				fmt.printf("[proxy-bg-test] FAIL: segment frames %d < source %d\n", total, frame_count)
+				os.exit(1)
+			}
+			// Light content check through the segments: decode frame 0 and the
+			// last covered frame via their picked files and compare to the
+			// source (lossy, so tolerate per-channel error).
+			check_frames := []i64{0, frame_count - 1}
+			check_fbuf: [4096]u8
+			for f, i in check_frames {
+				pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:])
+				if pick == nil {
+					fmt.printf("[proxy-bg-test] FAIL: frame %d unresolved\n", f)
+					os.exit(1)
+				}
+				gt, px: Clip_Decoder
+				defer clip_decoder_reset(&gt)
+				defer clip_decoder_reset(&px)
+				if !decode_clip_frame_sync(&gt, path, f, gts[i][:]) {
+					fmt.printf("[proxy-bg-test] FAIL: source decode frame %d\n", f)
+					os.exit(1)
+				}
+				decoder_set_preview(&px, pick, pick_base)
+				if !decode_clip_frame_sync(&px, path, f, pxs[i][:]) {
+					fmt.printf("[proxy-bg-test] FAIL: segment decode frame %d via %q\n", f, string(pick))
+					os.exit(1)
+				}
+				mean_abs, _ := buffer_diff_metrics(gts[i][:], pxs[i][:])
+				if buffer_mean(gts[i][:]) < 1.0 || mean_abs > 40.0 {
+					fmt.printf("[proxy-bg-test] FAIL: frame %d proxy content mismatch (mean_abs=%.1f)\n", f, mean_abs)
+					os.exit(1)
+				}
+			}
+			delete(idx.segs)
+			proxy_cleanup_artifacts(path)
+			fmt.println("[proxy-bg-test] OK: async segmented proxy built and verified")
 			os.exit(0)
 
 		case .Done_Cancelled:
@@ -200,13 +246,33 @@ proxy_bg_probe_run :: proc(v: string) {
 				fmt.println("[proxy-bg-test] FAIL: done-cancelled without a cancel request")
 				os.exit(1)
 			}
-			pbuf: [4096]u8
-			proxy, got := proxy_path_for(path, pbuf[:])
-			if got && os.exists(string(proxy)) {
-				fmt.println("[proxy-bg-test] FAIL: cancelled but partial proxy left on disk")
+			// Every segment either is listed + present (completed, kept for
+			// reuse) or is absent (never built / dropped in-flight). No orphan
+			// partials, no listed-but-missing segments.
+			idx2: Proxy_Idx
+			has_idx := proxy_idx_load(path, &idx2)
+			seg_total := proxy_seg_count(frame_count)
+			badk := -1
+			for k in 0 ..< seg_total {
+				seg_buf: [4096]u8
+				seg, ok := proxy_segment_path_for(path, k, seg_buf[:])
+				if !ok {
+					continue
+				}
+				listed := has_idx && k < len(idx2.segs) && idx2.segs[k] > 0
+				exists := os.exists(string(seg))
+				if listed && !exists || !listed && exists {
+					badk = k
+					break
+				}
+			}
+			if badk >= 0 {
+				fmt.printf("[proxy-bg-test] FAIL: segment %d left in inconsistent state after cancel\n", badk)
 				os.exit(1)
 			}
-			fmt.println("[proxy-bg-test] OK: cancelled, partial proxy cleaned up")
+			delete(idx2.segs)
+			proxy_cleanup_artifacts(path)
+			fmt.println("[proxy-bg-test] OK: cancelled, kept segments consistent")
 			os.exit(0)
 
 		case .Done_Fail:

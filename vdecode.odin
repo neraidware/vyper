@@ -46,6 +46,7 @@ Async_Decoder :: struct {
 	req_seq:      u64,
 	req_preview:  cstring,
 	req_preview_buf: [4096]u8,
+	req_base:     i64,
 
 	// Result side (worker writes, render thread consumes).
 	res_valid:   bool,
@@ -78,31 +79,36 @@ async_live_mode := true
 // the ASYNC mirror of decode_clip_frame_sync (same persistent-decoder +
 // cache-hit guard). If you change the cache-hit/last_frame logic in one, update
 // the other to match, then re-run NERED_CACHE_PROBE (0 mismatches).
-vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_idx: i64) -> bool {
-	if !ad.dec.opened || ad.dec_path != path {
-		decoder_set_preview_path(&ad.dec, preview)
+vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_base: i64, frame_idx: i64) -> bool {
+	frame_local := frame_idx - frame_base
+	want := path
+	if preview != nil && preview != path {
+		want = preview
+	}
+	if !ad.dec.opened || ad.dec_path != path || string(ad.dec.opened_path) != string(want) {
+		decoder_set_preview(&ad.dec, preview, frame_base)
 		if !open_clip_decoder(&ad.dec, path) {
 			ad.dec_path = path
 			return false
 		}
 		ad.dec_path = path
 	}
-	if cached := cache_find(&ad.dec, frame_idx); cached != nil {
+	if cached := cache_find(&ad.dec, frame_local); cached != nil {
 		copy(ad.wbuf[:], cached)
 		// Same guard as decode_clip_frame_sync: a cache hit must not advance
 		// last_frame past the decoder's real physical position, or a later
 		// forward request decodes wrong content under a shifted key.
-		if !ad.dec.have_last || frame_idx <= ad.dec.last_frame {
-			ad.dec.last_frame = frame_idx
+		if !ad.dec.have_last || frame_local <= ad.dec.last_frame {
+			ad.dec.last_frame = frame_local
 			ad.dec.have_last = true
 		}
 		return true
 	}
-	if !decode_source_frame(&ad.dec, frame_idx) {
+	if !decode_source_frame(&ad.dec, frame_local) {
 		return false
 	}
 	decode_into_buffer(&ad.dec, ad.wbuf[:], PREVIEW_W, PREVIEW_H)
-	cache_store(&ad.dec, frame_idx, ad.wbuf[:])
+	cache_store(&ad.dec, frame_local, ad.wbuf[:])
 	return true
 }
 
@@ -134,6 +140,7 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 		}
 		req_path := ad.req_path
 		req_frame := ad.req_frame
+		req_base := ad.req_base
 		// Capture the preview path into worker-owned storage before releasing
 		// the lock: the render thread may overwrite req_preview_buf with the
 		// next request's proxy immediately after posting.
@@ -148,7 +155,7 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 		ad.req_valid = false
 		sdl.UnlockMutex(ad.mutex)
 
-		ok := vdec_decode(ad, req_path, req_preview, req_frame)
+		ok := vdec_decode(ad, req_path, req_preview, req_base, req_frame)
 
 		sdl.LockMutex(ad.mutex)
 		if ok {
@@ -206,9 +213,10 @@ async_dec_reset :: proc() {
 
 // async_post_request asks the worker to decode the given clip frame of `path`
 // as soon as it is free. `preview` is the preview-path proxy to decode through
-// (nil decodes the source). Non-blocking. The worker always converges to the
-// most recent request.
-async_post_request :: proc(path: cstring, preview: cstring, clip_frame: i64) {
+// (nil decodes the source) and `frame_base` is its source-frame base (see
+// decode.odin's Clip_Decoder.frame_base). Non-blocking. The worker always
+// converges to the most recent request.
+async_post_request :: proc(path: cstring, preview: cstring, frame_base: i64, clip_frame: i64) {
 	ad := &async_decoder
 	if ad.thread == nil {
 		return
@@ -216,6 +224,7 @@ async_post_request :: proc(path: cstring, preview: cstring, clip_frame: i64) {
 	sdl.LockMutex(ad.mutex)
 	ad.req_path = path
 	ad.req_frame = clip_frame
+	ad.req_base = frame_base
 	// Copy the preview path into the worker's request staging area so the
 	// worker reads a stable snapshot regardless of when the render thread next
 	// overwrites it. Source identity (req_path) keeps the (path, frame) key.

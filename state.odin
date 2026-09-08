@@ -422,16 +422,6 @@ Preview_Slot :: struct {
 	clip_id:             u64,
 	asset_id:            u64,
 	path:                cstring,
-	// preview_path is the file the slot's decoder actually opens for LIVE
-	// playback: the low-res all-intra proxy when one exists and is
-	// frame-count-valid, else the source (`path`). Resolved once at slot
-	// assignment (never per-frame) and passed to the decoder by
-	// update_preview_slots. Render and probe paths never use it.
-	preview_path:        cstring,
-	// preview_path_buf owns the storage preview_path points at (proxy paths
-	// are built once per assignment, then keep their bytes for the slot's
-	// lifetime instead of re-probing the filesystem every frame).
-	preview_path_buf:    [4096]u8,
 	timeline_start_frame: i64,
 	source_start_frame:  i64,
 	transform_x:         f32,
