@@ -1223,10 +1223,20 @@ duplicate_track :: proc(index: int) {
 		layer = src.layer,
 		clips = make([dynamic]Clip, 0, len(src.clips)),
 	}
-	for &c in src.clips {
+	// Copy each clip by VALUE: mutations below land on the duplicate, never on
+	// the original track's clip. (A `for &c` loop would alias src.clips[i] and
+	// sever the ORIGINAL's link group.)
+	for i in 0 ..< len(src.clips) {
+		c := src.clips[i]
 		// A duplicated clip is an independent copy: sever its link group so
 		// selecting it never drags the original's partner tracks along.
 		c.link_id = 0
+		if len(c.markers) > 0 {
+			// Clone the markers array so the two tracks share no owned memory:
+			// deleting one track (remove_track frees per-clip markers) must not
+			// leave the other track's copy dangling.
+			c.markers = filter_markers_in_range(c.markers[:], c.source_start_frame, c.source_length_frames)
+		}
 		append(&new_track.clips, c)
 	}
 	inject_at_elem(&timeline.tracks, index + 1, new_track)
