@@ -158,23 +158,47 @@ timeline_resize_hover :: proc(mx, my: f32) -> bool {
 	return false
 }
 
+// timeline_tracks_content_height is the full height of the track list (every
+// track row plus one insert gap above the first and below the last), computed
+// purely from the track count and the fixed geometry constants. The track
+// region scrolls exactly this far, so content and viewport never disagree
+// regardless of layout timing.
+timeline_tracks_content_height :: proc() -> f32 {
+	n := len(timeline.tracks)
+	return f32(n + 1) * TRACK_GAP_H + f32(n) * TRACK_ROW_H
+}
+
 // timeline_tracks_max_top returns how far the track list can scroll vertically:
-// the content height (first row top through last row bottom, un-shifted by the
-// current scroll) minus the visible tracks area. 0 when the rows fit, so
-// vertical panning only scrolls once there are more tracks than room.
+// the data-derived content height minus the visible tracks viewport. 0 when the
+// rows fit, so vertical panning only scrolls once there are more tracks than
+// room.
 timeline_tracks_max_top :: proc() -> f32 {
 	if len(timeline.tracks) == 0 {
 		return 0
 	}
 	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
-	first := clay.GetElementData(clay.ID("TrackRow", 0)).boundingBox
-	last := clay.GetElementData(clay.ID("TrackRow", u32(len(timeline.tracks) - 1))).boundingBox
-	if sec.height <= 0 || first.width <= 0 || last.width <= 0 {
+	if sec.height <= 0 {
 		return 0
 	}
-	// Recover the un-scrolled row extent: rows are shifted up by timeline_view_top.
-	content := (last.y + last.height + timeline_view_top) - (first.y + timeline_view_top)
-	return max(content - sec.height, 0)
+	return max(timeline_tracks_content_height() - sec.height, 0)
+}
+
+// timeline_scrollbar_proportion returns the vertical thumb size and reach for
+// the timeline's scrollbar, given the viewport height. A zero viewport (or no
+// overflow) means no scrollbar.
+timeline_scrollbar_geometry :: proc() -> (thumb_h, travel, max_top: f32) {
+	max_top = timeline_tracks_max_top()
+	if max_top <= 0 {
+		return 0, 0, max_top
+	}
+	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	view := sec.height
+	if view <= 0 {
+		return 0, 0, 0
+	}
+	thumb_h = clamp(view * view / timeline_tracks_content_height(), TSCROLLBAR_MIN_H, view)
+	travel = view - thumb_h
+	return
 }
 
 // update_timeline_cursor shows the horizontal-resize cursor while dragging or
@@ -783,12 +807,12 @@ main :: proc() {
 						break
 					}
 				}
-				// Vertical wheel over the track LANES scrolls the track list (like
-				// the media bin) once the rows overflow the panel. The ruler strip
-				// above still zooms on wheel.
-				sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
-				if sec.height > 0 && event.wheel.mouse_x >= sec.x && event.wheel.mouse_x <= sec.x + sec.width &&
-					event.wheel.mouse_y >= sec.y && event.wheel.mouse_y <= sec.y + sec.height {
+				// Vertical wheel over the track LANES (and the scrollbar strip
+				// beside them) scrolls the track list, exactly like the media
+				// bin. The ruler strip above still zooms on wheel.
+				ta := clay.GetElementData(clay.ID("TrackArea")).boundingBox
+				if ta.height > 0 && event.wheel.mouse_x >= ta.x && event.wheel.mouse_x <= ta.x + ta.width &&
+					event.wheel.mouse_y >= ta.y && event.wheel.mouse_y <= ta.y + ta.height {
 					if event.wheel.y != 0 {
 						timeline_view_top = clamp(timeline_view_top - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
 						break
@@ -887,6 +911,21 @@ main :: proc() {
 		} else if panning_timeline {
 			panning_timeline = false
 		}
+		// Vertical scrollbar drag: the thumb position maps directly onto
+		// timeline_view_top, using the same data-derived geometry that draws the
+		// thumb. Ends the moment the button lifts.
+		if timeline_scroll_dragging {
+			if !mouse_down {
+				timeline_scroll_dragging = false
+			} else {
+				sb := clay.GetElementData(clay.ID("TimelineVScrollbar")).boundingBox
+				thumb_h, travel, max_top := timeline_scrollbar_geometry()
+				if sb.height > 0 && travel > 0 {
+					pos := (mouse_y - sb.y - timeline_scroll_grab) / travel
+					timeline_view_top = clamp(pos * max_top, 0, max_top)
+				}
+			}
+		}
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
 		commands := build_page(width, height)
@@ -966,6 +1005,19 @@ main :: proc() {
 			if editing_field != 0 {
 				if !edit_field_over() {
 					edit_commit()
+				}
+			}
+			// Timeline scrollbar: pressing the thumb starts a drag; pressing
+			// anywhere else on the strip jumps the thumb to the cursor.
+			if !handled {
+				if clay.PointerOver(clay.ID("VSbThumb")) {
+					timeline_scroll_dragging = true
+					timeline_scroll_grab = mouse_y - clay.GetElementData(clay.ID("VSbThumb")).boundingBox.y
+					handled = true
+				} else if clay.PointerOver(clay.ID("TimelineVScrollbar")) {
+					timeline_scroll_dragging = true
+					timeline_scroll_grab = clay.GetElementData(clay.ID("VSbThumb")).boundingBox.height / 2
+					handled = true
 				}
 			}
 			// Clicking an X/Y/Scale/crop property field focuses it for typing.

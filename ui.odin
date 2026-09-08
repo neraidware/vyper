@@ -208,7 +208,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					backgroundColor = BUTTON,
 					cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
 					border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-					clip = {vertical = true},
 				}) {
 					// Timeline toolbar: snapping and zoom, always visible above the
 					// ruler so the whole timeline is controllable without hunting.
@@ -242,6 +241,13 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 						}) {}
 					}
+					// The track list lives in its own scroll viewport. TrackArea
+					// holds the scrollable lanes (TracksSection) plus the vertical
+					// scrollbar strip, so the scroll geometry is one clean unit
+					// beside the fixed ruler strip above it.
+					if clay.UI(clay.ID("TrackArea"))({
+						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .LeftToRight, childGap = 0},
+					}) {
 					if clay.UI(clay.ID("TracksSection"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
 						clip = {vertical = true, childOffset = {0, -timeline_view_top}},
@@ -264,7 +270,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							}
 							track := &timeline.tracks[track_idx]
 							if clay.UI(clay.ID("TrackRow", u32(track_idx)))({
-								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})}, layoutDirection = .LeftToRight, childGap = SECTION_GAP},
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(TRACK_ROW_H)}, layoutDirection = .LeftToRight, childGap = SECTION_GAP},
 							}) {
 								if clay.UI(clay.ID("TrackName", u32(track_idx)))({
 									layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 4, childAlignment = {x = .Left, y = .Top}},
@@ -360,6 +366,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 								}
 							}
 						}
+					}
+						timeline_v_scrollbar()
 					}
 				}
 			}
@@ -628,6 +636,32 @@ tool_button :: proc(name: string, label: string) {
 	}
 }
 
+// timeline_v_scrollbar renders the track-list vertical scrollbar strip: a thin
+// column beside the lanes that only appears when the rows overflow the viewport
+// (timeline_scrollbar_geometry reports a drawable thumb). Thumb size/position
+// mirror that same data-driven geometry, so what's drawn is always what
+// dragging produces (press = jump, hold = drag; main.odin).
+timeline_v_scrollbar :: proc() {
+	thumb_h, travel, max_top := timeline_scrollbar_geometry()
+	if thumb_h <= 0 || travel <= 0 {
+		return
+	}
+	thumb_top := timeline_view_top / max_top * travel
+	if clay.UI(clay.ID("TimelineVScrollbar"))({
+		layout = {sizing = {width = clay.SizingFixed(TSCROLLBAR_W), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
+		backgroundColor = TRACK_GUTTER_BG,
+	}) {
+		if clay.UI(clay.ID("VSbPad"))({
+			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_top)}},
+		}) {}
+		if clay.UI(clay.ID("VSbThumb"))({
+			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_h)}},
+			backgroundColor = clay.PointerOver(clay.ID("VSbThumb")) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			cornerRadius = clay.CornerRadiusAll(4),
+		}) {}
+	}
+}
+
 // settings_button renders the shared preset control: a fixed-height button that
 // stays held (highlighted border + label) when active reports true. This is
 // used for both mutually-exclusive presets (resolution/fps, where only the
@@ -885,6 +919,8 @@ HELP_SHORTCUTS :: []Help_Shortcut{
 	{"Esc", "Dismiss menu / dialog"},
 	{"F1 / ?", "Toggle this overlay"},
 	{"Wheel over ruler/timeline", "Zoom about the playhead"},
+	{"Wheel over track lanes", "Scroll the track list"},
+	{"Drag timeline scrollbar", "Scroll the track list"},
 	{"Middle-drag timeline", "Pan"},
 	{"Alt+drag a handle", "Crop the selected box"},
 	{"Shift+drag a handle", "Scale from center"},

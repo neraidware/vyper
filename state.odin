@@ -533,6 +533,11 @@ pan_last_y: f32
 panning_timeline: bool
 timeline_pan_last_x: f32
 timeline_pan_last_y: f32
+// Track-list scrollbar drag: active while the left button is held on the
+// timeline's vertical scrollbar thumb; timeline_scroll_grab is the grabbed
+// offset within the thumb so a click+hold anywhere on it drags smoothly.
+timeline_scroll_dragging: bool
+timeline_scroll_grab: f32
 
 // Resize/crop handles shown around the selected clip's bounding box.
 PREVIEW_HANDLE_SIZE :: f32(9)
