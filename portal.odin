@@ -6,7 +6,6 @@ package main
 
 import "core:c"
 import "core:fmt"
-import "core:strings"
 
 GError :: struct {
 	domain: u32,
@@ -17,6 +16,7 @@ GDBusConnection :: struct {}
 GMainLoop :: struct {}
 GVariant :: struct {}
 GVariantType :: struct {}
+GVariantBuilder :: struct {}
 
 GDBusSignalCallback :: proc "c" (
 	connection: ^GDBusConnection,
@@ -29,15 +29,20 @@ foreign import glib "system:glib-2.0"
 foreign import gio "system:gio-2.0"
 
 foreign glib {
-	g_variant_parse :: proc(
-	_type: ^GVariantType,
-	text, limit: cstring,
-	endptr: ^^c.char,
-	error: ^^GError,
-	) -> ^GVariant ---
 	g_variant_unref :: proc(value: ^GVariant) ---
 	g_variant_ref :: proc(value: ^GVariant) -> ^GVariant ---
 	g_error_free :: proc(error: ^GError) ---
+	g_variant_new_string :: proc(s: cstring) -> ^GVariant ---
+	g_variant_new_uint32 :: proc(v: u32) -> ^GVariant ---
+	g_variant_new_variant :: proc(value: ^GVariant) -> ^GVariant ---
+	g_variant_new_tuple :: proc(children: rawptr, n_children: c.size_t) -> ^GVariant ---
+	g_variant_new_dict_entry :: proc(key: ^GVariant, value: ^GVariant) -> ^GVariant ---
+	g_variant_type_new :: proc(type_string: cstring) -> ^GVariantType ---
+	g_variant_type_free :: proc(type: ^GVariantType) ---
+	g_variant_builder_new :: proc(type: ^GVariantType) -> ^GVariantBuilder ---
+	g_variant_builder_unref :: proc(builder: ^GVariantBuilder) ---
+	g_variant_builder_end :: proc(builder: ^GVariantBuilder) -> ^GVariant ---
+	g_variant_builder_add_value :: proc(builder: ^GVariantBuilder, value: ^GVariant) ---
 	g_variant_get_child_value :: proc(value: ^GVariant, index: c.size_t) -> ^GVariant ---
 	g_variant_n_children :: proc(value: ^GVariant) -> c.size_t ---
 	g_variant_get_string :: proc(value: ^GVariant, length: ^c.size_t) -> cstring ---
@@ -86,18 +91,96 @@ portal_response :: proc "c" (
 	g_main_loop_quit(portal_loop)
 }
 
-portal_filter_media :=
-	"'Media files', [(uint32 0, '*.mp4'), (uint32 0, '*.m4v'), (uint32 0, '*.mov'), (uint32 0, '*.mkv'), (uint32 0, '*.webm'), (uint32 0, '*.avi'), (uint32 0, '*.mpeg'), (uint32 0, '*.mpg'), (uint32 0, '*.ts'), (uint32 0, '*.m2ts'), (uint32 0, '*.flv'), (uint32 0, '*.wmv'), (uint32 0, '*.3gp'), (uint32 0, '*.mp3'), (uint32 0, '*.wav'), (uint32 0, '*.flac'), (uint32 0, '*.ogg'), (uint32 0, '*.opus'), (uint32 0, '*.m4a'), (uint32 0, '*.aac'), (uint32 0, '*.png'), (uint32 0, '*.jpg'), (uint32 0, '*.jpeg'), (uint32 0, '*.webp'), (uint32 0, '*.gif'), (uint32 0, '*.bmp'), (uint32 0, '*.tiff')]"
+// Portal_Filter is a FileChooser filter: a display name plus its glob patterns.
+// The portal wire type for `filters` is a(sa(us)) — a list of (name, patterns)
+// structs where each pattern is (uint32 0, '*.ext'). Built with g_variant_builder:
+// GLib's text-format parser cannot express a a(sa(us)) value (a single-element
+// array of tuples is not type-inferable, "unable to find a common type"), which
+// previously made every portal dialog fail at g_variant_parse.
+Portal_Filter :: struct {
+	name:     string,
+	patterns: []string,
+}
 
-portal_filter_srt := "'Subtitle files', [(uint32 0, '*.srt')]"
+portal_filter_media := Portal_Filter{
+	name = "Media files",
+	patterns = {
+		"*.mp4", "*.m4v", "*.mov", "*.mkv", "*.webm", "*.avi", "*.mpeg", "*.mpg",
+		"*.ts", "*.m2ts", "*.flv", "*.wmv", "*.3gp", "*.mp3", "*.wav", "*.flac",
+		"*.ogg", "*.opus", "*.m4a", "*.aac", "*.png", "*.jpg", "*.jpeg", "*.webp",
+		"*.gif", "*.bmp", "*.tiff",
+	},
+}
+
+portal_filter_srt := Portal_Filter{name = "Subtitle files", patterns = {"*.srt"}}
+
+// portal_build_filters builds the `filters` a(sa(us)) value for one filter.
+portal_build_filters :: proc(f: Portal_Filter) -> ^GVariant {
+	filters_type := g_variant_type_new("a(sa(us))")
+	defer g_variant_type_free(filters_type)
+	filters := g_variant_builder_new(filters_type)
+
+	patterns_type := g_variant_type_new("a(us)")
+	pattern_type := g_variant_type_new("(us)")
+	patterns := g_variant_builder_new(patterns_type)
+	for p in f.patterns {
+		entry := g_variant_builder_new(pattern_type)
+		g_variant_builder_add_value(entry, g_variant_new_uint32(0))
+		g_variant_builder_add_value(entry, g_variant_new_string(cstring(raw_data(p))))
+		g_variant_builder_add_value(patterns, g_variant_builder_end(entry))
+		g_variant_builder_unref(entry)
+	}
+	value := g_variant_builder_end(patterns)
+	g_variant_builder_unref(patterns)
+
+	filter_type := g_variant_type_new("(sa(us))")
+	filter := g_variant_builder_new(filter_type)
+	g_variant_builder_add_value(filter, g_variant_new_string(cstring(raw_data(f.name))))
+	g_variant_builder_add_value(filter, value)
+	// add_value consumed `value`'s reference; `end` hands back a fresh one.
+	g_variant_builder_add_value(filters, g_variant_builder_end(filter))
+	g_variant_builder_unref(filter)
+
+	result := g_variant_builder_end(filters)
+	g_variant_builder_unref(filters)
+	g_variant_type_free(patterns_type)
+	g_variant_type_free(pattern_type)
+	g_variant_type_free(filter_type)
+	return result
+}
+
+// portal_build_open_params builds the OpenFile `(sa{sv})` parameters variant.
+portal_build_open_params :: proc(title: string, f: Portal_Filter) -> ^GVariant {
+	dict_type := g_variant_type_new("a{sv}")
+	dict := g_variant_builder_new(dict_type)
+
+	// Each option is a {sv} dict entry. g_variant_new_* constructors and
+	// g_variant_builder_add_value CONSUME their children's references, so no
+	// intermediate unrefs.
+	add_option :: proc(dict: ^GVariantBuilder, key: string, val: ^GVariant) {
+		entry := g_variant_new_dict_entry(g_variant_new_string(cstring(raw_data(key))), g_variant_new_variant(val))
+		g_variant_builder_add_value(dict, entry)
+	}
+
+	add_option(dict, "handle_token", g_variant_new_string("nered_open"))
+	add_option(dict, "title", g_variant_new_string(cstring(raw_data(title))))
+	add_option(dict, "filters", portal_build_filters(f))
+	options := g_variant_builder_end(dict)
+	g_variant_builder_unref(dict)
+	g_variant_type_free(dict_type)
+
+	// g_variant_new_tuple consumes the refs of `parent` and `options`.
+	parent := g_variant_new_string("")
+	params := g_variant_new_tuple(raw_data([]^GVariant{parent, options}), 2)
+	return params
+}
 
 // portal_open_picker runs the XDG portal OpenFile dialog with the given title
-// and g_variant filter spec (the contents of the 'filters' array), returning
-// the picked path as a cstring into glib-owned memory (kept alive for the
-// program's lifetime) or nil on cancel/error. Shared by the media and
-// subtitle pickers; the dialog is modal and blocks as the portal's synchronous
-// GDBus plumbing does.
-portal_open_picker :: proc(title, filter_spec: string) -> cstring {
+// and filter, returning the picked path as a cstring into glib-owned memory
+// (kept alive for the program's lifetime) or nil on cancel/error. Shared by the
+// media and subtitle pickers; the dialog is modal and blocks as the portal's
+// synchronous GDBus plumbing does.
+portal_open_picker :: proc(title: string, filter: Portal_Filter) -> cstring {
 	portal_response_data = nil
 	connection := g_bus_get_sync(2, nil, nil) // G_BUS_TYPE_SESSION
 	if connection == nil {
@@ -105,22 +188,7 @@ portal_open_picker :: proc(title, filter_spec: string) -> cstring {
 		return nil
 	}
 
-	variant_text := fmt.aprintf(
-		"('', '%s', {'handle_token': <'nered_open'>, 'filters': <[%s]>})",
-		title, filter_spec)
-	defer delete(variant_text)
-	parameters := g_variant_parse(
-		nil,
-		strings.clone_to_cstring(variant_text),
-		nil,
-		nil,
-		nil,
-	)
-	if parameters == nil {
-		fmt.println("Could not create portal request parameters")
-		return nil
-	}
-
+	parameters := portal_build_open_params(title, filter)
 	error: ^GError
 	reply := g_dbus_connection_call_sync(
 		connection,
@@ -256,25 +324,29 @@ portal_save_file_picker :: proc() -> cstring {
 	if render_out_path_len > 0 {
 		default_name = path_basename(cstring(&render_out_path_buf[0]))
 	}
-	variant_text := fmt.aprintf(
-		"('', 'Save render output', {" +
-			"'handle_token': <'nered_save'>, " +
-			"'current_name': <%q>, " +
-			"'filters': <[('MP4 video', [(uint32 0, '*.mp4')])]>" +
-			"})",
-		default_name)
-	defer delete(variant_text)
-	parameters := g_variant_parse(
-		nil,
-		strings.clone_to_cstring(variant_text),
-		nil,
-		nil,
-		nil,
-	)
-	if parameters == nil {
-		fmt.println("Could not create portal save parameters")
-		return nil
+	dict_type := g_variant_type_new("a{sv}")
+	dict := g_variant_builder_new(dict_type)
+
+	add_option :: proc(dict: ^GVariantBuilder, key, value: cstring) {
+		entry := g_variant_new_dict_entry(g_variant_new_string(key), g_variant_new_variant(g_variant_new_string(value)))
+		g_variant_builder_add_value(dict, entry)
 	}
+
+	add_option(dict, "handle_token", "nered_save")
+	add_option(dict, "title", "Save render output")
+	add_option(dict, "current_name", cstring(raw_data(default_name)))
+	{ // filters (a(sa(us)) value, not a plain string)
+		filter := Portal_Filter{name = "MP4 video", patterns = {"*.mp4"}}
+		entry := g_variant_new_dict_entry(g_variant_new_string("filters"), g_variant_new_variant(portal_build_filters(filter)))
+		g_variant_builder_add_value(dict, entry)
+	}
+	options := g_variant_builder_end(dict)
+	g_variant_builder_unref(dict)
+	g_variant_type_free(dict_type)
+
+	// g_variant_new_tuple consumes the refs of `parent` and `options`.
+	parent := g_variant_new_string("")
+	parameters := g_variant_new_tuple(raw_data([]^GVariant{parent, options}), 2)
 
 	error: ^GError
 	reply := g_dbus_connection_call_sync(
