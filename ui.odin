@@ -211,7 +211,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					}) {
 						clay.Text("Open file", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_HEADING, textAlignment = .Center})
 					}
-					clay.Text("or drop a file onto the window, or drag media from the Media Bin here.", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL, wrapMode = .Words})
 				}
 			} else {
 				if clay.UI(clay.ID("ClipTimeline"))({
@@ -493,7 +492,6 @@ project_card :: proc() {
 	} else {
 		clay.Text("full timeline", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
 	}
-	clay.Text("Set with I (start) and O (end) at the playhead", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 }
 
 // clip_label_text returns the display name for a clip (its own name, falling
@@ -517,7 +515,6 @@ clip_card :: proc() {
 	}
 	if tr, cl, ok := selected_clip(); !ok {
 		clay.Text("No clip selected", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
-		clay.Text("Select a clip on the timeline or in the preview to edit it here.", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words})
 		return
 	} else {
 		if cl.kind != .Audio {
@@ -1113,7 +1110,6 @@ media_bin_header :: proc() {
 media_bin_grid :: proc() {
 	if len(media_assets) == 0 {
 		clay.Text("No media imported", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
-		clay.Text("Import, or drop media onto the timeline", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 		return
 	}
 	cols := media_bin_cols()
