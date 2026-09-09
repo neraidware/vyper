@@ -570,9 +570,16 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 	}
 
 	// No segmentation at all: legacy whole-proxy fast path (old mono builds +
-	// the sync probe path). A background build in flight means this source is
-	// transitioning to segments -- never latch onto a half-written artifact.
-	if import_bg_building_for(string(src)) {
+	// the sync probe path). The blocked case is ONLY the synchronous build path
+	// (probes/CI): there a whole proxy may be half-written by proxy_transcode right
+	// now, and latching it would make proxy_valid_cache_hit remove it from under
+	// its open handle. In live (async) mode the segmented builder never writes the
+	// whole-proxy path -- it only writes segments + the .idx -- so a whole proxy
+	// present here is a complete pre-existing artifact, safe to serve through the
+	// entire segmented rebuild. Without this, a re-import degrades the preview to
+	// full-res source decode (~200ms/frame) for the whole build even when a fine
+	// proxy already exists.
+	if import_bg_building_for(string(src)) && !async_import_mode {
 		return nil, 0
 	}
 	if rc.whole_valid {
