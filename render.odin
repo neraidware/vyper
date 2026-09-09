@@ -250,7 +250,7 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		delete(render_text_setup_scratch)
 		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
 	}
-	ox, oy, ow, oh := rasterize_lines_into_buffer(lines, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, font_px)
+	ox, oy, ow, oh := rasterize_lines_into_buffer(lines, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, font_px, context.allocator)
 	if ow <= 0 || oh <= 0 {
 		delete(buf)
 		return

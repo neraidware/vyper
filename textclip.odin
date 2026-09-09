@@ -190,6 +190,7 @@ rasterize_lines_into_buffer :: proc(
 	font_init: ^bool,
 	scratch: []u8,
 	font_px: f32,
+	allocator: mem.Allocator,
 ) -> (ox: int, oy: int, ow: int, oh: int) {
 	mem.zero(raw_data(buf), len(buf))
 	if len(lines) == 0 {
@@ -204,8 +205,10 @@ rasterize_lines_into_buffer :: proc(
 		font_init^ = true
 	}
 
-	// Per-line temp rasterize first: every line is measured/positioned before
-	// compositing because centering needs the widest line's ink width.
+	// Per-line rasterize into `allocator`-backed scratch first: every line is
+	// measured/positioned before compositing because centering needs the widest
+	// line's ink width. Callers pass the frame temp arena (UI thread) or the
+	// job arena (render worker) — line buffers never outlive the call.
 	Type_Line_Slot :: struct {
 		buf: []u8,
 		bw:  int,
@@ -224,7 +227,7 @@ rasterize_lines_into_buffer :: proc(
 
 	for i in 0 ..< len(lines) {
 		lbw, lbh := text_buf_size_for(lines[i], px)
-		lbuf := make([]u8, lbw * lbh * 4)
+		lbuf := make([]u8, lbw * lbh * 4, allocator)
 		lox, loy, low, loh := rasterize_title_into_buffer(lines[i], lbuf, lbw, lbh, font, font_init, scratch, px)
 		slots[i] = {buf = lbuf, bw = lbw, bh = lbh, lox = lox, loy = loy, low = low, loh = loh}
 		if low > max_ink_w {
@@ -243,9 +246,6 @@ rasterize_lines_into_buffer :: proc(
 	}
 
 	if max_ink_w == 0 {
-		for i in 0 ..< len(lines) {
-			delete(slots[i].buf)
-		}
 		return 0, 0, 0, 0
 	}
 
@@ -294,8 +294,5 @@ rasterize_lines_into_buffer :: proc(
 
 	ow = max(0, right_ink - left_ink)
 	oh = max(0, ink_bottom - ink_top)
-	for i in 0 ..< len(lines) {
-		delete(slots[i].buf)
-	}
 	return left_ink, ink_top, ow, oh
 }

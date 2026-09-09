@@ -587,7 +587,7 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			delete(slot.text_scratch)
 			slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
 		}
-		_, _, bw0, bh0 := rasterize_lines_into_buffer(lines, slot.text_base_buf, base_bw, base_bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, TEXT_CLIP_FONT_PIXELS)
+		_, _, bw0, bh0 := rasterize_lines_into_buffer(lines, slot.text_base_buf, base_bw, base_bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, TEXT_CLIP_FONT_PIXELS, context.temp_allocator)
 
 		// Project-space box size for source_w x source_h text pixels at scale (1
 		// source px maps to scale * PW/PREVIEW_W project px, uniform in both
@@ -635,7 +635,7 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			delete(slot.text_buf)
 			slot.text_buf = make([]u8, need)
 		}
-		tx, ty, tw, th := rasterize_lines_into_buffer(lines, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px)
+		tx, ty, tw, th := rasterize_lines_into_buffer(lines, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px, context.temp_allocator)
 		slot.text_x = tx
 		slot.text_y = ty
 		slot.text_w = tw
