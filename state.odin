@@ -117,7 +117,7 @@ file_info_text: string
 // canvas.
 resolution_locked: bool
 
-Media_Kind :: enum { Video, Audio, Image, Other, Empty, Text }
+Media_Kind :: enum { Video, Audio, Image, Other, Empty, Text, Subtitles }
 
 // Generator_Kind marks clips that synthesize their output programmatically
 // instead of decoding a backing media file (a "generator"). .None = a regular
@@ -146,6 +146,10 @@ Media_Asset :: struct {
 	// audio_frames is the clip length for the audio stream(s), derived from the
 	// duration at import (never shorter than the video frame count).
 	audio_frames: i64,
+	// srt_id is the session srt-cache id for a .Subtitles asset (the srt text
+	// lives in the immortal append-only cache). -1 for non-subtitle assets; a
+	// drop of the asset derives its timeline clip length from frame_count.
+	srt_id: int,
 	// Thumbnail: CPU RGBA + lazily-created GPU texture (uploaded by the render
 	// loop once; thumb_tex_dirty set at import).
 	thumb_buf:          [THUMB_W * THUMB_H * 4]u8,

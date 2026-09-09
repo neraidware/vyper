@@ -1246,7 +1246,24 @@ render_start :: proc() {
 					    source_h = clip.source_h,
 				    })
 			    }
+		    case .Subtitles:
+		    // subtitle assets drop as .Text/.Subtitles generator clips (the
+		    // .Subtitles clip kind is never placed on the timeline)
+		    if clip.generator == .Subtitles {
+			    append(&subs, Render_Sub_Src{
+				    srt_id = clip.srt_id,
+				    fps = f32(timeline_fps()),
+				    timeline_start_frame = clip.timeline_start_frame,
+				    source_start_frame = clip.source_start_frame,
+				    source_length_frames = clip.source_length_frames,
+				    transform_x = clip.transform_x,
+				    transform_y = clip.transform_y,
+				    scale = clip.scale,
+				    source_w = clip.source_w,
+				    source_h = clip.source_h,
+			    })
 		    }
+	    }
 		}
 	}
 	render_job_videos = cls[:]

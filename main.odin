@@ -526,29 +526,6 @@ is_srt_pick :: proc(path: cstring) -> bool {
 	return true
 }
 
-// add_subtitle_clip_from_path loads the .srt at `path` and places a Subtitle
-// generator clip on track 0 at `at_frame`, selecting it. Returns true when a
-// clip was created; a message and no clip on parse failure.
-add_subtitle_clip_from_path :: proc(path: cstring, at_frame: i64) -> bool {
-	if len(timeline.tracks) == 0 {
-		return false
-	}
-	srt_id := srt_load(path)
-	if srt_id < 0 {
-		show_ui_notice(fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)), 4000)
-		return false
-	}
-	name := strings.clone(path_basename(path))
-	sync.mutex_lock(&audio_timeline_mtx)
-	track := 0
-	idx := add_subtitle_generator_clip(&timeline.tracks[track], at_frame, srt_id, name)
-	sync.mutex_unlock(&audio_timeline_mtx)
-	audio_note_edit()
-	selected_track = track
-	selected_index = idx
-	return true
-}
-
 // pointer_over_context_menu reports whether the cursor is over the context menu
 // proper or its "Add >" submenu (both are part of the same transient UI).
 pointer_over_context_menu :: proc() -> bool {
@@ -1067,7 +1044,7 @@ main :: proc() {
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
 			if path := open_file_picker(); path != nil {
 				if is_srt_pick(path) {
-					add_subtitle_clip_from_path(path, timeline_duration())
+					import_srt_to_bin(path)
 				} else {
 					import_media_to_bin(path)
 				}
@@ -1079,9 +1056,10 @@ main :: proc() {
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OpenFileButton")) {
 			if path := open_file_picker(); path != nil {
 				if is_srt_pick(path) {
-					// Subtitle pick: straight to a generator clip (can't probe a
-					// text file as media).
-					add_subtitle_clip_from_path(path, timeline_duration())
+					// Subtitle pick: into the bin as an asset, placed on the
+					// timeline only when the user drags it to a track (can't
+					// probe a text file as media).
+					import_srt_to_bin(path)
 				} else {
 					// Classic Open File flow: probe the file and drop it straight
 					// onto the timeline (appended at the end), keeping its bin

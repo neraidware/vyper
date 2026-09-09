@@ -1053,6 +1053,8 @@ kind_name :: proc(kind: Media_Kind) -> string {
 		return "empty"
 	case .Text:
 		return "text"
+	case .Subtitles:
+		return "subtitles"
 	case:
 		return "other"
 	}

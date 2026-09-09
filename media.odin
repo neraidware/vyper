@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
@@ -294,6 +295,39 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	return asset_id
 }
 
+// import_srt_to_bin loads a .srt into the media bin as a .Subtitles asset (no
+// timeline change: the clip appears only when the user drags the asset onto the
+// timeline, like any other bin media). One bin entry per path; re-importing the
+// same subtitle yields the existing asset's id. Returns 0 when the file cannot
+// be parsed as SRT.
+import_srt_to_bin :: proc(path: cstring) -> u64 {
+	for &a in media_assets {
+		if strings.compare(string(a.path), string(path)) == 0 {
+			return a.id
+		}
+	}
+	srt_id := srt_load(path)
+	if srt_id < 0 {
+		show_ui_notice(fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)), 4000)
+		return 0
+	}
+	one_sec := i64(math.round(timeline_fps()))
+	length := max(one_sec, cue_frame(srt_duration_ms(srt_source(srt_id)), f32(timeline_fps())))
+	asset_id := next_asset_id()
+	append(&media_assets, Media_Asset{
+		id = asset_id,
+		path = path,
+		kind = .Subtitles,
+		metadata = strings.clone(path_basename(path)),
+		frame_count = length,
+		audio_frames = length,
+		srt_id = srt_id,
+		thumb_tex_dirty = true,
+	})
+	show_ui_notice(fmt.aprintf("Subtitles '%s' added to the media bin", path_basename(path)), 2000)
+	return asset_id
+}
+
 // add_asset_to_timeline places one clip per stream of an imported asset onto
 // the timeline, starting at track `target_track`: a video clip on lane 0, then
 // one audio clip per audio stream on the lanes below (lane = target_track + s).
@@ -309,6 +343,9 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	n_lanes := int(asset.audio_streams)
 	if asset.kind == .Video {
 		n_lanes += 1
+	}
+	if asset.kind == .Subtitles {
+		n_lanes = 1
 	}
 	if n_lanes <= 0 {
 		return start_frame
@@ -343,20 +380,37 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	video_placed: i64 = -1
 	for offset in 0 ..< n_lanes {
 		is_video := asset.kind == .Video && offset == 0
+		is_sub := asset.kind == .Subtitles && offset == 0
 		lane_len := is_video ? asset.frame_count : asset.audio_frames
 		lane := base + offset
 		for len(timeline.tracks) <= lane {
 			append(&timeline.tracks, Track{name = next_track_name()})
 		}
 		track := &timeline.tracks[lane]
+		if is_sub && len(track.clips) > 0 {
+			// Clamp the subtitle's authored span to the placement gap, matching
+			// add_subtitle_generator_clip so a dropped subtitle never overlaps
+			// the next clip on the track.
+			gaps := clip_track_gaps(track, -1)
+			defer delete(gaps)
+			if gi := gap_for_start(gaps[:], anchor_placed); gi >= 0 {
+				hi := gaps[gi][1]
+				if anchor_placed + lane_len > hi {
+					lane_len = max(hi - anchor_placed, 1)
+				}
+			}
+		}
 		placed := anchor_placed
 		clip := Clip{
 			clip_id = new_clip_id(),
 			link_id = link,
 			asset_id = asset.id,
-			path = asset.path,
-			kind = is_video ? .Video : .Audio,
-			stream_index = c.int(offset - (asset.kind == .Video ? 1 : 0)),
+			path = is_sub ? nil : asset.path,
+			name = is_sub ? strings.clone(path_basename(asset.path)) : "",
+			kind = is_video ? .Video : (is_sub ? .Text : .Audio),
+			generator = is_sub ? .Subtitles : .None,
+			srt_id = is_sub ? asset.srt_id : -1,
+			stream_index = is_sub ? c.int(-1) : c.int(offset - (asset.kind == .Video ? 1 : 0)),
 			source_start_frame = 0,
 			source_length_frames = lane_len,
 			timeline_start_frame = placed,
@@ -378,6 +432,12 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			// surface them on the video clip as embedded clip markers.
 			clip.markers = import_obs_chapters(asset.path)
 			video_placed = placed
+		} else if is_sub {
+			// Subtitle generator clip sits centered on the project canvas at
+			// native scale, exactly like add_subtitle_generator_clip sets it.
+			clip.transform_x = f32(project.width) / 2
+			clip.transform_y = f32(project.height) / 2
+			clip.scale = 1
 		}
 		append(&track.clips, clip)
 		// Keep the track's clips sorted ascending by timeline start.

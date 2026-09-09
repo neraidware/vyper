@@ -81,6 +81,9 @@ compute_media_drop_lanes :: proc(asset: ^Media_Asset, target_track: int, frame: 
 	if asset.kind == .Video {
 		n_lanes += 1
 	}
+	if asset.kind == .Subtitles {
+		n_lanes = 1
+	}
 	if n_lanes <= 0 {
 		return
 	}
@@ -92,6 +95,19 @@ compute_media_drop_lanes :: proc(asset: ^Media_Asset, target_track: int, frame: 
 	anchor_placed := max(frame, 0)
 	if base < len(timeline.tracks) {
 		anchor_placed = clip_place_in_track(&timeline.tracks[base], -1, anchor_len, anchor_placed)
+	}
+	if asset.kind == .Subtitles {
+		created := base >= len(timeline.tracks)
+		append(lanes, Media_Lane{
+			track_idx = base,
+			created = created,
+			placed = anchor_placed,
+			blocked = false,
+			clip_len = anchor_len,
+			kind = .Subtitles,
+			stream_index = c.int(-1),
+		})
+		return
 	}
 	blocked := false
 	for offset in 1 ..< n_lanes {
@@ -279,6 +295,8 @@ media_kind_color :: proc(kind: Media_Kind) -> clay.Color {
 		return AUDIO_CLIP
 	case .Video:
 		return clay.Color{52, 66, 84, 255} // muted blue for a video without a thumb
+	case .Subtitles:
+		return clay.Color{214, 138, 34, 255} // amber: subtitles have no decoded frame
 	case:
 		return BUTTON
 	}
@@ -415,6 +433,9 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 				fill[3] = 170
 				render_sdf_rect(renderer, command_buffer, pass, b, fill, 6, 0)
 				audio_label := "Audio"
+				if lane.kind == .Subtitles {
+					audio_label = "Subtitles"
+				}
 				w := f32(len(audio_label)) * f32(FONT_NORMAL) * 0.6
 				render_text(renderer, command_buffer, pass, clay.BoundingBox{x = b.x + 6, y = b.y + b.height/2 - f32(FONT_NORMAL) * 0.5, width = w, height = f32(FONT_NORMAL)}, clay.TextRenderData{
 					stringContents = clay.StringSlice{length = c.int32_t(len(audio_label)), chars = ([^]c.char)(raw_data(audio_label))},
