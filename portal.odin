@@ -108,7 +108,7 @@ portal_filter_media := Portal_Filter{
 		"*.mp4", "*.m4v", "*.mov", "*.mkv", "*.webm", "*.avi", "*.mpeg", "*.mpg",
 		"*.ts", "*.m2ts", "*.flv", "*.wmv", "*.3gp", "*.mp3", "*.wav", "*.flac",
 		"*.ogg", "*.opus", "*.m4a", "*.aac", "*.png", "*.jpg", "*.jpeg", "*.webp",
-		"*.gif", "*.bmp", "*.tiff",
+		"*.gif", "*.bmp", "*.tiff", "*.srt",
 	},
 }
 

@@ -502,6 +502,53 @@ add_subtitle_clip_at :: proc() {
 	selected_index = idx
 }
 
+// is_srt_pick reports whether a picked path is a subtitle file (".srt" suffix,
+// case-insensitive). Picks like these are routed to the subtitle flow by the
+// media import / open-file buttons, which otherwise can't do anything useful
+// with a text file (ffprobe reports no streams).
+is_srt_pick :: proc(path: cstring) -> bool {
+	p := string(path)
+	n := len(p)
+	if n < 4 {
+		return false
+	}
+	ext := p[n - 4:n]
+	suffix := ".srt"
+	for i in 0 ..< 4 {
+		ch := ext[i]
+		if ch >= 'A' && ch <= 'Z' {
+			ch += 32
+		}
+		if ch != suffix[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// add_subtitle_clip_from_path loads the .srt at `path` and places a Subtitle
+// generator clip on track 0 at `at_frame`, selecting it. Returns true when a
+// clip was created; a message and no clip on parse failure.
+add_subtitle_clip_from_path :: proc(path: cstring, at_frame: i64) -> bool {
+	if len(timeline.tracks) == 0 {
+		return false
+	}
+	srt_id := srt_load(path)
+	if srt_id < 0 {
+		show_ui_notice(fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)), 4000)
+		return false
+	}
+	name := strings.clone(path_basename(path))
+	sync.mutex_lock(&audio_timeline_mtx)
+	track := 0
+	idx := add_subtitle_generator_clip(&timeline.tracks[track], at_frame, srt_id, name)
+	sync.mutex_unlock(&audio_timeline_mtx)
+	audio_note_edit()
+	selected_track = track
+	selected_index = idx
+	return true
+}
+
 // pointer_over_context_menu reports whether the cursor is over the context menu
 // proper or its "Add >" submenu (both are part of the same transient UI).
 pointer_over_context_menu :: proc() -> bool {
@@ -1019,7 +1066,11 @@ main :: proc() {
 			import_bg_cancel()
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("BinImportButton")) {
 			if path := open_file_picker(); path != nil {
-				import_media_to_bin(path)
+				if is_srt_pick(path) {
+					add_subtitle_clip_from_path(path, timeline_duration())
+				} else {
+					import_media_to_bin(path)
+				}
 			}
 		} else if mouse_down && !was_mouse_down && len(media_assets) > 0 && media_bin_item_at(mouse_x, mouse_y) >= 0 {
 			// Pressing a bin cell selects the media and starts the drag-to-timeline
@@ -1027,12 +1078,18 @@ main :: proc() {
 			begin_media_drag(media_bin_item_at(mouse_x, mouse_y), mouse_x, mouse_y)
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("OpenFileButton")) {
 			if path := open_file_picker(); path != nil {
-				// Classic Open File flow: probe the file and drop it straight
-				// onto the timeline (appended at the end), keeping its bin
-				// entry. A bin-only import forced an extra pick-and-drag step
-				// the old direct-load behavior didn't have.
-				if asset_id := import_media_to_bin(path); asset_id != 0 {
-					add_asset_to_timeline(asset_id, 0, timeline_duration())
+				if is_srt_pick(path) {
+					// Subtitle pick: straight to a generator clip (can't probe a
+					// text file as media).
+					add_subtitle_clip_from_path(path, timeline_duration())
+				} else {
+					// Classic Open File flow: probe the file and drop it straight
+					// onto the timeline (appended at the end), keeping its bin
+					// entry. A bin-only import forced an extra pick-and-drag step
+					// the old direct-load behavior didn't have.
+					if asset_id := import_media_to_bin(path); asset_id != 0 {
+						add_asset_to_timeline(asset_id, 0, timeline_duration())
+					}
 				}
 			}
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("Res720")) {
