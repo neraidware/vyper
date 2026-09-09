@@ -450,6 +450,15 @@ proxy_resolver_entry :: struct {
 	idx_mtime:   time.Time,
 	whole_proxy: [4096]u8,
 	whole_valid: bool,
+	// valid_k_ok + valid_k record the last segment index whose on-disk file this
+	// picker CONFIRMED exists (os.exists) in this session. The built-segment fast
+	// path used to stat the segment file every render frame per slot; a stat is a
+	// real syscall on the render-loop critical path. Once a segment has been
+	// positively validated AND chosen, it cannot vanish without the decoder's
+	// next open also failing, so we only re-stat when the segment index actually
+	// changes (boundary cross or index growth). A fresh source reset clears it.
+	valid_k_ok: bool,
+	valid_k:    int,
 }
 
 proxy_resolver_cache: proxy_resolver_entry
@@ -491,14 +500,27 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 		if k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
 			seg, sok := proxy_segment_path_for(src, k, out_buf)
 			if sok {
+				// The index says this segment is built; confirm its file exists
+				// ONCE per segment (not every frame). os.exists is a stat syscall
+				// on the render-loop critical path -- re-statting the same segment
+				// every frame whenever the playhead sits inside it is the core
+				// regression from going per-frame. We only re-stat when the
+				// segment index changed; a segment we already validated cannot
+				// vanish without the decoder's next open also failing.
+				if rc.valid_k_ok && rc.valid_k == k {
+					return seg, i64(k) * PROXY_SEG_FRAMES
+				}
 				if !os.exists(string(seg)) {
 					// The index claims this segment is built but its file is
 					// gone (external removal, or cleanup without an index
 					// write). Don't hand the decoder a doomed path that fails
 					// reopen every frame and leaves a stale face on screen:
 					// fall back to the source; a re-import/rebuild restores it.
+					rc.valid_k_ok = false
 					return nil, 0
 				}
+				rc.valid_k_ok = true
+				rc.valid_k = k
 				return seg, i64(k) * PROXY_SEG_FRAMES
 			}
 			return nil, 0
