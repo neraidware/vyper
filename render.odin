@@ -1600,12 +1600,12 @@ preview_probe_run :: proc(paths: [2]string) {
 	}
 
 	// Header for the trace below (mirrors the re-enabled [vf] gate).
-	fmt.println("[probe] frame playhead_playing req clip_frame last_frame have_last cache_keys has_frame frontier  |  pixel_diff(ground_truth)")
+	fmt.println("[probe] frame playhead_playing req clip_frame last_frame have_last cache_keys has_frame  |  pixel_diff(ground_truth)")
 	max_slot_idx_used = 1
 	total_frames_run := int(total_frames + 4)
 	for f := 0; f < total_frames_run; f += 1 {
 		// Interleave paused and playing to exercise both the exact-request path
-		// and the playing frontier-clamp path.
+		// (paused) and the dropped-frame playback path (playing).
 		playhead.frame = i64(f)
 		playhead.playing = false
 		update_preview_slots()
@@ -1623,7 +1623,7 @@ preview_probe_run :: proc(paths: [2]string) {
 				}
 				fmt.print(slot.dec.cache[ci].frame)
 			}
-			fmt.printf("} has_frame=%v frontier=%d\n", slot.has_frame, slot.frontier)
+			fmt.printf("} has_frame=%v\n", slot.has_frame)
 		}
 		if max_slot_idx_used > 0 {
 			playhead.playing = true
@@ -1635,8 +1635,8 @@ preview_probe_run :: proc(paths: [2]string) {
 				}
 				expected := slot.source_start_frame + i64(f) - slot.timeline_start_frame
 				diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
-				fmt.printf("  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v frontier=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
-					f, expected, slot.dec.last_frame, slot.dec.have_last, slot.has_frame, slot.frontier,
+				fmt.printf("  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
+					f, expected, slot.dec.last_frame, slot.dec.have_last, slot.has_frame,
 					gt_ok, diffs, maxd)
 			}
 		}
@@ -1716,7 +1716,7 @@ boundary_probe_run :: proc(v: string) {
 	fmt.println("[bprobe] after raw-delete middle + drag tail back")
 	boundary_probe_print_clips()
 
-	fmt.println("[bprobe] stepped play (playing=true, pixel-vs-ground-truth): tl/src cf last has_frame frontier | diff maxd")
+	fmt.println("[bprobe] stepped play (playing=true, pixel-vs-ground-truth): tl/src cf last has_frame | diff maxd")
 	for ph := i64(0); ph < total_frames; ph += 1 {
 		playhead.frame = ph
 		playhead.playing = true
@@ -1728,19 +1728,18 @@ boundary_probe_run :: proc(v: string) {
 			}
 			expected := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
-			fmt.printf("[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v fr=%d gt=%v diff=%d maxd=%d\n",
+			fmt.printf("[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v gt=%v diff=%d maxd=%d\n",
 				playhead.frame, slot.timeline_start_frame, slot.source_start_frame, expected,
-				slot.dec.last_frame, slot.dec.have_last, slot.has_frame, slot.frontier,
+				slot.dec.last_frame, slot.dec.have_last, slot.has_frame,
 				gt_ok, diffs, maxd)
 		}
 	}
 
-	// Live-cadence pass: the playhead runs on the wall clock while decode trails
-	// it (dropped-frame preview). Burst THROUGH the boundary and then keep the
-	// playhead a few frames ahead of the slot frontier, exactly like real-time
-	// playback where decode can't sustain 60fps. Every displayed buffer is
-	// compared to ground truth for the DECODED frame (slot.frontier), not the
-	// playhead.
+	// Live-cadence pass: the playhead runs ahead of decode (dropped-frame
+	// preview). Burst THROUGH the boundary and keep going, exactly like
+	// real-time playback where decode trails the playhead. Every displayed
+	// buffer is compared to ground truth: in probe mode the worker is drained
+	// after each step, so the posted playhead frame is what lands in the slot.
 	fmt.println("[bprobe] live dropped-frame cadence (decode trails playhead, burst across boundary)")
 	invalidate_preview_slots()
 	ph: i64 = 40
@@ -1753,11 +1752,11 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			shown := slot.source_start_frame + slot.frontier - slot.timeline_start_frame
+			shown := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, shown, slot.buffer[:])
-			fmt.printf("[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v frontier=%d last=%d | gt=%v diff=%d maxd=%d\n",
+			fmt.printf("[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v last=%d | gt=%v diff=%d maxd=%d\n",
 				ph, shown, slot.timeline_start_frame, slot.source_start_frame,
-				slot.has_frame, slot.frontier, slot.dec.last_frame, gt_ok, diffs, maxd)
+				slot.has_frame, slot.dec.last_frame, gt_ok, diffs, maxd)
 		}
 		if step_i == 7 {
 			ph += 10 // burst 61 -> 71: crosses the 68 boundary in a single tick

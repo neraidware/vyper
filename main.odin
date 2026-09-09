@@ -34,7 +34,6 @@ toggle_playback :: proc() {
 	playback_stop_frame = -1
 	playhead_accumulator = 0
 	last_tick_ns = sdl.GetTicksNS()
-	preview_frontier = playhead.frame
 	audio_was_playing = false
 	playhead.playing = true
 	preview.playing = true
@@ -60,7 +59,6 @@ jog_playback :: proc(dir: int) {
 		playback_stop_frame = -1
 		playhead_accumulator = 0
 		last_tick_ns = sdl.GetTicksNS()
-		preview_frontier = playhead.frame
 		audio_was_playing = false
 		playhead.playing = true
 		preview.playing = true
@@ -599,7 +597,6 @@ play_project_area :: proc() {
 	playback_boost = 0
 	playhead_accumulator = 0
 	last_tick_ns = sdl.GetTicksNS()
-	preview_frontier = playhead.frame
 	audio_was_playing = false
 	playhead.playing = true
 	preview.playing = true
@@ -779,7 +776,6 @@ main :: proc() {
 		playhead.playing = true
 		preview.playing = true
 		playhead_accumulator = 0
-		preview_frontier = playhead.frame
 		last_tick_ns = sdl.GetTicksNS()
 		audio_note_edit()
 	}
@@ -1475,21 +1471,14 @@ main :: proc() {
 				}
 			}
 			playhead.frame = frame
-			preview_frontier = frame
 			// A playhead jump must anchor audio to the new position immediately:
 			// otherwise the producer keeps decoding from the pre-scrub position
 			// and the sound lags the video until its far-forward guard trips.
 			audio_seek(frame)
 			sync.atomic_store(&audio_ph_src, 1)
 			sync.atomic_store(&audio_ph_catch, 0)
-			// And the preview: drop every slot's decode frontier so the exact
-			// playhead frame is requested (the forward-clamp would otherwise walk
-			// the image toward the new position one frame per update).
-			for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
-				if preview_slots[s].in_use {
-					preview_slots[s].have_frontier = false
-				}
-			}
+			// The preview requests the exact new playhead frame on its next
+			// update (there is no frontier to rewind), so it follows the scrub.
 		} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
 			toggle_playback()
 		}
@@ -1603,10 +1592,10 @@ main :: proc() {
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
 			if nered_trace {
 				elapsed := f64(now_ns - ui_report_tick) / 1e9
-				fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d frontier=%d gap=%d acc=%.3fs src=%d catch=%d prod=%d\n",
+				fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d acc=%.3fs src=%d catch=%d prod=%d\n",
 					f64(ui_frame_count) / elapsed,
 					f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
-					playhead.frame, preview_frontier, playhead.frame - preview_frontier,
+					playhead.frame,
 					playhead_accumulator, sync.atomic_load(&audio_ph_src), sync.atomic_load(&audio_ph_catch), sync.atomic_load(&audio_prod_frame))
 			}
 			ui_report_tick = now_ns

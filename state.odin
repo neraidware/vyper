@@ -289,13 +289,6 @@ dragging_playhead: bool
 // throttle so the final position decodes exactly once.
 scrub_tick: i32
 SCRUB_DECIMATION :: 4
-// Playback catch-up: while playing, a video slot whose decode frontier has
-// fallen this many frames (or more) behind the wall-clock playhead decodes the
-// CURRENT frame instead of crawling one dropped frame per update. Dropping to
-// the playhead keeps A/V drift bounded (an all-intra proxy re-seek is one
-// keyframe); without it a slow decode frontier falls unboundedly behind and
-// video appears frozen for seconds while audio plays on its own clock.
-PLAYBACK_CATCHUP_FRAMES :: 4
 upper_area_height: f32 = 560
 resizing_areas: bool
 moving_clip: bool
@@ -503,12 +496,6 @@ Preview_Slot :: struct {
 	text_recreate:       bool,
 	tex_dirty:           bool,
 	texture:             ^sdl.GPUTexture,
-	// Per-slot decode frontier, not the global one: the global gate rewinds
-	// wrongly after a clip is moved to an earlier point (playhead sits at/below
-	// the old purchased frontier, decode is skipped, and the slot freezes on the
-	// pre-move content). Each slot only caps how far AHEAD of itself it decodes.
-	frontier:            i64,
-	have_frontier:       bool,
 	// prime_from_warm is set when this slot's decoder was handed over by the
 	// warm prewarm (its RAM cache already holds the new clip's first frames).
 	// On that frame the front slot decodes synchronously from the warm cache
@@ -525,12 +512,6 @@ Preview_Slot :: struct {
 
 preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot
 
-// preview_frontier is the highest timeline frame whose pixels were actually
-// decoded into a preview slot. During playback the decoder always requests the
-// frame right after the frontier (never rewinds), so the image advances
-// best-effort at whatever decode sustains while the playhead stays on the wall
-// clock.
-preview_frontier: i64
 ui_playhead_frame: i64 // published playhead frame for the audio producer (atomic)
 // audio_dev_frame is the content frame the sound device has actually consumed
 // (everything the producer pushed minus what is still queued); published every

@@ -226,12 +226,9 @@ update_preview_slots :: proc() -> bool {
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
-			// A position/source shift makes the slot's frontier (timeline-keyed
-			// forward splice point) invalid: if we keep it, a clip moved forward
-			// gets clamped to req = frontier+1 which maps BELOW its new start.
-			// Within EITHER mapping the exact-playhead frame shown is the right
-			// one, so decode exactly once without the forward-drop clamp (the
-			// source-frame cache still makes it cheap).
+			// A position/source shift invalidates the slot's decoded buffer; it
+			// is cleared below and the exact playhead frame requested next update
+			// (the source-frame cache makes the re-decode cheap).
 			anchor_shifted := slot.timeline_start_frame != clip.timeline_start_frame || slot.source_start_frame != clip.source_start_frame
 			if nered_trace && anchor_shifted {
 				fmt.printf("[vf] SHIFT asset=%d tl=%d->%d src=%d->%d playing=%v\n",
@@ -246,12 +243,10 @@ update_preview_slots :: proc() -> bool {
 				// has_frame must be false and the buffer zeroed, or
 				// draw_preview keeps painting the stale image (same-asset
 				// switches — e.g. split halves moving — don't reset the slot's
-				// decoder, so without this the old clip's face lingers).
-				// Decode advances the frontier invalid too, so request the
-				// exact playhead frame once, then normal dropped-frame resume.
+				// decoder, so without this the old clip's face lingers). The
+				// exact playhead frame is requested next update.
 				slot.has_frame = false
 				slot.tex_dirty = false
-				slot.have_frontier = false
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
 			slot.transform_x = clip.transform_x
@@ -353,43 +348,23 @@ update_preview_slots :: proc() -> bool {
 				}
 				continue
 			}
-			// While playing, decode forward as fast as decode allows and show
-			// whatever the newest decoded frame is (dropped-frame preview: real
-			// speed, stutter when slow, never slow-motion). When paused, exact
-			// frames are requested for scrubbing. The frontier is per-slot so
-			// moving a clip to an earlier point (or switching clips) never gets
-			// frozen on stale content: skip only when the playhead sits AHEAD of
-			// this slot's own frontier, never behind it.
+			// Playback is dropped-frame: request the current playhead frame and
+			// display whatever is most-recently decoded (real speed, stutter when
+			// slow, never slow-motion, never frozen). When paused, exact frames
+			// are requested for scrubbing. There is no per-slot frontier
+			// bookkeeping: the playhead frame is always the target, so a clip
+			// move/switch or a scrub naturally requests the exact current frame
+			// with no stale crawl state to invalidate.
 			req := frame
-			if playhead.playing && playback_dir == 1 {
-				if slot.have_frontier && req > slot.frontier + 1 {
-					if req - slot.frontier <= PLAYBACK_CATCHUP_FRAMES {
-						// Within the drift budget: take the cheap +1 forward
-						// step (adjacent decode, no re-seek).
-						req = slot.frontier + 1
-					}
-					// Frontier fell further behind than PLAYBACK_CATCHUP_FRAMES
-					// (decode could not keep real time -- e.g. source fallback
-					// while a segment builds). Drop the intervening frames and
-					// decode the CURRENT playhead instead of crawling +1 forever:
-					// the unbounded crawl is what made video linger on a stale
-					// face for seconds while audio played on. A dropped-frame
-					// re-seek bounds A/V drift to the budget; on an all-intra
-					// proxy it is one keyframe decode, after which the frontier
-					// re-pins to the playhead and the next request is the +1
-					// forward step again. The front slot posts this to the async
-					// worker (no loop block); background slots decode it once.
-				}
-			}
-			// Scrub throttle: a drag fires many mousemoves, and dropping the
-			// frontier below forces an exact-seek decode per UI frame per slot.
-			// Decimate: decode exact frames on every SCRUB_DECIMATION-th update
-			// only, showing the last decoded face between. The foreground slot
-			// is exempt when its decode runs on the async worker: that path is
-			// non-blocking, so it chases the pointer every update and scrubbing
-			// the visible face stays live. A slot that has not yet covered its
-			// current frame still decodes on the first throttled tick so a clip
-			// crossing the playhead mid-drag shows immediately.
+			// Scrub throttle: a drag fires many mousemoves, which would otherwise
+			// force an exact-seek decode per UI frame per slot. Decimate: decode
+			// exact frames on every SCRUB_DECIMATION-th update only, showing the
+			// last decoded face between. The foreground slot is exempt when its
+			// decode runs on the async worker: that path is non-blocking, so it
+			// chases the pointer every update and scrubbing the visible face stays
+			// live. A slot that has not yet covered its current frame still
+			// decodes on the first throttled tick so a clip crossing the playhead
+			// mid-drag shows immediately.
 			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0 && (slot_idx != front_video_slot || !async_has_worker())
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
@@ -401,7 +376,7 @@ update_preview_slots :: proc() -> bool {
 			pick_buf: [4096]u8
 			slot_pick, slot_base := proxy_pick_for_frame(clip.path, clip.source_length_frames, clip_frame, pick_buf[:])
 			if !scrub_skip || !slot.has_frame {
-if slot_idx == front_video_slot && async_has_worker() {
+				if slot_idx == front_video_slot && async_has_worker() {
 					if slot.prime_from_warm {
 						// Transition frame: the decoder handed over by prewarm
 						// already holds this clip's first frames in its RAM cache,
@@ -413,56 +388,46 @@ if slot_idx == front_video_slot && async_has_worker() {
 						slot.prime_from_warm = false
 						decoder_set_preview(&slot.dec, slot_pick, slot_base)
 						if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
-							slot.frontier = req
-							slot.have_frontier = true
 							slot.has_frame = true
-							preview_frontier = req
 							slot.tex_dirty = true
 							changed = true
 						}
 					} else {
 						// Foreground clip decodes on the async worker: the render
-						// loop never blocks on its seek/decode, so scrubbing the top
-						// layer stays fluid even on a slow keyframe seek. The worker
-						// resolves its own proxy (preview path passed through); probe
-						// mode waits for the decode so asserts are deterministic.
+						// loop never blocks on its seek/decode, so scrubbing the
+						// top layer stays fluid even on a slow keyframe seek. The
+						// worker resolves its own proxy (preview path passed
+						// through); probe mode waits so asserts are deterministic.
+						//
+						// Consume the worker's NEWEST completed decode, not an
+						// exact frame match: an exact-only consume succeeds only
+						// when the playhead sits still, so once the worker lags
+						// even one tick behind moving playback the preview freezes
+						// until pause. Consuming the newest keeps a freshly-
+						// decoded face on screen every update (dropped-frame
+						// preview) regardless of how far behind the worker falls;
+						// the worker selects the newest posted request, so it
+						// converges toward the playhead on its own.
 						async_post_request(slot.path, slot_pick, slot_base, clip_frame)
 						if !async_live_mode {
 							async_wait_idle()
 						}
-						if async_try_consume(slot.path, clip_frame, slot.buffer[:]) {
-					slot.frontier = req
-					slot.have_frontier = true
-					slot.has_frame = true
-					preview_frontier = req
-					slot.tex_dirty = true
-					changed = true
-				} else if dragging_playhead {
-					// Exact-consume missed because the frontier outran the
-					// worker. While scrubbing show the newest decoded face
-					// instead of the pre-drag one, but leave the frontier
-					// untouched so release still requests the exact frame.
-					if ok, _ := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
-						slot.has_frame = true
-						preview_frontier = req
-						slot.tex_dirty = true
-						changed = true
+						if ok, _ := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
+							slot.has_frame = true
+							slot.tex_dirty = true
+							changed = true
+						} else if nered_trace {
+							fmt.printf("[vf] async miss req=%d ph=%d\n", req, playhead.frame)
+						}
 					}
-				} else if nered_trace {
-						fmt.printf("[vf] async miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
-					}
-				}
-			} else {
+				} else {
 					decoder_set_preview(&slot.dec, slot_pick, slot_base)
 					if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
-						slot.frontier = req
-						slot.have_frontier = true
 						slot.has_frame = true
-						preview_frontier = req
 						slot.tex_dirty = true
 						changed = true
 					} else if nered_trace {
-						fmt.printf("[vf] miss req=%d ph=%d frontier=%d\n", req, playhead.frame, preview_frontier)
+						fmt.printf("[vf] miss req=%d ph=%d\n", req, playhead.frame)
 					}
 				}
 			}
