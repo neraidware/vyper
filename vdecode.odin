@@ -47,11 +47,17 @@ Async_Decoder :: struct {
 	req_preview:  cstring,
 	req_preview_buf: [4096]u8,
 	req_base:     i64,
+	// req_pick_hash fingerprints the proxy file (segment) this request asked to
+	// decode through. It rides along and is copied to the result so the consumer
+	// can stamp displayed_pick with the SAME file identity it actually served --
+	// never the identity of a newer, unconsumed request.
+	req_pick_hash: u32,
 
 	// Result side (worker writes, render thread consumes).
 	res_valid:   bool,
 	res_path:    cstring,
 	res_frame:   i64,
+	res_pick_hash: u32,
 	done_seq:    u64,
 	display_buf: [PREVIEW_W * PREVIEW_H * 4]u8,
 
@@ -141,6 +147,9 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 		req_path := ad.req_path
 		req_frame := ad.req_frame
 		req_base := ad.req_base
+		// The pick hash must be captured while the request is still the current
+		// one (the render thread may post a newer request immediately after).
+		req_pick_hash := ad.req_pick_hash
 		// Capture the preview path into worker-owned storage before releasing
 		// the lock: the render thread may overwrite req_preview_buf with the
 		// next request's proxy immediately after posting.
@@ -163,6 +172,7 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 			ad.res_valid = true
 			ad.res_path = req_path
 			ad.res_frame = req_frame
+			ad.res_pick_hash = req_pick_hash
 		}
 		ad.done_seq += 1
 		sdl.UnlockMutex(ad.mutex)
@@ -225,6 +235,9 @@ async_post_request :: proc(path: cstring, preview: cstring, frame_base: i64, cli
 	ad.req_path = path
 	ad.req_frame = clip_frame
 	ad.req_base = frame_base
+	// Fingerprint the proxy file this request will decode through. The consumer
+	// reads it back with the result so displayed_pick matches the served frame.
+	ad.req_pick_hash = pick_hash_u32(preview)
 	// Copy the preview path into the worker's request staging area so the
 	// worker reads a stable snapshot regardless of when the render thread next
 	// overwrites it. Source identity (req_path) keeps the (path, frame) key.
@@ -269,20 +282,21 @@ async_try_consume :: proc(path: cstring, clip_frame: i64, out: []u8) -> bool {
 // newest completed decode so the preview chases the pointer in real time.
 // Only honored when the result belongs to the same source path. Returns false
 // when no completed result is present yet (caller keeps its last good frame).
-async_try_consume_latest :: proc(path: cstring, clip_frame: i64, out: []u8) -> (bool, i64) {
+async_try_consume_latest :: proc(path: cstring, clip_frame: i64, out: []u8) -> (bool, i64, u32) {
 	ad := &async_decoder
 	if ad.thread == nil {
-		return false, clip_frame
+		return false, clip_frame, 0
 	}
 	sdl.LockMutex(ad.mutex)
 	defer sdl.UnlockMutex(ad.mutex)
 	if !ad.res_valid || ad.res_path != path {
-		return false, clip_frame
+		return false, clip_frame, 0
 	}
 	copy(out, ad.display_buf[:])
 	frame := ad.res_frame
+	pick := ad.res_pick_hash
 	ad.res_valid = false
-	return true, frame
+	return true, frame, pick
 }
 
 // async_has_worker reports whether the async worker is initialized (render

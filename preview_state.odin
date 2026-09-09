@@ -436,9 +436,21 @@ update_preview_slots :: proc() -> bool {
 						if !async_live_mode {
 							async_wait_idle()
 						}
-						if ok, dyn_frame := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
+						// The worker serves the newest COMPLETED decode, which lags
+						// the requested frame during playback (dropped-frame). It
+						// may have decoded through a DIFFERENT proxy segment than
+						// the current playhead's pick (crossing a segment boundary
+						// while behind). displayed_frame AND displayed_pick must
+						// both describe the pixels actually served -- the worker
+						// returns the pick hash it used for the frame it decoded,
+						// never the current request's. Stamp both from the served
+						// result so the idle-skip (same frame AND same file) stays
+						// honest; otherwise the slot advertises a (frame,file)
+						// identity that matches no real decode and the preview
+						// re-decodes/serves the wrong thing across the boundary.
+						if ok, dyn_frame, served_pick := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
 							slot.displayed_frame = dyn_frame
-							slot.displayed_pick = pick_hash
+							slot.displayed_pick = served_pick
 							slot.has_frame = true
 							slot.tex_dirty = true
 							changed = true
