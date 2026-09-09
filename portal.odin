@@ -163,15 +163,17 @@ portal_build_open_params :: proc(title: string, f: Portal_Filter) -> ^GVariant {
 	}
 
 	add_option(dict, "handle_token", g_variant_new_string("nered_open"))
-	add_option(dict, "title", g_variant_new_string(cstring(raw_data(title))))
 	add_option(dict, "filters", portal_build_filters(f))
 	options := g_variant_builder_end(dict)
 	g_variant_builder_unref(dict)
 	g_variant_type_free(dict_type)
 
-	// g_variant_new_tuple consumes the refs of `parent` and `options`.
+	// The portal's FileChooser methods take (parent_window, title, options) as
+	// a three-part tuple `(ssa{sv})`. g_variant_new_tuple consumes the refs of
+	// `parent`, `title`, and `options`.
 	parent := g_variant_new_string("")
-	params := g_variant_new_tuple(raw_data([]^GVariant{parent, options}), 2)
+	title_v := g_variant_new_string(cstring(raw_data(title)))
+	params := g_variant_new_tuple(raw_data([]^GVariant{parent, title_v, options}), 3)
 	return params
 }
 
@@ -333,7 +335,6 @@ portal_save_file_picker :: proc() -> cstring {
 	}
 
 	add_option(dict, "handle_token", "nered_save")
-	add_option(dict, "title", "Save render output")
 	add_option(dict, "current_name", cstring(raw_data(default_name)))
 	{ // filters (a(sa(us)) value, not a plain string)
 		filter := Portal_Filter{name = "MP4 video", patterns = {"*.mp4"}}
@@ -344,9 +345,10 @@ portal_save_file_picker :: proc() -> cstring {
 	g_variant_builder_unref(dict)
 	g_variant_type_free(dict_type)
 
-	// g_variant_new_tuple consumes the refs of `parent` and `options`.
+	// Same (parent_window, title, options) `(ssa{sv})` shape as OpenFile.
 	parent := g_variant_new_string("")
-	parameters := g_variant_new_tuple(raw_data([]^GVariant{parent, options}), 2)
+	title_v := g_variant_new_string("Save render output")
+	parameters := g_variant_new_tuple(raw_data([]^GVariant{parent, title_v, options}), 3)
 
 	error: ^GError
 	reply := g_dbus_connection_call_sync(
