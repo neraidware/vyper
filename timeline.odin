@@ -61,6 +61,57 @@ add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
 	return idx
 }
 
+// add_subtitle_generator_clip inserts a Subtitle generator clip (kind .Text,
+// generator .Subtitles) backed by the parsed srt at cache index src_id on
+// `track`, starting at `start_frame`. The natural length is the srt's full
+// authored span (never shorter than one second), gap-fitted like the text clip
+// (shortened to fit the free gap if it can't hold the whole span; never
+// shifted). The caller owns `name` (cloned from the srt's basename downstream).
+add_subtitle_generator_clip :: proc(track: ^Track, start_frame: i64, src_id: int, name: string) -> int {
+	one_sec := i64(math.round(timeline_fps()))
+	start := max(start_frame, 0)
+	src := srt_source(src_id)
+	length := max(one_sec, cue_frame(srt_duration_ms(src), f32(timeline_fps())))
+	if len(track.clips) > 0 {
+		gaps := clip_track_gaps(track, -1)
+		defer delete(gaps)
+		if gi := gap_for_start(gaps[:], start); gi >= 0 {
+			hi := gaps[gi][1]
+			if start + length > hi {
+				length = clamp(hi - start, 1, length)
+			}
+		}
+	}
+	clip := Clip{
+		clip_id = new_clip_id(),
+		asset_id = 0,
+		path = nil,
+		name = name,
+		kind = .Text,
+		generator = .Subtitles,
+		srt_id = src_id,
+		stream_index = -1,
+		source_start_frame = 0,
+		source_length_frames = length,
+		timeline_start_frame = start,
+		transform_x = f32(project.width) / 2,
+		transform_y = f32(project.height) / 2,
+		scale = 1,
+		crop_l = 0,
+		crop_r = 0,
+		crop_t = 0,
+		crop_b = 0,
+	}
+	append(&track.clips, clip)
+	// Keep the track's clips sorted ascending by timeline start.
+	idx := len(track.clips) - 1
+	for i := idx; i > 0 && track.clips[i].timeline_start_frame < track.clips[i-1].timeline_start_frame; i -= 1 {
+		track.clips[i], track.clips[i-1] = track.clips[i-1], track.clips[i]
+		idx = i - 1
+	}
+	return idx
+}
+
 // lane_blocked reports whether [start, start+length) overlaps any clip already on
 // the track. Used to refuse an aligned multi-lane import when a partner lane is
 // occupied at the anchor frame (a per-lane clamp would desync the group).
@@ -1259,6 +1310,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 		name                   = strings.clone(src.name),
 		kind                   = src.kind,
 		generator              = src.generator,
+		srt_id                 = src.srt_id,
 		stream_index           = src.stream_index,
 		source_start_frame     = src.source_start_frame,
 		source_length_frames   = src.source_length_frames,

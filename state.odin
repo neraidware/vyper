@@ -1,6 +1,7 @@
 package main
 
 import "core:c"
+import "core:strings"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
 
@@ -121,7 +122,7 @@ Media_Kind :: enum { Video, Audio, Image, Other, Empty, Text }
 // Generator_Kind marks clips that synthesize their output programmatically
 // instead of decoding a backing media file (a "generator"). .None = a regular
 // file-backed clip.
-Generator_Kind :: enum { None, Text }
+Generator_Kind :: enum { None, Text, Subtitles }
 
 // Thumbnail size for the media bin grid. Decoded once at import (frame 0 of the
 // source, downsclaled from PREVIEW_W x PREVIEW_H into these dims, letterboxed)
@@ -183,8 +184,14 @@ Clip :: struct {
 	name: string,
 	kind: Media_Kind,
 	// generator identifies this clip as a generator (programmatic output).
-	// .None for ordinary file-backed clips; .Text for the text generator.
+	// .None for ordinary file-backed clips; .Text for the text generator;
+	// .Subtitles for the subtitle (.srt) generator.
 	generator: Generator_Kind,
+	// srt_id is the index into srt_cache for a .Subtitles generator clip (the
+	// parsed .srt backing this clip); -1/ignored for other clip kinds. The
+	// cache is session-scoped and append-only, so this index stays valid for
+	// the clip's lifetime without any ownership/freeing on the clip.
+	srt_id: int,
 	stream_index: c.int,
 	source_start_frame: i64,
 	source_length_frames: i64,
@@ -543,6 +550,29 @@ timeline_scroll_grab: f32
 inspector_scroll: f32
 inspector_scroll_dragging: bool
 inspector_scroll_grab: f32
+
+// Transient on-window notice (e.g. "couldn't load subtitles"): text owned by
+// the notice path, shown until ui_notice_until (ms) passes.
+ui_notice_text: string
+ui_notice_until: u64
+
+// show_ui_notice displays a transient message centered on the window for the
+// given duration (ms), replacing any current notice.
+show_ui_notice :: proc(text: string, duration_ms: u64) {
+	if len(ui_notice_text) > 0 {
+		delete(ui_notice_text)
+	}
+	ui_notice_text = strings.clone(text)
+	ui_notice_until = sdl.GetTicks() + duration_ms
+}
+
+// clear_expired_ui_notice frees the notice string once its time is up.
+clear_expired_ui_notice :: proc() {
+	if len(ui_notice_text) > 0 && sdl.GetTicks() >= ui_notice_until {
+		delete(ui_notice_text)
+		ui_notice_text = ""
+	}
+}
 
 // Resize/crop handles shown around the selected clip's bounding box.
 PREVIEW_HANDLE_SIZE :: f32(9)

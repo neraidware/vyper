@@ -244,6 +244,42 @@ Remaining (real lever for hours-long sources):
 - **Proxy re-encode on project resolution change** (see mid-project resolution
   semantics above): a canvas shrink/grow may want a fresh proxy resolution.
 
+### Proxy system problems — reported (next priority after subtitles)
+
+Three pain points reported as a single "proxy system problem":
+
+- **Proxies live next to the source file.** The proxy builder writes
+  `*.nered_proxy.*` and `*.nered_proxy_idx.json` into the SAME directory as the
+  original media. That clutters user folders, can fail on read-only mounts /
+  packaged assets, and means a project imported from a network share or ODD
+  device leaves hidden files behind. Fix: a dedicated proxy cache directory
+  (e.g. `$XDG_CACHE_HOME/nered/proxies` keyed by a stable hash of the absolute
+  source path), with the current sidecar-index path convention preserved only
+  inside that cache. Explicit "Clear proxy cache" action later.
+- **Proxies are still built at clip loading, so the wait is not solved.** The
+  background builder exists but a new/mostly-unbuilt project still blocks at
+  load while the head encodes (and proxyless ranges decode the source, which is
+  the slow path). Fix direction: stub/unbuilt ranges must decode + play the
+  ORIGINAL immediately (proxies are an acceleration, never a dependency), and
+  proxy build must be fully off the load path — scheduled opportunistically
+  only for ranges about to be played, honoring the chunked segment model so the
+  head is ready in ~1s and the editor never stalls on a full build.
+- **Playback A/V desync: audio keeps playing while video freezes for seconds or
+  drifts completely out of sync.** Suspects to investigate (in this order):
+  (1) segment-switch reopen on frame-N probe racing the cache/decoder eviction
+  mid-playback (a stale `open_path` frame blitted after the decoder restarted);
+  (2) the frame blit loop dropping frames or re-serving a cached frame while
+  audio continues on its own clock — verify the preview clock actually gates the
+  blit and that a "video stalled" state cannot silently reuse an old frame;
+  (3) proxy segment files not all-intra after all (a GOP seam mid-segment would
+  show as garbage, not freeze, but verify `-g`/`keyint` on the chunked path);
+  (4) `proxy_pick_for_frame` hitting nil for a covered range, silently falling
+  through to the transparent decode path and double-buffering wrong frames.
+  A regression check of video-frame timestamps vs the audio `dev_ratio`/clock
+  telemetry should pinpoint direction quickly.
+
+### NEXT REQUEST — Playback/timeline quality regression + audio scrubbing
+
 - **Pitch-preserving playback rate**: playback >1x currently uses
   `SDL_SetAudioStreamFrequencyRatio` (plain resample), so **pitch rises** at
   2x+. Recommended approach (user-approved, not started): FFmpeg
@@ -361,17 +397,25 @@ link/duplicate/delete, and the preview/export pipelines.
 **Data model**
 
 - `Generator_Kind` grows `.Subtitles` (beside `.Text`); the clip keeps
-  `kind = .Text` (rendered like text) or a new `Media_Kind.Subtitle` — decide
-  at implementation. Mirror how `.Text` clips are authored in
-  `add_text_generator_clip` (new `add_subtitle_generator_clip(track, start)`).
-- `clip.path` = absolute `.srt` path (cstring, clone-on-duplicate, freed on
-  delete — mirror the file-backed clip lifecycle).
-- `clip.name` = display label only (basename of the srt). **Crucially, unlike
-  the text generator, `name` is NOT the rendered text** — the preview/render
-  paths must branch on `generator` (`.Subtitles` ⇒ look up the active cue),
-  never on kind alone.
+  `kind = .Text` (rendered exactly like a text clip — same box/draw/handle
+  math) and `generator = .Subtitles`. Authored in
+  `add_subtitle_generator_clip(track, start, src_id, name)` (mirrors
+  `add_text_generator_clip` minus the name prompt — the label comes from the
+  srt basename).
+- **`clip.srt_id`** = index into the session-scoped, append-only `srt_cache`
+  (`srt.odin`). The cache owns the parsed cues and the path string; clips hold
+  only the index, which stays stable for the clip's lifetime — so duplicate,
+  delete and track removal never touch (or free) the path. `clip.path` stays
+  nil for subtitle clips (file-backed clips get their path from the asset; a
+  subtitle generator has no asset, and this design needs no owned path on the
+  clip at all).
+- `clip.name` = display label only (basename of the srt, cloned). **Crucially,
+  unlike the text generator, `name` is NOT the rendered text** — the preview/
+  render paths must branch on `generator` (`.Subtitles` ⇒ look up the active
+  cue), never on kind alone.
 - `source_start_frame`/`source_length_frames`: relative cue-frame window; the
-  clip's length defaults to the full SRT span. Trimming edits this window.
+  clip's length defaults to the full SRT span (min 1 s, gap-fitted). Trimming
+  edits this window.
 - No media-bin asset entry in v1: the srt is a generator *input*, not media.
   (Revisit if users want it listed.)
 

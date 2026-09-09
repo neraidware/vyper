@@ -633,6 +633,33 @@ draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComman
 // it for manual click dispatch).
 import_cancel_box: clay.BoundingBox
 
+// draw_ui_notice paints the transient on-window notice (ui_notice_text) as a
+// small dimmed panel centered on the window, shown until its deadline passes.
+// main.odin calls clear_expired_ui_notice each frame so the string is freed the
+// moment the notice expires.
+draw_ui_notice :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, win_w, win_h: f32) {
+	if len(ui_notice_text) == 0 || sdl.GetTicks() >= ui_notice_until {
+		return
+	}
+	render_sdf_rect(renderer, command_buffer, pass, {0, 0, win_w, win_h}, {6, 7, 10, 205}, 0, 0)
+
+	W: f32 = 480
+	H: f32 = 96
+	panel := clay.BoundingBox{x = (win_w - W) / 2, y = (win_h - H) / 2, width = W, height = H}
+	render_sdf_rect(renderer, command_buffer, pass, panel, EDITOR_BG, 10, 0)
+	render_sdf_rect(renderer, command_buffer, pass, {panel.x, panel.y, panel.width, 3}, BUTTON_BORDER_HOVER, 0, 0)
+
+	msg := string(ui_notice_text)
+	msg_len := min(len(msg), 120)
+	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 34, width = panel.width - 48, height = f32(FONT_NORMAL)}, clay.TextRenderData{
+		stringContents = clay.StringSlice{length = c.int32_t(msg_len), chars = ([^]c.char)(raw_data(msg))},
+		textColor = TEXT,
+		fontSize = FONT_NORMAL,
+		letterSpacing = 1,
+		lineHeight = FONT_NORMAL,
+	})
+}
+
 // draw_import_progress paints the modal overlay for a background proxy build:
 // a dimmed full-window veil, a panel with the source name, phase label,
 // progress bar (indeterminate while ffmpeg estimates), percent, and a Cancel

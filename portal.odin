@@ -86,7 +86,18 @@ portal_response :: proc "c" (
 	g_main_loop_quit(portal_loop)
 }
 
-portal_open_file_picker :: proc() -> cstring {
+portal_filter_media :=
+	"'Media files', [(uint32 0, '*.mp4'), (uint32 0, '*.m4v'), (uint32 0, '*.mov'), (uint32 0, '*.mkv'), (uint32 0, '*.webm'), (uint32 0, '*.avi'), (uint32 0, '*.mpeg'), (uint32 0, '*.mpg'), (uint32 0, '*.ts'), (uint32 0, '*.m2ts'), (uint32 0, '*.flv'), (uint32 0, '*.wmv'), (uint32 0, '*.3gp'), (uint32 0, '*.mp3'), (uint32 0, '*.wav'), (uint32 0, '*.flac'), (uint32 0, '*.ogg'), (uint32 0, '*.opus'), (uint32 0, '*.m4a'), (uint32 0, '*.aac'), (uint32 0, '*.png'), (uint32 0, '*.jpg'), (uint32 0, '*.jpeg'), (uint32 0, '*.webp'), (uint32 0, '*.gif'), (uint32 0, '*.bmp'), (uint32 0, '*.tiff')]"
+
+portal_filter_srt := "'Subtitle files', [(uint32 0, '*.srt')]"
+
+// portal_open_picker runs the XDG portal OpenFile dialog with the given title
+// and g_variant filter spec (the contents of the 'filters' array), returning
+// the picked path as a cstring into glib-owned memory (kept alive for the
+// program's lifetime) or nil on cancel/error. Shared by the media and
+// subtitle pickers; the dialog is modal and blocks as the portal's synchronous
+// GDBus plumbing does.
+portal_open_picker :: proc(title, filter_spec: string) -> cstring {
 	portal_response_data = nil
 	connection := g_bus_get_sync(2, nil, nil) // G_BUS_TYPE_SESSION
 	if connection == nil {
@@ -94,13 +105,13 @@ portal_open_file_picker :: proc() -> cstring {
 		return nil
 	}
 
+	variant_text := fmt.aprintf(
+		"('', '%s', {'handle_token': <'nered_open'>, 'filters': <[%s]>})",
+		title, filter_spec)
+	defer delete(variant_text)
 	parameters := g_variant_parse(
 		nil,
-		"('', 'Open media file', {" +
-			"'handle_token': <'nered_open'>, " +
-			"'filters': <[(" +
-				"'Media files', [(uint32 0, '*.mp4'), (uint32 0, '*.m4v'), (uint32 0, '*.mov'), (uint32 0, '*.mkv'), (uint32 0, '*.webm'), (uint32 0, '*.avi'), (uint32 0, '*.mpeg'), (uint32 0, '*.mpg'), (uint32 0, '*.ts'), (uint32 0, '*.m2ts'), (uint32 0, '*.flv'), (uint32 0, '*.wmv'), (uint32 0, '*.3gp'), (uint32 0, '*.mp3'), (uint32 0, '*.wav'), (uint32 0, '*.flac'), (uint32 0, '*.ogg'), (uint32 0, '*.opus'), (uint32 0, '*.m4a'), (uint32 0, '*.aac'), (uint32 0, '*.png'), (uint32 0, '*.jpg'), (uint32 0, '*.jpeg'), (uint32 0, '*.webp'), (uint32 0, '*.gif'), (uint32 0, '*.bmp'), (uint32 0, '*.tiff')]" +
-			")]>})",
+		strings.clone_to_cstring(variant_text),
 		nil,
 		nil,
 		nil,
@@ -148,6 +159,16 @@ portal_open_file_picker :: proc() -> cstring {
 	g_variant_unref(request)
 	g_variant_unref(reply)
 	return path
+}
+
+// portal_open_file_picker opens the media-file dialog (import entry point).
+portal_open_file_picker :: proc() -> cstring {
+	return portal_open_picker("Open media file", portal_filter_media)
+}
+
+// portal_open_srt_picker opens a subtitle (.srt)-only dialog.
+portal_open_srt_picker :: proc() -> cstring {
+	return portal_open_picker("Select subtitle file", portal_filter_srt)
 }
 
 // portal_wait_response_path runs the portal dialog to completion (blocking the

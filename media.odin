@@ -445,6 +445,16 @@ open_file_picker :: proc() -> cstring {
 	}
 }
 
+// open_srt_picker opens a subtitle (.srt)-only file dialog (subtitle-generator
+// creation) and returns the chosen path, or nil on cancel.
+open_srt_picker :: proc() -> cstring {
+	when ODIN_OS == .Windows {
+		return win32_open_srt_picker()
+	} else {
+		return portal_open_srt_picker()
+	}
+}
+
 // save_file_picker opens a save-as dialog (render output) and returns the chosen
 // path (or nil on cancel). Linux uses the XDG portal SaveFile; Windows uses the
 // Win32 common save dialog.

@@ -346,6 +346,8 @@ handle_ctx_option :: proc() {
 	ci := ctx_menu.target_clip_index
 	if clay.PointerOver(clay.ID("CtxTextClip")) {
 		add_text_clip_at()
+	} else if clay.PointerOver(clay.ID("CtxSubtitleClip")) {
+		add_subtitle_clip_at()
 	} else if ct >= 0 && ct < len(timeline.tracks) && ci >= 0 && ci < len(timeline.tracks[ct].clips) {
 		select_clip(ct, ci)
 		if clay.PointerOver(clay.ID("CtxRename")) {
@@ -472,6 +474,34 @@ add_text_clip_at :: proc() {	if ctx_menu.target_track < 0 || ctx_menu.target_tra
 	ti.is_create = true
 }
 
+// add_subtitle_clip_at inserts a Subtitle generator clip on ctx_menu.target_track
+// at the frame captured when the context menu was opened. It immediately opens
+// an .srt-only file dialog; only a successful pick creates a clip (cancel or a
+// parse failure leaves the timeline untouched). The clip's name is the srt's
+// basename and its length is the srt's full authored span.
+add_subtitle_clip_at :: proc() {
+	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
+		return
+	}
+	path := open_srt_picker()
+	if path == nil {
+		return // user cancelled (or picker error) — no clip
+	}
+	srt_id := srt_load(path)
+	if srt_id < 0 {
+		show_ui_notice(fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)), 4000)
+		return
+	}
+	name := strings.clone(path_basename(path))
+	sync.mutex_lock(&audio_timeline_mtx)
+	idx := add_subtitle_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame, srt_id, name)
+	sync.mutex_unlock(&audio_timeline_mtx)
+	audio_note_edit()
+
+	selected_track = ctx_menu.target_track
+	selected_index = idx
+}
+
 // pointer_over_context_menu reports whether the cursor is over the context menu
 // proper or its "Add >" submenu (both are part of the same transient UI).
 pointer_over_context_menu :: proc() -> bool {
@@ -483,7 +513,7 @@ pointer_over_context_menu :: proc() -> bool {
 
 // pointer_over_submenu reports whether the cursor is over any submenu item.
 pointer_over_submenu :: proc() -> bool {
-	return clay.PointerOver(clay.ID("CtxTextClip"))
+	return clay.PointerOver(clay.ID("CtxTextClip")) || clay.PointerOver(clay.ID("CtxSubtitleClip"))
 }
 
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
@@ -737,6 +767,7 @@ main :: proc() {
 	ui_frame_count := 0
 	ui_dec_us := i64(0)
 	for running {
+		clear_expired_ui_notice()
 		event: sdl.Event
 		for sdl.PollEvent(&event) {
 			#partial switch event.type {
@@ -958,7 +989,10 @@ main :: proc() {
 			if panning_timeline {
 				timeline_view_start -= (mouse_x - timeline_pan_last_x) / timeline_zoom
 				timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
-				timeline_view_top += mouse_y - timeline_pan_last_y
+				// Inverted vertical drag (grab-the-content convention): dragging
+				// down moves content down ("scroll down" pushes tracks up, the
+				// "hand tool" feel), so the view offset moves opposite the pointer.
+				timeline_view_top -= mouse_y - timeline_pan_last_y
 				// Clamp to the row area that overflows the visible tracks box.
 				timeline_view_top = clamp(timeline_view_top, 0, timeline_tracks_max_top())
 			}
@@ -1629,6 +1663,7 @@ main :: proc() {
 				draw_preview(&renderer, command_buffer, pass, preview_bounds)
 				draw_preview_hud(&renderer, command_buffer, pass, preview_bounds)
 			}
+			draw_ui_notice(&renderer, command_buffer, pass, f32(width), f32(height))
 			draw_import_progress(&renderer, command_buffer, pass, f32(width), f32(height))
 			sdl.EndGPURenderPass(pass)
 		}

@@ -60,6 +60,46 @@ win32_open_file_picker :: proc() -> cstring {
 	return cstring(&win32_picked_path[0])
 }
 
+// win32_open_srt_picker is the subtitle variant of win32_open_file_picker,
+// filtered to .srt files.
+win32_open_srt_picker :: proc() -> cstring {
+	filters := strings.concatenate({
+		"Subtitle files",
+		"\x00",
+		"*.srt",
+		"\x00",
+		"All Files",
+		"\x00",
+		"*.*",
+		"\x00\x00",
+	}, context.temp_allocator)
+
+	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
+	defer delete(file_buf)
+
+	ofn := win32.OPENFILENAMEW{
+		lStructSize  = size_of(win32.OPENFILENAMEW),
+		lpstrFile    = win32.wstring(&file_buf[0]),
+		nMaxFile     = win32.MAX_PATH_WIDE,
+		lpstrTitle   = win32.utf8_to_wstring("Select subtitle file", context.temp_allocator),
+		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
+		Flags        = win32.OPEN_FLAGS,
+	}
+
+	if win32.GetOpenFileNameW(&ofn) == win32.FALSE {
+		return nil // user cancelled or error
+	}
+
+	path_utf8, err := win32.utf16_to_utf8(file_buf[:], context.temp_allocator)
+	if err != nil {
+		return nil
+	}
+	path_utf8 = strings.trim_right_null(path_utf8)
+	n := copy(win32_picked_path[:], path_utf8)
+	win32_picked_path[n] = 0
+	return cstring(&win32_picked_path[0])
+}
+
 win32_save_picked_path: [1024]byte
 
 // win32_save_file_picker opens the Win32 common Save-As dialog for the render

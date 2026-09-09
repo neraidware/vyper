@@ -905,6 +905,7 @@ draw_context_menu :: proc() {
 			},
 		}) {
 			ctx_option("CtxTextClip", "Text Clip")
+			ctx_option("CtxSubtitleClip", "Subtitle Clip (.srt)")
 		}
 	}
 }

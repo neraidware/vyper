@@ -156,3 +156,146 @@ rasterize_title_into_buffer :: proc(
 	oh = max(0, bottom - top)
 	return left, top, ow, oh
 }
+
+// text_buf_size_for_lines estimates a single-call RGBA buffer (bw x bh) large
+// enough to hold the stacked lines of a multi-line subtitle rasterized at the
+// given glyph pixel height. Line pitch is ~1.2*font_px; the estimate is the
+// widest line estimate wide and the line count tall (with cap padding).
+text_buf_size_for_lines :: proc(lines: []string, font_px: f32) -> (bw: int, bh: int) {
+	fp := f32(1)
+	if font_px > 0 {
+		fp = font_px
+	}
+	pitch := int(fp * 1.2)
+	width, _ := text_buf_size_for("", font_px)
+	for l in lines {
+		w, _ := text_buf_size_for(l, font_px)
+		if w > width {
+			width = w
+		}
+	}
+	return width, 8 + len(lines) * pitch + int(fp * 1.2)
+}
+
+// rasterize_lines_into_buffer rasterizes `lines` (each as a single-line title
+// by calling rasterize_title_into_buffer) stacked top-to-bottom, each line
+// horizontally centered relative to the OTHER lines' ink, into a single RGBA
+// buffer bw x bh. Returns the tight ink rect (ox, oy, w, h) in buffer pixels.
+// Same signature contract as rasterize_title_into_buffer (thread-local font,
+// font_init, scratch).
+rasterize_lines_into_buffer :: proc(
+	lines: []string,
+	buf: []u8, bw, bh: int,
+	font: ^stb.fontinfo,
+	font_init: ^bool,
+	scratch: []u8,
+	font_px: f32,
+) -> (ox: int, oy: int, ow: int, oh: int) {
+	mem.zero(raw_data(buf), len(buf))
+	if len(lines) == 0 {
+		return 0, 0, 0, 0
+	}
+	px := font_px
+	if px <= 0 {
+		px = TEXT_CLIP_FONT_PIXELS
+	}
+	if !font_init^ {
+		stb.InitFont(font, raw_data(font_data), 0)
+		font_init^ = true
+	}
+
+	// Per-line temp rasterize first: every line is measured/positioned before
+	// compositing because centering needs the widest line's ink width.
+	Type_Line_Slot :: struct {
+		buf: []u8,
+		bw:  int,
+		bh:  int,
+		lox: int,
+		loy: int,
+		low: int,
+		loh: int,
+	}
+	slots := make([]Type_Line_Slot, len(lines), context.temp_allocator)
+
+	pitch := int(px * 1.2)
+	max_ink_w := 0
+	ink_top := max(int)
+	ink_bottom := -max(int)
+
+	for i in 0 ..< len(lines) {
+		lbw, lbh := text_buf_size_for(lines[i], px)
+		lbuf := make([]u8, lbw * lbh * 4)
+		lox, loy, low, loh := rasterize_title_into_buffer(lines[i], lbuf, lbw, lbh, font, font_init, scratch, px)
+		slots[i] = {buf = lbuf, bw = lbw, bh = lbh, lox = lox, loy = loy, low = low, loh = loh}
+		if low > max_ink_w {
+			max_ink_w = low
+		}
+		if low == 0 {
+			continue
+		}
+		band_y := 4 + i * pitch
+		if band_y + loy < ink_top {
+			ink_top = band_y + loy
+		}
+		if band_y + loy + loh > ink_bottom {
+			ink_bottom = band_y + loy + loh
+		}
+	}
+
+	if max_ink_w == 0 {
+		for i in 0 ..< len(lines) {
+			delete(slots[i].buf)
+		}
+		return 0, 0, 0, 0
+	}
+
+	// Re-position lines horizontally (band origin = (max_ink_w - ink_w)/2) and
+	// copy glyph pixels. main row = band_top + loy + dy.
+	left_ink := max(int)
+	right_ink := -max(int)
+	for i in 0 ..< len(lines) {
+		s := slots[i]
+		if s.low == 0 {
+			continue
+		}
+		band_top := 4 + i * pitch
+		band_dx := (max_ink_w - s.low) / 2
+		dst_y0 := band_top + s.loy
+		if band_dx < left_ink {
+			left_ink = band_dx
+		}
+		if band_dx + s.low > right_ink {
+			right_ink = band_dx + s.low
+		}
+		for dy in 0 ..< s.loh {
+			mrow := dst_y0 + dy
+			if mrow < 0 || mrow >= bh {
+				continue
+			}
+			srow := s.loy + dy
+			for dx0 in 0 ..< s.low {
+				sx := s.lox + dx0
+				dx := band_dx + dx0
+				if dx < 0 || dx >= bw {
+					continue
+				}
+				a := u8(s.buf[(srow * s.bw + sx) * 4 + 3])
+				if a == 0 {
+					continue
+				}
+				o := (mrow * bw + dx) * 4
+				buf[o + 0] = 255
+				buf[o + 1] = 255
+				buf[o + 2] = 255
+				buf[o + 3] = a
+			}
+		}
+	}
+
+	ow = max(0, right_ink - left_ink)
+	oh = max(0, ink_bottom - ink_top)
+	for i in 0 ..< len(lines) {
+		delete(slots[i].buf)
+	}
+	return left_ink, ink_top, ow, oh
+}

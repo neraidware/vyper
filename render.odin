@@ -207,6 +207,68 @@ cleanup_text_jobs :: proc(jobs: []Render_Text_Job) {
 	}
 }
 
+// Render_Sub_Src snapshots a .Subtitles generator clip (kind .Text) for the
+// worker. The srt cues are read from the immortal, session-scoped srt_cache by
+// id (never mutated after parse, so the worker can share them without a copy);
+// per-frame the active cue is looked up (binary search) and its text blitted.
+// The anchor is the CURRENT box's center at render time ("the user dragged the
+// text to"), recomputed from the snapshot's transform+source_w/h; each cue
+// change re-centers the new box on that anchor, matching the preview.
+Render_Sub_Src :: struct {
+	srt_id:              int,
+	fps:                 f32, // project rate, cues resolve to frames at this
+	timeline_start_frame: i64,
+	source_start_frame:  i64,
+	source_length_frames: i64,
+	transform_x:         f32, // current top-left anchor (project coords)
+	transform_y:         f32,
+	scale:               f32,
+	source_w:            c.int, // current cue's base ink dims (font 48)
+	source_h:            c.int,
+	// Worker-computed at setup: the fixed box center each cue stays centered on.
+	anchor_x: f32,
+	anchor_y: f32,
+}
+
+// Render_Sub_Cue is the worker's raster cache for one subtitle clip's ACTIVE
+// cue (keyspace is per clip). Cues play forward in population order during a
+// render, so a single slot per clip has a perfect hit rate between boundaries.
+Render_Sub_Cue :: struct {
+	cue_idx: int,
+	raster:  []u8, // baked-font (48*scale) RGBA raster
+	bw:      int,  // raster row stride
+	ox, oy, ow, oh: int, // tight ink rect in the raster
+}
+
+// rasterize_subtitle_cue builds the baked-font raster for one cue's text
+// (multi-line, worker's own font/scratch). Returns with raster empty on no ink.
+rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
+	j^ = {}
+	lines := strings.split(text, "\n")
+	defer delete(lines)
+	if len(lines) == 0 || (len(lines) == 1 && strings.trim_space(lines[0]) == "") {
+		return
+	}
+	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
+	bw, bh := text_buf_size_for_lines(lines, font_px)
+	if bw <= 0 || bh <= 0 {
+		return
+	}
+	buf := make([]u8, bw * bh * 4)
+	if len(render_text_setup_scratch) < text_scratch_size_for(font_px) {
+		delete(render_text_setup_scratch)
+		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
+	}
+	ox, oy, ow, oh := rasterize_lines_into_buffer(lines, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, font_px)
+	if ow <= 0 || oh <= 0 {
+		delete(buf)
+		return
+	}
+	j.raster = buf
+	j.bw = bw
+	j.ox, j.oy, j.ow, j.oh = ox, oy, ow, oh
+}
+
 Render_Audio_Src :: struct {
 	path:                 cstring,
 	stream_index:         c.int,
@@ -222,6 +284,7 @@ Render_Audio_Src :: struct {
 render_job_videos: []Render_Video_Src
 render_job_audios: []Render_Audio_Src
 render_job_texts: []Render_Text_Src
+render_job_subs: []Render_Sub_Src
 render_job_out_path: cstring
 render_job_width:  c.int
 render_job_height: c.int
@@ -638,9 +701,13 @@ render_worker_run :: proc() {
 		delete(render_job_videos)
 		delete(render_job_audios)
 		delete(render_job_texts)
+		if render_job_subs != nil {
+			delete(render_job_subs)
+		}
 		render_job_videos = nil
 		render_job_audios = nil
 		render_job_texts = nil
+		render_job_subs = nil
 		if render_job_out_path != nil {
 			mem.delete_cstring(render_job_out_path)
 			render_job_out_path = nil
@@ -739,6 +806,30 @@ render_worker_run :: proc() {
 		setup_text_job(&text_jobs[i], render_job_texts[i])
 	}
 
+	// Subtitle compositing: per-clip anchor (the box center to keep fixed across
+	// cue changes) + a one-slot active-cue raster cache. Cues play forward in
+	// population order, so a single slot per clip is a near-perfect LRU.
+	sub_cues := make([]Render_Sub_Cue, max(len(render_job_subs), 1))
+	defer {
+		for i in 0 ..< len(sub_cues) {
+			if sub_cues[i].raster != nil {
+				delete(sub_cues[i].raster)
+			}
+		}
+		delete(sub_cues)
+	}
+	sub_factor := f32(render_job_width) / f32(PREVIEW_W)
+	for i in 0 ..< len(render_job_subs) {
+		s := &render_job_subs[i]
+		if s.source_w > 0 && s.source_h > 0 {
+			s.anchor_x = s.transform_x + f32(s.source_w) * s.scale * sub_factor / 2
+			s.anchor_y = s.transform_y + f32(s.source_h) * s.scale * sub_factor / 2
+		} else {
+			s.anchor_x = f32(render_job_width) / 2
+			s.anchor_y = f32(render_job_height) / 2
+		}
+	}
+
 	for frame_idx in 0 ..< render_job_nframes {
 		if poll_cancel() {
 			return
@@ -774,6 +865,38 @@ render_worker_run :: proc() {
 				continue
 			}
 			render_text_blit(canvas, render_job_width, render_job_height, j.raster, j.bw, j.ox, j.oy, j.ow, j.oh, t.transform_x, t.transform_y, j.blit_scale)
+		}
+		// Composite subtitle-generator clips last (on top of everything else —
+		// the natural subtitle layering; matches the preview, where the topmost
+		// text/bottom-most slot order puts subtitles above the decoded faces).
+		for i in 0 ..< len(render_job_subs) {
+			s := &render_job_subs[i]
+			if timeline_frame < s.timeline_start_frame || timeline_frame >= s.timeline_start_frame + s.source_length_frames {
+				continue
+			}
+			src := srt_source(s.srt_id)
+			if src == nil {
+				continue
+			}
+			rel := timeline_frame - s.timeline_start_frame
+			ci := srt_cue_lookup(src.cues[:], rel + s.source_start_frame, s.fps)
+			if ci < 0 {
+				continue
+			}
+			jc := &sub_cues[i]
+			if jc.raster == nil || jc.cue_idx != ci {
+				if jc.raster != nil {
+					delete(jc.raster)
+				}
+				rasterize_subtitle_cue(jc, src.cues[ci].text, s.scale)
+				jc.cue_idx = ci
+				if jc.raster == nil {
+					continue
+				}
+			}
+			w := f32(jc.ow) * sub_factor
+			h := f32(jc.oh) * sub_factor
+			render_text_blit(canvas, render_job_width, render_job_height, jc.raster, jc.bw, jc.ox, jc.oy, jc.ow, jc.oh, s.anchor_x - w / 2, s.anchor_y - h / 2, 1)
 		}
 		if !rend_enc_video_frame(&e, canvas, render_job_width, render_job_height, frame_idx) {
 			err_msg = "video encoding failed"
@@ -1062,6 +1185,7 @@ render_start :: proc() {
 	cls := [dynamic]Render_Video_Src{}
 	auds := [dynamic]Render_Audio_Src{}
 	txts := [dynamic]Render_Text_Src{}
+	subs := [dynamic]Render_Sub_Src{}
 	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 		tr := &timeline.tracks[track_idx]
 		for i := 0; i < len(tr.clips); i += 1 {
@@ -1084,35 +1208,51 @@ render_start :: proc() {
 					source_w = clip.source_w,
 					source_h = clip.source_h,
 				})
-case .Audio:
-			append(&auds, Render_Audio_Src{
-				path = strings.clone_to_cstring(string(clip.path)),
-				stream_index = clip.stream_index,
-				timeline_start_frame = clip.timeline_start_frame,
-				source_start_frame = clip.source_start_frame,
-				source_length_frames = clip.source_length_frames,
-			})
-		case .Other:
-			// no renderable content in this clip
-		case .Empty:
-			// no renderable content in this clip (placeholder for text later)
-		case .Text:
-			append(&txts, Render_Text_Src{
-				name = strings.clone(clip.name),
-				timeline_start_frame = clip.timeline_start_frame,
-				source_length_frames = clip.source_length_frames,
-				transform_x = clip.transform_x,
-				transform_y = clip.transform_y,
-				scale = clip.scale,
-				source_w = clip.source_w,
-				source_h = clip.source_h,
-			})
-		}
+            case .Audio:
+			    append(&auds, Render_Audio_Src{
+				    path = strings.clone_to_cstring(string(clip.path)),
+				    stream_index = clip.stream_index,
+				    timeline_start_frame = clip.timeline_start_frame,
+				    source_start_frame = clip.source_start_frame,
+				    source_length_frames = clip.source_length_frames,
+			    })
+		    case .Other:
+			    // no renderable content in this clip
+		    case .Empty:
+			    // no renderable content in this clip (placeholder for text later)
+		    case .Text:
+			    if clip.generator == .Subtitles {
+				    append(&subs, Render_Sub_Src{
+					    srt_id = clip.srt_id,
+					    fps = f32(timeline_fps()),
+					    timeline_start_frame = clip.timeline_start_frame,
+					    source_start_frame = clip.source_start_frame,
+					    source_length_frames = clip.source_length_frames,
+					    transform_x = clip.transform_x,
+					    transform_y = clip.transform_y,
+					    scale = clip.scale,
+					    source_w = clip.source_w,
+					    source_h = clip.source_h,
+				    })
+			    } else {
+				    append(&txts, Render_Text_Src{
+					    name = strings.clone(clip.name),
+					    timeline_start_frame = clip.timeline_start_frame,
+					    source_length_frames = clip.source_length_frames,
+					    transform_x = clip.transform_x,
+					    transform_y = clip.transform_y,
+					    scale = clip.scale,
+					    source_w = clip.source_w,
+					    source_h = clip.source_h,
+				    })
+			    }
+		    }
 		}
 	}
 	render_job_videos = cls[:]
 	render_job_audios = auds[:]
 	render_job_texts = txts[:]
+	render_job_subs = subs[:]
 	render_job_width = project.width
 	render_job_height = project.height
 	render_job_start = start_frame
@@ -1172,9 +1312,13 @@ rising_thread_failed :: proc() {
 	delete(render_job_videos)
 	delete(render_job_audios)
 	delete(render_job_texts)
+	if render_job_subs != nil {
+		delete(render_job_subs)
+	}
 	render_job_videos = nil
 	render_job_audios = nil
 	render_job_texts = nil
+	render_job_subs = nil
 	if render_job_out_path != nil {
 		mem.delete_cstring(render_job_out_path)
 		render_job_out_path = nil

@@ -3,6 +3,7 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:mem"
+import "core:strings"
 
 // ---------------------------------------------------------------------------
 // Preview slot lifecycle: assigning a Preview_Slot to each video clip that
@@ -268,6 +269,20 @@ update_preview_slots :: proc() -> bool {
 			// the buffer + GPU texture stay in sync with the clip's name and a
 			// rename (even unpaused) triggers one re-upload.
 			if clip.kind == .Text {
+				if clip.generator == .Subtitles {
+					// Subtitle generator: the output is the active .srt cue's
+					// text, not the clip's name. update_subtitle_slot owns the
+					// whole raster + re-center lifecycle (see above).
+					slot.is_text = true
+					slot.crop_l = 0
+					slot.crop_r = 0
+					slot.crop_t = 0
+					slot.crop_b = 0
+					if update_subtitle_slot(slot, clip, frame) {
+						changed = true
+					}
+					continue
+				}
 				// The tight, top-left bounding box. Text size has TWO decoupled
 				// notions: clip.source_w/h are the BASE tight ink dims at font 48
 				// (constant per title), and clip.scale is the pure multiplier that
@@ -488,6 +503,135 @@ if slot_idx == front_video_slot && async_has_worker() {
 			slot^ = {}
 		}
 	}
+}
+
+// update_subtitle_slot refreshes a Subtitle generator clip's preview slot: it
+// resolves the cue active at the clip-relative playhead, re-rasterizes the
+// active cue's text (multi-line) when it changes (or the baked font changes),
+// and re-centers the text box on the anchor (the previous box's center, or the
+// canvas center on the clip's first rendered cue). Between cues the slot shows
+// nothing. Returns true when the texture changed (caller re-uploads).
+//
+// Called on the UI thread only (mutates clip.transform/source_w/h to re-center
+// the box exactly the way the text clip path re-measures on rename).
+update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bool {
+	changed := false
+	src := srt_source(clip.srt_id)
+	rel := frame - clip.timeline_start_frame
+	srt_f := rel + clip.source_start_frame
+	fps := f32(timeline_fps())
+	active_text := ""
+	active_hash: u64 = 0
+	if src != nil {
+		if ci := srt_cue_lookup(src.cues[:], srt_f, fps); ci >= 0 {
+			active_text = src.cues[ci].text
+			active_hash = text_clip_hash(active_text)
+		}
+	}
+	// Any cue change (including dropping back into a gap) invalidates the
+	// raster; a gap is just "empty cue". Identical back-to-back cues (same
+	// hash) reuse the cached raster.
+	cue_changed := slot.text_hash != active_hash
+	slot.text_hash = active_hash
+
+	if active_hash == 0 {
+		// Between cues (or trimmed past the content): nothing to show.
+		if cue_changed {
+			slot.has_frame = false
+			slot.text_w = 0
+			slot.text_h = 0
+			slot.tex_dirty = true
+			changed = true
+		}
+		return changed
+	}
+
+	font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
+	if cue_changed || slot.text_font_px != font_px {
+		// Split the cue text into lines once and reuse for both the base
+		// measure and the baked raster.
+		lines := strings.split(active_text, "\n")
+		defer delete(lines)
+
+		// Base measure at font 48: tight ink dims, and the new box dims for the
+		// re-center. The transform is a TOP-LEFT anchor, so centering on the
+		// anchor means transform = anchor_center - box/2.
+		base_bw, base_bh := text_buf_size_for_lines(lines, TEXT_CLIP_FONT_PIXELS)
+		need_base := base_bw * base_bh * 4
+		if need_base > len(slot.text_base_buf) {
+			delete(slot.text_base_buf)
+			slot.text_base_buf = make([]u8, need_base)
+		}
+		if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
+			delete(slot.text_scratch)
+			slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
+		}
+		_, _, bw0, bh0 := rasterize_lines_into_buffer(lines, slot.text_base_buf, base_bw, base_bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, TEXT_CLIP_FONT_PIXELS)
+
+		// Project-space box size for source_w x source_h text pixels at scale (1
+		// source px maps to scale * PW/PREVIEW_W project px, uniform in both
+		// axes — clip_image_bounds uses the same mapping).
+		k := f32(project.width) / f32(PREVIEW_W)
+		old_w := f32(clip.source_w) * clip.scale * k
+		old_h := f32(clip.source_h) * clip.scale * k
+		had_box := clip.source_w > 0 && clip.source_h > 0 && old_w > 0 && old_h > 0
+		new_w := f32(bw0) * clip.scale * k
+		new_h := f32(bh0) * clip.scale * k
+		if new_w <= 1 || new_h <= 1 {
+			// No measurable ink (empty/whitespace-only cue text).
+			slot.has_frame = false
+			slot.text_w = 0
+			slot.text_h = 0
+			slot.tex_dirty = true
+			return true
+		}
+		if had_box {
+			// Re-center on the previous box's center (the user's anchor).
+			cx := clip.transform_x + old_w / 2
+			cy := clip.transform_y + old_h / 2
+			clip.transform_x = cx - new_w / 2
+			clip.transform_y = cy - new_h / 2
+		} else {
+			// First rendered cue: anchor at the canvas center.
+			clip.transform_x = f32(project.width) / 2 - new_w / 2
+			clip.transform_y = f32(project.height) / 2 - new_h / 2
+		}
+		clip.source_w = c.int(bw0)
+		clip.source_h = c.int(bh0)
+		slot.source_w = c.int(bw0)
+		slot.source_h = c.int(bh0)
+
+		// Re-render at the baked font (48*scale) for the texture.
+		slot.text_font_px = font_px
+		need_sc := text_scratch_size_for(font_px)
+		if need_sc > len(slot.text_scratch) {
+			delete(slot.text_scratch)
+			slot.text_scratch = make([]u8, need_sc)
+		}
+		bw, bh := text_buf_size_for_lines(lines, font_px)
+		need := bw * bh * 4
+		if need > len(slot.text_buf) {
+			delete(slot.text_buf)
+			slot.text_buf = make([]u8, need)
+		}
+		tx, ty, tw, th := rasterize_lines_into_buffer(lines, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px)
+		slot.text_x = tx
+		slot.text_y = ty
+		slot.text_w = tw
+		slot.text_h = th
+		slot.text_tex_w = c.int(bw)
+		slot.text_tex_h = c.int(bh)
+		slot.has_frame = tw > 0 && th > 0
+		slot.tex_dirty = true
+		slot.text_recreate = true
+		changed = true
+	}
+
+	// The box may have been re-centered; keep slot transform in sync.
+	slot.transform_x = clip.transform_x
+	slot.transform_y = clip.transform_y
+	slot.scale = clip.scale
+	return changed
 }
 
 // find_preview_slot returns the slot and Clip* for a given clip identity, or
