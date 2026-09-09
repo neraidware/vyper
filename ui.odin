@@ -143,6 +143,18 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					if clay.UI(clay.ID("TransportSpacer"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 					}) {}
+					// Playhead time viewer: the current playhead timecode as a
+					// clickable badge. Clicking it opens numeric navigation
+					// (begin_playhead_time_edit) to jump the playhead to a typed
+					// timecode / seconds / frame number.
+					if clay.UI(clay.ID("PlayheadTime"))({
+						layout = {sizing = {width = clay.SizingFixed(110), height = clay.SizingFixed(BUTTON_HEIGHT)}, padding = clay.Padding{left = 6, right = 6}, childAlignment = {x = .Center, y = .Center}},
+						backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
+						border = {color = clay.Hovered() ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
+						cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+					}) {
+						clay.Text(playhead_timecode(), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, textAlignment = .Center})
+					}
 					clay.Text(fmt.aprintf("%d / %d  ·  %gfps", playhead.frame, timeline_duration(), timeline_fps()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 				}
 			}
@@ -225,19 +237,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					if clay.UI(clay.ID("TimelineBar"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(TIMELINE_BAR_H)}, layoutDirection = .LeftToRight, childGap = BUTTON_ROW_GAP, childAlignment = {x = .Left, y = .Center}},
 					}) {
-						bar_caption("Go:")
-						// Playhead time viewer: the current playhead timecode, shown
-						// as a clickable badge. Clicking it opens numeric navigation
-						// (begin_playhead_time_edit) to jump the playhead to a typed
-						// timecode / seconds / frame number.
-						if clay.UI(clay.ID("PlayheadTime"))({
-							layout = {sizing = {width = clay.SizingFixed(110), height = clay.SizingFixed(26)}, padding = clay.Padding{left = 6, right = 6}, childAlignment = {x = .Center, y = .Center}},
-							backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
-							border = {color = clay.Hovered() ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
-							cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-						}) {
-							clay.Text(playhead_timecode(), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL, textAlignment = .Center})
-						}
 						if clay.UI(clay.ID("TimelineBarSpacer"))({
 							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 						}) {}
@@ -389,6 +388,15 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						}
 					}
 v_scrollbar("TimelineV", timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
+				}
+				// Bottom bar: the snap toggles that used to live in the top
+				// toolbar, now under the tracks so the top bar stays zoom-only.
+				if clay.UI(clay.ID("TimelineBottomBar"))({
+					layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(TIMELINE_BAR_H)}, layoutDirection = .LeftToRight, childGap = BUTTON_ROW_GAP, childAlignment = {x = .Left, y = .Center}},
+				}) {
+					bar_caption("Snap:")
+					timeline_snap_button("SnapClipToPh", snap_clips_to_playhead)
+					timeline_snap_button("SnapPhToClip", snap_playhead_to_clips)
 				}
 				}
 			}
@@ -728,6 +736,20 @@ vertical_toggle_button :: proc(name: string, label: string) {
 // project's current fps (0 = auto).
 fps_preset_button :: proc(name: string, label: string, fps: f64) {
 	settings_button(name, label, project.frame_rate == fps)
+}
+
+// timeline_snap_button renders one of the two snap toggles living in the
+// timeline bottom bar. Held (highlighted border) while its snap behavior is
+// active; the icon is an embedded overlay (draw_ui_icons), so this element
+// only claims button visuals.
+timeline_snap_button :: proc(name: string, active: bool) {
+	if clay.UI(clay.ID(name))({
+		layout = {sizing = {width = clay.SizingFixed(26), height = clay.SizingFixed(26)}, childAlignment = {x = .Center, y = .Center}},
+		backgroundColor = active ? clay.Color{50, 62, 78, 255} : BUTTON,
+		border = {color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(active ? 2 : 1)},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	}) {
+	}
 }
 
 // playback_rate_label returns the display text for a playback rate value:

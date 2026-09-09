@@ -1308,9 +1308,16 @@ main :: proc() {
 			}
 			}
 			if !handled {
-				// Clicking the playhead time badge opens numeric navigation (the
-				// typed value is parsed and the playhead sought on commit).
-				if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayheadTime")) {
+				// Snap toggles live in the timeline's bottom bar.
+				if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapClipToPh")) {
+					snap_clips_to_playhead = !snap_clips_to_playhead
+					handled = true
+				} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapPhToClip")) {
+					snap_playhead_to_clips = !snap_playhead_to_clips
+					handled = true
+				} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayheadTime")) {
+					// Clicking the playhead time badge opens numeric navigation
+					// (the typed value is parsed and the playhead sought on commit).
 					begin_playhead_time_edit()
 					handled = true
 				}

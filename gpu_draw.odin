@@ -573,6 +573,8 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
 	draw_icon_in_element(renderer, command_buffer, pass, "PlayBack", .SkipBack, playhead.playing && playback_dir == -1, 15)
 	draw_icon_in_element(renderer, command_buffer, pass, "PlayFwd", .SkipForward, playhead.playing && playback_dir == 1, 15)
+	draw_icon_in_element(renderer, command_buffer, pass, "SnapClipToPh", .SnapClipToPlayhead, snap_clips_to_playhead, 14)
+	draw_icon_in_element(renderer, command_buffer, pass, "SnapPhToClip", .SnapPlayheadToClip, snap_playhead_to_clips, 14)
 	for ti in 0..<len(timeline.tracks) {
 		track_id := clay.ID("DuplicateTrack", u32(ti))
 		dup_color := clay.PointerOver(track_id) ? BUTTON_BORDER_HOVER : TEXT
