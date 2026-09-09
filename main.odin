@@ -1627,6 +1627,7 @@ main :: proc() {
 				if slot.texture == nil || slot.text_recreate {
 					if slot.texture != nil {
 						sdl.ReleaseGPUTexture(device, slot.texture)
+						slot.texture = nil
 					}
 					if slot.text_tex_w > 0 && slot.text_tex_h > 0 {
 						slot.texture = create_text_texture(device, slot.text_tex_w, slot.text_tex_h)

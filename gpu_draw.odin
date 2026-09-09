@@ -748,6 +748,11 @@ draw_import_progress :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCo
 // which point at the shared fixed preview_textures); it must be released via
 // release_slot_owned_texture when the slot is freed or reused for a video clip.
 create_text_texture :: proc(device: ^sdl.GPUDevice, w, h: c.int) -> ^sdl.GPUTexture {
+	if w <= 0 || h <= 0 {
+		// SDL asserts on 0-sized textures; a text slot with no ink yet must
+		// stay texture-less (draw skips it) until a real raster exists.
+		return nil
+	}
 	return sdl.CreateGPUTexture(device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = u32(w), height = u32(h), layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
 }
 
