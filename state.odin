@@ -543,13 +543,9 @@ pan_last_y: f32
 panning_timeline: bool
 timeline_pan_last_x: f32
 timeline_pan_last_y: f32
-// Track-list scrollbar drag: active while the left button is held on the
-// timeline's vertical scrollbar thumb; timeline_scroll_grab is the grabbed
-// offset within the thumb so a click+hold anywhere on it drags smoothly.
-timeline_scroll_dragging: bool
-timeline_scroll_grab: f32
-// Inspector-card scrollbar drag (same mechanics as the timeline's): the
-// inspector column scrolls when the cards overflow their viewport.
+// Inspector-card scrollbar drag (same mechanics): the inspector column
+// scrolls when the cards overflow their viewport. The timeline has no
+// vertical scrollbar — it scrolls by wheel/pan instead.
 inspector_scroll: f32
 inspector_scroll_dragging: bool
 inspector_scroll_grab: f32

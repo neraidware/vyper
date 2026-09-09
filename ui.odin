@@ -386,7 +386,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							}
 						}
 					}
-v_scrollbar("TimelineV", timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
 				}
 				// Bottom bar: the snap toggles that used to live in the top
 				// toolbar, now under the tracks so the top bar stays zoom-only.

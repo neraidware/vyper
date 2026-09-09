@@ -1144,9 +1144,8 @@ main :: proc() {
 		}
 		// Vertical scrollbar drags: the thumb position maps directly onto the
 		// container's scroll value, using the same geometry that draws the
-		// thumb. Active for both scrollable columns (timeline lanes, inspector
-		// cards); each ends the moment the button lifts.
-		scroll_drag_update("TimelineV", mouse_down, mouse_y, &timeline_scroll_dragging, &timeline_scroll_grab, &timeline_view_top, timeline_tracks_content_height(), timeline_tracks_content_height() - timeline_tracks_max_top())
+		// thumb. Active for the inspector cards column; ends the moment the
+		// button lifts. (The timeline scrolls by wheel/pan and needs no bar.)
 		scroll_drag_update("InspectorV", mouse_down, mouse_y, &inspector_scroll_dragging, &inspector_scroll_grab, &inspector_scroll, inspector_content_height(), inspector_view_height())
 		clay.SetPointerState({mouse_x, mouse_y}, mouse_down)
 
@@ -1241,13 +1240,11 @@ main :: proc() {
 					edit_commit()
 				}
 			}
-			// Scrollbars: pressing the thumb starts a drag; pressing anywhere
-			// else on the strip jumps the thumb to the cursor. One stack per
-			// scrollable column (timeline lanes, inspector cards).
+			// Scrollbar: pressing the thumb starts a drag; pressing anywhere else on
+			// the strip jumps the thumb to the cursor. One stack per scrollable
+			// column (inspector cards only — the timeline scrolls by wheel/pan).
 			if !handled {
-				if scroll_press("TimelineV", mouse_y, &timeline_scroll_dragging, &timeline_scroll_grab) {
-					handled = true
-				} else if scroll_press("InspectorV", mouse_y, &inspector_scroll_dragging, &inspector_scroll_grab) {
+				if scroll_press("InspectorV", mouse_y, &inspector_scroll_dragging, &inspector_scroll_grab) {
 					handled = true
 				}
 			}
