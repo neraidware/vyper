@@ -572,9 +572,7 @@ timeline_zoom_fit :: proc() {
 add_text_clip_at :: proc() {	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
 		return
 	}
-	sync.mutex_lock(&audio_timeline_mtx)
 	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame)
-	sync.mutex_unlock(&audio_timeline_mtx)
 	audio_note_edit()
 
 	selected_track = ctx_menu.target_track
@@ -608,9 +606,7 @@ add_subtitle_clip_at :: proc() {
 		return
 	}
 	name := strings.clone(path_basename(path))
-	sync.mutex_lock(&audio_timeline_mtx)
 	idx := add_subtitle_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame, srt_id, name)
-	sync.mutex_unlock(&audio_timeline_mtx)
 	audio_note_edit()
 
 	selected_track = ctx_menu.target_track

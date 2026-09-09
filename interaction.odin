@@ -432,7 +432,6 @@ interaction_post_build :: proc(inp: Mouse_Input, prev_mouse_down, prev_right_dow
 			if selected_track >= 0 && selected_index >= 0 && selected_track < len(timeline.tracks) && selected_index < len(timeline.tracks[selected_track].clips) {
 				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 				frame := max(f32(0), (inp.x - track_start) / timeline_zoom + timeline_view_start)
-				sync.mutex_lock(&audio_timeline_mtx)
 				if resize_edge == 0 {
 					if len(drag_group_orig) > 0 {
 						// Linked group: shift every member's head by the same delta.
@@ -448,7 +447,6 @@ interaction_post_build :: proc(inp: Mouse_Input, prev_mouse_down, prev_right_dow
 						resize_clip_right(&timeline.tracks[selected_track], selected_index, i64(frame))
 					}
 				}
-				sync.mutex_unlock(&audio_timeline_mtx)
 				audio_note_edit()
 			}
 		} else if moving_clip {
@@ -474,7 +472,6 @@ interaction_post_build :: proc(inp: Mouse_Input, prev_mouse_down, prev_right_dow
 						break
 					}
 				}
-				sync.mutex_lock(&audio_timeline_mtx)
 				if hover == drag_source_track {
 					drag_hover_track = hover
 					if len(drag_group_orig) > 1 {
@@ -517,7 +514,6 @@ interaction_post_build :: proc(inp: Mouse_Input, prev_mouse_down, prev_right_dow
 						drag_group_delta = i64(max(frame, 0)) - drag_group_orig[0].start
 					}
 				}
-				sync.mutex_unlock(&audio_timeline_mtx)
 				audio_note_edit()
 			}
 		} else if dragging_playhead {

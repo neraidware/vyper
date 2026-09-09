@@ -5,7 +5,6 @@ import "core:math"
 import "core:slice"
 import "core:strconv"
 import "core:strings"
-import "core:sync"
 
 // ---------------------------------------------------------------------------
 // Timeline queries and structural edits: duration/ruler math, frame lookups,
@@ -406,8 +405,6 @@ split_clip_at_playhead :: proc() {
 	if local <= 0 || local >= clip.source_length_frames {
 		return
 	}
-	sync.mutex_lock(&audio_timeline_mtx)
-	defer sync.mutex_unlock(&audio_timeline_mtx)
 	link := clip.link_id
 	right_link := u64(0)
 	if link != 0 {
@@ -486,7 +483,6 @@ unlink_selected_clips :: proc() {
 		return
 	}
 	link := clip.link_id
-	sync.mutex_lock(&audio_timeline_mtx)
 	count := 0
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
@@ -496,7 +492,6 @@ unlink_selected_clips :: proc() {
 			}
 		}
 	}
-	sync.mutex_unlock(&audio_timeline_mtx)
 	if count == 0 {
 		return
 	}
@@ -558,7 +553,6 @@ toggle_links_for_selection :: proc() {
 			return
 		}
 		link := c.link_id
-		sync.mutex_lock(&audio_timeline_mtx)
 		count := 0
 		for t := 0; t < len(timeline.tracks); t += 1 {
 			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
@@ -568,7 +562,6 @@ toggle_links_for_selection :: proc() {
 				}
 			}
 		}
-		sync.mutex_unlock(&audio_timeline_mtx)
 		if count == 0 {
 			return
 		}
@@ -586,13 +579,11 @@ toggle_links_for_selection :: proc() {
 			break
 		}
 	}
-	sync.mutex_lock(&audio_timeline_mtx)
 	clear(&drag_group_orig)
 	if same_group {
 		for c in resolved {
 			c.link_id = 0
 		}
-		sync.mutex_unlock(&audio_timeline_mtx)
 		audio_note_edit()
 		if nered_trace {
 			fmt.printf("[tl] unlinked %d selected clips\n", len(resolved))
@@ -603,7 +594,6 @@ toggle_links_for_selection :: proc() {
 	for c in resolved {
 		c.link_id = new_link
 	}
-	sync.mutex_unlock(&audio_timeline_mtx)
 	audio_note_edit()
 	if nered_trace {
 		fmt.printf("[tl] linked %d selected clips (link=%d)\n", len(resolved), new_link)
@@ -636,7 +626,6 @@ delete_selected_clip_raw :: proc() {
 		return
 	}
 	link := track.clips[selected_index].link_id
-	sync.mutex_lock(&audio_timeline_mtx)
 	Target :: struct { track, index: int }
 	targets := make([dynamic]Target, 0, 4)
 	defer delete(targets)
@@ -678,7 +667,6 @@ delete_selected_clip_raw :: proc() {
 		}
 		removed_any = true
 	}
-	sync.mutex_unlock(&audio_timeline_mtx)
 	if !removed_any {
 		return
 	}
@@ -708,7 +696,7 @@ delete_selected_clip_raw :: proc() {
 // shift left by `length`, clips straddling the edges get trimmed/split around
 // it, and clips entirely inside it are dropped. Shared by the all-tracks ripple
 // (ripple_delete_region) and the whole-link-group ripple so a linked cut can
-// rip each member's OWN span on its OWN lane. Caller holds audio_timeline_mtx.
+// rip each member's OWN span on its OWN lane.
 ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 	if length <= 0 {
 		return
@@ -777,8 +765,6 @@ ripple_delete_region :: proc(start, length: i64) {
 	if length <= 0 {
 		return
 	}
-	sync.mutex_lock(&audio_timeline_mtx)
-	defer sync.mutex_unlock(&audio_timeline_mtx)
 	for ti in 0 ..< len(timeline.tracks) {
 		ripple_delete_track_region(ti, start, length)
 	}
@@ -834,8 +820,6 @@ ripple_delete_linked_group :: proc(link: u64) {
 			}
 		}
 	}
-	sync.mutex_lock(&audio_timeline_mtx)
-	defer sync.mutex_unlock(&audio_timeline_mtx)
 	for s in spans {
 		ripple_delete_track_region(s.track, s.start, s.length)
 	}
@@ -942,7 +926,6 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 	    }
 	    clip := src.clips[src_index]
 	    dst := &timeline.tracks[dst_track]
-	    sync.mutex_lock(&audio_timeline_mtx)
 	    placed := clip_place_in_track(dst, -1, clip.source_length_frames, start)
 	    ordered_remove(&src.clips, src_index)
 	    append(&dst.clips, clip)
@@ -951,7 +934,6 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 	    for i := len(dst.clips) - 1; i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i-1].timeline_start_frame; i -= 1 {
 		    dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
 	    }
-	    sync.mutex_unlock(&audio_timeline_mtx)
 	    // Refresh selection to the moved clip.
 	    selected_track = dst_track
 	    selected_index = len(dst.clips) - 1
@@ -1129,10 +1111,8 @@ move_linked_group :: proc(track_delta: int) -> bool {
 	PlannedMove :: struct { src_track, dst_track: int, start: i64, clip: Clip }
 	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig))
 	defer delete(planned)
-	sync.mutex_lock(&audio_timeline_mtx)
 	for m in drag_group_orig {
 		if m.track < 0 || m.track >= len(timeline.tracks) {
-			sync.mutex_unlock(&audio_timeline_mtx)
 			return false
 		}
 		src := &timeline.tracks[m.track]
@@ -1143,7 +1123,6 @@ move_linked_group :: proc(track_delta: int) -> bool {
 		clip := src.clips[idx]
 		dst_track := m.track + track_delta
 		if dst_track < 0 || dst_track >= len(timeline.tracks) {
-			sync.mutex_unlock(&audio_timeline_mtx)
 			return false
 		}
 		// group_vertical_feasible already proved every member fits at the
@@ -1173,7 +1152,6 @@ move_linked_group :: proc(track_delta: int) -> bool {
 			dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
 		}
 	}
-	sync.mutex_unlock(&audio_timeline_mtx)
 	invalidate_preview_slots()
 	audio_note_edit()
 	// Re-select the anchor in its new home.
@@ -1349,14 +1327,12 @@ remove_track :: proc(index: int) {
 		return
 	}
 	removed := timeline.tracks[index]
-	sync.mutex_lock(&audio_timeline_mtx)
 	for &c in removed.clips {
 		delete(c.markers)
 	}
 	delete(removed.clips)
 	delete(removed.name)
 	ordered_remove(&timeline.tracks, index)
-	sync.mutex_unlock(&audio_timeline_mtx)
 	switch {
 	case selected_track == index:
 		selected_track = -1

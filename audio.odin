@@ -459,9 +459,31 @@ audio_pcm_dump_open :: proc() {
 	}
 }
 audio_dbg_budget: int
-// audio_timeline_mtx serializes clip-array mutations (import/split) against the
-// producer's timeline snapshot read during audio_provision.
-audio_timeline_mtx: sync.Mutex
+// The producer never touches live timeline memory. The UI thread publishes the
+// audio clip geometry into a double-buffered slab (audio_geometry_commit on
+// every edit); the producer reads whichever slot is active, lock-free. A slot
+// being read is never rebuilt: the publisher always writes the slot the
+// producer is NOT currently on, and only holds paths until the swap, so chips
+// stay alive for the whole provision read.
+AUDIO_GEOM_MAX_CLIPS :: 128
+AUDIO_GEOM_PATH_CAP :: 4096
+
+Audio_Geom_Chip :: struct {
+	timeline_start: i64,
+	source_start:   i64,
+	source_len:     i64,
+	stream_index:   c.int,
+	path_len:       int,
+	path:           [AUDIO_GEOM_PATH_CAP]u8,
+}
+
+Audio_Geom_Slot :: struct {
+	n:    int,
+	chip: [AUDIO_GEOM_MAX_CLIPS]Audio_Geom_Chip,
+}
+
+audio_geom: [2]Audio_Geom_Slot
+audio_geom_idx: u32 // atomic: active slot
 
 audio_src_reset :: proc(s: ^Play_Src) {
 	if s.dec.opened {
@@ -488,9 +510,46 @@ audio_reset_play :: proc() {
 	audio_play_frame = 0
 }
 
+// audio_geometry_commit re-mirrors the audio clip geometry from the timeline
+// into the inactive slab slot and publishes it. UI-thread only (the timeline's
+// single writer). Rebuilding the whole chip array per edit is cheap — the
+// timeline holds tens of clips, not millions.
+audio_geometry_commit :: proc() {
+	write := 1 - int(sync.atomic_load(&audio_geom_idx))
+	slot := &audio_geom[write]
+	n := 0
+	for tr in 0 ..< len(timeline.tracks) {
+		for c in 0 ..< len(timeline.tracks[tr].clips) {
+			if n >= AUDIO_GEOM_MAX_CLIPS {
+				slot.n = n
+				sync.atomic_store(&audio_geom_idx, u32(write))
+				return
+			}
+			clip := &timeline.tracks[tr].clips[c]
+			if clip.kind != .Audio {
+				continue
+			}
+			chip := &slot.chip[n]
+			chip.timeline_start = clip.timeline_start_frame
+			chip.source_start = clip.source_start_frame
+			chip.source_len = clip.source_length_frames
+			chip.stream_index = clip.stream_index
+			path := string(clip.path)
+			chip.path_len = min(len(path), AUDIO_GEOM_PATH_CAP)
+			mem.copy(raw_data(chip.path[:]), raw_data(path), chip.path_len)
+			n += 1
+		}
+	}
+	slot.n = n
+	sync.atomic_store(&audio_geom_idx, u32(write))
+}
+
 // audio_note_edit tells the producer the clip set or playhead changed out of
 // band (split, delete, clip move, fps change) so it re-seeks at the playhead.
+// The geometry commit runs first so the producer's next provision reads the
+// new state.
 audio_note_edit :: proc() {
+	audio_geometry_commit()
 	if !audio_device_ready {
 		return
 	}
@@ -498,8 +557,9 @@ audio_note_edit :: proc() {
 }
 
 // audio_provision (re)opens a decoder for every audio clip, seeked so that
-// play_frame is its content origin. Producer-thread only; snapshots the clip
-// geometry so the mix never reads live timeline memory.
+// play_frame is its content origin. Producer-thread only; reads the committed
+// double-buffered geometry slab instead of live timeline memory, so it never
+// waits on the UI thread's edits.
 audio_provision :: proc(play_frame: i64) {
 	audio_dec_dump_open()
 	audio_reset_play()
@@ -507,50 +567,43 @@ audio_provision :: proc(play_frame: i64) {
 	sync.atomic_store(&audio_prod_frame, play_frame)
 	audio_dbg_budget = 8
 	fps := timeline_fps()
-	sync.mutex_lock(&audio_timeline_mtx)
-	defer sync.mutex_unlock(&audio_timeline_mtx)
-	for tr in 0 ..< len(timeline.tracks) {
-		track := &timeline.tracks[tr]
-		for c in 0 ..< len(track.clips) {
-			if play_src_count >= MAX_PLAY_AUDIO {
-				return
-			}
-			clip := &track.clips[c]
-			if clip.kind != .Audio {
-				continue
-			}
-			seek_frame := max(play_frame, clip.timeline_start_frame)
-			content_sec := f64(seek_frame - clip.timeline_start_frame + clip.source_start_frame) / fps
-			s := &play_srcs[play_src_count]
-			s.start_a = clip.timeline_start_frame
-			s.start_s = clip.source_start_frame
-			s.len_a = clip.source_length_frames
-			s.path = strings.clone_to_cstring(string(clip.path))
-			s.stream_index = clip.stream_index
-			if !open_audio_decoder_resampled(&s.dec, s.path, s.stream_index, 48000, 2) {
-				audio_src_reset(s)
-				continue
-			}
-			if !seek_audio(&s.dec, content_sec) {
-				audio_src_reset(s)
-				continue
-			}
+	slot := &audio_geom[sync.atomic_load(&audio_geom_idx)]
+	for i in 0 ..< slot.n {
+		if play_src_count >= MAX_PLAY_AUDIO {
+			return
+		}
+		chip := &slot.chip[i]
+		seek_frame := max(play_frame, chip.timeline_start)
+		content_sec := f64(seek_frame - chip.timeline_start + chip.source_start) / fps
+		s := &play_srcs[play_src_count]
+		s.start_a = chip.timeline_start
+		s.start_s = chip.source_start
+		s.len_a = chip.source_len
+		s.path = strings.clone_to_cstring(string(chip.path[:chip.path_len]))
+		s.stream_index = chip.stream_index
+		if !open_audio_decoder_resampled(&s.dec, s.path, s.stream_index, 48000, 2) {
+			audio_src_reset(s)
+			continue
+		}
+		if !seek_audio(&s.dec, content_sec) {
+			audio_src_reset(s)
+			continue
+		}
 			// Align the fifo base to the decoder's real landing PTS, not the
-			// asked position. An AAC seek can land tens of ms off; labeling the
-			// fifo with the asked time compounds that offset every frame and the
-			// content drifts against the playhead (reads as half-speed).
-			n := decode_audio_chunk(&s.dec, content_sec)
-			if n <= 0 {
-				audio_src_reset(s)
-				continue
-			}
-real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
+		// asked position. An AAC seek can land tens of ms off; labeling the
+		// fifo with the asked time compounds that offset every frame and the
+		// content drifts against the playhead (reads as half-speed).
+		n := decode_audio_chunk(&s.dec, content_sec)
+		if n <= 0 {
+			audio_src_reset(s)
+			continue
+		}
+		real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
 		s.first48 = i64(real_sec * 48000)
 		s.have48 = s.first48 + i64(n)
 		audio_src_dump_dec(s, n)
 		audio_src_append(s, n)
-			play_src_count += 1
-		}
+		play_src_count += 1
 	}
 	sync.atomic_store(&audio_src_count_ui, i64(play_src_count))
 }
@@ -759,13 +812,12 @@ audio_src_covers_frame :: proc(f: i64) -> bool {
 }
 
 // timeline_has_audio_at reports whether the CURRENT timeline has an audio clip
-// covering frame f. UI-thread only (takes audio_timeline_mtx). Used by the
-// self-heal in audio_update to detect "playing but the producer has no sources
-// even though the timeline still expects audio here" — the signal that the
-// engine silently died and must be re-seeded.
+// covering frame f. UI-thread only; the timeline is its single writer, so this
+// reads the live clips directly. Used by the self-heal in audio_update to
+// detect "playing but the producer has no sources even though the timeline
+// still expects audio here" — the signal that the engine silently died and
+// must be re-seeded.
 timeline_has_audio_at :: proc(f: i64) -> bool {
-	sync.mutex_lock(&audio_timeline_mtx)
-	defer sync.mutex_unlock(&audio_timeline_mtx)
 	for tr in 0 ..< len(timeline.tracks) {
 		track := &timeline.tracks[tr]
 		for c in 0 ..< len(track.clips) {

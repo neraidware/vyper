@@ -352,7 +352,6 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	}
 	base := max(target_track, 0)
 
-	sync.mutex_lock(&audio_timeline_mtx)
 	// Aligned placement: every lane (video + each audio stream) lands on the SAME
 	// frame so an import never desyncs its own streams. The first lane anchors the
 	// placement; an existing partner lane that cannot host that exact frame
@@ -368,7 +367,6 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	for offset in 1 ..< n_lanes {
 		lane := base + offset
 		if lane < len(timeline.tracks) && lane_blocked(&timeline.tracks[lane], anchor_placed, asset.audio_frames) {
-			sync.mutex_unlock(&audio_timeline_mtx)
 			return start_frame
 		}
 	}
@@ -450,7 +448,6 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			first_placed = placed
 		}
 	}
-	sync.mutex_unlock(&audio_timeline_mtx)
 
 	// Post-edit: point the playhead at the placed content, select the video
 	// clip, and tear down stale decode/playback state like every other timeline
