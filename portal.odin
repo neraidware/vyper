@@ -6,6 +6,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:time"
 
 GError :: struct {
 	domain: u32,
@@ -49,10 +50,7 @@ foreign glib {
 	g_variant_get_uint32 :: proc(value: ^GVariant) -> u32 ---
 	g_variant_lookup_value :: proc(value: ^GVariant, key: cstring, expected_type: ^GVariantType) -> ^GVariant ---
 	g_filename_from_uri :: proc(uri, hostname: cstring, error: ^^GError) -> cstring ---
-	g_main_loop_new :: proc(ctx: rawptr, is_running: bool) -> ^GMainLoop ---
-	g_main_loop_run :: proc(loop: ^GMainLoop) ---
-	g_main_loop_quit :: proc(loop: ^GMainLoop) ---
-	g_main_loop_unref :: proc(loop: ^GMainLoop) ---
+	g_main_context_iteration :: proc(ctx: rawptr, may_block: bool) -> bool ---
 }
 
 foreign gio {
@@ -75,10 +73,20 @@ foreign gio {
 	user_data: rawptr,
 	user_data_free_func: rawptr,
 	) -> u32 ---
-	g_dbus_connection_signal_unsubscribe :: proc(connection: ^GDBusConnection, subscription_id: u32) ---
 }
 
-portal_loop: ^GMainLoop
+// The Response signal subscription is created per dialog with an exact
+// request-path match, and (deliberately) never torn down. The old
+// per-dialog subscribe + nested GMainLoop + unsubscribe cycle finalized
+// gio's internal signal listener twice (g_ref_count_dec saw rc=-1 inside
+// g_dbus_connection_signal_unsubscribe), crashing with "GLib CRITICAL:
+// g_atomic_ref_count_dec: old_value > 0" on dialog close. Instead dialogs
+// wait by polling the process-default main context until the Response
+// arrives, and each subscription is left to live out the session (a small,
+// bounded per-dialog leak) rather than risk the double-finalize. Standard
+// gio match-object clustering keeps a nil match from a flood of unrelated
+// portal signals: only one dialog is pending at a time here.
+portal_dialog_pending: bool
 portal_response_data: ^GVariant
 
 portal_response :: proc "c" (
@@ -87,8 +95,13 @@ portal_response :: proc "c" (
 	parameters: ^GVariant,
 	user_data: rawptr,
 ) {
+	if !portal_dialog_pending {
+		// A stale Response from a previous dialog: keep the current wait
+		// pending, ignore the emission entirely (no ref, no leak).
+		return
+	}
 	portal_response_data = g_variant_ref(parameters)
-	g_main_loop_quit(portal_loop)
+	portal_dialog_pending = false
 }
 
 // Portal_Filter is a FileChooser filter: a display name plus its glob patterns.
@@ -255,7 +268,6 @@ portal_open_srt_picker :: proc() -> cstring {
 // immediately without touching the empty results — parsing an empty (or NULL)
 // results dict is exactly what segfaulted g_variant_get_string.
 portal_wait_response_path :: proc(connection: ^GDBusConnection, request_path: cstring) -> cstring {
-	portal_loop = g_main_loop_new(nil, false)
 	subscription := g_dbus_connection_signal_subscribe(
 		connection,
 		"org.freedesktop.portal.Desktop",
@@ -268,9 +280,26 @@ portal_wait_response_path :: proc(connection: ^GDBusConnection, request_path: cs
 		nil,
 		nil,
 	)
-	g_main_loop_run(portal_loop)
-	g_dbus_connection_signal_unsubscribe(connection, subscription)
-	g_main_loop_unref(portal_loop)
+	if subscription == 0 {
+		fmt.println("Portal: could not subscribe to Request/Response")
+		return nil
+	}
+	portal_dialog_pending = true
+	// Pump the default main context until the portal emits Response. The old
+	// nested g_main_loop_run + per-dialog unsubscribe double-finalized gio's
+	// internal listener; iterating the existing default context (and leaving
+	// the subscription alive) has nothing to tear down.
+	started := time.now()
+	for portal_dialog_pending {
+		g_main_context_iteration(nil, false)
+		if time.since(started) > 5 * time.Minute {
+			fmt.println("Portal: dialog timed out")
+			portal_dialog_pending = false
+			portal_response_data = nil
+			return nil
+		}
+		time.sleep(2 * time.Millisecond)
+	}
 	if portal_response_data == nil {
 		return nil
 	}
