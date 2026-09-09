@@ -26,7 +26,10 @@ order, or consciously deviate with a comment saying why.
   not idiomatic ceremony a Java reviewer would applaud. Fast, understandable,
   simple at its core. If you must pick, pick simple and fast over "sound".
 
-## 2. Memory: arenas (large pre-allocated chunks) are the default approach
+## 2. Memory model: arenas, generational handles, single-writer ownership
+
+The memory model is the architecture. It decides how every subsystem addresses,
+lifetimes, and shares its data, so the ground rules come first.
 
 - Allocate big backing blocks up front per thread / per subsystem; carve from
   them instead of touching the general allocator.
@@ -35,8 +38,39 @@ order, or consciously deviate with a comment saying why.
   and an arena or fixed buffer for anything reuse-shaped.
 - A surprise heap allocation in a hot loop is a bug, not an optimization
   opportunity.
-- Explicit ownership: caller passes the buffer, callee fills it. Static
-  nothing; pre-sized everything.
+- Static nothing; pre-sized everything. Explicit ownership: caller passes the
+  buffer, callee fills it.
+
+### Address by handle, never by a pointer you keep
+
+- Refer to movable/recyclable things by a stable handle — `(id, generation)` —
+  never a stored `^T`. A pointer lives one frame: resolve at the use site, drop
+  it after. This is already the house pattern: `Clip.clip_id` (assigned once,
+  never mutated by drags), the append-only `srt_cache` (its indexes stay valid
+  because nothing there is freed), the fixed `preview_slots[]` pool with its
+  `in_use` flag.
+- Recycling a slot bumps its generation; a stale handle resolves to "gone",
+  loudly. Never let an old handle alias a reused slot.
+
+### Single writer per structure; hand off, don't lock
+
+- Each buffer/queue has exactly one writer at any time. Cross-thread reads ride
+  an atomic index/generation handoff; never a mutex guarding a hot buffer.
+  Arena + ownership means no GC, no refcounts, no lock contention.
+- Cross-thread queues are bounded with a named overflow policy: decode behind →
+  drop the oldest preview frame; audio behind → catch-up burst. Never stall the
+  render thread on a producer.
+- Mutable hot state that several threads poke per frame lives on its own cache
+  line; keep unrelated hot counters off shared lines.
+
+### Commit or mutate, by edit kind
+
+- Discrete edits (import, split, delete, parameter change) build a candidate and
+  commit it: the commit bumps a generation, and any cache keyed on that
+  generation drops stale entries for free. This is also the future undo model's
+  seam — an undo log is a cursor over commits.
+- Continuous interactions (dragging a clip, scrubbing) mutate in place and set
+  a dirty flag; no commit per frame.
 
 ## 3. Low level is home turf: raw data, memory, and the unknown
 
