@@ -20,8 +20,8 @@ import stb "vendor:stb/truetype"
 // ---------------------------------------------------------------------------
 // Video export: composite the timeline (as shown in the preview) and encode it
 // as MP4/H.264 + AAC with the vendored FFmpeg. Rendering runs on a worker
-// thread (UI stays responsive) against a snapshot of the timeline; the main
-// thread only reads the progress state through a mutex.
+// thread (UI stays responsive) against a snapshot of the timeline; worker and
+// main thread only touch render_progress, through atomic handoff — no mutex.
 // ---------------------------------------------------------------------------
 
 RENDER_FPS :: 60
@@ -50,41 +50,46 @@ Render_Status :: enum {
 	Cancelled,
 }
 
-// render_progress is the only state shared with the worker thread; every field
-// is guarded by job_mutex.
+// render_progress is the only state shared with the worker thread. Single-writer
+// handoff, no mutex: the worker writes status/error/frames_done and the main
+// thread writes frames_total; status is the release/acquire gate, so the error
+// buffer and counters are settled before a reader sees the state that consumes
+// them (UI reading .Failed sees a fully-written error string, render_start
+// reading .Rendering sees a settled frames_total).
 render_progress: struct {
-	job_mutex:  sync.Mutex,
-	status:     Render_Status,
-	frames_done: i64,
-	frames_total: i64,
-	error:      [256]u8,
-	guarding_thread: ^thread.Thread,
+	status:       u32, // atomic
+	frames_done:  i64, // atomic
+	frames_total: i64, // atomic
+	error:        [256]u8,
 }
 
+// status_text_buf is render_status_text's fixed scratch; the UI formats into it
+// and hands it to clay in the same frame, so a single shared buffer is fine.
+status_text_buf: [256]u8
+
 render_status :: proc() -> Render_Status {
-	sync.mutex_lock(&render_progress.job_mutex)
-	defer sync.mutex_unlock(&render_progress.job_mutex)
-	return render_progress.status
+	return Render_Status(sync.atomic_load(&render_progress.status))
 }
 
 render_status_text :: proc() -> string {
-	sync.mutex_lock(&render_progress.job_mutex)
-	defer sync.mutex_unlock(&render_progress.job_mutex)
-	switch render_progress.status {
+	status := Render_Status(sync.atomic_load(&render_progress.status))
+	switch status {
 	case .Idle:
 		return "Ready"
 	case .Rendering:
-		total := render_progress.frames_total
-		done := render_progress.frames_done
+		total := sync.atomic_load(&render_progress.frames_total)
+		done := sync.atomic_load(&render_progress.frames_done)
 		if total <= 0 {
 			return "Rendering..."
 		}
 		pct := i64(100) * done / total
-		return fmt.aprintf("Rendering %lld / %lld (%d%%)", done, total, pct)
+		text := fmt.bprintf(status_text_buf[:], "Rendering %lld / %lld (%d%%)", done, total, pct)
+		return string(text)
 	case .Done:
 		return "Render complete"
 	case .Failed:
-		return fmt.aprintf("Failed: %s", cstring(&render_progress.error[0]))
+		text := fmt.bprintf(status_text_buf[:], "Failed: %s", cstring(&render_progress.error[0]))
+		return string(text)
 	case .Cancelled:
 		return "Render cancelled"
 	}
@@ -191,20 +196,6 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 	over.bw = bw
 	over.ox, over.oy, over.ow, over.oh = ox, oy, ow, oh
 	over.blit_scale = 1
-}
-
-// cleanup_text_jobs frees the per-clip text rasters and the shared setup scratch.
-cleanup_text_jobs :: proc(jobs: []Render_Text_Job) {
-	for i in 0 ..< len(jobs) {
-		if jobs[i].raster != nil {
-			delete(jobs[i].raster)
-		}
-	}
-	delete(jobs)
-	if render_text_setup_scratch != nil {
-		delete(render_text_setup_scratch)
-		render_text_setup_scratch = nil
-	}
 }
 
 // Render_Sub_Src snapshots a .Subtitles generator clip (kind .Text) for the
@@ -662,6 +653,16 @@ render_worker :: proc(t: ^thread.Thread) {
 }
 
 render_worker_run :: proc() {
+	// Whole-job arena: every allocation the worker makes — blit buffers, canvas,
+	// text/subtitle rasters, the setup scratch, audio fifos — carves from this
+	// one block. A render is a finite, single-threaded pass, so nothing needs
+	// freeing until the arena dies at the end; the ffmpeg decoder context memory
+	// is the exception (reset below). The snapshot arrays (render_job_*) were
+	// allocated on the main thread and are freed there.
+	job_arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&job_arena)
+	context.allocator = mem.dynamic_arena_allocator(&job_arena)
+
 	set_status(.Rendering, "")
 	fail := false
 	e := Render_Enc{}
@@ -670,48 +671,14 @@ render_worker_run :: proc() {
 		enc_cleanup(&e)
 		for &v in render_job_videos {
 			clip_decoder_reset(&v.dec)
-			if v.path != nil {
-				mem.delete_cstring(v.path)
-				v.path = nil
-			}
-			if v.blit != nil {
-				delete(v.blit)
-				v.blit = nil
-			}
 		}
 		for &a in render_job_audios {
 			if a.dec.opened {
 				audio_decoder_reset(&a.dec)
 			}
-			if a.fifo != nil {
-				delete(a.fifo)
-				a.fifo = nil
-			}
-			if a.path != nil {
-				mem.delete_cstring(a.path)
-				a.path = nil
-			}
 		}
-		for &t in render_job_texts {
-			if t.name != "" {
-				delete(t.name)
-				t.name = ""
-			}
-		}
-		delete(render_job_videos)
-		delete(render_job_audios)
-		delete(render_job_texts)
-		if render_job_subs != nil {
-			delete(render_job_subs)
-		}
-		render_job_videos = nil
-		render_job_audios = nil
-		render_job_texts = nil
-		render_job_subs = nil
-		if render_job_out_path != nil {
-			mem.delete_cstring(render_job_out_path)
-			render_job_out_path = nil
-		}
+		mem.dynamic_arena_destroy(&job_arena)
+		render_text_setup_scratch = nil
 		status := fail ? Render_Status.Failed : (cancelled() ? .Cancelled : .Done)
 		if fail && len(err_msg) > 0 {
 			set_status(.Failed, err_msg)
@@ -795,13 +762,13 @@ render_worker_run :: proc() {
 	}
 
 	canvas := make([]u8, int(render_job_width) * int(render_job_height) * 4)
-	defer delete(canvas)
+	// canvas + all per-clip rasters live in the job arena (job_arena above),
+	// freed wholesale when the worker unwinds — no per-buffer deletes.
 
 	// Text compositing: each text clip gets a precomputed raster (baked font)
 	// + blit box built once below, then alpha-blitted on the canvas each frame.
 	// Built before the frame loop (titles + transforms are static for a job).
 	text_jobs := make([]Render_Text_Job, max(len(render_job_texts), 1))
-	defer cleanup_text_jobs(text_jobs)
 	for i in 0 ..< len(render_job_texts) {
 		setup_text_job(&text_jobs[i], render_job_texts[i])
 	}
@@ -810,14 +777,6 @@ render_worker_run :: proc() {
 	// cue changes) + a one-slot active-cue raster cache. Cues play forward in
 	// population order, so a single slot per clip is a near-perfect LRU.
 	sub_cues := make([]Render_Sub_Cue, max(len(render_job_subs), 1))
-	defer {
-		for i in 0 ..< len(sub_cues) {
-			if sub_cues[i].raster != nil {
-				delete(sub_cues[i].raster)
-			}
-		}
-		delete(sub_cues)
-	}
 	sub_factor := f32(render_job_width) / f32(PREVIEW_W)
 	for i in 0 ..< len(render_job_subs) {
 		s := &render_job_subs[i]
@@ -955,9 +914,7 @@ render_worker_run :: proc() {
 			}
 		}
 
-		sync.mutex_lock(&render_progress.job_mutex)
-		render_progress.frames_done = frame_idx + 1
-		sync.mutex_unlock(&render_progress.job_mutex)
+		sync.atomic_store(&render_progress.frames_done, frame_idx + 1)
 	}
 
 	// Flush encoders.
@@ -1095,22 +1052,17 @@ render_text_blit :: proc(
 // ---------------------------------------------------------------------------
 
 set_status :: proc(s: Render_Status, msg: string) {
-	sync.mutex_lock(&render_progress.job_mutex)
-	render_progress.status = s
 	i := 0
 	for i < len(msg) && i < len(render_progress.error) - 1 {
 		render_progress.error[i] = u8(msg[i])
 		i += 1
 	}
 	render_progress.error[i] = 0
-	sync.mutex_unlock(&render_progress.job_mutex)
+	sync.atomic_store(&render_progress.status, u32(s))
 }
 
 cancelled :: proc() -> bool {
-	sync.mutex_lock(&render_progress.job_mutex)
-	c := render_progress.status == .Cancelled
-	sync.mutex_unlock(&render_progress.job_mutex)
-	return c
+	return Render_Status(sync.atomic_load(&render_progress.status)) == .Cancelled
 }
 
 poll_cancel :: proc() -> bool {
@@ -1118,19 +1070,14 @@ poll_cancel :: proc() -> bool {
 }
 
 render_is_busy :: proc() -> bool {
-	sync.mutex_lock(&render_progress.job_mutex)
-	busy := render_progress.status == .Rendering
-	sync.mutex_unlock(&render_progress.job_mutex)
-	return busy
+	return Render_Status(sync.atomic_load(&render_progress.status)) == .Rendering
 }
 
 render_cancel :: proc() {
 	if !render_is_busy() {
 		return
 	}
-	sync.mutex_lock(&render_progress.job_mutex)
-	render_progress.status = .Cancelled
-	sync.mutex_unlock(&render_progress.job_mutex)
+	sync.atomic_store(&render_progress.status, u32(Render_Status.Cancelled))
 }
 
 render_out_path :: proc() -> string {
@@ -1285,31 +1232,37 @@ render_start :: proc() {
 		render_job_height += 1
 	}
 
-	sync.mutex_lock(&render_progress.job_mutex)
-	render_progress.frames_done = 0
-	render_progress.frames_total = render_job_nframes
-	render_progress.status = .Rendering
-	sync.mutex_unlock(&render_progress.job_mutex)
+	// Publish job bounds, then status: the release store on status orders the
+	// counter stores, so the worker's reader can never see .Rendering with stale
+	// frames_total.
+	sync.atomic_store(&render_progress.frames_done, 0)
+	sync.atomic_store(&render_progress.frames_total, render_job_nframes)
+	sync.atomic_store(&render_progress.status, u32(Render_Status.Rendering))
 
 	render_worker_thread = thread.create(render_worker)
 	if render_worker_thread == nil {
 		set_status(.Failed, "could not start render thread")
-		rising_thread_failed()
+		render_free_workbook()
 		return
 	}
 	thread.start(render_worker_thread)
 }
 
-// poll_completed_thread joins+destroys the worker once its status is terminal.
+// poll_completed_thread joins+destroys the worker once its status is terminal,
+// then releases the main-thread snapshot (render_free_workbook). Runs every UI
+// frame, but only does work on the finish transition.
 poll_completed_thread :: proc() {
 	if !render_is_busy() && render_worker_thread != nil {
 		thread.destroy(render_worker_thread)
 		render_worker_thread = nil
+		render_free_workbook()
 	}
 }
 
-rising_thread_failed :: proc() {
-	// Cleanup snapshot memory if thread creation failed.
+// render_free_workbook releases the snapshot arrays + cloned strings that
+// render_start built on the main thread. The worker never touches them after it
+// returns (its job arena died with it), so this is always main-thread-only.
+render_free_workbook :: proc() {
 	for &v in render_job_videos {
 		if v.path != nil {
 			mem.delete_cstring(v.path)
