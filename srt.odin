@@ -68,7 +68,11 @@ srt_cue_lookup :: proc(cues: []Srt_Cue, frame: i64, fps: f32) -> int {
 			hi = mid - 1
 		}
 	}
-	if frame < cue_end_frame(cues[lo], fps) {
+	// A cue is active only inside its half-open span [start, end). The binary
+	// search lands on the last cue whose start <= frame, but for a frame before
+	// the FIRST cue it still converges to index 0 — without the lower bound a
+	// blank pre-roll would show the first cue's title early.
+	if frame >= cue_start_frame(cues[lo], fps) && frame < cue_end_frame(cues[lo], fps) {
 		return lo
 	}
 	return -1
