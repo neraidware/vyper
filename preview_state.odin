@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:hash"
 import "core:mem"
 import "core:strings"
 
@@ -119,6 +120,16 @@ prewarm_next_clip :: proc() {
 			return
 		}
 	}
+}
+
+// pick_hash_u32 fingerprints a proxy pick path (a cstring resolving to a
+// segment file, the source, or nil when preview proxy is disabled) so the
+// idle-skip in update_preview_slots can tell "same frame, better file".
+pick_hash_u32 :: proc(pick: cstring) -> u32 {
+	if pick == nil || len(pick) == 0 {
+		return 0
+	}
+	return hash.fnv32(transmute([]u8)string(pick))
 }
 
 // update_preview_slots walks every video clip covering the current playhead and
@@ -375,6 +386,17 @@ update_preview_slots :: proc() -> bool {
 			// unaffected because they never set a preview target.
 			pick_buf: [4096]u8
 			slot_pick, slot_base := proxy_pick_for_frame(clip.path, clip.source_length_frames, clip_frame, pick_buf[:])
+			// Idle-skip: when the playhead is parked and this slot already
+			// shows the exact frame decoded through the exact same proxy file
+			// the pick just resolved to, the screen is already correct — skip
+			// the decode + upload (a ~4MB GPU transfer per slot). The pick
+			// comparison matters: the background builder keeps landing new
+			// segments, so the SAME source frame may later resolve to a better
+			// file (source -> segment); that must re-decode even while parked.
+			pick_hash := pick_hash_u32(slot_pick)
+			if slot.has_frame && !slot.tex_dirty && slot.displayed_frame == clip_frame && slot.displayed_pick == pick_hash {
+				continue
+			}
 			if !scrub_skip || !slot.has_frame {
 				if slot_idx == front_video_slot && async_has_worker() {
 					if slot.prime_from_warm {
@@ -388,6 +410,8 @@ update_preview_slots :: proc() -> bool {
 						slot.prime_from_warm = false
 						decoder_set_preview(&slot.dec, slot_pick, slot_base)
 						if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+							slot.displayed_frame = clip_frame
+							slot.displayed_pick = pick_hash
 							slot.has_frame = true
 							slot.tex_dirty = true
 							changed = true
@@ -412,7 +436,9 @@ update_preview_slots :: proc() -> bool {
 						if !async_live_mode {
 							async_wait_idle()
 						}
-						if ok, _ := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
+						if ok, dyn_frame := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
+							slot.displayed_frame = dyn_frame
+							slot.displayed_pick = pick_hash
 							slot.has_frame = true
 							slot.tex_dirty = true
 							changed = true
@@ -423,6 +449,8 @@ update_preview_slots :: proc() -> bool {
 				} else {
 					decoder_set_preview(&slot.dec, slot_pick, slot_base)
 					if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+						slot.displayed_frame = clip_frame
+						slot.displayed_pick = pick_hash
 						slot.has_frame = true
 						slot.tex_dirty = true
 						changed = true

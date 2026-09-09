@@ -508,6 +508,15 @@ Preview_Slot :: struct {
 	// clip identity; draw_preview skips slots without it so a reassigned slot
 	// never flashes the previous clip's image while the new decoder opens.
 	has_frame:           bool,
+	// displayed_frame is the SOURCE-frame whose pixels currently sit in
+	// slot.buffer (the frame consume_latest landed, which may trail the
+	// requested playhead frame during live playback). displayed_pick is the
+	// hash of the proxy pick that frame was decoded through. Together they let
+	// update_preview_slots skip the frame when nothing moved: same frame AND
+	// same proxy file means the screen is already correct, so re-decoding and
+	// re-uploading (a ~4MB GPU transfer per slot) is pure waste.
+	displayed_frame:     i64,
+	displayed_pick:      u32,
 }
 
 preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot

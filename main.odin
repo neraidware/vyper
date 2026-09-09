@@ -1608,7 +1608,7 @@ main :: proc() {
 			continue
 		}
 		dec_t0 := sdl.GetTicksNS()
-		changed := update_preview_slots()
+		update_preview_slots()
 		ui_dec_us += i64(sdl.GetTicksNS() - dec_t0)
 		any_frame := false
 		for i in 0..<MAX_PREVIEW_SLOTS {
@@ -1621,17 +1621,28 @@ main :: proc() {
 				// bw x bh, stored in text_tex_w/h). update_preview_slots sets
 				// text_recreate whenever it re-rasterizes (which is whenever the
 				// buffer size could change), so recreate on that flag + first use.
+				// A slot between subtitle cues has no ink yet (text_tex_w/h == 0
+				// until the first cue renders) — skip creation so a freshly
+				// reassigned slot never asks SDL for a 0x0 texture.
 				if slot.texture == nil || slot.text_recreate {
 					if slot.texture != nil {
 						sdl.ReleaseGPUTexture(device, slot.texture)
 					}
-					slot.texture = create_text_texture(device, slot.text_tex_w, slot.text_tex_h)
+					if slot.text_tex_w > 0 && slot.text_tex_h > 0 {
+						slot.texture = create_text_texture(device, slot.text_tex_w, slot.text_tex_h)
+					}
 				}
 				slot.text_recreate = false
 			} else if slot.texture == nil {
 				slot.texture = renderer.preview_textures[i]
 			}
-			if slot.tex_dirty || changed {
+			// Upload only the slots whose pixels actually changed this frame. The
+			// re-upload is a full-frame GPU transfer (up to ~4MB per slot), and
+			// every upload allocates + maps a transfer buffer — a blanket
+			// "changed" upload dragged all 8 slots through that even when their
+			// frame never moved (background slots holding a stale-but-correct
+			// face). idempotent: tex_dirty is cleared by upload_preview_slot.
+			if slot.tex_dirty {
 				upload_preview_slot(&renderer, command_buffer, slot)
 			}
 			// in_use only means the slot is claimed by some clip; it says
