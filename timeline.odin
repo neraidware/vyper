@@ -24,7 +24,6 @@ add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
 	length := one_sec
 	if len(track.clips) > 0 {
 		gaps := clip_track_gaps(track, -1)
-		defer delete(gaps)
 		if gi := gap_for_start(gaps[:], start); gi >= 0 {
 			hi := gaps[gi][1]
 			if start + length > hi {
@@ -73,7 +72,6 @@ add_subtitle_generator_clip :: proc(track: ^Track, start_frame: i64, src_id: int
 	length := max(one_sec, cue_frame(srt_duration_ms(src), f32(timeline_fps())))
 	if len(track.clips) > 0 {
 		gaps := clip_track_gaps(track, -1)
-		defer delete(gaps)
 		if gi := gap_for_start(gaps[:], start); gi >= 0 {
 			hi := gaps[gi][1]
 			if start + length > hi {
@@ -171,15 +169,15 @@ snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 
 // clip_track_gaps returns the free (non-covered) bands of `track`, ignoring the
 // clip at exclude_idx (-1 = include everything). The trailing band is unbounded
-// so clips may still extend the timeline. Caller must delete the result.
+// so clips may still extend the timeline. Allocated on the frame's temp arena
+// (edits never outlive the frame), so callers must not retain the result.
 clip_track_gaps :: proc(track: ^Track, exclude_idx: int) -> [dynamic][2]i64 {
-	gaps := make([dynamic][2]i64, 0, len(track.clips) + 1)
+	gaps := make([dynamic][2]i64, 0, len(track.clips) + 1, context.temp_allocator)
 	if len(track.clips) == 0 {
 		append(&gaps, [2]i64{0, max(0, i64(1 << 40))})
 		return gaps
 	}
-	covered := make([dynamic][2]i64, 0, len(track.clips))
-	defer delete(covered)
+	covered := make([dynamic][2]i64, 0, len(track.clips), context.temp_allocator)
 	for i in 0 ..< len(track.clips) {
 		if i == exclude_idx {
 			continue
@@ -240,7 +238,6 @@ clip_place_in_track :: proc(track: ^Track, exclude_idx: int, clip_len: i64, desi
 		return max(desired, 0)
 	}
 	gaps := clip_track_gaps(track, exclude_idx)
-	defer delete(gaps)
 	best_gap := -1
 	best_dist := i64(1 << 40)
 	for gi in 0 ..< len(gaps) {
@@ -277,7 +274,6 @@ clip_slide_in_track :: proc(track: ^Track, exclude_idx: int, clip_len: i64, desi
 		return max(desired, 0)
 	}
 	gaps := clip_track_gaps(track, exclude_idx)
-	defer delete(gaps)
 	gi := gap_for_start(gaps[:], anchor)
 	if gi < 0 || gi >= len(gaps) {
 		return max(desired, 0)
@@ -411,8 +407,7 @@ split_clip_at_playhead :: proc() {
 		right_link = new_clip_id()
 	}
 	SplitTarget :: struct { track, index: int }
-	targets := make([dynamic]SplitTarget, 0, 4)
-	defer delete(targets)
+	targets := make([dynamic]SplitTarget, 0, 4, context.temp_allocator)
 	if link != 0 {
 		for t := 0; t < len(timeline.tracks); t += 1 {
 			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
@@ -511,8 +506,7 @@ unlink_selected_clips :: proc() {
 // cuts/moves/deletes treat them as one unit.
 toggle_links_for_selection :: proc() {
 	_, anchor, ok := selected_clip()
-	ids := make([dynamic]u64, 0, len(selected_set) + 1)
-	defer delete(ids)
+	ids := make([dynamic]u64, 0, len(selected_set) + 1, context.temp_allocator)
 	if ok && anchor != nil {
 		append(&ids, anchor.clip_id)
 	}
@@ -531,8 +525,7 @@ toggle_links_for_selection :: proc() {
 	if len(ids) == 0 {
 		return
 	}
-	resolved := make([dynamic]^Clip, 0, len(ids))
-	defer delete(resolved)
+	resolved := make([dynamic]^Clip, 0, len(ids), context.temp_allocator)
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
 			c := &timeline.tracks[t].clips[i]
@@ -601,7 +594,9 @@ toggle_links_for_selection :: proc() {
 }
 
 // filter_markers_in_range returns a new dynamic array with the markers whose
-// source_frame lies in [start, start+length).
+// source_frame lies in [start, start+length). The result is PERSISTED on the
+// caller's clip (.markers survives across frames), so it allocates on
+// context.allocator, not the frame temp arena.
 filter_markers_in_range :: proc(markers: []Clip_Marker, start, length: i64) -> [dynamic]Clip_Marker {
 	out := make([dynamic]Clip_Marker)
 	for m in markers {
@@ -627,8 +622,7 @@ delete_selected_clip_raw :: proc() {
 	}
 	link := track.clips[selected_index].link_id
 	Target :: struct { track, index: int }
-	targets := make([dynamic]Target, 0, 4)
-	defer delete(targets)
+	targets := make([dynamic]Target, 0, 4, context.temp_allocator)
 	if link != 0 {
 		for t := 0; t < len(timeline.tracks); t += 1 {
 			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
@@ -703,6 +697,8 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 	}
 	end := start + length
 	track := &timeline.tracks[ti]
+	// Rebuilt clip array BECOMES the track's clips (delete + reassign below):
+	// persistent, so context.allocator, not the frame temp arena.
 	new_clips := make([dynamic]Clip, 0, len(track.clips))
 	for i in 0 ..< len(track.clips) {
 		c := track.clips[i]
@@ -798,8 +794,7 @@ ripple_delete_linked_group :: proc(link: u64) {
 		return
 	}
 	MemberSpan :: struct { track: int, start, length: i64 }
-	spans := make([dynamic]MemberSpan, 0, 4)
-	defer delete(spans)
+	spans := make([dynamic]MemberSpan, 0, 4, context.temp_allocator)
 	for ti in 0 ..< len(timeline.tracks) {
 		for &c in timeline.tracks[ti].clips {
 			if c.link_id == link {
@@ -1019,7 +1014,6 @@ apply_group_drag_to_members :: proc(anchor_delta: i64) {
 			}
 			clip.timeline_start_frame = clamp(m.start + anchor_delta, lo, hi)
 		}
-		delete(gaps)
 	}
 }
 
@@ -1109,8 +1103,7 @@ move_linked_group :: proc(track_delta: int) -> bool {
 		}
 	}
 	PlannedMove :: struct { src_track, dst_track: int, start: i64, clip: Clip }
-	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig))
-	defer delete(planned)
+	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig), context.temp_allocator)
 	for m in drag_group_orig {
 		if m.track < 0 || m.track >= len(timeline.tracks) {
 			return false
@@ -1251,6 +1244,7 @@ duplicate_track :: proc(index: int) {
 	new_track := Track{
 		name = next_track_name(),
 		layer = src.layer,
+		// Deep copy array persists on the inserted track: context.allocator.
 		clips = make([dynamic]Clip, 0, len(src.clips)),
 	}
 	// Copy each clip by VALUE: mutations below land on the duplicate, never on

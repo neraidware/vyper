@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -927,7 +928,10 @@ main :: proc() {
 		if nered_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 		}
-		import_media(strings.clone_to_cstring(autoplay, context.temp_allocator))
+		// The asset/clip paths store the passed cstring by reference, so the
+		// autoplay path must be owned on the long-lived allocator (assets never
+		// free their paths), not the per-frame temp arena.
+		import_media(strings.clone_to_cstring(autoplay))
 		if nered_trace {
 			fmt.printf("[autoplay] env=\"%s\" imported tracks=%d step=delay\n", autoplay, len(timeline.tracks))
 		}
@@ -957,6 +961,10 @@ main :: proc() {
 	ui_dec_us := i64(0)
 	for running {
 		spall_scope("render_frame")
+		// Frame-scoped scratch (timeline edit temporaries, decode error
+		// strings, preview decode buffers) lives on the temp arena; reset it
+		// once per loop so the arena stays bounded to one frame's peak.
+		mem.free_all(context.temp_allocator)
 		if spall_expired() {
 			running = false
 		}
