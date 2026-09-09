@@ -770,6 +770,8 @@ main :: proc() {
 		proxy_bg_probe_run(xb)
 		return
 	}
+	spall_prof_init()
+	defer spall_prof_shutdown()
 	if !load_font_data() {
 		return
 	}
@@ -904,6 +906,10 @@ main :: proc() {
 	ui_frame_count := 0
 	ui_dec_us := i64(0)
 	for running {
+		spall_scope("render_frame")
+		if spall_expired() {
+			running = false
+		}
 		clear_expired_ui_notice()
 		event: sdl.Event
 		for sdl.PollEvent(&event) {

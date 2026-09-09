@@ -784,6 +784,7 @@ release_slot_owned_texture :: proc(device: ^sdl.GPUDevice, slot: ^Preview_Slot) 
 // text slot uploads its tight text_buf into its owned tight texture; a video
 // slot uploads the fixed PREVIEW buffer into the shared preview texture.
 upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
+	spall_scope(#procedure)
 	if slot.texture == nil {
 		return
 	}

@@ -86,6 +86,7 @@ async_live_mode := true
 // cache-hit guard). If you change the cache-hit/last_frame logic in one, update
 // the other to match, then re-run NERED_CACHE_PROBE (0 mismatches).
 vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_base: i64, frame_idx: i64) -> bool {
+	spall_scope(#procedure)
 	frame_local := frame_idx - frame_base
 	want := path
 	if preview != nil && preview != path {
@@ -121,6 +122,8 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_b
 vdec_worker :: proc "c" (data: rawptr) -> c.int {
 	context = runtime.default_context()
 	ad := (^Async_Decoder)(data)
+	spall_thread_init("vdecode")
+	defer spall_thread_term()
 	for {
 		sdl.LockMutex(ad.mutex)
 		for !ad.stop && ad.reset == false && !ad.req_valid {

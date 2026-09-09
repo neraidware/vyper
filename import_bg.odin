@@ -215,6 +215,8 @@ import_bg_shutdown :: proc() {
 import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 	context = runtime.default_context()
 	ib := (^Proxy_Builder)(data)
+	spall_thread_init("import_bg")
+	defer spall_thread_term()
 	for {
 		sdl.LockMutex(ib.mutex)
 		busy := ib.phase == .Building || ib.phase == .Verifying
@@ -271,6 +273,7 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 // The encode settings mirror proxy_transcode's synchronous whole-file build so
 // a proxied frame is pixel-identical on either path.
 import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i64, w, h: c.int) {
+	spall_scope(#procedure)
 	scale_w, scale_h := proxy_scale(w, h)
 	filter := fmt.aprintf("scale=%d:%d", scale_w, scale_h)
 	threads := proxy_encode_threads()

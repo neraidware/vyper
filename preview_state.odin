@@ -138,6 +138,7 @@ pick_hash_u32 :: proc(pick: cstring) -> u32 {
 // identity changes its decoder is reset and reopened. Returns true if any
 // frame changed (caller re-uploads textures).
 update_preview_slots :: proc() -> bool {
+	spall_scope(#procedure)
 	changed := false
 	next_slot := 0
 	// front_video_slot is the lowest-index slot holding a non-text clip at the

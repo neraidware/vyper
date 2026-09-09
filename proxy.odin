@@ -480,6 +480,7 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 	if !preview_proxy_enabled {
 		return nil, 0
 	}
+	spall_scope(#procedure)
 	// Resolution per frame: source frame -> segment index.
 	k := proxy_seg_for_frame(frame)
 
