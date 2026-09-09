@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:hash"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -24,38 +25,98 @@ import sdl "vendor:sdl3"
 // keyed on source frame indices).
 // ---------------------------------------------------------------------------
 
-// proxy_suffix is appended to a source's basename to form the proxy path:
-// "<source parent>/<base>.neredproxy.mp4".
+// Proxy artifacts live in a per-user cache directory -- "$XDG_CACHE_HOME/nered",
+// or "$HOME/.cache/nered" when XDG_CACHE_HOME is unset -- keyed by
+// <basename>-<path-hash>, so they never pollute the source folders, survive any
+// source relocation (re-hash only when the path changes), and same-named sources
+// from different folders stay distinct. The naming scheme is unchanged:
 PROXY_SUFFIX := ".neredproxy.mp4"
 
-// proxy_path_for writes the on-disk proxy path for a source video into `buf`
-// (NUL-terminated) and returns a cstring into it. The proxy lives next to the
-// source so it moves with it and dies with it. Returns ("", false) if the
-// buffer is too small or the source has no directory component.
-proxy_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
-	src_str := string(src)
+// proxy_cache_ready is memoized true once the cache dir is known to exist; the
+// mkdir is skipped on the hot read path (proxy_pick_for_frame) but re-attempted
+// immediately if any build fails, so a raced/removed dir self-heals.
+proxy_cache_ready: bool
+
+// proxy_cache_prefix writes the nered proxy cache dir into buf (trailing '/'
+// included, NUL-terminated), creating it and any missing parents on first use.
+// Returns the byte offset just past the prefix, or (0, false) when no home can
+// be resolved, no XDG override exists, or the directory cannot be created --
+// callers treat any failure as "no proxy available".
+proxy_cache_prefix :: proc(buf: []u8) -> (int, bool) {
+	home: string
+	if v, ok := os.lookup_env_alloc("XDG_CACHE_HOME", context.temp_allocator); ok && v != "" {
+		home = v
+	} else {
+		h, err := os.user_home_dir(context.temp_allocator)
+		if err != os.General_Error.None || h == "" {
+			return 0, false
+		}
+		home = strings.concatenate({h, "/.cache"}, context.temp_allocator)
+	}
+	rel := "/nered/"
+	n := len(home) + len(rel)
+	if n + 1 >= len(buf) {
+		return 0, false
+	}
+	copy(buf[:n], home)
+	copy(buf[len(home):n], rel)
+	buf[n] = 0
+	if !proxy_cache_ready {
+		if err := os.make_directory_all(string(cstring(&buf[0]))); err == os.General_Error.None {
+			proxy_cache_ready = true
+		} else {
+			return 0, false
+		}
+	}
+	return n, true
+}
+
+// proxy_stem writes the in-cache naming stem for a source video: its basename
+// minus the final extension, a '-', then the low 32 bits of FNV-1a over the
+// source's (absolute) path in hex, so distinct sources never collide even with
+// identical basenames. Returns the updated offset, or (off, false) on overflow.
+proxy_stem :: proc(buf: []u8, off: int, src: cstring) -> (int, bool) {
 	base := path_basename(src)
-	dir_len := len(src_str) - len(base)
-	if dir_len < 0 {
+	no_ext := base
+	if dot := strings.last_index(base, "."); dot > 0 {
+		no_ext = base[:dot]
+	}
+	h := hash.fnv32a(transmute([]byte)string(src))
+	if off + len(no_ext) + 9 > len(buf) {
+		return off, false
+	}
+	s := off
+	for i in 0 ..< len(no_ext) {
+		buf[s] = no_ext[i]
+		s += 1
+	}
+	buf[s] = '-'
+	s += 1
+	for i in 0 ..< 8 {
+		d := u8(h >> u32((7 - i) * 4)) & 0xF
+		buf[s] = d < 10 ? u8('0') + d : u8('a') + (d - 10)
+		s += 1
+	}
+	return s, true
+}
+
+// proxy_path_for writes the on-disk whole-proxy path for a source video into
+// `buf` (NUL-terminated): "<cache>/<base>-<hash>.neredproxy.mp4". Returns
+// ("", false) if the buffer is too small or the cache dir is unusable.
+proxy_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
+	off, ok := proxy_cache_prefix(buf)
+	if !ok {
 		return "", false
 	}
-	n := dir_len + len(base) + len(PROXY_SUFFIX)
-	if n >= len(buf) {
+	s, stok := proxy_stem(buf, off, src)
+	if !stok {
 		return "", false
 	}
-	s := 0
-	for i in 0 ..< dir_len {
-		buf[s] = src_str[i]
-		s += 1
+	if s + len(PROXY_SUFFIX) + 1 > len(buf) {
+		return "", false
 	}
-	for i in 0 ..< len(base) {
-		buf[s] = base[i]
-		s += 1
-	}
-	for i in 0 ..< len(PROXY_SUFFIX) {
-		buf[s] = PROXY_SUFFIX[i]
-		s += 1
-	}
+	copy(buf[s:s + len(PROXY_SUFFIX)], PROXY_SUFFIX)
+	s += len(PROXY_SUFFIX)
 	buf[s] = 0
 	return cstring(&buf[0]), true
 }
@@ -207,14 +268,17 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 // exactly how Premiere/Resolve/Kdenlive previews behave. A completed build is
 // just the full segment set.
 //
-// Layout (all next to the source, named after the whole-proxy naming scheme):
-//   <src>.neredproxy.mp4      legacy WHOLE proxy (pre-segment builds / the
-//                             synchronous probe path) -- still served as a
-//                             fast path when present and no segmentation exists
-//   <src>.neredproxy.segNNNN.mp4   segment N, covering source frames
-//                             [N*seg_frames, (N+1)*seg_frames)
-//   <src>.neredproxy.idx       text index: "seg_frames <n>" then "k <count>"
-//                             per COMPLETED segment k (count = frames inside)
+// Layout (all in the per-user proxy cache dir, named after the whole-proxy
+// naming scheme):
+//   <cache>/<base>-<hash>.neredproxy.mp4      legacy WHOLE proxy (pre-segment
+//                             builds / the synchronous probe path) -- still
+//                             served as a fast path when present and no
+//                             segmentation exists
+//   <cache>/<base>-<hash>.neredproxy.segNNNN.mp4   segment N, covering source
+//                             frames [N*seg_frames, (N+1)*seg_frames)
+//   <cache>/<base>-<hash>.neredproxy.idx      text index: "seg_frames <n>" then
+//                             "k <count>" per COMPLETED segment k (count =
+//                             frames inside)
 // ---------------------------------------------------------------------------
 
 // PROXY_SEG_FRAMES is how many SOURCE frames each proxy segment covers (30s at
@@ -225,23 +289,19 @@ PROXY_SEG_FRAMES :: i64(900)
 // proxy_segment_path_for writes the segment-<k> proxy path into buf (NUL
 // terminated) and returns a cstring into it, or ("", false) on overflow.
 proxy_segment_path_for :: proc(src: cstring, k: int, buf: []u8) -> (cstring, bool) {
-	src_str := string(src)
-	base := path_basename(src)
-	dir_len := len(src_str) - len(base)
-	fixed := ".neredproxy.seg"
-	tail := ".mp4"
-	n := dir_len + len(base) + len(fixed) + 4 + len(tail)
-	if n >= len(buf) {
+	off, ok := proxy_cache_prefix(buf)
+	if !ok {
 		return "", false
 	}
-	s := 0
-	for i in 0 ..< dir_len {
-		buf[s] = src_str[i]
-		s += 1
+	s, stok := proxy_stem(buf, off, src)
+	if !stok {
+		return "", false
 	}
-	for i in 0 ..< len(base) {
-		buf[s] = base[i]
-		s += 1
+	fixed := ".neredproxy.seg"
+	tail := ".mp4"
+	need := s + len(fixed) + 4 + len(tail) + 1
+	if need >= len(buf) {
+		return "", false
 	}
 	for i in 0 ..< len(fixed) {
 		buf[s] = fixed[i]
@@ -262,22 +322,17 @@ proxy_segment_path_for :: proc(src: cstring, k: int, buf: []u8) -> (cstring, boo
 
 // proxy_idx_path_for writes the segment index path into buf (NUL terminated).
 proxy_idx_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
-	src_str := string(src)
-	base := path_basename(src)
-	dir_len := len(src_str) - len(base)
-	fixed := ".neredproxy.idx"
-	n := dir_len + len(base) + len(fixed)
-	if n >= len(buf) {
+	off, ok := proxy_cache_prefix(buf)
+	if !ok {
 		return "", false
 	}
-	s := 0
-	for i in 0 ..< dir_len {
-		buf[s] = src_str[i]
-		s += 1
+	s, stok := proxy_stem(buf, off, src)
+	if !stok {
+		return "", false
 	}
-	for i in 0 ..< len(base) {
-		buf[s] = base[i]
-		s += 1
+	fixed := ".neredproxy.idx"
+	if s + len(fixed) + 1 > len(buf) {
+		return "", false
 	}
 	for i in 0 ..< len(fixed) {
 		buf[s] = fixed[i]
