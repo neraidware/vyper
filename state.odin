@@ -420,7 +420,6 @@ Preview_State :: struct {
 	playing: bool,
 }
 preview: Preview_State
-preview_has_frame: bool
 last_decoded_playhead: i64
 last_requested_playhead: i64
 

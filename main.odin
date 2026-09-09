@@ -1610,7 +1610,6 @@ main :: proc() {
 		dec_t0 := sdl.GetTicksNS()
 		update_preview_slots()
 		ui_dec_us += i64(sdl.GetTicksNS() - dec_t0)
-		any_frame := false
 		for i in 0..<MAX_PREVIEW_SLOTS {
 			slot := &preview_slots[i]
 			if !slot.in_use {
@@ -1655,11 +1654,7 @@ main :: proc() {
 			// sitting in the GPU texture from the PREVIOUS clip that owned
 			// this slot for every frame the new decode took, which is
 			// exactly the "old clip's image fighting the new one" bug.
-			if slot.has_frame {
-				any_frame = true
 			}
-		}
-		preview_has_frame = any_frame
 		// Free text textures orphaned by slot reassignment/invalidation earlier
 		// this frame (they have no device in the preview state, so they wait
 		// here where the device is).
@@ -1694,11 +1689,13 @@ main :: proc() {
 				draw_timeline_ruler(&renderer, command_buffer, pass)
 				draw_render_range(&renderer, command_buffer, pass)
 			}
-			if preview_has_frame {
-				preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox
-				draw_preview(&renderer, command_buffer, pass, preview_bounds)
-				draw_preview_hud(&renderer, command_buffer, pass, preview_bounds)
-			}
+			// The preview canvas always renders: the black canvas + any selection
+			// border/HUD paint even when no clip covers the playhead yet, and the
+			// per-clip content inside draw_preview self-gates on each slot's
+			// has_frame/texture.
+			preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox
+			draw_preview(&renderer, command_buffer, pass, preview_bounds)
+			draw_preview_hud(&renderer, command_buffer, pass, preview_bounds)
 			draw_ui_notice(&renderer, command_buffer, pass, f32(width), f32(height))
 			draw_import_progress(&renderer, command_buffer, pass, f32(width), f32(height))
 			sdl.EndGPURenderPass(pass)
