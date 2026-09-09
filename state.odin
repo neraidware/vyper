@@ -285,6 +285,13 @@ dragging_playhead: bool
 // throttle so the final position decodes exactly once.
 scrub_tick: i32
 SCRUB_DECIMATION :: 4
+// Playback catch-up: while playing, a video slot whose decode frontier has
+// fallen this many frames (or more) behind the wall-clock playhead decodes the
+// CURRENT frame instead of crawling one dropped frame per update. Dropping to
+// the playhead keeps A/V drift bounded (an all-intra proxy re-seek is one
+// keyframe); without it a slow decode frontier falls unboundedly behind and
+// video appears frozen for seconds while audio plays on its own clock.
+PLAYBACK_CATCHUP_FRAMES :: 4
 upper_area_height: f32 = 560
 resizing_areas: bool
 moving_clip: bool

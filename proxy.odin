@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 // Preview proxies.
@@ -387,6 +388,11 @@ proxy_resolver_entry :: struct {
 	src:         [4096]u8,
 	idx:         Proxy_Idx,
 	idx_valid:   bool,
+	// idx_mtime is the modification time of the .idx on-disk file at the last
+	// full read. The picker re-reads the index ONLY when this mtime changes,
+	// so playback ahead of the build no longer re-reads + re-parses the file
+	// every render frame just because the playhead sits in unbuilt territory.
+	idx_mtime:   time.Time,
 	whole_proxy: [4096]u8,
 	whole_valid: bool,
 }
@@ -430,6 +436,14 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 		if k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
 			seg, sok := proxy_segment_path_for(src, k, out_buf)
 			if sok {
+				if !os.exists(string(seg)) {
+					// The index claims this segment is built but its file is
+					// gone (external removal, or cleanup without an index
+					// write). Don't hand the decoder a doomed path that fails
+					// reopen every frame and leaves a stale face on screen:
+					// fall back to the source; a re-import/rebuild restores it.
+					return nil, 0
+				}
 				return seg, i64(k) * PROXY_SEG_FRAMES
 			}
 			return nil, 0
@@ -444,21 +458,30 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 
 	// (Re)consult the on-disk index when it may have grown past what we know
 	// (fresh import, or the worker finished more segments since the last read).
+	// The on-disk index is written ONLY by the background builder, so its mtime
+	// is a cheap, exact "did any segment complete since my last read?" gate:
+	// playback ahead of the build never re-reads/re-parses the file per frame.
 	idx_path_buf: [4096]u8
 	idx_path, idx_ok := proxy_idx_path_for(src, idx_path_buf[:])
-	if idx_ok && os.exists(string(idx_path)) && (!rc.idx_valid || k >= len(rc.idx.segs)) {
-		delete(rc.idx.segs)
-		rc.idx = {}
-		rc.idx_valid = proxy_idx_load(src, &rc.idx)
-		if nered_trace {
-			fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
-		}
-		if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
-			seg, sok := proxy_segment_path_for(src, k, out_buf)
-			if sok {
-				return seg, i64(k) * PROXY_SEG_FRAMES
+	if idx_ok && (!rc.idx_valid || k >= len(rc.idx.segs)) {
+		if info, serr := os.stat(string(idx_path), context.temp_allocator); serr == 0 && info.modification_time != rc.idx_mtime {
+			delete(rc.idx.segs)
+			rc.idx = {}
+			rc.idx_valid = proxy_idx_load(src, &rc.idx)
+			rc.idx_mtime = info.modification_time
+			if nered_trace {
+				fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
 			}
-			return nil, 0
+			if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
+				seg, sok := proxy_segment_path_for(src, k, out_buf)
+				if sok {
+					if !os.exists(string(seg)) {
+						return nil, 0
+					}
+					return seg, i64(k) * PROXY_SEG_FRAMES
+				}
+				return nil, 0
+			}
 		}
 	}
 

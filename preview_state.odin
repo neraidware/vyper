@@ -363,7 +363,22 @@ update_preview_slots :: proc() -> bool {
 			req := frame
 			if playhead.playing && playback_dir == 1 {
 				if slot.have_frontier && req > slot.frontier + 1 {
-					req = slot.frontier + 1
+					if req - slot.frontier <= PLAYBACK_CATCHUP_FRAMES {
+						// Within the drift budget: take the cheap +1 forward
+						// step (adjacent decode, no re-seek).
+						req = slot.frontier + 1
+					}
+					// Frontier fell further behind than PLAYBACK_CATCHUP_FRAMES
+					// (decode could not keep real time -- e.g. source fallback
+					// while a segment builds). Drop the intervening frames and
+					// decode the CURRENT playhead instead of crawling +1 forever:
+					// the unbounded crawl is what made video linger on a stale
+					// face for seconds while audio played on. A dropped-frame
+					// re-seek bounds A/V drift to the budget; on an all-intra
+					// proxy it is one keyframe decode, after which the frontier
+					// re-pins to the playhead and the next request is the +1
+					// forward step again. The front slot posts this to the async
+					// worker (no loop block); background slots decode it once.
 				}
 			}
 			// Scrub throttle: a drag fires many mousemoves, and dropping the
