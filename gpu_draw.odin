@@ -575,6 +575,15 @@ draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBu
 	draw_icon_in_element(renderer, command_buffer, pass, "PlayFwd", .SkipForward, playhead.playing && playback_dir == 1, 15)
 	draw_icon_in_element(renderer, command_buffer, pass, "SnapClipToPh", .SnapClipToPlayhead, snap_clips_to_playhead, 14)
 	draw_icon_in_element(renderer, command_buffer, pass, "SnapPhToClip", .SnapPlayheadToClip, snap_playhead_to_clips, 14)
+	// The Duplicate/Remove icons sit in the scrolled track-name gutters, so
+	// their clay boxes move off-window when a track scrolls out of view.
+	// render_icon draws with no scissor: clip the whole gutter-icon pass to the
+	// TracksSection viewport so off-screen gutter icons never paint over the
+	// ruler/timeline bar.
+	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	if sec.width > 0 && sec.height > 0 {
+		sdl.SetGPUScissor(pass, sdl.Rect{c.int(sec.x), c.int(sec.y), c.int(sec.width), c.int(sec.height)})
+	}
 	for ti in 0..<len(timeline.tracks) {
 		track_id := clay.ID("DuplicateTrack", u32(ti))
 		dup_color := clay.PointerOver(track_id) ? BUTTON_BORDER_HOVER : TEXT
@@ -583,6 +592,7 @@ draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBu
 		remove_color := clay.PointerOver(remove_id) ? BUTTON_BORDER_HOVER : TEXT
 		draw_icon_in_element_color(renderer, command_buffer, pass, "RemoveTrack", .RemoveTrack, remove_color, 16, u32(ti))
 	}
+	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 }
 
 draw_icon_in_element :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, element_id: string, id: Icon_Id, active: bool, size: f32, hash: ..u32) {
