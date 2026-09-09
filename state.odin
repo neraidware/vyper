@@ -414,6 +414,9 @@ Text_Input :: struct {
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.
 TI_RENAME :: 1
+// TI_PLAYHEAD is the input_type for the playhead time viewer: the committed
+// text is parsed as a timecode/seconds/frames and the playhead is sought there.
+TI_PLAYHEAD :: 2
 
 Preview_State :: struct {
 	buffer: [PREVIEW_W * PREVIEW_H * 4]u8,

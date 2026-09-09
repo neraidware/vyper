@@ -334,6 +334,122 @@ apply_rename :: proc() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Playhead time viewer: numeric timeline navigation. The timeline toolbar's
+// time badge (PlayheadTime) opens the generic text input pre-filled with the
+// current playhead timecode; on commit the typed value is parsed back into a
+// frame and the playhead is sought there (same path as scrubbing).
+// ---------------------------------------------------------------------------
+
+// playhead_timecode renders the current playhead frame as an HH:MM:SS:FF
+// timecode at the timeline's fps.
+playhead_timecode :: proc() -> string {
+	fps_i := int(timeline_fps())
+	if fps_i <= 0 {
+		fps_i = 30
+	}
+	f := playhead.frame
+	ff := f % i64(fps_i)
+	total_sec := f / i64(fps_i)
+	s := total_sec % 60
+	m := (total_sec / 60) % 60
+	h := total_sec / (60 * 60)
+	return fmt.aprintf("%02d:%02d:%02d:%02d", h, m, s, ff)
+}
+
+// begin_playhead_time_edit opens the text field pre-filled with the current
+// timecode; the committed value is parsed by apply_playhead_time.
+begin_playhead_time_edit :: proc() {
+	text_input_begin(playhead_timecode(), TI_PLAYHEAD, 0)
+}
+
+// parse_time_input converts the field text into a timeline frame. Accepted:
+//   timecodes "MM:SS:FF" ("6:30:15"), "HH:MM:SS:FF" ("1:06:30:15"),
+//   MM:SS ("5:03"),
+//   "12.5" / "12.5s" seconds (scaled by fps), "1234" raw frames.
+parse_time_input :: proc(s: string, fps: f64) -> (i64, bool) {
+	t := strings.trim_space(s)
+	if len(t) == 0 {
+		return 0, false
+	}
+	if strings.contains(t, ":") || strings.contains(t, ";") {
+		sep := ":"
+		if strings.contains(t, ";") {
+			sep = ";"
+		}
+		parts := strings.split(t, sep)
+		defer delete(parts)
+		if len(parts) < 2 || len(parts) > 4 {
+			return 0, false
+		}
+		// Fields map to (hh, mm, ss, ff) but hours only exist in the full
+		// 4-field form: 4 = HH:MM:SS:FF, 3 = MM:SS:FF, 2 = MM:SS. The frames
+		// slot is clamped below fps.
+		vals := [4]i64{}
+		shift := 0
+		if len(parts) < 4 {
+			shift = 1
+		}
+		for i in 0 ..< len(parts) {
+			p := strings.trim_space(parts[i])
+			if len(p) == 0 {
+				return 0, false
+			}
+			v, ok := strconv.parse_i64(p, 10)
+			if !ok || v < 0 {
+				return 0, false
+			}
+			vals[shift + i] = v
+		}
+		if len(parts) == 4 && vals[3] >= i64(fps) {
+			return 0, false
+		}
+		return (((vals[0] * 60 + vals[1]) * 60 + vals[2]) * i64(fps) + vals[3]), true
+	}
+	// Seconds, e.g. "12.5" or "12.5s".
+	sec_s := t
+	if sec_s[len(sec_s) - 1] == 's' || sec_s[len(sec_s) - 1] == 'S' {
+		sec_s = strings.trim_space(sec_s[:len(sec_s) - 1])
+		if len(sec_s) == 0 {
+			return 0, false
+		}
+	}
+	if strings.contains(sec_s, ".") {
+		v, ok := strconv.parse_f64(sec_s)
+		if !ok || v < 0 {
+			return 0, false
+		}
+		return i64(v * fps), true
+	}
+	// Raw frame number.
+	v, ok := strconv.parse_i64(sec_s, 10)
+	if !ok || v < 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// apply_playhead_time parses the committed time field and seeks the playhead to
+// the parsed frame (clamped to the timeline's last real frame, matching scrub).
+apply_playhead_time :: proc() {
+	fps := timeline_fps()
+	if fps <= 0 {
+		return
+	}
+	frame, ok := parse_time_input(text_input_string(), fps)
+	if !ok {
+		return
+	}
+	frame = clamp(frame, 0, max(0, timeline_duration() - 1))
+	if playhead.frame == frame {
+		return
+	}
+	playhead.frame = frame
+	audio_seek(frame)
+	sync.atomic_store(&audio_ph_src, 1)
+	sync.atomic_store(&audio_ph_catch, 0)
+}
+
 // handle_ctx_option dispatches a click on a context-menu entry. Selecting
 // Add > Text Clip creates a Text generator clip on the right-clicked track at
 // the pointer's frame; the clip-action rows (Rename/Duplicate/Delete/Link)
@@ -800,7 +916,11 @@ main :: proc() {
 					ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
 					r := text_input_handle_key(event.key.key, shift, ctrl)
 					if r == .Commit {
-						apply_rename()
+						if ti.input_type == TI_PLAYHEAD {
+							apply_playhead_time()
+						} else {
+							apply_rename()
+						}
 					} else if r == .Cancel {
 						if ti.is_create {
 							// Aborted a clip-create dialog: drop the clip that was
@@ -1188,11 +1308,10 @@ main :: proc() {
 			}
 			}
 			if !handled {
-				if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapClipToPh")) {
-					snap_clips_to_playhead = !snap_clips_to_playhead
-					handled = true
-				} else if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("SnapPhToClip")) {
-					snap_playhead_to_clips = !snap_playhead_to_clips
+				// Clicking the playhead time badge opens numeric navigation (the
+				// typed value is parsed and the playhead sought on commit).
+				if mouse_down && !was_mouse_down && clay.PointerOver(clay.ID("PlayheadTime")) {
+					begin_playhead_time_edit()
 					handled = true
 				}
 			}
