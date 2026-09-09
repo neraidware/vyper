@@ -143,18 +143,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					if clay.UI(clay.ID("TransportSpacer"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 					}) {}
-					// Playhead time viewer: the current playhead timecode as a
-					// clickable badge. Clicking it opens numeric navigation
-					// (begin_playhead_time_edit) to jump the playhead to a typed
-					// timecode / seconds / frame number.
-					if clay.UI(clay.ID("PlayheadTime"))({
-						layout = {sizing = {width = clay.SizingFixed(110), height = clay.SizingFixed(BUTTON_HEIGHT)}, padding = clay.Padding{left = 6, right = 6}, childAlignment = {x = .Center, y = .Center}},
-						backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
-						border = {color = clay.Hovered() ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
-						cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-					}) {
-						clay.Text(playhead_timecode(), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, textAlignment = .Center})
-					}
 					clay.Text(fmt.aprintf("%d / %d  ·  %gfps", playhead.frame, timeline_duration(), timeline_fps()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 				}
 			}
@@ -253,7 +241,18 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						if clay.UI(clay.ID("RulerGutter"))({
 							layout = {sizing = {width = clay.SizingFixed(GUTTER_WIDTH), height = clay.SizingGrow({})}},
 							backgroundColor = TRACK_GUTTER_BG,
-						}) {}
+						}) {
+							// Playhead time viewer: the timecode badge sits in the
+							// empty top-left corner above the track-name gutters and
+							// before the ruler. Clicking it opens numeric navigation
+							// (begin_playhead_time_edit) to jump the playhead.
+							if clay.UI(clay.ID("PlayheadTime"))({
+								layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}, childAlignment = {x = .Center, y = .Center}},
+								backgroundColor = clay.Hovered() ? BUTTON_HOVER : TRACK_GUTTER_BG,
+							}) {
+								clay.Text(playhead_timecode(), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, textAlignment = .Center})
+							}
+						}
 						if clay.UI(clay.ID("Ruler"))({
 							layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 							backgroundColor = EDITOR_BG,
