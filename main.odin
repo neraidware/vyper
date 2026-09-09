@@ -401,7 +401,8 @@ parse_time_input :: proc(s: string, fps: f64) -> (i64, bool) {
 			}
 			vals[shift + i] = v
 		}
-		if len(parts) == 4 && vals[3] >= i64(fps) {
+		// The frames field only exists in the 3- and 4-field forms.
+		if len(parts) >= 3 && vals[3] >= i64(fps) {
 			return 0, false
 		}
 		return (((vals[0] * 60 + vals[1]) * 60 + vals[2]) * i64(fps) + vals[3]), true
