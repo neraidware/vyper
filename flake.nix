@@ -13,7 +13,7 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           packages = with pkgs; [
-            odin sdl3 sdl3-ttf ffmpeg glslang vulkan-loader pkg-config clang glib.dev
+            odin sdl3 sdl3-ttf ffmpeg glslang vulkan-loader pkg-config clang glib.dev mold
             xdg-desktop-portal xdg-desktop-portal-gnome
           ];
           LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader ];
@@ -29,20 +29,24 @@
           buildInputs = [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.ffmpeg pkgs.vulkan-loader pkgs.glib ];
 buildPhase = ''
             # Odin links its static vendor archives (clay-odin, vendored
-            # stb/truetype) as -l:/abs/path namespecs. clang resolves those via
-            # the default GNU bfd linker through its absolute -B toolchain dir;
-            # inside the sandbox bfd's -l: (search -L dirs only) can't resolve
-            # those absolute paths, so the link fails with "cannot find -l:/...".
-            # Using gold as the linker (-fuse-ld=gold) resolves absolute -l:
-            # namespecs against the -L search paths (odin emits -L/), which fixes
-            # the link inside the sandbox.
+            # stb/truetype) as -l:/abs/path GNU "namespec" arguments. The mold
+            # manpage documents plain `-l libname` only -- it has no reference
+            # to the GNU -l:filename namespec extension, and no default search
+            # paths ("Unlike the GNU linkers, mold does not have default search
+            # paths"). In practice mold/lld both fail to resolve odin's absolute
+            # -l: namespecs inside the nix sandbox ("library not found: :/...").
+            # gold (GNU binutils) resolves them, so the packaged build uses gold.
+            # The dev shell keeps mold for everyday local builds.
             glslangValidator -V shaders/rounded_rect.vert -o shaders/rounded_rect.vert.spv
             glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
             glslangValidator -V shaders/text.vert -o shaders/text.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
-            odin build . -out:nered -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
+            odin build . -out:nered \
+              -microarch:native -o:aggressive -no-bounds-check \
+              -vet-style -vet-semicolon \
+              -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
           '';
           # The binary is linked against SDL3/SDL3_ttf/vulkan-loader + the
           # ffmpeg libs and shells out to ffmpeg for proxy transcode, so it
