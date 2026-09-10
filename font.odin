@@ -1,9 +1,9 @@
 package main
 
+import clay "clay-odin"
 import "core:fmt"
 import "core:os"
 import "core:strings"
-import clay "clay-odin"
 
 // ---------------------------------------------------------------------------
 // Font loading (via fontconfig) and Clay text-measurement/error callbacks.
@@ -26,15 +26,23 @@ system_font_path: [1024]byte
 
 system_monospace_font :: proc() -> cstring {
 	when ODIN_OS == .Windows {
-		// Windows ships Consolas in %SystemRoot%\Fonts on every install; use it
-		// directly (no fontconfig on Windows).
-		computed := "C:\\Windows\\Fonts\\consola.ttf"
+		// No fontconfig on Windows: prefer Noto Sans if present, else Segoe UI
+		// (the default sans face that ships with every install).
+		noto := "C:\\Windows\\Fonts\\NotoSans-Regular.ttf"
+		if os.exists(noto) {
+			n := copy(system_font_path[:], noto)
+			system_font_path[n] = 0
+			return cstring(&system_font_path[0])
+		}
+		computed := "C:\\Windows\\Fonts\\segoeui.ttf"
 		n := copy(system_font_path[:], computed)
 		system_font_path[n] = 0
 		return cstring(&system_font_path[0])
 	} else {
-		// Ask Fontconfig for configured monospace family instead of hard-coding font.
-		out, _, okin := run_capture({"fc-match", "-f", "%{file}", "monospace"})
+		// Ask Fontconfig for Noto Sans (the editor UI + title/subtitle clips),
+		// instead of hard-coding a path. fc-match aliases "Noto Sans" and falls
+		// back to the nearest configured sans when it is not installed.
+		out, _, okin := run_capture({"fc-match", "-f", "%{file}", "Noto Sans"})
 		defer delete(out)
 		if okin && len(out) > 0 {
 			n := copy(system_font_path[:], strings.trim_space(out))
@@ -43,7 +51,7 @@ system_monospace_font :: proc() -> cstring {
 				return cstring(&system_font_path[0])
 			}
 		}
-		return "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+		return "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
 	}
 }
 

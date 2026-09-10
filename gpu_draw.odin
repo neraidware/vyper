@@ -1,9 +1,9 @@
 package main
 
+import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:sync"
-import clay "clay-odin"
 import sdl "vendor:sdl3"
 import stb "vendor:stb/truetype"
 
@@ -16,7 +16,11 @@ import stb "vendor:stb/truetype"
 // plus the vertical playhead line that runs from the ruler bar down through
 // every track row. The ruler strip itself is a Clay element ("Ruler"); this
 // proc only adds the detail Clay can't lay out cheaply.
-draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+draw_timeline_ruler :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
 	if len(timeline.tracks) == 0 {
 		return
 	}
@@ -29,8 +33,19 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	// playhead handle can't render over the track-name gutter or off the right
 	// edge. Vertically the scissor spans the whole window since the playhead
 	// line runs down through every track row.
-	sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), c.int(ruler.y - 8), c.int(ruler.width), c.int(renderer.viewport.y)})
-	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect {
+			c.int(ruler.x),
+			c.int(ruler.y - 8),
+			c.int(ruler.width),
+			c.int(renderer.viewport.y),
+		},
+	)
+	defer sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+	)
 	dur := timeline_duration()
 	// Adapt the tick spacing to the current zoom so labels stay ~70px apart.
 	major := nice_frame_step(timeline_zoom)
@@ -50,15 +65,37 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 		}
 		is_major := f % major == 0
 		tick_h := is_major ? major_h : minor_h
-		render_sdf_rect(renderer, command_buffer, pass, {x, ruler.y + ruler.height - tick_h, is_major ? 2 : 1, tick_h}, RULER_TICK_COLOR, 0, 0)
+		render_sdf_rect(
+			renderer,
+			command_buffer,
+			pass,
+			{x, ruler.y + ruler.height - tick_h, is_major ? 2 : 1, tick_h},
+			RULER_TICK_COLOR,
+			0,
+			0,
+		)
 		// Frame label above each major tick.
 		if is_major {
 			label_buf: [20]u8
 			label := fmt.bprintf(label_buf[:], "%d", f)
 			chars := ([^]c.char)(raw_data(label))
-			slice := clay.StringSlice{length = c.int32_t(len(label)), chars = chars, baseChars = chars}
-			text_data := clay.TextRenderData{stringContents = slice, textColor = RULER_LABEL_COLOR, fontSize = FONT_RULER, lineHeight = FONT_RULER}
-			text_bounds := clay.BoundingBox{x = x + 3, y = ruler.y + 3, width = 64, height = 13}
+			slice := clay.StringSlice {
+				length    = c.int32_t(len(label)),
+				chars     = chars,
+				baseChars = chars,
+			}
+			text_data := clay.TextRenderData {
+				stringContents = slice,
+				textColor      = RULER_LABEL_COLOR,
+				fontSize       = FONT_RULER,
+				lineHeight     = FONT_RULER,
+			}
+			text_bounds := clay.BoundingBox {
+				x      = x + 3,
+				y      = ruler.y + 3,
+				width  = 64,
+				height = 13,
+			}
 			render_text(renderer, command_buffer, pass, text_bounds, text_data)
 		}
 	}
@@ -68,8 +105,24 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	line_x := ruler.x + (f32(playhead.frame) - timeline_view_start) * timeline_zoom
 	tracks := clay.GetElementData(clay.ID("TracksSection")).boundingBox
 	line_bottom := ruler.y + RULER_HEIGHT + tracks.height
-	render_sdf_rect(renderer, command_buffer, pass, {line_x, ruler.y, 2, line_bottom - ruler.y}, BUTTON_BORDER_HOVER, 0, 0)
-	render_sdf_rect(renderer, command_buffer, pass, {line_x - 4, ruler.y - 4, 10, 10}, BUTTON_BORDER_HOVER, 2, 0)
+	render_sdf_rect(
+		renderer,
+		command_buffer,
+		pass,
+		{line_x, ruler.y, 2, line_bottom - ruler.y},
+		BUTTON_BORDER_HOVER,
+		0,
+		0,
+	)
+	render_sdf_rect(
+		renderer,
+		command_buffer,
+		pass,
+		{line_x - 4, ruler.y - 4, 10, 10},
+		BUTTON_BORDER_HOVER,
+		2,
+		0,
+	)
 }
 
 // draw_render_range draws the project render range as a band sitting just below
@@ -77,7 +130,11 @@ draw_timeline_ruler :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 // set and ordered). Each boundary also gets a cap marker, drawn independently:
 // with only one boundary set its cap still appears so the I/O placement stays
 // visible. Only the part inside the ruler's width is drawn.
-draw_render_range :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+draw_render_range :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
 	if len(timeline.tracks) == 0 || (project.start_frame < 0 && project.end_frame < 0) {
 		return
 	}
@@ -87,18 +144,34 @@ draw_render_range :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	}
 	// The band and its edge caps can stick out over the gutter when the range
 	// starts before the current view; keep them inside the ruler bar's width.
-	sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), 0, c.int(ruler.width), c.int(renderer.viewport.y)})
-	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{c.int(ruler.x), 0, c.int(ruler.width), c.int(renderer.viewport.y)},
+	)
+	defer sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+	)
 	y := ruler.y + ruler.height
 	isect := ruler.x + ruler.width
-	if project.start_frame >= 0 && project.end_frame >= 0 && project.start_frame < project.end_frame {
+	if project.start_frame >= 0 &&
+	   project.end_frame >= 0 &&
+	   project.start_frame < project.end_frame {
 		x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
 		x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
 		if x2 > ruler.x && x1 < isect {
 			band_x := max(x1, ruler.x)
 			band_w := min(x2, isect) - band_x
 			if band_w > 0 {
-				render_sdf_rect(renderer, command_buffer, pass, {band_x, y, band_w, 4}, RANGE_COLOR, 0, 0)
+				render_sdf_rect(
+					renderer,
+					command_buffer,
+					pass,
+					{band_x, y, band_w, 4},
+					RANGE_COLOR,
+					0,
+					0,
+				)
 			}
 		}
 	}
@@ -137,7 +210,17 @@ nice_frame_step :: proc(zoom: f32) -> i64 {
 	}
 }
 
-render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, commands: clay.ClayArray(clay.RenderCommand)) {
+// render_clay draws every clay command whose zIndex is in [min_z, max_z).
+// The context menu / dropdown / help / modal popups are drawn in a second
+// pass (frame.odin interleaves the preview canvas between the two) so the
+// preview never overpaints a floating overlay.
+render_clay :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	commands: clay.ClayArray(clay.RenderCommand),
+	min_z, max_z: i16,
+) {
 	array := commands
 	full := sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)}
 	defer sdl.SetGPUScissor(pass, full)
@@ -148,18 +231,27 @@ render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuff
 	// collapsed to nothing. Without this handling, scrolled clip tiles are
 	// drawn un-clipped over the track-name gutter and neighboring rows, which
 	// reads as the tracks moving around when panning.
-	stack: [16]struct { current: sdl.Rect, suppressed: bool }
+	stack: [16]struct {
+		current:    sdl.Rect,
+		suppressed: bool,
+	}
 	depth := 0
 	current := full
 	suppressed := false
-	for i in 0..<commands.length {
+	for i in 0 ..< commands.length {
 		command := clay.RenderCommandArray_Get(&array, i)
 		bounds := command.boundingBox
+		if command.zIndex < min_z || command.zIndex >= max_z {
+			continue
+		}
 
 		#partial switch command.commandType {
 		case .ScissorStart:
 			if depth < len(stack) {
-				stack[depth] = {current = current, suppressed = suppressed}
+				stack[depth] = {
+					current    = current,
+					suppressed = suppressed,
+				}
 				depth += 1
 			}
 			if !suppressed {
@@ -184,19 +276,37 @@ render_clay :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuff
 			if !suppressed {
 				config := command.renderData.rectangle
 				color := config.backgroundColor
-				if command.id == clay.ID("OpenFileButton").id && clay.PointerOver(clay.ID("OpenFileButton")) {
+				if command.id == clay.ID("OpenFileButton").id &&
+				   clay.PointerOver(clay.ID("OpenFileButton")) {
 					color = BUTTON_HOVER
 				}
-				render_sdf_rect(renderer, command_buffer, pass, bounds, color, config.cornerRadius.topLeft, 0)
+				render_sdf_rect(
+					renderer,
+					command_buffer,
+					pass,
+					bounds,
+					color,
+					config.cornerRadius.topLeft,
+					0,
+				)
 			}
 		case .Border:
 			if !suppressed {
 				config := command.renderData.border
 				color := config.color
-				if command.id == clay.ID("OpenFileButton").id && clay.PointerOver(clay.ID("OpenFileButton")) {
+				if command.id == clay.ID("OpenFileButton").id &&
+				   clay.PointerOver(clay.ID("OpenFileButton")) {
 					color = BUTTON_BORDER_HOVER
 				}
-				render_sdf_rect(renderer, command_buffer, pass, bounds, color, config.cornerRadius.topLeft, f32(config.width.left))
+				render_sdf_rect(
+					renderer,
+					command_buffer,
+					pass,
+					bounds,
+					color,
+					config.cornerRadius.topLeft,
+					f32(config.width.left),
+				)
 			}
 		case .Text:
 			if !suppressed {
@@ -217,10 +327,14 @@ scissor_intersect :: proc(bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect 
 
 // draw_text_input_caret paints the text-input field's selection highlight and
 // blinking caret as an overlay (after Clay) because caret alignment depends on
-// the laid-out field box and per-character advance. The field font is the
-// monospace app font, so advance is a constant per codepoint (matching the
-// measure function).
-draw_text_input_caret :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+// the laid-out field box and per-character advance. Advances come from the
+// baked glyph quads (actual variable-width advance of the current face), so the
+// caret tracks the real text geometry under a proportional font.
+draw_text_input_caret :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
 	if !ti.active {
 		return
 	}
@@ -229,27 +343,86 @@ draw_text_input_caret :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 		return
 	}
 	field_size: f32 = f32(TEXT_INPUT_FONT)
-	adv := f32(0.55) * field_size
+	scale := field_size / 32.0
 	text_x := box.x + CARD_GAP // matches the field's left padding
 	sm, lg := text_input_sel()
 	if sm != lg {
-		x0 := text_x + f32(text_input_codepoints_before(sm)) * adv
-		x1 := text_x + f32(text_input_codepoints_before(lg)) * adv
-		render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = x0, y = box.y + 4, width = max(2, x1 - x0), height = box.height - 8}, clay.Color{56, 90, 170, 170}, 2, 0)
+		x0 := text_x + input_advance_up_to(renderer, sm, scale)
+		x1 := text_x + input_advance_up_to(renderer, lg, scale)
+		render_sdf_rect(
+			renderer,
+			command_buffer,
+			pass,
+			clay.BoundingBox {
+				x = x0,
+				y = box.y + 4,
+				width = max(2, x1 - x0),
+				height = box.height - 8,
+			},
+			clay.Color{56, 90, 170, 170},
+			2,
+			0,
+		)
 	}
 	// Blinking caret.
 	blink := (sdl.GetTicks() / 500) % 2 == 0
 	if blink {
-		cx := text_x + f32(text_input_codepoints_before(ti.cursor)) * adv
-		render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = cx, y = box.y + 4, width = 2, height = box.height - 8}, BUTTON_BORDER_HOVER, 0, 0)
+		cx := text_x + input_advance_up_to(renderer, ti.cursor, scale)
+		render_sdf_rect(
+			renderer,
+			command_buffer,
+			pass,
+			clay.BoundingBox{x = cx, y = box.y + 4, width = 2, height = box.height - 8},
+			BUTTON_BORDER_HOVER,
+			0,
+			0,
+		)
 	}
+}
+
+// input_advance_up_to returns the laid-out width of the text-input string up to
+// byte offset `at`, mirroring render_text's per-glyph baked-quad accumulation
+// (same scale, same skip rules). This is what keeps the caret/selection on top
+// of the actual glyph geometry for a variable-width font.
+input_advance_up_to :: proc(renderer: ^GPU_Renderer, at: int, scale: f32) -> f32 {
+	x: f32 = 0
+	txt := text_input_string()
+	for i := 0; i < at && i < len(txt); i += 1 {
+		code := u8(txt[i])
+		if code == '\n' {
+			x = 0
+			continue
+		}
+		if code < 32 || code > 126 {
+			continue
+		}
+		px := x
+		py: f32 = 32
+		quad: stb.aligned_quad
+		stb.GetBakedQuad(
+			&renderer.font.chars[0],
+			512,
+			512,
+			c.int(code - 32),
+			&px,
+			&py,
+			&quad,
+			false,
+		)
+		x = px
+	}
+	return x * scale
 }
 
 // draw_timeline_resize_focus paints a thin accent bar on the hovered (or
 // actively dragged) duration edge of the selected clip, making the edge-grab
 // area visible. Drawn as an overlay after Clay because a clip element's laid-out
 // box is only available via GetElementData.
-draw_timeline_resize_focus :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+draw_timeline_resize_focus :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
 	_, cl, ok := selected_clip()
 	if !ok {
 		return
@@ -279,12 +452,34 @@ draw_timeline_resize_focus :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl
 			if &track.clips[index] != cl {
 				continue
 			}
-			box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
+			box :=
+				clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
 			color := BUTTON_BORDER_HOVER
 			if edge == 0 {
-				render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = box.x, y = box.y, width = 3, height = box.height}, color, 0, 0)
+				render_sdf_rect(
+					renderer,
+					command_buffer,
+					pass,
+					clay.BoundingBox{x = box.x, y = box.y, width = 3, height = box.height},
+					color,
+					0,
+					0,
+				)
 			} else {
-				render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = box.x + box.width - 3, y = box.y, width = 3, height = box.height}, color, 0, 0)
+				render_sdf_rect(
+					renderer,
+					command_buffer,
+					pass,
+					clay.BoundingBox {
+						x = box.x + box.width - 3,
+						y = box.y,
+						width = 3,
+						height = box.height,
+					},
+					color,
+					0,
+					0,
+				)
 			}
 			return
 		}
@@ -299,7 +494,11 @@ draw_timeline_resize_focus :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl
 // empty strip directly above the tile. Drawn as an overlay after the Clay
 // command batch because a clip element's final laid-out position is only
 // available via GetElementData.
-draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+draw_clip_markers :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
 	if len(timeline.tracks) == 0 {
 		return
 	}
@@ -317,14 +516,18 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 	for track, track_idx in timeline.tracks {
 		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
 		if lane.width > 0 && lane.height > 0 {
-			sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
+			sdl.SetGPUScissor(
+				pass,
+				sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+			)
 			restore_full = true
 		}
 		for clip, index in track.clips {
 			if len(clip.markers) == 0 {
 				continue
 			}
-			box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
+			box :=
+				clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
 			if box.width <= 0 || box.height <= 0 {
 				continue
 			}
@@ -338,15 +541,35 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 			}
 			rows := [3]f32{5, 3, 1}
 			for m in clip.markers {
-				line_x := clamp(box.x + f32(m.source_frame - clip.source_start_frame) * timeline_zoom, box.x, box.x + box.width)
+				line_x := clamp(
+					box.x + f32(m.source_frame - clip.source_start_frame) * timeline_zoom,
+					box.x,
+					box.x + box.width,
+				)
 				// Thin vertical line from just below the triangle to the tile bottom.
-				render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = line_x - 1, y = box.y, width = 2, height = box.height}, color, 0, 0)
+				render_sdf_rect(
+					renderer,
+					command_buffer,
+					pass,
+					clay.BoundingBox{x = line_x - 1, y = box.y, width = 2, height = box.height},
+					color,
+					0,
+					0,
+				)
 				// Downward-pointing triangle at the tile's top, at the marker's x.
 				y := box.y
 				for row, r in rows {
 					w := rows[r]
 					bx := clamp(line_x - w * 0.5, box.x, box.x + box.width - w)
-					render_sdf_rect(renderer, command_buffer, pass, clay.BoundingBox{x = bx, y = y, width = w, height = 3}, color, 0, 0)
+					render_sdf_rect(
+						renderer,
+						command_buffer,
+						pass,
+						clay.BoundingBox{x = bx, y = y, width = w, height = 3},
+						color,
+						0,
+						0,
+					)
 					y += 3
 				}
 				// Hover hit box: the marker's column near the top of the tile.
@@ -361,7 +584,10 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 			}
 		}
 		if restore_full {
-			sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+			sdl.SetGPUScissor(
+				pass,
+				sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+			)
 			restore_full = false
 		}
 	}
@@ -374,7 +600,11 @@ draw_clip_markers :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComma
 // onto another track: a ghost tile in the hovered lane at the nearest
 // non-overlapping slot. Same width as the dragged clip, positioned from
 // drag_ghost_start like regular clips (frame * zoom offset by the view).
-draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
+draw_drag_ghost :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
 	if !moving_clip || drag_clip == nil {
 		return
 	}
@@ -385,9 +615,9 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 		return
 	}
 	// Linked group: paint a ghost for every member in its destination lane at the
-// mouse-aligned position (m.start + drag_group_delta), so the whole unit
-// slides with the drag. If any member can't land at that exact spot on its
-// destination lane the drop is refused, shown red.
+	// mouse-aligned position (m.start + drag_group_delta), so the whole unit
+	// slides with the drag. If any member can't land at that exact spot on its
+	// destination lane the drop is refused, shown red.
 	if len(drag_group_orig) > 1 {
 		track_delta := drag_hover_track - drag_source_track
 		refused := !group_vertical_feasible(track_delta, drag_group_delta)
@@ -403,18 +633,29 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 			start := max(m.start + drag_group_delta, 0)
 			x0 := lane.x + (f32(start) - timeline_view_start) * timeline_zoom
 			w := f32(m.length) * timeline_zoom
-			bounds := clay.BoundingBox{x = x0, y = lane.y, width = w, height = CLIP_TILE_HEIGHT}
+			bounds := clay.BoundingBox {
+				x      = x0,
+				y      = lane.y,
+				width  = w,
+				height = CLIP_TILE_HEIGHT,
+			}
 			fill := clay.Color{140, 200, 255, 80}
 			edge := clay.Color{140, 200, 255, 220}
 			if refused {
 				fill = clay.Color{255, 70, 70, 80}
 				edge = clay.Color{255, 70, 70, 230}
 			}
-			sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
+			sdl.SetGPUScissor(
+				pass,
+				sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+			)
 			render_sdf_rect(renderer, command_buffer, pass, bounds, fill, 6, 0)
 			render_sdf_rect(renderer, command_buffer, pass, bounds, edge, 6, 2)
 		}
-		sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+		sdl.SetGPUScissor(
+			pass,
+			sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+		)
 		return
 	}
 	clip_len := drag_clip.source_length_frames
@@ -424,7 +665,12 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	// The nearest valid non-overlap slot may differ per frame (it follows the
 	// mouse during the drag), but the ghost must never hide an overlap it would
 	// cause: clamp once more against the hovered track's live content.
-	placed := clip_place_in_track(&timeline.tracks[drag_hover_track], -1, clip_len, drag_ghost_start)
+	placed := clip_place_in_track(
+		&timeline.tracks[drag_hover_track],
+		-1,
+		clip_len,
+		drag_ghost_start,
+	)
 	lane := clay.GetElementData(clay.ID("ClipsSection", u32(drag_hover_track))).boundingBox
 	if lane.width <= 0 || lane.height <= 0 {
 		return
@@ -434,9 +680,17 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 	w := f32(clip_len) * timeline_zoom
 	// Ghost tile height matches real clips (CLIP_TILE_HEIGHT, same as the layout).
 	h := CLIP_TILE_HEIGHT
-	bounds := clay.BoundingBox{x = x0, y = lane.y, width = w, height = h}
+	bounds := clay.BoundingBox {
+		x      = x0,
+		y      = lane.y,
+		width  = w,
+		height = h,
+	}
 	// Keep the ghost inside the lane (semi-transparent fill + strong border).
-	sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)})
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+	)
 	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 80}, 6, 0)
 	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 220}, 6, 2)
 	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
@@ -444,29 +698,67 @@ draw_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 
 // draw_marker_tooltip draws a small pill with the marker's label centered on
 // the marker's x position inside the reserved strip above the timeline rows.
-draw_marker_tooltip :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, label: string, at_x: f32, strip: clay.BoundingBox) {
+draw_marker_tooltip :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	label: string,
+	at_x: f32,
+	strip: clay.BoundingBox,
+) {
 	// The strip spans the full tracks area including the name gutter; pin the
 	// pill to the clip-lane region so it can't drift over the headers.
 	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
 	if ruler.width > 0 {
-		sdl.SetGPUScissor(pass, sdl.Rect{c.int(ruler.x), c.int(ruler.y - 8), c.int(ruler.width), c.int(renderer.viewport.y)})
-		defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+		sdl.SetGPUScissor(
+			pass,
+			sdl.Rect {
+				c.int(ruler.x),
+				c.int(ruler.y - 8),
+				c.int(ruler.width),
+				c.int(renderer.viewport.y),
+			},
+		)
+		defer sdl.SetGPUScissor(
+			pass,
+			sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+		)
 	}
 	font_size: f32 = FONT_TOOLTIP
 	text_w := f32(len(label)) * font_size * 0.6
 	text_x := clamp(at_x - text_w * 0.5, strip.x + 4, strip.x + strip.width - text_w - 4)
-	pill := clay.BoundingBox{x = text_x - 4, y = strip.y + 2, width = text_w + 8, height = 14}
+	pill := clay.BoundingBox {
+		x      = text_x - 4,
+		y      = strip.y + 2,
+		width  = text_w + 8,
+		height = 14,
+	}
 	render_sdf_rect(renderer, command_buffer, pass, pill, TOOLTIP_BG, 3, 0)
-	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = text_x, y = pill.y + 1, width = text_w, height = 12}, clay.TextRenderData{
-		stringContents = clay.StringSlice{length = c.int32_t(len(label)), chars = ([^]c.char)(raw_data(label))},
-		textColor = TOOLTIP_TEXT,
-		fontSize = FONT_TOOLTIP,
-		letterSpacing = 1,
-		lineHeight = FONT_TOOLTIP,
-	})
+	render_text(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox{x = text_x, y = pill.y + 1, width = text_w, height = 12},
+		clay.TextRenderData {
+			stringContents = clay.StringSlice {
+				length = c.int32_t(len(label)),
+				chars = ([^]c.char)(raw_data(label)),
+			},
+			textColor = TOOLTIP_TEXT,
+			fontSize = FONT_TOOLTIP,
+			letterSpacing = 1,
+			lineHeight = FONT_TOOLTIP,
+		},
+	)
 }
 
-render_text :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox, text: clay.TextRenderData) {
+render_text :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	bounds: clay.BoundingBox,
+	text: clay.TextRenderData,
+) {
 	if renderer.font.texture == nil || renderer.text_pipeline == nil {
 		return
 	}
@@ -481,9 +773,12 @@ render_text :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuff
 		line_height = f32(text.fontSize)
 	}
 	sdl.BindGPUGraphicsPipeline(pass, renderer.text_pipeline)
-	binding := sdl.GPUTextureSamplerBinding{texture = renderer.font.texture, sampler = renderer.font.sampler}
+	binding := sdl.GPUTextureSamplerBinding {
+		texture = renderer.font.texture,
+		sampler = renderer.font.sampler,
+	}
 	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-	for i in 0..<text.stringContents.length {
+	for i in 0 ..< text.stringContents.length {
 		code := u8(text.stringContents.chars[i])
 		if code == '\n' {
 			x = 0
@@ -494,34 +789,87 @@ render_text :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuff
 			continue
 		}
 		quad: stb.aligned_quad
-		stb.GetBakedQuad(&renderer.font.chars[0], 512, 512, c.int(code - 32), &x, &baseline, &quad, false)
-		quad_bounds := clay.BoundingBox{x = bounds.x + quad.x0 * scale, y = bounds.y + quad.y0 * scale, width = (quad.x1 - quad.x0) * scale, height = (quad.y1 - quad.y0) * scale}
-		vertex_uniforms := TextVertexUniforms{
-			bounds = {quad_bounds.x, quad_bounds.y, quad_bounds.width, quad_bounds.height},
+		stb.GetBakedQuad(
+			&renderer.font.chars[0],
+			512,
+			512,
+			c.int(code - 32),
+			&x,
+			&baseline,
+			&quad,
+			false,
+		)
+		quad_bounds := clay.BoundingBox {
+			x      = bounds.x + quad.x0 * scale,
+			y      = bounds.y + quad.y0 * scale,
+			width  = (quad.x1 - quad.x0) * scale,
+			height = (quad.y1 - quad.y0) * scale,
+		}
+		vertex_uniforms := TextVertexUniforms {
+			bounds   = {quad_bounds.x, quad_bounds.y, quad_bounds.width, quad_bounds.height},
 			viewport = renderer.viewport,
 			_padding = {},
-			uv = {quad.s0, quad.t0, quad.s1, quad.t1},
+			uv       = {quad.s0, quad.t0, quad.s1, quad.t1},
 		}
 		color := text.textColor
-		fragment_uniforms := TextFragmentUniforms{color = {f32(color[0]) / 255, f32(color[1]) / 255, f32(color[2]) / 255, f32(color[3]) / 255}}
-		sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
-		sdl.PushGPUFragmentUniformData(command_buffer, 0, &fragment_uniforms, sdl.Uint32(size_of(fragment_uniforms)))
+		fragment_uniforms := TextFragmentUniforms {
+			color = {
+				f32(color[0]) / 255,
+				f32(color[1]) / 255,
+				f32(color[2]) / 255,
+				f32(color[3]) / 255,
+			},
+		}
+		sdl.PushGPUVertexUniformData(
+			command_buffer,
+			0,
+			&vertex_uniforms,
+			sdl.Uint32(size_of(vertex_uniforms)),
+		)
+		sdl.PushGPUFragmentUniformData(
+			command_buffer,
+			0,
+			&fragment_uniforms,
+			sdl.Uint32(size_of(fragment_uniforms)),
+		)
 		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 		x += f32(text.letterSpacing) / scale
 	}
 }
 
-render_sdf_rect :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox, color: clay.Color, radius, border: f32) {
-	vertex_uniforms := RectVertexUniforms{
-		bounds = {bounds.x, bounds.y, bounds.width, bounds.height},
+render_sdf_rect :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	bounds: clay.BoundingBox,
+	color: clay.Color,
+	radius, border: f32,
+) {
+	vertex_uniforms := RectVertexUniforms {
+		bounds   = {bounds.x, bounds.y, bounds.width, bounds.height},
 		viewport = renderer.viewport,
 	}
-	fragment_uniforms := RectFragmentUniforms{
-		color = {f32(color[0]) / 255, f32(color[1]) / 255, f32(color[2]) / 255, f32(color[3]) / 255},
+	fragment_uniforms := RectFragmentUniforms {
+		color = {
+			f32(color[0]) / 255,
+			f32(color[1]) / 255,
+			f32(color[2]) / 255,
+			f32(color[3]) / 255,
+		},
 		shape = {bounds.width, bounds.height, radius, border},
 	}
-	sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
-	sdl.PushGPUFragmentUniformData(command_buffer, 0, &fragment_uniforms, sdl.Uint32(size_of(fragment_uniforms)))
+	sdl.PushGPUVertexUniformData(
+		command_buffer,
+		0,
+		&vertex_uniforms,
+		sdl.Uint32(size_of(vertex_uniforms)),
+	)
+	sdl.PushGPUFragmentUniformData(
+		command_buffer,
+		0,
+		&fragment_uniforms,
+		sdl.Uint32(size_of(fragment_uniforms)),
+	)
 	sdl.BindGPUGraphicsPipeline(pass, renderer.pipeline)
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
@@ -529,22 +877,49 @@ render_sdf_rect :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommand
 // render_icon draws one rasterized SVG icon through the text pipeline: the
 // icon texture's R channel is the alpha mask, tinted by `color`. The texture
 // covers the full [0,1] uv range (one icon per texture).
-render_icon :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox, id: Icon_Id, color: clay.Color) {
+render_icon :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	bounds: clay.BoundingBox,
+	id: Icon_Id,
+	color: clay.Color,
+) {
 	if renderer.icon_textures[id] == nil || renderer.text_pipeline == nil {
 		return
 	}
 	sdl.BindGPUGraphicsPipeline(pass, renderer.text_pipeline)
-	binding := sdl.GPUTextureSamplerBinding{texture = renderer.icon_textures[id], sampler = renderer.preview_sampler}
+	binding := sdl.GPUTextureSamplerBinding {
+		texture = renderer.icon_textures[id],
+		sampler = renderer.preview_sampler,
+	}
 	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-	vertex_uniforms := TextVertexUniforms{
-		bounds = {bounds.x, bounds.y, bounds.width, bounds.height},
+	vertex_uniforms := TextVertexUniforms {
+		bounds   = {bounds.x, bounds.y, bounds.width, bounds.height},
 		viewport = renderer.viewport,
 		_padding = {},
-		uv = {0, 0, 1, 1},
+		uv       = {0, 0, 1, 1},
 	}
-	fragment_uniforms := TextFragmentUniforms{color = {f32(color[0]) / 255, f32(color[1]) / 255, f32(color[2]) / 255, f32(color[3]) / 255}}
-	sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
-	sdl.PushGPUFragmentUniformData(command_buffer, 0, &fragment_uniforms, sdl.Uint32(size_of(fragment_uniforms)))
+	fragment_uniforms := TextFragmentUniforms {
+		color = {
+			f32(color[0]) / 255,
+			f32(color[1]) / 255,
+			f32(color[2]) / 255,
+			f32(color[3]) / 255,
+		},
+	}
+	sdl.PushGPUVertexUniformData(
+		command_buffer,
+		0,
+		&vertex_uniforms,
+		sdl.Uint32(size_of(vertex_uniforms)),
+	)
+	sdl.PushGPUFragmentUniformData(
+		command_buffer,
+		0,
+		&fragment_uniforms,
+		sdl.Uint32(size_of(fragment_uniforms)),
+	)
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
 
@@ -562,7 +937,13 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 		return {}, false
 	}
 	b := data.boundingBox
-	return clay.BoundingBox{x = b.x + (b.width - size) / 2, y = b.y + (b.height - size) / 2, width = size, height = size}, true
+	return clay.BoundingBox {
+			x = b.x + (b.width - size) / 2,
+			y = b.y + (b.height - size) / 2,
+			width = size,
+			height = size,
+		},
+		true
 }
 
 // draw_ui_icons overlays the vector icons for the duplicate/remove-track, jog
@@ -570,11 +951,47 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 // unchanged; only the visuals move from baked glyphs to embedded icons. Active
 // toggles and the highlighted jog direction tint brighter, mirroring the text
 // labels they replace.
-draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
-	draw_icon_in_element(renderer, command_buffer, pass, "PlayBack", .SkipBack, playhead.playing && playback_dir == -1, 15)
-	draw_icon_in_element(renderer, command_buffer, pass, "PlayFwd", .SkipForward, playhead.playing && playback_dir == 1, 15)
-	draw_icon_in_element(renderer, command_buffer, pass, "SnapClipToPh", .SnapClipToPlayhead, snap_clips_to_playhead, 14)
-	draw_icon_in_element(renderer, command_buffer, pass, "SnapPhToClip", .SnapPlayheadToClip, snap_playhead_to_clips, 14)
+draw_ui_icons :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"PlayBack",
+		.SkipBack,
+		playhead.playing && playback_dir == -1,
+		15,
+	)
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"PlayFwd",
+		.SkipForward,
+		playhead.playing && playback_dir == 1,
+		15,
+	)
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"SnapClipToPh",
+		.SnapClipToPlayhead,
+		snap_clips_to_playhead,
+		14,
+	)
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"SnapPhToClip",
+		.SnapPlayheadToClip,
+		snap_playhead_to_clips,
+		14,
+	)
 	// The Duplicate/Remove icons sit in the scrolled track-name gutters, so
 	// their clay boxes move off-window when a track scrolls out of view.
 	// render_icon draws with no scissor: clip the whole gutter-icon pass to the
@@ -582,25 +999,64 @@ draw_ui_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBu
 	// ruler/timeline bar.
 	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
 	if sec.width > 0 && sec.height > 0 {
-		sdl.SetGPUScissor(pass, sdl.Rect{c.int(sec.x), c.int(sec.y), c.int(sec.width), c.int(sec.height)})
+		sdl.SetGPUScissor(
+			pass,
+			sdl.Rect{c.int(sec.x), c.int(sec.y), c.int(sec.width), c.int(sec.height)},
+		)
 	}
-	for ti in 0..<len(timeline.tracks) {
+	for ti in 0 ..< len(timeline.tracks) {
 		track_id := clay.ID("DuplicateTrack", u32(ti))
 		dup_color := clay.PointerOver(track_id) ? BUTTON_BORDER_HOVER : TEXT
-		draw_icon_in_element_color(renderer, command_buffer, pass, "DuplicateTrack", .Duplicate, dup_color, 16, u32(ti))
+		draw_icon_in_element_color(
+			renderer,
+			command_buffer,
+			pass,
+			"DuplicateTrack",
+			.Duplicate,
+			dup_color,
+			16,
+			u32(ti),
+		)
 		remove_id := clay.ID("RemoveTrack", u32(ti))
 		remove_color := clay.PointerOver(remove_id) ? BUTTON_BORDER_HOVER : TEXT
-		draw_icon_in_element_color(renderer, command_buffer, pass, "RemoveTrack", .RemoveTrack, remove_color, 16, u32(ti))
+		draw_icon_in_element_color(
+			renderer,
+			command_buffer,
+			pass,
+			"RemoveTrack",
+			.RemoveTrack,
+			remove_color,
+			16,
+			u32(ti),
+		)
 	}
 	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 }
 
-draw_icon_in_element :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, element_id: string, id: Icon_Id, active: bool, size: f32, hash: ..u32) {
+draw_icon_in_element :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	element_id: string,
+	id: Icon_Id,
+	active: bool,
+	size: f32,
+	hash: ..u32,
+) {
 	color := active ? BUTTON_BORDER_HOVER : TEXT
 	draw_icon_in_element_color(renderer, command_buffer, pass, element_id, id, color, size, ..hash)
 }
 
-draw_icon_in_element_color :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, element_id: string, id: Icon_Id, color: clay.Color, size: f32, hash: ..u32) {
+draw_icon_in_element_color :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	element_id: string,
+	id: Icon_Id,
+	color: clay.Color,
+	size: f32,
+	hash: ..u32,
+) {
 	box, ok := icon_box(element_id, size, ..hash)
 	if !ok {
 		return
@@ -613,7 +1069,12 @@ draw_icon_in_element_color :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl
 // two sides this whole session with a number everyone can see: does the audio
 // content position (A, from the device clock) fall behind the video content
 // position (V, the playhead) — and at what delta.
-draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, preview: clay.BoundingBox) {
+draw_preview_hud :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	preview: clay.BoundingBox,
+) {
 	if !sync.atomic_load(&audio_run_flag) {
 		return
 	}
@@ -621,21 +1082,37 @@ draw_preview_hud :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComman
 	if fps <= 0 {
 		return
 	}
-	label := fmt.tprintf("A %6.2f  V %6.2f  d %+.2f",
+	label := fmt.tprintf(
+		"A %6.2f  V %6.2f  d %+.2f",
 		f64(sync.atomic_load(&audio_dev_frame)) / fps,
 		f64(playhead.frame) / fps,
-		f64(sync.atomic_load(&audio_dev_frame)-playhead.frame) / fps)
+		f64(sync.atomic_load(&audio_dev_frame) - playhead.frame) / fps,
+	)
 	fs: u16 = FONT_SMALL
 	text_w := f32(len(label)) * f32(fs) * 0.6
-	pill := clay.BoundingBox{x = preview.x + 8, y = preview.y + 8, width = text_w + 10, height = 17}
+	pill := clay.BoundingBox {
+		x      = preview.x + 8,
+		y      = preview.y + 8,
+		width  = text_w + 10,
+		height = 17,
+	}
 	render_sdf_rect(renderer, command_buffer, pass, pill, TOOLTIP_BG, 4, 0)
-	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = pill.x + 5, y = pill.y + 2, width = text_w, height = f32(fs)}, clay.TextRenderData{
-		stringContents = clay.StringSlice{length = c.int32_t(len(label)), chars = ([^]c.char)(raw_data(label))},
-		textColor = TOOLTIP_TEXT,
-		fontSize = fs,
-		letterSpacing = 1,
-		lineHeight = fs,
-	})
+	render_text(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox{x = pill.x + 5, y = pill.y + 2, width = text_w, height = f32(fs)},
+		clay.TextRenderData {
+			stringContents = clay.StringSlice {
+				length = c.int32_t(len(label)),
+				chars = ([^]c.char)(raw_data(label)),
+			},
+			textColor = TOOLTIP_TEXT,
+			fontSize = fs,
+			letterSpacing = 1,
+			lineHeight = fs,
+		},
+	)
 }
 
 // import_cancel_box is the modal's Cancel button hit-box, set by
@@ -647,7 +1124,12 @@ import_cancel_box: clay.BoundingBox
 // small dimmed panel centered on the window, shown until its deadline passes.
 // main.odin calls clear_expired_ui_notice each frame so the string is freed the
 // moment the notice expires.
-draw_ui_notice :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, win_w, win_h: f32) {
+draw_ui_notice :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	win_w, win_h: f32,
+) {
 	if len(ui_notice_text) == 0 || sdl.GetTicks() >= ui_notice_until {
 		return
 	}
@@ -655,26 +1137,58 @@ draw_ui_notice :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandB
 
 	W: f32 = 480
 	H: f32 = 96
-	panel := clay.BoundingBox{x = (win_w - W) / 2, y = (win_h - H) / 2, width = W, height = H}
+	panel := clay.BoundingBox {
+		x      = (win_w - W) / 2,
+		y      = (win_h - H) / 2,
+		width  = W,
+		height = H,
+	}
 	render_sdf_rect(renderer, command_buffer, pass, panel, EDITOR_BG, 10, 0)
-	render_sdf_rect(renderer, command_buffer, pass, {panel.x, panel.y, panel.width, 3}, BUTTON_BORDER_HOVER, 0, 0)
+	render_sdf_rect(
+		renderer,
+		command_buffer,
+		pass,
+		{panel.x, panel.y, panel.width, 3},
+		BUTTON_BORDER_HOVER,
+		0,
+		0,
+	)
 
 	msg := string(ui_notice_text)
 	msg_len := min(len(msg), 120)
-	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 34, width = panel.width - 48, height = f32(FONT_NORMAL)}, clay.TextRenderData{
-		stringContents = clay.StringSlice{length = c.int32_t(msg_len), chars = ([^]c.char)(raw_data(msg))},
-		textColor = TEXT,
-		fontSize = FONT_NORMAL,
-		letterSpacing = 1,
-		lineHeight = FONT_NORMAL,
-	})
+	render_text(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox {
+			x = panel.x + 24,
+			y = panel.y + 34,
+			width = panel.width - 48,
+			height = f32(FONT_NORMAL),
+		},
+		clay.TextRenderData {
+			stringContents = clay.StringSlice {
+				length = c.int32_t(msg_len),
+				chars = ([^]c.char)(raw_data(msg)),
+			},
+			textColor = TEXT,
+			fontSize = FONT_NORMAL,
+			letterSpacing = 1,
+			lineHeight = FONT_NORMAL,
+		},
+	)
 }
 
 // draw_import_progress paints the modal overlay for a background proxy build:
 // a dimmed full-window veil, a panel with the source name, phase label,
 // progress bar (indeterminate while ffmpeg estimates), percent, and a Cancel
 // button. Drawn last so it sits above every clay/gpu layer.
-draw_import_progress :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, win_w, win_h: f32) {
+draw_import_progress :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	win_w, win_h: f32,
+) {
 	active, frac, phase, src := import_bg_status()
 	if !active {
 		return
@@ -683,9 +1197,22 @@ draw_import_progress :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCo
 
 	W: f32 = 440
 	H: f32 = 180
-	panel := clay.BoundingBox{x = (win_w - W) / 2, y = (win_h - H) / 2, width = W, height = H}
+	panel := clay.BoundingBox {
+		x      = (win_w - W) / 2,
+		y      = (win_h - H) / 2,
+		width  = W,
+		height = H,
+	}
 	render_sdf_rect(renderer, command_buffer, pass, panel, EDITOR_BG, 10, 0)
-	render_sdf_rect(renderer, command_buffer, pass, {panel.x, panel.y, panel.width, 3}, BUTTON_BORDER_HOVER, 0, 0)
+	render_sdf_rect(
+		renderer,
+		command_buffer,
+		pass,
+		{panel.x, panel.y, panel.width, 3},
+		BUTTON_BORDER_HOVER,
+		0,
+		0,
+	)
 
 	title := "Building preview proxy…"
 	if phase == .Building {
@@ -695,24 +1222,52 @@ draw_import_progress :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCo
 	} else {
 		title = "Preparing proxy…"
 	}
-	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 22, width = panel.width - 48, height = f32(FONT_NORMAL)}, clay.TextRenderData{
-		stringContents = clay.StringSlice{length = c.int32_t(len(title)), chars = ([^]c.char)(raw_data(title))},
-		textColor = TEXT,
-		fontSize = FONT_NORMAL,
-		letterSpacing = 1,
-		lineHeight = FONT_NORMAL,
-	})
+	render_text(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox {
+			x = panel.x + 24,
+			y = panel.y + 22,
+			width = panel.width - 48,
+			height = f32(FONT_NORMAL),
+		},
+		clay.TextRenderData {
+			stringContents = clay.StringSlice {
+				length = c.int32_t(len(title)),
+				chars = ([^]c.char)(raw_data(title)),
+			},
+			textColor = TEXT,
+			fontSize = FONT_NORMAL,
+			letterSpacing = 1,
+			lineHeight = FONT_NORMAL,
+		},
+	)
 
 	// Source name, truncated to the panel (raw byte clamp; typical files are ASCII).
 	name := string(src)
 	name_len := min(len(name), 52)
-	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 50, width = panel.width - 48, height = f32(FONT_SMALL)}, clay.TextRenderData{
-		stringContents = clay.StringSlice{length = c.int32_t(name_len), chars = ([^]c.char)(raw_data(name))},
-		textColor = TOOLTIP_TEXT,
-		fontSize = FONT_SMALL,
-		letterSpacing = 1,
-		lineHeight = FONT_SMALL,
-	})
+	render_text(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox {
+			x = panel.x + 24,
+			y = panel.y + 50,
+			width = panel.width - 48,
+			height = f32(FONT_SMALL),
+		},
+		clay.TextRenderData {
+			stringContents = clay.StringSlice {
+				length = c.int32_t(name_len),
+				chars = ([^]c.char)(raw_data(name)),
+			},
+			textColor = TOOLTIP_TEXT,
+			fontSize = FONT_SMALL,
+			letterSpacing = 1,
+			lineHeight = FONT_SMALL,
+		},
+	)
 
 	fill_frac := f32(frac)
 	if fill_frac < 0 {
@@ -721,36 +1276,79 @@ draw_import_progress :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCo
 	if fill_frac > 1 {
 		fill_frac = 1
 	}
-	track := clay.BoundingBox{x = panel.x + 24, y = panel.y + 84, width = panel.width - 48, height = 12}
+	track := clay.BoundingBox {
+		x      = panel.x + 24,
+		y      = panel.y + 84,
+		width  = panel.width - 48,
+		height = 12,
+	}
 	render_sdf_rect(renderer, command_buffer, pass, track, HANDLE_FILL, 6, 0)
 	if phase == .Building && fill_frac > 0 {
-		fill := clay.BoundingBox{x = track.x, y = track.y, width = track.width * fill_frac, height = track.height}
+		fill := clay.BoundingBox {
+			x      = track.x,
+			y      = track.y,
+			width  = track.width * fill_frac,
+			height = track.height,
+		}
 		render_sdf_rect(renderer, command_buffer, pass, fill, BUTTON_BORDER_HOVER, 6, 0)
 	}
 
 	if frac >= 0 && phase == .Building {
 		pct := fmt.tprintf("%d%%", int(frac * 100 + 0.5))
-		render_text(renderer, command_buffer, pass, clay.BoundingBox{x = panel.x + 24, y = panel.y + 102, width = panel.width - 48, height = f32(FONT_SMALL)}, clay.TextRenderData{
-			stringContents = clay.StringSlice{length = c.int32_t(len(pct)), chars = ([^]c.char)(raw_data(pct))},
-			textColor = TOOLTIP_TEXT,
-			fontSize = FONT_SMALL,
-			letterSpacing = 1,
-			lineHeight = FONT_SMALL,
-		})
+		render_text(
+			renderer,
+			command_buffer,
+			pass,
+			clay.BoundingBox {
+				x = panel.x + 24,
+				y = panel.y + 102,
+				width = panel.width - 48,
+				height = f32(FONT_SMALL),
+			},
+			clay.TextRenderData {
+				stringContents = clay.StringSlice {
+					length = c.int32_t(len(pct)),
+					chars = ([^]c.char)(raw_data(pct)),
+				},
+				textColor = TOOLTIP_TEXT,
+				fontSize = FONT_SMALL,
+				letterSpacing = 1,
+				lineHeight = FONT_SMALL,
+			},
+		)
 	}
 
-	cancel := clay.BoundingBox{x = panel.x + panel.width - 104, y = panel.y + panel.height - 40, width = 80, height = 26}
+	cancel := clay.BoundingBox {
+		x      = panel.x + panel.width - 104,
+		y      = panel.y + panel.height - 40,
+		width  = 80,
+		height = 26,
+	}
 	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON, 6, 0)
 	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON_BORDER, 6, 1)
 	import_cancel_box = cancel
 	cancel_label := "Cancel"
-	render_text(renderer, command_buffer, pass, clay.BoundingBox{x = cancel.x + 6, y = cancel.y + 6, width = cancel.width - 12, height = f32(FONT_NORMAL)}, clay.TextRenderData{
-		stringContents = clay.StringSlice{length = c.int32_t(len(cancel_label)), chars = ([^]c.char)(raw_data(cancel_label))},
-		textColor = TEXT,
-		fontSize = FONT_NORMAL,
-		letterSpacing = 1,
-		lineHeight = FONT_NORMAL,
-	})
+	render_text(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox {
+			x = cancel.x + 6,
+			y = cancel.y + 6,
+			width = cancel.width - 12,
+			height = f32(FONT_NORMAL),
+		},
+		clay.TextRenderData {
+			stringContents = clay.StringSlice {
+				length = c.int32_t(len(cancel_label)),
+				chars = ([^]c.char)(raw_data(cancel_label)),
+			},
+			textColor = TEXT,
+			fontSize = FONT_NORMAL,
+			letterSpacing = 1,
+			lineHeight = FONT_NORMAL,
+		},
+	)
 }
 
 // create_text_texture creates a tight R8G8B8A8 texture (owned by the slot) for
@@ -763,7 +1361,19 @@ create_text_texture :: proc(device: ^sdl.GPUDevice, w, h: c.int) -> ^sdl.GPUText
 		// stay texture-less (draw skips it) until a real raster exists.
 		return nil
 	}
-	return sdl.CreateGPUTexture(device, sdl.GPUTextureCreateInfo{type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER}, width = u32(w), height = u32(h), layer_count_or_depth = 1, num_levels = 1, sample_count = ._1})
+	return sdl.CreateGPUTexture(
+		device,
+		sdl.GPUTextureCreateInfo {
+			type = .D2,
+			format = .R8G8B8A8_UNORM,
+			usage = {.SAMPLER},
+			width = u32(w),
+			height = u32(h),
+			layer_count_or_depth = 1,
+			num_levels = 1,
+			sample_count = ._1,
+		},
+	)
 }
 
 // release_slot_owned_texture frees a text slot's owned texture + dynamic buffer.
@@ -783,7 +1393,11 @@ release_slot_owned_texture :: proc(device: ^sdl.GPUDevice, slot: ^Preview_Slot) 
 // texture using a transfer buffer + copy pass on the given command buffer. A
 // text slot uploads its tight text_buf into its owned tight texture; a video
 // slot uploads the fixed PREVIEW buffer into the shared preview texture.
-upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
+upload_preview_slot :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	slot: ^Preview_Slot,
+) {
 	spall_scope(#procedure)
 	if slot.texture == nil {
 		return
@@ -792,7 +1406,10 @@ upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 		upload_text_slot(renderer, command_buffer, slot)
 		return
 	}
-	transfer := sdl.CreateGPUTransferBuffer(renderer.device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = PREVIEW_W * PREVIEW_H * 4})
+	transfer := sdl.CreateGPUTransferBuffer(
+		renderer.device,
+		sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = PREVIEW_W * PREVIEW_H * 4},
+	)
 	if transfer == nil {
 		return
 	}
@@ -805,8 +1422,17 @@ upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 	copy(dst, slot.buffer[:])
 	sdl.UnmapGPUTransferBuffer(renderer.device, transfer)
 	copy_pass := sdl.BeginGPUCopyPass(command_buffer)
-	source := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, pixels_per_row = PREVIEW_W, rows_per_layer = PREVIEW_H}
-	destination := sdl.GPUTextureRegion{texture = slot.texture, w = PREVIEW_W, h = PREVIEW_H, d = 1}
+	source := sdl.GPUTextureTransferInfo {
+		transfer_buffer = transfer,
+		pixels_per_row  = PREVIEW_W,
+		rows_per_layer  = PREVIEW_H,
+	}
+	destination := sdl.GPUTextureRegion {
+		texture = slot.texture,
+		w       = PREVIEW_W,
+		h       = PREVIEW_H,
+		d       = 1,
+	}
 	sdl.UploadToGPUTexture(copy_pass, source, destination, false)
 	sdl.EndGPUCopyPass(copy_pass)
 	slot.tex_dirty = false
@@ -814,14 +1440,21 @@ upload_preview_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCom
 
 // upload_text_slot uploads a text slot's full raster buffer (text_tex_w x
 // text_tex_h, the estimated buffer size) into its texture.
-upload_text_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, slot: ^Preview_Slot) {
+upload_text_slot :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	slot: ^Preview_Slot,
+) {
 	w := u32(slot.text_tex_w)
 	h := u32(slot.text_tex_h)
 	if w <= 0 || h <= 0 || slot.text_buf == nil {
 		return
 	}
 	n := int(w) * int(h) * 4
-	transfer := sdl.CreateGPUTransferBuffer(renderer.device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = u32(n)})
+	transfer := sdl.CreateGPUTransferBuffer(
+		renderer.device,
+		sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = u32(n)},
+	)
 	if transfer == nil {
 		return
 	}
@@ -835,8 +1468,17 @@ upload_text_slot :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUComman
 	copy(dst, src)
 	sdl.UnmapGPUTransferBuffer(renderer.device, transfer)
 	copy_pass := sdl.BeginGPUCopyPass(command_buffer)
-	source := sdl.GPUTextureTransferInfo{transfer_buffer = transfer, pixels_per_row = w, rows_per_layer = h}
-	destination := sdl.GPUTextureRegion{texture = slot.texture, w = w, h = h, d = 1}
+	source := sdl.GPUTextureTransferInfo {
+		transfer_buffer = transfer,
+		pixels_per_row  = w,
+		rows_per_layer  = h,
+	}
+	destination := sdl.GPUTextureRegion {
+		texture = slot.texture,
+		w       = w,
+		h       = h,
+		d       = 1,
+	}
 	sdl.UploadToGPUTexture(copy_pass, source, destination, false)
 	sdl.EndGPUCopyPass(copy_pass)
 	slot.tex_dirty = false
@@ -893,15 +1535,28 @@ drain_pending_text_releases :: proc(device: ^sdl.GPUDevice) {
 // fit (aspect-preserving, letterboxed) into it and the quad samples only the
 // fit region so the image is never stretched to the (possibly differently
 // shaped) project canvas.
-draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass, bounds: clay.BoundingBox) {
+draw_preview :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	bounds: clay.BoundingBox,
+) {
 	if renderer.preview_pipeline == nil {
 		return
 	}
 	// Clip everything (zoomed content, background, border) to the preview window
 	// so zooming/panning behaves like a scrollable viewport.
-	scissor := sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)}
+	scissor := sdl.Rect {
+		c.int(bounds.x),
+		c.int(bounds.y),
+		c.int(bounds.width),
+		c.int(bounds.height),
+	}
 	sdl.SetGPUScissor(pass, scissor)
-	defer sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+	defer sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+	)
 
 	canvas := preview_canvas(bounds)
 	// The composited/canvas area has a completely black background.
@@ -921,26 +1576,45 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 	}
 
 	// Paint every clip covering the playhead with the top track on top. Slots
-	// are assigned in track order (track 0 = top = slot 0), so draw slots in
-	// reverse so the top track's clip is drawn last and appears on top.
-	for i := MAX_PREVIEW_SLOTS - 1; i >= 0; i -= 1 {
-		slot := &preview_slots[i]
-		if !slot.in_use || !slot.has_frame || slot.texture == nil {
-			continue
+	// keep a STABLE index per clip identity (update_preview_slots), so index
+	// order no longer means depth: sort the visible slots by layer (the
+	// track-order walk position, lowest = topmost) and draw the lowest layer
+	// last so the top track's clip appears on top.
+	order: [MAX_PREVIEW_SLOTS]int
+	n := 0
+	for i := 0; i < MAX_PREVIEW_SLOTS; i += 1 {
+		if s := &preview_slots[i]; s.in_use && s.has_frame && s.texture != nil {
+			order[n] = i
+			n += 1
 		}
+	}
+	for a := 1; a < n; a += 1 {
+		key := order[a]
+		b := a
+		for b > 0 && preview_slots[order[b - 1]].layer > preview_slots[key].layer {
+			order[b] = order[b - 1]
+			b -= 1
+		}
+		order[b] = key
+	}
+	for k := n - 1; k >= 0; k -= 1 {
+		slot := &preview_slots[order[k]]
 		is_text := slot.text_w > 0 && slot.text_h > 0
-		cb := clip_image_bounds(canvas, &Clip{
-			kind = is_text ? Media_Kind.Text : .Video,
-			transform_x = slot.transform_x,
-			transform_y = slot.transform_y,
-			scale = slot.scale,
-			crop_l = slot.crop_l,
-			crop_r = slot.crop_r,
-			crop_t = slot.crop_t,
-			crop_b = slot.crop_b,
-			source_w = slot.source_w,
-			source_h = slot.source_h,
-		})
+		cb := clip_image_bounds(
+			canvas,
+			&Clip {
+				kind = is_text ? Media_Kind.Text : .Video,
+				transform_x = slot.transform_x,
+				transform_y = slot.transform_y,
+				scale = slot.scale,
+				crop_l = slot.crop_l,
+				crop_r = slot.crop_r,
+				crop_t = slot.crop_t,
+				crop_b = slot.crop_b,
+				source_w = slot.source_w,
+				source_h = slot.source_h,
+			},
+		)
 		// The decoded texture holds the source fit (letterboxed) inside the
 		// fixed PREVIEW_W x PREVIEW_H buffer. Start the quad from that fit
 		// region so the sampled area keeps the source's aspect, then apply the
@@ -960,7 +1634,12 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 			u1 = f32(slot.text_x + slot.text_w) / tw
 			v1 = f32(slot.text_y + slot.text_h) / th
 		} else {
-			fw, fh, fox, foy := source_fit_in_buffer(slot.source_w, slot.source_h, PREVIEW_W, PREVIEW_H)
+			fw, fh, fox, foy := source_fit_in_buffer(
+				slot.source_w,
+				slot.source_h,
+				PREVIEW_W,
+				PREVIEW_H,
+			)
 			u_base := f32(fox) / f32(PREVIEW_W)
 			v_base := f32(foy) / f32(PREVIEW_H)
 			u_span := f32(fw) / f32(PREVIEW_W)
@@ -970,22 +1649,33 @@ draw_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 			v0 = v_base + slot.crop_t * v_span
 			v1 = v_base + (1 - slot.crop_b) * v_span
 		}
-		vertex_uniforms := TextVertexUniforms{
-			bounds = {cb.x, cb.y, cb.width, cb.height},
+		vertex_uniforms := TextVertexUniforms {
+			bounds   = {cb.x, cb.y, cb.width, cb.height},
 			viewport = renderer.viewport,
 			_padding = {},
-			uv = {u0, v0, u1, v1},
+			uv       = {u0, v0, u1, v1},
 		}
 		sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
-		binding := sdl.GPUTextureSamplerBinding{texture = slot.texture, sampler = renderer.preview_sampler}
+		binding := sdl.GPUTextureSamplerBinding {
+			texture = slot.texture,
+			sampler = renderer.preview_sampler,
+		}
 		sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-		sdl.PushGPUVertexUniformData(command_buffer, 0, &vertex_uniforms, sdl.Uint32(size_of(vertex_uniforms)))
+		sdl.PushGPUVertexUniformData(
+			command_buffer,
+			0,
+			&vertex_uniforms,
+			sdl.Uint32(size_of(vertex_uniforms)),
+		)
 		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 	}
 	// Draw a border box around the currently-selected clip's image rect.
 	// Border/handles are editor affordances: restore the widget-level scissor so
 	// handles on an off-canvas box stay visible/grabbable.
-	sdl.SetGPUScissor(pass, sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)})
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)},
+	)
 	if selected_clip, ok := transformable_selected(); ok {
 		sb := clip_image_bounds(canvas, selected_clip)
 		render_sdf_rect(renderer, command_buffer, pass, sb, SELECT_BORDER, 0, 3)

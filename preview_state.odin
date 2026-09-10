@@ -157,8 +157,17 @@ pick_hash_u32 :: proc(pick: cstring) -> u32 {
 update_preview_slots :: proc() -> bool {
 	spall_scope(#procedure)
 	changed := false
-	next_slot := 0
-	// front_video_slot is the lowest-index slot holding a non-text clip at the
+	// Identity-stable slots: each covering clip keeps the slot it already owns
+	// (its decoder + RAM cache + last decoded face), so a composition change
+	// mid-playback -- a text clip joining the playhead above a video -- reuses
+	// the video's existing slot instead of reshuffling slot indexes and
+	// re-opening its decoder (which blanked has_frame and flashed the canvas
+	// black while the async reopen+seek landed). A clip first claims a free
+	// slot; dropped clips are swept at the end. Depth order comes from `layer`
+	// (the track-order walk position), NOT the slot index.
+	claimed: [MAX_PREVIEW_SLOTS]bool
+	layer: u8
+	// front_video_slot is the slot of the topmost non-text clip at the
 	// playhead: the foreground face. Only it is decoded on the async worker
 	// (probe mode below waits for the result); all other slots decode
 	// synchronously.
@@ -169,11 +178,9 @@ update_preview_slots :: proc() -> bool {
 	// Warm the upcoming clip's decoder before the playhead crosses the
 	// boundary, so the transition hands over a warm decoder (no cut stall).
 	prewarm_next_clip()
-	for track_idx := 0;
-	    track_idx < len(timeline.tracks) && next_slot < MAX_PREVIEW_SLOTS;
-	    track_idx += 1 {
+	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 		track := &timeline.tracks[track_idx]
-		for i := 0; i < len(track.clips) && next_slot < MAX_PREVIEW_SLOTS; i += 1 {
+		for i := 0; i < len(track.clips); i += 1 {
 			clip := &track.clips[i]
 			if clip.kind != .Video && clip.kind != .Text {
 				continue
@@ -183,9 +190,34 @@ update_preview_slots :: proc() -> bool {
 			   frame >= clip.timeline_start_frame + clip.source_length_frames {
 				continue
 			}
-			slot := &preview_slots[next_slot]
-			slot_idx := next_slot
-			next_slot += 1
+			slot_idx := -1
+			for s in 0 ..< MAX_PREVIEW_SLOTS {
+				if preview_slots[s].in_use && preview_slots[s].clip_id == clip.clip_id {
+					slot_idx = s
+					break
+				}
+			}
+			if slot_idx < 0 {
+				// Fresh clip: claim the lowest free slot. Its decoder is reset by
+				// the reassignment block below; the texture behind that index is
+				// the renderer's shared per-index preview texture.
+				for s in 0 ..< MAX_PREVIEW_SLOTS {
+					if !preview_slots[s].in_use {
+						slot_idx = s
+						break
+					}
+				}
+			}
+			if slot_idx < 0 {
+				// All slots busy; the clip can't be shown this frame. Bounded
+				// preview: keep walking so later (usually under) clips still
+				// claim what's free.
+				continue
+			}
+			claimed[slot_idx] = true
+			layer += 1
+			slot := &preview_slots[slot_idx]
+			slot.layer = layer
 			if clip.kind != .Text && front_video_slot < 0 {
 				front_video_slot = slot_idx
 			}
@@ -255,7 +287,7 @@ update_preview_slots :: proc() -> bool {
 				if nered_trace {
 					fmt.printf(
 						"[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
-						next_slot - 1,
+						slot_idx,
 						clip.asset_id,
 						clip.timeline_start_frame,
 						clip.source_start_frame,
@@ -568,10 +600,32 @@ update_preview_slots :: proc() -> bool {
 			}
 		}
 	}
-	for i := next_slot; i < MAX_PREVIEW_SLOTS; i += 1 {
-		if preview_slots[i].in_use {
-			clip_decoder_reset(&preview_slots[i].dec)
-			preview_slots[i].in_use = false
+	for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+		if preview_slots[s].in_use && !claimed[s] {
+			// The slot's clip no longer covers the playhead (clip ended, moved
+			// away, or was deleted). Free the decoder + text-owned resources.
+			// Video slots ride the renderer's shared per-index preview texture,
+			// so nothing GPU-side is owned here; a text slot's tight texture is
+			// released via the render loop's pending-release queue (no device
+			// on this thread).
+			slot := &preview_slots[s]
+			clip_decoder_reset(&slot.dec)
+			if slot.is_text && slot.texture != nil {
+				queue_text_texture_release(slot.texture)
+			}
+			if slot.text_buf != nil {
+				delete(slot.text_buf)
+				slot.text_buf = nil
+			}
+			if slot.text_base_buf != nil {
+				delete(slot.text_base_buf)
+				slot.text_base_buf = nil
+			}
+			if slot.text_scratch != nil {
+				delete(slot.text_scratch)
+				slot.text_scratch = nil
+			}
+			slot^ = {}
 		}
 	}
 	return changed
