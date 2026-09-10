@@ -20,10 +20,10 @@ BUTTON_HEIGHT :: f32(28)   // Small action buttons (transport, settings, menu ro
 BUTTON_H_PAD :: 10         // Padding{left/right} inside small buttons/fields.
 
 // Corner radii (visual hierarchy: container > panel > widget > button).
-RADIUS_CONTAINER :: 10
-RADIUS_PANEL :: 8
-RADIUS_WIDGET :: 6
-RADIUS_BUTTON :: 4
+RADIUS_CONTAINER :: 8
+RADIUS_PANEL :: 6
+RADIUS_WIDGET :: 4
+RADIUS_BUTTON :: 2
 
 // Font sizes.
 FONT_RULER :: 11
