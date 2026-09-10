@@ -685,9 +685,13 @@ pointer_over_context_menu :: proc() -> bool {
 	return pointer_over_submenu()
 }
 
-// pointer_over_submenu reports whether the cursor is over any submenu item.
+// pointer_over_submenu reports whether the cursor is over the "Add >" flyout.
+// This tests the CONTAINER (not the two leaf items): the flyout's padding +
+// border ring is a couple of px wide, and testing only the leaves makes that
+// ring read as "not the submenu" — the flag flaps off the instant the cursor
+// grazes the margin, and the flyout flickers open/closed under the cursor.
 pointer_over_submenu :: proc() -> bool {
-	return clay.PointerOver(clay.ID("CtxTextClip")) || clay.PointerOver(clay.ID("CtxSubtitleClip"))
+	return clay.PointerOver(clay.ID("CtxSubmenu"))
 }
 
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
