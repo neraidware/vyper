@@ -485,6 +485,12 @@ interaction_post_build :: proc(
 		   selected_index < len(timeline.tracks[selected_track].clips) {
 			track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 			frame := max(f32(0), (inp.x - track_start) / timeline_zoom + timeline_view_start)
+			// Clip→playhead toggle applies to edge drags too: the dragged edge
+			// (head on resize_edge 0, tail on 1) latches onto the playhead
+			// within the snap margin, like a clip move.
+			if snap_clips_to_playhead {
+				frame = f32(snap_to_playhead(i64(frame)))
+			}
 			if resize_edge == 0 {
 				if len(drag_group_orig) > 0 {
 					// Linked group: shift every member's head by the same delta.
