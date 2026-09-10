@@ -108,7 +108,7 @@ subtitle_render_probe_run :: proc(out: string) {
 	pscratch := make([]u8, text_scratch_size_for(192))
 	for s in ([2]string{"final cue", "longsubtitleline."}) {
 		one := strings.split(s, "\n")
-		obw, obh := text_buf_size_for_lines(one, 192)
+		obw, obh := text_buf_size_for_lines(one, &pfont, &pfont_init, 192)
 		obuf := make([]u8, obw * obh * 4, context.temp_allocator)
 		oox, ooy, oow, ooh := rasterize_lines_into_buffer(
 			one,
@@ -130,7 +130,7 @@ subtitle_render_probe_run :: proc(out: string) {
 			continue
 		}
 		l := strings.split(ch_s, "\n")
-		cbw, cbh := text_buf_size_for_lines(l, 192)
+		cbw, cbh := text_buf_size_for_lines(l, &pfont, &pfont_init, 192)
 		cbuf := make([]u8, cbw * cbh * 4, context.temp_allocator)
 		cox, coy, cow, coh := rasterize_lines_into_buffer(
 			l,

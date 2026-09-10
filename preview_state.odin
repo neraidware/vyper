@@ -392,9 +392,20 @@ update_preview_slots :: proc() -> bool {
 				name_hash := text_clip_hash(clip.name)
 				base_changed := slot.text_hash != name_hash
 				font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
+				// The box is ink WIDTH x metric BOX HEIGHT: width is the tight
+				// ink (single line, so it hugs the text); height is the font's
+				// typographic line box at 48 (ascent + descent + TEXT_BOX_PAD
+				// air), constant per font/size, so it always covers descenders
+				// and does NOT jump when the title's deepest glyph changes (the
+				// old tight-ink height did).
+				base_bw, base_bh := text_buf_size_for(
+					clip.name,
+					&text_clip_font,
+					&text_clip_font_init,
+					TEXT_CLIP_FONT_PIXELS,
+				)
 				if base_changed {
-					// Re-measure the base tight dims at font 48 on rename.
-					base_bw, base_bh := text_buf_size_for(clip.name, TEXT_CLIP_FONT_PIXELS)
+					// Re-measure / re-derive the base dims at font 48 on rename.
 					need_base := base_bw * base_bh * 4
 					if need_base > len(slot.text_base_buf) {
 						delete(slot.text_base_buf)
@@ -407,7 +418,7 @@ update_preview_slots :: proc() -> bool {
 							text_scratch_size_for(TEXT_CLIP_FONT_PIXELS),
 						)
 					}
-					_, _, bw0, bh0 := rasterize_title_into_buffer(
+					_, _, bw0, _ := rasterize_title_into_buffer(
 						clip.name,
 						slot.text_base_buf,
 						base_bw,
@@ -417,13 +428,24 @@ update_preview_slots :: proc() -> bool {
 						slot.text_scratch,
 						TEXT_CLIP_FONT_PIXELS,
 					)
-					clip.source_w = c.int(bw0)
-					clip.source_h = c.int(bh0)
-					slot.source_w = c.int(bw0)
-					slot.source_h = c.int(bh0)
+					// Legacy clips (pre-metric model) carry a galley-height
+					// source_h; the box is deterministic from the name alone, so
+					// a mismatch means "remodel on load, once".
+					if bw0 > 0 {
+						clip.source_w = c.int(bw0)
+						clip.source_h = c.int(base_bh)
+						slot.source_w = c.int(bw0)
+						slot.source_h = c.int(base_bh)
+					}
 					slot.text_hash = name_hash
 				}
-				if base_changed || slot.text_font_px != font_px {
+				stale_box :=
+					base_changed == false && clip.source_w > 0 && clip.source_h != c.int(base_bh)
+				if stale_box {
+					clip.source_h = c.int(base_bh)
+					slot.source_h = c.int(base_bh)
+				}
+				if base_changed || stale_box || slot.text_font_px != font_px {
 					// Re-render at the baked font (48*scale) for the texture.
 					slot.text_font_px = font_px
 					need_sc := text_scratch_size_for(font_px)
@@ -431,13 +453,18 @@ update_preview_slots :: proc() -> bool {
 						delete(slot.text_scratch)
 						slot.text_scratch = make([]u8, need_sc)
 					}
-					bw, bh := text_buf_size_for(clip.name, font_px)
+					bw, bh := text_buf_size_for(
+						clip.name,
+						&text_clip_font,
+						&text_clip_font_init,
+						font_px,
+					)
 					need := bw * bh * 4
 					if need > len(slot.text_buf) {
 						delete(slot.text_buf)
 						slot.text_buf = make([]u8, need)
 					}
-					text_x, text_y, text_w, text_h := rasterize_title_into_buffer(
+					ink_x, _, ink_bw, _ := rasterize_title_into_buffer(
 						clip.name,
 						slot.text_buf,
 						bw,
@@ -447,16 +474,19 @@ update_preview_slots :: proc() -> bool {
 						slot.text_scratch,
 						font_px,
 					)
-					slot.text_x = text_x
-					slot.text_y = text_y
-					slot.text_w = text_w
-					slot.text_h = text_h
-					// The texture is the FULL estimated buffer (bw x bh), so the
-					// upload + UV sampling work against it; the draw samples only
-					// the tight ink sub-rect (text_x/text_y/text_w/text_h).
+					// Sample the tight ink horizontally (the width estimate is
+					// over-wide) over the FULL metric box height, so the quad
+					// (source_w x source_h) maps 1:1 onto the texture with
+					// TEXT_BOX_PAD air above and descent space below the ink.
+					slot.text_x = ink_x
+					slot.text_y = 0
+					slot.text_w = ink_bw
+					slot.text_h = bh
+					// The texture is the FULL buffer (bw x bh), so the upload +
+					// UV sampling work against it.
 					slot.text_tex_w = c.int(bw)
 					slot.text_tex_h = c.int(bh)
-					slot.has_frame = text_w > 0 && text_h > 0
+					slot.has_frame = ink_bw > 0
 					slot.tex_dirty = true
 					slot.text_recreate = true
 					changed = true
@@ -722,17 +752,20 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		lines := strings.split(active_text, "\n")
 		defer delete(lines)
 
-		// Base measure at font 48. The box is ink WIDTH x galley HEIGHT. The
-		// galley estimate is ~1.2 px/char wide but the font's real advance is
-		// far smaller, so the ink sits at the LEFT of the galley — a
-		// galley-wide box would push the text off-center. Use the tight ink
-		// width (text centered), and the galley height: the galley bottom is a
-		// font-metric line (fixed tail padding), so the last line's baseline
-		// sits a constant distance above it. That keeps the baseline fixed
-		// when the cue gains descenders or a second line. Anchoring the tight
-		// ink bottom is wrong: it tracks the deepest descender and drags the
-		// baseline up.
-		base_bw, base_bh := text_buf_size_for_lines(lines, TEXT_CLIP_FONT_PIXELS)
+		// Base measure at font 48. The box is ink WIDTH x metric BOX HEIGHT.
+		// Width: the tight ink width (single-line cues hug their text, and
+		// multi-line cues are centered on the widest line's ink). Height: the
+		// SUM of each line's typographic line box (ascent + descent) plus
+		// TEXT_BOX_PAD air -- a font-metric constant per line, so the height
+		// cannot balloon with the galley estimate and a line always reserves
+		// its own descent space. Anchoring the tight ink bottom would be wrong:
+		// it tracks the deepest descender and drags the baseline up.
+		base_bw, base_bh := text_buf_size_for_lines(
+			lines,
+			&text_clip_font,
+			&text_clip_font_init,
+			TEXT_CLIP_FONT_PIXELS,
+		)
 		need_base := base_bw * base_bh * 4
 		if need_base > len(slot.text_base_buf) {
 			delete(slot.text_base_buf)
@@ -775,9 +808,10 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		}
 		if had_box {
 			// Re-anchor on the previous box: keep the box CENTER in x and the
-			// box BOTTOM EDGE in y fixed. The bottom edge is the galley bottom
-			// (a font-metric line), so subtitles grow upward around a stable
-			// baseline instead of floating as the cue's line count changes.
+			// box BOTTOM EDGE in y fixed. The bottom edge is the last line's
+			// metric line box bottom (font-metric), so subtitles grow upward
+			// around a stable baseline instead of floating as the cue's line
+			// count changes.
 			cx := clip.transform_x + old_w / 2
 			bottom := clip.transform_y + old_h
 			clip.transform_x = cx - new_w / 2
@@ -788,7 +822,7 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			clip.transform_y = f32(project.height) / 2 - new_h / 2
 		}
 		clip.source_w = c.int(ink_w)
-		clip.source_h = c.int(base_bh)
+		clip.source_h = c.int(base_bh) // metric line-box stack, text pixels
 		slot.source_w = c.int(ink_w)
 		slot.source_h = c.int(base_bh)
 
@@ -800,7 +834,7 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			slot.text_scratch = {} // stale-len hazard (above)
 			slot.text_scratch = make([]u8, need_sc)
 		}
-		bw, bh := text_buf_size_for_lines(lines, font_px)
+		bw, bh := text_buf_size_for_lines(lines, &text_clip_font, &text_clip_font_init, font_px)
 		need := bw * bh * 4
 		if need > len(slot.text_buf) {
 			delete(slot.text_buf)
@@ -819,10 +853,10 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			context.temp_allocator,
 		)
 		// Sample the ink horizontally (text sits at the left of the over-wide
-		// galley estimate) over the FULL galley height. The ink box is
+		// galley estimate) over the FULL metric box height. The ink box is
 		// source_w x source_h, so the sub-rect maps 1:1 onto the quad with the
-		// text centered. Full-height sampling keeps the baseline on the galley
-		// bottom (see above).
+		// text centered. Full-height sampling keeps the baseline on the last
+		// line's metric box bottom (see above).
 		slot.text_x = ink_x
 		slot.text_y = 0
 		slot.text_w = ink_bw

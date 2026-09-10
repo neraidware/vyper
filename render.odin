@@ -181,7 +181,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 		return
 	}
 	font_px := f32(TEXT_CLIP_FONT_PIXELS) * t.scale
-	bw, bh := text_buf_size_for(t.name, font_px)
+	bw, bh := text_buf_size_for(t.name, &render_text_font, &render_text_font_init, font_px)
 	buf := make([]u8, bw * bh * 4)
 	if len(render_text_setup_scratch) < text_scratch_size_for(font_px) {
 		delete(render_text_setup_scratch)
@@ -251,7 +251,7 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		return
 	}
 	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
-	bw, bh := text_buf_size_for_lines(lines, font_px)
+	bw, bh := text_buf_size_for_lines(lines, &render_text_font, &render_text_font_init, font_px)
 	if bw <= 0 || bh <= 0 {
 		return
 	}

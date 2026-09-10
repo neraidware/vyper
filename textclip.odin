@@ -11,10 +11,47 @@ import stb "vendor:stb/truetype"
 // transparent background, positioned at the top-left of the preview buffer.
 // ---------------------------------------------------------------------------
 
-text_clip_font:      stb.fontinfo
+text_clip_font: stb.fontinfo
 text_clip_font_init: bool
 
 TEXT_CLIP_FONT_PIXELS :: 48
+
+// TEXT_BOX_PAD is the small air margin above the first line's ascenders and
+// below the last line's descenders kept inside a text/subtitle box, so the
+// antialias overshoot never kisses the box edge. It is the ONLY vertical
+// padding a text box carries: the box height itself comes from the font's
+// typographic line metrics (text_metrics_px), which are the standard per-font
+// character height and can't balloon like the old fixed galley estimates.
+TEXT_BOX_PAD :: 2
+
+// text_metrics_px reports the font's typographic line box at glyph height
+// `px`: ascent_px pixels above the baseline, and the full line_h = ascent +
+// descent. Sizing a text box off these (rather than this title's ink) gives a
+// box that is a CONSTANT per font+size and automatically leaves room for
+// descenders -- no jump when the deepest glyph in a string changes, no dead
+// margin when a string has no descenders.
+text_metrics_px :: proc(
+	font: ^stb.fontinfo,
+	font_init: ^bool,
+	px: f32,
+) -> (
+	ascent_px, line_h: int,
+) {
+	epx := px
+	if epx <= 0 {
+		epx = TEXT_CLIP_FONT_PIXELS
+	}
+	if !font_init^ {
+		stb.InitFont(font, raw_data(font_data), 0)
+		font_init^ = true
+	}
+	scale := stb.ScaleForPixelHeight(font, epx)
+	ascent, descent, _: c.int
+	stb.GetFontVMetrics(font, &ascent, &descent, nil)
+	a := int(f32(ascent) * scale)
+	d := int(f32(-descent) * scale) // descent is negative (below baseline)
+	return a, a + d
+}
 
 // Scratch for one glyph's bitmap; sized for a 48px monospace glyph (a few KB).
 // Preview rendering is single-threaded on the UI loop, so a shared buffer is
@@ -41,14 +78,25 @@ text_scratch_size_for :: proc(font_px: f32) -> int {
 
 // text_buf_size_for estimates a tight RGBA buffer (bw x bh) large enough to
 // hold a title rasterized at the given glyph pixel height without clipping.
-// Generous estimate: ~1.2*font_px advance per codepoint, ~2.4*font_px tall.
-text_buf_size_for :: proc(title: string, font_px: f32) -> (bw: int, bh: int) {
+// Width is a generous advance estimate (1.2*font_px per codepoint); height is
+// the font's typographic line box (ascent + descent + TEXT_BOX_PAD air), so
+// the raster's baseline sits inside it and descenders always fit.
+text_buf_size_for :: proc(
+	title: string,
+	font: ^stb.fontinfo,
+	font_init: ^bool,
+	font_px: f32,
+) -> (
+	bw: int,
+	bh: int,
+) {
 	fp := f32(1)
 	if font_px > 0 {
 		fp = font_px
 	}
 	bw = int(f32(len(title) + 1) * fp * 1.2) + 8
-	bh = int(fp * 2.4) + 8
+	_, lh := text_metrics_px(font, font_init, font_px)
+	bh = TEXT_BOX_PAD + lh + TEXT_BOX_PAD
 	return bw, bh
 }
 
@@ -63,12 +111,18 @@ text_buf_size_for :: proc(title: string, font_px: f32) -> (bw: int, bh: int) {
 // globals.
 rasterize_title_into_buffer :: proc(
 	title: string,
-	buf: []u8, bw, bh: int,
+	buf: []u8,
+	bw, bh: int,
 	font: ^stb.fontinfo,
 	font_init: ^bool,
 	scratch: []u8,
 	font_px: f32,
-) -> (ox: int, oy: int, ow: int, oh: int) {
+) -> (
+	ox: int,
+	oy: int,
+	ow: int,
+	oh: int,
+) {
 	mem.zero(raw_data(buf), len(buf))
 	if len(title) == 0 {
 		return 0, 0, 0, 0
@@ -98,7 +152,16 @@ rasterize_title_into_buffer :: proc(
 		adv: c.int
 		stb.GetCodepointHMetrics(font, ch, &adv, nil)
 		box_val: [4]c.int
-		stb.GetCodepointBitmapBox(font, ch, scale, scale, &box_val[0], &box_val[1], &box_val[2], &box_val[3])
+		stb.GetCodepointBitmapBox(
+			font,
+			ch,
+			scale,
+			scale,
+			&box_val[0],
+			&box_val[1],
+			&box_val[2],
+			&box_val[3],
+		)
 		ix0 := int(box_val[0])
 		iy0 := int(box_val[1])
 		ix1 := int(box_val[2])
@@ -128,7 +191,16 @@ rasterize_title_into_buffer :: proc(
 			n := gw * gh
 			if n <= len(scratch) {
 				mem.zero(raw_data(scratch[:n]), n)
-				stb.MakeCodepointBitmap(font, raw_data(scratch[:]), c.int(gw), c.int(gh), c.int(gw), scale, scale, ch)
+				stb.MakeCodepointBitmap(
+					font,
+					raw_data(scratch[:]),
+					c.int(gw),
+					c.int(gh),
+					c.int(gw),
+					scale,
+					scale,
+					ch,
+				)
 				for gy in 0 ..< gh {
 					for gx in 0 ..< gw {
 						a := int(scratch[gy * gw + gx])
@@ -159,22 +231,27 @@ rasterize_title_into_buffer :: proc(
 
 // text_buf_size_for_lines estimates a single-call RGBA buffer (bw x bh) large
 // enough to hold the stacked lines of a multi-line subtitle rasterized at the
-// given glyph pixel height. Line pitch is ~1.2*font_px; the estimate is the
-// widest line estimate wide and the line count tall (with cap padding).
-text_buf_size_for_lines :: proc(lines: []string, font_px: f32) -> (bw: int, bh: int) {
-	fp := f32(1)
-	if font_px > 0 {
-		fp = font_px
-	}
-	pitch := int(fp * 1.2)
-	width, _ := text_buf_size_for("", font_px)
+// given glyph pixel height. Width is the widest line's estimate; height is
+// per-line typographic line boxes stacked (TEXT_BOX_PAD air top and bottom, no
+// dead tail -- each line's box already includes its descent space).
+text_buf_size_for_lines :: proc(
+	lines: []string,
+	font: ^stb.fontinfo,
+	font_init: ^bool,
+	font_px: f32,
+) -> (
+	bw: int,
+	bh: int,
+) {
+	_, lh := text_metrics_px(font, font_init, font_px)
+	width := 0
 	for l in lines {
-		w, _ := text_buf_size_for(l, font_px)
+		w, _ := text_buf_size_for(l, font, font_init, font_px)
 		if w > width {
 			width = w
 		}
 	}
-	return width, 8 + len(lines) * pitch + int(fp * 1.2)
+	return width, TEXT_BOX_PAD + len(lines) * lh + TEXT_BOX_PAD
 }
 
 // rasterize_lines_into_buffer rasterizes `lines` (each as a single-line title
@@ -185,13 +262,19 @@ text_buf_size_for_lines :: proc(lines: []string, font_px: f32) -> (bw: int, bh: 
 // font_init, scratch).
 rasterize_lines_into_buffer :: proc(
 	lines: []string,
-	buf: []u8, bw, bh: int,
+	buf: []u8,
+	bw, bh: int,
 	font: ^stb.fontinfo,
 	font_init: ^bool,
 	scratch: []u8,
 	font_px: f32,
 	allocator: mem.Allocator,
-) -> (ox: int, oy: int, ow: int, oh: int) {
+) -> (
+	ox: int,
+	oy: int,
+	ow: int,
+	oh: int,
+) {
 	mem.zero(raw_data(buf), len(buf))
 	if len(lines) == 0 {
 		return 0, 0, 0, 0
@@ -220,23 +303,43 @@ rasterize_lines_into_buffer :: proc(
 	}
 	slots := make([]Type_Line_Slot, len(lines), context.temp_allocator)
 
-	pitch := int(px * 1.2)
+	// Line pitch = the font's typographic line box, so stacked lines sit at
+	// exactly their standard character height (no overlap, no dead gap).
+	_, lh := text_metrics_px(font, font_init, px)
+	pitch := lh
 	max_ink_w := 0
 	ink_top := max(int)
 	ink_bottom := -max(int)
 
 	for i in 0 ..< len(lines) {
-		lbw, lbh := text_buf_size_for(lines[i], px)
+		lbw, lbh := text_buf_size_for(lines[i], font, font_init, px)
 		lbuf := make([]u8, lbw * lbh * 4, allocator)
-		lox, loy, low, loh := rasterize_title_into_buffer(lines[i], lbuf, lbw, lbh, font, font_init, scratch, px)
-		slots[i] = {buf = lbuf, bw = lbw, bh = lbh, lox = lox, loy = loy, low = low, loh = loh}
+		lox, loy, low, loh := rasterize_title_into_buffer(
+			lines[i],
+			lbuf,
+			lbw,
+			lbh,
+			font,
+			font_init,
+			scratch,
+			px,
+		)
+		slots[i] = {
+			buf = lbuf,
+			bw  = lbw,
+			bh  = lbh,
+			lox = lox,
+			loy = loy,
+			low = low,
+			loh = loh,
+		}
 		if low > max_ink_w {
 			max_ink_w = low
 		}
 		if low == 0 {
 			continue
 		}
-		band_y := 4 + i * pitch
+		band_y := TEXT_BOX_PAD + i * pitch
 		if band_y + loy < ink_top {
 			ink_top = band_y + loy
 		}
@@ -258,7 +361,7 @@ rasterize_lines_into_buffer :: proc(
 		if s.low == 0 {
 			continue
 		}
-		band_top := 4 + i * pitch
+		band_top := TEXT_BOX_PAD + i * pitch
 		band_dx := (max_ink_w - s.low) / 2
 		dst_y0 := band_top + s.loy
 		if band_dx < left_ink {
