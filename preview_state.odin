@@ -295,11 +295,24 @@ update_preview_slots :: proc() -> bool {
 				// has_frame must be false and the buffer zeroed, or
 				// draw_preview keeps painting the stale image (same-asset
 				// switches — e.g. split halves moving — don't reset the slot's
-				// decoder, so without this the old clip's face lingers). The
-				// exact playhead frame is requested next update.
-				slot.has_frame = false
-				slot.tex_dirty = false
-				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
+				// decoder, so without this the old clip's face lingers).
+				//
+				// EXCEPT while the clip is the one under the cursor right now:
+				// a live drag mutates timeline_start_frame every mousemove, so
+				// blanking would flash the canvas black between every move and
+				// the fresh decode (the front slot's decode runs on the async
+				// worker, adding a round-trip per move). Keep the last decoded
+				// face on screen through the drag; the decode below chases the
+				// clip's new position (the idle-skip misses because the
+				// requested clip_frame changed).
+				if drag_clip == clip || resizing_clip {
+					// Leave has_frame as-is: paint the stale face through the
+					// drag (the decode below chases the clip's new position).
+				} else {
+					slot.has_frame = false
+					slot.tex_dirty = false
+					mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
+				}
 			}
 			slot.transform_x = clip.transform_x
 			slot.transform_y = clip.transform_y
