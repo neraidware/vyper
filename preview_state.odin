@@ -67,7 +67,8 @@ prewarm_next_clip :: proc() {
 			if c.kind != .Video {
 				continue
 			}
-			if playhead.frame < c.timeline_start_frame || playhead.frame >= c.timeline_start_frame + c.source_length_frames {
+			if playhead.frame < c.timeline_start_frame ||
+			   playhead.frame >= c.timeline_start_frame + c.source_length_frames {
 				continue
 			}
 			// c is the frontmost active video clip; warm what plays next on this track.
@@ -85,7 +86,8 @@ prewarm_next_clip :: proc() {
 			// (an extra open + keyframe seek into the file during the current
 			// clip's tail). Only pre-warm when the boundary is a source-index gap
 			// or a cross-asset leap -- the cases that would otherwise cold-seek.
-			if next.path == c.path && next.source_start_frame == c.source_start_frame + c.source_length_frames {
+			if next.path == c.path &&
+			   next.source_start_frame == c.source_start_frame + c.source_length_frames {
 				return
 			}
 			if warm_valid && warm_clip_id == next.clip_id {
@@ -101,15 +103,30 @@ prewarm_next_clip :: proc() {
 			// the background builder lands more segments); each decoded warm
 			// frame may come from a different segment than the last, and the
 			// decoder reopens when the physical file changes.
-			warm_pick, warm_base := proxy_pick_for_frame(next.path, next.source_length_frames, next.source_start_frame, warm_proxy_buf[:])
+			warm_pick, warm_base := proxy_pick_for_frame(
+				next.path,
+				next.source_length_frames,
+				next.source_start_frame,
+				warm_proxy_buf[:],
+			)
 			decoder_set_preview(&warm_decoder, warm_pick, warm_base)
-			if !decode_clip_frame_sync(&warm_decoder, next.path, next.source_start_frame, warm_buf[:]) {
+			if !decode_clip_frame_sync(
+				&warm_decoder,
+				next.path,
+				next.source_start_frame,
+				warm_buf[:],
+			) {
 				return
 			}
 			// Buttress the cache with a few following frames (cheap forward steps).
 			for kf in i64(1) ..< 4 {
 				wf := next.source_start_frame + kf
-				warm_pick, warm_base = proxy_pick_for_frame(next.path, next.source_length_frames, wf, warm_proxy_buf[:])
+				warm_pick, warm_base = proxy_pick_for_frame(
+					next.path,
+					next.source_length_frames,
+					wf,
+					warm_proxy_buf[:],
+				)
 				decoder_set_preview(&warm_decoder, warm_pick, warm_base)
 				if !decode_clip_frame_sync(&warm_decoder, next.path, wf, warm_buf[:]) {
 					break
@@ -152,7 +169,9 @@ update_preview_slots :: proc() -> bool {
 	// Warm the upcoming clip's decoder before the playhead crosses the
 	// boundary, so the transition hands over a warm decoder (no cut stall).
 	prewarm_next_clip()
-	for track_idx := 0; track_idx < len(timeline.tracks) && next_slot < MAX_PREVIEW_SLOTS; track_idx += 1 {
+	for track_idx := 0;
+	    track_idx < len(timeline.tracks) && next_slot < MAX_PREVIEW_SLOTS;
+	    track_idx += 1 {
 		track := &timeline.tracks[track_idx]
 		for i := 0; i < len(track.clips) && next_slot < MAX_PREVIEW_SLOTS; i += 1 {
 			clip := &track.clips[i]
@@ -160,7 +179,8 @@ update_preview_slots :: proc() -> bool {
 				continue
 			}
 			frame := playhead.frame
-			if frame < clip.timeline_start_frame || frame >= clip.timeline_start_frame + clip.source_length_frames {
+			if frame < clip.timeline_start_frame ||
+			   frame >= clip.timeline_start_frame + clip.source_length_frames {
 				continue
 			}
 			slot := &preview_slots[next_slot]
@@ -233,18 +253,38 @@ update_preview_slots :: proc() -> bool {
 				slot.path = clip.path
 				slot.tex_dirty = true
 				if nered_trace {
-					fmt.printf("[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
-						next_slot - 1, clip.asset_id, clip.timeline_start_frame, clip.source_start_frame, clip.source_length_frames, playhead.playing, same_asset, warm_hit, clip.clip_id, warm_clip_id)
+					fmt.printf(
+						"[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
+						next_slot - 1,
+						clip.asset_id,
+						clip.timeline_start_frame,
+						clip.source_start_frame,
+						clip.source_length_frames,
+						playhead.playing,
+						same_asset,
+						warm_hit,
+						clip.clip_id,
+						warm_clip_id,
+					)
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 			}
 			// A position/source shift invalidates the slot's decoded buffer; it
 			// is cleared below and the exact playhead frame requested next update
 			// (the source-frame cache makes the re-decode cheap).
-			anchor_shifted := slot.timeline_start_frame != clip.timeline_start_frame || slot.source_start_frame != clip.source_start_frame
+			anchor_shifted :=
+				slot.timeline_start_frame != clip.timeline_start_frame ||
+				slot.source_start_frame != clip.source_start_frame
 			if nered_trace && anchor_shifted {
-				fmt.printf("[vf] SHIFT asset=%d tl=%d->%d src=%d->%d playing=%v\n",
-					clip.asset_id, slot.timeline_start_frame, clip.timeline_start_frame, slot.source_start_frame, clip.source_start_frame, playhead.playing)
+				fmt.printf(
+					"[vf] SHIFT asset=%d tl=%d->%d src=%d->%d playing=%v\n",
+					clip.asset_id,
+					slot.timeline_start_frame,
+					clip.timeline_start_frame,
+					slot.source_start_frame,
+					clip.source_start_frame,
+					playhead.playing,
+				)
 			}
 			slot.timeline_start_frame = clip.timeline_start_frame
 			slot.source_start_frame = clip.source_start_frame
@@ -317,9 +357,21 @@ update_preview_slots :: proc() -> bool {
 					}
 					if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
 						delete(slot.text_scratch)
-						slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
+						slot.text_scratch = make(
+							[]u8,
+							text_scratch_size_for(TEXT_CLIP_FONT_PIXELS),
+						)
 					}
-					_, _, bw0, bh0 := rasterize_title_into_buffer(clip.name, slot.text_base_buf, base_bw, base_bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, TEXT_CLIP_FONT_PIXELS)
+					_, _, bw0, bh0 := rasterize_title_into_buffer(
+						clip.name,
+						slot.text_base_buf,
+						base_bw,
+						base_bh,
+						&text_clip_font,
+						&text_clip_font_init,
+						slot.text_scratch,
+						TEXT_CLIP_FONT_PIXELS,
+					)
 					clip.source_w = c.int(bw0)
 					clip.source_h = c.int(bh0)
 					slot.source_w = c.int(bw0)
@@ -340,7 +392,16 @@ update_preview_slots :: proc() -> bool {
 						delete(slot.text_buf)
 						slot.text_buf = make([]u8, need)
 					}
-					text_x, text_y, text_w, text_h := rasterize_title_into_buffer(clip.name, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px)
+					text_x, text_y, text_w, text_h := rasterize_title_into_buffer(
+						clip.name,
+						slot.text_buf,
+						bw,
+						bh,
+						&text_clip_font,
+						&text_clip_font_init,
+						slot.text_scratch,
+						font_px,
+					)
 					slot.text_x = text_x
 					slot.text_y = text_y
 					slot.text_w = text_w
@@ -377,7 +438,10 @@ update_preview_slots :: proc() -> bool {
 			// live. A slot that has not yet covered its current frame still
 			// decodes on the first throttled tick so a clip crossing the playhead
 			// mid-drag shows immediately.
-			scrub_skip := dragging_playhead && scrub_tick % SCRUB_DECIMATION != 0 && (slot_idx != front_video_slot || !async_has_worker())
+			scrub_skip :=
+				dragging_playhead &&
+				scrub_tick % SCRUB_DECIMATION != 0 &&
+				(slot_idx != front_video_slot || !async_has_worker())
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
 			// the background builder lands more segments, so the frame the
@@ -386,7 +450,12 @@ update_preview_slots :: proc() -> bool {
 			// reopens on the physical-file change; render/probe paths are
 			// unaffected because they never set a preview target.
 			pick_buf: [4096]u8
-			slot_pick, slot_base := proxy_pick_for_frame(clip.path, clip.source_length_frames, clip_frame, pick_buf[:])
+			slot_pick, slot_base := proxy_pick_for_frame(
+				clip.path,
+				clip.source_length_frames,
+				clip_frame,
+				pick_buf[:],
+			)
 			// Idle-skip: when the playhead is parked and this slot already
 			// shows the exact frame decoded through the exact same proxy file
 			// the pick just resolved to, the screen is already correct — skip
@@ -395,7 +464,10 @@ update_preview_slots :: proc() -> bool {
 			// segments, so the SAME source frame may later resolve to a better
 			// file (source -> segment); that must re-decode even while parked.
 			pick_hash := pick_hash_u32(slot_pick)
-			if slot.has_frame && !slot.tex_dirty && slot.displayed_frame == clip_frame && slot.displayed_pick == pick_hash {
+			if slot.has_frame &&
+			   !slot.tex_dirty &&
+			   slot.displayed_frame == clip_frame &&
+			   slot.displayed_pick == pick_hash {
 				continue
 			}
 			if !scrub_skip || !slot.has_frame {
@@ -410,7 +482,12 @@ update_preview_slots :: proc() -> bool {
 						// consumed; later frames decode on the worker.
 						slot.prime_from_warm = false
 						decoder_set_preview(&slot.dec, slot_pick, slot_base)
-						if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
+						if decode_clip_frame_sync(
+							&slot.dec,
+							slot.path,
+							clip_frame,
+							slot.buffer[:],
+						) {
 							slot.displayed_frame = clip_frame
 							slot.displayed_pick = pick_hash
 							slot.has_frame = true
@@ -449,7 +526,11 @@ update_preview_slots :: proc() -> bool {
 						// honest; otherwise the slot advertises a (frame,file)
 						// identity that matches no real decode and the preview
 						// re-decodes/serves the wrong thing across the boundary.
-						if ok, dyn_frame, served_pick := async_try_consume_latest(slot.path, clip_frame, slot.buffer[:]); ok {
+						if ok, dyn_frame, served_pick := async_try_consume_latest(
+							slot.path,
+							clip_frame,
+							slot.buffer[:],
+						); ok {
 							slot.displayed_frame = dyn_frame
 							slot.displayed_pick = served_pick
 							slot.has_frame = true
@@ -494,7 +575,7 @@ update_preview_slots :: proc() -> bool {
 // state that can fight (and show) the removed clip at the playhead. This is the
 // other half of the "deleted clip keeps rendering" bug — the timeline and audio
 // drop the clip, but the preview slot must drop it too, explicitly.
-	invalidate_preview_slots :: proc() {
+invalidate_preview_slots :: proc() {
 	// The warm decoder targets a clip that no longer exists; drop it so a
 	// stale hand-in can never occur.
 	if warm_valid {
@@ -574,20 +655,39 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		lines := strings.split(active_text, "\n")
 		defer delete(lines)
 
-		// Base measure at font 48: tight ink dims, and the new box dims for the
-		// re-center. The transform is a TOP-LEFT anchor, so centering on the
-		// anchor means transform = anchor_center - box/2.
+		// Base measure at font 48. The box is ink WIDTH x galley HEIGHT. The
+		// galley estimate is ~1.2 px/char wide but the font's real advance is
+		// far smaller, so the ink sits at the LEFT of the galley — a
+		// galley-wide box would push the text off-center. Use the tight ink
+		// width (text centered), and the galley height: the galley bottom is a
+		// font-metric line (fixed tail padding), so the last line's baseline
+		// sits a constant distance above it. That keeps the baseline fixed
+		// when the cue gains descenders or a second line. Anchoring the tight
+		// ink bottom is wrong: it tracks the deepest descender and drags the
+		// baseline up.
 		base_bw, base_bh := text_buf_size_for_lines(lines, TEXT_CLIP_FONT_PIXELS)
 		need_base := base_bw * base_bh * 4
 		if need_base > len(slot.text_base_buf) {
 			delete(slot.text_base_buf)
-			slot.text_base_buf = make([]u8, need_base)
+			slot.text_base_buf = {} // delete leaves a stale non-zero len; a later
+			slot.text_base_buf = make([]u8, need_base) // grow-check must not see it
 		}
 		if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
 			delete(slot.text_scratch)
+			slot.text_scratch = {} // same stale-len hazard
 			slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
 		}
-		_, _, bw0, bh0 := rasterize_lines_into_buffer(lines, slot.text_base_buf, base_bw, base_bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, TEXT_CLIP_FONT_PIXELS, context.temp_allocator)
+		_, _, ink_w, ink_h := rasterize_lines_into_buffer(
+			lines,
+			slot.text_base_buf,
+			base_bw,
+			base_bh,
+			&text_clip_font,
+			&text_clip_font_init,
+			slot.text_scratch,
+			TEXT_CLIP_FONT_PIXELS,
+			context.temp_allocator,
+		)
 
 		// Project-space box size for source_w x source_h text pixels at scale (1
 		// source px maps to scale * PW/PREVIEW_W project px, uniform in both
@@ -596,9 +696,9 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		old_w := f32(clip.source_w) * clip.scale * k
 		old_h := f32(clip.source_h) * clip.scale * k
 		had_box := clip.source_w > 0 && clip.source_h > 0 && old_w > 0 && old_h > 0
-		new_w := f32(bw0) * clip.scale * k
-		new_h := f32(bh0) * clip.scale * k
-		if new_w <= 1 || new_h <= 1 {
+		new_w := f32(ink_w) * clip.scale * k
+		new_h := f32(base_bh) * clip.scale * k
+		if ink_w <= 1 || ink_h <= 1 {
 			// No measurable ink (empty/whitespace-only cue text).
 			slot.has_frame = false
 			slot.text_w = 0
@@ -608,10 +708,9 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		}
 		if had_box {
 			// Re-anchor on the previous box: keep the box CENTER in x and the
-			// box BOTTOM EDGE in y fixed. The bottom edge is the text baseline
-			// (box height == ink height), so subtitles grow upward instead of
-			// floating as the cue's line count changes. Center-anchoring y
-			// would make every 1-line<->2-line cue jump.
+			// box BOTTOM EDGE in y fixed. The bottom edge is the galley bottom
+			// (a font-metric line), so subtitles grow upward around a stable
+			// baseline instead of floating as the cue's line count changes.
 			cx := clip.transform_x + old_w / 2
 			bottom := clip.transform_y + old_h
 			clip.transform_x = cx - new_w / 2
@@ -621,32 +720,49 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			clip.transform_x = f32(project.width) / 2 - new_w / 2
 			clip.transform_y = f32(project.height) / 2 - new_h / 2
 		}
-		clip.source_w = c.int(bw0)
-		clip.source_h = c.int(bh0)
-		slot.source_w = c.int(bw0)
-		slot.source_h = c.int(bh0)
+		clip.source_w = c.int(ink_w)
+		clip.source_h = c.int(base_bh)
+		slot.source_w = c.int(ink_w)
+		slot.source_h = c.int(base_bh)
 
 		// Re-render at the baked font (48*scale) for the texture.
 		slot.text_font_px = font_px
 		need_sc := text_scratch_size_for(font_px)
 		if need_sc > len(slot.text_scratch) {
 			delete(slot.text_scratch)
+			slot.text_scratch = {} // stale-len hazard (above)
 			slot.text_scratch = make([]u8, need_sc)
 		}
 		bw, bh := text_buf_size_for_lines(lines, font_px)
 		need := bw * bh * 4
 		if need > len(slot.text_buf) {
 			delete(slot.text_buf)
+			slot.text_buf = {} // stale-len hazard (above)
 			slot.text_buf = make([]u8, need)
 		}
-		tx, ty, tw, th := rasterize_lines_into_buffer(lines, slot.text_buf, bw, bh, &text_clip_font, &text_clip_font_init, slot.text_scratch, font_px, context.temp_allocator)
-		slot.text_x = tx
-		slot.text_y = ty
-		slot.text_w = tw
-		slot.text_h = th
+		ink_x, _, ink_bw, _ := rasterize_lines_into_buffer(
+			lines,
+			slot.text_buf,
+			bw,
+			bh,
+			&text_clip_font,
+			&text_clip_font_init,
+			slot.text_scratch,
+			font_px,
+			context.temp_allocator,
+		)
+		// Sample the ink horizontally (text sits at the left of the over-wide
+		// galley estimate) over the FULL galley height. The ink box is
+		// source_w x source_h, so the sub-rect maps 1:1 onto the quad with the
+		// text centered. Full-height sampling keeps the baseline on the galley
+		// bottom (see above).
+		slot.text_x = ink_x
+		slot.text_y = 0
+		slot.text_w = ink_bw
+		slot.text_h = bh
 		slot.text_tex_w = c.int(bw)
 		slot.text_tex_h = c.int(bh)
-		slot.has_frame = tw > 0 && th > 0
+		slot.has_frame = true
 		slot.tex_dirty = true
 		slot.text_recreate = true
 		changed = true

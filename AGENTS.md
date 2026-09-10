@@ -22,6 +22,10 @@ order, or consciously deviate with a comment saying why.
 - Iterate by index over slices; never hand-roll containers that `core` already
   provides well.
 - Reuse hot buffers; don't rebuild the same scratch inside a loop.
+- Hand-rolled solutions (own containers, mini frame formats, custom fiddly
+  loops) are fine when nothing existing solves the problem well — but avoid
+  them otherwise: every hand-rolled widget is an implementation we maintain,
+  not a dependency. Favor `core`/vendored libs unless they provably don't fit.
 - "Clean" here means code that does exactly what it needs to and no more —
   not idiomatic ceremony a Java reviewer would applaud. Fast, understandable,
   simple at its core. If you must pick, pick simple and fast over "sound".
@@ -40,6 +44,14 @@ lifetimes, and shares its data, so the ground rules come first.
   opportunity.
 - Static nothing; pre-sized everything. Explicit ownership: caller passes the
   buffer, callee fills it.
+- **Avoid individual allocations.** A one-off `make([]T, 1)`, per-item `new`,
+  per-call pair of `make`+`delete` is expensive and breeds bookkeeping bugs
+  (leaks, stale-length reuse after `delete`, µff-by-one lifetimes). Allocate in
+  bulk or from the pool/model that owns the shape: fixed slot arrays with an
+  `in_use` flag (preview_slots), grow-only append buffers (srt_cache), arena
+  scratches. `new`/`delete` on single objects happen rarely, deliberately, at a
+  teardown/ownership boundary — not inline in a routine that runs per frame or
+  per cue.
 
 ### Address by handle, never by a pointer you keep
 

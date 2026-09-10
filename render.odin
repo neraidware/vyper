@@ -109,46 +109,46 @@ render_output_name :: proc() -> string {
 // ---------------------------------------------------------------------------
 
 Render_Video_Src :: struct {
-	path:                cstring, // owned copy, freed by the worker
-	stream_index:        c.int,
-	source_start_frame:  i64,
+	path:                 cstring, // owned copy, freed by the worker
+	stream_index:         c.int,
+	source_start_frame:   i64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
-	transform_x:         f32,
-	transform_y:         f32,
-	scale:               f32,
-	crop_l:              f32,
-	crop_r:              f32,
-	crop_t:              f32,
-	crop_b:              f32,
-	source_w:            c.int,
-	source_h:            c.int,
+	transform_x:          f32,
+	transform_y:          f32,
+	scale:                f32,
+	crop_l:               f32,
+	crop_r:               f32,
+	crop_t:               f32,
+	crop_b:               f32,
+	source_w:             c.int,
+	source_h:             c.int,
 	// Compositing state (computed once at open).
-	dec:                 Clip_Decoder,
-	rw, rh:              c.int, // display (cropped box) rect size in output pixels
-	ox, oy:              c.int, // rounded top-left offset on the canvas
-	fw, fh:              c.int, // full (pre-crop) box size the frame decodes into
-	blit:                []u8,  // fw*fh*4 scaled frame
+	dec:                  Clip_Decoder,
+	rw, rh:               c.int, // display (cropped box) rect size in output pixels
+	ox, oy:               c.int, // rounded top-left offset on the canvas
+	fw, fh:               c.int, // full (pre-crop) box size the frame decodes into
+	blit:                 []u8, // fw*fh*4 scaled frame
 }
 
 // Render_Text_Src snapshots a .Text generator clip for the worker. It carries
 // the title plus the transform math needed to place it at output resolution:
 // box = text (source_w x source_h, in text px) * scale * (out_w / PREVIEW_W).
 Render_Text_Src :: struct {
-	name:               string, // owned copy, freed by the worker
+	name:                 string, // owned copy, freed by the worker
 	timeline_start_frame: i64,
 	source_length_frames: i64,
-	transform_x:        f32, // top-left anchor
-	transform_y:        f32,
-	scale:              f32,
-	source_w:           c.int, // text_w (tight ink width, text px)
-	source_h:           c.int, // text_h (tight ink height, text px)
+	transform_x:          f32, // top-left anchor
+	transform_y:          f32,
+	scale:                f32,
+	source_w:             c.int, // text_w (tight ink width, text px)
+	source_h:             c.int, // text_h (tight ink height, text px)
 }
 
 // The render worker rasterizes text with its own font + scratch so it never
 // races the UI thread's shared text_clip_font/text_clip_scratch globals (the
 // preview thread can be compositing a text slot while the worker renders).
-render_text_font:      stb.fontinfo
+render_text_font: stb.fontinfo
 render_text_font_init: bool
 
 // Render_Text_Job is a text clip's per-render precomputed raster + box, built
@@ -157,10 +157,10 @@ render_text_font_init: bool
 // output crisp and consistent with the preview; blit_scale is the clip's baked
 // scale (=1) so the box falls out of the tight dims times the uniform factor.
 Render_Text_Job :: struct {
-	raster: []u8,
-	bw:     int, // raster row stride
+	raster:         []u8,
+	bw:             int, // raster row stride
 	ox, oy, ow, oh: int, // tight ink rect in raster
-	blit_scale: f32,
+	blit_scale:     f32,
 }
 
 // text_scratch: worker needs its own dynamic scratch for baked fonts (the
@@ -187,7 +187,16 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 		delete(render_text_setup_scratch)
 		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
 	}
-	ox, oy, ow, oh := rasterize_title_into_buffer(t.name, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, font_px)
+	ox, oy, ow, oh := rasterize_title_into_buffer(
+		t.name,
+		buf,
+		bw,
+		bh,
+		&render_text_font,
+		&render_text_font_init,
+		render_text_setup_scratch,
+		font_px,
+	)
 	if ow <= 0 || oh <= 0 {
 		delete(buf)
 		return
@@ -206,28 +215,29 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 // text to"), recomputed from the snapshot's transform+source_w/h; each cue
 // change re-centers the new box on that anchor, matching the preview.
 Render_Sub_Src :: struct {
-	srt_id:              int,
-	fps:                 f32, // project rate, cues resolve to frames at this
+	srt_id:               int,
+	fps:                  f32, // project rate, cues resolve to frames at this
 	timeline_start_frame: i64,
-	source_start_frame:  i64,
+	source_start_frame:   i64,
 	source_length_frames: i64,
-	transform_x:         f32, // current top-left anchor (project coords)
-	transform_y:         f32,
-	scale:               f32,
-	source_w:            c.int, // current cue's base ink dims (font 48)
-	source_h:            c.int,
+	transform_x:          f32, // current top-left anchor (project coords)
+	transform_y:          f32,
+	scale:                f32,
+	source_w:             c.int, // current cue's base ink dims (font 48)
+	source_h:             c.int,
 	// Worker-computed at setup: the fixed box center each cue stays centered on.
-	anchor_x: f32,
-	anchor_y: f32,
+	anchor_x:             f32,
+	anchor_y:             f32,
 }
 
 // Render_Sub_Cue is the worker's raster cache for one subtitle clip's ACTIVE
 // cue (keyspace is per clip). Cues play forward in population order during a
 // render, so a single slot per clip has a perfect hit rate between boundaries.
 Render_Sub_Cue :: struct {
-	cue_idx: int,
-	raster:  []u8, // baked-font (48*scale) RGBA raster
-	bw:      int,  // raster row stride
+	cue_idx:        int,
+	raster:         []u8, // baked-font (48*scale) RGBA raster
+	bw:             int, // raster row stride
+	bh:             int, // raster height
 	ox, oy, ow, oh: int, // tight ink rect in the raster
 }
 
@@ -250,13 +260,37 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		delete(render_text_setup_scratch)
 		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
 	}
-	ox, oy, ow, oh := rasterize_lines_into_buffer(lines, buf, bw, bh, &render_text_font, &render_text_font_init, render_text_setup_scratch, font_px, context.allocator)
+	ox, oy, ow, oh := rasterize_lines_into_buffer(
+		lines,
+		buf,
+		bw,
+		bh,
+		&render_text_font,
+		&render_text_font_init,
+		render_text_setup_scratch,
+		font_px,
+		context.allocator,
+	)
+	if nered_trace || os.get_env_alloc("NERED_SUB_RENDER_TRACE", context.temp_allocator) != "" {
+		fmt.printf(
+			"[sub-raster] len=%d scale=%.1f bw=%d bh=%d ink=%d,%d,%d,%d\n",
+			len(text),
+			scale,
+			bw,
+			bh,
+			ox,
+			oy,
+			ow,
+			oh,
+		)
+	}
 	if ow <= 0 || oh <= 0 {
 		delete(buf)
 		return
 	}
 	j.raster = buf
 	j.bw = bw
+	j.bh = bh
 	j.ox, j.oy, j.ow, j.oh = ox, oy, ow, oh
 }
 
@@ -267,9 +301,9 @@ Render_Audio_Src :: struct {
 	source_start_frame:   i64,
 	source_length_frames: i64,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
-	fifo:                 [dynamic]f32,     // converted stereo f32, content-relative
-	first48:              i64,              // content 48 kHz frame of fifo[0]
-	have48:               i64,              // content frames produced so far (next un-produced)
+	fifo:                 [dynamic]f32, // converted stereo f32, content-relative
+	first48:              i64, // content 48 kHz frame of fifo[0]
+	have48:               i64, // content frames produced so far (next un-produced)
 }
 
 render_job_videos: []Render_Video_Src
@@ -277,10 +311,10 @@ render_job_audios: []Render_Audio_Src
 render_job_texts: []Render_Text_Src
 render_job_subs: []Render_Sub_Src
 render_job_out_path: cstring
-render_job_width:  c.int
+render_job_width: c.int
 render_job_height: c.int
-render_job_start:  i64
-render_job_end:    i64 // inclusive
+render_job_start: i64
+render_job_end: i64 // inclusive
 render_job_nframes: i64
 
 // clip_full_box_dims works on ^Clip; mirrored here for snapshot structs.
@@ -298,13 +332,12 @@ render_full_box_dims :: proc(sw0, sh0: c.int, out_w, out_h: f32) -> (f32, f32) {
 
 // render_display_rect returns the clip's visible rect in project (output)
 // pixels, honoring source aspect (letterbox) and crop insets.
-render_display_rect :: proc(
-	src: ^Render_Video_Src,
-	PW, PH: c.int,
-) -> (l, t, r, b: f32) {
+render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, b: f32) {
 	cw, ch := render_full_box_dims(
-		src.source_w, src.source_h,
-		f32(PW) * src.scale, f32(PH) * src.scale,
+		src.source_w,
+		src.source_h,
+		f32(PW) * src.scale,
+		f32(PH) * src.scale,
 	)
 	l = src.transform_x - cw / 2 + src.crop_l * cw
 	r = src.transform_x + cw / 2 - src.crop_r * cw
@@ -318,22 +351,26 @@ render_display_rect :: proc(
 // ---------------------------------------------------------------------------
 
 Render_Enc :: struct {
-	fmt_ctx:       ^avfmt.FormatContext,
-	vstream:       ^avfmt.Stream,
-	vcodec_ctx:    ^avcodec.CodecContext,
-	astream:       ^avfmt.Stream,
-	acodec_ctx:    ^avcodec.CodecContext,
-	sws_rgb_yuv:   ^sws.Context,
-	yuv_data:      [4][^]u8,
-	yuv_linesize:  [4]c.int,
-	yuv_avail:     bool,
-	audio_frame:   ^avutil.Frame,
-	audio_plane:   bool,
-	vpkt:          ^avcodec.Packet,
-	apkt:          ^avcodec.Packet,
-	audio_pending: [AAC_FRAME_SIZE * 2 * 2]f32,
+	fmt_ctx:         ^avfmt.FormatContext,
+	vstream:         ^avfmt.Stream,
+	vcodec_ctx:      ^avcodec.CodecContext,
+	astream:         ^avfmt.Stream,
+	acodec_ctx:      ^avcodec.CodecContext,
+	sws_rgb_yuv:     ^sws.Context,
+	yuv_data:        [4][^]u8,
+	yuv_linesize:    [4]c.int,
+	yuv_avail:       bool,
+	audio_frame:     ^avutil.Frame,
+	audio_plane:     bool,
+	vpkt:            ^avcodec.Packet,
+	apkt:            ^avcodec.Packet,
+	// Pending audio holds the largest push (MAX_AUDIO_FRAME_SAMPLES*2 stereo
+	// samples) plus the sub-AAC residue a flush leaves behind; a 4096-cap
+	// alone overflowed whenever residue + chunk crossed it (bounds trap at
+	// every 30 fps render).
+	audio_pending:   [MAX_AUDIO_FRAME_SAMPLES * 2 + AAC_FRAME_SIZE * 2]f32,
 	audio_pending_n: int,
-	audio_sent:    i64, // total 48k samples pushed so far (pts basis)
+	audio_sent:      i64, // total 48k samples pushed so far (pts basis)
 }
 
 enc_cleanup :: proc(e: ^Render_Enc) {
@@ -369,7 +406,12 @@ enc_cleanup :: proc(e: ^Render_Enc) {
 
 // enc_write_packets drains an encoder's output packets into the muxer,
 // rescaling timestamps from the codec time base to the stream time base.
-enc_drain :: proc(e: ^Render_Enc, ctx: ^avcodec.CodecContext, stream: ^avfmt.Stream, pkt: ^avcodec.Packet) -> bool {
+enc_drain :: proc(
+	e: ^Render_Enc,
+	ctx: ^avcodec.CodecContext,
+	stream: ^avfmt.Stream,
+	pkt: ^avcodec.Packet,
+) -> bool {
 	for avcodec.receive_packet(ctx, pkt) >= 0 {
 		pkt.stream_index = stream.index
 		pkt.pts = avutil.rescale_q(pkt.pts, ctx.time_base, stream.time_base)
@@ -402,8 +444,14 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c
 	ctx.height = height
 	// The output canvas ticks the source/timeline frame rate, not a fixed 60,
 	// so the rendered video and its audio track stay 1:1 with the source.
-	ctx.time_base = avutil.Rational{num = fps_den, den = fps_num}
-	ctx.framerate = avutil.Rational{num = fps_num, den = fps_den}
+	ctx.time_base = avutil.Rational {
+		num = fps_den,
+		den = fps_num,
+	}
+	ctx.framerate = avutil.Rational {
+		num = fps_num,
+		den = fps_den,
+	}
 	ctx.pix_fmt = .YUV420P
 	ctx.gop_size = 120
 	ctx.max_b_frames = 2
@@ -427,15 +475,30 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c
 	stream.codecpar.height = height
 
 	e.sws_rgb_yuv = sws.getContext(
-		width, height, avutil.PixelFormat.RGBA,
-		width, height, avutil.PixelFormat.YUV420P,
-		sws.Flags{.Bilinear}, nil, nil, nil,
+		width,
+		height,
+		avutil.PixelFormat.RGBA,
+		width,
+		height,
+		avutil.PixelFormat.YUV420P,
+		sws.Flags{.Bilinear},
+		nil,
+		nil,
+		nil,
 	)
 	if e.sws_rgb_yuv == nil {
 		fmt.println("sws_getContext (rgb->yuv) failed")
 		return false
 	}
-	if avutil.image_alloc(&e.yuv_data[0], &e.yuv_linesize[0], width, height, avutil.PixelFormat.YUV420P, 32) < 0 {
+	if avutil.image_alloc(
+		   &e.yuv_data[0],
+		   &e.yuv_linesize[0],
+		   width,
+		   height,
+		   avutil.PixelFormat.YUV420P,
+		   32,
+	   ) <
+	   0 {
 		fmt.println("av_image_alloc (yuv) failed")
 		return false
 	}
@@ -462,7 +525,10 @@ enc_open_audio :: proc(e: ^Render_Enc) -> bool {
 	ctx.sample_fmt = .FltP
 	avutil.channel_layout_default(&ctx.ch_layout, 2)
 	ctx.bit_rate = 192_000
-	ctx.time_base = avutil.Rational{num = 1, den = RENDER_AUDIO_RATE}
+	ctx.time_base = avutil.Rational {
+		num = 1,
+		den = RENDER_AUDIO_RATE,
+	}
 	if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
 		fmt.println("avcodec_open2 (aac):", ff_err_str(ret))
 		return false
@@ -488,7 +554,15 @@ enc_open_audio :: proc(e: ^Render_Enc) -> bool {
 	f.format = c.int(avutil.SampleFormat.FltP)
 	f.sample_rate = RENDER_AUDIO_RATE
 	avutil.channel_layout_default(&f.ch_layout, 2)
-	if avutil.samples_alloc(&f.data[0], &f.linesize[0], 2, AAC_FRAME_SIZE, avutil.SampleFormat.FltP, 0) < 0 {
+	if avutil.samples_alloc(
+		   &f.data[0],
+		   &f.linesize[0],
+		   2,
+		   AAC_FRAME_SIZE,
+		   avutil.SampleFormat.FltP,
+		   0,
+	   ) <
+	   0 {
 		fmt.println("av_samples_alloc (audio) failed")
 		return false
 	}
@@ -496,7 +570,13 @@ enc_open_audio :: proc(e: ^Render_Enc) -> bool {
 	return true
 }
 
-render_open_output :: proc(e: ^Render_Enc, path: cstring, width, height: c.int, with_audio: bool, fps_num, fps_den: c.int) -> bool {
+render_open_output :: proc(
+	e: ^Render_Enc,
+	path: cstring,
+	width, height: c.int,
+	with_audio: bool,
+	fps_num, fps_den: c.int,
+) -> bool {
 	if ret := avfmt.alloc_output_context2(&e.fmt_ctx, nil, nil, path); ret < 0 {
 		// Fall back to guessing the format by name.
 		if ret2 := avfmt.alloc_output_context2(&e.fmt_ctx, nil, cstring("mp4"), path); ret2 < 0 {
@@ -521,14 +601,20 @@ render_open_output :: proc(e: ^Render_Enc, path: cstring, width, height: c.int, 
 	return true
 }
 
-rend_enc_video_frame :: proc(e: ^Render_Enc, rgb: []u8, width, height: c.int, frame_index: i64) -> bool {
+rend_enc_video_frame :: proc(
+	e: ^Render_Enc,
+	rgb: []u8,
+	width, height: c.int,
+	frame_index: i64,
+) -> bool {
 	slice: [1][^]u8 = {raw_data(rgb)}
 	ls: [4]c.int = {width * 4, 0, 0, 0}
 	sws.scale(
 		e.sws_rgb_yuv,
 		cast([^][^]u8)&slice[0],
 		cast([^]c.int)&ls[0],
-		0, height,
+		0,
+		height,
 		cast([^][^]u8)&e.yuv_data[0],
 		cast([^]c.int)&e.yuv_linesize[0],
 	)
@@ -632,7 +718,15 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 		return false
 	}
 	src := &a.dec
-	real_sec := f64(avutil.rescale_q(src.first_ts, src.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
+	real_sec :=
+		f64(
+			avutil.rescale_q(
+				src.first_ts,
+				src.stream.time_base,
+				avutil.Rational{num = 1, den = 1_000_000},
+			),
+		) /
+		1e6
 	a.first48 = i64(real_sec * f64(RENDER_AUDIO_RATE))
 	a.have48 = a.first48 + i64(n)
 	for j in 0 ..< n {
@@ -698,8 +792,10 @@ render_worker_run :: proc() {
 		// Decode the frame at the full (pre-crop) box size so the cropped
 		// region can be sampled out of it (render_blit).
 		cw, ch := render_full_box_dims(
-			v.source_w, v.source_h,
-			f32(render_job_width) * v.scale, f32(render_job_height) * v.scale,
+			v.source_w,
+			v.source_h,
+			f32(render_job_width) * v.scale,
+			f32(render_job_height) * v.scale,
 		)
 		v.fw = max(1, c.int(cw + 0.5))
 		v.fh = max(1, c.int(ch + 0.5))
@@ -752,7 +848,15 @@ render_worker_run :: proc() {
 		}
 	}
 
-	if !render_open_output(&e, render_job_out_path, render_job_width, render_job_height, has_audio, rfps_num, rfps_den) {
+	if !render_open_output(
+		&e,
+		render_job_out_path,
+		render_job_width,
+		render_job_height,
+		has_audio,
+		rfps_num,
+		rfps_den,
+	) {
 		err_msg = "failed to open output"
 		fail = true
 		return
@@ -799,7 +903,8 @@ render_worker_run :: proc() {
 		mem.zero(raw_data(canvas), len(canvas))
 		for i := len(render_job_videos) - 1; i >= 0; i -= 1 {
 			v := &render_job_videos[i]
-			if timeline_frame < v.timeline_start_frame || timeline_frame >= v.timeline_start_frame + v.source_length_frames {
+			if timeline_frame < v.timeline_start_frame ||
+			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
 				continue
 			}
 			src_frame := v.source_start_frame + timeline_frame - v.timeline_start_frame
@@ -813,7 +918,8 @@ render_worker_run :: proc() {
 		// clips, alpha-blended on top, matching the preview layering).
 		for i := 0; i < len(render_job_texts); i += 1 {
 			t := &render_job_texts[i]
-			if timeline_frame < t.timeline_start_frame || timeline_frame >= t.timeline_start_frame + t.source_length_frames {
+			if timeline_frame < t.timeline_start_frame ||
+			   timeline_frame >= t.timeline_start_frame + t.source_length_frames {
 				continue
 			}
 			if t.name == "" {
@@ -823,14 +929,28 @@ render_worker_run :: proc() {
 			if j.raster == nil || j.ow <= 0 || j.oh <= 0 {
 				continue
 			}
-			render_text_blit(canvas, render_job_width, render_job_height, j.raster, j.bw, j.ox, j.oy, j.ow, j.oh, t.transform_x, t.transform_y, j.blit_scale)
+			render_text_blit(
+				canvas,
+				render_job_width,
+				render_job_height,
+				j.raster,
+				j.bw,
+				j.ox,
+				j.oy,
+				j.ow,
+				j.oh,
+				t.transform_x,
+				t.transform_y,
+				j.blit_scale,
+			)
 		}
 		// Composite subtitle-generator clips last (on top of everything else —
 		// the natural subtitle layering; matches the preview, where the topmost
 		// text/bottom-most slot order puts subtitles above the decoded faces).
 		for i in 0 ..< len(render_job_subs) {
 			s := &render_job_subs[i]
-			if timeline_frame < s.timeline_start_frame || timeline_frame >= s.timeline_start_frame + s.source_length_frames {
+			if timeline_frame < s.timeline_start_frame ||
+			   timeline_frame >= s.timeline_start_frame + s.source_length_frames {
 				continue
 			}
 			src := srt_source(s.srt_id)
@@ -853,9 +973,50 @@ render_worker_run :: proc() {
 					continue
 				}
 			}
+			// Blit the ink sub-rect horizontally over the FULL galley height,
+			// anchored like the preview slot: x centered on the box center, y
+			// on the box BOTTOM. The box is ink-width x galley-height, so the
+			// text stays centered while the galley bottom (a font-metric line)
+			// keeps the last line's baseline fixed when the cue gains
+			// descenders or a line — matching preview_state.odin.
 			w := f32(jc.ow) * sub_factor
-			h := f32(jc.oh) * sub_factor
-			render_text_blit(canvas, render_job_width, render_job_height, jc.raster, jc.bw, jc.ox, jc.oy, jc.ow, jc.oh, s.anchor_x - w / 2, s.anchor_y - h / 2, 1)
+			h := f32(jc.bh) * sub_factor
+			bottom := s.anchor_y + f32(s.source_h) * s.scale * sub_factor / 2
+			if nered_trace ||
+			   os.get_env_alloc("NERED_SUB_RENDER_TRACE", context.temp_allocator) != "" {
+				fmt.printf(
+					"[sub-blit] cue=%d ox=%d oy=%d ow=%d oh=%d bw=%d bh=%d w=%.0f h=%.0f x0=%.0f y0=%.0f anchor=(%.0f,%.0f) src=%dx%d\n",
+					ci,
+					jc.ox,
+					jc.oy,
+					jc.ow,
+					jc.oh,
+					jc.bw,
+					jc.bh,
+					w,
+					h,
+					s.anchor_x - w / 2,
+					bottom - h,
+					s.anchor_x,
+					s.anchor_y,
+					s.source_w,
+					s.source_h,
+				)
+			}
+			render_text_blit(
+				canvas,
+				render_job_width,
+				render_job_height,
+				jc.raster,
+				jc.bw,
+				jc.ox,
+				0,
+				jc.ow,
+				jc.bh,
+				s.anchor_x - w / 2,
+				bottom - h,
+				1,
+			)
 		}
 		if !rend_enc_video_frame(&e, canvas, render_job_width, render_job_height, frame_idx) {
 			err_msg = "video encoding failed"
@@ -881,10 +1042,15 @@ render_worker_run :: proc() {
 				if !a.dec.opened {
 					continue
 				}
-				if timeline_frame < a.timeline_start_frame || timeline_frame >= a.timeline_start_frame + a.source_length_frames {
+				if timeline_frame < a.timeline_start_frame ||
+				   timeline_frame >= a.timeline_start_frame + a.source_length_frames {
 					continue
 				}
-				start48 := i64(f64(timeline_frame - a.timeline_start_frame + a.source_start_frame) * f64(RENDER_AUDIO_RATE) / rfps)
+				start48 := i64(
+					f64(timeline_frame - a.timeline_start_frame + a.source_start_frame) *
+					f64(RENDER_AUDIO_RATE) /
+					rfps,
+				)
 				render_audio_pull(a, start48 + i64(cur_spf))
 				if start48 < a.first48 || a.have48 < start48 + i64(cur_spf) {
 					continue
@@ -902,7 +1068,11 @@ render_worker_run :: proc() {
 					a.first48 += i64(drop)
 					remain := len(a.fifo) - drop * 2
 					if remain > 0 {
-						mem.copy(raw_data(a.fifo[0:]), raw_data(a.fifo[drop * 2:]), remain * size_of(f32))
+						mem.copy(
+							raw_data(a.fifo[0:]),
+							raw_data(a.fifo[drop * 2:]),
+							remain * size_of(f32),
+						)
 					}
 					resize(&a.fifo, remain)
 				}
@@ -996,8 +1166,11 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 // is never squished by the project's aspect), box = bw0*scale x bh0*scale with
 // scale=1 post-bake. bw is the buffer's row stride (the raster's own width).
 render_text_blit :: proc(
-	canvas: []u8, draw_w, draw_h: c.int,
-	text_buf: []u8, bw: int, ox, oy, ow, oh: int,
+	canvas: []u8,
+	draw_w, draw_h: c.int,
+	text_buf: []u8,
+	bw: int,
+	ox, oy, ow, oh: int,
 	tx, ty, scale: f32,
 ) {
 	if ow <= 0 || oh <= 0 {
@@ -1139,78 +1312,93 @@ render_start :: proc() {
 			clip := &tr.clips[i]
 			switch clip.kind {
 			case .Video, .Image:
-				append(&cls, Render_Video_Src{
-					path = strings.clone_to_cstring(string(clip.path)),
-					stream_index = clip.stream_index,
-					source_start_frame = clip.source_start_frame,
-					source_length_frames = clip.source_length_frames,
-					timeline_start_frame = clip.timeline_start_frame,
-					transform_x = clip.transform_x,
-					transform_y = clip.transform_y,
-					scale = clip.scale,
-					crop_l = clip.crop_l,
-					crop_r = clip.crop_r,
-					crop_t = clip.crop_t,
-					crop_b = clip.crop_b,
-					source_w = clip.source_w,
-					source_h = clip.source_h,
-				})
-            case .Audio:
-			    append(&auds, Render_Audio_Src{
-				    path = strings.clone_to_cstring(string(clip.path)),
-				    stream_index = clip.stream_index,
-				    timeline_start_frame = clip.timeline_start_frame,
-				    source_start_frame = clip.source_start_frame,
-				    source_length_frames = clip.source_length_frames,
-			    })
-		    case .Other:
-			    // no renderable content in this clip
-		    case .Empty:
-			    // no renderable content in this clip (placeholder for text later)
-		    case .Text:
-			    if clip.generator == .Subtitles {
-				    append(&subs, Render_Sub_Src{
-					    srt_id = clip.srt_id,
-					    fps = f32(timeline_fps()),
-					    timeline_start_frame = clip.timeline_start_frame,
-					    source_start_frame = clip.source_start_frame,
-					    source_length_frames = clip.source_length_frames,
-					    transform_x = clip.transform_x,
-					    transform_y = clip.transform_y,
-					    scale = clip.scale,
-					    source_w = clip.source_w,
-					    source_h = clip.source_h,
-				    })
-			    } else {
-				    append(&txts, Render_Text_Src{
-					    name = strings.clone(clip.name),
-					    timeline_start_frame = clip.timeline_start_frame,
-					    source_length_frames = clip.source_length_frames,
-					    transform_x = clip.transform_x,
-					    transform_y = clip.transform_y,
-					    scale = clip.scale,
-					    source_w = clip.source_w,
-					    source_h = clip.source_h,
-				    })
-			    }
-		    case .Subtitles:
-		    // subtitle assets drop as .Text/.Subtitles generator clips (the
-		    // .Subtitles clip kind is never placed on the timeline)
-		    if clip.generator == .Subtitles {
-			    append(&subs, Render_Sub_Src{
-				    srt_id = clip.srt_id,
-				    fps = f32(timeline_fps()),
-				    timeline_start_frame = clip.timeline_start_frame,
-				    source_start_frame = clip.source_start_frame,
-				    source_length_frames = clip.source_length_frames,
-				    transform_x = clip.transform_x,
-				    transform_y = clip.transform_y,
-				    scale = clip.scale,
-				    source_w = clip.source_w,
-				    source_h = clip.source_h,
-			    })
-		    }
-	    }
+				append(
+					&cls,
+					Render_Video_Src {
+						path = strings.clone_to_cstring(string(clip.path)),
+						stream_index = clip.stream_index,
+						source_start_frame = clip.source_start_frame,
+						source_length_frames = clip.source_length_frames,
+						timeline_start_frame = clip.timeline_start_frame,
+						transform_x = clip.transform_x,
+						transform_y = clip.transform_y,
+						scale = clip.scale,
+						crop_l = clip.crop_l,
+						crop_r = clip.crop_r,
+						crop_t = clip.crop_t,
+						crop_b = clip.crop_b,
+						source_w = clip.source_w,
+						source_h = clip.source_h,
+					},
+				)
+			case .Audio:
+				append(
+					&auds,
+					Render_Audio_Src {
+						path = strings.clone_to_cstring(string(clip.path)),
+						stream_index = clip.stream_index,
+						timeline_start_frame = clip.timeline_start_frame,
+						source_start_frame = clip.source_start_frame,
+						source_length_frames = clip.source_length_frames,
+					},
+				)
+			case .Other:
+			// no renderable content in this clip
+			case .Empty:
+			// no renderable content in this clip (placeholder for text later)
+			case .Text:
+				if clip.generator == .Subtitles {
+					append(
+						&subs,
+						Render_Sub_Src {
+							srt_id = clip.srt_id,
+							fps = f32(timeline_fps()),
+							timeline_start_frame = clip.timeline_start_frame,
+							source_start_frame = clip.source_start_frame,
+							source_length_frames = clip.source_length_frames,
+							transform_x = clip.transform_x,
+							transform_y = clip.transform_y,
+							scale = clip.scale,
+							source_w = clip.source_w,
+							source_h = clip.source_h,
+						},
+					)
+				} else {
+					append(
+						&txts,
+						Render_Text_Src {
+							name = strings.clone(clip.name),
+							timeline_start_frame = clip.timeline_start_frame,
+							source_length_frames = clip.source_length_frames,
+							transform_x = clip.transform_x,
+							transform_y = clip.transform_y,
+							scale = clip.scale,
+							source_w = clip.source_w,
+							source_h = clip.source_h,
+						},
+					)
+				}
+			case .Subtitles:
+				// subtitle assets drop as .Text/.Subtitles generator clips (the
+				// .Subtitles clip kind is never placed on the timeline)
+				if clip.generator == .Subtitles {
+					append(
+						&subs,
+						Render_Sub_Src {
+							srt_id = clip.srt_id,
+							fps = f32(timeline_fps()),
+							timeline_start_frame = clip.timeline_start_frame,
+							source_start_frame = clip.source_start_frame,
+							source_length_frames = clip.source_length_frames,
+							transform_x = clip.transform_x,
+							transform_y = clip.transform_y,
+							scale = clip.scale,
+							source_w = clip.source_w,
+							source_h = clip.source_h,
+						},
+					)
+				}
+			}
 		}
 	}
 	render_job_videos = cls[:]
@@ -1434,7 +1622,15 @@ pixel_diff :: proc(a, b: []u8) -> (diff_count: int, max_delta: int) {
 // Kept as one proc so the probe loop stays short (the decode.odin/render.odin
 // macro-heavy status bar file trips Odin's statement parser when new local
 // declarations are interleaved with multi-line calls).
-probe_ground_truth :: proc(path: cstring, clip_frame: i64, got: []u8) -> (diffs: int, max_delta: int, ok: bool) {
+probe_ground_truth :: proc(
+	path: cstring,
+	clip_frame: i64,
+	got: []u8,
+) -> (
+	diffs: int,
+	max_delta: int,
+	ok: bool,
+) {
 	gt: Clip_Decoder
 	if !open_clip_decoder(&gt, path) {
 		return 0, 0, false
@@ -1488,9 +1684,15 @@ preview_probe_run :: proc(paths: [2]string) {
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
 			c := timeline.tracks[t].clips[ci]
-			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
-				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
-				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+			fmt.printf(
+				"  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t,
+				c.timeline_start_frame,
+				c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame,
+				c.source_start_frame + c.source_length_frames,
+				c.source_length_frames,
+			)
 		}
 	}
 
@@ -1499,9 +1701,15 @@ preview_probe_run :: proc(paths: [2]string) {
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
 			c := timeline.tracks[t].clips[ci]
-			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
-				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
-				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+			fmt.printf(
+				"  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t,
+				c.timeline_start_frame,
+				c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame,
+				c.source_start_frame + c.source_length_frames,
+				c.source_length_frames,
+			)
 		}
 	}
 
@@ -1512,9 +1720,11 @@ preview_probe_run :: proc(paths: [2]string) {
 	// video at tl=0 shows src=split_at). Report it, then rebuild the scene the
 	// way the DRAG path does it: split, delete the left half raw, drag the right
 	// half back with clip_slide_in_track (gap-preserving move).
-	fmt.printf("[probe] AUDIO_DESYNC_CHECK: video_clip src_start=%d, audio_clip src_start=%d (should match for A/V glue)\n",
+	fmt.printf(
+		"[probe] AUDIO_DESYNC_CHECK: video_clip src_start=%d, audio_clip src_start=%d (should match for A/V glue)\n",
 		timeline.tracks[0].clips[0].source_start_frame,
-		timeline.tracks[1].clips[0].source_start_frame)
+		timeline.tracks[1].clips[0].source_start_frame,
+	)
 
 	// Rebuild: fresh import, split, raw-delete left half, slide right half back.
 	track0 := &timeline.tracks[0]
@@ -1534,26 +1744,46 @@ preview_probe_run :: proc(paths: [2]string) {
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
 			c := timeline.tracks[t].clips[ci]
-			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
-				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
-				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+			fmt.printf(
+				"  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t,
+				c.timeline_start_frame,
+				c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame,
+				c.source_start_frame + c.source_length_frames,
+				c.source_length_frames,
+			)
 		}
 	}
 	// Drag the right-half clip back to tl=0 on track 0 (gap-close move).
-	slide_to := clip_slide_in_track(&timeline.tracks[0], 0, timeline.tracks[0].clips[0].source_length_frames, 0, timeline.tracks[0].clips[0].timeline_start_frame)
+	slide_to := clip_slide_in_track(
+		&timeline.tracks[0],
+		0,
+		timeline.tracks[0].clips[0].source_length_frames,
+		0,
+		timeline.tracks[0].clips[0].timeline_start_frame,
+	)
 	timeline.tracks[0].clips[0].timeline_start_frame = slide_to
 	fmt.printf("[probe] slide right-half back -> tl=%d\n", slide_to)
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
 			c := timeline.tracks[t].clips[ci]
-			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
-				t, c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames,
-				c.source_start_frame, c.source_start_frame + c.source_length_frames, c.source_length_frames)
+			fmt.printf(
+				"  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t,
+				c.timeline_start_frame,
+				c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame,
+				c.source_start_frame + c.source_length_frames,
+				c.source_length_frames,
+			)
 		}
 	}
 
 	// Header for the trace below (mirrors the re-enabled [vf] gate).
-	fmt.println("[probe] frame playhead_playing req clip_frame last_frame have_last cache_keys has_frame  |  pixel_diff(ground_truth)")
+	fmt.println(
+		"[probe] frame playhead_playing req clip_frame last_frame have_last cache_keys has_frame  |  pixel_diff(ground_truth)",
+	)
 	max_slot_idx_used = 1
 	total_frames_run := int(total_frames + 4)
 	for f := 0; f < total_frames_run; f += 1 {
@@ -1567,9 +1797,16 @@ preview_probe_run :: proc(paths: [2]string) {
 			if !slot.in_use {
 				continue
 			}
-			fmt.printf("  [probe paused f=%d] asset=%d tl=%d src=%d clip_frame=%d last=%d have_last=%v keys={",
-				f, slot.asset_id, slot.timeline_start_frame, slot.source_start_frame,
-				slot.source_start_frame + i64(f) - slot.timeline_start_frame, slot.dec.last_frame, slot.dec.have_last)
+			fmt.printf(
+				"  [probe paused f=%d] asset=%d tl=%d src=%d clip_frame=%d last=%d have_last=%v keys={",
+				f,
+				slot.asset_id,
+				slot.timeline_start_frame,
+				slot.source_start_frame,
+				slot.source_start_frame + i64(f) - slot.timeline_start_frame,
+				slot.dec.last_frame,
+				slot.dec.have_last,
+			)
 			for ci := 0; ci < len(slot.dec.cache); ci += 1 {
 				if ci > 0 {
 					fmt.print(",")
@@ -1588,9 +1825,17 @@ preview_probe_run :: proc(paths: [2]string) {
 				}
 				expected := slot.source_start_frame + i64(f) - slot.timeline_start_frame
 				diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
-				fmt.printf("  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
-					f, expected, slot.dec.last_frame, slot.dec.have_last, slot.has_frame,
-					gt_ok, diffs, maxd)
+				fmt.printf(
+					"  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
+					f,
+					expected,
+					slot.dec.last_frame,
+					slot.dec.have_last,
+					slot.has_frame,
+					gt_ok,
+					diffs,
+					maxd,
+				)
 			}
 		}
 	}
@@ -1611,9 +1856,15 @@ boundary_probe_print_clips :: proc() {
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
 			c := timeline.tracks[t].clips[ci]
-			fmt.printf("  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
-				t, c.timeline_start_frame, c.timeline_start_frame+c.source_length_frames,
-				c.source_start_frame, c.source_start_frame+c.source_length_frames, c.source_length_frames)
+			fmt.printf(
+				"  track=%d clip tl=[%d,%d) src=[%d,%d) len=%d\n",
+				t,
+				c.timeline_start_frame,
+				c.timeline_start_frame + c.source_length_frames,
+				c.source_start_frame,
+				c.source_start_frame + c.source_length_frames,
+				c.source_length_frames,
+			)
 		}
 	}
 }
@@ -1637,7 +1888,7 @@ boundary_probe_run :: proc(v: string) {
 	total_frames := i64(s2 + 400)
 	inp: [4096]u8
 	n := 0
-	for n < len(file) && n < len(inp)-1 {
+	for n < len(file) && n < len(inp) - 1 {
 		inp[n] = u8(file[n])
 		n += 1
 	}
@@ -1664,12 +1915,20 @@ boundary_probe_run :: proc(v: string) {
 	// Drag the tail back flush: nearest valid non-overlapping start near s1.
 	track := &timeline.tracks[0]
 	last := len(track.clips) - 1
-	slide_to := clip_slide_in_track(track, last, track.clips[last].source_length_frames, s1, track.clips[last].timeline_start_frame)
+	slide_to := clip_slide_in_track(
+		track,
+		last,
+		track.clips[last].source_length_frames,
+		s1,
+		track.clips[last].timeline_start_frame,
+	)
 	track.clips[last].timeline_start_frame = slide_to
 	fmt.println("[bprobe] after raw-delete middle + drag tail back")
 	boundary_probe_print_clips()
 
-	fmt.println("[bprobe] stepped play (playing=true, pixel-vs-ground-truth): tl/src cf last has_frame | diff maxd")
+	fmt.println(
+		"[bprobe] stepped play (playing=true, pixel-vs-ground-truth): tl/src cf last has_frame | diff maxd",
+	)
 	for ph := i64(0); ph < total_frames; ph += 1 {
 		playhead.frame = ph
 		playhead.playing = true
@@ -1681,10 +1940,19 @@ boundary_probe_run :: proc(v: string) {
 			}
 			expected := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
-			fmt.printf("[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v gt=%v diff=%d maxd=%d\n",
-				playhead.frame, slot.timeline_start_frame, slot.source_start_frame, expected,
-				slot.dec.last_frame, slot.dec.have_last, slot.has_frame,
-				gt_ok, diffs, maxd)
+			fmt.printf(
+				"[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v gt=%v diff=%d maxd=%d\n",
+				playhead.frame,
+				slot.timeline_start_frame,
+				slot.source_start_frame,
+				expected,
+				slot.dec.last_frame,
+				slot.dec.have_last,
+				slot.has_frame,
+				gt_ok,
+				diffs,
+				maxd,
+			)
 		}
 	}
 
@@ -1693,7 +1961,9 @@ boundary_probe_run :: proc(v: string) {
 	// real-time playback where decode trails the playhead. Every displayed
 	// buffer is compared to ground truth: in probe mode the worker is drained
 	// after each step, so the posted playhead frame is what lands in the slot.
-	fmt.println("[bprobe] live dropped-frame cadence (decode trails playhead, burst across boundary)")
+	fmt.println(
+		"[bprobe] live dropped-frame cadence (decode trails playhead, burst across boundary)",
+	)
 	invalidate_preview_slots()
 	ph: i64 = 40
 	for step_i in 0 ..< 30 {
@@ -1707,9 +1977,18 @@ boundary_probe_run :: proc(v: string) {
 			}
 			shown := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, shown, slot.buffer[:])
-			fmt.printf("[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v last=%d | gt=%v diff=%d maxd=%d\n",
-				ph, shown, slot.timeline_start_frame, slot.source_start_frame,
-				slot.has_frame, slot.dec.last_frame, gt_ok, diffs, maxd)
+			fmt.printf(
+				"[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v last=%d | gt=%v diff=%d maxd=%d\n",
+				ph,
+				shown,
+				slot.timeline_start_frame,
+				slot.source_start_frame,
+				slot.has_frame,
+				slot.dec.last_frame,
+				gt_ok,
+				diffs,
+				maxd,
+			)
 		}
 		if step_i == 7 {
 			ph += 10 // burst 61 -> 71: crosses the 68 boundary in a single tick
@@ -1758,9 +2037,19 @@ boundary_probe_run :: proc(v: string) {
 			}
 			expected := slot.source_start_frame + ph - slot.timeline_start_frame
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
-			fmt.printf("[bprobe replay ph=%d] cf=%d tl=%d src=%d last=%d hv=%v has_frame=%v | gt=%v diff=%d maxd=%d\n",
-				ph, expected, slot.timeline_start_frame, slot.source_start_frame,
-				slot.dec.last_frame, slot.dec.have_last, slot.has_frame, gt_ok, diffs, maxd)
+			fmt.printf(
+				"[bprobe replay ph=%d] cf=%d tl=%d src=%d last=%d hv=%v has_frame=%v | gt=%v diff=%d maxd=%d\n",
+				ph,
+				expected,
+				slot.timeline_start_frame,
+				slot.source_start_frame,
+				slot.dec.last_frame,
+				slot.dec.have_last,
+				slot.has_frame,
+				gt_ok,
+				diffs,
+				maxd,
+			)
 		}
 	}
 	os.exit(0)
@@ -1779,8 +2068,8 @@ boundary_probe_run :: proc(v: string) {
 // ---------------------------------------------------------------------------
 
 probe_hash_buf: [PREVIEW_W * PREVIEW_H * 4]u8
-probe_hash_gt:  [PREVIEW_W * PREVIEW_H * 4]u8
-probe_hashes:   [dynamic]u64
+probe_hash_gt: [PREVIEW_W * PREVIEW_H * 4]u8
+probe_hashes: [dynamic]u64
 
 fnv64 :: proc(data: []u8) -> u64 {
 	h := u64(0xcbf29ce484222325)
@@ -1892,6 +2181,13 @@ preview_framecheck_run :: proc(v: string) {
 			}
 		}
 	}
-	fmt.printf("[frame-probe] checked=%d mismatches=%d slow(>50ms)=%d max_ms=%.0f%s\n", checked, bad, slow_cnt, max_ms, bad > 40 ? " (rest suppressed)" : "")
+	fmt.printf(
+		"[frame-probe] checked=%d mismatches=%d slow(>50ms)=%d max_ms=%.0f%s\n",
+		checked,
+		bad,
+		slow_cnt,
+		max_ms,
+		bad > 40 ? " (rest suppressed)" : "",
+	)
 	os.exit(bad == 0 ? 0 : 1)
 }
