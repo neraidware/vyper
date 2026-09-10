@@ -1021,38 +1021,43 @@ clip_card :: proc() {
 				}
 			}
 		}
+		// Inspector clip-card readouts, rebuilt every frame into one fixed
+		// buffer (clay copies the text at the call).
+		info_buf: [256]u8
 		clay.Text(
-			fmt.tprintf("Track: %s", tr.name),
+			fmt.bprintf(info_buf[:], "Track: %s", tr.name),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		clay.Text(
-			fmt.tprintf("File: %s", path_basename(cl.path)),
+			fmt.bprintf(info_buf[:], "File: %s", path_basename(cl.path)),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		clay.Text(
-			fmt.tprintf("Duration: %d frames", cl.source_length_frames),
+			fmt.bprintf(info_buf[:], "Duration: %d frames", cl.source_length_frames),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		if cl.kind != .Audio {
 			clay.Text(
-				fmt.tprintf(
+				fmt.bprintf(
+					info_buf[:],
 					"In: %d   Out: %d",
 					cl.source_start_frame,
 					cl.source_start_frame + cl.source_length_frames,
 				),
 				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 			)
-			x_val := fmt.tprintf("%.0f", cl.transform_x)
+			val_buf: [64]u8
+			x_val := fmt.bprintf(val_buf[:], "%.0f", cl.transform_x)
 			if editing_field == 1 {
 				x_val = string(edit_chars[:edit_len])
 			}
 			prop_field("PropFieldX", "X", x_val, editing_field == 1)
-			y_val := fmt.tprintf("%.0f", cl.transform_y)
+			y_val := fmt.bprintf(val_buf[:], "%.0f", cl.transform_y)
 			if editing_field == 2 {
 				y_val = string(edit_chars[:edit_len])
 			}
 			prop_field("PropFieldY", "Y", y_val, editing_field == 2)
-			scl_val := fmt.tprintf("%.2f", cl.scale)
+			scl_val := fmt.bprintf(val_buf[:], "%.2f", cl.scale)
 			if editing_field == 3 {
 				scl_val = string(edit_chars[:edit_len])
 			}
@@ -1072,19 +1077,19 @@ clip_card :: proc() {
 				settings_button("SnapCenter", "Snap to canvas center", snap_center_to_canvas)
 			}
 			panel_caption("Crop (percent of box)")
-			l_val := fmt.tprintf("%.0f%%", cl.crop_l * 100)
+			l_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_l * 100)
 			if editing_field == 4 {
 				l_val = string(edit_chars[:edit_len])
 			}
-			r_val := fmt.tprintf("%.0f%%", cl.crop_r * 100)
+			r_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_r * 100)
 			if editing_field == 5 {
 				r_val = string(edit_chars[:edit_len])
 			}
-			t_val := fmt.tprintf("%.0f%%", cl.crop_t * 100)
+			t_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_t * 100)
 			if editing_field == 6 {
 				t_val = string(edit_chars[:edit_len])
 			}
-			b_val := fmt.tprintf("%.0f%%", cl.crop_b * 100)
+			b_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_b * 100)
 			if editing_field == 7 {
 				b_val = string(edit_chars[:edit_len])
 			}
@@ -1183,8 +1188,9 @@ render_card :: proc() {
 			}
 		}
 	}
+	out_buf: [128]u8
 	clay.Text(
-		fmt.tprintf("Output: %s", render_output_name()),
+		fmt.bprintf(out_buf[:], "Output: %s", render_output_name()),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words},
 	)
 	clay.Text(

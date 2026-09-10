@@ -1161,8 +1161,7 @@ group_delta_feasible :: proc(delta: i64) -> bool {
 	if len(drag_group_orig) <= 1 {
 		return true
 	}
-	members := make(map[u64]bool, len(drag_group_orig))
-	defer delete(members)
+	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
 	for m in drag_group_orig {
 		members[m.clip_id] = true
 	}
@@ -1198,8 +1197,7 @@ group_vertical_feasible :: proc(track_delta: int, delta: i64) -> bool {
 	if len(drag_group_orig) == 0 {
 		return false
 	}
-	members := make(map[u64]bool, len(drag_group_orig))
-	defer delete(members)
+	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
 	for m in drag_group_orig {
 		members[m.clip_id] = true
 	}

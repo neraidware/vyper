@@ -1085,7 +1085,9 @@ draw_preview_hud :: proc(
 	if fps <= 0 {
 		return
 	}
-	label := fmt.tprintf(
+	label_buf: [64]u8
+	label := fmt.bprintf(
+		label_buf[:],
 		"A %6.2f  V %6.2f  d %+.2f",
 		f64(sync.atomic_load(&audio_dev_frame)) / fps,
 		f64(playhead.frame) / fps,
@@ -1297,7 +1299,8 @@ draw_import_progress :: proc(
 	}
 
 	if frac >= 0 && phase == .Building {
-		pct := fmt.tprintf("%d%%", int(frac * 100 + 0.5))
+		pct_buf: [16]u8
+		pct := fmt.bprintf(pct_buf[:], "%d%%", int(frac * 100 + 0.5))
 		render_text(
 			renderer,
 			command_buffer,
