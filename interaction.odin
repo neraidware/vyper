@@ -515,8 +515,18 @@ interaction_post_build :: proc(
 			// Clip→playhead toggle: latch the drag target onto the playhead
 			// once it comes within the pixel snap margin. Applied to the
 			// whole linked group, since every member follows the anchor.
+			// But an all-or-nothing group must never be glued onto a
+			// playhead slot it cannot clear: latch only when every member can
+			// follow, else keep following the cursor and let the feasibility
+			// gate park the unit at the true blocker.
 			if snap_clips_to_playhead {
-				frame = f32(snap_to_playhead(i64(max(frame, 0))))
+				snapped := snap_to_playhead(i64(max(frame, 0)))
+				if len(drag_group_orig) > 1 &&
+				   snapped != i64(frame) &&
+				   !group_delta_feasible(snapped - drag_group_orig[0].start) {
+					snapped = i64(frame)
+				}
+				frame = f32(snapped)
 			}
 			// Determine which track lane the pointer hovers: that decides
 			// whether this is a horizontal move (same track) or a vertical

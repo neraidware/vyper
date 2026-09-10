@@ -318,6 +318,37 @@ test_drag_blocked_holds :: proc() {
 	tl_probe_check(v == 10 && a == 10, "retreat keeps V@%d A@%d", v, a)
 }
 
+// test_drag_left_blocked_holds: moving a linked group LEFT, one member blocked
+// on its own lane while others are free — the whole group must refuse. This is
+// the mirrored twin of test_drag_blocked_holds: a non-member sitting ahead (to
+// the left) of member B's target slot must freeze the anchor A too, because
+// all-or-nothing means nobody advances unless EVERY captured member clears its
+// slot.
+test_drag_left_blocked_holds :: proc() {
+	tl_scene()
+	// Rebuild: A (video) and B (audio) linked at 100, drawn hoping to move
+	// LEFT; B's lane carries a non-member X occupying [25,65) ahead of B, so a
+	// -50 shift parks B at [50,100) right on top of X. The free leftward shift
+	// -30 parks both at 70, clear of X (70 > 65).
+	clear(&timeline.tracks[0].clips)
+	append(&timeline.tracks[0].clips, mk_tl_clip(1001, 9001, 100, 50, 100, .Video))
+	clear(&timeline.tracks[1].clips)
+	append(&timeline.tracks[1].clips, mk_tl_clip(1002, 9001, 100, 50, 100, .Audio))
+	append(&timeline.tracks[1].clips, mk_tl_clip(1102, 0, 25, 40, 25, .Audio))
+	capture_link_group(&timeline.tracks[0].clips[0], 0)
+	// delta -50 puts B at [50,100), overlapping X's [25,65): must be refused.
+	tl_probe_check(!group_delta_feasible(-50), "leftward -50 must be infeasible (B blocked)")
+	v, a := tl_group_starts()
+	tl_probe_check(v == 100 && a == 100, "blocked leftward must move nobody (V@%d A@%d)", v, a)
+	// A free leftward delta that clears B of X must move the whole pair.
+	tl_probe_check(group_delta_feasible(-30), "leftward -30 must be feasible (B clears X)")
+	drag_clip = &timeline.tracks[0].clips[0]
+	drag_clip.timeline_start_frame = drag_group_orig[0].start + -30
+	apply_group_drag_to_members(-30)
+	v, a = tl_group_starts()
+	tl_probe_check(v == 70 && a == 70, "leftward move keeps the pair aligned (V@%d A@%d)", v, a)
+}
+
 // test_vertical_drop_alignment: a vertical group drop commits every member at
 // m.start + drag_group_delta on its destination lane, all still linked+aligned.
 test_vertical_drop_alignment :: proc() {
@@ -386,6 +417,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_drag_blocked_holds()
 	fmt.println("[tl-probe] blocked-holds ok")
+	tl_scene()
+	test_drag_left_blocked_holds()
+	fmt.println("[tl-probe] left-blocked ok")
 	tl_scene()
 	test_vertical_drop_alignment()
 	fmt.println("[tl-probe] vertical-drop ok")
