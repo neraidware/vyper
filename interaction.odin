@@ -668,18 +668,32 @@ interaction_post_build :: proc(
 			close_context_menu()
 		}
 	} else if was_click && ctx_menu.open {
-		if pointer_over_context_menu() {
-			handle_ctx_option()
+		if pointer_over_context_menu(inp.x, inp.y) {
+			handle_ctx_option(inp.x, inp.y)
 		} else {
 			close_context_menu()
 		}
 	}
-	// Submenu flyout follows the cursor: show while hovering the "Add >"
-	// row or the submenu, hide while hovering neither. The flyout is
-	// positioned flush against the row's right edge (no seam), so these two
-	// tests are exhaustive and stable across the whole unit.
+	// Submenu flyout follows the cursor: show while hovering the "Add >" row,
+	// the flyout, or the seam between them; hide only after the cursor has left
+	// the whole popup for CTX_SUBMENU_GRACE frames. The hover tests are
+	// geometry-based (against last frame's element rects), NOT clay.PointerOver:
+	// clay's hover is resolved during the layout pass, so polling it here (before
+	// this frame's layout) lags one frame and, the frame the flyout mounts, the
+	// element has no prior hover at all — either would make the flyout flap
+	// open/closed mid-transit and the cursor could never reach it.
 	if ctx_menu.open {
-		ctx_menu.submenu = clay.PointerOver(clay.ID("CtxAdd")) || pointer_over_submenu()
+		zone := ctx_add_row_zone()
+		fly_up := ctx_menu.submenu || ctx_menu.submenu_grace > 0
+		over :=
+			ctx_point_in(inp.x, inp.y, zone) ||
+			(fly_up && ctx_point_in(inp.x, inp.y, ctx_flyout_rect()))
+		if over {
+			ctx_menu.submenu_grace = CTX_SUBMENU_GRACE
+		} else if ctx_menu.submenu_grace > 0 {
+			ctx_menu.submenu_grace -= 1
+		}
+		ctx_menu.submenu = over
 	}
 	update_timeline_cursor(inp.x, inp.y)
 	next_left = inp.left

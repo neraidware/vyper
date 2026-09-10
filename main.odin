@@ -312,6 +312,7 @@ close_context_menu :: proc() {
 	ctx_menu.target_track = -1
 	ctx_menu.frame = 0
 	ctx_menu.submenu = false
+	ctx_menu.submenu_grace = 0
 	ctx_menu.target_clip_track = -1
 	ctx_menu.target_clip_index = -1
 }
@@ -474,29 +475,44 @@ apply_playhead_time :: proc() {
 // Add > Text Clip creates a Text generator clip on the right-clicked track at
 // the pointer's frame; the clip-action rows (Rename/Duplicate/Delete/Link)
 // act on the clip that was right-clicked (ctx_menu.target_clip_*), which is
-// selected first so every later action sees the same selection.
-handle_ctx_option :: proc() {
+// selected first so every later action sees the same selection. The clicked
+// row is resolved by its GEOMETRY (row index within the mounted menu/flyout
+// box), not clay.PointerOver: the click is handled before this frame's clay
+// layout, so clay's hover still reflects the previous frame and would misroute
+// (or drop) a click on the flyout the same frame it mounts.
+handle_ctx_option :: proc(mx, my: f32) {
 	ct := ctx_menu.target_clip_track
 	ci := ctx_menu.target_clip_index
-	if clay.PointerOver(clay.ID("CtxTextClip")) {
-		add_text_clip_at()
-	} else if clay.PointerOver(clay.ID("CtxSubtitleClip")) {
-		add_subtitle_clip_at()
-	} else if ct >= 0 &&
+
+	if ctx_menu.submenu && ctx_point_in(mx, my, ctx_flyout_rect()) {
+		// Click in the "Add >" flyout: row 0 = Text Clip, row 1 = Subtitle.
+		if ctx_row_hit(mx, my, ctx_flyout_rect()) == 0 {
+			add_text_clip_at()
+		} else {
+			add_subtitle_clip_at()
+		}
+		close_context_menu()
+		return
+	}
+
+	row := ctx_row_hit(mx, my, clay.GetElementData(clay.ID("CtxMenu")).boundingBox)
+	if row >= 1 &&
+	   ct >= 0 &&
 	   ct < len(timeline.tracks) &&
 	   ci >= 0 &&
 	   ci < len(timeline.tracks[ct].clips) {
 		select_clip(ct, ci)
-		if clay.PointerOver(clay.ID("CtxRename")) {
+		switch row {
+		case 1:
 			begin_clip_rename()
-		} else if clay.PointerOver(clay.ID("CtxDuplicate")) {
+		case 2:
 			new_i := duplicate_clip(ct, ci)
 			// Select the fresh copy so the user immediately sees what appeared.
 			select_clip(ct, new_i)
-		} else if clay.PointerOver(clay.ID("CtxDelete")) {
-			delete_clip_at(ct, ci)
-		} else if clay.PointerOver(clay.ID("CtxLink")) {
+		case 3:
 			toggle_links_for_selection()
+		case 4:
+			delete_clip_at(ct, ci)
 		}
 	}
 	close_context_menu()
@@ -676,22 +692,13 @@ is_srt_pick :: proc(path: cstring) -> bool {
 	return true
 }
 
-// pointer_over_context_menu reports whether the cursor is over the context menu
-// proper or its "Add >" submenu (both are part of the same transient UI).
-pointer_over_context_menu :: proc() -> bool {
-	if clay.PointerOver(clay.ID("CtxMenu")) {
-		return true
-	}
-	return pointer_over_submenu()
-}
-
-// pointer_over_submenu reports whether the cursor is over the "Add >" flyout.
-// This tests the CONTAINER (not the two leaf items): the flyout's padding +
-// border ring is a couple of px wide, and testing only the leaves makes that
-// ring read as "not the submenu" — the flag flaps off the instant the cursor
-// grazes the margin, and the flyout flickers open/closed under the cursor.
-pointer_over_submenu :: proc() -> bool {
-	return clay.PointerOver(clay.ID("CtxSubmenu"))
+// pointer_over_context_menu reports whether the cursor is inside the context
+// menu popup proper or its "Add >" submenu (both are part of the same transient
+// UI). It tests the last frame's element GEOMETRY directly (not clay's
+// frame-lagged PointerOver), so a click on the flyout the same frame it mounts
+// still routes to handle_ctx_option instead of dismissing the menu.
+pointer_over_context_menu :: proc(mx, my: f32) -> bool {
+	return ctx_popup_hover(mx, my)
 }
 
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.

@@ -648,6 +648,7 @@ ContextMenu :: struct {
 	target_track:      int, // -1 = none/between tracks
 	frame:             i64, // timeline frame captured at right-click time
 	submenu:           bool, // the "Add >" flyout is showing
+	submenu_grace:     u8, // frames to keep the flyout after leaving its zone
 	target_clip_track: int, // right-click ON a clip; -1 = empty space
 	target_clip_index: int, // index within target_clip_track
 }

@@ -1452,6 +1452,97 @@ CONTEXT_MENU_W :: 180
 CONTEXT_MENU_PAD :: 2
 CONTEXT_MENU_EDGE :: CONTEXT_MENU_PAD + 1 // border + padding to the first row
 
+// CTX_SUBMENU_GRACE is how many frames the "Add >" flyout stays open after the
+// cursor leaves its hover zone (the Add row + the flyout + the seam between
+// them). It absorbs the one-frame clay-geometry/pointer lag on mount, so the
+// flyout can't flap shut under a moving cursor that is still on its way into
+// it.
+CTX_SUBMENU_GRACE :: 6
+
+// ctx_point_in reports whether (x, y) is inside a rect.
+ctx_point_in :: proc(x, y: f32, r: clay.BoundingBox) -> bool {
+	return x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
+}
+
+// ctx_add_row_zone is the hover band of the "Add >" row EXTENDED across the
+// seam flush to the flyout's left edge, so a cursor sliding from the row into
+// the flyout is always inside the open zone — no dead columns between the two
+// boxes for the keep-open test to trip on.
+ctx_add_row_zone :: proc() -> clay.BoundingBox {
+	flyout_left := ctx_menu.x + CONTEXT_MENU_W + 2 * CONTEXT_MENU_EDGE
+	return clay.BoundingBox {
+		x = ctx_menu.x + CONTEXT_MENU_EDGE,
+		y = ctx_menu.y + CONTEXT_MENU_EDGE,
+		width = flyout_left - (ctx_menu.x + CONTEXT_MENU_EDGE) + 1,
+		height = BUTTON_HEIGHT,
+	}
+}
+
+// ctx_flyout_rect returns the flyout's box from last frame's layout (zero when
+// the flyout is not mounted — callers gate on ctx_menu.submenu).
+ctx_flyout_rect :: proc() -> clay.BoundingBox {
+	return clay.GetElementData(clay.ID("CtxSubmenu")).boundingBox
+}
+
+// ctx_popup_hover reports whether the cursor is inside the floating popup: the
+// menu box or, when it is mounted, the Add flyout box. Geometry-based against
+// the last frame's rects rather than clay.PointerOver, so tests work the frame
+// an element first mounts and never carry clay's one-frame hover lag.
+ctx_popup_hover :: proc(x, y: f32) -> bool {
+	if ctx_point_in(x, y, clay.GetElementData(clay.ID("CtxMenu")).boundingBox) {
+		return true
+	}
+	if ctx_menu.submenu {
+		return ctx_point_in(x, y, ctx_flyout_rect())
+	}
+	return false
+}
+
+// CTX_ROW_GAP is the 1px gutter between context-menu rows (draw_context_menu's
+// childGap). It is part of the row geometry, so click/hover tests that resolve
+// a row from the container box must agree with it.
+CTX_ROW_GAP :: 1
+
+// ctx_row_rect is row `index` within a context-menu container box: the rows
+// stack at BUTTON_HEIGHT tall with CTX_ROW_GAP gutters, inset left/right/top
+// by CONTEXT_MENU_EDGE (border + padding), exactly as draw_context_menu lays
+// them out.
+ctx_row_rect :: proc(box: clay.BoundingBox, index: int) -> clay.BoundingBox {
+	return clay.BoundingBox {
+		x = box.x + CONTEXT_MENU_EDGE,
+		y = box.y + CONTEXT_MENU_EDGE + f32(index) * (BUTTON_HEIGHT + CTX_ROW_GAP),
+		width = CONTEXT_MENU_W,
+		height = BUTTON_HEIGHT,
+	}
+}
+
+// ctx_row_hit returns the index of the menu row under (x, y) within `box`, or
+// -1. The 1px row gutters resolve to the row BELOW them (so a click on a seam
+// still acts on the row under it).
+ctx_row_hit :: proc(x, y: f32, box: clay.BoundingBox) -> int {
+	if ctx_point_in(x, y, box) == false {
+		return -1
+	}
+	at_y := y - (box.y + CONTEXT_MENU_EDGE)
+	if at_y < 0 {
+		return -1
+	}
+	i := int(at_y / (BUTTON_HEIGHT + CTX_ROW_GAP))
+	if i < 0 || i > 7 {
+		return -1
+	}
+	if ctx_point_in(x, y, ctx_row_rect(box, i)) == false &&
+	   at_y - f32(i) * (BUTTON_HEIGHT + CTX_ROW_GAP) >= BUTTON_HEIGHT {
+		// Cursor in the gutter between row i and i+1: fold it down to i+1 when
+		// that row exists and is under the cursor.
+		if i + 1 <= 7 && ctx_point_in(x, y, ctx_row_rect(box, i + 1)) {
+			return i + 1
+		}
+		return -1
+	}
+	return i
+}
+
 // ctx_option renders one row (option) of the floating timeline context menu.
 // Rows are borderless and highlight as a solid band on hover so the menu reads
 // as one widget, not a grid of cells.
@@ -1545,7 +1636,7 @@ draw_context_menu :: proc() {
 		layout = {
 			sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})},
 			layoutDirection = .TopToBottom,
-			childGap = 1,
+			childGap = CTX_ROW_GAP,
 			padding = clay.PaddingAll(CONTEXT_MENU_PAD),
 		},
 		backgroundColor = BUTTON,
@@ -1580,7 +1671,7 @@ draw_context_menu :: proc() {
 			layout = {
 				sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})},
 				layoutDirection = .TopToBottom,
-				childGap = 1,
+				childGap = CTX_ROW_GAP,
 				padding = clay.PaddingAll(CONTEXT_MENU_PAD),
 			},
 			backgroundColor = BUTTON,
