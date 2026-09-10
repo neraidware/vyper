@@ -212,8 +212,12 @@ scrollbar_geometry :: proc(content_h, view_h: f32) -> (max_top, thumb_h, travel:
 // its center so a movement continues the jump). Returns whether the press hit a
 // scrollbar, and tags this stack's thumb/strip ids with the container's tag.
 scroll_press :: proc(tag: string, my: f32, drag: ^bool, grab: ^f32) -> bool {
-	thumb_id := clay.ID(fmt.aprintf("%sSbThumb", tag))
-	strip_id := clay.ID(fmt.aprintf("%sScrollbar", tag))
+	// Clay hashes id strings immediately and keeps no pointer to them, so a
+	// fixed stack buffer rebuilt per call is safe and avoids a per-frame heap
+	// allocation for id strings that are rebuilt every polled frame.
+	id_buf: [64]u8
+	thumb_id := clay.ID(fmt.bprintf(id_buf[:], "%sSbThumb", tag))
+	strip_id := clay.ID(fmt.bprintf(id_buf[:], "%sScrollbar", tag))
 	if clay.PointerOver(thumb_id) {
 		drag^ = true
 		grab^ = my - clay.GetElementData(thumb_id).boundingBox.y
@@ -246,7 +250,8 @@ scroll_drag_update :: proc(
 		drag^ = false
 		return
 	}
-	strip := clay.GetElementData(clay.ID(fmt.aprintf("%sScrollbar", tag))).boundingBox
+	id_buf: [64]u8
+	strip := clay.GetElementData(clay.ID(fmt.bprintf(id_buf[:], "%sScrollbar", tag))).boundingBox
 	max_top, _, travel := scrollbar_geometry(content_h, view_h)
 	if strip.height > 0 && travel > 0 {
 		pos := (my - strip.y - grab^) / travel
@@ -362,6 +367,12 @@ apply_rename :: proc() {
 // ---------------------------------------------------------------------------
 
 // playhead_timecode renders the current playhead frame as an HH:MM:SS:FF
+// playhead_timecode_buf backs the per-frame timecode readout (ui.odin) and the
+// text-edit prefill (main.odin): rebuilt with fmt.bprintf every call, never a
+// heap allocation. The returned string is valid only until the next call in the
+// same frame; consumers (clay.Text, text_input_begin) read it immediately.
+playhead_timecode_buf: [32]u8
+
 // timecode at the timeline's fps.
 playhead_timecode :: proc() -> string {
 	fps_i := int(timeline_fps())
@@ -374,7 +385,7 @@ playhead_timecode :: proc() -> string {
 	s := total_sec % 60
 	m := (total_sec / 60) % 60
 	h := total_sec / (60 * 60)
-	return fmt.aprintf("%02d:%02d:%02d:%02d", h, m, s, ff)
+	return fmt.bprintf(playhead_timecode_buf[:], "%02d:%02d:%02d:%02d", h, m, s, ff)
 }
 
 // begin_playhead_time_edit opens the text field pre-filled with the current
@@ -728,7 +739,8 @@ handle_playback_rate_click :: proc(rate_clicked: bool) {
 // from a currently-rendered element.
 in_playback_rate_menu :: proc() -> bool {
 	for rate in PLAYBACK_RATES {
-		if clay.PointerOver(clay.ID(playback_rate_name(rate))) {
+		id_buf: [64]u8
+		if clay.PointerOver(clay.ID(playback_rate_name(rate, id_buf[:]))) {
 			return true
 		}
 	}
@@ -739,7 +751,8 @@ in_playback_rate_menu :: proc() -> bool {
 // the pointer (the selection just made). Only valid inside an open menu.
 rate_from_element :: proc() -> f64 {
 	for rate in PLAYBACK_RATES {
-		if clay.PointerOver(clay.ID(playback_rate_name(rate))) {
+		id_buf: [64]u8
+		if clay.PointerOver(clay.ID(playback_rate_name(rate, id_buf[:]))) {
 			return rate
 		}
 	}

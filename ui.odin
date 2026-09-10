@@ -28,14 +28,17 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	clay.BeginLayout()
 	DEFAULT_BORDER := clay.BorderOutside(1)
 
-	// App-bar project summary text (project label · resolution · fps).
+	// App-bar project summary text (project label · resolution · fps). Built
+	// into fixed buffers below so the every-frame labels never allocate.
+	summary_buf: [512]u8
+	fps_buf: [32]u8
 	project_label := project.name
 	if project_label == "" {
 		project_label = "untitled project"
 	}
 	fps_l := "auto"
 	if project.frame_rate > 0 {
-		fps_l = fmt.tprintf("%g", project.frame_rate)
+		fps_l = fmt.bprintf(fps_buf[:], "%g", project.frame_rate)
 	}
 
 	if clay.UI()(
@@ -69,7 +72,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 				clay.TextElementConfig{textColor = BUTTON_BORDER, fontSize = FONT_NORMAL},
 			)
 			clay.Text(
-				fmt.tprintf(
+				fmt.bprintf(
+					summary_buf[:],
 					"%s · %dx%d @ %sfps",
 					project_label,
 					project.width,
@@ -236,8 +240,10 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					},
 					) {}
+					state_buf: [64]u8
 					clay.Text(
-						fmt.tprintf(
+						fmt.bprintf(
+							state_buf[:],
 							"%d / %d  ·  %gfps",
 							playhead.frame,
 							timeline_duration(),
@@ -924,8 +930,9 @@ project_card :: proc() {
 	if project.start_frame >= 0 &&
 	   project.end_frame >= 0 &&
 	   project.end_frame > project.start_frame {
+		range_buf: [64]u8
 		clay.Text(
-			fmt.tprintf("%d – %d", project.start_frame, project.end_frame),
+			fmt.bprintf(range_buf[:], "%d – %d", project.start_frame, project.end_frame),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 	} else {
@@ -1243,8 +1250,11 @@ v_scrollbar :: proc(tag: string, scroll, content_h, view_h: f32) {
 	if thumb_h <= 0 || travel <= 0 {
 		return
 	}
+	// Clay hashes id strings immediately, so one fixed stack buffer rebuilt for
+	// each id is safe (no retention, no per-frame alloc).
+	id_buf: [64]u8
 	thumb_top := scroll / max_top * travel
-	if clay.UI(clay.ID(fmt.tprintf("%sScrollbar", tag)))(
+	if clay.UI(clay.ID(fmt.bprintf(id_buf[:], "%sScrollbar", tag)))(
 	{
 		layout = {
 			sizing = {width = clay.SizingFixed(TSCROLLBAR_W), height = clay.SizingGrow({})},
@@ -1254,13 +1264,13 @@ v_scrollbar :: proc(tag: string, scroll, content_h, view_h: f32) {
 		backgroundColor = TRACK_GUTTER_BG,
 	},
 	) {
-		if clay.UI(clay.ID(fmt.tprintf("%sSbPad", tag)))(
+		if clay.UI(clay.ID(fmt.bprintf(id_buf[:], "%sSbPad", tag)))(
 		{layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_top)}}},
 		) {}
-		if clay.UI(clay.ID(fmt.tprintf("%sSbThumb", tag)))(
+		if clay.UI(clay.ID(fmt.bprintf(id_buf[:], "%sSbThumb", tag)))(
 		{
 			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_h)}},
-			backgroundColor = clay.PointerOver(clay.ID(fmt.tprintf("%sSbThumb", tag))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			backgroundColor = clay.PointerOver(clay.ID(fmt.bprintf(id_buf[:], "%sSbThumb", tag))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			cornerRadius = clay.CornerRadiusAll(4),
 		},
 		) {}
@@ -1352,25 +1362,28 @@ timeline_snap_button :: proc(name: string, active: bool) {
 }
 
 // playback_rate_label returns the display text for a playback rate value:
-// "Auto" for 0, otherwise "<rate>x".
-playback_rate_label :: proc(rate: f64) -> string {
+// "Auto" for 0, otherwise "<rate>x". Formatted into the caller's fixed buffer
+// so the per-frame dropdown labels never allocate.
+playback_rate_label :: proc(rate: f64, buf: []u8) -> string {
 	if rate <= 0 {
 		return "Auto"
 	}
 	if rate == f64(int(rate)) {
-		return fmt.tprintf("%dx", int(rate))
+		return fmt.bprintf(buf, "%dx", int(rate))
 	}
-	return fmt.tprintf("%.1fx", rate)
+	return fmt.bprintf(buf, "%.1fx", rate)
 }
 
 // playback_rate_name returns the unique element id string for a rate value
 // (used both to render its button and to hit-test it on click). Rates are
 // encoded by tenths: 1.5 -> "PlayRate15", 2 -> "PlayRate20", 0 -> "Auto".
-playback_rate_name :: proc(rate: f64) -> string {
+// Formatted into the caller's fixed buffer (clay hashes ids immediately, so
+// the buffer may be stack-local).
+playback_rate_name :: proc(rate: f64, buf: []u8) -> string {
 	if rate <= 0 {
 		return "PlayRateAuto"
 	}
-	return fmt.tprintf("PlayRate%d", int(rate * 10))
+	return fmt.bprintf(buf, "PlayRate%d", int(rate * 10))
 }
 
 // playback_rate_dropdown renders the rate selector beside the play button. The
@@ -1395,8 +1408,9 @@ playback_rate_dropdown :: proc() {
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	},
 	) {
+		rate_lbl: [64]u8
 		clay.Text(
-			playback_rate_label(playback_rate),
+			playback_rate_label(playback_rate, rate_lbl[:]),
 			clay.TextElementConfig {
 				textColor = playback_rate_open ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_NORMAL,
@@ -1429,9 +1443,12 @@ playback_rate_dropdown :: proc() {
 		},
 		) {
 			for rate in PLAYBACK_RATES {
+				// name and label must stay live for settings_button's own clay
+				// calls, so each gets its own fixed buffer.
+				name_buf, label_buf: [64]u8
 				settings_button(
-					playback_rate_name(rate),
-					playback_rate_label(rate),
+					playback_rate_name(rate, name_buf[:]),
+					playback_rate_label(rate, label_buf[:]),
 					playback_rate == rate,
 				)
 			}
@@ -1872,11 +1889,9 @@ draw_text_input_popup :: proc(width, height: c.int) {
 		},
 	},
 	) {
+		hint_buf: [512]u8
 		clay.Text(
-			strings.concatenate(
-				{title, " — Enter to confirm, Esc to cancel"},
-				context.temp_allocator,
-			),
+			fmt.bprintf(hint_buf[:], "%s — Enter to confirm, Esc to cancel", title),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
 		if ti.input_type == TI_PLAYHEAD {

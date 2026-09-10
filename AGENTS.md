@@ -52,6 +52,18 @@ lifetimes, and shares its data, so the ground rules come first.
   scratches. `new`/`delete` on single objects happen rarely, deliberately, at a
   teardown/ownership boundary — not inline in a routine that runs per frame or
   per cue.
+- **Per-frame text/ids are formatted into fixed buffers, never allocated.** The
+  frame loop's per-frame labels readouts (playhead timecode, fps, transport
+  line, render range, playback-rate labels), clay element ids (scrollbar thumb/
+  strip, `PlayRate*`) and transient hints are rebuilt every frame — build them
+  with `fmt.bprintf` into a stack-local or persistent `[64]u8`/`[512]u8` buffer,
+  not `fmt.aprintf`/`fmt.tprintf` (heap or temp churn) and not
+  `strings.concatenate`. Clay hashes id strings immediately and copies text
+  strings at the call, so a fixed buffer reused within the frame is safe all
+  the way down. A few KB of fixed buffer costs nothing; allocating-and-freeing
+  the same tiny string every frame is real work and, when heap, a leak.
+  `context.temp_allocator` is for frame-scoped scratch that genuinely cannot be
+  pre-sized (line raster scratch, sort temporaries), not for per-frame labels.
 
 ### Address by handle, never by a pointer you keep
 

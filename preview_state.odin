@@ -748,9 +748,9 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 	font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
 	if cue_changed || slot.text_font_px != font_px {
 		// Split the cue text into lines once and reuse for both the base
-		// measure and the baked raster.
-		lines := strings.split(active_text, "\n")
-		defer delete(lines)
+		// measure and the baked raster. Temp arena: event-driven (cue/font
+		// change), and the frame's free_all reclaims it either way.
+		lines := strings.split(active_text, "\n", context.temp_allocator)
 
 		// Base measure at font 48. The box is ink WIDTH x metric BOX HEIGHT.
 		// Width: the tight ink width (single-line cues hug their text, and
