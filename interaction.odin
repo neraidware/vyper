@@ -307,7 +307,9 @@ interaction_post_build :: proc(
 		}
 		if !handled {
 			for i := 0; i <= len(timeline.tracks); i += 1 {
-				if clay.PointerOver(clay.ID("TrackGap", u32(i))) {
+				// Adding a track is limited to the gutter-width button in the
+				// insert gap; the rest of the strip is the point-marker lane.
+				if clay.PointerOver(clay.ID("AddTrack", u32(i))) {
 					insert_track(i)
 					handled = true
 					break

@@ -494,9 +494,14 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 						) {
 							for track_idx := 0; track_idx <= len(timeline.tracks); track_idx += 1 {
-								// Gap indent where a new track can be inserted.
+								// Insert gap above each track: the "Add track"
+								// button is limited to the gutter column, and the
+								// strip's remaining space carries the track's
+								// point-marker triangles (drawn by
+								// draw_clip_markers).
 								gap_id := clay.ID("TrackGap", u32(track_idx))
-								gap_hovered := clay.PointerOver(gap_id)
+								button_id := clay.ID("AddTrack", u32(track_idx))
+								button_hovered := clay.PointerOver(button_id)
 								if clay.UI(gap_id)(
 								{
 									layout = {
@@ -504,21 +509,33 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 											width = clay.SizingGrow({}),
 											height = clay.SizingFixed(TRACK_GAP_H),
 										},
-										childAlignment = {x = .Left, y = .Center},
-										padding = clay.Padding{left = 4},
+										layoutDirection = .LeftToRight,
+										childGap = 0,
 									},
-									backgroundColor = gap_hovered ? clay.Color{36, 60, 84, 255} : EDITOR_BG,
-									cornerRadius = clay.CornerRadiusAll(3),
 								},
 								) {
-									if gap_hovered {
-										clay.Text(
-											"+ Add track",
-											clay.TextElementConfig {
-												textColor = BUTTON_BORDER_HOVER,
-												fontSize = FONT_NORMAL,
+									if clay.UI(button_id)(
+									{
+										layout = {
+											sizing = {
+												width = clay.SizingFixed(GUTTER_WIDTH),
+												height = clay.SizingGrow({}),
 											},
-										)
+											childAlignment = {x = .Center, y = .Center},
+										},
+										backgroundColor = button_hovered ? clay.Color{36, 60, 84, 255} : EDITOR_BG,
+										cornerRadius = clay.CornerRadiusAll(3),
+									},
+									) {
+										if button_hovered {
+											clay.Text(
+												"+ Add track",
+												clay.TextElementConfig {
+													textColor = BUTTON_BORDER_HOVER,
+													fontSize = FONT_NORMAL,
+												},
+											)
+										}
 									}
 								}
 								if track_idx >= len(timeline.tracks) {
@@ -678,15 +695,14 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 											} else if clip_label == "" {
 												clip_label = "Clip"
 											}
-											if is_clip_selected(track_idx, index) {
-												// Selected linked clips (video + audio moving as one unit)
-												// outline yellow so the group is distinct from a lone clip;
-												// a lone selected clip gets the blue selection border.
+											// Only the anchor clip (and any explicitly Shift+clicked
+											// partner) gets the blue selection border; linked members no
+											// longer outline yellow.
+											if (track_idx == selected_track &&
+												   index == selected_index) ||
+											   timeline_clip.clip_id in selected_set {
 												clip_border = SELECT_BORDER
 												clip_border_w = 3
-												if timeline_clip.link_id != 0 {
-													clip_border = MARKER_COLOR
-												}
 											}
 											// Adjacent clips keep their corner radius but drop the
 											// shared border where this clip's end touches the next

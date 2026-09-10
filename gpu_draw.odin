@@ -487,13 +487,13 @@ draw_timeline_resize_focus :: proc(
 }
 
 // draw_clip_markers paints each clip's embedded markers on its timeline tile:
-// a small downward-pointing triangle at the tile's top (in the tile's border
-// color, highlighted when the tile is selected) with a thin vertical line
-// running from the triangle down to the bottom of the tile, positioned at the
-// marker's source frame. Shows the hovered marker's label as a tooltip in the
-// empty strip directly above the tile. Drawn as an overlay after the Clay
-// command batch because a clip element's final laid-out position is only
-// available via GetElementData.
+// a thin vertical line from the tile's top to its bottom at the marker's source
+// frame, and a small downward-pointing triangle in the insert gap directly above
+// the tile, inside the lane region right of the track gutter — the "Add track"
+// strip's remaining space marks the point, the line below carries it into the
+// tile. Shows the hovered marker's label as a tooltip in the same strip. Drawn
+// as an overlay after the Clay command batch because a clip element's final
+// laid-out position is only available via GetElementData.
 draw_clip_markers :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -509,16 +509,22 @@ draw_clip_markers :: proc(
 	hover_x: f32
 	gap_bounds: clay.BoundingBox
 	best_dist := f32(1e9)
-	// Marker lines and triangles must stay inside their track's lane; a marker
+	// Marker lines and triangles must stay inside their track's column; a marker
 	// inside a tile that has slid under the track-name gutter (or off the right
-	// edge) would otherwise render on top of neighboring rows and headers.
+	// edge) would otherwise render on top of neighboring rows and headers. The
+	// gap triangle sits above the lane, so the scissor spans lane + insert gap
+	// on one column.
 	restore_full := false
 	for track, track_idx in timeline.tracks {
 		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
+		gap := clay.GetElementData(clay.ID("TrackGap", u32(track_idx))).boundingBox
+		gap_bounds = gap
 		if lane.width > 0 && lane.height > 0 {
+			lo_y := min(lane.y, gap.y)
+			hi_y := max(lane.y + lane.height, gap.y + gap.height)
 			sdl.SetGPUScissor(
 				pass,
-				sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+				sdl.Rect{c.int(lane.x), c.int(lo_y), c.int(lane.width), c.int(hi_y - lo_y)},
 			)
 			restore_full = true
 		}
@@ -531,10 +537,6 @@ draw_clip_markers :: proc(
 			if box.width <= 0 || box.height <= 0 {
 				continue
 			}
-			// The strip directly above this tile (where "+ Add track" appears
-			// when the gap itself is hovered) is where the tooltip renders.
-			gap := clay.GetElementData(clay.ID("TrackGap", u32(track_idx))).boundingBox
-			gap_bounds = gap
 			color := BUTTON_BORDER
 			if selected_track == track_idx && selected_index == index {
 				color = BUTTON_BORDER_HOVER
@@ -546,7 +548,7 @@ draw_clip_markers :: proc(
 					box.x,
 					box.x + box.width,
 				)
-				// Thin vertical line from just below the triangle to the tile bottom.
+				// Thin vertical line from the tile's top down to its bottom.
 				render_sdf_rect(
 					renderer,
 					command_buffer,
@@ -556,11 +558,12 @@ draw_clip_markers :: proc(
 					0,
 					0,
 				)
-				// Downward-pointing triangle at the tile's top, at the marker's x.
-				y := box.y
+				// Downward-pointing triangle in the insert gap just above the
+				// tile, clamped to the lane region right of the gutter.
+				y := gap.y + gap.height - 9
 				for row, r in rows {
 					w := rows[r]
-					bx := clamp(line_x - w * 0.5, box.x, box.x + box.width - w)
+					bx := clamp(line_x - w * 0.5, lane.x, gap.x + gap.width - w)
 					render_sdf_rect(
 						renderer,
 						command_buffer,
@@ -572,8 +575,8 @@ draw_clip_markers :: proc(
 					)
 					y += 3
 				}
-				// Hover hit box: the marker's column near the top of the tile.
-				if len(m.label) > 0 && mouse_y >= box.y && mouse_y <= box.y + 18 {
+				// Hover hit box: the marker's column within the insert strip.
+				if len(m.label) > 0 && mouse_y >= gap.y && mouse_y <= gap.y + gap.height {
 					d := abs(mouse_x - line_x)
 					if d <= 6 && d < best_dist {
 						best_dist = d

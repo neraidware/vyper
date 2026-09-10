@@ -37,8 +37,7 @@ set_project_fps :: proc(fps: f64) {
 // vertical=false, portrait when vertical=true), swapping the dimensions only
 // when they already point the other way, and locks the canvas.
 set_project_orientation :: proc(vertical: bool) {
-	if vertical && project.height < project.width ||
-		!vertical && project.width < project.height {
+	if vertical && project.height < project.width || !vertical && project.width < project.height {
 		project.width, project.height = project.height, project.width
 	}
 	resolution_locked = true
@@ -47,11 +46,20 @@ set_project_orientation :: proc(vertical: bool) {
 // probe_video_size returns the first video stream's pixel dimensions, or
 // ok=false if the file has no video stream / ffprobe fails.
 probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
-	out, code, okin := run_capture({
-		"ffprobe", "-v", "error", "-select_streams", "v:0",
-		"-show_entries", "stream=width,height", "-of", "csv=p=0",
-		string(path),
-	})
+	out, code, okin := run_capture(
+		{
+			"ffprobe",
+			"-v",
+			"error",
+			"-select_streams",
+			"v:0",
+			"-show_entries",
+			"stream=width,height",
+			"-of",
+			"csv=p=0",
+			string(path),
+		},
+	)
 	defer delete(out)
 	if !okin || code != 0 {
 		return 0, 0, false
@@ -70,12 +78,18 @@ probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
 }
 
 probe_media :: proc(path: cstring) -> string {
-	out, _, okin := run_capture({
-		"ffprobe", "-v", "error",
-		"-show_entries", "format=format_name,duration,size:stream=codec_name,nb_frames,avg_frame_rate",
-		"-of", "default=noprint_wrappers=1",
-		string(path),
-	})
+	out, _, okin := run_capture(
+		{
+			"ffprobe",
+			"-v",
+			"error",
+			"-show_entries",
+			"format=format_name,duration,size:stream=codec_name,nb_frames,avg_frame_rate",
+			"-of",
+			"default=noprint_wrappers=1",
+			string(path),
+		},
+	)
 	if !okin {
 		return "Length: unavailable\nFormat: unavailable\nCodecs: unavailable\nSize: unavailable"
 	}
@@ -269,18 +283,21 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	}
 
 	asset_id := next_asset_id()
-	append(&media_assets, Media_Asset{
-		id = asset_id,
-		path = path,
-		kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
-		metadata = file_info_text,
-		frame_count = frame_count,
-		src_w = src_w,
-		src_h = src_h,
-		audio_streams = c.int(probe.audio_streams),
-		audio_frames = audio_frames,
-		thumb_tex_dirty = true,
-	})
+	append(
+		&media_assets,
+		Media_Asset {
+			id = asset_id,
+			path = path,
+			kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
+			metadata = file_info_text,
+			frame_count = frame_count,
+			src_w = src_w,
+			src_h = src_h,
+			audio_streams = c.int(probe.audio_streams),
+			audio_frames = audio_frames,
+			thumb_tex_dirty = true,
+		},
+	)
 	decode_asset_thumbnail(&media_assets[len(media_assets) - 1])
 
 	// Editing-time preview can decode a low-res all-intra proxy of a video for
@@ -290,7 +307,14 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	// with no proxy just previews from the source.
 	if probe.has_video {
 		proxy_buf: [4096]u8
-		_ = proxy_transcode(path, frame_count, src_w, src_h, i64(probe.duration_sec * 1_000_000), proxy_buf[:])
+		_ = proxy_transcode(
+			path,
+			frame_count,
+			src_w,
+			src_h,
+			i64(probe.duration_sec * 1_000_000),
+			proxy_buf[:],
+		)
 	}
 	return asset_id
 }
@@ -308,22 +332,28 @@ import_srt_to_bin :: proc(path: cstring) -> u64 {
 	}
 	srt_id := srt_load(path)
 	if srt_id < 0 {
-		show_ui_notice(fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)), 4000)
+		show_ui_notice(
+			fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)),
+			4000,
+		)
 		return 0
 	}
 	one_sec := i64(math.round(timeline_fps()))
 	length := max(one_sec, cue_frame(srt_duration_ms(srt_source(srt_id)), f32(timeline_fps())))
 	asset_id := next_asset_id()
-	append(&media_assets, Media_Asset{
-		id = asset_id,
-		path = path,
-		kind = .Subtitles,
-		metadata = strings.clone(path_basename(path)),
-		frame_count = length,
-		audio_frames = length,
-		srt_id = srt_id,
-		thumb_tex_dirty = true,
-	})
+	append(
+		&media_assets,
+		Media_Asset {
+			id = asset_id,
+			path = path,
+			kind = .Subtitles,
+			metadata = strings.clone(path_basename(path)),
+			frame_count = length,
+			audio_frames = length,
+			srt_id = srt_id,
+			thumb_tex_dirty = true,
+		},
+	)
 	show_ui_notice(fmt.aprintf("Subtitles '%s' added to the media bin", path_basename(path)), 2000)
 	return asset_id
 }
@@ -366,7 +396,8 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	}
 	for offset in 1 ..< n_lanes {
 		lane := base + offset
-		if lane < len(timeline.tracks) && lane_blocked(&timeline.tracks[lane], anchor_placed, asset.audio_frames) {
+		if lane < len(timeline.tracks) &&
+		   lane_blocked(&timeline.tracks[lane], anchor_placed, asset.audio_frames) {
 			return start_frame
 		}
 	}
@@ -375,7 +406,6 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	// unit, so a video edit never leaves its audio behind.
 	link := new_clip_id()
 	first_placed := anchor_placed
-	video_placed: i64 = -1
 	for offset in 0 ..< n_lanes {
 		is_video := asset.kind == .Video && offset == 0
 		is_sub := asset.kind == .Subtitles && offset == 0
@@ -399,17 +429,17 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			}
 		}
 		placed := anchor_placed
-		clip := Clip{
-			clip_id = new_clip_id(),
-			link_id = link,
-			asset_id = asset.id,
-			path = is_sub ? nil : asset.path,
-			name = is_sub ? strings.clone(path_basename(asset.path)) : "",
-			kind = is_video ? .Video : (is_sub ? .Text : .Audio),
-			generator = is_sub ? .Subtitles : .None,
-			srt_id = is_sub ? asset.srt_id : -1,
-			stream_index = is_sub ? c.int(-1) : c.int(offset - (asset.kind == .Video ? 1 : 0)),
-			source_start_frame = 0,
+		clip := Clip {
+			clip_id              = new_clip_id(),
+			link_id              = link,
+			asset_id             = asset.id,
+			path                 = is_sub ? nil : asset.path,
+			name                 = is_sub ? strings.clone(path_basename(asset.path)) : "",
+			kind                 = is_video ? .Video : (is_sub ? .Text : .Audio),
+			generator            = is_sub ? .Subtitles : .None,
+			srt_id               = is_sub ? asset.srt_id : -1,
+			stream_index         = is_sub ? c.int(-1) : c.int(offset - (asset.kind == .Video ? 1 : 0)),
+			source_start_frame   = 0,
 			source_length_frames = lane_len,
 			timeline_start_frame = placed,
 		}
@@ -429,7 +459,6 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			// OBS hybrid MP4 recordings embed chapter markers as a text stream;
 			// surface them on the video clip as embedded clip markers.
 			clip.markers = import_obs_chapters(asset.path)
-			video_placed = placed
 		} else if is_sub {
 			// Subtitle generator clip sits centered on the project canvas at
 			// native scale, exactly like add_subtitle_generator_clip sets it.
@@ -439,8 +468,10 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 		}
 		append(&track.clips, clip)
 		// Keep the track's clips sorted ascending by timeline start.
-		for j := len(track.clips) - 1; j > 0 && track.clips[j].timeline_start_frame < track.clips[j-1].timeline_start_frame; j -= 1 {
-			track.clips[j], track.clips[j-1] = track.clips[j-1], track.clips[j]
+		for j := len(track.clips) - 1;
+		    j > 0 && track.clips[j].timeline_start_frame < track.clips[j - 1].timeline_start_frame;
+		    j -= 1 {
+			track.clips[j], track.clips[j - 1] = track.clips[j - 1], track.clips[j]
 		}
 		if offset == 0 {
 			first_placed = placed
@@ -449,9 +480,10 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 		}
 	}
 
-	// Post-edit: point the playhead at the placed content, select the video
-	// clip, and tear down stale decode/playback state like every other timeline
-	// edit.
+	// Post-edit: point the playhead at the placed content, select ONLY the newly
+	// added clips, and tear down stale decode/playback state like every other
+	// timeline edit. A previous selection must not survive the import or the old
+	// clip keeps its border next to the fresh one.
 	timeline.playhead_frame = first_placed
 	playhead.frame = first_placed
 	playhead.playing = false
@@ -468,14 +500,24 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	audio_reset_for_load()
 	invalidate_preview_slots()
 	audio_note_edit()
-	if video_placed >= 0 {
-		for ti in 0 ..< len(timeline.tracks) {
-			for ci in 0 ..< len(timeline.tracks[ti].clips) {
-				c := &timeline.tracks[ti].clips[ci]
-				if c.asset_id == asset_id && c.kind == .Video && c.timeline_start_frame == video_placed {
-					selected_track = ti
-					selected_index = ci
-				}
+	clear(&selected_set)
+	selected_track = -1
+	selected_index = -1
+	want_kind := Media_Kind.Video
+	#partial switch asset.kind {
+	case .Audio:
+		want_kind = .Audio
+	case .Subtitles:
+		want_kind = .Text
+	}
+	for ti in 0 ..< len(timeline.tracks) {
+		for ci in 0 ..< len(timeline.tracks[ti].clips) {
+			c := &timeline.tracks[ti].clips[ci]
+			if c.asset_id == asset_id &&
+			   c.kind == want_kind &&
+			   c.timeline_start_frame == anchor_placed {
+				selected_track = ti
+				selected_index = ci
 			}
 		}
 	}
