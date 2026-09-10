@@ -142,12 +142,21 @@ proxy_scale :: proc(src_w, src_h: c.int) -> (w, h: c.int) {
 // proxy_probe_frame_count returns the number of frames ffprobe attributes to
 // the proxy's video stream (for parity checking against the source).
 proxy_probe_frame_count :: proc(path: cstring) -> i64 {
-	out, code, okin := run_capture({
-		"ffprobe", "-v", "error", "-select_streams", "v:0",
-		"-count_packets", "-show_entries", "stream=nb_read_packets",
-		"-of", "csv=p=0",
-		string(path),
-	})
+	out, code, okin := run_capture(
+		{
+			"ffprobe",
+			"-v",
+			"error",
+			"-select_streams",
+			"v:0",
+			"-count_packets",
+			"-show_entries",
+			"stream=nb_read_packets",
+			"-of",
+			"csv=p=0",
+			string(path),
+		},
+	)
 	defer delete(out)
 	if !okin || code != 0 {
 		return -1
@@ -183,7 +192,13 @@ proxy_encode_threads :: proc() -> string {
 // when one is ready right now (fast disk-cache hit, or the sync build), or
 // cstring(nil) when the build is deferred (async) or failed. `src_frames` is the
 // source's own frame count.
-proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, src_dur_us: i64, out_buf: []u8) -> cstring {
+proxy_transcode :: proc(
+	src: cstring,
+	src_frames: i64,
+	src_w, src_h: c.int,
+	src_dur_us: i64,
+	out_buf: []u8,
+) -> cstring {
 	if !preview_proxy_enabled {
 		return nil
 	}
@@ -209,21 +224,32 @@ proxy_transcode :: proc(src: cstring, src_frames: i64, src_w, src_h: c.int, src_
 	threads := proxy_encode_threads()
 	defer delete(threads)
 	// Run ffmpeg with an argv (no shell), capturing (and discarding) its output.
-	run_capture({
-		"ffmpeg",
-		"-y",
-		"-i", string(src),
-		"-an",
-		"-vf", filter,
-		"-c:v", "libx264",
-		"-preset", "ultrafast",
-		"-tune", "fastdecode",
-		"-crf", "26",
-		"-g", "1",
-		"-threads", threads,
-		"-pix_fmt", "yuv420p",
-		string(proxy),
-	})
+	run_capture(
+		{
+			"ffmpeg",
+			"-y",
+			"-i",
+			string(src),
+			"-an",
+			"-vf",
+			filter,
+			"-c:v",
+			"libx264",
+			"-preset",
+			"ultrafast",
+			"-tune",
+			"fastdecode",
+			"-crf",
+			"26",
+			"-g",
+			"1",
+			"-threads",
+			threads,
+			"-pix_fmt",
+			"yuv420p",
+			string(proxy),
+		},
+	)
 	if !proxy_valid_cache_hit(proxy, src_frames) {
 		return nil
 	}
@@ -457,8 +483,8 @@ proxy_resolver_entry :: struct {
 	// positively validated AND chosen, it cannot vanish without the decoder's
 	// next open also failing, so we only re-stat when the segment index actually
 	// changes (boundary cross or index growth). A fresh source reset clears it.
-	valid_k_ok: bool,
-	valid_k:    int,
+	valid_k_ok:  bool,
+	valid_k:     int,
 }
 
 proxy_resolver_cache: proxy_resolver_entry
@@ -476,7 +502,15 @@ proxy_resolver_cache: proxy_resolver_entry
 // corresponds to (0 for a source or whole-file proxy, k*PROXY_SEG_FRAMES for a
 // segment). The decoder translates the SOURCE request index by this before
 // seeking/caching, since a segment's stream timestamps restart at 0.
-proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf: []u8) -> (cstring, i64) {
+proxy_pick_for_frame :: proc(
+	src: cstring,
+	src_frames: i64,
+	frame: i64,
+	out_buf: []u8,
+) -> (
+	cstring,
+	i64,
+) {
 	if !preview_proxy_enabled {
 		return nil, 0
 	}
@@ -527,7 +561,12 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 			return nil, 0
 		}
 		if nered_trace {
-			fmt.printf("[pick] seg index %d not covered: len=%d segs=%v\n", k, len(rc.idx.segs), rc.idx.segs)
+			fmt.printf(
+				"[pick] seg index %d not covered: len=%d segs=%v\n",
+				k,
+				len(rc.idx.segs),
+				rc.idx.segs,
+			)
 		}
 		// Not covered yet: the on-disk index may have grown since we read it,
 		// so fall through and re-consult it when the needed segment might
@@ -542,7 +581,8 @@ proxy_pick_for_frame :: proc(src: cstring, src_frames: i64, frame: i64, out_buf:
 	idx_path_buf: [4096]u8
 	idx_path, idx_ok := proxy_idx_path_for(src, idx_path_buf[:])
 	if idx_ok && (!rc.idx_valid || k >= len(rc.idx.segs)) {
-		if info, serr := os.stat(string(idx_path), context.temp_allocator); serr == 0 && info.modification_time != rc.idx_mtime {
+		if info, serr := os.stat(string(idx_path), context.temp_allocator);
+		   serr == os.ERROR_NONE && info.modification_time != rc.idx_mtime {
 			delete(rc.idx.segs)
 			rc.idx = {}
 			rc.idx_valid = proxy_idx_load(src, &rc.idx)
