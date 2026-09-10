@@ -839,6 +839,7 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 main :: proc() {
 	when ODIN_OS == .Windows {
 		crash_handler_install()
+		win_ffmpeg_versions_diag()
 	}
 	nered_trace = os.get_env_alloc("NERED_TRACE", context.temp_allocator) == "1"
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {

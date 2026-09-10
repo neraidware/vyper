@@ -114,6 +114,49 @@ jobs:
           Copy-Item -Path deps\ffmpeg.exe, deps\ffprobe.exe -Destination dist -Force
           Get-ChildItem dist | Select-Object Name,Length
 
+      # Smoke test the shipped dist headlessly: generate a sample, decode a
+      # frame range through the vendored ffmpeg DLLs (NERED_FRAME_PROBE), then
+      # build a proxy with the bundled ffmpeg.exe and verify proxy/source
+      # parity (NERED_PROXY_PROBE). A dist whose DLL set or decode path is
+      # broken dies HERE with a non-zero exit -- and nered_crash.log next to
+      # the exe is captured into the log so the fault is diagnosable without
+      # a Windows box. This is what would have caught "crashes as soon as I
+      # open a video" upstream of the artifact.
+      - name: Smoke test (decode + proxy)
+        shell: pwsh
+        run: |
+          # nered.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
+          # redirected, so every run writes a log that we dump on failure/success.
+          $env:PATH = "$PWD\dist;$env:PATH"
+          & .\dist\ffmpeg.exe -y -loglevel error -f lavfi -i testsrc2=duration=8:size=320x180:rate=30 -frames:v 240 -pix_fmt yuv420p sample.mp4
+          if ($LASTEXITCODE -ne 0) { throw "sample generation failed (exit $LASTEXITCODE)" }
+
+          Remove-Item -ErrorAction SilentlyContinue .\smoke_frame.log
+          $env:NERED_FRAME_PROBE = "sample.mp4|0-239|30"
+          & .\dist\nered.exe > .\smoke_frame.log 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content .\smoke_frame.log
+            if (Test-Path .\dist\nered_crash.log) { Get-Content .\dist\nered_crash.log }
+            throw "frame-probe failed (exit $LASTEXITCODE)"
+          }
+          Remove-Item Env:NERED_FRAME_PROBE
+
+          Remove-Item -ErrorAction SilentlyContinue .\smoke_proxy.log
+          $env:NERED_PROXY_PROBE = "sample.mp4"
+          & .\dist\nered.exe > .\smoke_proxy.log 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content .\smoke_proxy.log
+            if (Test-Path .\dist\nered_crash.log) { Get-Content .\dist\nered_crash.log }
+            throw "proxy-probe failed (exit $LASTEXITCODE)"
+          }
+
+          if (Test-Path .\dist\nered_crash.log) {
+            Get-Content .\dist\nered_crash.log
+            throw "nered_crash.log present after smoke test"
+          }
+          Get-Content .\smoke_frame.log
+          Get-Content .\smoke_proxy.log
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

@@ -2,7 +2,13 @@
 
 package main
 
+import "core:c"
+import "core:fmt"
 import win32 "core:sys/windows"
+import avcodec "vendor/ffmpeg/avcodec"
+import avfmt "vendor/ffmpeg/avformat"
+import avutil "vendor/ffmpeg/avutil"
+import sws "vendor/ffmpeg/swscale"
 
 // ---------------------------------------------------------------------------
 // Windows crash handler.
@@ -24,13 +30,35 @@ crash_handler_installed: bool
 
 crash_log_name: [win32.MAX_PATH]u16
 
+// win_ffmpeg_versions_diag prints the running FFmpeg shared-library majors once,
+// first thing at startup. The vendored bindings link these DLLs at import time;
+// if the DLL set on disk has drifted from the ABI the bindings were written
+// against, the very first in-process decode (the thumbnail of a just-opened
+// video) faults inside the DLLs. This line separates "DLL/binding drift" (majors
+// here disagree with what the bindings expect) from a code bug in the decode
+// path -- read it in CI logs or before the crash, it is printed before any
+// window/canvas work.
+ff_major :: proc(v: c.uint) -> u32 {
+	return u32(v >> 16)
+}
+
+win_ffmpeg_versions_diag :: proc() {
+	fmt.printf(
+		"[win-ff] avformat=%d avcodec=%d avutil=%d swscale=%d\n",
+		ff_major(avfmt.version()),
+		ff_major(avcodec.version()),
+		ff_major(avutil.version()),
+		ff_major(sws.version()),
+	)
+}
+
 crash_log_put :: proc "system" (b: []u8, p: ^int, c: u8) {
-	if p^ < len(b) { b[p^] = c }
+	if p^ < len(b) {b[p^] = c}
 	p^ += 1
 }
 
 crash_log_put_cstr :: proc "system" (b: []u8, p: ^int, s: string) {
-	for i := 0; i < len(s); i += 1 { crash_log_put(b, p, s[i]) }
+	for i := 0; i < len(s); i += 1 {crash_log_put(b, p, s[i])}
 }
 
 crash_log_put_hex :: proc "system" (b: []u8, p: ^int, value: u64, width: int) {
@@ -61,7 +89,7 @@ crash_log_write :: proc "system" (code: u32, addr: uintptr) {
 		win32.FILE_ATTRIBUTE_NORMAL,
 		nil,
 	)
-	if log_handle == win32.INVALID_HANDLE_VALUE { return }
+	if log_handle == win32.INVALID_HANDLE_VALUE {return}
 
 	written: win32.DWORD
 	win32.WriteFile(log_handle, cast(win32.LPVOID)&buf[0], u32(pos), &written, nil)
@@ -82,7 +110,7 @@ crash_filter :: proc "system" (ep: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 crash_handler_install :: proc() {
 	if !crash_handler_installed {
 		w := win32.utf8_to_utf16_buf(crash_log_name[:], "nered_crash.log")
-		if w != nil { crash_log_name[len(w)] = 0 }
+		if w != nil {crash_log_name[len(w)] = 0}
 		win32.SetUnhandledExceptionFilter(crash_filter)
 		crash_handler_installed = true
 	}

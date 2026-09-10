@@ -63,6 +63,25 @@ swscale-10.dll
 by exe directory, not `PATH`. On a crash, nered writes `nered_crash.log`
 (exception code + fault address) in this same directory.
 
+## CI smoke test (decode + proxy)
+
+The `windows` workflow runs headless probes against the staged `dist/` before
+uploading the artifact, so a build whose FFmpeg DLL set or decode path is broken
+fails the run instead of shipping a binary that crashes on open:
+
+- generates `sample.mp4` with the bundled `ffmpeg.exe`; then
+- `NERED_FRAME_PROBE="sample.mp4|0-240|30"` decodes a frame range through the
+  vendored FFmpeg DLLs; and
+- `NERED_PROXY_PROBE="sample.mp4"` builds a proxy with `ffmpeg.exe` and verifies
+  proxy/source parity.
+- Any non-zero exit, or `nered_crash.log` next to the exe, fails the job.
+
+`nered.exe` also prints the linked FFmpeg majors first thing on startup:
+`[win-ff] avformat=N avcodec=N avutil=N swscale=N`. If those differ from the
+majors the vendored bindings target, the first in-process decode (thumbnail of a
+just-opened video) can fault inside the DLLs — the print separates DLL/binding
+drift from a code bug in the decode path.
+
 ## What was ported
 
 - **Shell-outs** (`posix.popen/fgets/pclose`) → `run_capture()` via
