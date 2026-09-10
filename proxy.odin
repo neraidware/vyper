@@ -26,7 +26,8 @@ import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 
 // Proxy artifacts live in a per-user cache directory -- "$XDG_CACHE_HOME/nered",
-// or "$HOME/.cache/nered" when XDG_CACHE_HOME is unset -- keyed by
+// or "$HOME/.cache/nered" when XDG_CACHE_HOME is unset; on Windows that base is
+// "%LOCALAPPDATA%/nered" (no XDG/dotdir convention there) -- keyed by
 // <basename>-<path-hash>, so they never pollute the source folders, survive any
 // source relocation (re-hash only when the path changes), and same-named sources
 // from different folders stay distinct. The naming scheme is unchanged:
@@ -47,11 +48,23 @@ proxy_cache_prefix :: proc(buf: []u8) -> (int, bool) {
 	if v, ok := os.lookup_env_alloc("XDG_CACHE_HOME", context.temp_allocator); ok && v != "" {
 		home = v
 	} else {
-		h, err := os.user_home_dir(context.temp_allocator)
-		if err != os.General_Error.None || h == "" {
-			return 0, false
+		when ODIN_OS == .Windows {
+			// Windows has no XDG convention and no dotdirs: the sanctioned
+			// per-user cache root is %LOCALAPPDATA% (AppData\Local). Falling
+			// back to ~/.cache would drop proxies where Windows users never
+			// look and tools never clean.
+			localapp, lok := os.lookup_env_alloc("LOCALAPPDATA", context.temp_allocator)
+			if !lok || localapp == "" {
+				return 0, false
+			}
+			home = localapp
+		} else {
+			h, err := os.user_home_dir(context.temp_allocator)
+			if err != os.General_Error.None || h == "" {
+				return 0, false
+			}
+			home = strings.concatenate({h, "/.cache"}, context.temp_allocator)
 		}
-		home = strings.concatenate({h, "/.cache"}, context.temp_allocator)
 	}
 	rel := "/nered/"
 	n := len(home) + len(rel)

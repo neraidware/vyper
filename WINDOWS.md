@@ -63,6 +63,11 @@ swscale-10.dll
 by exe directory, not `PATH`. On a crash, nered writes `nered_crash.log`
 (exception code + fault address) in this same directory.
 
+Preview proxies (low-res all-intra cache of edited clips) are stored under
+`%LOCALAPPDATA%\nered\` — `<base>-<hash>.neredproxy.mp4`, per-segment
+`.neredproxy.segNNNN.mp4`, and the `.neredproxy.idx` index. Old proxies from
+before this change may linger in `%USERPROFILE%\.cache\nered\`.
+
 ## CI smoke test (decode + proxy)
 
 The `windows` workflow runs headless probes against the staged `dist/` before
