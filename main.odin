@@ -1,5 +1,6 @@
 package main
 
+import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:mem"
@@ -7,7 +8,6 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
-import clay "clay-odin"
 import sdl "vendor:sdl3"
 
 // ---------------------------------------------------------------------------
@@ -39,7 +39,12 @@ toggle_playback :: proc() {
 	playhead.playing = true
 	preview.playing = true
 	if nered_trace {
-		fmt.printf("[pb] toggle playing=%v ph=%d dir=%d\n", playhead.playing, playhead.frame, playback_dir)
+		fmt.printf(
+			"[pb] toggle playing=%v ph=%d dir=%d\n",
+			playhead.playing,
+			playhead.frame,
+			playback_dir,
+		)
 	}
 }
 
@@ -72,7 +77,12 @@ jog_playback :: proc(dir: int) {
 	if playback_dir == dir {
 		playback_boost += 1
 		if nered_trace {
-			fmt.printf("[pb] jog boost dir=%d boost=%d eff=%.2fx\n", dir, playback_boost, effective_playback_rate())
+			fmt.printf(
+				"[pb] jog boost dir=%d boost=%d eff=%.2fx\n",
+				dir,
+				playback_boost,
+				effective_playback_rate(),
+			)
 		}
 	} else {
 		playback_dir = dir
@@ -220,7 +230,15 @@ scroll_press :: proc(tag: string, my: f32, drag: ^bool, grab: ^f32) -> bool {
 // scroll_drag_update moves a scroll value while its scrollbar drag is active,
 // mapping the cursor's position within the strip onto the scroll range. Ends
 // the drag the moment the button lifts.
-scroll_drag_update :: proc(tag: string, down: bool, my: f32, drag: ^bool, grab: ^f32, scroll: ^f32, content_h, view_h: f32) {
+scroll_drag_update :: proc(
+	tag: string,
+	down: bool,
+	my: f32,
+	drag: ^bool,
+	grab: ^f32,
+	scroll: ^f32,
+	content_h, view_h: f32,
+) {
 	if !drag^ {
 		return
 	}
@@ -464,7 +482,10 @@ handle_ctx_option :: proc() {
 		add_text_clip_at()
 	} else if clay.PointerOver(clay.ID("CtxSubtitleClip")) {
 		add_subtitle_clip_at()
-	} else if ct >= 0 && ct < len(timeline.tracks) && ci >= 0 && ci < len(timeline.tracks[ct].clips) {
+	} else if ct >= 0 &&
+	   ct < len(timeline.tracks) &&
+	   ci >= 0 &&
+	   ci < len(timeline.tracks[ct].clips) {
 		select_clip(ct, ci)
 		if clay.PointerOver(clay.ID("CtxRename")) {
 			begin_clip_rename()
@@ -549,7 +570,11 @@ timeline_zoom_about_playhead :: proc(factor: f32) {
 	anchor_frame := timeline_view_start + anchor / max(timeline_zoom, 0.0001)
 	new_zoom := clamp(timeline_zoom * factor, TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
 	if new_zoom != timeline_zoom {
-		timeline_view_start = clamp(anchor_frame - anchor / max(new_zoom, 0.0001), 0, f32(timeline_duration()))
+		timeline_view_start = clamp(
+			anchor_frame - anchor / max(new_zoom, 0.0001),
+			0,
+			f32(timeline_duration()),
+		)
 		timeline_zoom = new_zoom
 	}
 }
@@ -561,7 +586,11 @@ timeline_zoom_fit :: proc() {
 	if ruler.width <= 0 {
 		return
 	}
-	new_zoom := clamp(ruler.width / f32(max(timeline_duration(), 1)), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+	new_zoom := clamp(
+		ruler.width / f32(max(timeline_duration(), 1)),
+		TIMELINE_MIN_ZOOM,
+		TIMELINE_MAX_ZOOM,
+	)
 	timeline_zoom = new_zoom
 	timeline_view_start = 0
 }
@@ -570,7 +599,8 @@ timeline_zoom_fit :: proc() {
 // the frame captured when the context menu was opened (right-click), one second
 // long (shortened to fit its free gap). After insert the new clip becomes the
 // timeline selection.
-add_text_clip_at :: proc() {	if ctx_menu.target_track < 0 || ctx_menu.target_track >= len(timeline.tracks) {
+add_text_clip_at :: proc() {if ctx_menu.target_track < 0 ||
+	   ctx_menu.target_track >= len(timeline.tracks) {
 		return
 	}
 	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame)
@@ -603,11 +633,19 @@ add_subtitle_clip_at :: proc() {
 	}
 	srt_id := srt_load(path)
 	if srt_id < 0 {
-		show_ui_notice(fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)), 4000)
+		show_ui_notice(
+			fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)),
+			4000,
+		)
 		return
 	}
 	name := strings.clone(path_basename(path))
-	idx := add_subtitle_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame, srt_id, name)
+	idx := add_subtitle_generator_clip(
+		&timeline.tracks[ctx_menu.target_track],
+		ctx_menu.frame,
+		srt_id,
+		name,
+	)
 	audio_note_edit()
 
 	selected_track = ctx_menu.target_track
@@ -726,7 +764,8 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 	if playhead.playing {
 		// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
 		// delta so the cadence is perfectly jitter-free (or any fixed rate).
-		dt_s := PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
+		dt_s :=
+			PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
 		// The playhead advances +dir frames at effective_playback_rate against
 		// the wall clock (rate * jog boost). Audio pacing at non-1x is the
 		// producer's stream frequency ratio; audio is muted going backward.
@@ -743,7 +782,13 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 			sync.atomic_store(&audio_ph_catch, catchup)
 			if catchup > 1 {
 				if nered_trace {
-					fmt.printf("[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n", i64(playback_dir) * catchup, playhead.frame, f64(now_ns-last_tick_ns)/1e6, playhead_accumulator)
+					fmt.printf(
+						"[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n",
+						i64(playback_dir) * catchup,
+						playhead.frame,
+						f64(now_ns - last_tick_ns) / 1e6,
+						playhead_accumulator,
+					)
 				}
 			}
 		}
@@ -754,7 +799,9 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		if stop_frame < 0 {
 			stop_frame = timeline_duration()
 		}
-		at_end := (playback_dir == 1 && playhead.frame >= stop_frame) || (playback_dir == -1 && playhead.frame <= 0)
+		at_end :=
+			(playback_dir == 1 && playhead.frame >= stop_frame) ||
+			(playback_dir == -1 && playhead.frame <= 0)
 		if at_end {
 			playback_stop_frame = -1
 			playback_boost = 0
@@ -762,7 +809,12 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 			playhead.playing = false
 			preview.playing = false
 			if nered_trace {
-				fmt.printf("[pb] auto-stop dir=%d ph=%d stop=%d\n", playback_dir, playhead.frame, stop_frame)
+				fmt.printf(
+					"[pb] auto-stop dir=%d ph=%d stop=%d\n",
+					playback_dir,
+					playhead.frame,
+					stop_frame,
+				)
 			}
 		}
 		// Playback is real-time: the playhead (and with it the audio) runs on
@@ -812,6 +864,10 @@ main :: proc() {
 		transform_probe_run(tp)
 		return
 	}
+	if tlp, _ := os.lookup_env_alloc("NERED_TL_PROBE", context.temp_allocator); tlp != "" {
+		timeline_probe_run(tlp)
+		return
+	}
 	if xp, _ := os.lookup_env_alloc("NERED_PROXY_PROBE", context.temp_allocator); xp != "" {
 		proxy_probe_run(xp)
 		return
@@ -825,7 +881,10 @@ main :: proc() {
 	if !load_font_data() {
 		return
 	}
-	if sub_render_probe, _ := os.lookup_env_alloc("NERED_SUB_RENDER_PROBE", context.temp_allocator); sub_render_probe != "" {
+	if sub_render_probe, _ := os.lookup_env_alloc(
+		"NERED_SUB_RENDER_PROBE",
+		context.temp_allocator,
+	); sub_render_probe != "" {
 		// The probe free-alls the temp arena per simulated frame, so the env
 		// string must not live on the temp arena (same rule as the autoplay
 		// path below). Clone it to a cstring the probe keeps for the session.
@@ -891,7 +950,10 @@ main :: proc() {
 	// Media-bin thumbnails own per-asset GPU textures; free them at shutdown.
 	defer release_media_asset_textures(device)
 	initial_upload := sdl.AcquireGPUCommandBuffer(device)
-	if initial_upload == nil || !upload_font_atlas(&renderer, initial_upload) || !upload_icons(&renderer, initial_upload) || !sdl.SubmitGPUCommandBuffer(initial_upload) {
+	if initial_upload == nil ||
+	   !upload_font_atlas(&renderer, initial_upload) ||
+	   !upload_icons(&renderer, initial_upload) ||
+	   !sdl.SubmitGPUCommandBuffer(initial_upload) {
 		fmt.println("Could not upload font atlas:", sdl.GetError())
 		return
 	}
@@ -924,7 +986,11 @@ main :: proc() {
 	}
 	if PLAYBACK_MAGIC_MS > 0 || PLAYBACK_MAGIC_FPS > 0 {
 		if nered_trace {
-			fmt.printf("[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n", PLAYBACK_MAGIC_MS, PLAYBACK_MAGIC_FPS)
+			fmt.printf(
+				"[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n",
+				PLAYBACK_MAGIC_MS,
+				PLAYBACK_MAGIC_FPS,
+			)
 		}
 	}
 
@@ -941,11 +1007,18 @@ main :: proc() {
 		// free their paths), not the per-frame temp arena.
 		import_media(strings.clone_to_cstring(autoplay))
 		if nered_trace {
-			fmt.printf("[autoplay] env=\"%s\" imported tracks=%d step=delay\n", autoplay, len(timeline.tracks))
+			fmt.printf(
+				"[autoplay] env=\"%s\" imported tracks=%d step=delay\n",
+				autoplay,
+				len(timeline.tracks),
+			)
 		}
 		if len(timeline.tracks) == 0 {
 			if nered_trace {
-				fmt.printf("[autoplay] FATAL: NERED_AUTOPLAY=\"%s\" imported nothing (no audio track)\n", autoplay)
+				fmt.printf(
+					"[autoplay] FATAL: NERED_AUTOPLAY=\"%s\" imported nothing (no audio track)\n",
+					autoplay,
+				)
 			}
 			os.exit(1)
 		}
@@ -994,7 +1067,12 @@ main :: proc() {
 
 		commands := build_page(width, height)
 		clamp_view_scrolls()
-		was_mouse_down, was_right_down = interaction_post_build(inp, was_mouse_down, was_right_down, height)
+		was_mouse_down, was_right_down = interaction_post_build(
+			inp,
+			was_mouse_down,
+			was_right_down,
+			height,
+		)
 
 		now_ns := sdl.GetTicksNS()
 		playback_update(now_ns)
@@ -1008,11 +1086,16 @@ main :: proc() {
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
 			if nered_trace {
 				elapsed := f64(now_ns - ui_report_tick) / 1e9
-				fmt.printf("[ui] fps=%.1f dec_ms=%.1f playhead=%d acc=%.3fs src=%d catch=%d prod=%d\n",
+				fmt.printf(
+					"[ui] fps=%.1f dec_ms=%.1f playhead=%d acc=%.3fs src=%d catch=%d prod=%d\n",
 					f64(ui_frame_count) / elapsed,
 					f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
 					playhead.frame,
-					playhead_accumulator, sync.atomic_load(&audio_ph_src), sync.atomic_load(&audio_ph_catch), sync.atomic_load(&audio_prod_frame))
+					playhead_accumulator,
+					sync.atomic_load(&audio_ph_src),
+					sync.atomic_load(&audio_ph_catch),
+					sync.atomic_load(&audio_prod_frame),
+				)
 			}
 			ui_report_tick = now_ns
 			ui_frame_count = 0

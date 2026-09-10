@@ -1,0 +1,9 @@
+{
+  "collections": [
+    { "name": ".", "path": "." }
+  ],
+  "checker_args": ["-vet-using-param", "-vet-using-stmt"],
+  "flag_values": {
+    "-strict-style": true
+  }
+}

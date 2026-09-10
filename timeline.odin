@@ -11,7 +11,10 @@ import "core:strings"
 // selection, and track insert/duplicate/naming.
 // ---------------------------------------------------------------------------
 
-clip_timeline_end :: proc(clip: Clip) -> i64 { return clip.timeline_start_frame + clip.source_length_frames }
+clip_timeline_end :: proc(clip: Clip) -> i64 {return(
+		clip.timeline_start_frame +
+		clip.source_length_frames \
+	)}
 
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
 // starting at `start_frame` (timeline frames). The duration is one second at the
@@ -31,29 +34,31 @@ add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
 			}
 		}
 	}
-	clip := Clip{
-		clip_id = new_clip_id(),
-		asset_id = 0,
-		path = nil,
-		kind = .Text,
-		generator = .Text,
-		stream_index = -1,
-		source_start_frame = 0,
+	clip := Clip {
+		clip_id              = new_clip_id(),
+		asset_id             = 0,
+		path                 = nil,
+		kind                 = .Text,
+		generator            = .Text,
+		stream_index         = -1,
+		source_start_frame   = 0,
 		source_length_frames = length,
 		timeline_start_frame = start,
-		transform_x = f32(project.width) / 2,
-		transform_y = f32(project.height) / 2,
-		scale = 1,
-		crop_l = 0,
-		crop_r = 0,
-		crop_t = 0,
-		crop_b = 0,
+		transform_x          = f32(project.width) / 2,
+		transform_y          = f32(project.height) / 2,
+		scale                = 1,
+		crop_l               = 0,
+		crop_r               = 0,
+		crop_t               = 0,
+		crop_b               = 0,
 	}
 	append(&track.clips, clip)
 	// Keep the track's clips sorted ascending by timeline start.
 	idx := len(track.clips) - 1
-	for i := idx; i > 0 && track.clips[i].timeline_start_frame < track.clips[i-1].timeline_start_frame; i -= 1 {
-		track.clips[i], track.clips[i-1] = track.clips[i-1], track.clips[i]
+	for i := idx;
+	    i > 0 && track.clips[i].timeline_start_frame < track.clips[i - 1].timeline_start_frame;
+	    i -= 1 {
+		track.clips[i], track.clips[i - 1] = track.clips[i - 1], track.clips[i]
 		idx = i - 1
 	}
 	return idx
@@ -65,7 +70,12 @@ add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
 // authored span (never shorter than one second), gap-fitted like the text clip
 // (shortened to fit the free gap if it can't hold the whole span; never
 // shifted). The caller owns `name` (cloned from the srt's basename downstream).
-add_subtitle_generator_clip :: proc(track: ^Track, start_frame: i64, src_id: int, name: string) -> int {
+add_subtitle_generator_clip :: proc(
+	track: ^Track,
+	start_frame: i64,
+	src_id: int,
+	name: string,
+) -> int {
 	one_sec := i64(math.round(timeline_fps()))
 	start := max(start_frame, 0)
 	src := srt_source(src_id)
@@ -79,31 +89,33 @@ add_subtitle_generator_clip :: proc(track: ^Track, start_frame: i64, src_id: int
 			}
 		}
 	}
-	clip := Clip{
-		clip_id = new_clip_id(),
-		asset_id = 0,
-		path = nil,
-		name = name,
-		kind = .Text,
-		generator = .Subtitles,
-		srt_id = src_id,
-		stream_index = -1,
-		source_start_frame = 0,
+	clip := Clip {
+		clip_id              = new_clip_id(),
+		asset_id             = 0,
+		path                 = nil,
+		name                 = name,
+		kind                 = .Text,
+		generator            = .Subtitles,
+		srt_id               = src_id,
+		stream_index         = -1,
+		source_start_frame   = 0,
 		source_length_frames = length,
 		timeline_start_frame = start,
-		transform_x = f32(project.width) / 2,
-		transform_y = f32(project.height) / 2,
-		scale = 1,
-		crop_l = 0,
-		crop_r = 0,
-		crop_t = 0,
-		crop_b = 0,
+		transform_x          = f32(project.width) / 2,
+		transform_y          = f32(project.height) / 2,
+		scale                = 1,
+		crop_l               = 0,
+		crop_r               = 0,
+		crop_t               = 0,
+		crop_b               = 0,
 	}
 	append(&track.clips, clip)
 	// Keep the track's clips sorted ascending by timeline start.
 	idx := len(track.clips) - 1
-	for i := idx; i > 0 && track.clips[i].timeline_start_frame < track.clips[i-1].timeline_start_frame; i -= 1 {
-		track.clips[i], track.clips[i-1] = track.clips[i-1], track.clips[i]
+	for i := idx;
+	    i > 0 && track.clips[i].timeline_start_frame < track.clips[i - 1].timeline_start_frame;
+	    i -= 1 {
+		track.clips[i], track.clips[i - 1] = track.clips[i - 1], track.clips[i]
 		idx = i - 1
 	}
 	return idx
@@ -186,8 +198,8 @@ clip_track_gaps :: proc(track: ^Track, exclude_idx: int) -> [dynamic][2]i64 {
 		append(&covered, [2]i64{c.timeline_start_frame, clip_timeline_end(c)})
 	}
 	for i in 1 ..< len(covered) {
-		for j := i; j > 0 && covered[j][0] < covered[j-1][0]; j -= 1 {
-			covered[j], covered[j-1] = covered[j-1], covered[j]
+		for j := i; j > 0 && covered[j][0] < covered[j - 1][0]; j -= 1 {
+			covered[j], covered[j - 1] = covered[j - 1], covered[j]
 		}
 	}
 	band_end: i64 = 0
@@ -266,7 +278,12 @@ clip_place_in_track :: proc(track: ^Track, exclude_idx: int, clip_len: i64, desi
 // that currently contains `anchor` (its live position): same-track horizontal
 // drags slide freely within their band but never cross/collide with a neighbor,
 // and never jump to a far gap when the pointer briefly crosses a clip.
-clip_slide_in_track :: proc(track: ^Track, exclude_idx: int, clip_len: i64, desired, anchor: i64) -> i64 {
+clip_slide_in_track :: proc(
+	track: ^Track,
+	exclude_idx: int,
+	clip_len: i64,
+	desired, anchor: i64,
+) -> i64 {
 	if clip_len <= 0 {
 		return desired
 	}
@@ -389,14 +406,23 @@ timeline_duration :: proc() -> i64 {
 // just no longer glued to the left halves). Both halves keep their in-range
 // markers; each right half is inserted right after its left so the two touch.
 split_clip_at_playhead :: proc() {
-	tr: ^Track
-	clip: ^Clip
-	ok := false
-	tr, clip, ok = selected_clip()
-	if !ok {
-		return
-	}
 	frame := playhead.frame
+	tr, clip, ok := selected_clip()
+	if !ok ||
+	   clip == nil ||
+	   frame < clip.timeline_start_frame ||
+	   frame >= clip_timeline_end(clip^) {
+		// The selection doesn't straddle the playhead (or nothing is selected):
+		// "split at playhead" must cut the clip UNDER the playhead, not whatever
+		// happens to be selected. Resolve by coverage and move the selection to
+		// the cut clip so the UI reads what was just cut.
+		tr, clip, ok = clip_at_frame(frame)
+		if !ok || clip == nil {
+			return
+		}
+		selected_track = track_index_of(tr)
+		selected_index = clip_index_on_track(tr, clip)
+	}
 	local := frame - clip.timeline_start_frame
 	if local <= 0 || local >= clip.source_length_frames {
 		return
@@ -406,13 +432,17 @@ split_clip_at_playhead :: proc() {
 	if link != 0 {
 		right_link = new_clip_id()
 	}
-	SplitTarget :: struct { track, index: int }
+	SplitTarget :: struct {
+		track, index: int,
+	}
 	targets := make([dynamic]SplitTarget, 0, 4, context.temp_allocator)
 	if link != 0 {
 		for t := 0; t < len(timeline.tracks); t += 1 {
 			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
 				c := &timeline.tracks[t].clips[i]
-				if c.link_id == link && frame >= c.timeline_start_frame && frame < clip_timeline_end(c^) {
+				if c.link_id == link &&
+				   frame >= c.timeline_start_frame &&
+				   frame < clip_timeline_end(c^) {
 					append(&targets, SplitTarget{t, i})
 				}
 			}
@@ -427,7 +457,8 @@ split_clip_at_playhead :: proc() {
 	// invalidates a still-pending target's index on the same track.
 	for t in 0 ..< len(targets) {
 		for i := t + 1; i < len(targets); i += 1 {
-			if targets[i].track > targets[t].track || (targets[i].track == targets[t].track && targets[i].index > targets[t].index) {
+			if targets[i].track > targets[t].track ||
+			   (targets[i].track == targets[t].track && targets[i].index > targets[t].index) {
 				targets[t], targets[i] = targets[i], targets[t]
 			}
 		}
@@ -459,7 +490,11 @@ split_clip_at_playhead :: proc() {
 		old_markers := c.markers
 		c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, left_len)
 		c.source_length_frames = left_len
-		right.markers = filter_markers_in_range(old_markers[:], right.source_start_frame, right_len)
+		right.markers = filter_markers_in_range(
+			old_markers[:],
+			right.source_start_frame,
+			right_len,
+		)
 		delete(old_markers)
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
@@ -597,7 +632,10 @@ toggle_links_for_selection :: proc() {
 // source_frame lies in [start, start+length). The result is PERSISTED on the
 // caller's clip (.markers survives across frames), so it allocates on
 // context.allocator, not the frame temp arena.
-filter_markers_in_range :: proc(markers: []Clip_Marker, start, length: i64) -> [dynamic]Clip_Marker {
+filter_markers_in_range :: proc(
+	markers: []Clip_Marker,
+	start, length: i64,
+) -> [dynamic]Clip_Marker {
 	out := make([dynamic]Clip_Marker)
 	for m in markers {
 		if m.source_frame >= start && m.source_frame < start + length {
@@ -621,7 +659,9 @@ delete_selected_clip_raw :: proc() {
 		return
 	}
 	link := track.clips[selected_index].link_id
-	Target :: struct { track, index: int }
+	Target :: struct {
+		track, index: int,
+	}
 	targets := make([dynamic]Target, 0, 4, context.temp_allocator)
 	if link != 0 {
 		for t := 0; t < len(timeline.tracks); t += 1 {
@@ -638,7 +678,8 @@ delete_selected_clip_raw :: proc() {
 	// still-pending target's index on the same track.
 	for t in 0 ..< len(targets) {
 		for i := t + 1; i < len(targets); i += 1 {
-			if targets[i].track > targets[t].track || (targets[i].track == targets[t].track && targets[i].index > targets[t].index) {
+			if targets[i].track > targets[t].track ||
+			   (targets[i].track == targets[t].track && targets[i].index > targets[t].index) {
 				targets[t], targets[i] = targets[i], targets[t]
 			}
 		}
@@ -656,8 +697,12 @@ delete_selected_clip_raw :: proc() {
 		ordered_remove(&tt.clips, target.index)
 		delete(removed.markers)
 		if nered_trace {
-			fmt.printf("[tl] deleted clip raw src=%s start=%d len=%d\n",
-				removed.path, removed.timeline_start_frame, removed.source_length_frames)
+			fmt.printf(
+				"[tl] deleted clip raw src=%s start=%d len=%d\n",
+				removed.path,
+				removed.timeline_start_frame,
+				removed.source_length_frames,
+			)
 		}
 		removed_any = true
 	}
@@ -717,13 +762,21 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			// Straddles the whole region: split into left + right pieces.
 			left := c
 			left.source_length_frames = start - cs
-			left.markers = filter_markers_in_range(left.markers[:], left.source_start_frame, left.source_length_frames)
+			left.markers = filter_markers_in_range(
+				left.markers[:],
+				left.source_start_frame,
+				left.source_length_frames,
+			)
 			append(&new_clips, left)
 			right := c
 			right.source_start_frame += end - cs
 			right.source_length_frames = ce - end
 			right.timeline_start_frame = start
-			right.markers = filter_markers_in_range(right.markers[:], right.source_start_frame, right.source_length_frames)
+			right.markers = filter_markers_in_range(
+				right.markers[:],
+				right.source_start_frame,
+				right.source_length_frames,
+			)
 			append(&new_clips, right)
 			// Original markers array no longer referenced by any copy.
 			delete(c.markers)
@@ -731,7 +784,11 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			// Overlaps the left edge only: trim its tail.
 			old_markers := c.markers
 			c.source_length_frames = start - cs
-			c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
+			c.markers = filter_markers_in_range(
+				old_markers[:],
+				c.source_start_frame,
+				c.source_length_frames,
+			)
 			append(&new_clips, c)
 			delete(old_markers)
 		case ce > end:
@@ -740,7 +797,11 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			c.source_start_frame += cs - start
 			c.source_length_frames = ce - end
 			c.timeline_start_frame = start
-			c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, c.source_length_frames)
+			c.markers = filter_markers_in_range(
+				old_markers[:],
+				c.source_start_frame,
+				c.source_length_frames,
+			)
 			append(&new_clips, c)
 			delete(old_markers)
 		case cs >= start && ce <= end:
@@ -793,7 +854,10 @@ ripple_delete_linked_group :: proc(link: u64) {
 	if link == 0 {
 		return
 	}
-	MemberSpan :: struct { track: int, start, length: i64 }
+	MemberSpan :: struct {
+		track:         int,
+		start, length: i64,
+	}
 	spans := make([dynamic]MemberSpan, 0, 4, context.temp_allocator)
 	for ti in 0 ..< len(timeline.tracks) {
 		for &c in timeline.tracks[ti].clips {
@@ -808,7 +872,8 @@ ripple_delete_linked_group :: proc(link: u64) {
 	// Sort by (track asc, start DESC).
 	for a in 0 ..< len(spans) {
 		for b := a + 1; b < len(spans); b += 1 {
-			later := spans[b].track < spans[a].track ||
+			later :=
+				spans[b].track < spans[a].track ||
 				(spans[b].track == spans[a].track && spans[b].start > spans[a].start)
 			if later {
 				spans[a], spans[b] = spans[b], spans[a]
@@ -854,6 +919,41 @@ selected_clip :: proc() -> (^Track, ^Clip, bool) {
 	return nil, nil, false
 }
 
+// clip_at_frame returns the first clip across all tracks whose timeline span
+// covers `frame` (any kind). Track order first, then clip order — the clip the
+// pointer/playhead rests on for a coverage-driven edit.
+clip_at_frame :: proc(frame: i64) -> (^Track, ^Clip, bool) {
+	for ti in 0 ..< len(timeline.tracks) {
+		for ci in 0 ..< len(timeline.tracks[ti].clips) {
+			c := &timeline.tracks[ti].clips[ci]
+			if frame >= c.timeline_start_frame && frame < clip_timeline_end(c^) {
+				return &timeline.tracks[ti], c, true
+			}
+		}
+	}
+	return nil, nil, false
+}
+
+// track_index_of / clip_index_on_track locate a resolved pointer inside the
+// timeline's dynamic arrays (pointer comparison; resolves to -1 when absent).
+track_index_of :: proc(tr: ^Track) -> int {
+	for ti in 0 ..< len(timeline.tracks) {
+		if &timeline.tracks[ti] == tr {
+			return ti
+		}
+	}
+	return -1
+}
+
+clip_index_on_track :: proc(tr: ^Track, clip: ^Clip) -> int {
+	for ci in 0 ..< len(tr.clips) {
+		if &tr.clips[ci] == clip {
+			return ci
+		}
+	}
+	return -1
+}
+
 // is_clip_selected reports whether the clip at (track_idx, index) is part of the
 // current selection: the anchor clip itself, or any member of the selected
 // clip's link group. Highlighting every linked member makes a linked cut/move
@@ -862,7 +962,10 @@ is_clip_selected :: proc(track_idx, index: int) -> bool {
 	if track_idx == selected_track && index == selected_index {
 		return true
 	}
-	if track_idx < 0 || track_idx >= len(timeline.tracks) || index < 0 || index >= len(timeline.tracks[track_idx].clips) {
+	if track_idx < 0 ||
+	   track_idx >= len(timeline.tracks) ||
+	   index < 0 ||
+	   index >= len(timeline.tracks[track_idx].clips) {
 		return false
 	}
 	candidate := &timeline.tracks[track_idx].clips[index]
@@ -897,8 +1000,14 @@ timeline_frame_at :: proc(frame: i64) -> Timeline_Frame {
 			if candidate.kind != .Video {
 				continue
 			}
-			if frame >= candidate.timeline_start_frame && frame < candidate.timeline_start_frame + candidate.source_length_frames {
-				return {active_clip = candidate, clip_frame = candidate.source_start_frame + frame - candidate.timeline_start_frame}
+			if frame >= candidate.timeline_start_frame &&
+			   frame < candidate.timeline_start_frame + candidate.source_length_frames {
+				return {
+					active_clip = candidate,
+					clip_frame = candidate.source_start_frame +
+					frame -
+					candidate.timeline_start_frame,
+				}
 			}
 		}
 	}
@@ -910,43 +1019,53 @@ timeline_frame_at :: proc(frame: i64) -> Timeline_Frame {
 // clip never overlaps another clip on the destination track. Returns the
 // clip's new index in dst_track, or -1 if the move was refused (no room).
 move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64) -> int {
-	if src_track < 0 || src_track >= len(timeline.tracks) ||
-		dst_track < 0 || dst_track >= len(timeline.tracks) ||
-		src_track == dst_track {
-		    return -1
-	    }
-	    src := &timeline.tracks[src_track]
-	    if src_index < 0 || src_index >= len(src.clips) {
-		    return -1
-	    }
-	    clip := src.clips[src_index]
-	    dst := &timeline.tracks[dst_track]
-	    placed := clip_place_in_track(dst, -1, clip.source_length_frames, start)
-	    ordered_remove(&src.clips, src_index)
-	    append(&dst.clips, clip)
-	    dst.clips[len(dst.clips)-1].timeline_start_frame = placed
-	    // Keep dst sorted by start for stable rendering.
-	    for i := len(dst.clips) - 1; i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i-1].timeline_start_frame; i -= 1 {
-		    dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
-	    }
-	    // Refresh selection to the moved clip.
-	    selected_track = dst_track
-	    selected_index = len(dst.clips) - 1
-	    for i in 0 ..< len(dst.clips) {
-		    if dst.clips[i].timeline_start_frame == placed {
-			    selected_index = i
-			    break
-		    }
-	    }
-	    if nered_trace {
-		    fmt.printf("[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
-			    clip.path, clip.source_length_frames, start, dst_track, placed)
-	    }
-	    // Cross-track moves change which clip covers the playhead: re-derive the
-	    // slots from the edited timeline instead of reusing the old covering state.
-	    invalidate_preview_slots()
-	    audio_note_edit()
-	    return selected_index
+	if src_track < 0 ||
+	   src_track >= len(timeline.tracks) ||
+	   dst_track < 0 ||
+	   dst_track >= len(timeline.tracks) ||
+	   src_track == dst_track {
+		return -1
+	}
+	src := &timeline.tracks[src_track]
+	if src_index < 0 || src_index >= len(src.clips) {
+		return -1
+	}
+	clip := src.clips[src_index]
+	dst := &timeline.tracks[dst_track]
+	placed := clip_place_in_track(dst, -1, clip.source_length_frames, start)
+	ordered_remove(&src.clips, src_index)
+	append(&dst.clips, clip)
+	dst.clips[len(dst.clips) - 1].timeline_start_frame = placed
+	// Keep dst sorted by start for stable rendering.
+	for i := len(dst.clips) - 1;
+	    i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i - 1].timeline_start_frame;
+	    i -= 1 {
+		dst.clips[i], dst.clips[i - 1] = dst.clips[i - 1], dst.clips[i]
+	}
+	// Refresh selection to the moved clip.
+	selected_track = dst_track
+	selected_index = len(dst.clips) - 1
+	for i in 0 ..< len(dst.clips) {
+		if dst.clips[i].timeline_start_frame == placed {
+			selected_index = i
+			break
+		}
+	}
+	if nered_trace {
+		fmt.printf(
+			"[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
+			clip.path,
+			clip.source_length_frames,
+			start,
+			dst_track,
+			placed,
+		)
+	}
+	// Cross-track moves change which clip covers the playhead: re-derive the
+	// slots from the edited timeline instead of reusing the old covering state.
+	invalidate_preview_slots()
+	audio_note_edit()
+	return selected_index
 }
 
 // clip_index_by_id returns the index of the clip with the given clip_id on the
@@ -972,21 +1091,41 @@ capture_link_group :: proc(clip: ^Clip, track: int) {
 	if clip.link_id == 0 {
 		return
 	}
-	append(&drag_group_orig, Drag_Group_Orig{clip_id = clip.clip_id, track = track, start = clip.timeline_start_frame, length = clip.source_length_frames})
+	append(
+		&drag_group_orig,
+		Drag_Group_Orig {
+			clip_id = clip.clip_id,
+			track = track,
+			start = clip.timeline_start_frame,
+			length = clip.source_length_frames,
+		},
+	)
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
 			c := &timeline.tracks[t].clips[i]
 			if c.link_id == clip.link_id && c.clip_id != clip.clip_id {
-				append(&drag_group_orig, Drag_Group_Orig{clip_id = c.clip_id, track = t, start = c.timeline_start_frame, length = c.source_length_frames})
+				append(
+					&drag_group_orig,
+					Drag_Group_Orig {
+						clip_id = c.clip_id,
+						track = t,
+						start = c.timeline_start_frame,
+						length = c.source_length_frames,
+					},
+				)
 			}
 		}
 	}
 }
 
 // apply_group_drag_to_members shifts every non-anchor member by the anchor's
-// live drag delta (anchor_delta = new anchor start - original anchor start),
-// each clamped to its own lane so no member overlaps a neighbor. Horizontal
-// moves of a link group keep all members time-aligned with the anchor.
+// live drag delta (anchor_delta = new anchor start - original anchor start).
+// Members land EXACTLY at m.start + anchor_delta — no per-member clamping: the
+// caller only ever reaches here when group_delta_feasible proved every member
+// can land there (>= 0, no non-member overlap), and a member clamped against its
+// own current neighbors would silently split the group (a same-track partner or
+// a hard left-edge always clamps the same member short). Horizontal moves of a
+// link group keep all members time-aligned with the anchor.
 apply_group_drag_to_members :: proc(anchor_delta: i64) {
 	if len(drag_group_orig) <= 1 {
 		return
@@ -1004,16 +1143,7 @@ apply_group_drag_to_members :: proc(anchor_delta: i64) {
 		if idx < 0 {
 			continue
 		}
-		clip := &track.clips[idx]
-		gaps := clip_track_gaps(track, idx)
-		gi := gap_for_start(gaps[:], m.start)
-		if gi >= 0 {
-			lo, hi := gaps[gi][0], gaps[gi][1] - m.length
-			if hi < lo {
-				hi = lo
-			}
-			clip.timeline_start_frame = clamp(m.start + anchor_delta, lo, hi)
-		}
+		track.clips[idx].timeline_start_frame = m.start + anchor_delta
 	}
 }
 
@@ -1038,6 +1168,11 @@ group_delta_feasible :: proc(delta: i64) -> bool {
 		}
 		t := &timeline.tracks[m.track]
 		ts := m.start + delta
+		if ts < 0 {
+			// A member would land before the timeline start: the whole group
+			// must not advance (an exact-landing member clamp would split it).
+			return false
+		}
 		for &c in t.clips {
 			if c.clip_id in members {
 				continue
@@ -1069,7 +1204,10 @@ group_vertical_feasible :: proc(track_delta: int, delta: i64) -> bool {
 		if dst < 0 || dst >= len(timeline.tracks) {
 			return false
 		}
-		ts := max(m.start + delta, 0)
+		ts := m.start + delta
+		if ts < 0 {
+			return false
+		}
 		for &c in timeline.tracks[dst].clips {
 			if c.clip_id in members {
 				continue
@@ -1102,7 +1240,11 @@ move_linked_group :: proc(track_delta: int) -> bool {
 			return false
 		}
 	}
-	PlannedMove :: struct { src_track, dst_track: int, start: i64, clip: Clip }
+	PlannedMove :: struct {
+		src_track, dst_track: int,
+		start:                i64,
+		clip:                 Clip,
+	}
 	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig), context.temp_allocator)
 	for m in drag_group_orig {
 		if m.track < 0 || m.track >= len(timeline.tracks) {
@@ -1118,11 +1260,15 @@ move_linked_group :: proc(track_delta: int) -> bool {
 		if dst_track < 0 || dst_track >= len(timeline.tracks) {
 			return false
 		}
-		// group_vertical_feasible already proved every member fits at the
-		// mouse-aligned slot; commit exactly there (no per-member clamping,
-		// which would silently split the group).
-		start := max(m.start + drag_group_delta, 0)
-		append(&planned, PlannedMove{src_track = m.track, dst_track = dst_track, start = start, clip = clip})
+		// group_vertical_feasible already proved every member fits exactly at
+		// the mouse-aligned slot (>= 0, no non-member overlap); commit exactly
+		// there — max(.,0) would clamp lone members against the left edge and
+		// split the group off the anchor.
+		start := m.start + drag_group_delta
+		append(
+			&planned,
+			PlannedMove{src_track = m.track, dst_track = dst_track, start = start, clip = clip},
+		)
 	}
 	// Commit every relocation. Source indices captured at planning time are NOT
 	// reusable here: appending one member into another member's destination lane
@@ -1141,8 +1287,10 @@ move_linked_group :: proc(track_delta: int) -> bool {
 		clip.timeline_start_frame = p.start
 		dst := &timeline.tracks[p.dst_track]
 		append(&dst.clips, clip)
-		for i := len(dst.clips) - 1; i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i-1].timeline_start_frame; i -= 1 {
-			dst.clips[i], dst.clips[i-1] = dst.clips[i-1], dst.clips[i]
+		for i := len(dst.clips) - 1;
+		    i > 0 && dst.clips[i].timeline_start_frame < dst.clips[i - 1].timeline_start_frame;
+		    i -= 1 {
+			dst.clips[i], dst.clips[i - 1] = dst.clips[i - 1], dst.clips[i]
 		}
 	}
 	invalidate_preview_slots()
@@ -1232,7 +1380,9 @@ next_track_name :: proc() -> string {
 // insert_track inserts a new empty track at the given index (0-based) in the
 // timeline track list — e.g. between existing tracks.
 insert_track :: proc(index: int) {
-	track := Track{name = next_track_name()}
+	track := Track {
+		name = next_track_name(),
+	}
 	inject_at_elem(&timeline.tracks, index, track)
 }
 
@@ -1241,8 +1391,8 @@ insert_track :: proc(index: int) {
 // dynamic array so the two tracks are fully independent.
 duplicate_track :: proc(index: int) {
 	src := &timeline.tracks[index]
-	new_track := Track{
-		name = next_track_name(),
+	new_track := Track {
+		name  = next_track_name(),
 		layer = src.layer,
 		// Deep copy array persists on the inserted track: context.allocator.
 		clips = make([dynamic]Clip, 0, len(src.clips)),
@@ -1259,7 +1409,11 @@ duplicate_track :: proc(index: int) {
 			// Clone the markers array so the two tracks share no owned memory:
 			// deleting one track (remove_track frees per-clip markers) must not
 			// leave the other track's copy dangling.
-			c.markers = filter_markers_in_range(c.markers[:], c.source_start_frame, c.source_length_frames)
+			c.markers = filter_markers_in_range(
+				c.markers[:],
+				c.source_start_frame,
+				c.source_length_frames,
+			)
 		}
 		append(&new_track.clips, c)
 	}
@@ -1274,37 +1428,41 @@ duplicate_track :: proc(index: int) {
 duplicate_clip :: proc(track_idx, index: int) -> int {
 	track := &timeline.tracks[track_idx]
 	src := &track.clips[index]
-	c := Clip{
-		clip_id                = new_clip_id(),
-		asset_id               = src.asset_id,
-		link_id                = 0,
-		path                   = src.path,
-		name                   = strings.clone(src.name),
-		kind                   = src.kind,
-		generator              = src.generator,
-		srt_id                 = src.srt_id,
-		stream_index           = src.stream_index,
-		source_start_frame     = src.source_start_frame,
-		source_length_frames   = src.source_length_frames,
-		timeline_start_frame   = src.timeline_start_frame,
-		layer                  = src.layer,
-		source_w               = src.source_w,
-		source_h               = src.source_h,
-		transform_x            = src.transform_x,
-		transform_y            = src.transform_y,
-		scale                  = src.scale,
-		crop_l                 = src.crop_l,
-		crop_r                 = src.crop_r,
-		crop_t                 = src.crop_t,
-		crop_b                 = src.crop_b,
+	c := Clip {
+		clip_id              = new_clip_id(),
+		asset_id             = src.asset_id,
+		link_id              = 0,
+		path                 = src.path,
+		name                 = strings.clone(src.name),
+		kind                 = src.kind,
+		generator            = src.generator,
+		srt_id               = src.srt_id,
+		stream_index         = src.stream_index,
+		source_start_frame   = src.source_start_frame,
+		source_length_frames = src.source_length_frames,
+		timeline_start_frame = src.timeline_start_frame,
+		layer                = src.layer,
+		source_w             = src.source_w,
+		source_h             = src.source_h,
+		transform_x          = src.transform_x,
+		transform_y          = src.transform_y,
+		scale                = src.scale,
+		crop_l               = src.crop_l,
+		crop_r               = src.crop_r,
+		crop_t               = src.crop_t,
+		crop_b               = src.crop_b,
 	}
 	for m in src.markers {
-		append(&c.markers, Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)})
+		append(
+			&c.markers,
+			Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)},
+		)
 	}
 	place := clip_timeline_end(src^)
 	c.timeline_start_frame = clip_place_in_track(track, index, c.source_length_frames, place)
 	insert_at := index + 1
-	for insert_at < len(track.clips) && track.clips[insert_at].timeline_start_frame < c.timeline_start_frame {
+	for insert_at < len(track.clips) &&
+	    track.clips[insert_at].timeline_start_frame < c.timeline_start_frame {
 		insert_at += 1
 	}
 	inject_at_elem(&track.clips, insert_at, c)
