@@ -695,13 +695,20 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 											} else if clip_label == "" {
 												clip_label = "Clip"
 											}
-											// Only the anchor clip (and any explicitly Shift+clicked
-											// partner) gets the blue selection border; linked members no
-											// longer outline yellow.
-											if (track_idx == selected_track &&
-												   index == selected_index) ||
-											   timeline_clip.clip_id in selected_set {
+											// The anchor clip gets the blue selection border; linked members of its
+											// group keep the yellow border so the unit reads as one; any
+											// Shift+clicked extra is blue (or yellow when it is itself
+											// linked).
+											if track_idx == selected_track &&
+											   index == selected_index {
 												clip_border = SELECT_BORDER
+												clip_border_w = 3
+											} else if is_clip_selected(track_idx, index) {
+												if timeline_clip.link_id != 0 {
+													clip_border = MARKER_COLOR
+												} else {
+													clip_border = SELECT_BORDER
+												}
 												clip_border_w = 3
 											}
 											// Adjacent clips keep their corner radius but drop the
