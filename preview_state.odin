@@ -607,11 +607,15 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			return true
 		}
 		if had_box {
-			// Re-center on the previous box's center (the user's anchor).
+			// Re-anchor on the previous box: keep the box CENTER in x and the
+			// box BOTTOM EDGE in y fixed. The bottom edge is the text baseline
+			// (box height == ink height), so subtitles grow upward instead of
+			// floating as the cue's line count changes. Center-anchoring y
+			// would make every 1-line<->2-line cue jump.
 			cx := clip.transform_x + old_w / 2
-			cy := clip.transform_y + old_h / 2
+			bottom := clip.transform_y + old_h
 			clip.transform_x = cx - new_w / 2
-			clip.transform_y = cy - new_h / 2
+			clip.transform_y = bottom - new_h
 		} else {
 			// First rendered cue: anchor at the canvas center.
 			clip.transform_x = f32(project.width) / 2 - new_w / 2

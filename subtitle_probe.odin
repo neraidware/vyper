@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -58,6 +59,31 @@ subtitle_render_probe_run :: proc(out: string) {
 			delete(slot.text_scratch)
 		}
 	}
+
+	// Baseline stability: the subtitle's box BOTTOM EDGE must stay fixed across
+	// cue boundaries (transform_y + box_h in project px, box_h == ink height).
+	// A drifting bottom is the floating-subtitle bug: center-anchoring y made
+	// every 1-line<->2-line cue jump.
+	base_slot := new(Preview_Slot)
+	clip.scale = 1
+	prev_bottom: f32 = -1
+	k := f32(project.width) / f32(PREVIEW_W)
+	ok := true
+	for frame in ([3]i64{0, 34, 60}) {
+		mem.free_all(context.temp_allocator)
+		update_subtitle_slot(base_slot, clip, frame)
+		bottom := clip.transform_y + f32(clip.source_h) * clip.scale * k
+		if prev_bottom > 0 && abs(bottom - prev_bottom) > 0.01 {
+			fmt.printf("[sub-probe] baseline drift frame=%d bottom=%.2f prev=%.2f\n", frame, bottom, prev_bottom)
+			ok = false
+		}
+		prev_bottom = bottom
+	}
+	if !ok {
+		fmt.println("[sub-probe] FAILED: subtitle baseline drifts across cues")
+		os.exit(1)
+	}
+	if base_slot.text_buf != nil { delete(base_slot.text_buf) }
 
 	// Export path at a baked font well past the preview default.
 	clip.scale = 4.0
