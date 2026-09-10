@@ -825,6 +825,14 @@ main :: proc() {
 	if !load_font_data() {
 		return
 	}
+	if sub_render_probe, _ := os.lookup_env_alloc("NERED_SUB_RENDER_PROBE", context.temp_allocator); sub_render_probe != "" {
+		// The probe free-alls the temp arena per simulated frame, so the env
+		// string must not live on the temp arena (same rule as the autoplay
+		// path below). Clone it to a cstring the probe keeps for the session.
+		probe_out := strings.clone_to_cstring(sub_render_probe, context.allocator)
+		subtitle_render_probe_run(string(probe_out))
+		return
+	}
 	if !sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO) {
 		fmt.println("SDL initialization failed")
 		return

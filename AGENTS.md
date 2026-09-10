@@ -72,6 +72,47 @@ lifetimes, and shares its data, so the ground rules come first.
 - Continuous interactions (dragging a clip, scrubbing) mutate in place and set
   a dirty flag; no commit per frame.
 
+### Ownership matrix (audited)
+
+Every allocation falls into exactly one bucket; name the bucket when you
+allocate. `delete` must pair with each heap `make`/`new` at that bucket's
+teardown; `free_all(context.temp_allocator)` (main.odin frame loop, once per
+frame) is the ONLY thing that frees frame-scoped memory.
+
+- **Session heap** — owner is the owning struct; freed at teardown, never
+  before. Track/clip `name` + `metadata`, clip `markers`, decoder caches
+  (decode buf, `dec.s16`), `ui_notice_text`, `srt_cache` (append-only, never
+  freed mid-session), clay's memory block. Nothing per-frame may grow here.
+- **Caller heap** — a proc returns a buffer the caller must `delete` (or
+  `defer delete`). Examples: subprocess result strings, textinput paste cstr,
+  decode `markers` return, media dynamic `out` (deleted + cloned into a
+  persistent string). If a proc allocates and hands back a string, the callee
+  never frees.
+- **Frame temp** — `context.temp_allocator`, dead at the next frame start
+  (free_all at main.odin:975 and only there). Timeline edit temporaries, the
+  per-line raster buffers in `rasterize_lines_into_buffer`, decode thumbnail
+  scratch, `ff_err_str`, probe env strings. A frame-scoped pointer/string must
+  never be stored on a struct or ride a thread hop across a frame boundary.
+- **Worker job arena** — the render job's own arena, destroyed with the job
+  (render.odin worker teardown). Canvas, text/subtitle jobs, one-slot caches
+  ride it; nothing survives job teardown, which is why the worker's font/
+  scratch lives outside the arena.
+- **Probe rule** — a headless probe that simulates the frame loop free-alls
+  the temp arena itself, so any string it must keep (paths built from
+  `lookup_env_alloc`) must be cloned to heap first. Temp-backing a value a
+  probe reads after a simulated frame is a dangling buffer (subtitle probe
+  hit this: env path read after the first free_all).
+
+Two violations this model has already caught (both were real segfaults):
+
+- textclip.odin:282 — the rasterizer's ink rect can overshoot its galley
+  (negative `lox`/`loy`), so both the per-glyph writes and the composite reads
+  must clamp to the line buffer on BOTH axes. The write side always clamped;
+  the read side didn't, and `-no-bounds-check` turned the OOB read into a SEGV
+  only after line buffers moved from a reused 4 MB blob to fresh temp slices.
+- Probe env strings were temp-backed and read after a simulated-frame
+  `free_all` (see above).
+
 ## 3. Low level is home turf: raw data, memory, and the unknown
 
 - Raw bytes, pointer math, bit twiddling, `transmute`, `offset_of`, packing —

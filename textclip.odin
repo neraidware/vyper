@@ -268,13 +268,22 @@ rasterize_lines_into_buffer :: proc(
 			right_ink = band_dx + s.low
 		}
 		for dy in 0 ..< s.loh {
+			// The rasterizer's ink rect (lox,loy,low,loh) may extend left/above
+			// its own galley when glyph bearings overshoot the buffer, so the
+			// source reads must be clamped like the output writes above.
+			srow := s.loy + dy
+			if srow < 0 || srow >= s.bh {
+				continue
+			}
 			mrow := dst_y0 + dy
 			if mrow < 0 || mrow >= bh {
 				continue
 			}
-			srow := s.loy + dy
 			for dx0 in 0 ..< s.low {
 				sx := s.lox + dx0
+				if sx < 0 || sx >= s.bw {
+					continue
+				}
 				dx := band_dx + dx0
 				if dx < 0 || dx >= bw {
 					continue

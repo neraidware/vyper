@@ -35,7 +35,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	}
 	fps_l := "auto"
 	if project.frame_rate > 0 {
-		fps_l = fmt.aprintf("%g", project.frame_rate)
+		fps_l = fmt.tprintf("%g", project.frame_rate)
 	}
 
 	if clay.UI()({
@@ -58,7 +58,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		}) {
 			clay.Text("Nered", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_HEADING})
 			clay.Text("·", clay.TextElementConfig{textColor = BUTTON_BORDER, fontSize = FONT_NORMAL})
-			clay.Text(fmt.aprintf("%s · %dx%d @ %sfps", project_label, project.width, project.height, fps_l), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
+			clay.Text(fmt.tprintf("%s · %dx%d @ %sfps", project_label, project.width, project.height, fps_l), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL})
 			if clay.UI(clay.ID("AppSpacer"))({
 				layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 			}) {}
@@ -143,7 +143,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					if clay.UI(clay.ID("TransportSpacer"))({
 						layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}},
 					}) {}
-					clay.Text(fmt.aprintf("%d / %d  ·  %gfps", playhead.frame, timeline_duration(), timeline_fps()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+					clay.Text(fmt.tprintf("%d / %d  ·  %gfps", playhead.frame, timeline_duration(), timeline_fps()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 				}
 			}
 			// Column 3: Inspector -- Project / Clip / Render cards. The cards
@@ -488,7 +488,7 @@ project_card :: proc() {
 	}
 	panel_caption("Render range")
 	if project.start_frame >= 0 && project.end_frame >= 0 && project.end_frame > project.start_frame {
-		clay.Text(fmt.aprintf("%d – %d", project.start_frame, project.end_frame), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		clay.Text(fmt.tprintf("%d – %d", project.start_frame, project.end_frame), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
 	} else {
 		clay.Text("full timeline", clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
 	}
@@ -538,22 +538,22 @@ clip_card :: proc() {
 				}
 			}
 		}
-		clay.Text(fmt.aprintf("Track: %s", tr.name), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
-		clay.Text(fmt.aprintf("File: %s", path_basename(cl.path)), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
-		clay.Text(fmt.aprintf("Duration: %d frames", cl.source_length_frames), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		clay.Text(fmt.tprintf("Track: %s", tr.name), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		clay.Text(fmt.tprintf("File: %s", path_basename(cl.path)), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		clay.Text(fmt.tprintf("Duration: %d frames", cl.source_length_frames), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
 		if cl.kind != .Audio {
-			clay.Text(fmt.aprintf("In: %d   Out: %d", cl.source_start_frame, cl.source_start_frame + cl.source_length_frames), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
-			x_val := fmt.aprintf("%.0f", cl.transform_x)
+			clay.Text(fmt.tprintf("In: %d   Out: %d", cl.source_start_frame, cl.source_start_frame + cl.source_length_frames), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+			x_val := fmt.tprintf("%.0f", cl.transform_x)
 			if editing_field == 1 {
 				x_val = string(edit_chars[:edit_len])
 			}
 			prop_field("PropFieldX", "X", x_val, editing_field == 1)
-			y_val := fmt.aprintf("%.0f", cl.transform_y)
+			y_val := fmt.tprintf("%.0f", cl.transform_y)
 			if editing_field == 2 {
 				y_val = string(edit_chars[:edit_len])
 			}
 			prop_field("PropFieldY", "Y", y_val, editing_field == 2)
-			scl_val := fmt.aprintf("%.2f", cl.scale)
+			scl_val := fmt.tprintf("%.2f", cl.scale)
 			if editing_field == 3 {
 				scl_val = string(edit_chars[:edit_len])
 			}
@@ -566,19 +566,19 @@ clip_card :: proc() {
 				settings_button("SnapCenter", "Snap to canvas center", snap_center_to_canvas)
 			}
 			panel_caption("Crop (percent of box)")
-			l_val := fmt.aprintf("%.0f%%", cl.crop_l * 100)
+			l_val := fmt.tprintf("%.0f%%", cl.crop_l * 100)
 			if editing_field == 4 {
 				l_val = string(edit_chars[:edit_len])
 			}
-			r_val := fmt.aprintf("%.0f%%", cl.crop_r * 100)
+			r_val := fmt.tprintf("%.0f%%", cl.crop_r * 100)
 			if editing_field == 5 {
 				r_val = string(edit_chars[:edit_len])
 			}
-			t_val := fmt.aprintf("%.0f%%", cl.crop_t * 100)
+			t_val := fmt.tprintf("%.0f%%", cl.crop_t * 100)
 			if editing_field == 6 {
 				t_val = string(edit_chars[:edit_len])
 			}
-			b_val := fmt.aprintf("%.0f%%", cl.crop_b * 100)
+			b_val := fmt.tprintf("%.0f%%", cl.crop_b * 100)
 			if editing_field == 7 {
 				b_val = string(edit_chars[:edit_len])
 			}
@@ -635,7 +635,7 @@ render_card :: proc() {
 			}
 		}
 	}
-	clay.Text(fmt.aprintf("Output: %s", render_output_name()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words})
+	clay.Text(fmt.tprintf("Output: %s", render_output_name()), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words})
 	clay.Text(render_status_text(), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words})
 }
 
@@ -672,16 +672,16 @@ v_scrollbar :: proc(tag: string, scroll, content_h, view_h: f32) {
 		return
 	}
 	thumb_top := scroll / max_top * travel
-	if clay.UI(clay.ID(fmt.aprintf("%sScrollbar", tag)))({
+	if clay.UI(clay.ID(fmt.tprintf("%sScrollbar", tag)))({
 		layout = {sizing = {width = clay.SizingFixed(TSCROLLBAR_W), height = clay.SizingGrow({})}, layoutDirection = .TopToBottom, childGap = 0},
 		backgroundColor = TRACK_GUTTER_BG,
 	}) {
-		if clay.UI(clay.ID(fmt.aprintf("%sSbPad", tag)))({
+		if clay.UI(clay.ID(fmt.tprintf("%sSbPad", tag)))({
 			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_top)}},
 		}) {}
-		if clay.UI(clay.ID(fmt.aprintf("%sSbThumb", tag)))({
+		if clay.UI(clay.ID(fmt.tprintf("%sSbThumb", tag)))({
 			layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(thumb_h)}},
-			backgroundColor = clay.PointerOver(clay.ID(fmt.aprintf("%sSbThumb", tag))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			backgroundColor = clay.PointerOver(clay.ID(fmt.tprintf("%sSbThumb", tag))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			cornerRadius = clay.CornerRadiusAll(4),
 		}) {}
 	}
@@ -754,9 +754,9 @@ playback_rate_label :: proc(rate: f64) -> string {
 		return "Auto"
 	}
 	if rate == f64(int(rate)) {
-		return fmt.aprintf("%dx", int(rate))
+		return fmt.tprintf("%dx", int(rate))
 	}
-	return fmt.aprintf("%.1fx", rate)
+	return fmt.tprintf("%.1fx", rate)
 }
 
 // playback_rate_name returns the unique element id string for a rate value
@@ -766,7 +766,7 @@ playback_rate_name :: proc(rate: f64) -> string {
 	if rate <= 0 {
 		return "PlayRateAuto"
 	}
-	return fmt.aprintf("PlayRate%d", int(rate * 10))
+	return fmt.tprintf("PlayRate%d", int(rate * 10))
 }
 
 // playback_rate_dropdown renders the rate selector beside the play button. The
@@ -1037,7 +1037,7 @@ draw_text_input_popup :: proc(width, height: c.int) {
 			pointerCaptureMode = .Capture,
 		},
 	}) {
-		clay.Text(strings.concatenate({title, " — Enter to confirm, Esc to cancel"}), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+		clay.Text(strings.concatenate({title, " — Enter to confirm, Esc to cancel"}, context.temp_allocator), clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
 		if ti.input_type == TI_PLAYHEAD {
 			clay.Text("timecode 1:23:45:06 · seconds 12.5 · frames 1234", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL})
 		}
