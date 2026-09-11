@@ -1084,22 +1084,22 @@ clip_card :: proc() {
 			)
 			x_buf := UI_TEXT_X[:]
 			x_val := fmt.bprintf(x_buf[:], "%.0f", cl.transform_x)
-			if editing_field == 1 {
+			if editing_field == .X {
 				x_val = string(edit_chars[:edit_len])
 			}
-			prop_field("PropFieldX", "X", x_val, editing_field == 1)
+			prop_field("PropFieldX", "X", x_val, editing_field == .X)
 			y_buf := UI_TEXT_Y[:]
 			y_val := fmt.bprintf(y_buf[:], "%.0f", cl.transform_y)
-			if editing_field == 2 {
+			if editing_field == .Y {
 				y_val = string(edit_chars[:edit_len])
 			}
-			prop_field("PropFieldY", "Y", y_val, editing_field == 2)
+			prop_field("PropFieldY", "Y", y_val, editing_field == .Y)
 			s_buf := UI_TEXT_S[:]
 			scl_val := fmt.bprintf(s_buf[:], "%.2f", cl.scale)
-			if editing_field == 3 {
+			if editing_field == .Scale {
 				scl_val = string(edit_chars[:edit_len])
 			}
-			prop_field("PropFieldS", "Scale", scl_val, editing_field == 3)
+			prop_field("PropFieldS", "Scale", scl_val, editing_field == .Scale)
 			// Canvas-center snap belongs with the transform settings it governs.
 			if clay.UI(clay.ID("SnapRow"))(
 			{
@@ -1117,22 +1117,22 @@ clip_card :: proc() {
 			panel_caption("Crop (percent of box)")
 			l_buf := UI_TEXT_L[:]
 			l_val := fmt.bprintf(l_buf[:], "%.0f%%", cl.crop_l * 100)
-			if editing_field == 4 {
+			if editing_field == .Crop_L {
 				l_val = string(edit_chars[:edit_len])
 			}
 			r_buf := UI_TEXT_R[:]
 			r_val := fmt.bprintf(r_buf[:], "%.0f%%", cl.crop_r * 100)
-			if editing_field == 5 {
+			if editing_field == .Crop_R {
 				r_val = string(edit_chars[:edit_len])
 			}
 			t_buf := UI_TEXT_T[:]
 			t_val := fmt.bprintf(t_buf[:], "%.0f%%", cl.crop_t * 100)
-			if editing_field == 6 {
+			if editing_field == .Crop_T {
 				t_val = string(edit_chars[:edit_len])
 			}
 			b_buf := UI_TEXT_B[:]
 			b_val := fmt.bprintf(b_buf[:], "%.0f%%", cl.crop_b * 100)
-			if editing_field == 7 {
+			if editing_field == .Crop_B {
 				b_val = string(edit_chars[:edit_len])
 			}
 			if clay.UI(clay.ID("CropRowTop"))(
@@ -1144,8 +1144,8 @@ clip_card :: proc() {
 				},
 			},
 			) {
-				prop_field("PropCropL", "L", l_val, editing_field == 4)
-				prop_field("PropCropR", "R", r_val, editing_field == 5)
+				prop_field("PropCropL", "L", l_val, editing_field == .Crop_L)
+				prop_field("PropCropR", "R", r_val, editing_field == .Crop_R)
 			}
 			if clay.UI(clay.ID("CropRowBot"))(
 			{
@@ -1156,8 +1156,8 @@ clip_card :: proc() {
 				},
 			},
 			) {
-				prop_field("PropCropT", "T", t_val, editing_field == 6)
-				prop_field("PropCropB", "B", b_val, editing_field == 7)
+				prop_field("PropCropT", "T", t_val, editing_field == .Crop_T)
+				prop_field("PropCropB", "B", b_val, editing_field == .Crop_B)
 			}
 		}
 	}

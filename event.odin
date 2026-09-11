@@ -39,7 +39,7 @@ handle_sdl_events :: proc(running: ^bool) {
 						ti.is_create = false
 					}
 				}
-			} else if editing_field != 0 {
+			} else if editing_field != .None {
 				switch event.key.key {
 				case sdl.K_BACKSPACE:
 					edit_backspace()
@@ -116,7 +116,7 @@ handle_sdl_events :: proc(running: ^bool) {
 		case .TEXT_INPUT:
 			if ti.active {
 				text_input_insert(string(event.text.text))
-			} else if editing_field != 0 {
+			} else if editing_field != .None {
 				for ch in string(event.text.text) {
 					// Only accept printable ASCII that makes sense in a number.
 					if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {

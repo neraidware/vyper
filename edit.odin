@@ -5,18 +5,18 @@ import "core:strconv"
 import clay "clay-odin"
 
 // ---------------------------------------------------------------------------
-// Inline editing of a clip property text field. editing_field is 1 (X), 2 (Y),
-// 3 (Scale), 4..7 (crop L/R/T/B). Scale and the crop fields are normalized
-// values but edit in percent-scale text (crop % of the box, Scale ×1), so both
-// format/parse by the same 10^decimals factor.
-edit_begin :: proc(field: int, value: f32) {
+// Inline editing of a clip property text field. Scale and the crop fields are
+// normalized values but edit in percent-scale text (crop % of the box, Scale
+// ×1), so both format/parse by the same 10^decimals factor.
+edit_begin :: proc(field: Edit_Field, value: f32) {
 	editing_field = field
 	prec := 0
 	scaled := value
 	switch field {
-	case 3:
+	case .X, .Y, .None:
+	case .Scale:
 		prec = 2
-	case 4, 5, 6, 7:
+	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 		scaled = value * 100
 	}
 	text := fmt.aprintf("%.*f", prec, scaled)
@@ -25,7 +25,7 @@ edit_begin :: proc(field: int, value: f32) {
 }
 
 edit_cancel :: proc() {
-	editing_field = 0
+	editing_field = .None
 	edit_len = 0
 }
 
@@ -33,20 +33,22 @@ edit_cancel :: proc() {
 // currently being edited (so a click-away outside it commits).
 edit_field_over :: proc() -> bool {
 	switch editing_field {
-	case 1:
+	case .X:
 		return clay.PointerOver(clay.ID("PropFieldX"))
-	case 2:
+	case .Y:
 		return clay.PointerOver(clay.ID("PropFieldY"))
-	case 3:
+	case .Scale:
 		return clay.PointerOver(clay.ID("PropFieldS"))
-	case 4:
+	case .Crop_L:
 		return clay.PointerOver(clay.ID("PropCropL"))
-	case 5:
+	case .Crop_R:
 		return clay.PointerOver(clay.ID("PropCropR"))
-	case 6:
+	case .Crop_T:
 		return clay.PointerOver(clay.ID("PropCropT"))
-	case 7:
+	case .Crop_B:
 		return clay.PointerOver(clay.ID("PropCropB"))
+	case .None:
+		return false
 	}
 	return false
 }
@@ -59,20 +61,21 @@ edit_commit :: proc() {
 			return
 		}
 		switch editing_field {
-		case 1:
+		case .X:
 			sel.transform_x = value
-		case 2:
+		case .Y:
 			sel.transform_y = value
-		case 3:
+		case .Scale:
 			sel.scale = max(value, 0.01)
-		case 4:
+		case .Crop_L:
 			sel.crop_l = clamp(value / 100, 0, 1)
-		case 5:
+		case .Crop_R:
 			sel.crop_r = clamp(value / 100, 0, 1)
-		case 6:
+		case .Crop_T:
 			sel.crop_t = clamp(value / 100, 0, 1)
-		case 7:
+		case .Crop_B:
 			sel.crop_b = clamp(value / 100, 0, 1)
+		case .None:
 		}
 	}
 }

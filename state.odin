@@ -414,9 +414,20 @@ selected_set: map[u64]bool
 preview_drag_offset_x: f32
 preview_drag_offset_y: f32
 
-// Inline editing of a clip property text field (X or Y). editing_field is 0
-// (none), 1 (X) or 2 (Y); edit_chars/edit_len hold the buffer being typed.
-editing_field: int
+// Edit_Field names which clip property a text-edit session targets. .None
+// means no field is being edited; edit_chars/edit_len hold the buffer typed.
+Edit_Field :: enum {
+	None,
+	X,
+	Y,
+	Scale,
+	Crop_L,
+	Crop_R,
+	Crop_T,
+	Crop_B,
+}
+
+editing_field: Edit_Field
 edit_chars: [64]u8
 edit_len: int
 

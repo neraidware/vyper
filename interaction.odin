@@ -204,7 +204,7 @@ dispatch_click_table :: proc(inp: Mouse_Input) -> bool {
 // is committed first, exactly like the old trailing else block, then each probe
 // runs in order until one claims the click.
 dispatch_click_fallback :: proc(inp: Mouse_Input) -> bool {
-	if editing_field != 0 && !edit_field_over() {
+	if editing_field != .None && !edit_field_over() {
 		edit_commit()
 	}
 	for fb in click_fallbacks {
@@ -239,31 +239,31 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			return false
 		}
 		if clay.PointerOver(clay.ID("PropFieldX")) {
-			edit_begin(1, sel.transform_x)
+			edit_begin(.X, sel.transform_x)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldY")) {
-			edit_begin(2, sel.transform_y)
+			edit_begin(.Y, sel.transform_y)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldS")) {
-			edit_begin(3, sel.scale)
+			edit_begin(.Scale, sel.scale)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropL")) {
-			edit_begin(4, sel.crop_l * 100)
+			edit_begin(.Crop_L, sel.crop_l * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropR")) {
-			edit_begin(5, sel.crop_r * 100)
+			edit_begin(.Crop_R, sel.crop_r * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropT")) {
-			edit_begin(6, sel.crop_t * 100)
+			edit_begin(.Crop_T, sel.crop_t * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropB")) {
-			edit_begin(7, sel.crop_b * 100)
+			edit_begin(.Crop_B, sel.crop_b * 100)
 			return true
 		}
 		return false
