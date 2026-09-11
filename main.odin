@@ -897,9 +897,15 @@ main :: proc() {
 		proxy_probe_run(xp)
 		return
 	}
-	if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); xb != "" {
+if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); xb != "" {
 		proxy_bg_probe_run(xb)
 		return
+	}
+	// Headless UI draw-call probe: runs build_page's clay layout for N frames
+	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
+	// Border command + per glyph) without a display or GPU.
+	if v, _ := os.lookup_env_alloc("NERED_UI_PROBE", context.temp_allocator); v != "" {
+		ui_draw_probe_run()
 	}
 	spall_prof_init()
 	defer spall_prof_shutdown()
