@@ -10,3 +10,10 @@
 # Compile-time outputs (nanosvg C TU), produced by flake.nix / CI / local build
 /vendor/nanosvg/*.o
 /vendor/nanosvg/*.obj
+
+# Clay C TU + linked archive, produced by flake.nix / CI / local build from
+# the vendored single-header vendor/clay.h (never ship prebuilt clay binaries)
+/vendor/clay.o
+/clay-odin/*/clay.a
+/clay-odin/*/clay.lib
+/clay-odin/*/clay.o

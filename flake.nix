@@ -43,6 +43,8 @@
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
+            clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
+            ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
             odin build . -out:nered \
               -microarch:native -o:aggressive -no-bounds-check \
               -strict-style -vet-using-param -vet-using-stmt \
@@ -93,6 +95,8 @@
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
+            clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
+            ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
             odin build . -out:nered \
               -debug \
               -vet-style -vet-semicolon \

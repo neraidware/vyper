@@ -7,6 +7,8 @@ Editor de clipe de live do neraid
 ```sh
 nix develop
 clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
+clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
+ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
 odin build .
 ./nered
 ```

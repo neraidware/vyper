@@ -91,6 +91,15 @@ jobs:
           # flake.nix; nerd receives it through foreign import (vendor/nanosvg).
           cl /nologo /O2 /c vendor\nanosvg\nanosvg.c /Fovendor\nanosvg\nanosvg.obj
 
+      - name: Compile clay (UI layout library)
+        shell: pwsh
+        run: |
+          # Instantiate the vendored single-header clay into its link archive,
+          # the same slot the committed prebuilt used. Mirrors the flake.nix
+          # step so the shipped build always matches vendor/clay.h.
+          cl /nologo /O2 /c vendor\clay.c /Fovendor\clay.obj
+          lib /nologo /OUT:clay-odin\windows\clay.lib vendor\clay.obj
+
       - name: Build nered
         shell: pwsh
         run: |
