@@ -367,10 +367,10 @@ apply_rename :: proc() {
 // ---------------------------------------------------------------------------
 
 // playhead_timecode renders the current playhead frame as an HH:MM:SS:FF
-// playhead_timecode_buf backs the per-frame timecode readout (ui.odin) and the
-// text-edit prefill (main.odin): rebuilt with fmt.bprintf every call, never a
-// heap allocation. The returned string is valid only until the next call in the
-// same frame; consumers (clay.Text, text_input_begin) read it immediately.
+// value. playhead_timecode_buf is persistent (never stack/temp): clay keeps
+// the returned slice until draw, so the buffer must outlive build_page, and
+// it backs exactly one clay.Text element per frame. If more consumers appear,
+// each needs its own buffer.
 playhead_timecode_buf: [32]u8
 
 // timecode at the timeline's fps.

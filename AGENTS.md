@@ -58,12 +58,33 @@ lifetimes, and shares its data, so the ground rules come first.
   strip, `PlayRate*`) and transient hints are rebuilt every frame — build them
   with `fmt.bprintf` into a stack-local or persistent `[64]u8`/`[512]u8` buffer,
   not `fmt.aprintf`/`fmt.tprintf` (heap or temp churn) and not
-  `strings.concatenate`. Clay hashes id strings immediately and copies text
-  strings at the call, so a fixed buffer reused within the frame is safe all
-  the way down. A few KB of fixed buffer costs nothing; allocating-and-freeing
-  the same tiny string every frame is real work and, when heap, a leak.
-  `context.temp_allocator` is for frame-scoped scratch that genuinely cannot be
-  pre-sized (line raster scratch, sort temporaries), not for per-frame labels.
+  `strings.concatenate`. A few KB of fixed buffer costs nothing;
+  allocating-and-freeing the same tiny string every frame is real work and,
+  when heap, a leak. `context.temp_allocator` is for frame-scoped scratch that
+  genuinely cannot be pre-sized (line raster scratch, sort temporaries), not
+  for per-frame labels.
+- **Lifetime is a memory-management rule, and it governs every buffer you pass
+  out — temp, stack, or heap.** A stack/temp buffer is safe only while every
+  consumer that holds a pointer/slice into it is done reading, not merely while
+  the code that filled it is on the stack. Two consequences, both from real
+  bugs:
+  - **Clay does NOT copy text strings at the call.** `clay.Text()` retains the
+    `StringSlice`'s pointer and reads it at layout/draw time, later in the same
+    frame. Feeding `fmt.bprintf` bytes from ONE shared buffer into several
+    `clay.Text()` calls makes every readout show the last (or clobbered)
+    content — the whole stream of Track/File/Duration/crop readouts rendered as
+    garbage because they all pointed into the same `[256]u8`. Rule: **one
+    buffer per text element** — a separate stack buffer per string, or one big
+    buffer carved into disjoint slices, never the same buffer rewritten between
+    two clay calls that both outlive the rewrite. This also means a frame-
+    scoped fixed buffer passed to clay is safe, but only if each element it
+    feeds owns its own slice and nothing rewrites that slice before draw.
+    Clay does hash id strings immediately, so the one-buffer-per-element
+    constraint does not apply to ids.
+  - **Never read a temp-backed pointer after a `free_all` of its arena** — see
+    the probe rule below. If the worst offender in the codebase today is a
+    single `textclip.odin:282` overshoot, the worst lifetime trap is passing
+    the same buffer to more than one consumer that keeps it.
 
 ### Address by handle, never by a pointer you keep
 

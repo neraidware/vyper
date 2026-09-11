@@ -3,7 +3,6 @@ package main
 import clay "clay-odin"
 import "core:c"
 import "core:fmt"
-import "core:strings"
 
 // ---------------------------------------------------------------------------
 // Clay UI layout tree for the whole app (build_page), plus small display
@@ -23,22 +22,55 @@ import "core:strings"
 // home and nothing hides behind the track count.
 // ---------------------------------------------------------------------------
 
+// Per-frame text buffers for clay.Text elements. Clay does NOT copy text: it
+// keeps the StringSlice until layout/draw later in the same frame, so the
+// backing bytes must outlive build_page. Stack-scoped buffers die as soon as
+// their enclosing UI block returns -- long before clay reads them -- which
+// rendered every dynamic label that fed clay.Text from a local buffer as
+// garbage. Every per-frame label has its own persistent buffer here, one per
+// text element, never shared between two clay.Text calls.
+UI_TEXT_APP_SUMMARY: [512]u8
+UI_TEXT_APP_FPS:     [32]u8
+UI_TEXT_STATE:       [64]u8
+UI_TEXT_RANGE:       [64]u8
+UI_TEXT_TRACK:       [256]u8
+UI_TEXT_FILE:        [256]u8
+UI_TEXT_DUR:         [128]u8
+UI_TEXT_IO:          [128]u8
+UI_TEXT_X:           [64]u8
+UI_TEXT_Y:           [64]u8
+UI_TEXT_S:           [64]u8
+UI_TEXT_L:           [64]u8
+UI_TEXT_R:           [64]u8
+UI_TEXT_T:           [64]u8
+UI_TEXT_B:           [64]u8
+UI_TEXT_OUT:         [128]u8
+UI_TEXT_RATE:        [64]u8
+UI_TEXT_HINT:        [512]u8
+
+// One label+name buffer per rate for the playback-rate dropdown items. Each
+// menu row must keep its own buffer alive until draw (clay keeps the slices),
+// and the same buffer can never back two rows -- so sizes match PLAYBACK_RATES.
+UI_TEXT_RATE_MENU: [7]struct {
+	name:  [64]u8,
+	label: [64]u8,
+}
+
 build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	clay.SetLayoutDimensions({f32(width), f32(height)})
 	clay.BeginLayout()
 	DEFAULT_BORDER := clay.BorderOutside(1)
 
 	// App-bar project summary text (project label · resolution · fps). Built
-	// into fixed buffers below so the every-frame labels never allocate.
-	summary_buf: [512]u8
-	fps_buf: [32]u8
+	// into the persistent buffers below so the every-frame labels never
+	// allocate and outlive build_page (clay keeps the slices until draw).
 	project_label := project.name
 	if project_label == "" {
 		project_label = "untitled project"
 	}
 	fps_l := "auto"
 	if project.frame_rate > 0 {
-		fps_l = fmt.bprintf(fps_buf[:], "%g", project.frame_rate)
+		fps_l = fmt.bprintf(UI_TEXT_APP_FPS[:], "%g", project.frame_rate)
 	}
 
 	if clay.UI()(
@@ -73,7 +105,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			)
 			clay.Text(
 				fmt.bprintf(
-					summary_buf[:],
+					UI_TEXT_APP_SUMMARY[:],
 					"%s · %dx%d @ %sfps",
 					project_label,
 					project.width,
@@ -240,10 +272,9 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					},
 					) {}
-					state_buf: [64]u8
 					clay.Text(
 						fmt.bprintf(
-							state_buf[:],
+							UI_TEXT_STATE[:],
 							"%d / %d  ·  %gfps",
 							playhead.frame,
 							timeline_duration(),
@@ -930,7 +961,7 @@ project_card :: proc() {
 	if project.start_frame >= 0 &&
 	   project.end_frame >= 0 &&
 	   project.end_frame > project.start_frame {
-		range_buf: [64]u8
+		range_buf := UI_TEXT_RANGE[:]
 		clay.Text(
 			fmt.bprintf(range_buf[:], "%d – %d", project.start_frame, project.end_frame),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
@@ -1021,43 +1052,50 @@ clip_card :: proc() {
 				}
 			}
 		}
-		// Inspector clip-card readouts, rebuilt every frame into one fixed
-		// buffer (clay copies the text at the call).
-		info_buf: [256]u8
+		// Inspector clip-card readouts, rebuilt every frame. Clay does NOT copy
+		// text at the call — it keeps the slice until draw — so every element
+		// must own its own buffer: one per line, never a shared buffer rewritten
+		// between clay.Text calls.
+		track_buf := UI_TEXT_TRACK[:]
+		file_buf := UI_TEXT_FILE[:]
+		dur_buf := UI_TEXT_DUR[:]
 		clay.Text(
-			fmt.bprintf(info_buf[:], "Track: %s", tr.name),
+			fmt.bprintf(track_buf[:], "Track: %s", tr.name),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		clay.Text(
-			fmt.bprintf(info_buf[:], "File: %s", path_basename(cl.path)),
+			fmt.bprintf(file_buf[:], "File: %s", path_basename(cl.path)),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		clay.Text(
-			fmt.bprintf(info_buf[:], "Duration: %d frames", cl.source_length_frames),
+			fmt.bprintf(dur_buf[:], "Duration: %d frames", cl.source_length_frames),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		if cl.kind != .Audio {
+			io_buf := UI_TEXT_IO[:]
 			clay.Text(
 				fmt.bprintf(
-					info_buf[:],
+					io_buf[:],
 					"In: %d   Out: %d",
 					cl.source_start_frame,
 					cl.source_start_frame + cl.source_length_frames,
 				),
 				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 			)
-			val_buf: [64]u8
-			x_val := fmt.bprintf(val_buf[:], "%.0f", cl.transform_x)
+			x_buf := UI_TEXT_X[:]
+			x_val := fmt.bprintf(x_buf[:], "%.0f", cl.transform_x)
 			if editing_field == 1 {
 				x_val = string(edit_chars[:edit_len])
 			}
 			prop_field("PropFieldX", "X", x_val, editing_field == 1)
-			y_val := fmt.bprintf(val_buf[:], "%.0f", cl.transform_y)
+			y_buf := UI_TEXT_Y[:]
+			y_val := fmt.bprintf(y_buf[:], "%.0f", cl.transform_y)
 			if editing_field == 2 {
 				y_val = string(edit_chars[:edit_len])
 			}
 			prop_field("PropFieldY", "Y", y_val, editing_field == 2)
-			scl_val := fmt.bprintf(val_buf[:], "%.2f", cl.scale)
+			s_buf := UI_TEXT_S[:]
+			scl_val := fmt.bprintf(s_buf[:], "%.2f", cl.scale)
 			if editing_field == 3 {
 				scl_val = string(edit_chars[:edit_len])
 			}
@@ -1077,19 +1115,23 @@ clip_card :: proc() {
 				settings_button("SnapCenter", "Snap to canvas center", snap_center_to_canvas)
 			}
 			panel_caption("Crop (percent of box)")
-			l_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_l * 100)
+			l_buf := UI_TEXT_L[:]
+			l_val := fmt.bprintf(l_buf[:], "%.0f%%", cl.crop_l * 100)
 			if editing_field == 4 {
 				l_val = string(edit_chars[:edit_len])
 			}
-			r_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_r * 100)
+			r_buf := UI_TEXT_R[:]
+			r_val := fmt.bprintf(r_buf[:], "%.0f%%", cl.crop_r * 100)
 			if editing_field == 5 {
 				r_val = string(edit_chars[:edit_len])
 			}
-			t_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_t * 100)
+			t_buf := UI_TEXT_T[:]
+			t_val := fmt.bprintf(t_buf[:], "%.0f%%", cl.crop_t * 100)
 			if editing_field == 6 {
 				t_val = string(edit_chars[:edit_len])
 			}
-			b_val := fmt.bprintf(val_buf[:], "%.0f%%", cl.crop_b * 100)
+			b_buf := UI_TEXT_B[:]
+			b_val := fmt.bprintf(b_buf[:], "%.0f%%", cl.crop_b * 100)
 			if editing_field == 7 {
 				b_val = string(edit_chars[:edit_len])
 			}
@@ -1188,7 +1230,7 @@ render_card :: proc() {
 			}
 		}
 	}
-	out_buf: [128]u8
+	out_buf := UI_TEXT_OUT[:]
 	clay.Text(
 		fmt.bprintf(out_buf[:], "Output: %s", render_output_name()),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words},
@@ -1414,7 +1456,7 @@ playback_rate_dropdown :: proc() {
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	},
 	) {
-		rate_lbl: [64]u8
+		rate_lbl := UI_TEXT_RATE[:]
 		clay.Text(
 			playback_rate_label(playback_rate, rate_lbl[:]),
 			clay.TextElementConfig {
@@ -1448,13 +1490,11 @@ playback_rate_dropdown :: proc() {
 			},
 		},
 		) {
-			for rate in PLAYBACK_RATES {
-				// name and label must stay live for settings_button's own clay
-				// calls, so each gets its own fixed buffer.
-				name_buf, label_buf: [64]u8
+			for rate, i in PLAYBACK_RATES {
+				assert(i < len(UI_TEXT_RATE_MENU))
 				settings_button(
-					playback_rate_name(rate, name_buf[:]),
-					playback_rate_label(rate, label_buf[:]),
+					playback_rate_name(rate, UI_TEXT_RATE_MENU[i].name[:]),
+					playback_rate_label(rate, UI_TEXT_RATE_MENU[i].label[:]),
 					playback_rate == rate,
 				)
 			}
@@ -1895,7 +1935,7 @@ draw_text_input_popup :: proc(width, height: c.int) {
 		},
 	},
 	) {
-		hint_buf: [512]u8
+		hint_buf := UI_TEXT_HINT[:]
 		clay.Text(
 			fmt.bprintf(hint_buf[:], "%s — Enter to confirm, Esc to cancel", title),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
