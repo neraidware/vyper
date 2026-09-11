@@ -91,11 +91,6 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   `free_all`. Anything it needs past that point must be cloned to heap
   first, or it's a dangling read.
 
-Real bugs this model caught — a rasterizer overshoot that only segfaulted
-once its scratch moved off a reused blob, a probe reading a temp path after
-its own simulated `free_all` — live in `docs/MEMORY_POSTMORTEMS.md`. Read
-it before touching text rasterization, probes, or multi-consumer buffers.
-
 ## 2. Write Odin, not generic code translated to Odin
 
 - Compiler happy first: `-vet` clean, no hacks aimed at another toolchain's
