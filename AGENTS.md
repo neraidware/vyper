@@ -1,228 +1,269 @@
 # AGENTS.md
 
-Engineering philosophy for this codebase. Every change should satisfy these, in
-order, or consciously deviate with a comment saying why.
+Engineering philosophy for this codebase. Every change should satisfy these,
+in order, or deviate with a comment saying why.
 
-## 1. Follow the Odin compiler / language, and its style
+## 1. Memory model: arenas, generational handles, single-writer ownership
 
-- Write code the Odin compiler is happy with first and always: no hacks to
-  satisfy another toolchain, no patterns the language itself rejects. The
-  compiler's warnings, `-vet`, and the core idiom are the style guide.
-- Use the latest language features where they make code simpler, but never
-  where they complicate a thing that works. New feature off the shelf — if the
-  old, plain line was clearer, keep the plain line.
-- Declare types and procedures before use; no forward-declaration gymnastics.
-- Prefer data-oriented layout: `#packed` structs for on-disk/wire formats,
-  `#soa` where iteration skips, flat arrays over linked/pointer-chasing
-  structures.
-- Favor tagged unions over `rawptr` + casts. If a union won't work, contain the
-  cast behind one well-named accessor, not inline at every caller.
-- Use `switch` / `switch #partial` and `#'with` to destructure; default-case
-  nothing that can be enumerated exhaustively.
-- Iterate by index over slices; never hand-roll containers that `core` already
-  provides well.
-- Reuse hot buffers; don't rebuild the same scratch inside a loop.
-- Hand-rolled solutions (own containers, mini frame formats, custom fiddly
-  loops) are fine when nothing existing solves the problem well — but avoid
-  them otherwise: every hand-rolled widget is an implementation we maintain,
-  not a dependency. Favor `core`/vendored libs unless they provably don't fit.
-- "Clean" here means code that does exactly what it needs to and no more —
-  not idiomatic ceremony a Java reviewer would applaud. Fast, understandable,
-  simple at its core. If you must pick, pick simple and fast over "sound".
+The memory model is the architecture — it decides how every subsystem
+addresses, lifetimes, and shares data. Everything else follows from it.
 
-## 2. Memory model: arenas, generational handles, single-writer ownership
-
-The memory model is the architecture. It decides how every subsystem addresses,
-lifetimes, and shares its data, so the ground rules come first.
-
-- Allocate big backing blocks up front per thread / per subsystem; carve from
-  them instead of touching the general allocator.
-- Hot paths (per frame, per decode, per proxy segment) must not allocate from
-  `context.allocator`. Use `context.temp_allocator` for frame-scoped scratch
-  and an arena or fixed buffer for anything reuse-shaped.
-- A surprise heap allocation in a hot loop is a bug, not an optimization
-  opportunity.
-- Static nothing; pre-sized everything. Explicit ownership: caller passes the
+- Ownership (who frees it) and lifetime (how long it stays valid) are
+  different questions. A caller-heap buffer is owned by whoever allocated
+  it, but its lifetime is decided by the caller that received it. Don't
+  conflate the two when debugging.
+- Most allocations here are size-known + lifetime-known — the easy case the
+  ownership matrix below is built for. When one isn't, name which dimension
+  is unknown before reaching for a general-purpose container.
+- Allocate big backing blocks up front, per thread or subsystem, and carve
+  from them. Don't touch the general allocator on a hot path — use
+  `context.temp_allocator` for scratch, an arena or fixed buffer for
+  anything reuse-shaped. A surprise heap allocation in a hot loop is a bug.
+- Pre-size everything with a real bound from the problem. Caller passes the
   buffer, callee fills it.
-- **Avoid individual allocations.** A one-off `make([]T, 1)`, per-item `new`,
-  per-call pair of `make`+`delete` is expensive and breeds bookkeeping bugs
-  (leaks, stale-length reuse after `delete`, µff-by-one lifetimes). Allocate in
-  bulk or from the pool/model that owns the shape: fixed slot arrays with an
-  `in_use` flag (preview_slots), grow-only append buffers (srt_cache), arena
-  scratches. `new`/`delete` on single objects happen rarely, deliberately, at a
-  teardown/ownership boundary — not inline in a routine that runs per frame or
-  per cue.
-- **Per-frame text/ids are formatted into fixed buffers, never allocated.** The
-  frame loop's per-frame labels readouts (playhead timecode, fps, transport
-  line, render range, playback-rate labels), clay element ids (scrollbar thumb/
-  strip, `PlayRate*`) and transient hints are rebuilt every frame — build them
-  with `fmt.bprintf` into a stack-local or persistent `[64]u8`/`[512]u8` buffer,
-  not `fmt.aprintf`/`fmt.tprintf` (heap or temp churn) and not
-  `strings.concatenate`. A few KB of fixed buffer costs nothing;
-  allocating-and-freeing the same tiny string every frame is real work and,
-  when heap, a leak. `context.temp_allocator` is for frame-scoped scratch that
-  genuinely cannot be pre-sized (line raster scratch, sort temporaries), not
-  for per-frame labels.
-- **Lifetime is a memory-management rule, and it governs every buffer you pass
-  out — temp, stack, or heap.** A stack/temp buffer is safe only while every
-  consumer that holds a pointer/slice into it is done reading, not merely while
-  the code that filled it is on the stack. Two consequences, both from real
-  bugs:
-  - **Clay does NOT copy text strings at the call.** `clay.Text()` retains the
-    `StringSlice`'s pointer and reads it at layout/draw time, later in the same
-    frame. Feeding `fmt.bprintf` bytes from ONE shared buffer into several
-    `clay.Text()` calls makes every readout show the last (or clobbered)
-    content — the whole stream of Track/File/Duration/crop readouts rendered as
-    garbage because they all pointed into the same `[256]u8`. Rule: **one
-    buffer per text element** — a separate stack buffer per string, or one big
-    buffer carved into disjoint slices, never the same buffer rewritten between
-    two clay calls that both outlive the rewrite. This also means a frame-
-    scoped fixed buffer passed to clay is safe, but only if each element it
-    feeds owns its own slice and nothing rewrites that slice before draw.
-    Clay does hash id strings immediately, so the one-buffer-per-element
-    constraint does not apply to ids.
-  - **Never read a temp-backed pointer after a `free_all` of its arena** — see
-    the probe rule below. If the worst offender in the codebase today is a
-    single `textclip.odin:282` overshoot, the worst lifetime trap is passing
-    the same buffer to more than one consumer that keeps it.
+- Avoid individual allocations — a one-off `make([]T, 1)`, a per-item `new`,
+  a `make`+`delete` pair per call breeds leaks and stale-length bugs. Prefer
+  fixed slot arrays with an `in_use` flag, grow-only append buffers, or
+  arena scratch. `new`/`delete` should happen rarely, at a real teardown
+  boundary — never inline in a routine that runs per frame or per cue.
+- Per-frame text/ids format into fixed buffers, never allocate:
+  `fmt.bprintf` into a `[64]u8`/`[512]u8`, not `fmt.aprintf`/`tprintf`/
+  `strings.concatenate`. A few KB fixed costs nothing; allocating the same
+  string every frame is real work, and a leak if it's heap.
+- **Buffer lifetime must cover every reader, not just the writer's stack
+  frame.** Some APIs copy what you hand them; some retain the pointer and
+  read it later. Know which. If it retains, one buffer feeding several
+  outliving calls means each reads whatever the buffer holds *last* — use
+  one buffer per thing that outlives the call unless you've confirmed the
+  callee copies. Never read a temp pointer after `free_all` of its arena.
 
-### Address by handle, never by a pointer you keep
+### Handles, not pointers
 
-- Refer to movable/recyclable things by a stable handle — `(id, generation)` —
-  never a stored `^T`. A pointer lives one frame: resolve at the use site, drop
-  it after. This is already the house pattern: `Clip.clip_id` (assigned once,
-  never mutated by drags), the append-only `srt_cache` (its indexes stay valid
-  because nothing there is freed), the fixed `preview_slots[]` pool with its
-  `in_use` flag.
-- Recycling a slot bumps its generation; a stale handle resolves to "gone",
-  loudly. Never let an old handle alias a reused slot.
+- **Handle-indexed flat arrays are the default container shape.** A `[]T`
+  indexed by handle beats a linked list or `^Node` tree for almost
+  everything here: cache-friendly, trivially iterable, no per-node alloc,
+  `#soa`-able later. Reach for pointer-based structures only when the shape
+  genuinely isn't array-like — unbounded branching, a graph with no natural
+  bound — not because it's the familiar way to model a collection.
+- Movable/recyclable things get a handle, `(id, generation)` — never a
+  stored `^T`. Resolve a pointer at the use site, drop it right after.
+- Recycling a slot bumps its generation. A stale handle resolves to "gone,"
+  loudly — never let an old handle alias a reused slot.
 
 ### Single writer per structure; hand off, don't lock
 
-- Each buffer/queue has exactly one writer at any time. Cross-thread reads ride
-  an atomic index/generation handoff; never a mutex guarding a hot buffer.
-  Arena + ownership means no GC, no refcounts, no lock contention.
-- Cross-thread queues are bounded with a named overflow policy: decode behind →
-  drop the oldest preview frame; audio behind → catch-up burst. Never stall the
-  render thread on a producer.
-- Mutable hot state that several threads poke per frame lives on its own cache
-  line; keep unrelated hot counters off shared lines.
+- One writer at a time, always. Cross-thread reads ride an atomic index/
+  generation handoff, never a mutex on a hot buffer — this is what lets
+  arena + ownership skip GC, refcounts, and lock contention.
+- `core:sync` atomics for hot handoffs; `sync.Mutex` only for cold paths
+  (config reload, init). A mutex on anything touched per-frame means the
+  design is wrong, not that you need a lock.
+- Bound cross-thread queues with a named overflow policy — decode behind
+  drops the oldest preview frame, audio behind catch-up-bursts. Never stall
+  the render thread on a producer.
+- Hot state touched by multiple threads gets its own cache line. Pad
+  explicitly, name the field; don't rely on incidental layout.
 
 ### Commit or mutate, by edit kind
 
-- Discrete edits (import, split, delete, parameter change) build a candidate and
-  commit it: the commit bumps a generation, and any cache keyed on that
-  generation drops stale entries for free. This is also the future undo model's
-  seam — an undo log is a cursor over commits.
-- Continuous interactions (dragging a clip, scrubbing) mutate in place and set
-  a dirty flag; no commit per frame.
+- Discrete edits (import, split, delete, parameter change) build a
+  candidate and commit: the commit bumps a generation, and caches keyed on
+  it drop stale entries free. Also the seam for the future undo model.
+- Continuous interactions (dragging, scrubbing) mutate in place, set a
+  dirty flag. No commit per frame.
 
-### Ownership matrix (audited)
+### Ownership matrix — name the bucket when you allocate
 
-Every allocation falls into exactly one bucket; name the bucket when you
-allocate. `delete` must pair with each heap `make`/`new` at that bucket's
-teardown; `free_all(context.temp_allocator)` (main.odin frame loop, once per
-frame) is the ONLY thing that frees frame-scoped memory.
+- **Session heap** — owned by the struct, freed at teardown only. Track/
+  clip name and metadata, markers, decoder caches, the append-only
+  `srt_cache`. Nothing per-frame grows here.
+- **Caller heap** — proc returns a buffer the caller must `delete`/`defer
+  delete`: subprocess strings, textinput paste, decode `markers`, a media
+  `out` string cloned into something persistent. Callee never frees.
+- **Frame temp** — `context.temp_allocator`, dead next frame (`free_all` in
+  the main frame loop, and only there). Edit temporaries, raster scratch,
+  transient error strings, probe env strings. Never store on a struct or
+  carry across a thread hop.
+- **Worker job arena** — dies with the render job. Canvas, text/subtitle
+  jobs, one-slot caches ride it; anything that must outlive the job (font,
+  persistent scratch) lives outside the arena.
+- **Probe rule** — a headless probe simulating the frame loop does its own
+  `free_all`. Anything it needs past that point must be cloned to heap
+  first, or it's a dangling read.
 
-- **Session heap** — owner is the owning struct; freed at teardown, never
-  before. Track/clip `name` + `metadata`, clip `markers`, decoder caches
-  (decode buf, `dec.s16`), `ui_notice_text`, `srt_cache` (append-only, never
-  freed mid-session), clay's memory block. Nothing per-frame may grow here.
-- **Caller heap** — a proc returns a buffer the caller must `delete` (or
-  `defer delete`). Examples: subprocess result strings, textinput paste cstr,
-  decode `markers` return, media dynamic `out` (deleted + cloned into a
-  persistent string). If a proc allocates and hands back a string, the callee
-  never frees.
-- **Frame temp** — `context.temp_allocator`, dead at the next frame start
-  (free_all at main.odin:975 and only there). Timeline edit temporaries, the
-  per-line raster buffers in `rasterize_lines_into_buffer`, decode thumbnail
-  scratch, `ff_err_str`, probe env strings. A frame-scoped pointer/string must
-  never be stored on a struct or ride a thread hop across a frame boundary.
-- **Worker job arena** — the render job's own arena, destroyed with the job
-  (render.odin worker teardown). Canvas, text/subtitle jobs, one-slot caches
-  ride it; nothing survives job teardown, which is why the worker's font/
-  scratch lives outside the arena.
-- **Probe rule** — a headless probe that simulates the frame loop free-alls
-  the temp arena itself, so any string it must keep (paths built from
-  `lookup_env_alloc`) must be cloned to heap first. Temp-backing a value a
-  probe reads after a simulated frame is a dangling buffer (subtitle probe
-  hit this: env path read after the first free_all).
+Real bugs this model caught — a rasterizer overshoot that only segfaulted
+once its scratch moved off a reused blob, a probe reading a temp path after
+its own simulated `free_all` — live in `docs/MEMORY_POSTMORTEMS.md`. Read
+it before touching text rasterization, probes, or multi-consumer buffers.
 
-Two violations this model has already caught (both were real segfaults):
+## 2. Write Odin, not generic code translated to Odin
 
-- textclip.odin:282 — the rasterizer's ink rect can overshoot its galley
-  (negative `lox`/`loy`), so both the per-glyph writes and the composite reads
-  must clamp to the line buffer on BOTH axes. The write side always clamped;
-  the read side didn't, and `-no-bounds-check` turned the OOB read into a SEGV
-  only after line buffers moved from a reused 4 MB blob to fresh temp slices.
-- Probe env strings were temp-backed and read after a simulated-frame
-  `free_all` (see above).
+- Compiler happy first: `-vet` clean, no hacks aimed at another toolchain's
+  habits. Compiler warnings and core idiom are the style guide.
+- New language features earn their place only if they simplify a line. Old
+  plain line beats new fancy one.
+- Declare in reading order — Odin doesn't need forward declarations, don't
+  restructure a file pretending it does.
+- Data-oriented layout: `#packed` for wire formats, `#soa` where iteration
+  skips fields, flat arrays over pointer-chasing.
+- Tagged unions over `rawptr` + casts. If a union won't work, contain the
+  cast behind one named accessor, not inline at every caller.
+- Reuse logic through composition — a shared proc, an embedded struct where
+  behavior is genuinely shared, a table when "differences" are just
+  constants — not copy-paste-and-tweak, which means every future fix has to
+  land in both places and eventually only lands in one.
+- `switch`/`switch #partial`/`#with` to destructure; no default-case on an
+  exhaustible enum. Prefer a long switch over any hand-built dispatch
+  simulation — vtable-style function-pointer structs, `map[Type_Tag]proc`
+  registries, `any`/`reflect` type erasure, embedding-as-inheritance,
+  visitor patterns. These buy adding a case without touching the switch,
+  which only pays off if new cases come from outside your control. If you
+  own the whole closed set, the switch is honest, every case is visible,
+  and a direct call beats an indirect one.
+- Index over slices; don't hand-roll a container `core` already has. Reuse
+  hot buffers instead of rebuilding scratch inside a loop.
+- **Abstraction must pay rent** — in speed or invariant-safety, not
+  vibes. A bounds clamp, a generation tag, a named `#packed` layout pay
+  rent. A generic `Container(T)` nobody will swap, a cast hidden behind an
+  unneeded accessor, don't. Reach for `core`/vendor before inventing;
+  invent only when nothing fits, and keep it small.
+- Clean = does exactly what's needed, no more. Simple and fast beats
+  "sound" when forced to choose.
+- **Make the zero value useful.** `Foo{}` shouldn't need an `init()` before
+  it's safe to touch — a valid generation of 0, an empty-but-iterable
+  slice, a harmless zero-state enum. Already true of `preview_slots`'
+  `in_use` flag and `srt_cache`'s append-only growth; hold new structs to
+  the same bar.
+- Solve the specific problem you have. Going generic loses the shape,
+  access pattern, and size bound that would've made it simpler *and*
+  faster.
 
-## 3. Low level is home turf: raw data, memory, and the unknown
+## 3. Solve the simple problem simply
 
-- Raw bytes, pointer math, bit twiddling, `transmute`, `offset_of`, packing —
-  none of that is scary. The GPU and the file formats we decode are low-level;
-  so is the code that talks to them. Write the low-level thing directly when it
-  is simpler or faster than the abstraction over it.
-- "Messing with the unknown" (an unfamiliar format, an undocumented structure,
-  a weird alignment) is how this project learns. Probe it, instrument it, dump
-  bytes until it makes sense — then contain what you learned behind a clean
-  accessor.
-- Low-level does not mean sloppy: any place raw data flows in, name the layout
-  (`#packed` struct, explicit size constants), assert invariants, and own the
-  memory. Fearless is compatible with careful.
-- Prefer a `[]u8`/`rawptr` + one named accessor over a chain of speculative
-  indirection. When the data model is bytes, model bytes.
+- Plain loop or one-line condition fixes it? That's the fix. New subsystem
+  only when the old one provably can't express the problem.
+- No indirection for its own sake, no machinery for a problem you don't
+  have yet.
+- Needing escape hatches and special cases signals the abstraction is
+  wrong — fix the shape, don't add flags around it.
+- If even the simplest change is unscalable in the current system, stop
+  patching and redesign. Sometimes bigger is simpler overall.
 
-## 4. Solve the simple problem simply
+## 3b. No workarounds
 
-- If a plain loop or a one-line condition fixes it, that is the fix. Introduce
-  a new subsystem only when the old one provably cannot express the problem.
-- Avoid cleverness: no indirection for its own sake, no machinery sized for a
-  problem we do not yet have.
-- When a design starts to need escape-hatches and special cases, that is a
-  signal the abstraction is wrong, not that it needs more flags.
-- Similarly, when a system is complicated enough that even the simplest thing
-  has become unscalable to do, stop patching it — consider a more complete
-  system that simplifies the overall architecture. Sometimes the "bigger"
-  design is the simpler one.
+- A workaround targets the symptom, not the defect. Not "avoid when
+  possible" — not allowed.
+- Buggy, confusing, or wrong code: fix it, refactor it, clean it up. No
+  special case, guard clause, retry, or reordering that hides the symptom
+  while the cause stays live for the next person or code path to hit blind.
+- Worse than doing nothing — the symptom stopping removes the pressure to
+  fix the real thing.
+- Signs you're about to write one: you don't fully understand why the bug
+  happens but found an input that avoids it; the change lives far from the
+  actual defect; you're about to write a comment explaining why this weird
+  thing is here instead of fixing what made it necessary.
+- Genuinely can't fix it now? Say so at the actual defect site, not just
+  the call site papering over it — so the next person finds the real
+  problem, not another layer on top.
 
-## 5. Asserts are your friend — use them wherever an invariant can be stated
+## 4. Low level is home turf
 
-- Any condition the later code depends on: assert it (bounds, non-nil, enum
-  validity, cache-key match, decoded state).
-- Assert loudly at the cause, never swallow-and-continue to the symptom.
-- When a bug is unclear, write an assert or a probe to characterize the
-  violation first; then decide whether the guard should stay an assert or
-  become a handled case. A silent `return` where an invariant was violated is
-  how desync bugs survive.
-- Asserts live in all builds; they are the documentation of what must never
-  happen.
+- Raw bytes, pointer math, bit twiddling, `transmute`, `offset_of`,
+  packing — not scary, just the job. Write it direct when direct is
+  simpler or faster than the abstraction.
+- Unfamiliar format or structure: probe it, dump bytes until it makes
+  sense, then contain what you learned behind one clean accessor.
+- Low-level ≠ sloppy: name the layout (`#packed`, explicit size constants),
+  assert invariants, own the memory.
+- `[]u8`/`rawptr` + one named accessor beats a chain of speculative
+  indirection. Bytes are bytes — model them as bytes.
 
-## 6. Logging is useful, not automatic
+## 5. Errors: values for recoverable, asserts for invariants — never mixed
 
-- Log user-facing errors and state transitions. Do not log per-frame or
-  per-iteration noise — that is what counters and the profiler are for.
-- When something must be observable at runtime, prefer a structured line over a
-  scattering of debug prints.
-- Probes (cache/frame/boundary) are the reproducibility tool, not logging.
+- **Recoverable** (bad file, dropped frame, non-critical OOM, bad input) is
+  data, not a bug. Return `(T, ok)`/`(T, err)`. `or_return` to thread up a
+  chain, `or_else` for a real fallback. Never `panic` on user-triggerable
+  input.
+- **Invariant violation** (cache mismatch, wrong-handle resolve, unhandled
+  enum case) is a bug — assert it (§6) where it's caught, don't launder it
+  into a normal error return.
+- **Handle it where it happens; don't reflex-bubble it.** `or_return` is
+  for legit propagation, not the default. Ask if this proc can actually act
+  on the failure — if so, handle it here instead of passing it up for
+  "someone else." An `or_return` chain that terminates several callers away
+  with nobody able to act is the "pass it up" problem exceptions have, just
+  type-checked instead of silent — the type system makes it visible in
+  review, it doesn't prevent it.
+- Test: caller can meaningfully continue → error value. Only a code fix
+  helps → assert. Unsure → assert first; loud-wrong beats silent-wrong
+  three subsystems later.
+- Invariant asserts run in all builds, no `when ODIN_DEBUG` gate. Debug-
+  only guards only for checks proven too expensive for release.
 
-## 7. Be explicit and readable. No magic numbers; comments where useful.
+## 6. Assert everything you can state
 
-- Every bare number is a named constant (proxy segment size, preview dims,
-  thread counts, timeouts). If you must inline a number, the page must already
-  name it.
-- Prefer code that states intent; comment where code alone cannot explain
-  itself: the why, cross-file invariants, coupling to a probe or a cached
-  value, a non-obvious decision. Never restate what the code already says —
-  if a comment would only repeat the line, the line wins.
-- Short identifiers only when the scope is tiny; err on the side of naming.
+- Any condition later code depends on: assert it — bounds, non-nil, enum
+  validity, cache-key match, decoded state.
+- Assert loud, at the cause. Never swallow-and-continue to the symptom.
+- Bug unclear? Write an assert/probe to characterize it first, then decide
+  if it stays an assert or becomes a handled case (§5). A silent `return`
+  on a violated invariant is how desync bugs survive.
+- Asserts run in every build — they're the doc of what must never happen.
+- **Crashing is good, not a failure.** An assert failure downgrades a
+  catastrophic bug into a liveness bug: work stops, but the trace points at
+  the cause, and no corrupt state gets written where other systems will
+  later trust it. Swallowing the violation doesn't fix it — it defers
+  discovery downstream, buried under everything that ran after. Crash-at-
+  assert beats wrong-answer-five-frames-later.
+- **Pair assertions across the boundary that matters.** Invariant set in
+  one place, relied on far away — decode thread writes it, render thread
+  reads it; commit bumps a generation, cache checks it — assert both ends.
+  A single assert catches "wrong right now"; the pair catches "silently
+  drifted apart since." Can only think to assert once? Find who else
+  depends on it, assert there too.
 
-## 8. Spall is the profiler; use it wherever performance matters
+## 7. Logging is useful, not automatic
 
-- Any hot path worth touching is worth measuring first with
-  `spall_scope(#procedure)` and `NERED_SPALL=/tmp/x.spall`; full call-tree
-  captures with `-define:NERED_INSTRUMENT=true`.
-- Perf claims ship with a Spall trace or a probe measurement, not vibes.
-- Check the capture size — a 35 s full-tree trace is ~20 MB/s; trim with
-  `NERED_SPALL_MS` and manual markers for steady-state work.
+- Log user-facing errors and state transitions — a failed export, a
+  dropped connection, a mode switch. Not per-frame noise; that's what
+  counters and the profiler are for.
+- Runtime observability = one structured line, not scattered debug prints.
+- Probes are the reproducibility tool for a specific bug — don't reach for
+  logging when you need a rerunnable probe instead.
+
+## 8. No magic numbers. Name things. Comment the why.
+
+- Every bare number is a named constant. Inline only if the page already
+  names it.
+- Comment what code can't say: the why, cross-file invariants, a coupling
+  to a probe or cached value. Never restate the line — if a comment would
+  just repeat it, the line wins.
+- Short identifiers only in tiny scopes. Default to naming clearly.
+
+## 9. Spall is the profiler; use it wherever performance matters
+
+- Measure first: `spall_scope(#procedure)`, `NERED_SPALL=/tmp/x.spall`;
+  full tree with `-define:NERED_INSTRUMENT=true`.
+- Perf claims ship with a trace or probe measurement, not vibes.
+- 35s full trace ≈ 20MB/s. Trim with `NERED_SPALL_MS` + manual markers.
+
+## 10. Build flags live in scripts, not your head
+
+- Typing `-vet`, `-no-bounds-check`, `-define:NERED_INSTRUMENT=true`, or
+  `NERED_SPALL*` by hand means the build script is missing a target — fix
+  the script.
+- `-vet` clean and warning-free is the baseline for every change, not a
+  pre-release chore.
+
+## 11. Source code is the source of truth
+
+- Unsure how a `core:`/`vendor:` proc behaves? Read it. Odin root and
+  vendored libs are on disk — check before guessing, before trusting
+  memory or docs. Docs drift; source doesn't.
+- Same for third-party C libs we bind against (ffmpeg, etc.) — header/
+  source is the spec, not a remembered signature or blog post.
+- Recalled API knowledge is a hypothesis, not a fact — verify against the
+  version actually vendored here.
+- Surprising behavior? Read the implementation before writing a
+  workaround. The workaround is often wrong; the implementation tells you
+  what's actually happening.
