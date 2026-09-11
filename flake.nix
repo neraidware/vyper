@@ -43,6 +43,7 @@
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
+            mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
             ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
             odin build . -out:nered \
@@ -95,6 +96,7 @@
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
+            mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
             ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
             odin build . -out:nered \
