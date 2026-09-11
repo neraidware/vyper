@@ -237,7 +237,7 @@ begin_media_drag :: proc(asset_index: int, mx, my: f32) {
 	}
 	asset := &media_assets[asset_index]
 	selected_asset_id = asset.id
-	dragging_media_from_bin = true
+	active_interaction = .Media_Bin_Drag
 	media_drag_asset_id = asset.id
 	media_drag_trace_once = true
 	media_drag_asset_index = asset_index
@@ -252,7 +252,7 @@ begin_media_drag :: proc(asset_index: int, mx, my: f32) {
 // update_media_drag_lanes recomputes the drop target + ghost lanes while a bin
 // drag is in flight (called every mouse-move while down).
 update_media_drag_lanes :: proc(mx, my: f32) {
-	if !dragging_media_from_bin {
+	if active_interaction != .Media_Bin_Drag {
 		return
 	}
 	media_drag_mx = mx
@@ -280,7 +280,7 @@ end_media_drag :: proc(mx, my: f32) {
 	if target >= 0 {
 		add_asset_to_timeline(media_drag_asset_id, target, timeline_frame_from_x(mx))
 	}
-	dragging_media_from_bin = false
+	active_interaction = .None
 	media_drag_asset_id = 0
 	media_drag_asset_index = -1
 	media_drag_target = -1
@@ -355,7 +355,7 @@ draw_media_bin_thumbnails :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.
 // The media is only committed to the timeline on release over a lane
 // (end_media_drag); nothing here mutates the timeline.
 draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
-	if !dragging_media_from_bin {
+	if active_interaction != .Media_Bin_Drag {
 		return
 	}
 	asset := find_asset(media_drag_asset_id)

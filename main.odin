@@ -151,7 +151,7 @@ timeline_resize_edge_at :: proc(track_idx, index: int, mx, my: f32) -> int {
 // timeline_resize_hover reports whether a duration resize is in progress or the
 // pointer is over the selected clip's edge grab area (drives the resize cursor).
 timeline_resize_hover :: proc(mx, my: f32) -> bool {
-	if resizing_clip {
+	if active_interaction == .Clip_Resize {
 		return true
 	}
 	if tr, cl, ok := selected_clip(); ok {

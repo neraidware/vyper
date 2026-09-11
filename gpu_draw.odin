@@ -428,7 +428,7 @@ draw_timeline_resize_focus :: proc(
 		return
 	}
 	edge := -1
-	if resizing_clip {
+	if active_interaction == .Clip_Resize {
 		edge = resize_edge
 	} else {
 		pointer := clay.GetPointerState()
@@ -608,7 +608,7 @@ draw_drag_ghost :: proc(
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 ) {
-	if !moving_clip || drag_clip == nil {
+	if active_interaction != .Clip_Move || drag_clip == nil {
 		return
 	}
 	if drag_hover_track < 0 || drag_hover_track >= len(timeline.tracks) {

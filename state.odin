@@ -309,21 +309,19 @@ last_tick_ns: sdl.Uint64
 // means the whole timeline (timeline_duration). Ctrl+Space sets it to the
 // project's render range end so playback stops there.
 playback_stop_frame: i64 = -1
-// dragging the playhead by its ruler bar/handle scrubs to the pointer's frame.
-dragging_playhead: bool
-// Scrub decimation: while dragging_playhead, exact-frame preview decodes run
-// on every SCRUB_DECIMATION-th update (scrub_tick counts update_preview_slots
-// calls during a drag) instead of on every mousemove. The last decoded frame
-// stays on-screen between throttled decodes; releasing the drag lifts the
-// throttle so the final position decodes exactly once.
+// active_interaction tracks which pointer gesture is active. Exactly one at a
+// time; .None means idle.  Replaces the old pile of mutually-exclusive booleans
+// so the compiler enforces one-active-at-a-time via the type system.
+active_interaction: Interaction
+// Scrub decimation: while active_interaction == .Playhead_Scrub, exact-frame
+// preview decodes run on every SCRUB_DECIMATION-th update (scrub_tick counts
+// update_preview_slots calls during a drag) instead of on every mousemove. The
+// last decoded frame stays on-screen between throttled decodes; releasing the
+// drag lifts the throttle so the final position decodes exactly once.
 scrub_tick: i32
 SCRUB_DECIMATION :: 4
 upper_area_height: f32 = 560
-resizing_areas: bool
-moving_clip: bool
-// resizing_clip + resize_edge track a timeline clip duration-edge drag:
 // resize_edge 0 = left (trim/extend head), 1 = right (trim/extend tail).
-resizing_clip: bool
 resize_edge: int = -1
 // _timeline_resize_cursor and _timeline_arrow_cursor are lazily-created SDL
 // cursors: the horizontal-resize one is shown while dragging/hovering a clip's
@@ -379,7 +377,6 @@ Media_Lane :: struct {
 	video_thumb_id:  u64, // asset id whose thumbnail paints the video lane
 	has_video_thumb: bool,
 }
-dragging_media_from_bin: bool
 media_drag_asset_id: u64
 media_drag_asset_index: int = -1
 media_drag_lanes: [dynamic]Media_Lane
@@ -414,7 +411,6 @@ selected_index: int = -1
 selected_set: map[u64]bool
 
 // Transform dragging: moving the selected clip around within the preview.
-moving_preview_clip: bool
 preview_drag_offset_x: f32
 preview_drag_offset_y: f32
 
@@ -614,6 +610,21 @@ Handle_Kind :: enum {
 	None,
 	Scale,
 	Crop,
+}
+// active_interaction discriminates which pointer gesture is running. Exactly
+// one interaction is active at any time; this is the tagged difference from
+// the old boolean soup, which could drift into multiple-"true" states. Payload
+// globals (drag_clip, resize_edge, media_drag_*, ...) belong to whichever
+// variant is active and are reset when it clears.
+Interaction :: enum {
+	None,          // no gesture active (playback-only frame, or track-list scroll)
+	Panel_Resize,  // dragging the divider to resize the upper/lower areas
+	Playhead_Scrub,
+	Clip_Resize,   // dragging a clip's duration edge
+	Clip_Move,     // dragging a clip along/onto tracks
+	Preview_Move,  // dragging a clip's transform in the preview
+	Media_Bin_Drag,
+	Handle_Drag,   // dragging a preview resize/crop handle
 }
 dragging_handle: int = -1
 handle_kind: Handle_Kind = .None

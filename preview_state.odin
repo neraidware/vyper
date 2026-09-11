@@ -172,7 +172,7 @@ update_preview_slots :: proc() -> bool {
 	// (probe mode below waits for the result); all other slots decode
 	// synchronously.
 	front_video_slot := -1
-	if dragging_playhead {
+	if active_interaction == .Playhead_Scrub {
 		scrub_tick += 1
 	}
 	// Warm the upcoming clip's decoder before the playhead crosses the
@@ -337,7 +337,7 @@ update_preview_slots :: proc() -> bool {
 				// face on screen through the drag; the decode below chases the
 				// clip's new position (the idle-skip misses because the
 				// requested clip_frame changed).
-				if drag_clip == clip || resizing_clip {
+				if drag_clip == clip || active_interaction == .Clip_Resize {
 					// Leave has_frame as-is: paint the stale face through the
 					// drag (the decode below chases the clip's new position).
 				} else {
@@ -514,7 +514,7 @@ update_preview_slots :: proc() -> bool {
 			// decodes on the first throttled tick so a clip crossing the playhead
 			// mid-drag shows immediately.
 			scrub_skip :=
-				dragging_playhead &&
+				active_interaction == .Playhead_Scrub &&
 				scrub_tick % SCRUB_DECIMATION != 0 &&
 				(slot_idx != front_video_slot || !async_has_worker())
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame

@@ -724,8 +724,7 @@ delete_selected_clip_raw :: proc() {
 	// invalidate_preview_slots the deleted clip keeps painting at the playhead
 	// (classic "deleted clip still renders" bug). Do not remove this regardless
 	// of how the delete is wired — any new delete path must do the same.
-	moving_clip = false
-	moving_preview_clip = false
+	active_interaction = .None
 	drag_clip = nil
 	drag_source_track = -1
 	drag_source_index = -1
@@ -832,8 +831,7 @@ ripple_delete_region :: proc(start, length: i64) {
 	// The edit may have removed/replaced the dragged clip and the decoded state
 	// cached for it: cancel any in-flight drag and drop the preview slots so the
 	// next update re-derives them purely from the edited timeline.
-	moving_clip = false
-	moving_preview_clip = false
+	active_interaction = .None
 	drag_clip = nil
 	drag_source_track = -1
 	drag_source_index = -1
@@ -887,8 +885,7 @@ ripple_delete_linked_group :: proc(link: u64) {
 	for s in spans {
 		ripple_delete_track_region(s.track, s.start, s.length)
 	}
-	moving_clip = false
-	moving_preview_clip = false
+	active_interaction = .None
 	drag_clip = nil
 	drag_source_track = -1
 	drag_source_index = -1
@@ -1494,8 +1491,7 @@ remove_track :: proc(index: int) {
 	case selected_track > index:
 		selected_track -= 1
 	}
-	moving_clip = false
-	moving_preview_clip = false
+	active_interaction = .None
 	drag_clip = nil
 	drag_source_track = -1
 	drag_source_index = -1
