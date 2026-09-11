@@ -39,10 +39,10 @@ system_monospace_font :: proc() -> cstring {
 		system_font_path[n] = 0
 		return cstring(&system_font_path[0])
 	} else {
-		// Ask Fontconfig for Noto Sans (the editor UI + title/subtitle clips),
-		// instead of hard-coding a path. fc-match aliases "Noto Sans" and falls
+		// Ask Fontconfig for DejaVu Sans (the editor UI + title/subtitle clips),
+		// instead of hard-coding a path. fc-match aliases "DejaVu Sans" and falls
 		// back to the nearest configured sans when it is not installed.
-		out, _, okin := run_capture({"fc-match", "-f", "%{file}", "Noto Sans"})
+		out, _, okin := run_capture({"fc-match", "-f", "%{file}", "monospace"})
 		defer delete(out)
 		if okin && len(out) > 0 {
 			n := copy(system_font_path[:], strings.trim_space(out))
@@ -51,7 +51,7 @@ system_monospace_font :: proc() -> cstring {
 				return cstring(&system_font_path[0])
 			}
 		}
-		return "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"
+		return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 	}
 }
 
