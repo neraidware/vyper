@@ -282,7 +282,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		canvas := preview_canvas(pb)
 		ib := clip_image_bounds(canvas, sel)
 		if h := preview_handle_at(ib, inp.x, inp.y); h >= 0 {
-			begin_handle_drag(sel, canvas, h, inp.x, inp.y, inp.alt && sel.kind != .Text)
+			begin_handle_drag(sel, canvas, Handle(h), inp.x, inp.y, inp.alt && sel.kind != .Text)
 			active_interaction = .Handle_Drag
 			return true
 		}
@@ -479,7 +479,7 @@ interaction_post_build :: proc(
 			}
 		}
 		active_interaction = .None
-		dragging_handle = -1
+		dragging_handle = nil
 		handle_kind = .None
 		handle_corner_snapped = false
 		drag_clip = nil
@@ -525,8 +525,8 @@ interaction_post_build :: proc(
 					// 5px snap margin (in rendered preview pixels): to the canvas
 					// center when near it, and/or to the canvas borders (edge
 					// snap runs regardless, so a centered clip still snaps).
-					snap_center(sel, snap_margin(canvas, 5))
-					snap_transform(sel, snap_margin(canvas, 5))
+					snap_center(sel, snap_margin(canvas, SNAP_MARGIN_PX))
+					snap_transform(sel, snap_margin(canvas, SNAP_MARGIN_PX))
 				}
 			}
 		case .Clip_Resize:

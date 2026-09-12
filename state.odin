@@ -616,7 +616,21 @@ clear_expired_ui_notice :: proc() {
 
 // Resize/crop handles shown around the selected clip's bounding box.
 PREVIEW_HANDLE_SIZE :: f32(9)
-// Handle indices: 0 TL, 1 T, 2 TR, 3 R, 4 BR, 5 B, 6 BL, 7 L.
+// Handle spells out the 8 resize/crop handles. Declaration order IS the
+// preview_handles render/hit-test index (TL=0 .. L=7), so it must stay put.
+Handle :: enum {
+	TL,
+	T,
+	TR,
+	R,
+	BR,
+	B,
+	BL,
+	L,
+}
+// Snap margin for handle drags, in rendered preview pixels; snap_margin turns
+// it into project units for the current viewport scale.
+SNAP_MARGIN_PX :: f32(5)
 Handle_Kind :: enum {
 	None,
 	Scale,
@@ -637,7 +651,7 @@ Interaction :: enum {
 	Media_Bin_Drag,
 	Handle_Drag,   // dragging a preview resize/crop handle
 }
-dragging_handle: int = -1
+dragging_handle: Maybe(Handle)
 handle_kind: Handle_Kind = .None
 handle_start_mx: f32
 handle_start_my: f32

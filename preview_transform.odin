@@ -213,27 +213,29 @@ snap_center :: proc(clip: ^Clip, margin: f32) -> bool {
 // in whatever units the caller uses (visible box for video, base text size for
 // text); for video the return is a multiplier on scale0, for text (where the
 // units are the scale=1 base size) it is already the absolute target scale.
-handle_center_pivot_scale :: proc(handle: int, cx, cy, pmx, pmy, bw, bh: f32) -> f32 {
+handle_center_pivot_scale :: proc(handle: Handle, cx, cy, pmx, pmy, bw, bh: f32) -> f32 {
 	half_w := max(bw / 2, 0.0001)
 	half_h := max(bh / 2, 0.0001)
 	switch handle {
-	case 1: // top
+	case .T: // top
 		return (cy - pmy) / half_h
-	case 5: // bottom
+	case .B: // bottom
 		return (pmy - cy) / half_h
-	case 7: // left
+	case .L: // left
 		return (cx - pmx) / half_w
-	case 3: // right
+	case .R: // right
 		return (pmx - cx) / half_w
+	case .TL, .TR, .BR, .BL:
+		kx := (pmx - cx) / half_w
+		ky := (pmy - cy) / half_h
+		// Corner: keep the aspect lock via the dominant axis, same rule as the
+		// opposite-pivot path.
+		if abs(pmy - cy) / half_h > abs(pmx - cx) / half_w {
+			return ky
+		}
+		return kx
 	}
-	kx := (pmx - cx) / half_w
-	ky := (pmy - cy) / half_h
-	// Corner: keep the aspect lock via the dominant axis, same rule as the
-	// opposite-pivot path.
-	if abs(pmy - cy) / half_h > abs(pmx - cx) / half_w {
-		return ky
-	}
-	return kx
+	unreachable()
 }
 
 // corner_snap_both snaps a dragged corner so BOTH of its edges land on the
@@ -244,26 +246,28 @@ handle_center_pivot_scale :: proc(handle: int, cx, cy, pmx, pmy, bw, bh: f32) ->
 // box corner flush against the canvas corner (a side and the ceiling/floor
 // together). Returns the transform delta and whether it snapped.
 corner_snap_both :: proc(
-	handle: int,
+	handle: Handle,
 	left, right, top, bottom, margin, pw, ph: f32,
 ) -> (tx_delta, ty_delta: f32, snapped: bool) {
 	switch handle {
-	case 0: // TL corner -> canvas (0,0)
+	case .TL: // TL corner -> canvas (0,0)
 		if abs(left) <= margin && abs(top) <= margin {
 			return -left, -top, true
 		}
-	case 2: // TR corner -> canvas (pw,0)
+	case .TR: // TR corner -> canvas (pw,0)
 		if abs(right - pw) <= margin && abs(top) <= margin {
 			return pw - right, -top, true
 		}
-	case 4: // BR corner -> canvas (pw,ph)
+	case .BR: // BR corner -> canvas (pw,ph)
 		if abs(right - pw) <= margin && abs(bottom - ph) <= margin {
 			return pw - right, ph - bottom, true
 		}
-	case 6: // BL corner -> canvas (0,ph)
+	case .BL: // BL corner -> canvas (0,ph)
 		if abs(left) <= margin && abs(bottom - ph) <= margin {
 			return -left, ph - bottom, true
 		}
+	case .T, .B, .L, .R:
+		assert(false, "corner_snap_both: edge handle reached a corner-only snap")
 	}
 	return 0, 0, false
 }
@@ -280,7 +284,7 @@ corner_snap_both :: proc(
 // edges in project units) is computed the same way as snap_driven_handle.
 corner_snap_scale :: proc(
 	clip: ^Clip,
-	handle: int,
+	handle: Handle,
 	s, tx, ty, l, r, t, b, margin, pw, ph: f32,
 ) -> (s_out, tx_out, ty_out: f32, snapped: bool) {
 	s_out = s
@@ -288,15 +292,22 @@ corner_snap_scale :: proc(
 	ty_out = ty
 	dx, dy, txg, tyg, px, py: f32
 	switch handle {
-	case 0: // TL driven corner -> canvas (0,0), pinned BR
+	case .TL: // TL driven corner -> canvas (0,0), pinned BR
 		dx, dy, txg, tyg, px, py = l, t, 0.0, 0.0, r, b
-	case 2: // TR -> canvas (pw,0), pinned BL
+	case .TR: // TR -> canvas (pw,0), pinned BL
 		dx, dy, txg, tyg, px, py = r, t, pw, 0.0, l, b
-	case 4: // BR -> canvas (pw,ph), pinned TL
+	case .BR: // BR -> canvas (pw,ph), pinned TL
 		dx, dy, txg, tyg, px, py = r, b, pw, ph, l, t
-	case 6: // BL -> canvas (0,ph), pinned TR
+	case .BL: // BL -> canvas (0,ph), pinned TR
 		dx, dy, txg, tyg, px, py = l, b, 0.0, ph, r, t
+	case .T, .B, .L, .R:
+		assert(false, "corner_snap_scale: edge handle reached a corner-only snap")
 	}
+	// The scale solves to (target - pinned) / (driven - pinned); a zero-size box
+	// would divide by zero here. The drag caller clamps scale to [0.05, 100] and
+	// crop keeps the visible box >= one pixel, so the driven and pinned edges
+	// are never equal on either axis.
+	assert(dx - px != 0 && dy - py != 0, "corner_snap_scale: degenerate zero-size box")
 	gx := abs(dx - txg)
 	gy := abs(dy - tyg)
 	if gx > margin || gy > margin {
@@ -320,18 +331,20 @@ corner_snap_scale :: proc(
 	dt2 := (0.5 - clip.crop_t) * ch2
 	db2 := (0.5 - clip.crop_b) * ch2
 	switch handle {
-	case 0:
+	case .TL: // keep pinned BR fixed
 		tx_out = r - dr2
 		ty_out = b - db2
-	case 2:
+	case .TR: // keep pinned BL fixed
 		tx_out = l + dl2
 		ty_out = b - db2
-	case 4:
+	case .BR: // keep pinned TL fixed
 		tx_out = l + dl2
 		ty_out = t + dt2
-	case 6:
+	case .BL: // keep pinned TR fixed
 		tx_out = r - dr2
 		ty_out = t + dt2
+	case .T, .B, .L, .R:
+		assert(false, "corner_snap_scale: edge handle reached reanchor")
 	}
 	// Close only the perpendicular residual (bounded by the margin) so the
 	// corner sits flush on both edges; the pinned corner rides at most that
@@ -341,18 +354,20 @@ corner_snap_scale :: proc(
 	resx: f32
 	resy: f32
 	switch handle {
-	case 0:
+	case .TL:
 		resx = -l2
 		resy = -t2
-	case 2:
+	case .TR:
 		resx = pw - (tx_out + dr2)
 		resy = -t2
-	case 4:
+	case .BR:
 		resx = pw - (tx_out + dr2)
 		resy = ph - (ty_out + db2)
-	case 6:
+	case .BL:
 		resx = -l2
 		resy = ph - (ty_out + db2)
+	case .T, .B, .L, .R:
+		assert(false, "corner_snap_scale: edge handle reached residual")
 	}
 	if gx > gy {
 		if abs(resy) <= margin {
@@ -442,10 +457,21 @@ preview_handle_at :: proc(b: clay.BoundingBox, mx, my: f32) -> int {
 	return -1
 }
 
+// is_corner reports whether the handle is a diagonal (corner) handle.
+is_corner :: proc(handle: Handle) -> bool {
+	switch handle {
+	case .TL, .TR, .BR, .BL:
+		return true
+	case .T, .B, .L, .R:
+		return false
+	}
+	unreachable()
+}
+
 // begin_handle_drag captures the state needed to scale/crop the selected clip
 // from a handle drag. crop=true makes the drag adjust the source crop instead
 // of the scale.
-begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx, my: f32, crop: bool) {
+begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: Handle, mx, my: f32, crop: bool) {
 	dragging_handle = handle
 	handle_kind = crop ? .Crop : .Scale
 	handle_corner_snapped = false
@@ -477,7 +503,7 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx
 // still scale outward from its corner, so the freeze only engages after a real
 // snap. Edge handles deliberately do NOT freeze: scaling an edge past its
 // border is intended.
-handle_drag_frozen :: proc(clip: ^Clip, pmx, pmy, margin: f32) -> bool {
+handle_drag_frozen :: proc(clip: ^Clip, handle: Handle, pmx, pmy, margin: f32) -> bool {
 	if clip == nil {
 		return false
 	}
@@ -487,17 +513,19 @@ handle_drag_frozen :: proc(clip: ^Clip, pmx, pmy, margin: f32) -> bool {
 	PW := f32(project.width)
 	PH := f32(project.height)
 	l, r, t, b := clip_visible_box_project(clip)
-	switch dragging_handle {
-	case 0: // TL driven corner flush at canvas (0,0)
+	switch handle {
+	case .TL: // TL driven corner flush at canvas (0,0)
 		return abs(l) <= margin && abs(t) <= margin && (pmx < -margin || pmy < -margin)
-	case 2: // TR flush at (PW,0)
+	case .TR: // TR flush at (PW,0)
 		return abs(r - PW) <= margin && abs(t) <= margin && (pmx > PW + margin || pmy < -margin)
-	case 4: // BR flush at (PW,PH)
+	case .BR: // BR flush at (PW,PH)
 		return abs(r - PW) <= margin && abs(b - PH) <= margin && (pmx > PW + margin || pmy > PH + margin)
-	case 6: // BL flush at (0,PH)
+	case .BL: // BL flush at (0,PH)
 		return abs(l) <= margin && abs(b - PH) <= margin && (pmx < -margin || pmy > PH + margin)
+	case .T, .B, .L, .R:
+		return false
 	}
-	return false
+	unreachable()
 }
 
 // clip_visible_box_project returns the clip's current visible (crop-adjusted)
@@ -536,7 +564,7 @@ clip_visible_box_project :: proc(clip: ^Clip) -> (l, r, t, b: f32) {
 // switches to a center-stable scale correction for the Shift+drag case.
 snap_driven_handle :: proc(
 	clip: ^Clip,
-	handle: int,
+	handle: Handle,
 	s, tx, ty, cw, ch, margin: f32,
 	from_center: bool,
 ) {
@@ -558,7 +586,7 @@ snap_driven_handle :: proc(
 	tx_out := tx
 	ty_out := ty
 	switch handle {
-	case 1: // top driven
+	case .T: // top driven
 		if abs(t) > margin {
 			break
 		}
@@ -576,7 +604,7 @@ snap_driven_handle :: proc(
 			db = (0.5 - cb) * ch2
 			ty_out = b - db
 		}
-	case 5: // bottom driven
+	case .B: // bottom driven
 		if abs(b - PH) > margin {
 			break
 		}
@@ -594,7 +622,7 @@ snap_driven_handle :: proc(
 			db = (0.5 - cb) * ch2
 			ty_out = t + dt
 		}
-	case 7: // left driven
+	case .L: // left driven
 		if abs(l) > margin {
 			break
 		}
@@ -612,7 +640,7 @@ snap_driven_handle :: proc(
 			dr = (0.5 - cr) * cw2
 			tx_out = r - dr
 		}
-	case 3: // right driven
+	case .R: // right driven
 		if abs(r - PW) > margin {
 			break
 		}
@@ -630,7 +658,7 @@ snap_driven_handle :: proc(
 			dr = (0.5 - cr) * cw2
 			tx_out = l + dl
 		}
-	case 0, 2, 4, 6:
+	case .TL, .TR, .BR, .BL:
 		if from_center {
 			dtx, dty, ok := corner_snap_both(handle, l, r, t, b, margin, PW, PH)
 			if ok {
@@ -657,9 +685,10 @@ snap_driven_handle :: proc(
 // pins the handle opposite the one being dragged: the opposite edge/corner
 // stays fixed while the dragged handle tracks the pointer.
 update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, from_center := false) {
-	if dragging_handle < 0 || clip == nil {
+	if dragging_handle == nil || clip == nil {
 		return
 	}
+	h := dragging_handle.?
 	cx := handle_start_center_x
 	cy := handle_start_center_y
 	bw := handle_start_box_w
@@ -698,14 +727,14 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		top0 := ty0
 		bottom0 := ty0 + bh0 * scale0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
-		if handle_drag_frozen(clip, pmx, pmy, snap_margin(canvas, 5)) {
+		if handle_drag_frozen(clip, h, pmx, pmy, snap_margin(canvas, SNAP_MARGIN_PX)) {
 			return
 		}
 
 		if from_center {
 			cpx := left0 + bw0 * scale0 / 2
 			cpy := top0 + bh0 * scale0 / 2
-			s := max(handle_center_pivot_scale(dragging_handle, cpx, cpy, pmx, pmy, bw0, bh0), 0.01)
+			s := max(handle_center_pivot_scale(h, cpx, cpy, pmx, pmy, bw0, bh0), 0.01)
 			w := bw0 * s
 			h := bh0 * s
 			clip.scale = clamp(s, 0.05, 100.0)
@@ -715,16 +744,16 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		}
 
 		k: f32 = 1
-		switch dragging_handle {
-		case 1: // top pins bottom
+		switch h {
+		case .T: // top pins bottom
 			k = (bottom0 - pmy) / bh0
-		case 5: // bottom pins top
+		case .B: // bottom pins top
 			k = (pmy - top0) / bh0
-		case 7: // left pins right
+		case .L: // left pins right
 			k = (right0 - pmx) / bw0
-		case 3: // right pins left
+		case .R: // right pins left
 			k = (pmx - left0) / bw0
-		case 0, 2, 4, 6:
+		case .TL, .TR, .BR, .BL:
 			kx: f32 = 1
 			ky: f32 = 1
 			// Live dominant axis measured from the PINNED (opposite) corner --
@@ -736,27 +765,29 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			// out horizontal-only and vertical corner drags froze the box.
 			dx: f32
 			dy: f32
-			switch dragging_handle {
-			case 0: // TL pins BR
+			switch h {
+			case .TL: // TL pins BR
 				kx = (right0 - pmx) / bw0
 				ky = (bottom0 - pmy) / bh0
 				dx = right0 - pmx
 				dy = bottom0 - pmy
-			case 2: // TR pins BL
+			case .TR: // TR pins BL
 				kx = (pmx - left0) / bw0
 				ky = (bottom0 - pmy) / bh0
 				dx = pmx - left0
 				dy = bottom0 - pmy
-			case 4: // BR pins TL
+			case .BR: // BR pins TL
 				kx = (pmx - left0) / bw0
 				ky = (pmy - top0) / bh0
 				dx = pmx - left0
 				dy = pmy - top0
-			case 6: // BL pins TR
+			case .BL: // BL pins TR
 				kx = (right0 - pmx) / bw0
 				ky = (pmy - top0) / bh0
 				dx = right0 - pmx
 				dy = pmy - top0
+			case .T, .B, .L, .R: // corner-only pin, unreachable inside corner group
+				assert(false, "DominantAxis: text corner k-switch reached an edge handle")
 			}
 			if abs(dy) / bh0 > abs(dx) / bw0 {
 				k = ky
@@ -780,41 +811,41 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		center_y0 := top0 + bh0 * scale0 / 2
 		tx := tx0
 		ty := ty0
-		switch dragging_handle {
-		case 1: // top pins bottom edge, x stays centered
+		switch h {
+		case .T: // top pins bottom edge, x stays centered
 			ty = bottom0 - new_h
 			tx = center_x0 - new_w / 2
-		case 5: // bottom pins top edge, x stays centered
+		case .B: // bottom pins top edge, x stays centered
 			ty = top0
 			tx = center_x0 - new_w / 2
-		case 7: // left pins right edge, y stays centered
+		case .L: // left pins right edge, y stays centered
 			tx = right0 - new_w
 			ty = center_y0 - new_h / 2
-		case 3: // right pins left edge, y stays centered
+		case .R: // right pins left edge, y stays centered
 			tx = left0
 			ty = center_y0 - new_h / 2
-		case 0: // TL pins BR
+		case .TL: // TL pins BR
 			tx = right0 - new_w
 			ty = bottom0 - new_h
-		case 2: // TR pins BL
+		case .TR: // TR pins BL
 			tx = left0
 			ty = bottom0 - new_h
-		case 4: // BR pins TL
+		case .BR: // BR pins TL
 			tx = left0
 			ty = top0
-		case 6: // BL pins TR
+		case .BL: // BL pins TR
 			tx = right0 - new_w
 			ty = top0
 		}
 		clip.scale = clamp(s, 0.05, 100.0)
 		clip.transform_x = tx
 		clip.transform_y = ty
-		if dragging_handle == 0 || dragging_handle == 2 || dragging_handle == 4 || dragging_handle == 6 {
+		if is_corner(h) {
 			dtx, dty, snapped := corner_snap_both(
-				dragging_handle,
+				h,
 				clip.transform_x, clip.transform_x + new_w,
 				clip.transform_y, clip.transform_y + new_h,
-				snap_margin(canvas, 5), PW, PH,
+				snap_margin(canvas, SNAP_MARGIN_PX), PW, PH,
 			)
 			if snapped {
 				clip.transform_x += dtx
@@ -856,12 +887,17 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		vb0 := handle_start_ty + db0
 		w0 := (1 - cl - cr) * cw0
 		h0 := (1 - ct - cb) * ch0
+		// The k-switch below divides by w0/h0, and every handle's formula uses
+		// the box's own extent as its divisor. A fully-inset crop (cl+cr >= 1 or
+		// ct+cb >= 1) would zero the visible box; the crop UI pins each edge
+		// inside the opposite edge, so assert the divisor has extent.
+		assert(w0 > 0 && h0 > 0, "Scale: visible box has zero width or height")
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
 		// Corner (diagonal) handles hold their snapped geometry while the
 		// pointer sits beyond the flushed canvas corner; edge handles keep
 		// scaling past their borders by design. Without this gate an outward
 		// drag after a corner snap resizes the box from its opposite corner.
-		if handle_drag_frozen(clip, pmx, pmy, snap_margin(canvas, 5)) {
+		if handle_drag_frozen(clip, h, pmx, pmy, snap_margin(canvas, SNAP_MARGIN_PX)) {
 			return
 		}
 
@@ -872,7 +908,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			// what the user sees.
 			cx := handle_start_tx + (dl0 - dr0) / 2
 			cy := handle_start_ty + (dt0 - db0) / 2
-			k := max(handle_center_pivot_scale(dragging_handle, cx, cy, pmx, pmy, w0, h0), 0.01)
+			k := max(handle_center_pivot_scale(h, cx, cy, pmx, pmy, w0, h0), 0.01)
 			s := scale0 * k
 			cw, ch := clip_full_box_dims(clip, PW * s, PH * s)
 			dl := (0.5 - cl) * cw
@@ -882,21 +918,21 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			clip.scale = clamp(s, 0.05, 100.0)
 			clip.transform_x = cx + (dl - dr) / 2
 			clip.transform_y = cy + (dt - db) / 2
-			snap_driven_handle(clip, dragging_handle, clamp(s, 0.05, 100.0), clip.transform_x, clip.transform_y, cw, ch, snap_margin(canvas, 5), true)
+			snap_driven_handle(clip, h, clamp(s, 0.05, 100.0), clip.transform_x, clip.transform_y, cw, ch, snap_margin(canvas, SNAP_MARGIN_PX), true)
 			return
 		}
 
 		k: f32 = 1
-		switch dragging_handle {
-		case 1: // top: pin bottom
+		switch h {
+		case .T: // top: pin bottom
 			k = (vb0 - pmy) / h0
-		case 5: // bottom: pin top
+		case .B: // bottom: pin top
 			k = (pmy - vt0) / h0
-		case 7: // left: pin right
+		case .L: // left: pin right
 			k = (vr0 - pmx) / w0
-		case 3: // right: pin left
+		case .R: // right: pin left
 			k = (pmx - vl0) / w0
-		case 0, 2, 4, 6: // corners: pin opposite corner, dominant axis
+		case .TL, .TR, .BR, .BL: // corners: pin opposite corner, dominant axis
 			kx: f32 = 1
 			ky: f32 = 1
 			// Live dominant axis measured from the PINNED (opposite) corner --
@@ -908,27 +944,29 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			// out horizontal-only and vertical corner drags froze the box.
 			dx: f32
 			dy: f32
-			switch dragging_handle {
-			case 0: // TL pins BR
+			switch h {
+			case .TL: // TL pins BR
 				kx = (vr0 - pmx) / w0
 				ky = (vb0 - pmy) / h0
 				dx = vr0 - pmx
 				dy = vb0 - pmy
-			case 2: // TR pins BL
+			case .TR: // TR pins BL
 				kx = (pmx - vl0) / w0
 				ky = (vb0 - pmy) / h0
 				dx = pmx - vl0
 				dy = vb0 - pmy
-			case 4: // BR pins TL
+			case .BR: // BR pins TL
 				kx = (pmx - vl0) / w0
 				ky = (pmy - vt0) / h0
 				dx = pmx - vl0
 				dy = pmy - vt0
-			case 6: // BL pins TR
+			case .BL: // BL pins TR
 				kx = (vr0 - pmx) / w0
 				ky = (pmy - vt0) / h0
 				dx = vr0 - pmx
 				dy = pmy - vt0
+			case .T, .B, .L, .R: // corner-only pin, unreachable inside corner group
+				assert(false, "DominantAxis: video corner k-switch reached an edge handle")
 			}
 			if abs(dy) / h0 > abs(dx) / w0 {
 				k = ky
@@ -946,25 +984,25 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		db := (0.5 - cb) * ch
 		tx := handle_start_tx
 		ty := handle_start_ty
-		switch dragging_handle {
-		case 1: // top pins bottom
+		switch h {
+		case .T: // top pins bottom
 			ty = vb0 - db
-		case 5: // bottom pins top
+		case .B: // bottom pins top
 			ty = vt0 + dt
-		case 7: // left pins right
+		case .L: // left pins right
 			tx = vr0 - dr
-		case 3: // right pins left
+		case .R: // right pins left
 			tx = vl0 + dl
-		case 0: // TL pins BR
+		case .TL: // TL pins BR
 			tx = vr0 - dr
 			ty = vb0 - db
-		case 2: // TR pins BL
+		case .TR: // TR pins BL
 			tx = vl0 + dl
 			ty = vb0 - db
-		case 4: // BR pins TL
+		case .BR: // BR pins TL
 			tx = vl0 + dl
 			ty = vt0 + dt
-		case 6: // BL pins TR
+		case .BL: // BL pins TR
 			tx = vr0 - dr
 			ty = vt0 + dt
 		}
@@ -972,7 +1010,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		// Snap ONLY the driven handle: corners snap both their edges flush on
 		// the canvas corner, edges snap their single driven edge; the pinned
 		// edges are the drag's anchor and are never moved by a snap.
-		snap_driven_handle(clip, dragging_handle, clamp(s, 0.05, 100.0), tx, ty, cw, ch, snap_margin(canvas, 5), false)
+		snap_driven_handle(clip, h, clamp(s, 0.05, 100.0), tx, ty, cw, ch, snap_margin(canvas, SNAP_MARGIN_PX), false)
 	case .Crop:
 		// Crop trims the visible box: dragging one edge moves that edge (and the
 		// adjacent edges for a corner) while the opposite visible edge stays
@@ -998,25 +1036,25 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		vb0 := OX_B - cb * out_h
 		minsz := f32(0.5)
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
-		switch dragging_handle {
-		case 1: // top: keep bottom visible edge fixed, allow un-crop to outer top
+		switch h {
+		case .T: // top: keep bottom visible edge fixed, allow un-crop to outer top
 			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
-		case 5: // bottom: keep top visible edge fixed
+		case .B: // bottom: keep top visible edge fixed
 			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
-		case 7: // left: keep right visible edge fixed
+		case .L: // left: keep right visible edge fixed
 			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
-		case 3: // right: keep left visible edge fixed
+		case .R: // right: keep left visible edge fixed
 			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
-		case 0: // TL: keep right+bottom visible edges fixed
+		case .TL: // TL: keep right+bottom visible edges fixed
 			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
 			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
-		case 2: // TR: keep left+bottom visible edges fixed
+		case .TR: // TR: keep left+bottom visible edges fixed
 			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
 			clip.crop_t = (clamp(pmy, OX_T, vb0 - minsz) - OX_T) / out_h
-		case 4: // BR: keep left+top visible edges fixed
+		case .BR: // BR: keep left+top visible edges fixed
 			clip.crop_r = (OX_R - clamp(pmx, vl0 + minsz, OX_R)) / out_w
 			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
-		case 6: // BL: keep right+top visible edges fixed
+		case .BL: // BL: keep right+top visible edges fixed
 			clip.crop_l = (clamp(pmx, OX_L, vr0 - minsz) - OX_L) / out_w
 			clip.crop_b = (OX_B - clamp(pmy, vt0 + minsz, OX_B)) / out_h
 		}

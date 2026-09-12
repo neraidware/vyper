@@ -68,7 +68,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip() // full-canvas box: t=0, b=PH
 		_, _, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 1, PW / 2, t0, false)
+		begin_handle_drag(&c, canvas, .T, PW / 2, t0, false)
 		update_handle_drag(&c, canvas, PW / 2, -2000, false) // way above the canvas
 		_, _, t, b := probe_visible_edges(&c)
 		check(&fail, abs(t - (-2000)) <= 0.5, "top: driven top must follow the pointer beyond the canvas", 0, 0, t, b)
@@ -79,7 +79,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, _, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 1, PW / 2, t0, false)
+		begin_handle_drag(&c, canvas, .T, PW / 2, t0, false)
 		update_handle_drag(&c, canvas, PW / 2, PH / 2, false)
 		_, _, t, b := probe_visible_edges(&c)
 		check(&fail, abs(t - PH/2) <= 0.5, "top: driven top should track the pointer", 0, 0, t, b)
@@ -90,7 +90,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, _, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 1, PW / 2, t0, false)
+		begin_handle_drag(&c, canvas, .T, PW / 2, t0, false)
 		update_handle_drag(&c, canvas, PW / 2, -2, false) // ~within snap margin
 		_, _, t, b := probe_visible_edges(&c)
 		check(&fail, abs(t) <= 0.05, "top: driven top should snap onto the border", 0, 0, t, b)
@@ -101,7 +101,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, _, _, b0 := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 5, PW / 2, b0, false)
+		begin_handle_drag(&c, canvas, .B, PW / 2, b0, false)
 		update_handle_drag(&c, canvas, PW / 2, 9999, false) // way below the canvas
 		_, _, t, b := probe_visible_edges(&c)
 		check(&fail, abs(b - 9999) <= 0.5, "bottom: driven bottom must follow the pointer beyond the canvas", 0, 0, t, b)
@@ -112,7 +112,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, _, _, b0 := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 5, PW / 2, b0, false)
+		begin_handle_drag(&c, canvas, .B, PW / 2, b0, false)
 		update_handle_drag(&c, canvas, PW / 2, PH / 2, false)
 		_, _, t, b := probe_visible_edges(&c)
 		check(&fail, abs(b - PH/2) <= 0.5, "bottom: driven bottom should track the pointer", 0, 0, t, b)
@@ -123,7 +123,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, _, _, b0 := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 5, PW / 2, b0, false)
+		begin_handle_drag(&c, canvas, .B, PW / 2, b0, false)
 		update_handle_drag(&c, canvas, PW / 2, PH + 2, false) // ~within snap margin
 		_, _, t, b := probe_visible_edges(&c)
 		check(&fail, abs(b - PH) <= 0.05, "bottom: driven bottom should snap onto the border", 0, 0, t, b)
@@ -134,7 +134,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, _, _, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 7, l0, PH / 2, false)
+		begin_handle_drag(&c, canvas, .L, l0, PH / 2, false)
 		update_handle_drag(&c, canvas, -9999, PH / 2, false) // way left of the canvas
 		l, r, _, _ := probe_visible_edges(&c)
 		check(&fail, abs(l - (-9999)) <= 0.5, "left: driven left must follow the pointer beyond the canvas", l, r, 0, 0)
@@ -145,7 +145,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, _, _, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 7, l0, PH / 2, false)
+		begin_handle_drag(&c, canvas, .L, l0, PH / 2, false)
 		update_handle_drag(&c, canvas, PW / 2, PH / 2, false)
 		l, r, _, _ := probe_visible_edges(&c)
 		check(&fail, abs(l - PW/2) <= 0.5, "left: driven left should track the pointer", l, r, 0, 0)
@@ -156,7 +156,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, _, _, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 7, l0, PH / 2, false)
+		begin_handle_drag(&c, canvas, .L, l0, PH / 2, false)
 		update_handle_drag(&c, canvas, -2, PH / 2, false) // ~within snap margin
 		l, r, _, _ := probe_visible_edges(&c)
 		check(&fail, abs(l - 0) <= 0.05, "left: driven left should snap onto the border", l, r, 0, 0)
@@ -167,7 +167,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, r0, _, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 3, r0, PH / 2, false)
+		begin_handle_drag(&c, canvas, .R, r0, PH / 2, false)
 		update_handle_drag(&c, canvas, 9999, PH / 2, false) // way right of the canvas
 		l, r, _, _ := probe_visible_edges(&c)
 		check(&fail, abs(r - 9999) <= 0.5, "right: driven right must follow the pointer beyond the canvas", l, r, 0, 0)
@@ -178,7 +178,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, r0, _, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 3, r0, PH / 2, false)
+		begin_handle_drag(&c, canvas, .R, r0, PH / 2, false)
 		update_handle_drag(&c, canvas, PW / 2, PH / 2, false)
 		l, r, _, _ := probe_visible_edges(&c)
 		check(&fail, abs(r - PW/2) <= 0.5, "right: driven right should track the pointer", l, r, 0, 0)
@@ -189,7 +189,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		_, r0, _, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 3, r0, PH / 2, false)
+		begin_handle_drag(&c, canvas, .R, r0, PH / 2, false)
 		update_handle_drag(&c, canvas, PW + 2, PH / 2, false) // ~within snap margin
 		l, r, _, _ := probe_visible_edges(&c)
 		check(&fail, abs(r - PW) <= 0.05, "right: driven right should snap onto the border", l, r, 0, 0)
@@ -201,7 +201,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, r0, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		begin_handle_drag(&c, canvas, .TL, l0, t0, false)
 		update_handle_drag(&c, canvas, -200, -200, false)
 		l, r, t, b := probe_visible_edges(&c)
 		check(&fail, l < -0.5 && t < -0.5, "tl corner: driven corner must scale beyond the canvas", l, r, t, b)
@@ -213,7 +213,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, r0, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		begin_handle_drag(&c, canvas, .TL, l0, t0, false)
 		update_handle_drag(&c, canvas, 10, -600, false) // 10px on x, ~55% on y
 		l, r, t, b := probe_visible_edges(&c)
 		check(&fail, abs(t - (-600)) <= 0.5, "tl corner: vertical-dominant drag must scale the driven top to the pointer", l, r, t, b)
@@ -224,7 +224,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, r0, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		begin_handle_drag(&c, canvas, .TL, l0, t0, false)
 		update_handle_drag(&c, canvas, -2, -2, false) // both driven edges within snap margin
 		l, r, t, b := probe_visible_edges(&c)
 		check(&fail, abs(l - 0) <= 0.25 && abs(t - 0) <= 0.25, "tl corner: both driven edges must snap flush on the canvas corner", l, r, t, b)
@@ -239,7 +239,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, r0, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		begin_handle_drag(&c, canvas, .TL, l0, t0, false)
 		update_handle_drag(&c, canvas, -2, -2, false) // snap flush on (0,0)
 		s_snapped := c.scale
 		_, r_snapped, _, b_snapped := probe_visible_edges(&c)
@@ -255,7 +255,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, r0, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		begin_handle_drag(&c, canvas, .TL, l0, t0, false)
 		update_handle_drag(&c, canvas, -2, -2, false) // snap flush
 		update_handle_drag(&c, canvas, -200, -200, false) // freeze
 		update_handle_drag(&c, canvas, -2, -2, false) // back inside the snap margin
@@ -273,7 +273,7 @@ transform_probe_run :: proc(v: string) {
 	{
 		c := mk_probe_clip()
 		l0, r0, t0, _ := probe_visible_edges(&c)
-		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		begin_handle_drag(&c, canvas, .TL, l0, t0, false)
 		update_handle_drag(&c, canvas, -2, -2, false)
 		l, r, t, b := probe_visible_edges(&c)
 		check(&fail, abs(c.scale - 1.0) <= 0.01, "tl corner: snapped scale must be the exact flush scale (1.0)", l, r, t, b)
