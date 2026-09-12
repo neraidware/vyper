@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=vyper
+Comment=Live clip editor
+Exec=vyper
+Icon=vyper
+Terminal=false
+Categories=AudioVideo;VideoEditor;
+StartupNotify=false
