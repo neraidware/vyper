@@ -10,8 +10,9 @@ package main
 //     onto the canvas border (by adjusting scale, so the pinned edge stays
 //     put); a corner snaps with an EXACT scale about the pinned corner so the
 //     driven corner lands flush on the canvas corner, then FREEZES while the
-//     pointer sits beyond that corner (it does not keep resizing from the
-//     opposite corner) and resumes once the pointer crosses back inside.
+//     pointer sits DIAGONALLY beyond that corner (both axes; it does not keep
+//     resizing from the opposite corner) and resumes once the pointer crosses
+//     back inside on either axis.
 //
 // Each case builds a full-canvas box, grabs the handle ON its border, then
 // asserts the pointer/border behavior. pixel<->project is identity here.
@@ -279,6 +280,64 @@ transform_probe_run :: proc(v: string) {
 		check(&fail, abs(c.scale - 1.0) <= 0.01, "tl corner: snapped scale must be the exact flush scale (1.0)", l, r, t, b)
 		check(&fail, abs(l - 0) <= 0.25 && abs(t - 0) <= 0.25, "tl corner: corner flush", l, r, t, b)
 		check(&fail, abs(r - PW) <= 0.5 && abs(b - PH) <= 0.5, "tl corner: pinned BR exactly on its corner", l, r, t, b)
+	}
+
+	// --- Case 19: BR corner snap-freeze-resume (mirror of 16/17 for .BR).
+	{
+		c := mk_probe_clip()
+		_, _, _, b0 := probe_visible_edges(&c)
+		begin_handle_drag(&c, canvas, .BR, PW, b0, false)
+		update_handle_drag(&c, canvas, PW - 2, PH - 2, false) // snap flush BR
+		update_handle_drag(&c, canvas, PW + 400, PH + 400, false) // freeze beyond
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(r - PW) <= 0.25 && abs(b - PH) <= 0.25, "br freeze: driven corner stays flush while beyond", l, r, t, b)
+		update_handle_drag(&c, canvas, PW - 400, PH - 300, false) // deep inside
+		l, r, t, b = probe_visible_edges(&c)
+		check(&fail, abs(r - PW) > 50 && abs(b - PH) > 50, "br resume: box must detach once the pointer is inside", l, r, t, b)
+	}
+
+	// --- Case 20: TR corner snap-freeze-resume.
+	{
+		c := mk_probe_clip()
+		begin_handle_drag(&c, canvas, .TR, PW, 0, false)
+		update_handle_drag(&c, canvas, PW - 2, 2, false) // snap flush TR
+		update_handle_drag(&c, canvas, PW + 400, -400, false) // freeze beyond
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(r - PW) <= 0.25 && abs(t - 0) <= 0.25, "tr freeze: driven corner stays flush while beyond", l, r, t, b)
+		update_handle_drag(&c, canvas, PW - 400, 300, false) // deep inside
+		l, r, t, b = probe_visible_edges(&c)
+		check(&fail, abs(r - PW) > 50 && abs(t - 0) > 50, "tr resume: box must detach once the pointer is inside", l, r, t, b)
+	}
+
+	// --- Case 21: BL corner snap-freeze-resume.
+	{
+		c := mk_probe_clip()
+		begin_handle_drag(&c, canvas, .BL, 0, PH, false)
+		update_handle_drag(&c, canvas, 2, PH - 2, false) // snap flush BL
+		update_handle_drag(&c, canvas, -400, PH + 400, false) // freeze beyond
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(l - 0) <= 0.25 && abs(b - PH) <= 0.25, "bl freeze: driven corner stays flush while beyond", l, r, t, b)
+		update_handle_drag(&c, canvas, 400, PH - 300, false) // deep inside
+		l, r, t, b = probe_visible_edges(&c)
+		check(&fail, abs(l - 0) > 50 && abs(b - PH) > 50, "bl resume: box must detach once the pointer is inside", l, r, t, b)
+	}
+
+	// --- Case 22: freeze requires the pointer DIAGONALLY beyond the corner
+	// (both axes). Once one axis returns inside the canvas the box must detach
+	// immediately -- single-axis-beyond behaves like an edge drag -- so a sweep
+	// along the bottom/top edge plane never leaves the handle stuck. Only the
+	// diagonal overflow freezes.
+	{
+		c := mk_probe_clip()
+		begin_handle_drag(&c, canvas, .BR, PW, PH, false)
+		update_handle_drag(&c, canvas, PW - 2, PH - 2, false) // snap flush BR
+		update_handle_drag(&c, canvas, PW + 400, PH + 400, false) // diagonal beyond -> held
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(r - PW) <= 0.25 && abs(b - PH) <= 0.25, "br diagonal: beyond on both axes holds the flush box", l, r, t, b)
+		update_handle_drag(&c, canvas, PW - 400, PH + 400, false) // x back inside, y still beyond
+		l, r, t, b = probe_visible_edges(&c)
+		check(&fail, abs(r - PW) > 50, "br single-axis: box detaches as soon as one axis returns inside", l, r, t, b)
+		check(&fail, abs(b - PH) > 50, "br single-axis: driven corner follows the pointer again", l, r, t, b)
 	}
 
 	if !fail {

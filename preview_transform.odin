@@ -495,14 +495,16 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: Handle,
 // handle_drag_frozen reports whether a corner-handle drag must hold its box
 // instead of resizing. Once the driven corner has snapped flush onto a canvas
 // corner during this drag (handle_corner_snapped latched), moving the cursor
-// BEYOND that corner would keep rescaling the box about the pinned opposite
-// corner -- the "resizing on the other corner" overflow, the corner-handle
-// version of the old edge bug. The box freezes at its snapped geometry while
-// the pointer sits beyond the corner (past the snap margin on either axis) and
-// resumes once it crosses back inside. A box that merely STARTS flush must
-// still scale outward from its corner, so the freeze only engages after a real
-// snap. Edge handles deliberately do NOT freeze: scaling an edge past its
-// border is intended.
+// DIAGONALLY beyond that corner (past the snap margin on BOTH axes) would keep
+// rescaling the box about the pinned opposite corner -- the "resizing on the
+// other corner" overflow, the corner-handle version of the old edge bug. The
+// box freezes at its snapped geometry while the pointer sits diagonally beyond
+// the corner and resumes as soon as it crosses back inside the canvas on
+// either axis. Beyond on ONE axis alone must NOT freeze: that is just an edge
+// drag (like an edge handle scaling past its border, which is intended). A box
+// that merely STARTS flush must still scale outward from its corner, so the
+// freeze only engages after a real snap. Edge handles deliberately do NOT
+// freeze: scaling an edge past its border is intended.
 handle_drag_frozen :: proc(clip: ^Clip, handle: Handle, pmx, pmy, margin: f32) -> bool {
 	if clip == nil {
 		return false
@@ -515,13 +517,13 @@ handle_drag_frozen :: proc(clip: ^Clip, handle: Handle, pmx, pmy, margin: f32) -
 	l, r, t, b := clip_visible_box_project(clip)
 	switch handle {
 	case .TL: // TL driven corner flush at canvas (0,0)
-		return abs(l) <= margin && abs(t) <= margin && (pmx < -margin || pmy < -margin)
+		return abs(l) <= margin && abs(t) <= margin && (pmx < -margin && pmy < -margin)
 	case .TR: // TR flush at (PW,0)
-		return abs(r - PW) <= margin && abs(t) <= margin && (pmx > PW + margin || pmy < -margin)
+		return abs(r - PW) <= margin && abs(t) <= margin && (pmx > PW + margin && pmy < -margin)
 	case .BR: // BR flush at (PW,PH)
-		return abs(r - PW) <= margin && abs(b - PH) <= margin && (pmx > PW + margin || pmy > PH + margin)
+		return abs(r - PW) <= margin && abs(b - PH) <= margin && (pmx > PW + margin && pmy > PH + margin)
 	case .BL: // BL flush at (0,PH)
-		return abs(l) <= margin && abs(b - PH) <= margin && (pmx < -margin || pmy > PH + margin)
+		return abs(l) <= margin && abs(b - PH) <= margin && (pmx < -margin && pmy > PH + margin)
 	case .T, .B, .L, .R:
 		return false
 	}
