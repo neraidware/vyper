@@ -75,7 +75,12 @@ proxy_cache_prefix :: proc(buf: []u8) -> (int, bool) {
 	copy(buf[len(home):n], rel)
 	buf[n] = 0
 	if !proxy_cache_ready {
-		if err := os.make_directory_all(string(cstring(&buf[0]))); err == os.General_Error.None {
+		// make_directory_all returns .Exist when the dir already exists (a plain
+		// idempotent success for our purpose), so treat it as ready -- otherwise
+		// the cache dir ever existing beforehand disables proxying for the whole
+		// session until the dir is removed.
+		if err := os.make_directory_all(string(cstring(&buf[0])));
+		   err == os.General_Error.None || err == os.General_Error.Exist {
 			proxy_cache_ready = true
 		} else {
 			return 0, false
@@ -223,6 +228,15 @@ proxy_transcode :: proc(
 		return proxy
 	}
 	if async_import_mode {
+		// A complete segmented proxy from a previous session is a cache hit:
+		// re-importing the same file must not re-encode it (proxy_valid_cache_hit
+		// above checks the legacy WHOLE file, which the segmented builder never
+		// writes, so a finished segmented proxy would otherwise be rebuilt every
+		// launch -- meanwhile the preview decodes full-res source until the
+		// rebuild head catches up, e.g. a 41s clip at 60fps ~ 30s of lag).
+		if proxy_segments_complete(src, src_frames) {
+			return nil
+		}
 		// Defer the encode to the worker: import returns immediately and the
 		// clip previews from the ORIGINAL until the opening segment lands.
 		// proxy_pick_for_frame refuses to latch a half-written artifact while
@@ -453,6 +467,41 @@ proxy_idx_load :: proc(src: cstring, idx: ^Proxy_Idx) -> bool {
 	return true
 }
 
+// proxy_segments_complete reports whether a source's segmented proxy already
+// covers the whole source on disk: the index lists every expected segment with
+// a sufficient frame count, and each listed segment file actually exists.
+// import_media_to_bin consults this BEFORE enqueuing a background rebuild, so
+// a fresh session that re-imports the same file as a previous one does not
+// re-encode the whole proxy and thereby push the preview back to full-res
+// source decode (lag) for the entire build. This is the segmented analog of
+// proxy_valid_cache_hit's whole-file check: completion, not "any segment
+// exists".
+proxy_segments_complete :: proc(src: cstring, src_frames: i64) -> bool {
+	idx: Proxy_Idx
+	if !proxy_idx_load(src, &idx) {
+		return false
+	}
+	defer delete(idx.segs)
+	if idx.seg_frames != PROXY_SEG_FRAMES {
+		return false
+	}
+	// Enough segments must be LISTED to cover the source (with the same
+	// tolerance the whole-file path allows), and each must be present on disk.
+	built: i64
+	for k in 0 ..< len(idx.segs) {
+		if idx.segs[k] <= 0 {
+			continue
+		}
+		seg_buf: [4096]u8
+		seg, ok := proxy_segment_path_for(src, k, seg_buf[:])
+		if !ok || !os.exists(string(seg)) {
+			return false
+		}
+		built += idx.segs[k]
+	}
+	return built >= src_frames - PROXY_FRAME_TOLERANCE
+}
+
 // proxy_idx_store writes `idx` for a source (called by the background builder
 // after each completed segment, on its worker thread -- the single writer).
 proxy_idx_store :: proc(src: cstring, idx: ^Proxy_Idx) {
@@ -532,7 +581,11 @@ proxy_pick_for_frame :: proc(
 	k := proxy_seg_for_frame(frame)
 
 	rc := &proxy_resolver_cache
-	same_src := string(rc.src[:]) == string(src)
+	// rc.src is a NUL-terminated [4096]u8; string([:]) keeps the full 4096-byte
+	// length, so it can never equal a strlen'd cstring and the cache would reset
+	// EVERY call (per-frame .idx re-read + stat thrash). Re-derive length via the
+	// NUL so the comparison is real.
+	same_src := string(cstring(&rc.src[0])) == string(src)
 	if !same_src {
 		if rc.idx_valid {
 			delete(rc.idx.segs)
@@ -675,7 +728,8 @@ proxy_cleanup_artifacts :: proc(src: cstring) {
 	}
 	// Drop cache references so a re-import of the same path re-derives state.
 	rc := &proxy_resolver_cache
-	if string(rc.src[:]) == string(src) {
+	// Same NUL-terminated compare as proxy_pick_for_frame; rc.src is a [4096]u8.
+	if string(cstring(&rc.src[0])) == string(src) {
 		if rc.idx_valid {
 			delete(rc.idx.segs)
 		}

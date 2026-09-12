@@ -115,6 +115,101 @@ proxy_probe_run :: proc(v: string) {
 
 // ---------------------------------------------------------------------------
 // VYPER_PROXY_BG_TEST="<file>[|<cancel_pct>]": exercise the BACKGROUND proxy
+// proxy_bg_verify_complete asserts that a source's segments on disk fully cover
+// the source AND decode frame 0 + the last reachable frame with content that
+// matches the source (same lossy tolerance as proxy_probe_run). Used by the
+// background-proxy probe for both outcomes that leave a complete proxy behind:
+// a finished build, and an at-import cache hit (segments already on disk from a
+// prior session, so no build was ever enqueued).
+// ---------------------------------------------------------------------------
+proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bool, ok_label: string) {
+	// The head and tail frames must both resolve to a built segment (a
+	// fully-built background proxy is the complete segment set -- there is no
+	// whole-file artifact to check).
+	pbuf0: [4096]u8
+	pfirst, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf0[:])
+	plast_buf: [4096]u8
+	plast, _ := proxy_pick_for_frame(path, frame_count, frame_count - 1, plast_buf[:])
+	if pfirst == nil || plast == nil {
+		fmt.println("[proxy-bg-test] FAIL: complete but frames not covered by segments")
+		os.exit(1)
+	}
+	idx: Proxy_Idx
+	if !proxy_idx_load(path, &idx) {
+		fmt.println("[proxy-bg-test] FAIL: complete but no usable .idx")
+		os.exit(1)
+	}
+	total: i64
+	for c in idx.segs {
+		total += c
+	}
+	if total < frame_count - PROXY_FRAME_TOLERANCE {
+		fmt.printf("[proxy-bg-test] FAIL: segment frames %d < source %d\n", total, frame_count)
+		os.exit(1)
+	}
+	// Light content check through the segments: decode frame 0 and the last
+	// reachable frame via their picked files and compare to the source (lossy,
+	// so tolerate per-channel error). The last reachable frame is frame_count-3,
+	// not -1: the duration*fps estimate overshoots the real end-of-stream on
+	// exact-duration synthetic media (see proxy_probe_run's scrub test), so the
+	// tail frames do not reliably decode as ground truth.
+	check_frames := []i64{0, frame_count - 3}
+	check_fbuf: [4096]u8
+	for f, i in check_frames {
+		pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:])
+		if pick == nil {
+			fmt.printf("[proxy-bg-test] FAIL: frame %d unresolved\n", f)
+			os.exit(1)
+		}
+		gt, px: Clip_Decoder
+		defer clip_decoder_reset(&gt)
+		defer clip_decoder_reset(&px)
+		if !decode_clip_frame_sync(&gt, path, f, gts[i][:]) {
+			fmt.printf("[proxy-bg-test] FAIL: source decode frame %d\n", f)
+			os.exit(1)
+		}
+		decoder_set_preview(&px, pick, pick_base)
+		if !decode_clip_frame_sync(&px, path, f, pxs[i][:]) {
+			fmt.printf("[proxy-bg-test] FAIL: segment decode frame %d via %q\n", f, string(pick))
+			os.exit(1)
+		}
+		mean_abs, _ := buffer_diff_metrics(gts[i][:], pxs[i][:])
+		if buffer_mean(gts[i][:]) < 1.0 || mean_abs > 40.0 {
+			fmt.printf("[proxy-bg-test] FAIL: frame %d proxy content mismatch (mean_abs=%.1f)\n", f, mean_abs)
+			os.exit(1)
+		}
+	}
+	delete(idx.segs)
+	if keep_cache {
+		// A complete segmented proxy is a cache hit for a re-import: a second
+		// proxy_transcode must short-circuit WITHOUT enqueuing a rebuild
+		// (mirrors the live flow: re-opening the same file must not re-encode
+		// the proxy the previous session already built).
+		if !proxy_segments_complete(path, frame_count) {
+			fmt.println("[proxy-bg-test] FAIL: complete proxy not recognized as a cache hit")
+			os.exit(1)
+		}
+		xbuf: [4096]u8
+		xp := proxy_transcode(path, frame_count, 0, 0, 1, xbuf[:])
+		if import_bg_active() {
+			fmt.println("[proxy-bg-test] FAIL: re-import enqueued a rebuild over a complete proxy")
+			os.exit(1)
+		}
+		if xp != nil {
+			fmt.printf("[proxy-bg-test] re-import: proxy cache hit %q (no rebuild)\n", string(xp))
+		} else {
+			fmt.println("[proxy-bg-test] re-import: no rebuild enqueued (segments served live)")
+		}
+		fmt.printf("[proxy-bg-test] OK: %s (cache kept)\n", ok_label)
+	} else {
+		proxy_cleanup_artifacts(path)
+		fmt.printf("[proxy-bg-test] OK: %s\n", ok_label)
+	}
+	os.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// VYPER_PROXY_BG_TEST="<file>[|<cancel_pct>]": exercise the BACKGROUND proxy
 // builder (import_bg.odin) without a window.
 //
 // Imports `file` with async_import_mode=true like the live editor, then polls
@@ -152,6 +247,11 @@ proxy_bg_probe_run :: proc(v: string) {
 	inp[n] = 0
 	path := cstring(&inp[0])
 
+	// With NERED_PROXY_BG_KEEP=1 the probe leaves the built segments + .idx in
+	// place (default: proxy_cleanup_artifacts like the other probes), so an
+	// out-of-band second run can verify the rebuild skip.
+	keep_cache := os.get_env_alloc("NERED_PROXY_BG_KEEP", context.temp_allocator) == "1"
+
 	// Full import: bin + timeline, mirroring the GUI's Open File flow. The
 	// proxy build must NOT block this call.
 	import_media(path)
@@ -165,6 +265,17 @@ proxy_bg_probe_run :: proc(v: string) {
 	for {
 		active, frac, phase, src := import_bg_status()
 		now := sdl.GetTicksNS()
+
+		// A proxy already complete at import (a prior session's build, cache
+		// kept) short-circuits: proxy_transcode never enqueued a rebuild, so
+		// there is nothing to wait for. Verify the artifacts directly.
+		if !active && phase == .Idle && !cancel_sent && cancel_pct < 0 && proxy_segments_complete(path, frame_count) {
+			if nered_trace {
+				fmt.printf("[proxy-bg-test] proxy already complete at import; no build needed\n")
+			}
+			proxy_bg_verify_complete(path, frame_count, keep_cache, "proxy already complete (no rebuild)")
+			os.exit(0)
+		}
 
 		pct := int(frac * 100)
 		if frac >= 0 && pct != reported && now - last_report > 200_000_000 {
@@ -184,61 +295,7 @@ proxy_bg_probe_run :: proc(v: string) {
 			if vyper_trace {
 				fmt.printf("[proxy-bg-test] worker finished, verifying on-disk artifacts\n")
 			}
-			// The head and tail frames must both resolve to a built segment (a
-			// fully-built background proxy is the complete segment set -- there
-			// is no whole-file artifact to check).
-			pfirst, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf0[:])
-			plast_buf: [4096]u8
-			plast, _ := proxy_pick_for_frame(path, frame_count, frame_count - 1, plast_buf[:])
-			if pfirst == nil || plast == nil {
-				fmt.println("[proxy-bg-test] FAIL: Done_Ok but frames not covered by segments")
-				os.exit(1)
-			}
-			idx: Proxy_Idx
-			if !proxy_idx_load(path, &idx) {
-				fmt.println("[proxy-bg-test] FAIL: Done_Ok but no usable .idx")
-				os.exit(1)
-			}
-			total: i64
-			for c in idx.segs {
-				total += c
-			}
-			if total < frame_count - PROXY_FRAME_TOLERANCE {
-				fmt.printf("[proxy-bg-test] FAIL: segment frames %d < source %d\n", total, frame_count)
-				os.exit(1)
-			}
-			// Light content check through the segments: decode frame 0 and the
-			// last covered frame via their picked files and compare to the
-			// source (lossy, so tolerate per-channel error).
-			check_frames := []i64{0, frame_count - 1}
-			check_fbuf: [4096]u8
-			for f, i in check_frames {
-				pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:])
-				if pick == nil {
-					fmt.printf("[proxy-bg-test] FAIL: frame %d unresolved\n", f)
-					os.exit(1)
-				}
-				gt, px: Clip_Decoder
-				defer clip_decoder_reset(&gt)
-				defer clip_decoder_reset(&px)
-				if !decode_clip_frame_sync(&gt, path, f, gts[i][:]) {
-					fmt.printf("[proxy-bg-test] FAIL: source decode frame %d\n", f)
-					os.exit(1)
-				}
-				decoder_set_preview(&px, pick, pick_base)
-				if !decode_clip_frame_sync(&px, path, f, pxs[i][:]) {
-					fmt.printf("[proxy-bg-test] FAIL: segment decode frame %d via %q\n", f, string(pick))
-					os.exit(1)
-				}
-				mean_abs, _ := buffer_diff_metrics(gts[i][:], pxs[i][:])
-				if buffer_mean(gts[i][:]) < 1.0 || mean_abs > 40.0 {
-					fmt.printf("[proxy-bg-test] FAIL: frame %d proxy content mismatch (mean_abs=%.1f)\n", f, mean_abs)
-					os.exit(1)
-				}
-			}
-			delete(idx.segs)
-			proxy_cleanup_artifacts(path)
-			fmt.println("[proxy-bg-test] OK: async segmented proxy built and verified")
+			proxy_bg_verify_complete(path, frame_count, keep_cache, "async segmented proxy built and verified")
 			os.exit(0)
 
 		case .Done_Cancelled:
@@ -270,9 +327,22 @@ proxy_bg_probe_run :: proc(v: string) {
 				fmt.printf("[proxy-bg-test] FAIL: segment %d left in inconsistent state after cancel\n", badk)
 				os.exit(1)
 			}
+			if keep_cache {
+				// Kept for an out-of-band follow-up run: the completed head
+				// segments must be reused by the next build, not re-encoded.
+				built: i64 = 0
+				if has_idx && len(idx2.segs) > 0 {
+					for c in idx2.segs {
+						built += c
+					}
+					fmt.printf("[proxy-bg-test] kept %d completed frames across %d segments\n", built, len(idx2.segs))
+				}
+				fmt.println("[proxy-bg-test] OK: cancelled, segments kept for reuse (cache kept)")
+			} else {
+				fmt.println("[proxy-bg-test] OK: cancelled, kept segments consistent")
+				proxy_cleanup_artifacts(path)
+			}
 			delete(idx2.segs)
-			proxy_cleanup_artifacts(path)
-			fmt.println("[proxy-bg-test] OK: cancelled, kept segments consistent")
 			os.exit(0)
 
 		case .Done_Fail:

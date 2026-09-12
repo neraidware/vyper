@@ -331,6 +331,31 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			}
 		}
 
+		// A completed segment already on disk (a prior session's build, or a
+		// cancelled rebuild that kept the head) is reused as-is rather than
+		// re-encoded: the rebuild then only fills the missing tail, and the
+		// preview never falls back to full-res source decode for footage the
+		// proxy head already covers. Verified by frame count like the fresh
+		// encode (a stale/truncated file fails and is re-encoded).
+		if os.exists(string(seg)) {
+			have := proxy_probe_frame_count(seg)
+			tol: i64
+			if k == seg_total - 1 {
+				tol = PROXY_FRAME_TOLERANCE
+			}
+			if have >= seg_want - tol {
+				for len(idx.segs) <= k {
+					append(&idx.segs, 0)
+				}
+				idx.segs[k] = have
+				completed_frames += have
+				if nered_trace {
+					fmt.printf("[bg] segment %d/%d reused: %d frames\n", k + 1, seg_total, have)
+				}
+				continue
+			}
+		}
+
 		t0_str := fmt.aprintf("%.3f", t0_sec)
 		want_str := fmt.aprintf("%d", seg_want)
 		argv := []string{
