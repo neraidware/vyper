@@ -268,6 +268,104 @@ corner_snap_both :: proc(
 	return 0, 0, false
 }
 
+// corner_snap_scale snaps the box so the driven corner lands flush on the
+// canvas corner with an EXACT scale, not a rigid translate. corner_snap_both
+// nudges the transform by the residual gap, which leaves the scale pointer-
+// ballistic and shifts the pinned opposite corner on BOTH axes. This solves the
+// scale about the pinned corner so the driven edge lands exactly on its flush
+// target along the DOMINANT axis (the driven edge farther from flush), then
+// closes only the perpendicular residual with a bounded translate (≤ margin).
+// For an aspect-matched box the perpendicular residual is ~0, so the snap is
+// perfectly scale-exact about a stationary pinned corner. All geometry (box
+// edges in project units) is computed the same way as snap_driven_handle.
+corner_snap_scale :: proc(
+	clip: ^Clip,
+	handle: int,
+	s, tx, ty, l, r, t, b, margin, pw, ph: f32,
+) -> (s_out, tx_out, ty_out: f32, snapped: bool) {
+	s_out = s
+	tx_out = tx
+	ty_out = ty
+	dx, dy, txg, tyg, px, py: f32
+	switch handle {
+	case 0: // TL driven corner -> canvas (0,0), pinned BR
+		dx, dy, txg, tyg, px, py = l, t, 0.0, 0.0, r, b
+	case 2: // TR -> canvas (pw,0), pinned BL
+		dx, dy, txg, tyg, px, py = r, t, pw, 0.0, l, b
+	case 4: // BR -> canvas (pw,ph), pinned TL
+		dx, dy, txg, tyg, px, py = r, b, pw, ph, l, t
+	case 6: // BL -> canvas (0,ph), pinned TR
+		dx, dy, txg, tyg, px, py = l, b, 0.0, ph, r, t
+	}
+	gx := abs(dx - txg)
+	gy := abs(dy - tyg)
+	if gx > margin || gy > margin {
+		return
+	}
+	// Scale about the pinned corner to land the driven edge on its flush
+	// target: new = pinned + (driven - pinned) * k, so k = (target - pinned) /
+	// (driven - pinned) per axis. An aspect-locked box can only land one edge
+	// exactly, so the axis whose driven edge is farther from flush wins.
+	kx := (txg - px) / (dx - px)
+	ky := (tyg - py) / (dy - py)
+	k := kx
+	if gy > gx {
+		k = ky
+	}
+	s_out = s * k
+	// Reanchor the transform on the pinned corner at the new scale.
+	cw2, ch2 := clip_full_box_dims(clip, pw * s_out, ph * s_out)
+	dl2 := (0.5 - clip.crop_l) * cw2
+	dr2 := (0.5 - clip.crop_r) * cw2
+	dt2 := (0.5 - clip.crop_t) * ch2
+	db2 := (0.5 - clip.crop_b) * ch2
+	switch handle {
+	case 0:
+		tx_out = r - dr2
+		ty_out = b - db2
+	case 2:
+		tx_out = l + dl2
+		ty_out = b - db2
+	case 4:
+		tx_out = l + dl2
+		ty_out = t + dt2
+	case 6:
+		tx_out = r - dr2
+		ty_out = t + dt2
+	}
+	// Close only the perpendicular residual (bounded by the margin) so the
+	// corner sits flush on both edges; the pinned corner rides at most that
+	// single-axis residual. The scaled (dominant) axis keeps its exact flush.
+	l2 := tx_out - dl2
+	t2 := ty_out - dt2
+	resx: f32
+	resy: f32
+	switch handle {
+	case 0:
+		resx = -l2
+		resy = -t2
+	case 2:
+		resx = pw - (tx_out + dr2)
+		resy = -t2
+	case 4:
+		resx = pw - (tx_out + dr2)
+		resy = ph - (ty_out + db2)
+	case 6:
+		resx = -l2
+		resy = ph - (ty_out + db2)
+	}
+	if gx > gy {
+		if abs(resy) <= margin {
+			ty_out += resy
+		}
+	} else {
+		if abs(resx) <= margin {
+			tx_out += resx
+		}
+	}
+	return s_out, tx_out, ty_out, abs(gx) <= margin && abs(gy) <= margin
+}
+
 // clip_image_bounds returns the pixel-space rect the clip occupies in the
 // preview: the crop-adjusted (visible) box. Crop insets are normalized
 // fractions (0..1) of the scale box, so the visible box is the scale box
@@ -350,6 +448,7 @@ preview_handle_at :: proc(b: clay.BoundingBox, mx, my: f32) -> int {
 begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx, my: f32, crop: bool) {
 	dragging_handle = handle
 	handle_kind = crop ? .Crop : .Scale
+	handle_corner_snapped = false
 	handle_start_mx = mx
 	handle_start_my = my
 	handle_start_scale = clip.scale
@@ -365,6 +464,40 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: int, mx
 	ib := clip_image_bounds(canvas, clip)
 	handle_start_box_w = ib.width
 	handle_start_box_h = ib.height
+}
+
+// handle_drag_frozen reports whether a corner-handle drag must hold its box
+// instead of resizing. Once the driven corner has snapped flush onto a canvas
+// corner during this drag (handle_corner_snapped latched), moving the cursor
+// BEYOND that corner would keep rescaling the box about the pinned opposite
+// corner -- the "resizing on the other corner" overflow, the corner-handle
+// version of the old edge bug. The box freezes at its snapped geometry while
+// the pointer sits beyond the corner (past the snap margin on either axis) and
+// resumes once it crosses back inside. A box that merely STARTS flush must
+// still scale outward from its corner, so the freeze only engages after a real
+// snap. Edge handles deliberately do NOT freeze: scaling an edge past its
+// border is intended.
+handle_drag_frozen :: proc(clip: ^Clip, pmx, pmy, margin: f32) -> bool {
+	if clip == nil {
+		return false
+	}
+	if !handle_corner_snapped {
+		return false
+	}
+	PW := f32(project.width)
+	PH := f32(project.height)
+	l, r, t, b := clip_visible_box_project(clip)
+	switch dragging_handle {
+	case 0: // TL driven corner flush at canvas (0,0)
+		return abs(l) <= margin && abs(t) <= margin && (pmx < -margin || pmy < -margin)
+	case 2: // TR flush at (PW,0)
+		return abs(r - PW) <= margin && abs(t) <= margin && (pmx > PW + margin || pmy < -margin)
+	case 4: // BR flush at (PW,PH)
+		return abs(r - PW) <= margin && abs(b - PH) <= margin && (pmx > PW + margin || pmy > PH + margin)
+	case 6: // BL flush at (0,PH)
+		return abs(l) <= margin && abs(b - PH) <= margin && (pmx < -margin || pmy > PH + margin)
+	}
+	return false
 }
 
 // clip_visible_box_project returns the clip's current visible (crop-adjusted)
@@ -393,10 +526,12 @@ clip_visible_box_project :: proc(clip: ^Clip) -> (l, r, t, b: f32) {
 //   • edge handles: nudge the SCALE so the driven edge lands exactly on its
 //     border about the pinned edge, then recompute the transform that keeps the
 //     pinned edge fixed (the scale change would otherwise shift it).
-//   • corner (diagonal) handles: both driven edges must land flush on the
-//     canvas corner at once, which aspect-locked scaling about the pinned
-//     opposite corner cannot satisfy exactly -- so a small rigid translate
-//     closes the gap (bounded by the margin per axis).
+//   • corner (diagonal) handles: scale about the pinned opposite corner so the
+//     driven corner lands exactly flush on the canvas corner along the
+//     dominant axis (corner_snap_scale), with only a bounded perpendicular
+//     translate (≤ margin) closing the residual an aspect-locked box can't
+//     reach by scaling alone. The center-pivot (Shift) case keeps a rigid
+//     corner_snap_both translate since it has no single pinned corner.
 // The pivot math differs between a pinned-above and a center pivot; `from_center`
 // switches to a center-stable scale correction for the Shift+drag case.
 snap_driven_handle :: proc(
@@ -496,10 +631,20 @@ snap_driven_handle :: proc(
 			tx_out = l + dl
 		}
 	case 0, 2, 4, 6:
-		dtx, dty, ok := corner_snap_both(handle, l, r, t, b, margin, PW, PH)
-		if ok {
-			tx_out = tx + dtx
-			ty_out = ty + dty
+		if from_center {
+			dtx, dty, ok := corner_snap_both(handle, l, r, t, b, margin, PW, PH)
+			if ok {
+				tx_out = tx + dtx
+				ty_out = ty + dty
+			}
+		} else {
+			ss, tsx, tsy, ok := corner_snap_scale(clip, handle, s, tx, ty, l, r, t, b, margin, PW, PH)
+			if ok {
+				s_out = ss
+				tx_out = tsx
+				ty_out = tsy
+				handle_corner_snapped = true
+			}
 		}
 	}
 	clip.scale = s_out
@@ -553,6 +698,9 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		top0 := ty0
 		bottom0 := ty0 + bh0 * scale0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+		if handle_drag_frozen(clip, pmx, pmy, snap_margin(canvas, 5)) {
+			return
+		}
 
 		if from_center {
 			cpx := left0 + bw0 * scale0 / 2
@@ -709,6 +857,13 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		w0 := (1 - cl - cr) * cw0
 		h0 := (1 - ct - cb) * ch0
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
+		// Corner (diagonal) handles hold their snapped geometry while the
+		// pointer sits beyond the flushed canvas corner; edge handles keep
+		// scaling past their borders by design. Without this gate an outward
+		// drag after a corner snap resizes the box from its opposite corner.
+		if handle_drag_frozen(clip, pmx, pmy, snap_margin(canvas, 5)) {
+			return
+		}
 
 		if from_center {
 			// Shift held: pivot about the visible box center — both edges move,

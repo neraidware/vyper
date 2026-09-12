@@ -8,7 +8,10 @@ package main
 //     the drag, and not from a snap;
 //   • only the ACTIVE handle snaps: an edge handle snaps its single driven edge
 //     onto the canvas border (by adjusting scale, so the pinned edge stays
-//     put); a corner snaps BOTH driven edges flush on the canvas corner.
+//     put); a corner snaps with an EXACT scale about the pinned corner so the
+//     driven corner lands flush on the canvas corner, then FREEZES while the
+//     pointer sits beyond that corner (it does not keep resizing from the
+//     opposite corner) and resumes once the pointer crosses back inside.
 //
 // Each case builds a full-canvas box, grabs the handle ON its border, then
 // asserts the pointer/border behavior. pixel<->project is identity here.
@@ -225,10 +228,57 @@ transform_probe_run :: proc(v: string) {
 		update_handle_drag(&c, canvas, -2, -2, false) // both driven edges within snap margin
 		l, r, t, b := probe_visible_edges(&c)
 		check(&fail, abs(l - 0) <= 0.25 && abs(t - 0) <= 0.25, "tl corner: both driven edges must snap flush on the canvas corner", l, r, t, b)
-		// The flush is closed by a small rigid translate of the box (aspect-locked
-		// scaling alone can't land both edges at once), so the pinned corner rides
-		// along by at most the snap margin -- it is NOT snapped to anything.
-		check(&fail, abs(r - PW) <= 6 && abs(b - PH) <= 6, "tl corner: pinned BR only rides the corner flush (bounded translate)", l, r, t, b)
+		// The flush is now scale-exact about the pinned corner (aspect-matched
+		// box), so the pinned BR does NOT ride along: it stays put.
+		check(&fail, abs(r - PW) <= 0.5 && abs(b - PH) <= 0.5, "tl corner: pinned BR must not move on a scale-exact snap", l, r, t, b)
+	}
+
+	// --- Case 16: TL corner snapped flush, pointer pushed BEYOND the corner:
+	// the box FREEZES at its snapped geometry instead of resizing from the
+	// opposite (pinned) corner.
+	{
+		c := mk_probe_clip()
+		l0, r0, t0, _ := probe_visible_edges(&c)
+		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		update_handle_drag(&c, canvas, -2, -2, false) // snap flush on (0,0)
+		s_snapped := c.scale
+		_, r_snapped, _, b_snapped := probe_visible_edges(&c)
+		update_handle_drag(&c, canvas, -400, -400, false) // well beyond the corner
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(l - 0) <= 0.25 && abs(t - 0) <= 0.25, "tl freeze: driven corner must stay flush while the pointer is beyond it", l, r, t, b)
+		check(&fail, abs(r - r_snapped) <= 0.5 && abs(b - b_snapped) <= 0.5, "tl freeze: pinned corner must not move while frozen", l, r, t, b)
+		check(&fail, abs(c.scale - s_snapped) <= 0.01, "tl freeze: scale must hold while frozen", l, r, t, b)
+	}
+
+	// --- Case 17: TL corner frozen, pointer crosses back inside the margin:
+	// resize resumes (the box re-detaches and the driven corner tracks again).
+	{
+		c := mk_probe_clip()
+		l0, r0, t0, _ := probe_visible_edges(&c)
+		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		update_handle_drag(&c, canvas, -2, -2, false) // snap flush
+		update_handle_drag(&c, canvas, -200, -200, false) // freeze
+		update_handle_drag(&c, canvas, -2, -2, false) // back inside the snap margin
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(l - 0) <= 0.25 && abs(t - 0) <= 0.25, "tl resume: corner re-snaps flush once the pointer is inside again", l, r, t, b)
+		update_handle_drag(&c, canvas, PW / 2, PH / 2, false) // well inside the canvas
+		l, r, t, b = probe_visible_edges(&c)
+		check(&fail, abs(l - PW/2) <= 0.5 && abs(t - PH/2) <= 0.5, "tl resume: driven corner tracks the pointer again after un-freeze", l, r, t, b)
+	}
+
+	// --- Case 18: TL corner snap is scale-exact: a full-canvas 16:9 box dragged
+	// to (-2,-2) must end at EXACTLY canvas size (scale 1.0), corner flush on
+	// (0,0), pinned BR unmoved. (The old rigid-translate snap left the scale
+	// ballistic and shifted BR out of the canvas.)
+	{
+		c := mk_probe_clip()
+		l0, r0, t0, _ := probe_visible_edges(&c)
+		begin_handle_drag(&c, canvas, 0, l0, t0, false)
+		update_handle_drag(&c, canvas, -2, -2, false)
+		l, r, t, b := probe_visible_edges(&c)
+		check(&fail, abs(c.scale - 1.0) <= 0.01, "tl corner: snapped scale must be the exact flush scale (1.0)", l, r, t, b)
+		check(&fail, abs(l - 0) <= 0.25 && abs(t - 0) <= 0.25, "tl corner: corner flush", l, r, t, b)
+		check(&fail, abs(r - PW) <= 0.5 && abs(b - PH) <= 0.5, "tl corner: pinned BR exactly on its corner", l, r, t, b)
 	}
 
 	if !fail {

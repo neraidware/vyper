@@ -652,6 +652,12 @@ handle_start_center_x: f32
 handle_start_center_y: f32
 handle_start_tx: f32
 handle_start_ty: f32
+// handle_corner_snapped latches when a corner (diagonal) handle has actually
+// snapped flush onto a canvas corner during THIS drag. The freeze gate
+// (handle_drag_frozen) only engages after a snap has happened, so a box that
+// merely STARTS flush (e.g. a full-canvas clip whose corner sits on the canvas
+// corner) can still be dragged outward to scale freely.
+handle_corner_snapped: bool
 
 Timeline_Frame :: struct {
 	active_clip: ^Clip,

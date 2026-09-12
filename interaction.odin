@@ -481,6 +481,7 @@ interaction_post_build :: proc(
 		active_interaction = .None
 		dragging_handle = -1
 		handle_kind = .None
+		handle_corner_snapped = false
 		drag_clip = nil
 		drag_source_track = -1
 		drag_source_index = -1
