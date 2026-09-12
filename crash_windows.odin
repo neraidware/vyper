@@ -14,11 +14,11 @@ import sws "vendor/ffmpeg/swscale"
 // Windows crash handler.
 //
 // Installs a SetUnhandledExceptionFilter so an unhandled crash writes
-// nered_crash.log next to the exe with the exception code and faulting
+// vyper_crash.log next to the exe with the exception code and faulting
 // address. A crash report of just "it closed" becomes concrete exceptions
 // (e.g. 0xC0000005 access violation, 0xC00000FD stack overflow). Without a
 // PDB / full minidump this can't walk the stack, but code+address is what
-// separates a bug in nered from a fault inside a loaded DLL.
+// separates a bug in vyper from a fault inside a loaded DLL.
 //
 // The handler itself uses only raw Win32 (CreateFileW/WriteFile) and a stack
 // buffer for formatting: no Odin heap allocator, so it stays safe even when
@@ -74,7 +74,7 @@ crash_log_write :: proc "system" (code: u32, addr: uintptr) {
 	buf: [256]u8
 	pos := 0
 
-	crash_log_put_cstr(buf[:], &pos, "nered crash\nexception_code=0x")
+	crash_log_put_cstr(buf[:], &pos, "vyper crash\nexception_code=0x")
 	crash_log_put_hex(buf[:], &pos, u64(code), 8)
 	crash_log_put_cstr(buf[:], &pos, "\nfault_address=0x")
 	crash_log_put_hex(buf[:], &pos, u64(addr), 16)
@@ -109,7 +109,7 @@ crash_filter :: proc "system" (ep: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 
 crash_handler_install :: proc() {
 	if !crash_handler_installed {
-		w := win32.utf8_to_utf16_buf(crash_log_name[:], "nered_crash.log")
+		w := win32.utf8_to_utf16_buf(crash_log_name[:], "vyper_crash.log")
 		if w != nil {crash_log_name[len(w)] = 0}
 		win32.SetUnhandledExceptionFilter(crash_filter)
 		crash_handler_installed = true

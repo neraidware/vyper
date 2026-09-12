@@ -1,5 +1,5 @@
 {
-  description = "nered live clip editor";
+  description = "vyper live clip editor";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -22,7 +22,7 @@
 
       packages = forAllSystems (pkgs: {
         default = pkgs.stdenv.mkDerivation {
-          pname = "nered";
+          pname = "vyper";
           version = "0.1.0";
           src = ./.;
           nativeBuildInputs = [ pkgs.odin pkgs.glslang pkgs.makeWrapper pkgs.llvmPackages.clang ];
@@ -46,7 +46,7 @@
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
             ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
-            odin build . -out:nered \
+            odin build . -out:vyper \
               -microarch:native -o:aggressive -no-bounds-check \
               -strict-style -vet-using-param -vet-using-stmt \
               -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
@@ -55,27 +55,27 @@
           # ffmpeg libs and shells out to ffmpeg for proxy transcode, so it
           # can't be run from a bare result/ dir. Keep the real binary under
           # libexec, wrap it with the needed runtime lib path + ffmpeg on
-          # PATH, and expose the wrapper as bin/nered. The .desktop entry and
+          # PATH, and expose the wrapper as bin/vyper. The .desktop entry and
           # icon ship in share/ so environment.systemPackages (or home-manager)
           # pick them up for the app menu.
           installPhase = ''
-            mkdir -p $out/bin $out/libexec/nered
-            cp nered $out/libexec/nered/nered
-            wrapProgram $out/libexec/nered/nered \
+            mkdir -p $out/bin $out/libexec/vyper
+            cp vyper $out/libexec/vyper/vyper
+            wrapProgram $out/libexec/vyper/vyper \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader pkgs.glib pkgs.ffmpeg ]}" \
               --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
-            ln -s $out/libexec/nered/nered $out/bin/nered
-            install -Dm644 packaging/nered.desktop $out/share/applications/nered.desktop
-            install -Dm644 packaging/nered.svg $out/share/icons/hicolor/scalable/apps/nered.svg
+            ln -s $out/libexec/vyper/vyper $out/bin/vyper
+            install -Dm644 packaging/vyper.desktop $out/share/applications/vyper.desktop
+            install -Dm644 packaging/vyper.svg $out/share/icons/hicolor/scalable/apps/vyper.svg
           '';
           meta = {
-            description = "nered live clip editor";
-            mainProgram = "nered";
+            description = "vyper live clip editor";
+            mainProgram = "vyper";
           };
         };
 
         debug = pkgs.stdenv.mkDerivation {
-          pname = "nered-debug";
+          pname = "vyper-debug";
           version = "0.1.0";
           src = ./.;
           nativeBuildInputs = [ pkgs.odin pkgs.glslang pkgs.makeWrapper pkgs.llvmPackages.clang ];
@@ -99,7 +99,7 @@
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
             ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
-            odin build . -out:nered \
+            odin build . -out:vyper \
               -debug \
               -vet-style -vet-semicolon \
               -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
@@ -108,22 +108,22 @@
           # ffmpeg libs and shells out to ffmpeg for proxy transcode, so it
           # can't be run from a bare result/ dir. Keep the real binary under
           # libexec, wrap it with the needed runtime lib path + ffmpeg on
-          # PATH, and expose the wrapper as bin/nered. The .desktop entry and
+          # PATH, and expose the wrapper as bin/vyper. The .desktop entry and
           # icon ship in share/ so environment.systemPackages (or home-manager)
           # pick them up for the app menu.
           installPhase = ''
-            mkdir -p $out/bin $out/libexec/nered
-            cp nered $out/libexec/nered/nered
-            wrapProgram $out/libexec/nered/nered \
+            mkdir -p $out/bin $out/libexec/vyper
+            cp vyper $out/libexec/vyper/vyper
+            wrapProgram $out/libexec/vyper/vyper \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader pkgs.glib pkgs.ffmpeg ]}" \
               --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
-            ln -s $out/libexec/nered/nered $out/bin/nered
-            install -Dm644 packaging/nered.desktop $out/share/applications/nered.desktop
-            install -Dm644 packaging/nered.svg $out/share/icons/hicolor/scalable/apps/nered.svg
+            ln -s $out/libexec/vyper/vyper $out/bin/vyper
+            install -Dm644 packaging/vyper.desktop $out/share/applications/vyper.desktop
+            install -Dm644 packaging/vyper.svg $out/share/icons/hicolor/scalable/apps/vyper.svg
           '';
           meta = {
-            description = "nered live clip editor";
-            mainProgram = "nered";
+            description = "vyper live clip editor";
+            mainProgram = "vyper";
           };
         };
       });

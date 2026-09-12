@@ -11,9 +11,9 @@ import sdl "vendor:sdl3"
 // they all read and write.
 // ---------------------------------------------------------------------------
 
-// nered_trace enables the interactive debug traces ([pb]/[tl]/[ui]/[autoplay]).
-// Off by default; set NERED_TRACE=1 to turn on.
-nered_trace: bool = false
+// vyper_trace enables the interactive debug traces ([pb]/[tl]/[ui]/[autoplay]).
+// Off by default; set VYPER_TRACE=1 to turn on.
+vyper_trace: bool = false
 
 WINDOW_WIDTH :: 1280
 WINDOW_HEIGHT :: 720
@@ -85,10 +85,10 @@ timeline_fps :: proc() -> f64 {
 
 // DIAG (temporary): magic playback-clock overrides to isolate whether the
 // playhead's wall-clock cadence affects the audible audio rate.
-//   NERED_PLAYBACK_MAGIC_MS  > 0  ignore measured wall delta; advance the
+//   VYPER_PLAYBACK_MAGIC_MS  > 0  ignore measured wall delta; advance the
 //                               playhead by exactly this many ms per frame tick
 //                               (16.6667 = perfect 60fps cadence, zero jitter).
-//   NERED_PLAYBACK_FPS       > 0  override timeline_fps() for the playhead
+//   VYPER_PLAYBACK_FPS       > 0  override timeline_fps() for the playhead
 //                               advance, the mixer's start48/spf mapping, and
 //                               the audio producer. 0 = use the imported rate.
 PLAYBACK_MAGIC_MS: f64 = 0

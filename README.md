@@ -1,4 +1,4 @@
-# nered
+# vyper
 
 Editor de clipe de live do neraid
 
@@ -10,7 +10,7 @@ clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
 clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
 ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
 odin build .
-./nered
+./vyper
 ```
 
 Clay Odin bindings live in `vendor/clay-odin`. SDL3 GPU owns Vulkan device,

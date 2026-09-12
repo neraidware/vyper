@@ -7,7 +7,7 @@ import "core:strconv"
 import "core:strings"
 
 // ---------------------------------------------------------------------------
-// NERED_CACHE_PROBE="<file>|<step>|<back>|<count>": adversarial cache-desync
+// VYPER_CACHE_PROBE="<file>|<step>|<back>|<count>": adversarial cache-desync
 // check on ONE persistent decoder.
 //
 // The lost-region bug at a flush (no-gap) boundary comes from decode_clip_frame_sync's
@@ -28,7 +28,7 @@ cache_probe_run :: proc(v: string) {
 	preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 4 {
-		fmt.println("cache-probe: need NERED_CACHE_PROBE=\"<file>|<step>|<back>|<count>\"")
+		fmt.println("cache-probe: need VYPER_CACHE_PROBE=\"<file>|<step>|<back>|<count>\"")
 		os.exit(2)
 	}
 	file := parts[0]

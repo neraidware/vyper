@@ -10,7 +10,7 @@ import "core:unicode/utf8"
 import stb "vendor:stb/truetype"
 
 // ---------------------------------------------------------------------------
-// Headless subtitle-export probe (NERED_SUB_RENDER_PROBE="<out.mp4>").
+// Headless subtitle-export probe (VYPER_SUB_RENDER_PROBE="<out.mp4>").
 //
 // Builds a subtitle generator clip (multi-line cues, including one long line)
 // on a deterministic track, then:
@@ -196,7 +196,7 @@ subtitle_probe_srt :: proc() -> int {
 	}
 	append(
 		&src.cues,
-		Srt_Cue{start_ms = 0, end_ms = 1000, text = "Hello nered\nsecond line, wider"},
+		Srt_Cue{start_ms = 0, end_ms = 1000, text = "Hello vyper\nsecond line, wider"},
 	)
 	append(
 		&src.cues,

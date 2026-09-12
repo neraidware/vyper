@@ -502,7 +502,7 @@ split_clip_at_playhead :: proc() {
 		delete(old_markers)
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[tl] split group link=%d (%d clips) @ %d\n", link, len(targets), frame)
 	}
 	audio_note_edit()
@@ -532,7 +532,7 @@ unlink_selected_clips :: proc() {
 	// Any group drag math captured earlier is now invalid: members are free.
 	clear(&drag_group_orig)
 	audio_note_edit()
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
 	}
 }
@@ -598,7 +598,7 @@ toggle_links_for_selection :: proc() {
 			return
 		}
 		audio_note_edit()
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
 		}
 		return
@@ -617,7 +617,7 @@ toggle_links_for_selection :: proc() {
 			c.link_id = 0
 		}
 		audio_note_edit()
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[tl] unlinked %d selected clips\n", len(resolved))
 		}
 		return
@@ -627,7 +627,7 @@ toggle_links_for_selection :: proc() {
 		c.link_id = new_link
 	}
 	audio_note_edit()
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[tl] linked %d selected clips (link=%d)\n", len(resolved), new_link)
 	}
 }
@@ -700,7 +700,7 @@ delete_selected_clip_raw :: proc() {
 		removed := tt.clips[target.index]
 		ordered_remove(&tt.clips, target.index)
 		delete(removed.markers)
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf(
 				"[tl] deleted clip raw src=%s start=%d len=%d\n",
 				removed.path,
@@ -713,7 +713,7 @@ delete_selected_clip_raw :: proc() {
 	if !removed_any {
 		return
 	}
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[tl] deleted clip group link=%d (%d clips)\n", link, len(targets))
 	}
 	selected_track = -1
@@ -837,7 +837,7 @@ ripple_delete_region :: proc(start, length: i64) {
 	drag_source_index = -1
 	drag_hover_track = -1
 	invalidate_preview_slots()
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[tl] ripple delete region [%d, %d)\n", start, start + length)
 	}
 	selected_track = -1
@@ -891,7 +891,7 @@ ripple_delete_linked_group :: proc(link: u64) {
 	drag_source_index = -1
 	drag_hover_track = -1
 	invalidate_preview_slots()
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[tl] ripple delete linked group link=%d (%d members)\n", link, len(spans))
 	}
 	selected_track = -1
@@ -1052,7 +1052,7 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 			break
 		}
 	}
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf(
 			"[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
 			clip.path,

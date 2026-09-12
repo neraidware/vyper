@@ -237,15 +237,15 @@ addresses, lifetimes, and shares data. Everything else follows from it.
 
 ## 9. Spall is the profiler; use it wherever performance matters
 
-- Measure first: `spall_scope(#procedure)`, `NERED_SPALL=/tmp/x.spall`;
-  full tree with `-define:NERED_INSTRUMENT=true`.
+- Measure first: `spall_scope(#procedure)`, `VYPER_SPALL=/tmp/x.spall`;
+  full tree with `-define:VYPER_INSTRUMENT=true`.
 - Perf claims ship with a trace or probe measurement, not vibes.
-- 35s full trace ≈ 20MB/s. Trim with `NERED_SPALL_MS` + manual markers.
+- 35s full trace ≈ 20MB/s. Trim with `VYPER_SPALL_MS` + manual markers.
 
 ## 10. Build flags live in scripts, not your head
 
-- Typing `-vet`, `-no-bounds-check`, `-define:NERED_INSTRUMENT=true`, or
-  `NERED_SPALL*` by hand means the build script is missing a target — fix
+- Typing `-vet`, `-no-bounds-check`, `-define:VYPER_INSTRUMENT=true`, or
+  `VYPER_SPALL*` by hand means the build script is missing a target — fix
   the script.
 - `-vet` clean and warning-free is the baseline for every change, not a
   pre-release chore.

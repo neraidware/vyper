@@ -1,12 +1,12 @@
-# Building & Running nered on Windows
+# Building & Running vyper on Windows
 
 ## CI
 
 A GitHub Actions workflow (`/.github/workflows/windows.yml`) builds a Windows
 executable on every push. The runner is `windows-latest` (VS 2022 + MSVC).
-The artifact `nered-windows` contains the exe + all required DLLs + ffmpeg/ffprobe.
+The artifact `vyper-windows` contains the exe + all required DLLs + ffmpeg/ffprobe.
 
-Download: https://github.com/neraidware/nered/actions → latest successful `windows` run → `nered-windows` artifact.
+Download: https://github.com/neraidware/vyper/actions → latest successful `windows` run → `vyper-windows` artifact.
 
 ## Dependencies (provided by CI; listed here for local dev)
 
@@ -19,7 +19,7 @@ Download: https://github.com/neraidware/nered/actions → latest successful `win
 ## Build command
 
 ```
-odin build . -out:nered.exe -define:FFMPEG_LINK=system -extra-linker-flags:"/LIBPATH:C:\path\to\sdl3\lib\x64;C:\path\to\ffmpeg\lib"
+odin build . -out:vyper.exe -define:FFMPEG_LINK=system -extra-linker-flags:"/LIBPATH:C:\path\to\sdl3\lib\x64;C:\path\to\ffmpeg\lib"
 ```
 
 ### Critical: ffmpeg import libs must be in vendor/ffmpeg/\<lib\>/
@@ -48,10 +48,10 @@ via `/LIBPATH`.
 All files must be co-located (`dist/`):
 
 ```
-nered.exe
+vyper.exe
 SDL3.dll
-ffmpeg.exe        ← nered shells out to this for transcoding
-ffprobe.exe       ← nered shells out to this for probing
+ffmpeg.exe        ← vyper shells out to this for transcoding
+ffprobe.exe       ← vyper shells out to this for probing
 avcodec-63.dll    ← ffmpeg runtime DLLs (version numbers vary by BtbN build)
 avformat-63.dll
 avutil-61.dll
@@ -59,14 +59,14 @@ swresample-7.dll
 swscale-10.dll
 ```
 
-`ffmpeg.exe`/`ffprobe.exe` must live next to `nered.exe` — nered resolves them
-by exe directory, not `PATH`. On a crash, nered writes `nered_crash.log`
+`ffmpeg.exe`/`ffprobe.exe` must live next to `vyper.exe` — vyper resolves them
+by exe directory, not `PATH`. On a crash, vyper writes `vyper_crash.log`
 (exception code + fault address) in this same directory.
 
 Preview proxies (low-res all-intra cache of edited clips) are stored under
-`%LOCALAPPDATA%\nered\` — `<base>-<hash>.neredproxy.mp4`, per-segment
-`.neredproxy.segNNNN.mp4`, and the `.neredproxy.idx` index. Old proxies from
-before this change may linger in `%USERPROFILE%\.cache\nered\`.
+`%LOCALAPPDATA%\vyper\` — `<base>-<hash>.vyperproxy.mp4`, per-segment
+`.vyperproxy.segNNNN.mp4`, and the `.vyperproxy.idx` index. Old proxies from
+before this change may linger in `%USERPROFILE%\.cache\vyper\`.
 
 ## CI smoke test (decode + proxy)
 
@@ -75,13 +75,13 @@ uploading the artifact, so a build whose FFmpeg DLL set or decode path is broken
 fails the run instead of shipping a binary that crashes on open:
 
 - generates `sample.mp4` with the bundled `ffmpeg.exe`; then
-- `NERED_FRAME_PROBE="sample.mp4|0-240|30"` decodes a frame range through the
+- `VYPER_FRAME_PROBE="sample.mp4|0-240|30"` decodes a frame range through the
   vendored FFmpeg DLLs; and
-- `NERED_PROXY_PROBE="sample.mp4"` builds a proxy with `ffmpeg.exe` and verifies
+- `VYPER_PROXY_PROBE="sample.mp4"` builds a proxy with `ffmpeg.exe` and verifies
   proxy/source parity.
-- Any non-zero exit, or `nered_crash.log` next to the exe, fails the job.
+- Any non-zero exit, or `vyper_crash.log` next to the exe, fails the job.
 
-`nered.exe` also prints the linked FFmpeg majors first thing on startup:
+`vyper.exe` also prints the linked FFmpeg majors first thing on startup:
 `[win-ff] avformat=N avcodec=N avutil=N swscale=N`. If those differ from the
 majors the vendored bindings target, the first in-process decode (thumbnail of a
 just-opened video) can fault inside the DLLs — the print separates DLL/binding
@@ -96,11 +96,11 @@ drift from a code bug in the decode path.
   `CreateProcessW` does not search the running exe's directory for a bare
   argv0. `resolve_tool_argv()` rewrites a bare `ffprobe`/`ffmpeg` argv0 to
   `<exe_dir>\ffprobe.exe` / `<exe_dir>\ffmpeg.exe` via
-  `os.get_executable_directory`, so nered finds its co-located tools regardless
+  `os.get_executable_directory`, so vyper finds its co-located tools regardless
   of the CWD that launched it.
 - **Crash logger** (`crash_windows.odin`, gated `#+build windows`): installs a
   `SetUnhandledExceptionFilter` via `crash_handler_install()` (called from
-  `main.odin` under `when ODIN_OS == .Windows`) that writes `nered_crash.log`
+  `main.odin` under `when ODIN_OS == .Windows`) that writes `vyper_crash.log`
   next to the exe with `exception_code` + `fault_address` on an unhandled
   exception. Uses only raw `CreateFileW`/`WriteFile` + a stack buffer and
   `proc "system"` bindings, so it works with no Odin `context`/allocator. This

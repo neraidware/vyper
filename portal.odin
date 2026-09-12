@@ -175,7 +175,7 @@ portal_build_open_params :: proc(title: string, f: Portal_Filter) -> ^GVariant {
 		g_variant_builder_add_value(dict, entry)
 	}
 
-	add_option(dict, "handle_token", g_variant_new_string("nered_open"))
+	add_option(dict, "handle_token", g_variant_new_string("vyper_open"))
 	add_option(dict, "filters", portal_build_filters(f))
 	options := g_variant_builder_end(dict)
 	g_variant_builder_unref(dict)
@@ -363,7 +363,7 @@ portal_save_file_picker :: proc() -> cstring {
 		g_variant_builder_add_value(dict, entry)
 	}
 
-	add_option(dict, "handle_token", "nered_save")
+	add_option(dict, "handle_token", "vyper_save")
 	add_option(dict, "current_name", cstring(raw_data(default_name)))
 	{ // filters (a(sa(us)) value, not a plain string)
 		filter := Portal_Filter{name = "MP4 video", patterns = {"*.mp4"}}

@@ -9,7 +9,7 @@ import "core:strings"
 // os.process_exec on Windows calls CreateProcessW with lpApplicationName=nil,
 // so the first command token is resolved with the standard search order, which
 // conspicuously does NOT include the directory of the running exe (the runtime
-// tools ffprobe.exe / ffmpeg.exe are staged right next to nered.exe, not on
+// tools ffprobe.exe / ffmpeg.exe are staged right next to vyper.exe, not on
 // PATH). If left bare, the spawn fails and every probe/transcode silently
 // returns "unavailable". Rewriting to <exe_dir>\<name>.exe fixes it.
 //

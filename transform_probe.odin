@@ -1,6 +1,6 @@
 package main
 
-// NERED_TRANSFORM_PROBE — regression check for preview handle scaling.
+// VYPER_TRANSFORM_PROBE — regression check for preview handle scaling.
 // Rules under test:
 //   • a scale drag follows the pointer with NO canvas clamp — the driven edge
 //     (and a whole box) may scale beyond the rendered preview space;

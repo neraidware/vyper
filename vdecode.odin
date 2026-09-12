@@ -29,7 +29,7 @@ import sdl "vendor:sdl3"
 // decoders; it is only used for the foreground clip and does not touch the slot
 // structs (slot.buffer is written solely by the render thread via
 // async_try_consume). Its decode path (vdec_decode) mirrors decode_clip_frame_sync
-// and must keep the cache-hit/last_frame guard in lockstep; NERED_CACHE_PROBE
+// and must keep the cache-hit/last_frame guard in lockstep; VYPER_CACHE_PROBE
 // stays at 0 mismatches for that reason.
 Async_Decoder :: struct {
 	thread: ^sdl.Thread,
@@ -84,7 +84,7 @@ async_live_mode := true
 // path the preview path would use (nil decodes the source). WARNING: this is
 // the ASYNC mirror of decode_clip_frame_sync (same persistent-decoder +
 // cache-hit guard). If you change the cache-hit/last_frame logic in one, update
-// the other to match, then re-run NERED_CACHE_PROBE (0 mismatches).
+// the other to match, then re-run VYPER_CACHE_PROBE (0 mismatches).
 vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_base: i64, frame_idx: i64) -> bool {
 	spall_scope(#procedure)
 	frame_local := frame_idx - frame_base

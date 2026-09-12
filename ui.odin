@@ -96,7 +96,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		},
 		) {
 			clay.Text(
-				"Nered",
+				"Vyper",
 				clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_HEADING},
 			)
 			clay.Text(

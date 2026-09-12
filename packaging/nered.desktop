@@ -1,9 +1,9 @@
 [Desktop Entry]
 Type=Application
-Name=nered
+Name=vyper
 Comment=Live clip editor
-Exec=nered
-Icon=nered
+Exec=vyper
+Icon=vyper
 Terminal=false
 Categories=AudioVideo;VideoEditor;
 StartupNotify=false

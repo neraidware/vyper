@@ -25,20 +25,20 @@ import sdl "vendor:sdl3"
 // keyed on source frame indices).
 // ---------------------------------------------------------------------------
 
-// Proxy artifacts live in a per-user cache directory -- "$XDG_CACHE_HOME/nered",
-// or "$HOME/.cache/nered" when XDG_CACHE_HOME is unset; on Windows that base is
-// "%LOCALAPPDATA%/nered" (no XDG/dotdir convention there) -- keyed by
+// Proxy artifacts live in a per-user cache directory -- "$XDG_CACHE_HOME/vyper",
+// or "$HOME/.cache/vyper" when XDG_CACHE_HOME is unset; on Windows that base is
+// "%LOCALAPPDATA%/vyper" (no XDG/dotdir convention there) -- keyed by
 // <basename>-<path-hash>, so they never pollute the source folders, survive any
 // source relocation (re-hash only when the path changes), and same-named sources
 // from different folders stay distinct. The naming scheme is unchanged:
-PROXY_SUFFIX := ".neredproxy.mp4"
+PROXY_SUFFIX := ".vyperproxy.mp4"
 
 // proxy_cache_ready is memoized true once the cache dir is known to exist; the
 // mkdir is skipped on the hot read path (proxy_pick_for_frame) but re-attempted
 // immediately if any build fails, so a raced/removed dir self-heals.
 proxy_cache_ready: bool
 
-// proxy_cache_prefix writes the nered proxy cache dir into buf (trailing '/'
+// proxy_cache_prefix writes the vyper proxy cache dir into buf (trailing '/'
 // included, NUL-terminated), creating it and any missing parents on first use.
 // Returns the byte offset just past the prefix, or (0, false) when no home can
 // be resolved, no XDG override exists, or the directory cannot be created --
@@ -66,7 +66,7 @@ proxy_cache_prefix :: proc(buf: []u8) -> (int, bool) {
 			home = strings.concatenate({h, "/.cache"}, context.temp_allocator)
 		}
 	}
-	rel := "/nered/"
+	rel := "/vyper/"
 	n := len(home) + len(rel)
 	if n + 1 >= len(buf) {
 		return 0, false
@@ -114,7 +114,7 @@ proxy_stem :: proc(buf: []u8, off: int, src: cstring) -> (int, bool) {
 }
 
 // proxy_path_for writes the on-disk whole-proxy path for a source video into
-// `buf` (NUL-terminated): "<cache>/<base>-<hash>.neredproxy.mp4". Returns
+// `buf` (NUL-terminated): "<cache>/<base>-<hash>.vyperproxy.mp4". Returns
 // ("", false) if the buffer is too small or the cache dir is unusable.
 proxy_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
 	off, ok := proxy_cache_prefix(buf)
@@ -309,13 +309,13 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 //
 // Layout (all in the per-user proxy cache dir, named after the whole-proxy
 // naming scheme):
-//   <cache>/<base>-<hash>.neredproxy.mp4      legacy WHOLE proxy (pre-segment
+//   <cache>/<base>-<hash>.vyperproxy.mp4      legacy WHOLE proxy (pre-segment
 //                             builds / the synchronous probe path) -- still
 //                             served as a fast path when present and no
 //                             segmentation exists
-//   <cache>/<base>-<hash>.neredproxy.segNNNN.mp4   segment N, covering source
+//   <cache>/<base>-<hash>.vyperproxy.segNNNN.mp4   segment N, covering source
 //                             frames [N*seg_frames, (N+1)*seg_frames)
-//   <cache>/<base>-<hash>.neredproxy.idx      text index: "seg_frames <n>" then
+//   <cache>/<base>-<hash>.vyperproxy.idx      text index: "seg_frames <n>" then
 //                             "k <count>" per COMPLETED segment k (count =
 //                             frames inside)
 // ---------------------------------------------------------------------------
@@ -336,7 +336,7 @@ proxy_segment_path_for :: proc(src: cstring, k: int, buf: []u8) -> (cstring, boo
 	if !stok {
 		return "", false
 	}
-	fixed := ".neredproxy.seg"
+	fixed := ".vyperproxy.seg"
 	tail := ".mp4"
 	need := s + len(fixed) + 4 + len(tail) + 1
 	if need >= len(buf) {
@@ -369,7 +369,7 @@ proxy_idx_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
 	if !stok {
 		return "", false
 	}
-	fixed := ".neredproxy.idx"
+	fixed := ".vyperproxy.idx"
 	if s + len(fixed) + 1 > len(buf) {
 		return "", false
 	}
@@ -573,7 +573,7 @@ proxy_pick_for_frame :: proc(
 			}
 			return nil, 0
 		}
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf(
 				"[pick] seg index %d not covered: len=%d segs=%v\n",
 				k,
@@ -600,7 +600,7 @@ proxy_pick_for_frame :: proc(
 			rc.idx = {}
 			rc.idx_valid = proxy_idx_load(src, &rc.idx)
 			rc.idx_mtime = info.modification_time
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
 			}
 			if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Headless UI draw-call probe (NERED_UI_PROBE=1).
+// Headless UI draw-call probe (VYPER_UI_PROBE=1).
 //
 // The GPU pass issues one SDL draw call per clay command: render_sdf_rect per
 // Rectangle/Border command, and render_text issues one DrawGPUPrimitives per
@@ -158,7 +158,7 @@ seed_ui_probe_session :: proc() {
 }
 
 handle_ui_probe :: proc() -> bool {
-	if v, _ := os.lookup_env_alloc("NERED_UI_PROBE", context.temp_allocator); v != "" {
+	if v, _ := os.lookup_env_alloc("VYPER_UI_PROBE", context.temp_allocator); v != "" {
 		ui_draw_probe_run()
 		return true
 	}

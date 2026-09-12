@@ -425,10 +425,10 @@ audio_pcm_dump_path: string = ""
 audio_dec_dump: ^os.File = nil // DIAG: headless-only, dumps dec.s16 immediately after decode_audio_chunk (pre-mix)
 
 audio_dec_dump_open :: proc() {
-	if audio_dec_dump != nil || os.get_env_alloc("NERED_DECDUMP", context.temp_allocator) == "" {
+	if audio_dec_dump != nil || os.get_env_alloc("VYPER_DECDUMP", context.temp_allocator) == "" {
 		return
 	}
-	path := os.get_env_alloc("NERED_DECDUMP", context.temp_allocator)
+	path := os.get_env_alloc("VYPER_DECDUMP", context.temp_allocator)
 	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
 	if err == nil {
 		audio_dec_dump = f
@@ -436,8 +436,8 @@ audio_dec_dump_open :: proc() {
 	}
 }
 
-// A/V telemetry. NERED_AUDIO_LOG=ms overrides the report interval (default
-// 1000 ms); NERED_AUDIO_FULL=1 adds per-source fifo lines and playhead-jump
+// A/V telemetry. VYPER_AUDIO_LOG=ms overrides the report interval (default
+// 1000 ms); VYPER_AUDIO_FULL=1 adds per-source fifo lines and playhead-jump
 // logging. audio_silence_holes counts fed frames that were silence while a
 // clip covered them (decode/seek holes, producer thread accumulates it).
 audio_log_ms: i64 = 0
@@ -447,10 +447,10 @@ audio_thread_start_ns: u64
 audio_silence_holes: i64
 
 audio_pcm_dump_open :: proc() {
-	if audio_pcm_dump != nil || os.get_env_alloc("NERED_PCMDUMP", context.temp_allocator) == "" {
+	if audio_pcm_dump != nil || os.get_env_alloc("VYPER_PCMDUMP", context.temp_allocator) == "" {
 		return
 	}
-	path := os.get_env_alloc("NERED_PCMDUMP", context.temp_allocator)
+	path := os.get_env_alloc("VYPER_PCMDUMP", context.temp_allocator)
 	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
 	if err == nil {
 		audio_pcm_dump = f
@@ -610,7 +610,7 @@ audio_provision :: proc(play_frame: i64) {
 
 // audio_src_append converts n interleaved S16 frames from dec.s16 into
 // stereo f32 and appends them to the source fifo.
-// audio_src_dump_dec writes dec.s16 to NERED_DECDUMP verbatim (stereo S16)
+// audio_src_dump_dec writes dec.s16 to VYPER_DECDUMP verbatim (stereo S16)
 // between the decoder and the fifo/mix, so the decode stage can be validated
 // in isolation against the source PCM.
 audio_src_dump_dec :: proc(s: ^Play_Src, n: int) {
@@ -751,14 +751,14 @@ audio_init :: proc() -> bool {
 	if audio_trace {
 		fmt.printf("audio device ready (%d Hz, %dch, fmt %d)\n", device_spec.freq, device_spec.channels, device_spec.format)
 	}
-	if interval := os.get_env_alloc("NERED_AUDIO_LOG", context.temp_allocator); interval != "" {
+	if interval := os.get_env_alloc("VYPER_AUDIO_LOG", context.temp_allocator); interval != "" {
 		v, ok := strconv.parse_i64(interval)
 		if ok && v >= 50 {
 			audio_log_ms = v
 		}
 	}
-	audio_log_full = os.get_env_alloc("NERED_AUDIO_FULL", context.temp_allocator) == "1"
-	audio_trace = os.get_env_alloc("NERED_AUDIO_TRACE", context.temp_allocator) == "1"
+	audio_log_full = os.get_env_alloc("VYPER_AUDIO_FULL", context.temp_allocator) == "1"
+	audio_trace = os.get_env_alloc("VYPER_AUDIO_TRACE", context.temp_allocator) == "1"
 	sdl.PauseAudioDevice(dev)
 	sync.atomic_store(&audio_stop_flag, false)
 	sync.atomic_store(&audio_done_flag, false)

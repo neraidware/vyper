@@ -284,7 +284,7 @@ update_preview_slots :: proc() -> bool {
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
 				slot.tex_dirty = true
-				if nered_trace {
+				if vyper_trace {
 					fmt.printf(
 						"[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
 						slot_idx,
@@ -307,7 +307,7 @@ update_preview_slots :: proc() -> bool {
 			anchor_shifted :=
 				slot.timeline_start_frame != clip.timeline_start_frame ||
 				slot.source_start_frame != clip.source_start_frame
-			if nered_trace && anchor_shifted {
+			if vyper_trace && anchor_shifted {
 				fmt.printf(
 					"[vf] SHIFT asset=%d tl=%d->%d src=%d->%d playing=%v\n",
 					clip.asset_id,
@@ -611,7 +611,7 @@ update_preview_slots :: proc() -> bool {
 							slot.has_frame = true
 							slot.tex_dirty = true
 							changed = true
-						} else if nered_trace {
+						} else if vyper_trace {
 							fmt.printf("[vf] async miss req=%d ph=%d\n", req, playhead.frame)
 						}
 					}
@@ -623,7 +623,7 @@ update_preview_slots :: proc() -> bool {
 						slot.has_frame = true
 						slot.tex_dirty = true
 						changed = true
-					} else if nered_trace {
+					} else if vyper_trace {
 						fmt.printf("[vf] miss req=%d ph=%d\n", req, playhead.frame)
 					}
 				}

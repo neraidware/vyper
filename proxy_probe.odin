@@ -11,7 +11,7 @@ import sdl "vendor:sdl3"
 gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
 
 // ---------------------------------------------------------------------------
-// NERED_PROXY_PROBE="<file>": verify the editing-time proxy pipeline end to end.
+// VYPER_PROXY_PROBE="<file>": verify the editing-time proxy pipeline end to end.
 //
 // The regular probes run with preview_proxy_enabled=false so they exercise the
 // ORIGINAL decode path (proxy pixels are lossy by design). This probe flips the
@@ -32,7 +32,7 @@ proxy_probe_run :: proc(v: string) {
 	async_import_mode = false
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
-		fmt.println("proxy-probe: need NERED_PROXY_PROBE=\"<file>\"")
+		fmt.println("proxy-probe: need VYPER_PROXY_PROBE=\"<file>\"")
 		os.exit(2)
 	}
 	file := parts[0]
@@ -114,7 +114,7 @@ proxy_probe_run :: proc(v: string) {
 }
 
 // ---------------------------------------------------------------------------
-// NERED_PROXY_BG_TEST="<file>[|<cancel_pct>]": exercise the BACKGROUND proxy
+// VYPER_PROXY_BG_TEST="<file>[|<cancel_pct>]": exercise the BACKGROUND proxy
 // builder (import_bg.odin) without a window.
 //
 // Imports `file` with async_import_mode=true like the live editor, then polls
@@ -134,7 +134,7 @@ proxy_bg_probe_run :: proc(v: string) {
 
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
-		fmt.println("proxy-bg-test: need NERED_PROXY_BG_TEST=\"<file>[|<cancel_pct>]\"")
+		fmt.println("proxy-bg-test: need VYPER_PROXY_BG_TEST=\"<file>[|<cancel_pct>]\"")
 		os.exit(2)
 	}
 	file := parts[0]
@@ -181,7 +181,7 @@ proxy_bg_probe_run :: proc(v: string) {
 
 		switch phase {
 		case .Done_Ok:
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf("[proxy-bg-test] worker finished, verifying on-disk artifacts\n")
 			}
 			// The head and tail frames must both resolve to a built segment (a

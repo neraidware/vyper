@@ -138,7 +138,7 @@ ff_err_str :: proc(code: c.int) -> string {
 }
 
 clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)
 	}
 	if dec.opened {
@@ -583,7 +583,7 @@ decode_into_buffer :: proc(dec: ^Clip_Decoder, out: []u8, w, h: c.int) {
 // cache-hit branch below is the delicate one — see the guard. A cache hit must
 // never advance last_frame past the decoder's real position, or the next
 // forward request serves wrong pixels (the flush-boundary bug). If you change
-// anything here, re-run: NERED_CACHE_PROBE and NERED_FRAME_PROBE must stay at
+// anything here, re-run: VYPER_CACHE_PROBE and VYPER_FRAME_PROBE must stay at
 // 0 mismatches.
 decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64, out: []u8) -> bool {
 	// A proxy segment is keyed by LOCAL index (its stream restarts at 0); the
@@ -627,7 +627,7 @@ decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64
 		return true
 	}
 	forward := dec.have_last && frame_local == dec.last_frame + 1
-	if !forward && nered_trace {
+	if !forward && vyper_trace {
 		fmt.printf("[dec] SEEK frame=%d (was at %d) -> re-seek decoder\n",
 			frame_local, dec.last_frame)
 	}
@@ -636,7 +636,7 @@ decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64
 	}
 	decode_into_buffer(dec, out, PREVIEW_W, PREVIEW_H)
 	cache_store(dec, frame_local, out)
-	if !forward && nered_trace {
+	if !forward && vyper_trace {
 		fmt.printf("[dec] decoded frame=%d keys:", frame_local)
 		for ci := 0; ci < len(dec.cache); ci += 1 {
 			fmt.printf(" %d", dec.cache[ci].frame)

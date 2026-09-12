@@ -1,8 +1,8 @@
-// Spall instrumentation (core:prof/spall), gated behind the NERED_SPALL env
+// Spall instrumentation (core:prof/spall), gated behind the VYPER_SPALL env
 // var. When unset the whole thing is a single cheap branch, so profiling is
 // compiled in for every build (development + release) with zero idle cost.
 //
-// Usage: NERED_SPALL=/path/to/capture.spall ./nered
+// Usage: VYPER_SPALL=/path/to/capture.spall ./vyper
 //
 // One shared Context (file writer) is created up front; each thread gets its
 // own Spall buffer (thread-local) and names itself so the trace distinguishes
@@ -33,10 +33,10 @@ spall_deadline_ns: i64     // capture duration limit (0 = unbounded)
 @(thread_local) spall_buffer_data: [spall.BUFFER_DEFAULT_SIZE]u8
 @(thread_local) spall_thread_active: bool
 
-// spall_prof_init opens the capture file when NERED_SPALL is set and arms the
+// spall_prof_init opens the capture file when VYPER_SPALL is set and arms the
 // render thread's buffer. Returns true always (init is best-effort).
 spall_prof_init :: proc() -> bool {
-	path := os.get_env_alloc("NERED_SPALL", context.temp_allocator)
+	path := os.get_env_alloc("VYPER_SPALL", context.temp_allocator)
 	if path == "" {
 		spall_enabled = false
 		return true
@@ -56,7 +56,7 @@ spall_prof_init :: proc() -> bool {
 	// Optional capture-duration limit (ms): lets a scripted run take a bounded
 	// trace and exit cleanly so the shutdown defers flush the buffers. The
 	// render loop calls spall_expired() each frame and breaks when reached.
-	if ms := os.get_env_alloc("NERED_SPALL_MS", context.temp_allocator); ms != "" {
+	if ms := os.get_env_alloc("VYPER_SPALL_MS", context.temp_allocator); ms != "" {
 		if v, ok := strconv.parse_i64(strings.trim_space(ms)); ok && v > 0 {
 			spall_deadline_ns = time.now()._nsec + v * 1_000_000
 		}
@@ -140,13 +140,13 @@ spall_scope_end :: proc(name: string) {
 // guard check on every proc call even with profiling off. So the hooks are
 // compiled out by default and only exist when explicitly requested:
 //
-//	odin build . -define:NERED_INSTRUMENT=true -o:aggressive ...
-//	NERED_SPALL=/tmp/x.spall ./nered
+//	odin build . -define:VYPER_INSTRUMENT=true -o:aggressive ...
+//	VYPER_SPALL=/tmp/x.spall ./vyper
 //
-// Expect a big trace (this toolchain: ~20 MB per second); keep NERED_SPALL_MS
+// Expect a big trace (this toolchain: ~20 MB per second); keep VYPER_SPALL_MS
 // short. For hot-path work the manual spall_scope markers are enough.
 // ---------------------------------------------------------------------------
-when #config(NERED_INSTRUMENT, false) {
+when #config(VYPER_INSTRUMENT, false) {
 
 	@(instrumentation_enter)
 	profiler_enter :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {

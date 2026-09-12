@@ -3,7 +3,7 @@ package main
 import "core:fmt"
 import "core:os"
 
-// Timeline probe (NERED_TL_PROBE): headless regression checks for the clip-edit
+// Timeline probe (VYPER_TL_PROBE): headless regression checks for the clip-edit
 // paths — the playhead-coverage split (cut the clip UNDER the playhead), the
 // linked-group split fanout, and the never-desync invariants for linked-group
 // drag/drop/resize. Builds its own timeline state directly; no decode, no SDL.

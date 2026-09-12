@@ -271,7 +271,7 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		font_px,
 		context.allocator,
 	)
-	if nered_trace || os.get_env_alloc("NERED_SUB_RENDER_TRACE", context.temp_allocator) != "" {
+	if vyper_trace || os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
 		fmt.printf(
 			"[sub-raster] len=%d scale=%.1f bw=%d bh=%d ink=%d,%d,%d,%d\n",
 			len(text),
@@ -982,8 +982,8 @@ render_worker_run :: proc() {
 			w := f32(jc.ow) * sub_factor
 			h := f32(jc.bh) * sub_factor
 			bottom := s.anchor_y + f32(s.source_h) * s.scale * sub_factor / 2
-			if nered_trace ||
-			   os.get_env_alloc("NERED_SUB_RENDER_TRACE", context.temp_allocator) != "" {
+			if vyper_trace ||
+			   os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
 				fmt.printf(
 					"[sub-blit] cue=%d ox=%d oy=%d ow=%d oh=%d bw=%d bh=%d w=%.0f h=%.0f x0=%.0f y0=%.0f anchor=(%.0f,%.0f) src=%dx%d\n",
 					ci,
@@ -1506,14 +1506,14 @@ render_set_out_path :: proc(s: string) {
 }
 
 // ---------------------------------------------------------------------------
-// Headless end-to-end render test (NERED_RENDER_TEST="in.mp4|out.mp4").
+// Headless end-to-end render test (VYPER_RENDER_TEST="in.mp4|out.mp4").
 // ---------------------------------------------------------------------------
 
 test_input_buf: [4096]u8
 test_output_buf: [4096]u8
 
 render_test_env :: proc() -> (bool, [2]string) {
-	v, _ := os.lookup_env_alloc("NERED_RENDER_TEST", context.allocator)
+	v, _ := os.lookup_env_alloc("VYPER_RENDER_TEST", context.allocator)
 	if v == "" {
 		return false, [2]string{}
 	}
@@ -1528,7 +1528,7 @@ render_test_env :: proc() -> (bool, [2]string) {
 
 render_test_run :: proc(paths: [2]string) {
 	if len(paths[0]) == 0 || len(paths[1]) == 0 {
-		fmt.println("render-test: need NERED_RENDER_TEST=\"<in>|<out>\"")
+		fmt.println("render-test: need VYPER_RENDER_TEST=\"<in>|<out>\"")
 		os.exit(2)
 	}
 	n := 0
@@ -1541,9 +1541,9 @@ render_test_run :: proc(paths: [2]string) {
 	if len(timeline.tracks) > 0 && len(timeline.tracks[0].clips) > 0 {
 		vclip := &timeline.tracks[0].clips[0]
 		fmt.println("render-test clip markers:", len(vclip.markers))
-		// NERED_CROP="l,r,t,b" applies a crop to the first clip so the render
+		// VYPER_CROP="l,r,t,b" applies a crop to the first clip so the render
 		// output's crop behavior can be verified headlessly.
-		if cv, cv_ok := os.lookup_env_alloc("NERED_CROP", context.allocator); cv_ok && cv != "" {
+		if cv, cv_ok := os.lookup_env_alloc("VYPER_CROP", context.allocator); cv_ok && cv != "" {
 			parts := strings.split(cv, ",")
 			if len(parts) == 4 {
 				vals := [4]f64{}
@@ -1569,7 +1569,7 @@ render_test_run :: proc(paths: [2]string) {
 }
 
 // ---------------------------------------------------------------------------
-// Headless preview-decode probe (NERED_PREVIEW_PROBE="in.mp4|split_at").
+// Headless preview-decode probe (VYPER_PREVIEW_PROBE="in.mp4|split_at").
 // Reproduces the split -> delete-one-half -> other-half-shifts-back edit (the
 // "moved back" bug) and dumps, per requested frame, what clip_frame the slot
 // computed, what the RAM cache keyed, and how the slot's decoded RGBA buffer
@@ -1584,7 +1584,7 @@ max_slot_idx_used: int
 probe_gtbuf: [PREVIEW_W * PREVIEW_H * 4]u8
 
 preview_probe_env :: proc() -> (bool, [2]string) {
-	v, _ := os.lookup_env_alloc("NERED_PREVIEW_PROBE", context.allocator)
+	v, _ := os.lookup_env_alloc("VYPER_PREVIEW_PROBE", context.allocator)
 	if v == "" {
 		return false, [2]string{}
 	}
@@ -1646,7 +1646,7 @@ probe_ground_truth :: proc(
 preview_probe_run :: proc(paths: [2]string) {
 	preview_proxy_enabled = false // ground truth vs the original decode path
 	if len(paths[0]) == 0 {
-		fmt.println("preview-probe: need NERED_PREVIEW_PROBE=\"<in>|<split_at>\"")
+		fmt.println("preview-probe: need VYPER_PREVIEW_PROBE=\"<in>|<split_at>\"")
 		os.exit(2)
 	}
 	split_at: i64 = 120
@@ -1843,7 +1843,7 @@ preview_probe_run :: proc(paths: [2]string) {
 }
 
 // ---------------------------------------------------------------------------
-// NERED_BOUNDARY_PROBE="<file>|<split1>|<split2>": reproduce the exact reported
+// VYPER_BOUNDARY_PROBE="<file>|<split1>|<split2>": reproduce the exact reported
 // scene — import, split at split1, split at split2, raw-delete the middle clip,
 // drag the tail back to sit flush against the left clip — then step the playhead
 // across the boundary, pixel-comparing every displayed slot buffer against
@@ -1873,7 +1873,7 @@ boundary_probe_run :: proc(v: string) {
 	preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 2 {
-		fmt.println("boundary-probe: need NERED_BOUNDARY_PROBE=\"<file>|<split1>[|<split2>]\"")
+		fmt.println("boundary-probe: need VYPER_BOUNDARY_PROBE=\"<file>|<split1>[|<split2>]\"")
 		os.exit(2)
 	}
 	file := parts[0]
@@ -2056,7 +2056,7 @@ boundary_probe_run :: proc(v: string) {
 }
 
 // ---------------------------------------------------------------------------
-// NERED_FRAME_PROBE="<file>|<start>-<end>|<stride>": ground-truth frame check.
+// VYPER_FRAME_PROBE="<file>|<start>-<end>|<stride>": ground-truth frame check.
 //
 // The preview probe's pixel_diff compares two decodes that use the SAME seek
 // logic, so a systematic seek bug (wrong frame delivered, offset the same way
@@ -2096,7 +2096,7 @@ preview_framecheck_run :: proc(v: string) {
 	preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 3 {
-		fmt.println("frame-probe: need NERED_FRAME_PROBE=\"<file>|<start>-<end>|<stride>\"")
+		fmt.println("frame-probe: need VYPER_FRAME_PROBE=\"<file>|<start>-<end>|<stride>\"")
 		os.exit(2)
 	}
 	file := parts[0]

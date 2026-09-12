@@ -24,7 +24,7 @@ toggle_playback :: proc() {
 		// A pause drops the jog speed boost so the next play uses the selected
 		// rate again.
 		playback_boost = 0
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
 		}
 		return
@@ -38,7 +38,7 @@ toggle_playback :: proc() {
 	audio_was_playing = false
 	playhead.playing = true
 	preview.playing = true
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf(
 			"[pb] toggle playing=%v ph=%d dir=%d\n",
 			playhead.playing,
@@ -68,7 +68,7 @@ jog_playback :: proc(dir: int) {
 		audio_was_playing = false
 		playhead.playing = true
 		preview.playing = true
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[pb] jog start dir=%d ph=%d\n", dir, playhead.frame)
 		}
 		return
@@ -76,7 +76,7 @@ jog_playback :: proc(dir: int) {
 	// Already playing.
 	if playback_dir == dir {
 		playback_boost += 1
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf(
 				"[pb] jog boost dir=%d boost=%d eff=%.2fx\n",
 				dir,
@@ -87,7 +87,7 @@ jog_playback :: proc(dir: int) {
 	} else {
 		playback_dir = dir
 		playback_boost = 0
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[pb] jog flip dir=%d ph=%d\n", dir, playhead.frame)
 		}
 	}
@@ -776,7 +776,7 @@ play_project_area :: proc() {
 	audio_was_playing = false
 	playhead.playing = true
 	preview.playing = true
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback_stop_frame)
 	}
 }
@@ -805,7 +805,7 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 			sync.atomic_store(&audio_ph_src, 2)
 			sync.atomic_store(&audio_ph_catch, catchup)
 			if catchup > 1 {
-				if nered_trace {
+				if vyper_trace {
 					fmt.printf(
 						"[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n",
 						i64(playback_dir) * catchup,
@@ -832,7 +832,7 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 			playhead.frame = clamp(playhead.frame, 0, max(0, stop_frame - 1))
 			playhead.playing = false
 			preview.playing = false
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf(
 					"[pb] auto-stop dir=%d ph=%d stop=%d\n",
 					playback_dir,
@@ -854,12 +854,12 @@ main :: proc() {
 		crash_handler_install()
 		win_ffmpeg_versions_diag()
 	}
-	nered_trace = os.get_env_alloc("NERED_TRACE", context.temp_allocator) == "1"
+	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {
 		render_test_run(test_paths)
 		return
 	}
-	if fp, _ := os.lookup_env_alloc("NERED_FRAME_PROBE", context.temp_allocator); fp != "" {
+	if fp, _ := os.lookup_env_alloc("VYPER_FRAME_PROBE", context.temp_allocator); fp != "" {
 		preview_framecheck_run(fp)
 		return
 	}
@@ -874,37 +874,37 @@ main :: proc() {
 		preview_probe_run(probe_paths)
 		return
 	}
-	if bp, _ := os.lookup_env_alloc("NERED_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
+	if bp, _ := os.lookup_env_alloc("VYPER_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
 		async_live_mode = false
 		async_dec_init()
 		defer async_dec_shutdown()
 		boundary_probe_run(bp)
 		return
 	}
-	if cp, _ := os.lookup_env_alloc("NERED_CACHE_PROBE", context.temp_allocator); cp != "" {
+	if cp, _ := os.lookup_env_alloc("VYPER_CACHE_PROBE", context.temp_allocator); cp != "" {
 		cache_probe_run(cp)
 		return
 	}
-	if tp, _ := os.lookup_env_alloc("NERED_TRANSFORM_PROBE", context.temp_allocator); tp != "" {
+	if tp, _ := os.lookup_env_alloc("VYPER_TRANSFORM_PROBE", context.temp_allocator); tp != "" {
 		transform_probe_run(tp)
 		return
 	}
-	if tlp, _ := os.lookup_env_alloc("NERED_TL_PROBE", context.temp_allocator); tlp != "" {
+	if tlp, _ := os.lookup_env_alloc("VYPER_TL_PROBE", context.temp_allocator); tlp != "" {
 		timeline_probe_run(tlp)
 		return
 	}
-	if xp, _ := os.lookup_env_alloc("NERED_PROXY_PROBE", context.temp_allocator); xp != "" {
+	if xp, _ := os.lookup_env_alloc("VYPER_PROXY_PROBE", context.temp_allocator); xp != "" {
 		proxy_probe_run(xp)
 		return
 	}
-if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); xb != "" {
+if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); xb != "" {
 		proxy_bg_probe_run(xb)
 		return
 	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.
-	if v, _ := os.lookup_env_alloc("NERED_UI_PROBE", context.temp_allocator); v != "" {
+	if v, _ := os.lookup_env_alloc("VYPER_UI_PROBE", context.temp_allocator); v != "" {
 		ui_draw_probe_run()
 	}
 	spall_prof_init()
@@ -913,7 +913,7 @@ if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); 
 		return
 	}
 	if sub_render_probe, _ := os.lookup_env_alloc(
-		"NERED_SUB_RENDER_PROBE",
+		"VYPER_SUB_RENDER_PROBE",
 		context.temp_allocator,
 	); sub_render_probe != "" {
 		// The probe free-alls the temp arena per simulated frame, so the env
@@ -929,9 +929,9 @@ if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); 
 	}
 	defer sdl.Quit()
 
-	window := sdl.CreateWindow("nered", WINDOW_WIDTH, WINDOW_HEIGHT, {.RESIZABLE, .VULKAN})
+	window := sdl.CreateWindow("vyper", WINDOW_WIDTH, WINDOW_HEIGHT, {.RESIZABLE, .VULKAN})
 	if window == nil {
-		fmt.println("Could not create nered window")
+		fmt.println("Could not create vyper window")
 		return
 	}
 	defer sdl.DestroyWindow(window)
@@ -1009,14 +1009,14 @@ if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); 
 	clay.SetMeasureTextFunction(measure_text, nil)
 
 	// DIAG (temporary): magic playhead-clock knobs.
-	if v := os.get_env_alloc("NERED_PLAYBACK_MAGIC_MS", context.temp_allocator); v != "" {
+	if v := os.get_env_alloc("VYPER_PLAYBACK_MAGIC_MS", context.temp_allocator); v != "" {
 		PLAYBACK_MAGIC_MS, _ = strconv.parse_f64(v)
 	}
-	if v := os.get_env_alloc("NERED_PLAYBACK_FPS", context.temp_allocator); v != "" {
+	if v := os.get_env_alloc("VYPER_PLAYBACK_FPS", context.temp_allocator); v != "" {
 		PLAYBACK_MAGIC_FPS, _ = strconv.parse_f64(v)
 	}
 	if PLAYBACK_MAGIC_MS > 0 || PLAYBACK_MAGIC_FPS > 0 {
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf(
 				"[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n",
 				PLAYBACK_MAGIC_MS,
@@ -1029,15 +1029,15 @@ if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); 
 	// starts playback after a couple of seconds. Refuses silently-failed imports
 	// (bad path, unreadable file, probe failure) instead of opening an empty
 	// project that immediately auto-stops without ever playing anything.
-	if autoplay := os.get_env_alloc("NERED_AUTOPLAY", context.temp_allocator); autoplay != "" {
-		if nered_trace {
+	if autoplay := os.get_env_alloc("VYPER_AUTOPLAY", context.temp_allocator); autoplay != "" {
+		if vyper_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 		}
 		// The asset/clip paths store the passed cstring by reference, so the
 		// autoplay path must be owned on the long-lived allocator (assets never
 		// free their paths), not the per-frame temp arena.
 		import_media(strings.clone_to_cstring(autoplay))
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf(
 				"[autoplay] env=\"%s\" imported tracks=%d step=delay\n",
 				autoplay,
@@ -1045,16 +1045,16 @@ if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); 
 			)
 		}
 		if len(timeline.tracks) == 0 {
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf(
-					"[autoplay] FATAL: NERED_AUTOPLAY=\"%s\" imported nothing (no audio track)\n",
+					"[autoplay] FATAL: VYPER_AUTOPLAY=\"%s\" imported nothing (no audio track)\n",
 					autoplay,
 				)
 			}
 			os.exit(1)
 		}
 		sdl.Delay(2500)
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
 		}
 		playhead.playing = true
@@ -1115,7 +1115,7 @@ if xb, _ := os.lookup_env_alloc("NERED_PROXY_BG_TEST", context.temp_allocator); 
 		if ui_report_tick == 0 {
 			ui_report_tick = now_ns
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
-			if nered_trace {
+			if vyper_trace {
 				elapsed := f64(now_ns - ui_report_tick) / 1e9
 				fmt.printf(
 					"[ui] fps=%.1f dec_ms=%.1f playhead=%d acc=%.3fs src=%d catch=%d prod=%d\n",

@@ -1,4 +1,4 @@
-# nered TODO
+# vyper TODO
 
 ## Phase 1 — Performance, Cleanup, Refactoring, Polish
 
@@ -6,7 +6,7 @@
   dependent), resets at segment boundary when decoder reopens. Root cause and
   fix remaining open.
 - Proxy cache directory: move proxies out of source dir into
-  `$XDG_CACHE_HOME/nered/proxies` keyed by stable source-path hash.
+  `$XDG_CACHE_HOME/vyper/proxies` keyed by stable source-path hash.
 - Per-asset decoder cache: share one decoder + pool across clips referencing
   the same source; current RAM frame cache exists but decoders are per-clip.
 - Hardware decode + encode for proxies (NVENC / AMF / VA-API / VideoToolbox):

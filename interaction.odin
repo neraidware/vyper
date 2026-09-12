@@ -606,7 +606,7 @@ interaction_post_build :: proc(
 						delta := i64(max(frame, 0)) - drag_group_orig[0].start
 						if group_delta_feasible(delta) {
 							if drag_clip.timeline_start_frame != drag_group_orig[0].start + delta {
-								if nered_trace {
+								if vyper_trace {
 									fmt.printf(
 										"[tl] drag group link=%d (%d clips) delta=%d\n",
 										drag_clip.link_id,
@@ -629,7 +629,7 @@ interaction_post_build :: proc(
 							drag_clip.timeline_start_frame,
 						)
 						if drag_clip.timeline_start_frame != new_start {
-							if nered_trace {
+							if vyper_trace {
 								fmt.printf(
 									"[tl] drag clip src=%s len=%d start=%d -> %d\n",
 									drag_clip.path,
@@ -677,7 +677,7 @@ interaction_post_build :: proc(
 				frame = snap_playhead_to_clip_edge(frame)
 			}
 			if playhead.frame != frame {
-				if nered_trace {
+				if vyper_trace {
 					fmt.printf(
 						"[pb] scrub ph=%d (was %d) playing=%v\n",
 						frame,

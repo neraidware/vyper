@@ -283,7 +283,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 	seg_total := proxy_seg_count(frames)
 	fps := f64(frames) * 1e6 / f64(max(dur_us, 1))
 	if seg_total <= 0 || fps <= 0 {
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[bg] bad segment plan for %q: frames=%d dur_us=%d\n", string(src), frames, dur_us)
 		}
 		import_bg_set_phase(ib, .Done_Fail)
@@ -322,7 +322,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			pending := ib.cancel_pending
 			sdl.UnlockMutex(ib.mutex)
 			if pending {
-				if nered_trace {
+				if vyper_trace {
 					fmt.printf("[bg] cancel between segments; keeping %d completed frames\n", completed_frames)
 				}
 				import_bg_set_phase(ib, .Done_Cancelled)
@@ -366,7 +366,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		// full pipe.
 		proc_handle, spawn_err := os.process_start({command = rargv, stdout = nil, stderr = nil})
 		if spawn_err != nil {
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf("[bg] spawn ffmpeg failed: %v\n", spawn_err)
 			}
 			os.remove(progress_file)
@@ -394,7 +394,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 
 			st, werr := os.process_wait(proc_handle, 0)
 			if werr != nil && werr != os.General_Error.Timeout {
-				if nered_trace {
+				if vyper_trace {
 					fmt.printf("[bg] process wait poll failed: %v\n", werr)
 				}
 				_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
@@ -430,7 +430,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			tol = PROXY_FRAME_TOLERANCE
 		}
 		if count < seg_want - tol {
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf("[bg] segment %d short: wanted %d frames, got %d\n", k, seg_want, count)
 			}
 			os.remove(string(seg))
@@ -452,7 +452,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			import_bg_set_progress(ib, frac)
 			last_frac = frac
 		}
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf("[bg] segment %d/%d done: %d frames -> %.1f%%\n", k + 1, seg_total, count, frac * 100)
 		}
 	}
@@ -469,7 +469,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 	}
 	import_bg_set_phase(ib, phase)
 	import_bg_clear_cancel(ib)
-	if nered_trace {
+	if vyper_trace {
 		fmt.printf("[bg] proxy %s -> %v (segments=%d, %d frames)\n", string(src), phase, seg_total, sum)
 	}
 }
