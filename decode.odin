@@ -221,6 +221,28 @@ open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
 // source is scaled to exactly dst (render path, where dst already matches the
 // clip's on-canvas display size).
 open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.int, dst_w, dst_h: c.int, fit: bool) -> bool {
+	// The caller may have pre-resolved dec.preview_path to a proxy for THIS
+	// open (decoder_set_preview set it before calling here). The reopen below
+	// discards decoder state wholesale, which would wipe that target and make
+	// every reopen at a segment boundary fall back to the source -- the
+	// "preview flips to the original and stays there" bug. preview_path/frame_base
+	// are the decode TARGET (re-supplied by the caller every open), not decoder
+	// state, so carry them across the reset and restore them before choosing
+	// the physical file. A nil/empty preview_path means decode the source.
+	//
+	// dec.preview_path points INTO dec.preview_path_buf, which the reset wipes,
+	// so stage the bytes in a local buffer first -- restoring from the aliased
+	// cstring would copy the zeroed buffer back out (an empty open path).
+	preview_buf: [4096]u8
+	preview_len := 0
+	have_preview := dec.preview_path != nil && string(dec.preview_path) != "" && string(dec.preview_path) != string(path)
+	if have_preview {
+		src_s := string(dec.preview_path)
+		preview_len = min(len(src_s), len(preview_buf) - 1)
+		copy(preview_buf[:preview_len], src_s[:preview_len])
+		preview_buf[preview_len] = 0
+	}
+	saved_base := dec.frame_base
 	if dec.opened {
 		clip_decoder_reset(dec)
 	}
@@ -232,9 +254,18 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	// (probes, ground-truth checks) always decode the ORIGINAL so fidelity and
 	// test symmetry are preserved.
 	open_path := path
-	if fit && dec.preview_path != "" && dec.preview_path != path {
+	if fit && have_preview {
+		// clip_decoder_reset above wiped preview_path; restore the caller's
+		// decode target so the open (and the reopen guard's identity compare)
+		// sees the file this decoder is supposed to be serving.
+		copy(dec.preview_path_buf[:preview_len], preview_buf[:preview_len])
+		dec.preview_path_buf[preview_len] = 0
+		dec.preview_path = cstring(&dec.preview_path_buf[0])
+		open_path = dec.preview_path
+	} else if fit && dec.preview_path != "" && dec.preview_path != path {
 		open_path = dec.preview_path
 	}
+	dec.frame_base = saved_base
 
 	fmt_ctx: ^avfmt.FormatContext
 	if ret := avfmt.open_input(&fmt_ctx, open_path, nil, nil); ret < 0 {
@@ -594,15 +625,13 @@ decode_clip_frame_sync :: proc(dec: ^Clip_Decoder, path: cstring, frame_idx: i64
 		want = dec.preview_path
 	}
 	if !dec.opened || dec.path != path || string(dec.opened_path) != string(want) {
-		if dec.opened {
-			// Reopening discards the RAM cache too: a cache kept across a
-			// physical-file switch (e.g. into the next proxy segment) would
-			// let a cache hit re-claim the decoder's forward position while
-			// the physical decoder is actually parked on a DIFFERENT file --
-			// the exact over-claim that corrupted previews. Cache (24 frames,
-			// ~29ms/frame fill) is cheap; wrong pixels are not.
-			clip_decoder_reset(dec)
-		}
+		// The reopen's reset lives inside open_clip_decoder_ex (not here): it
+		// discards decoder state wholesale -- including the RAM cache, which
+		// must not survive a physical-file switch (a cache kept across e.g.
+		// into the next proxy segment would let a hit re-claim the forward
+		// position while the decoder is parked on a different file) -- but
+		// carries dec.preview_path / dec.frame_base across, since those are
+		// the caller's resolve-for-THIS-frame decode target, not decoder state.
 		if !open_clip_decoder(dec, path) {
 			dec.path = path
 			return false

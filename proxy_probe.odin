@@ -47,7 +47,6 @@ proxy_probe_run :: proc(v: string) {
 
 	import_media(path)
 	frame_count := media_frame_count(probe_media(path))
-	src_w, src_h, _ := probe_video_size(path)
 
 	// 1. Proxy exists on disk.
 	pbuf: [4096]u8
@@ -256,14 +255,13 @@ proxy_bg_probe_run :: proc(v: string) {
 	// proxy build must NOT block this call.
 	import_media(path)
 	frame_count := media_frame_count(file_info_text)
-	pbuf0: [4096]u8
 
 	deadline := sdl.GetTicksNS() + 300_000_000_000
 	last_report := sdl.GetTicksNS()
 	cancel_sent := false
 	reported: int = -1
 	for {
-		active, frac, phase, src := import_bg_status()
+		active, frac, phase, _ := import_bg_status()
 		now := sdl.GetTicksNS()
 
 		// A proxy already complete at import (a prior session's build, cache
@@ -358,6 +356,155 @@ proxy_bg_probe_run :: proc(v: string) {
 		}
 		time.sleep(50 * time.Millisecond)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// NERED_PROXY_PICK_SCAN="<file>": call proxy_pick_for_frame for every source
+// frame with NO decode (fast), and print the frames where the resolved file is
+// not a segment (nil / source). Decouples the picker from the decoder: if the
+// picker serves segments for all frames, the flip lives in the decoder path;
+// if the picker itself flips, the resolver is the bug.
+// ---------------------------------------------------------------------------
+proxy_pick_scan_run :: proc(v: string) {
+	preview_proxy_enabled = true
+	async_import_mode = true
+	parts := strings.split(v, "|")
+	if len(parts) < 1 {
+		fmt.println("proxy-pick-scan: need NERED_PROXY_PICK_SCAN=\"<file>\"")
+		os.exit(2)
+	}
+	inp: [4096]u8
+	n := 0
+	for n < len(parts[0]) && n < len(inp) - 1 {
+		inp[n] = u8(parts[0][n])
+		n += 1
+	}
+	inp[n] = 0
+	path := cstring(&inp[0])
+	import_media(path)
+	frame_count := media_frame_count(file_info_text)
+
+	last_seg: int = -1
+	buf: [4096]u8
+	flips: [dynamic]int
+	for f := i64(0); f < frame_count + 4; f += 1 {
+		pick, base := proxy_pick_for_frame(path, frame_count, f, buf[:])
+		seg := -1
+		if pick != nil && base > 0 {
+			seg = int(base / PROXY_SEG_FRAMES)
+		}
+		if seg != last_seg {
+			fmt.printf(
+				"[pick-scan f=%d] -> %s (base=%d k=%d)\n",
+				f,
+				pick != nil ? string(pick) : "<nil>",
+				base,
+				seg,
+			)
+			last_seg = seg
+		}
+		if pick == nil && seg != last_seg {
+			append(&flips, int(f))
+		}
+	}
+	fmt.printf("[pick-scan] done: nil-frames=%v\n", flips)
+	os.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// NERED_PROXY_STEP="<file>": reproduce the "preview flips to the original
+// source and stays there" bug on a real file + a complete on-disk cache.
+//
+// Mirrors preview_probe_run's deterministic playhead walk but with the proxy
+// ENABLED (the preview probe forces preview_proxy_enabled=false, so it only
+// ever exercises the source decode path). Each playhead step calls
+// update_preview_slots like the live editor; the probe then reports, for the
+// foreground slot, what proxy_pick_for_frame resolved for that clip frame and
+// which physical file slot.dec actually opened. A persistent source after an
+// initial segment serve is the bug reproduced.
+// ---------------------------------------------------------------------------
+proxy_step_probe_run :: proc(v: string) {
+	preview_proxy_enabled = true
+	async_import_mode = true
+	parts := strings.split(v, "|")
+	if len(parts) < 1 {
+		fmt.println("proxy-step: need NERED_PROXY_STEP=\"<file>\"")
+		os.exit(2)
+	}
+	inp: [4096]u8
+	n := 0
+	for n < len(parts[0]) && n < len(inp) - 1 {
+		inp[n] = u8(parts[0][n])
+		n += 1
+	}
+	inp[n] = 0
+	path := cstring(&inp[0])
+	import_media(path)
+
+	clip: ^Clip = nil
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for ci := 0; ci < len(timeline.tracks[t].clips); ci += 1 {
+			if timeline.tracks[t].clips[ci].kind == .Video {
+				clip = &timeline.tracks[t].clips[ci]
+				break
+			}
+		}
+		if clip != nil {
+			break
+		}
+	}
+	if clip == nil {
+		fmt.println("proxy-step: no video clip on timeline")
+		os.exit(1)
+	}
+	frame_count := clip.source_length_frames
+	fmt.println("[proxy-step] imported clip tl=[", clip.timeline_start_frame, ",", clip.timeline_start_frame + frame_count, ") src=[", clip.source_start_frame, ",", clip.source_start_frame + frame_count, ") total_frames =", frame_count)
+
+	source_opens := 0
+	seg_opens := 0
+	flipped_at := i64(-1)
+	last_served_seg: bool
+	for f := i64(0); f < frame_count; f += 1 {
+		playhead.frame = f
+		playhead.playing = false
+		update_preview_slots()
+		for s := 0; s < MAX_PREVIEW_SLOTS; s += 1 {
+			slot := &preview_slots[s]
+			if !slot.in_use {
+				continue
+			}
+			opened_is_seg := slot.dec.opened && slot.dec.opened_path != slot.dec.path
+			if slot.dec.opened {
+				if opened_is_seg {
+					seg_opens += 1
+				} else {
+					source_opens += 1
+				}
+			}
+			served_seg := opened_is_seg && slot.has_frame
+			if served_seg != last_served_seg && f > 0 && served_seg == false && flipped_at < 0 {
+				flipped_at = f
+			}
+			last_served_seg = served_seg
+			fmt.printf(
+				"[proxy-step f=%d] clip_f=%d has_frame=%v dec_opened=%v dec_path=%v opened_path=%q displayed_pick=%08x\n",
+				f,
+				slot.source_start_frame + f - slot.timeline_start_frame,
+				slot.has_frame,
+				slot.dec.opened,
+				slot.dec.path != nil ? string(slot.dec.path) : "nil",
+				slot.dec.opened_path != nil ? string(slot.dec.opened_path) : "",
+				slot.displayed_pick,
+			)
+		}
+	}
+	fmt.printf(
+		"[proxy-step] done: source_opens=%d seg_opens=%d flipped_at=%d\n",
+		source_opens,
+		seg_opens,
+		flipped_at,
+	)
+	os.exit(0)
 }
 
 // buffer_diff_metrics computes mean and max |gt - px| per channel (RGBA packed).

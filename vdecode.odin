@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "base:runtime"
+import "core:fmt"
 import sdl "vendor:sdl3"
 
 // Async_Decoder runs decode from the FRONTMOST video clip on a dedicated worker
@@ -93,6 +94,16 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_b
 		want = preview
 	}
 	if !ad.dec.opened || ad.dec_path != path || string(ad.dec.opened_path) != string(want) {
+		if nered_trace {
+			fmt.printf(
+				"[vdec] REOPEN src_f=%d want=%q opened=%v opened_path=%q preview=%q\n",
+				frame_idx + frame_base,
+				string(want),
+				ad.dec.opened,
+				ad.dec.opened_path != nil ? string(ad.dec.opened_path) : "",
+				preview != nil ? string(preview) : "<nil>",
+			)
+		}
 		decoder_set_preview(&ad.dec, preview, frame_base)
 		if !open_clip_decoder(&ad.dec, path) {
 			ad.dec_path = path

@@ -874,6 +874,13 @@ main :: proc() {
 		preview_probe_run(probe_paths)
 		return
 	}
+if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); psp != "" {
+		async_live_mode = false
+		async_dec_init()
+		defer async_dec_shutdown()
+		proxy_step_probe_run(psp)
+		return
+	}
 	if bp, _ := os.lookup_env_alloc("VYPER_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
 		async_live_mode = false
 		async_dec_init()
@@ -899,6 +906,10 @@ main :: proc() {
 	}
 if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); xb != "" {
 		proxy_bg_probe_run(xb)
+		return
+	}
+	if ps, _ := os.lookup_env_alloc("NERED_PROXY_PICK_SCAN", context.temp_allocator); ps != "" {
+		proxy_pick_scan_run(ps)
 		return
 	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
