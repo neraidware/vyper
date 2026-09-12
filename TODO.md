@@ -1,5 +1,74 @@
 # vyper TODO
 
+## Active — Unicode text + GPU glyph cache (full font coverage)
+
+**Status:** UI text (`render_text`) bakes a fixed 512px atlas of 95 ASCII
+chars at 32px and loops bytes, so `é` (and any non-ASCII) is dropped both by
+the byte-loop clamp and the missing atlas entry. Text clips/subtitles are
+**already Unicode-safe** (`textclip.odin` iterates runes via
+`stb.MakeCodepointBitmap`) — no work there. Input already routes composed
+UTF-8 through `SDL_StartTextInput` + `.TEXT_INPUT` (event.odin:116); `é`
+reaches the buffer, it just never renders. Goal: cache every glyph the font
+provides, GPU-side, on demand.
+
+Design decisions (from 2026-09-12 review):
+- **Dynamic growable atlas**, R8, bake-at-32px keeping the current
+  `scale = fontSize/32` model (UI sizes are 11–18px, so 32px bake is
+  sharp). Fixed 48px cells (4px bleed), grid doubles 16→32→64 cells/side
+  (1024→2048→4096px).
+- **Flat direct-index `rune_map[0x110000]u32`** (4.4MB session-heap block,
+  single allocation) instead of a hash map — O(1) lookup, no hot-path
+  hashing. `slots` grow-only array, cap 4096, zero value = unused.
+- **Deferred baking**: `render_text` runs mid-render-pass, cannot start a
+  GPU copy pass. Missing glyph → record in pending list (coalesced per
+  frame), skip quad that frame. Pre-swapchain in `render_ui_frame`
+  (frame.odin, after thumbnail uploads, before AcquireSwapchainTexture)
+  bake + upload only dirty cells via region copy.
+- **Grow = re-create texture 2x, re-bake all cached runes into it** (no
+   9MB CPU pixel mirror retained; re-bake is CPU-cheap, measure with
+   spall — one-time ~ms hitch on a rare event).
+- ASCII 0x20–0x7E prebaked in `upload_font_atlas` replacement.
+- Combining marks overlay naturally (zero-advance quads) — no shaping. Full
+  harfbuzz shaping is a separate future task, explicitly out of scope here.
+- Unsupported runes (e.g. emoji the face lacks) blank this phase; tofu box
+  is a later polish item.
+
+Steps (each lands + passes probe + vet before the next):
+- [ ] S1. CPU core in `gpu_renderer.odin`: `Glyph_Atlas` struct (texture/
+      sampler, cells_x/y, generation, `rune_map`, `slots`, pending/dirty
+      lists) + slot allocator + cell-grid placement + `glyph_ensure(rune)`
+      doing metrics-only bake (advance/bbox via `stbtt_GetCodepointHMetrics`
+      + `GetCodepointBitmapBox`, no pixels yet). Extend `ui_probe` (rename
+      the ASCII-only assertion at ui_probe.odin:69) or add a CPU-only
+      `font_probe` covering: slot allocation, cell layout on grid growth,
+      rune dedup, rune_map round-trip.
+- [ ] S2. `render_text` (gpu_draw.odin:758) iterates runes via `utf8`
+      decode over `chars[0:length]`; draws from slot metrics+UV; missing
+      glyph → queue pending + skip. Delete the byte clamp and the
+      `stb.GetBakedQuad`/`renderer.font.chars[95]` call sites.
+- [ ] S3. `input_advance_up_to` (gpu_draw.odin:387) decodes runes and sums
+      cached advances so caret/selection track non-ASCII text.
+- [ ] S4. Deferred bake + upload in `render_ui_frame`: CPU-bake pending
+      glyphs, assign cells, upload dirty cells via copy pass (no render
+      pass open there), grow on capacity. Remove fixed 512 atlas
+      (`Font_Atlas` → `Glyph_Atlas`, `upload_font_atlas` → prebake ASCII +
+      dynamic path).
+- [ ] S5. `measure_text` (font.odin:58) counts runes, not bytes, for the
+      0.55/character layout estimate (optional later: exact stbtt advance).
+- [ ] S6. Input verification: probe confirms a composed `é` via
+      `text_input_insert` renders a non-empty glyph; lifecycle polish —
+      `SDL_StartTextInput`/`StopTextInput` scoped to when a field is open
+      (so IME never eats global hotkeys); `.TEXT_EDITING` (IME preedit)
+      optional in a later pass.
+- [ ] ACCEPT: type `é`, `Й`, `ω`, `日本` in the rename popup and each
+      renders glyph-true and moves the caret correctly; no per-frame
+      allocation (temp allocator only for bake scratch); spall trace shows
+      glyph bake+upload outside the hot frame path; probes + `-vet` green.
+
+Out of scope (future): harfbuzz shaping, color/emoji glyphs, tofu box,
+per-size-bucket baking for >32px UI text, IME preedit UI, exact-advance
+text measurement for layout.
+
 ## Phase 1 — Performance, Cleanup, Refactoring, Polish
 
 - Proxy lag: decode cost grows monotonically within a segment (file-position
