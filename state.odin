@@ -30,6 +30,7 @@ BUTTON :: clay.Color{42, 42, 55, 255}
 BUTTON_BORDER :: clay.Color{84, 82, 105, 255}
 BUTTON_HOVER :: clay.Color{50, 50, 65, 255}
 BUTTON_BORDER_HOVER :: clay.Color{126, 180, 198, 255} // wave blue
+SWITCH_TRACK_ON :: clay.Color{36, 55, 66, 255} // muted wave blue switch track when active
 AUDIO_CLIP :: clay.Color{76, 58, 78, 255}
 SELECT_BORDER :: clay.Color{96, 150, 255, 255} // selection blue
 MARKER_COLOR :: clay.Color{226, 190, 101, 255} // carp yellow

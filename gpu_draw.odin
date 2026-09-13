@@ -940,8 +940,9 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 		true
 }
 
-// draw_ui_icons overlays the vector icons for the duplicate/remove-track, jog
-// and snap toggles. The clay elements are hit-test targets (main.odin) with ids
+// draw_ui_icons overlays the vector icons for the duplicate/remove-track and
+// jog buttons plus the snap switch toggles (their labels are small glyphs next
+// to each pill). The clay elements are hit-test targets (main.odin) with ids
 // unchanged; only the visuals move from baked glyphs to embedded icons. Active
 // toggles and the highlighted jog direction tint brighter, mirroring the text
 // labels they replace.
@@ -950,6 +951,24 @@ draw_ui_icons :: proc(
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 ) {
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"SnapClipToPhSwitchIcon",
+		.SnapClipToPlayhead,
+		snap_clips_to_playhead,
+		14,
+	)
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"SnapPhToClipSwitchIcon",
+		.SnapPlayheadToClip,
+		snap_playhead_to_clips,
+		14,
+	)
 	draw_icon_in_element(
 		renderer,
 		command_buffer,
@@ -967,24 +986,6 @@ draw_ui_icons :: proc(
 		.SkipForward,
 		playhead.playing && playback_dir == 1,
 		15,
-	)
-	draw_icon_in_element(
-		renderer,
-		command_buffer,
-		pass,
-		"SnapClipToPh",
-		.SnapClipToPlayhead,
-		snap_clips_to_playhead,
-		14,
-	)
-	draw_icon_in_element(
-		renderer,
-		command_buffer,
-		pass,
-		"SnapPhToClip",
-		.SnapPlayheadToClip,
-		snap_playhead_to_clips,
-		14,
 	)
 	// The Duplicate/Remove icons sit in the scrolled track-name gutters, so
 	// their clay boxes move off-window when a track scrolls out of view.

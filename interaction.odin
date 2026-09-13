@@ -162,9 +162,9 @@ click_cases := []Click_Case{
 			}
 		}
 	} },
-	{ id = "Res720", action = proc(_: Mouse_Input) { set_project_resolution(1280, 720) } },
-	{ id = "Res1080", action = proc(_: Mouse_Input) { set_project_resolution(1920, 1080) } },
-	{ id = "Res4K", action = proc(_: Mouse_Input) { set_project_resolution(3840, 2160) } },
+	{ id = "Res720", action = proc(_: Mouse_Input) { set_project_resolution_preset(1280, 720) } },
+	{ id = "Res1080", action = proc(_: Mouse_Input) { set_project_resolution_preset(1920, 1080) } },
+	{ id = "Res4K", action = proc(_: Mouse_Input) { set_project_resolution_preset(3840, 2160) } },
 	{ id = "ResAuto", action = proc(_: Mouse_Input) { set_project_resolution_auto() } },
 	{ id = "OrientVertical", action = proc(_: Mouse_Input) { set_project_orientation(!(project.height > project.width)) } },
 	{ id = "SnapCenter", action = proc(_: Mouse_Input) { snap_center_to_canvas = !snap_center_to_canvas } },
@@ -185,6 +185,18 @@ click_cases := []Click_Case{
 	{ hit = proc(inp: Mouse_Input) -> bool {
 		return len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("Ruler"))
 	}, action = proc(_: Mouse_Input) { active_interaction = .Playhead_Scrub } },
+}
+
+// Apply a resolution preset without losing the current canvas orientation.
+// Presets are stored as landscape dimensions; portrait mode swaps the pair so
+// choosing another preset preserves the user's portrait setting.
+set_project_resolution_preset :: proc(w, h: c.int) {
+	portrait := project.height > project.width
+	if portrait {
+		set_project_resolution(h, w)
+	} else {
+		set_project_resolution(w, h)
+	}
 }
 
 dispatch_click_table :: proc(inp: Mouse_Input) -> bool {

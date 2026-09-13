@@ -46,9 +46,9 @@
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
             ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
+            odin check . -strict-style -vet-using-param -vet-using-stmt
             odin build . -out:vyper \
               -microarch:native -o:aggressive -no-bounds-check \
-              -strict-style -vet-using-param -vet-using-stmt \
               -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
           '';
           # The binary is linked against SDL3/SDL3_ttf/vulkan-loader + the

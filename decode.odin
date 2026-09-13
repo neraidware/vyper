@@ -214,6 +214,27 @@ open_clip_decoder :: proc(dec: ^Clip_Decoder, path: cstring) -> bool {
 	return open_clip_decoder_ex(dec, path, -1, PREVIEW_W, PREVIEW_H, true)
 }
 
+// footage_video_stream returns the first video stream whose disposition is not
+// an attached picture (embedded cover art), or -1 when a file carries only
+// cover art. Covers demux as AVStreams that some demuxers never register as
+// real streams — seeking them is a crash — and they hold no playable frames.
+footage_video_stream :: proc(fmt_ctx: ^avfmt.FormatContext) -> c.int {
+	for i in 0 ..< int(fmt_ctx.nb_streams) {
+		s := fmt_ctx.streams[i]
+		if s == nil || s.codecpar == nil {
+			continue
+		}
+		if s.codecpar.codec_type != avutil.MediaType.Video {
+			continue
+		}
+		if .Attached_Pic in s.disposition {
+			continue
+		}
+		return c.int(i)
+	}
+	return -1
+}
+
 // open_clip_decoder_ex opens a video stream (stream_index >= 0 selects the
 // stream_index-th video stream, -1 picks the best one) and scales every decoded
 // frame into a dst_w x dst_h RGBA buffer. When fit is true the source is
@@ -279,7 +300,10 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	}
 	idx: c.int = -1
 	if stream_index >= 0 {
-		// Count video streams until the requested index is reached.
+		// Count video streams until the requested index is reached. Attached
+		// pictures (embedded cover art) are metadata, not footage — an Ogg/Opus
+		// file carrying one demuxes its cover into an AVStream that is no real
+		// Ogg stream, and seeking it aborts the demuxer.
 		seen := c.int(0)
 		for i in 0 ..< int(fmt_ctx.nb_streams) {
 			s := fmt_ctx.streams[i]
@@ -287,6 +311,9 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 				continue
 			}
 			if s.codecpar.codec_type != avutil.MediaType.Video {
+				continue
+			}
+			if .Attached_Pic in s.disposition {
 				continue
 			}
 			if seen == stream_index {
@@ -298,6 +325,9 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	}
 	if idx < 0 {
 		idx = avfmt.find_best_stream(fmt_ctx, .Video, -1, -1, nil, 0)
+		if idx >= 0 && .Attached_Pic in fmt_ctx.streams[idx].disposition {
+			idx = footage_video_stream(fmt_ctx)
+		}
 	}
 	if idx < 0 {
 		fmt.println("no video stream:", ff_err_str(idx))
@@ -712,6 +742,13 @@ probe_streams :: proc(path: cstring) -> Stream_Probe {
 		}
 		#partial switch stream.codecpar.codec_type {
 		case avutil.MediaType.Video:
+			// Attached pictures (cover art) are metadata, not footage — a pure
+			// Opus file demuxes its cover as a fake video stream. Skip them so
+			// such files import as audio and never get a video clip that would
+			// seek a stream the demuxer doesn't actually own.
+			if .Attached_Pic in stream.disposition {
+				continue
+			}
 			probe.video_streams += 1
 			probe.has_video = true
 			if probe.video_fps_num <= 0 && stream.avg_frame_rate.num > 0 {
@@ -759,7 +796,9 @@ import_obs_chapters :: proc(path: cstring) -> [dynamic]Clip_Marker {
 		if stream == nil || stream.codecpar == nil {
 			continue
 		}
-		if stream.codecpar.codec_type == avutil.MediaType.Video && video_idx < 0 {
+		if stream.codecpar.codec_type == avutil.MediaType.Video && video_idx < 0 && !(.Attached_Pic in stream.disposition) {
+			// Cover art demuxes as a video stream; never use it as the chapter
+			// clock — it has no frames and its rate is meaningless.
 			video_idx = c.int(i)
 		}
 		if stream.codecpar.codec_type != avutil.MediaType.Subtitle {

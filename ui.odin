@@ -816,9 +816,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					},
 					) {
-						bar_caption("Snap:")
-						timeline_snap_button("SnapClipToPh", snap_clips_to_playhead)
-						timeline_snap_button("SnapPhToClip", snap_playhead_to_clips)
+						switch_toggle("SnapClipToPh", "", snap_clips_to_playhead, .SnapClipToPlayhead)
+						switch_toggle("SnapPhToClip", "", snap_playhead_to_clips, .SnapPlayheadToClip)
 					}
 				}
 			}
@@ -928,7 +927,7 @@ project_card :: proc() {
 		},
 	},
 	) {
-		vertical_toggle_button("OrientVertical", "Vertical")
+		switch_toggle("OrientVertical", "Portrait canvas", project.height > project.width)
 	}
 	panel_caption("Frame rate")
 	if clay.UI(clay.ID("FpsRow1"))(
@@ -1111,8 +1110,7 @@ clip_card :: proc() {
 				},
 			},
 			) {
-				panel_caption("Align:")
-				settings_button("SnapCenter", "Snap to canvas center", snap_center_to_canvas)
+				switch_toggle("SnapCenter", "Snap center", snap_center_to_canvas)
 			}
 			panel_caption("Crop (percent of box)")
 			l_buf := UI_TEXT_L[:]
@@ -1374,39 +1372,89 @@ res_auto_button :: proc() {
 	settings_button("ResAuto", "Auto", !resolution_locked)
 }
 
-// vertical_toggle_button renders a single persistent toggle for canvas
-// orientation: held when the canvas is currently portrait (taller than
-// wide), unpressed when landscape.
-vertical_toggle_button :: proc(name: string, label: string) {
-	settings_button(name, label, project.height > project.width)
+// switch_toggle is the shared binary control. Only the switch track owns the
+// semantic ID used by input handling; the label and surrounding row are
+// passive. That means clicking the text never toggles the setting -- the track
+// is the only hit target.
+switch_toggle :: proc(name, label: string, active: bool, icon: Maybe(Icon_Id) = nil) {
+	row_buf: [64]u8
+	label_buf: [64]u8
+	knob_buf: [64]u8
+	icon_buf: [64]u8
+	row_id := fmt.bprintf(row_buf[:], "%sSwitchRow", name)
+	label_id := fmt.bprintf(label_buf[:], "%sSwitchLabel", name)
+	knob_id := fmt.bprintf(knob_buf[:], "%sSwitchKnob", name)
+	icon_id := fmt.bprintf(icon_buf[:], "%sSwitchIcon", name)
+
+	if clay.UI(clay.ID(row_id))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(SWITCH_H + 4)},
+			layoutDirection = .LeftToRight,
+			childAlignment = {x = .Left, y = .Center},
+		},
+	},
+	) {
+		if clay.UI(clay.ID(label_id))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				childAlignment = {x = .Left, y = .Center},
+			},
+		},
+		) {
+			if icon == nil {
+				clay.Text(
+					label,
+					clay.TextElementConfig{textColor = active ? TEXT : BUTTON_BORDER, fontSize = FONT_NORMAL},
+				)
+			}
+		}
+
+		if icon != nil {
+			// Icon rows replace the label with a glyph drawn right next to the
+			// switch. draw_ui_icons fills this slot by element id from the
+			// toggle's own state, so the pill and its icon always agree.
+			if clay.UI(clay.ID(icon_id))(
+			{
+				layout = {
+					sizing = {width = clay.SizingFixed(SWITCH_H), height = clay.SizingFixed(SWITCH_H)},
+					childAlignment = {x = .Center, y = .Center},
+				},
+			},
+			) {}
+		}
+
+		// The semantic ID deliberately belongs only to the switch itself. The
+		// label is a sibling, so pointer/click hit testing cannot reach `name`
+		// when the user clicks the text.
+		if clay.UI(clay.ID(name))(
+		{
+			layout = {
+				sizing = {width = clay.SizingFixed(SWITCH_W), height = clay.SizingFixed(SWITCH_H)},
+				padding = clay.PaddingAll(3),
+				childAlignment = {x = active ? .Right : .Left, y = .Center},
+			},
+			backgroundColor = active ? SWITCH_TRACK_ON : TEXT_INPUT_BG,
+			border = {color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(SWITCH_H / 2),
+		},
+		) {
+			if clay.UI(clay.ID(knob_id))(
+			{
+				layout = {sizing = {width = clay.SizingFixed(SWITCH_KNOB), height = clay.SizingFixed(SWITCH_KNOB)}},
+				backgroundColor = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+				cornerRadius = clay.CornerRadiusAll(SWITCH_KNOB / 2),
+			},
+			) {}
+		}
+	}
 }
 
 // fps_preset_button renders a frame-rate preset, held when it matches the
 // project's current fps (0 = auto).
 fps_preset_button :: proc(name: string, label: string, fps: f64) {
 	settings_button(name, label, project.frame_rate == fps)
-}
-
-// timeline_snap_button renders one of the two snap toggles living in the
-// timeline bottom bar. Held (highlighted border) while its snap behavior is
-// active; the icon is an embedded overlay (draw_ui_icons), so this element
-// only claims button visuals.
-timeline_snap_button :: proc(name: string, active: bool) {
-	if clay.UI(clay.ID(name))(
-	{
-		layout = {
-			sizing = {width = clay.SizingFixed(26), height = clay.SizingFixed(26)},
-			childAlignment = {x = .Center, y = .Center},
-		},
-		backgroundColor = active ? clay.Color{50, 62, 78, 255} : BUTTON,
-		border = {
-			color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-			width = clay.BorderOutside(active ? 2 : 1),
-		},
-		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-	},
-	) {
-	}
 }
 
 // playback_rate_label returns the display text for a playback rate value:

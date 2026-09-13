@@ -18,6 +18,9 @@ SECTION_GAP :: 16     // childGap between major panels/columns.
 // Button geometry.
 BUTTON_HEIGHT :: f32(28)   // Small action buttons (transport, settings, menu rows).
 BUTTON_H_PAD :: 10         // Padding{left/right} inside small buttons/fields.
+SWITCH_W :: f32(40)        // Binary toggle (switch_toggle) track width.
+SWITCH_H :: f32(22)        // Binary toggle (switch_toggle) track height.
+SWITCH_KNOB :: f32(16)     // Binary toggle (switch_toggle) knob diameter.
 
 // Corner radii (visual hierarchy: container > panel > widget > button).
 RADIUS_CONTAINER :: 8
