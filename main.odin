@@ -923,6 +923,9 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if !load_font_data() {
 		return
 	}
+	if fp, _ := os.lookup_env_alloc("NERED_FONT_PROBE", context.temp_allocator); fp != "" {
+		font_probe_run()
+	}
 	if sub_render_probe, _ := os.lookup_env_alloc(
 		"VYPER_SUB_RENDER_PROBE",
 		context.temp_allocator,
@@ -981,6 +984,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	defer sdl.ReleaseGPUGraphicsPipeline(device, renderer.preview_pipeline)
 	defer sdl.ReleaseGPUTexture(device, renderer.font.texture)
 	defer sdl.ReleaseGPUSampler(device, renderer.font.sampler)
+	defer glyph_atlas_destroy(&renderer.font)
 	defer release_preview_textures(device, renderer.preview_textures[:])
 	defer release_slot_owned_textures(device)
 	defer sdl.ReleaseGPUSampler(device, renderer.preview_sampler)
@@ -991,12 +995,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	}
 	// Media-bin thumbnails own per-asset GPU textures; free them at shutdown.
 	defer release_media_asset_textures(device)
+	// Cache metrics for printable ASCII so plain-text UI never waits on a
+	// grow round-trip; ink pixels land on the first deferred upload pass.
+	glyph_atlas_ensure_ascii(&renderer.font)
 	initial_upload := sdl.AcquireGPUCommandBuffer(device)
 	if initial_upload == nil ||
-	   !upload_font_atlas(&renderer, initial_upload) ||
 	   !upload_icons(&renderer, initial_upload) ||
 	   !sdl.SubmitGPUCommandBuffer(initial_upload) {
-		fmt.println("Could not upload font atlas:", sdl.GetError())
+		fmt.println("Could not upload initial GPU data:", sdl.GetError())
 		return
 	}
 
