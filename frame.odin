@@ -112,7 +112,7 @@ render_ui_frame :: proc(
 	renderer.viewport = {f32(pixel_width), f32(pixel_height)}
 	color_target := sdl.GPUColorTargetInfo {
 		texture     = swapchain_texture,
-		clear_color = sdl.FColor{10.0 / 255, 11.0 / 255, 14.0 / 255, 1},
+		clear_color = sdl.FColor{35.0 / 255, 42.0 / 255, 46.0 / 255, 1},
 		load_op     = .CLEAR,
 		store_op    = .STORE,
 	}

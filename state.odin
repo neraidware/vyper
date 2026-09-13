@@ -21,30 +21,36 @@ WINDOW_HEIGHT :: 720
 PREVIEW_W :: 768
 PREVIEW_H :: 432
 
-BACKGROUND :: clay.Color{31, 31, 40, 255} // sumi ink
-EDITOR_BG :: clay.Color{36, 36, 46, 255}
+// Everforest dark medium-contrast palette. Backgrounds climb the bg_dim→bg4
+// ladder (raised surfaces get brighter), fg/grey* carry text and borders, and
+// the accents are semantic: green for anything active/hovered, blue for
+// selection, yellow/orange/red for markers and errors. Hex values are the
+// theme's own (palette.md), the alpha-lowered variants stay inline at the draw
+// site that needs them.
+BACKGROUND :: clay.Color{35, 42, 46, 255} // bg_dim — dimmed window background
+EDITOR_BG :: clay.Color{45, 53, 59, 255} // bg0 — default editor background
 // TRACK_GUTTER_BG paints the left track-name column (and its ruler header strip)
 // so the name gutter reads as a distinct panel from the clip lane area.
-TRACK_GUTTER_BG :: clay.Color{46, 49, 62, 255}
-BUTTON :: clay.Color{42, 42, 55, 255}
-BUTTON_BORDER :: clay.Color{84, 82, 105, 255}
-BUTTON_HOVER :: clay.Color{50, 50, 65, 255}
-BUTTON_BORDER_HOVER :: clay.Color{126, 180, 198, 255} // wave blue
-SWITCH_TRACK_ON :: clay.Color{36, 55, 66, 255} // muted wave blue switch track when active
-AUDIO_CLIP :: clay.Color{76, 58, 78, 255}
-SELECT_BORDER :: clay.Color{96, 150, 255, 255} // selection blue
-MARKER_COLOR :: clay.Color{226, 190, 101, 255} // carp yellow
-TOOLTIP_BG :: clay.Color{43, 43, 53, 255}
-TOOLTIP_TEXT :: clay.Color{220, 215, 198, 255}
-RANGE_COLOR :: clay.Color{139, 173, 109, 255}
-HANDLE_FILL :: clay.Color{24, 24, 32, 255}
-HANDLE_BORDER :: clay.Color{115, 115, 125, 255}
-TEXT :: clay.Color{220, 215, 198, 255}
-TEXT_INPUT_BG :: clay.Color{15, 17, 22, 255}
+TRACK_GUTTER_BG :: clay.Color{52, 63, 68, 255} // bg1 — raised panel
+BUTTON :: clay.Color{61, 72, 77, 255} // bg2 — raised control fill
+BUTTON_BORDER :: clay.Color{133, 146, 137, 255} // grey1 — UI border
+BUTTON_HOVER :: clay.Color{71, 82, 88, 255} // bg3 — hover raises a step
+BUTTON_BORDER_HOVER :: clay.Color{167, 192, 128, 255} // green — active accent (hover, focus, held)
+SWITCH_TRACK_ON :: clay.Color{66, 80, 71, 255} // bg_green — muted green switch track when active
+AUDIO_CLIP :: clay.Color{84, 58, 72, 255} // bg_visual — muted purple clip fill
+SELECT_BORDER :: clay.Color{127, 187, 179, 255} // blue — selection
+MARKER_COLOR :: clay.Color{219, 188, 127, 255} // yellow — clip markers
+TOOLTIP_BG :: clay.Color{61, 72, 77, 255} // bg2 — popup/tooltip surface
+TOOLTIP_TEXT :: clay.Color{211, 198, 170, 255} // fg
+RANGE_COLOR :: clay.Color{167, 192, 128, 255} // green — active range chevrons
+HANDLE_FILL :: clay.Color{35, 42, 46, 255} // bg_dim — thumb fill inside the blue handle
+HANDLE_BORDER :: clay.Color{133, 146, 137, 255} // grey1
+TEXT :: clay.Color{211, 198, 170, 255} // fg — warm off-white
+TEXT_INPUT_BG :: clay.Color{35, 42, 46, 255} // bg_dim — recessed input, switch-off track
 
 RULER_HEIGHT :: f32(30)
-RULER_TICK_COLOR :: clay.Color{80, 90, 110, 255}
-RULER_LABEL_COLOR :: clay.Color{170, 180, 200, 255}
+RULER_TICK_COLOR :: clay.Color{79, 88, 94, 255} // bg4 — ruler ticks
+RULER_LABEL_COLOR :: clay.Color{157, 169, 160, 255} // grey2 — ruler labels
 // Timeline navigation: timeline_view_start is the first visible frame (pan),
 // timeline_zoom is horizontal pixels per frame, and timeline_view_top is the
 // vertical scroll offset over the track rows (so many tracks stay reachable).

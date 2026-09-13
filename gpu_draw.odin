@@ -359,7 +359,7 @@ draw_text_input_caret :: proc(
 				width = max(2, x1 - x0),
 				height = box.height - 8,
 			},
-			clay.Color{56, 90, 170, 170},
+			clay.Color{127, 187, 179, 170},
 			2,
 			0,
 		)
@@ -632,11 +632,11 @@ draw_drag_ghost :: proc(
 				width  = w,
 				height = CLIP_TILE_HEIGHT,
 			}
-			fill := clay.Color{140, 200, 255, 80}
-			edge := clay.Color{140, 200, 255, 220}
+			fill := clay.Color{127, 187, 179, 80}
+			edge := clay.Color{127, 187, 179, 220}
 			if refused {
-				fill = clay.Color{255, 70, 70, 80}
-				edge = clay.Color{255, 70, 70, 230}
+				fill = clay.Color{230, 126, 128, 80}
+				edge = clay.Color{230, 126, 128, 230}
 			}
 			sdl.SetGPUScissor(
 				pass,
@@ -684,8 +684,8 @@ draw_drag_ghost :: proc(
 		pass,
 		sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
 	)
-	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 80}, 6, 0)
-	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{140, 200, 255, 220}, 6, 2)
+	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{127, 187, 179, 80}, 6, 0)
+	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{127, 187, 179, 220}, 6, 2)
 	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 }
 

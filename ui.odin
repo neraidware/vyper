@@ -560,7 +560,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 											},
 											childAlignment = {x = .Center, y = .Center},
 										},
-										backgroundColor = button_hovered ? clay.Color{36, 60, 84, 255} : EDITOR_BG,
+										backgroundColor = button_hovered ? clay.Color{58, 81, 93, 255} : EDITOR_BG,
 										cornerRadius = clay.CornerRadiusAll(3),
 									},
 									) {
@@ -2158,7 +2158,7 @@ media_bin_item :: proc(index: int) {
 			layout = {
 				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(MEDIA_THUMB_H)},
 			},
-			backgroundColor = clay.Color{21, 24, 27, 255},
+			backgroundColor = clay.Color{61, 72, 77, 255},
 			cornerRadius = clay.CornerRadiusAll(4),
 		},
 		) {

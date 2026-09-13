@@ -294,9 +294,9 @@ media_kind_color :: proc(kind: Media_Kind) -> clay.Color {
 	case .Audio:
 		return AUDIO_CLIP
 	case .Video:
-		return clay.Color{52, 66, 84, 255} // muted blue for a video without a thumb
+		return clay.Color{58, 81, 93, 255} // bg_blue: a video without a thumb reads as muted footage
 	case .Subtitles:
-		return clay.Color{214, 138, 34, 255} // amber: subtitles have no decoded frame
+		return clay.Color{230, 152, 117, 255} // orange: subtitles have no decoded frame
 	case:
 		return BUTTON
 	}
@@ -386,15 +386,15 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 				// clay's last command (or the previous lane's clip rect) left
 				// would clip the name column out of frame.
 				sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
-				render_sdf_rect(renderer, command_buffer, pass, row, clay.Color{52, 66, 84, 110}, 4, 0)
+				render_sdf_rect(renderer, command_buffer, pass, row, clay.Color{58, 81, 93, 110}, 4, 0)
 				// Name-gutter overlay: the dark row ghost is nearly invisible
 				// against the lighter TRACK_GUTTER_BG, so paint the gutter column
 				// with a bold cyan wash + outline that cannot blend into the
 				// background.
 				if gx >= 0 {
 					header := clay.BoundingBox{x = gx, y = lane_box.y, width = GUTTER_WIDTH, height = lane_box.height}
-					render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 120}, 0, 0)
-					render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{140, 200, 255, 255}, 0, 2)
+render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179, 120}, 0, 0)
+				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179, 255}, 0, 2)
 				}
 			}
 			if media_drag_trace_once {
@@ -420,7 +420,7 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 					fill[3] = 150
 					render_sdf_rect(renderer, command_buffer, pass, b, fill, 6, 0)
 				}
-				render_sdf_rect(renderer, command_buffer, pass, b, clay.Color{255, 70, 70, 230}, 6, 2)
+				render_sdf_rect(renderer, command_buffer, pass, b, clay.Color{230, 126, 128, 230}, 6, 2)
 				continue
 			}
 			if lane.kind == .Video && lane.has_video_thumb {
@@ -445,7 +445,7 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 					lineHeight = FONT_NORMAL,
 				})
 			}
-			render_sdf_rect(renderer, command_buffer, pass, b, clay.Color{140, 200, 255, 220}, 6, 2)
+			render_sdf_rect(renderer, command_buffer, pass, b, clay.Color{127, 187, 179, 220}, 6, 2)
 		}
 		sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 	}
@@ -476,7 +476,7 @@ draw_media_drag_float :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 	} else {
 		render_sdf_rect(renderer, command_buffer, pass, tile, media_kind_color(asset.kind), 4, 1)
 	}
-	render_sdf_rect(renderer, command_buffer, pass, tile, clay.Color{140, 200, 255, 230}, 4, 2)
+	render_sdf_rect(renderer, command_buffer, pass, tile, clay.Color{127, 187, 179, 230}, 4, 2)
 	name := path_basename(asset.path)
 	label_w := f32(len(name)) * f32(FONT_SMALL) * 0.6
 	pill := clay.BoundingBox{x = tile.x, y = tile.y + tile.height + 4, width = max(label_w + 8, 40), height = 16}
