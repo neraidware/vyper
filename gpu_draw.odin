@@ -941,11 +941,11 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 }
 
 // draw_ui_icons overlays the vector icons for the duplicate/remove-track and
-// jog buttons plus the snap switch toggles (their labels are small glyphs next
-// to each pill). The clay elements are hit-test targets (main.odin) with ids
-// unchanged; only the visuals move from baked glyphs to embedded icons. Active
-// toggles and the highlighted jog direction tint brighter, mirroring the text
-// labels they replace.
+// jog buttons plus the snap playhead/clip toggle buttons (settings_icon_button).
+// The clay elements are hit-test targets (main.odin) with ids unchanged; only
+// the visuals move from baked glyphs to embedded icons. Active toggles and the
+// highlighted jog direction tint brighter, mirroring the text labels they
+// replace.
 draw_ui_icons :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -955,19 +955,19 @@ draw_ui_icons :: proc(
 		renderer,
 		command_buffer,
 		pass,
-		"SnapClipToPhSwitchIcon",
+		"SnapClipToPh",
 		.SnapClipToPlayhead,
 		snap_clips_to_playhead,
-		14,
+		16,
 	)
 	draw_icon_in_element(
 		renderer,
 		command_buffer,
 		pass,
-		"SnapPhToClipSwitchIcon",
+		"SnapPhToClip",
 		.SnapPlayheadToClip,
 		snap_playhead_to_clips,
-		14,
+		16,
 	)
 	draw_icon_in_element(
 		renderer,

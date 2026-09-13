@@ -816,8 +816,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					},
 					) {
-						switch_toggle("SnapClipToPh", "", snap_clips_to_playhead, .SnapClipToPlayhead)
-						switch_toggle("SnapPhToClip", "", snap_playhead_to_clips, .SnapPlayheadToClip)
+						settings_icon_button("SnapClipToPh", snap_clips_to_playhead)
+						settings_icon_button("SnapPhToClip", snap_playhead_to_clips)
 					}
 				}
 			}
@@ -1375,22 +1375,29 @@ res_auto_button :: proc() {
 // switch_toggle is the shared binary control. Only the switch track owns the
 // semantic ID used by input handling; the label and surrounding row are
 // passive. That means clicking the text never toggles the setting -- the track
-// is the only hit target.
-switch_toggle :: proc(name, label: string, active: bool, icon: Maybe(Icon_Id) = nil) {
+// is the only hit target. Icon rows reuse the label slot (drawn right-aligned
+// up against the pill by draw_ui_icons). The row sizes to its content rather
+// than growing: the control never stretches into extra space it doesn't own,
+// so a toggle stays the size of its label plus its pill wherever it sits.
+// switch_toggle is the shared binary control. Only the switch track owns the
+// semantic ID used by input handling; the label and surrounding row are
+// passive. That means clicking the text never toggles the setting -- the track
+// is the only hit target. The row sizes to its content rather than growing:
+// the control never stretches into extra space it doesn't own.
+switch_toggle :: proc(name, label: string, active: bool) {
 	row_buf: [64]u8
 	label_buf: [64]u8
 	knob_buf: [64]u8
-	icon_buf: [64]u8
 	row_id := fmt.bprintf(row_buf[:], "%sSwitchRow", name)
 	label_id := fmt.bprintf(label_buf[:], "%sSwitchLabel", name)
 	knob_id := fmt.bprintf(knob_buf[:], "%sSwitchKnob", name)
-	icon_id := fmt.bprintf(icon_buf[:], "%sSwitchIcon", name)
 
 	if clay.UI(clay.ID(row_id))(
 	{
 		layout = {
-			sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(SWITCH_H + 4)},
+			sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(SWITCH_H + 4)},
 			layoutDirection = .LeftToRight,
+			childGap = BUTTON_ROW_GAP,
 			childAlignment = {x = .Left, y = .Center},
 		},
 	},
@@ -1398,31 +1405,15 @@ switch_toggle :: proc(name, label: string, active: bool, icon: Maybe(Icon_Id) = 
 		if clay.UI(clay.ID(label_id))(
 		{
 			layout = {
-				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				sizing = {width = clay.SizingFit({}), height = clay.SizingGrow({})},
 				childAlignment = {x = .Left, y = .Center},
 			},
 		},
 		) {
-			if icon == nil {
-				clay.Text(
-					label,
-					clay.TextElementConfig{textColor = active ? TEXT : BUTTON_BORDER, fontSize = FONT_NORMAL},
-				)
-			}
-		}
-
-		if icon != nil {
-			// Icon rows replace the label with a glyph drawn right next to the
-			// switch. draw_ui_icons fills this slot by element id from the
-			// toggle's own state, so the pill and its icon always agree.
-			if clay.UI(clay.ID(icon_id))(
-			{
-				layout = {
-					sizing = {width = clay.SizingFixed(SWITCH_H), height = clay.SizingFixed(SWITCH_H)},
-					childAlignment = {x = .Center, y = .Center},
-				},
-			},
-			) {}
+			clay.Text(
+				label,
+				clay.TextElementConfig{textColor = active ? TEXT : BUTTON_BORDER, fontSize = FONT_NORMAL},
+			)
 		}
 
 		// The semantic ID deliberately belongs only to the switch itself. The
@@ -1449,6 +1440,28 @@ switch_toggle :: proc(name, label: string, active: bool, icon: Maybe(Icon_Id) = 
 			) {}
 		}
 	}
+}
+
+// settings_icon_button is a square toggle whose content is an icon, drawn into
+// its center by draw_ui_icons (the element id IS the toggle name). Held states
+// mirror settings_button -- border + a bg_blue fill -- so the bar's icon
+// toggles read as the same control family as the text preset pills.
+ICON_BUTTON_SIZE :: 26
+settings_icon_button :: proc(name: string, active: bool) {
+	if clay.UI(clay.ID(name))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFixed(ICON_BUTTON_SIZE), height = clay.SizingFixed(ICON_BUTTON_SIZE)},
+			childAlignment = {x = .Center, y = .Center},
+		},
+		backgroundColor = active ? clay.Color{58, 81, 93, 255} : BUTTON,
+		border = {
+			color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			width = clay.BorderOutside(active ? 2 : 1),
+		},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	},
+	) {}
 }
 
 // fps_preset_button renders a frame-rate preset, held when it matches the
