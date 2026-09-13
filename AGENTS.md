@@ -47,14 +47,17 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   bound — not because it's the familiar way to model a collection.
 - Movable/recyclable things get a handle, `(id, generation)` — never a
   stored `^T`. Resolve a pointer at the use site, drop it right after.
+  Sketch: `Handle :: struct { id: u32, gen: u32 }`; lookups must assert
+  the generation matches (`slots[h.id].gen == h.gen`) before use.
 - Recycling a slot bumps its generation. A stale handle resolves to "gone,"
   loudly — never let an old handle alias a reused slot.
 
 ### Single writer per structure; hand off, don't lock
 
 - One writer at a time, always. Cross-thread reads ride an atomic index/
-  generation handoff, never a mutex on a hot buffer — this is what lets
-  arena + ownership skip GC, refcounts, and lock contention.
+  generation handoff (`intrinsics.atomic_store_rel` to publish, swap to
+  consume — never a mutex on a hot buffer) — this is what lets arena +
+  ownership skip GC, refcounts, and lock contention.
 - `core:sync` atomics for hot handoffs; `sync.Mutex` only for cold paths
   (config reload, init). A mutex on anything touched per-frame means the
   design is wrong, not that you need a lock.
@@ -62,7 +65,8 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   drops the oldest preview frame, audio behind catch-up-bursts. Never stall
   the render thread on a producer.
 - Hot state touched by multiple threads gets its own cache line. Pad
-  explicitly, name the field; don't rely on incidental layout.
+  explicitly (`#align 64` or a named `_pad: [64]u8`), name the field;
+  don't rely on incidental layout.
 
 ### Commit or mutate, by edit kind
 
@@ -91,6 +95,11 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   `free_all`. Anything it needs past that point must be cloned to heap
   first, or it's a dangling read.
 
+Real bugs this model caught — a rasterizer overshoot that only segfaulted
+once its scratch moved off a reused blob, a probe reading a temp path after
+its own simulated `free_all` — live in `docs/MEMORY_POSTMORTEMS.md`. Read
+it before touching text rasterization, probes, or multi-consumer buffers.
+
 ## 2. Write Odin, not generic code translated to Odin
 
 - Compiler happy first: `-vet` clean, no hacks aimed at another toolchain's
@@ -115,6 +124,15 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   which only pays off if new cases come from outside your control. If you
   own the whole closed set, the switch is honest, every case is visible,
   and a direct call beats an indirect one.
+- **A closed set of cases is a named type, never a bare int.** If a value
+  picks between a fixed, enumerable set of states — which UI field is being
+  edited, which resize handle is active, which edit kind this is — give it
+  an `enum`, not `0`/`1`/`2` with a comment saying what each number means.
+  A comment is easy to let drift from the actual cases; the compiler
+  checking a `switch` against real enum members isn't. This has shown up
+  three separate times as int-coded state (`editing_field`, resize
+  `handle`, dropdown row index) where an enum would have caught a typo'd
+  case number at compile time instead of silently doing nothing at runtime.
 - Index over slices; don't hand-roll a container `core` already has. Reuse
   hot buffers instead of rebuilding scratch inside a loop.
 - **Abstraction must pay rent** — in speed or invariant-safety, not
@@ -137,6 +155,9 @@ addresses, lifetimes, and shares data. Everything else follows from it.
 
 - Plain loop or one-line condition fixes it? That's the fix. New subsystem
   only when the old one provably can't express the problem.
+- Write it inline at the call site first. Extract a shared proc only when
+  identical patterns already exist in 3+ distinct locations — composition
+  rewrites for future reuse are speculative.
 - No indirection for its own sake, no machinery for a problem you don't
   have yet.
 - Needing escape hatches and special cases signals the abstraction is
