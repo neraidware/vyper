@@ -87,6 +87,15 @@ render_ui_frame :: proc(
 	for &a in media_assets {
 		upload_asset_thumbnail(renderer, command_buffer, &a)
 	}
+	// Deferred glyph atlas bake+upload: grows the grid + re-creates the
+	// texture first when a cached rune outgrew it, then materializes any
+	// ink whose pixels are not resident yet and uploads the whole grid in
+	// one copy pass. Must run with no render pass open -- this early in the
+	// frame, before the swapchain texture is acquired.
+	if !glyph_atlas_upload_if_dirty(&renderer.font, device, command_buffer) {
+		fmt.println("Could not upload glyph atlas")
+		return false
+	}
 	swapchain_texture: ^sdl.GPUTexture
 	pixel_width, pixel_height: sdl.Uint32
 	if !sdl.WaitAndAcquireGPUSwapchainTexture(

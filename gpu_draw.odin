@@ -4,8 +4,8 @@ import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:sync"
+import "core:unicode/utf8"
 import sdl "vendor:sdl3"
-import stb "vendor:stb/truetype"
 
 // ---------------------------------------------------------------------------
 // Per-frame GPU draw calls: translating Clay render commands into SDF rect/
@@ -381,35 +381,25 @@ draw_text_input_caret :: proc(
 }
 
 // input_advance_up_to returns the laid-out width of the text-input string up to
-// byte offset `at`, mirroring render_text's per-glyph baked-quad accumulation
-// (same scale, same skip rules). This is what keeps the caret/selection on top
-// of the actual glyph geometry for a variable-width font.
+// byte offset `at`, mirroring render_text's per-glyph cached-advance
+// accumulation (same scale, same skip rules). This is what keeps the caret and
+// selection on top of the actual glyph geometry for a variable-width font.
 input_advance_up_to :: proc(renderer: ^GPU_Renderer, at: int, scale: f32) -> f32 {
 	x: f32 = 0
+	atlas := &renderer.font
 	txt := text_input_string()
-	for i := 0; i < at && i < len(txt); i += 1 {
-		code := u8(txt[i])
-		if code == '\n' {
+	for i := 0; i < at && i < len(txt); {
+		r, size := utf8.decode_rune(txt[i:])
+		i += size
+		if r == '\n' {
 			x = 0
 			continue
 		}
-		if code < 32 || code > 126 {
+		s, uok, _ := glyph_ensure(atlas, r)
+		if !uok {
 			continue
 		}
-		px := x
-		py: f32 = 32
-		quad: stb.aligned_quad
-		stb.GetBakedQuad(
-			&renderer.font.chars[0],
-			512,
-			512,
-			c.int(code - 32),
-			&px,
-			&py,
-			&quad,
-			false,
-		)
-		x = px
+		x += atlas.slots[s].adv
 	}
 	return x * scale
 }
@@ -766,76 +756,77 @@ render_text :: proc(
 		return
 	}
 
-	// Clay's text command gives us the laid-out origin. stb's baked quad uses a
-	// baseline origin, so start one font height below that origin.
-	scale := f32(text.fontSize) / 32.0
+	// Clay's text command gives us the laid-out origin. The atlas bakes a
+	// baseline origin at GLYPH_BAKE_PX, so start one font height below.
+	scale := f32(text.fontSize) / f32(GLYPH_BAKE_PX)
 	x: f32 = 0
-	baseline: f32 = 32
+	baseline: f32 = f32(GLYPH_BAKE_PX)
 	line_height := f32(text.lineHeight)
 	if line_height <= 0 {
 		line_height = f32(text.fontSize)
 	}
+	atlas := &renderer.font
 	sdl.BindGPUGraphicsPipeline(pass, renderer.text_pipeline)
 	binding := sdl.GPUTextureSamplerBinding {
-		texture = renderer.font.texture,
-		sampler = renderer.font.sampler,
+		texture = atlas.texture,
+		sampler = atlas.sampler,
 	}
 	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-	for i in 0 ..< text.stringContents.length {
-		code := u8(text.stringContents.chars[i])
-		if code == '\n' {
+	txt := string(([^]u8)(text.stringContents.chars)[:int(text.stringContents.length)])
+	tex_px := f32(glyph_atlas_texture_px(atlas))
+	for i := 0; i < len(txt); {
+		r, size := utf8.decode_rune(txt[i:])
+		i += size
+		if r == '\n' {
 			x = 0
 			baseline += line_height / scale
 			continue
 		}
-		if code < 32 || code > 126 {
+		s, uok, _ := glyph_ensure(atlas, r)
+		if !uok {
 			continue
 		}
-		quad: stb.aligned_quad
-		stb.GetBakedQuad(
-			&renderer.font.chars[0],
-			512,
-			512,
-			c.int(code - 32),
-			&x,
-			&baseline,
-			&quad,
-			false,
-		)
-		quad_bounds := clay.BoundingBox {
-			x      = bounds.x + quad.x0 * scale,
-			y      = bounds.y + quad.y0 * scale,
-			width  = (quad.x1 - quad.x0) * scale,
-			height = (quad.y1 - quad.y0) * scale,
+		slot := &atlas.slots[s]
+		if slot.w > 0 && slot.h > 0 && slot.cell < atlas.baked_until_cell {
+			quad_bounds := clay.BoundingBox {
+				x      = bounds.x + (x + slot.xoff) * scale,
+				y      = bounds.y + (baseline + slot.yoff) * scale,
+				width  = f32(slot.w) * scale,
+				height = f32(slot.h) * scale,
+			}
+			cx, cy := glyph_atlas_cell_xy(atlas, slot.cell)
+			u0 := (f32(cx) * GLYPH_CELL_PX + GLYPH_CELL_PAD) / tex_px
+			v0 := (f32(cy) * GLYPH_CELL_PX + GLYPH_CELL_PAD) / tex_px
+			vertex_uniforms := TextVertexUniforms {
+				bounds   = {quad_bounds.x, quad_bounds.y, quad_bounds.width, quad_bounds.height},
+				viewport = renderer.viewport,
+				_padding = {},
+				uv       = {u0, v0, u0 + f32(slot.w) / tex_px, v0 + f32(slot.h) / tex_px},
+			}
+			color := text.textColor
+			fragment_uniforms := TextFragmentUniforms {
+				color = {
+					f32(color[0]) / 255,
+					f32(color[1]) / 255,
+					f32(color[2]) / 255,
+					f32(color[3]) / 255,
+				},
+			}
+			sdl.PushGPUVertexUniformData(
+				command_buffer,
+				0,
+				&vertex_uniforms,
+				sdl.Uint32(size_of(vertex_uniforms)),
+			)
+			sdl.PushGPUFragmentUniformData(
+				command_buffer,
+				0,
+				&fragment_uniforms,
+				sdl.Uint32(size_of(fragment_uniforms)),
+			)
+			sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 		}
-		vertex_uniforms := TextVertexUniforms {
-			bounds   = {quad_bounds.x, quad_bounds.y, quad_bounds.width, quad_bounds.height},
-			viewport = renderer.viewport,
-			_padding = {},
-			uv       = {quad.s0, quad.t0, quad.s1, quad.t1},
-		}
-		color := text.textColor
-		fragment_uniforms := TextFragmentUniforms {
-			color = {
-				f32(color[0]) / 255,
-				f32(color[1]) / 255,
-				f32(color[2]) / 255,
-				f32(color[3]) / 255,
-			},
-		}
-		sdl.PushGPUVertexUniformData(
-			command_buffer,
-			0,
-			&vertex_uniforms,
-			sdl.Uint32(size_of(vertex_uniforms)),
-		)
-		sdl.PushGPUFragmentUniformData(
-			command_buffer,
-			0,
-			&fragment_uniforms,
-			sdl.Uint32(size_of(fragment_uniforms)),
-		)
-		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+		x += slot.adv
 		x += f32(text.letterSpacing) / scale
 	}
 }

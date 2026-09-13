@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:mem"
 import sdl "vendor:sdl3"
 import stb "vendor:stb/truetype"
 
@@ -418,7 +419,7 @@ glyph_atlas_bake_pending_ink :: proc(a: ^Glyph_Atlas) {
 	scale := stb.ScaleForPixelHeight(&a.font, GLYPH_BAKE_PX)
 	tex_px := int(glyph_atlas_texture_px(a))
 	if a.pix_generation != a.generation {
-		clear(a.pix)
+		mem.zero_slice(a.pix)
 		a.baked_until_cell = 0
 	}
 	scratch: [GLYPH_CELL_PX * GLYPH_CELL_PX]u8
@@ -472,7 +473,7 @@ glyph_atlas_upload_if_dirty :: proc(a: ^Glyph_Atlas, device: ^sdl.GPUDevice, com
 	}
 	glyph_atlas_bake_pending_ink(a)
 	n := int(glyph_atlas_texture_px(a)) * int(glyph_atlas_texture_px(a))
-	transfer := sdl.CreateGPUTransferBuffer(device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = n})
+	transfer := sdl.CreateGPUTransferBuffer(device, sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = u32(n)})
 	if transfer == nil {
 		return false
 	}
@@ -481,7 +482,7 @@ glyph_atlas_upload_if_dirty :: proc(a: ^Glyph_Atlas, device: ^sdl.GPUDevice, com
 		sdl.ReleaseGPUTransferBuffer(device, transfer)
 		return false
 	}
-	mem.copy(cast([^]u8)mapped, raw_data(a.pix), n)
+	mem.copy(mapped, raw_data(a.pix), n)
 	sdl.UnmapGPUTransferBuffer(device, transfer)
 	tex_px := glyph_atlas_texture_px(a)
 	copy_pass := sdl.BeginGPUCopyPass(command_buffer)

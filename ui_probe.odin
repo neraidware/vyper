@@ -22,6 +22,7 @@ import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:unicode/utf8"
 
 ui_probe_tracks :: 6
 ui_probe_clips_per_track :: 12
@@ -62,14 +63,15 @@ ui_draw_probe_run :: proc() {
 				BORDER += 1
 			case .Text:
 				TEXT += 1
-				// The renderer issues one DrawGPUPrimitives per glyph; count the
-				// text runs by codepoint length (ASCII labels -> equal to quads).
+				// The renderer issues one DrawGPUPrimitives per glyph (rune);
+				// count the text runs by codepoint length, not byte length.
 				g := 0
-				for j in 0 ..< command.renderData.text.stringContents.length {
-					if command.renderData.text.stringContents.chars[j] < 0x80 {
-						g += 1
-					}
-				}
+				raw := ([^]u8)(command.renderData.text.stringContents.chars)[:int(command.renderData.text.stringContents.length)]
+for j := 0; j < len(raw); {
+				_, size := utf8.decode_rune(string(raw[j:]))
+				g += 1
+				j += size
+			}
 				GLYPHS += g
 			case .None,
 			     .Image,

@@ -4,6 +4,7 @@ import clay "clay-odin"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:unicode/utf8"
 
 // ---------------------------------------------------------------------------
 // Font loading (via fontconfig) and Clay text-measurement/error callbacks.
@@ -61,7 +62,16 @@ measure_text :: proc "c" (
 	user_data: rawptr,
 ) -> clay.Dimensions {
 	// Temporary font metrics keep layout independent from renderer resources.
-	return {width = f32(text.length) * f32(config.fontSize) * 0.55, height = f32(config.fontSize)}
+	// Count runes, not bytes -- a multi-byte rune like <é> lays out one glyph
+	// regardless of its UTF-8 width, so extra bytes must not widen the box.
+	runes := 0
+	raw := ([^]u8)(text.chars)[:int(text.length)]
+	for i := 0; i < len(raw); {
+		r, size := utf8.decode_rune(string(raw[i:]))
+		runes += 1
+		i += size
+	}
+	return {width = f32(runes) * f32(config.fontSize) * 0.55, height = f32(config.fontSize)}
 }
 
 clay_error :: proc "c" (data: clay.ErrorData) {
