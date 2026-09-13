@@ -349,7 +349,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 				}
 				idx.segs[k] = have
 				completed_frames += have
-				if nered_trace {
+				if vyper_trace {
 					fmt.printf("[bg] segment %d/%d reused: %d frames\n", k + 1, seg_total, have)
 				}
 				continue

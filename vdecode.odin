@@ -94,7 +94,7 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_b
 		want = preview
 	}
 	if !ad.dec.opened || ad.dec_path != path || string(ad.dec.opened_path) != string(want) {
-		if nered_trace {
+		if vyper_trace {
 			fmt.printf(
 				"[vdec] REOPEN src_f=%d want=%q opened=%v opened_path=%q preview=%q\n",
 				frame_idx + frame_base,

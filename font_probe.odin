@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// Glyph-atlas CPU probe (NERED_FONT_PROBE=1).
+// Glyph-atlas CPU probe (VYPER_FONT_PROBE=1).
 //
 // Exercises the Unicode glyph cache's CPU core -- slot allocation, rune
 // dedup, missing-rune marking, cell ordinal accounting, and grid growth --

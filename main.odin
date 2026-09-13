@@ -908,7 +908,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		proxy_bg_probe_run(xb)
 		return
 	}
-	if ps, _ := os.lookup_env_alloc("NERED_PROXY_PICK_SCAN", context.temp_allocator); ps != "" {
+	if ps, _ := os.lookup_env_alloc("VYPER_PROXY_PICK_SCAN", context.temp_allocator); ps != "" {
 		proxy_pick_scan_run(ps)
 		return
 	}
@@ -923,7 +923,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if !load_font_data() {
 		return
 	}
-	if fp, _ := os.lookup_env_alloc("NERED_FONT_PROBE", context.temp_allocator); fp != "" {
+	if fp, _ := os.lookup_env_alloc("VYPER_FONT_PROBE", context.temp_allocator); fp != "" {
 		font_probe_run()
 	}
 	if sub_render_probe, _ := os.lookup_env_alloc(

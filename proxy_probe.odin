@@ -246,10 +246,10 @@ proxy_bg_probe_run :: proc(v: string) {
 	inp[n] = 0
 	path := cstring(&inp[0])
 
-	// With NERED_PROXY_BG_KEEP=1 the probe leaves the built segments + .idx in
+	// With VYPER_PROXY_BG_KEEP=1 the probe leaves the built segments + .idx in
 	// place (default: proxy_cleanup_artifacts like the other probes), so an
 	// out-of-band second run can verify the rebuild skip.
-	keep_cache := os.get_env_alloc("NERED_PROXY_BG_KEEP", context.temp_allocator) == "1"
+	keep_cache := os.get_env_alloc("VYPER_PROXY_BG_KEEP", context.temp_allocator) == "1"
 
 	// Full import: bin + timeline, mirroring the GUI's Open File flow. The
 	// proxy build must NOT block this call.
@@ -268,7 +268,7 @@ proxy_bg_probe_run :: proc(v: string) {
 		// kept) short-circuits: proxy_transcode never enqueued a rebuild, so
 		// there is nothing to wait for. Verify the artifacts directly.
 		if !active && phase == .Idle && !cancel_sent && cancel_pct < 0 && proxy_segments_complete(path, frame_count) {
-			if nered_trace {
+			if vyper_trace {
 				fmt.printf("[proxy-bg-test] proxy already complete at import; no build needed\n")
 			}
 			proxy_bg_verify_complete(path, frame_count, keep_cache, "proxy already complete (no rebuild)")
@@ -359,7 +359,7 @@ proxy_bg_probe_run :: proc(v: string) {
 }
 
 // ---------------------------------------------------------------------------
-// NERED_PROXY_PICK_SCAN="<file>": call proxy_pick_for_frame for every source
+// VYPER_PROXY_PICK_SCAN="<file>": call proxy_pick_for_frame for every source
 // frame with NO decode (fast), and print the frames where the resolved file is
 // not a segment (nil / source). Decouples the picker from the decoder: if the
 // picker serves segments for all frames, the flip lives in the decoder path;
@@ -370,7 +370,7 @@ proxy_pick_scan_run :: proc(v: string) {
 	async_import_mode = true
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
-		fmt.println("proxy-pick-scan: need NERED_PROXY_PICK_SCAN=\"<file>\"")
+		fmt.println("proxy-pick-scan: need VYPER_PROXY_PICK_SCAN=\"<file>\"")
 		os.exit(2)
 	}
 	inp: [4096]u8
@@ -412,7 +412,7 @@ proxy_pick_scan_run :: proc(v: string) {
 }
 
 // ---------------------------------------------------------------------------
-// NERED_PROXY_STEP="<file>": reproduce the "preview flips to the original
+// VYPER_PROXY_STEP="<file>": reproduce the "preview flips to the original
 // source and stays there" bug on a real file + a complete on-disk cache.
 //
 // Mirrors preview_probe_run's deterministic playhead walk but with the proxy
@@ -428,7 +428,7 @@ proxy_step_probe_run :: proc(v: string) {
 	async_import_mode = true
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
-		fmt.println("proxy-step: need NERED_PROXY_STEP=\"<file>\"")
+		fmt.println("proxy-step: need VYPER_PROXY_STEP=\"<file>\"")
 		os.exit(2)
 	}
 	inp: [4096]u8
