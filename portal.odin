@@ -177,6 +177,18 @@ portal_build_open_params :: proc(title: string, f: Portal_Filter) -> ^GVariant {
 
 	add_option(dict, "handle_token", g_variant_new_string("vyper_open"))
 	add_option(dict, "filters", portal_build_filters(f))
+	// Open the dialog on the user's videos folder (~/Videos) instead of
+	// wherever the portal last remembered, matching the save dialog and the
+	// render default output path.
+	{
+		dir_buf: [512]u8
+		if dir := render_videos_dir(dir_buf[:]); dir != "" {
+			uri_buf: [1024]u8
+			uri := fmt.bprintf(uri_buf[:], "file://%s", dir)
+			uri_buf[len(uri)] = 0
+			add_option(dict, "current_folder", g_variant_new_string(cstring(raw_data(uri))))
+		}
+	}
 	options := g_variant_builder_end(dict)
 	g_variant_builder_unref(dict)
 	g_variant_type_free(dict_type)

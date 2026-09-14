@@ -72,20 +72,32 @@ render_resolve_output_path :: proc() -> string {
 	return target
 }
 
-// render_default_output_path computes the startup render path into `buf`:
-// <XDG videos dir>/render.mp4 ($HOME/Videos fallback), or the cwd-relative
-// render.mp4 when no home dir is resolvable.
-render_default_output_path :: proc(buf: []u8) -> string {
+// render_videos_dir resolves the user's videos directory into `buf` (no
+// trailing slash): $XDG_VIDEOS_DIR when set, else $HOME/Videos. Returns ""
+// when the home directory is not resolvable, letting the caller fall back.
+render_videos_dir :: proc(buf: []u8) -> string {
 	tmp: [512]u8
 	home, home_ok := os.user_home_dir(context.temp_allocator)
 	if home_ok != os.General_Error.None {
-		return string(Render_Default_Path)
+		return ""
 	}
 	videos := os.get_env("XDG_VIDEOS_DIR", context.temp_allocator)
 	if videos == "" {
 		videos = fmt.bprintf(tmp[:], "%s/Videos", home)
 	}
-	return fmt.bprintf(buf, "%s/render.mp4", strings.trim_suffix(videos, "/"))
+	return strings.trim_suffix(videos, "/")
+}
+
+// render_default_output_path computes the startup render path into `buf`:
+// <XDG videos dir>/render.mp4 ($HOME/Videos fallback), or the cwd-relative
+// render.mp4 when no home dir is resolvable.
+render_default_output_path :: proc(buf: []u8) -> string {
+	dir_buf: [512]u8
+	dir := render_videos_dir(dir_buf[:])
+	if dir == "" {
+		return string(Render_Default_Path)
+	}
+	return fmt.bprintf(buf, "%s/render.mp4", dir)
 }
 
 // Output path chosen with the save dialog (fixed buffer, written by the SDL
