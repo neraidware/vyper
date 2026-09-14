@@ -137,6 +137,7 @@ render_ui_frame :: proc(
 		draw_clip_markers(renderer, command_buffer, pass)
 		draw_timeline_resize_focus(renderer, command_buffer, pass)
 		draw_drag_ghost(renderer, command_buffer, pass)
+		draw_track_drag_ghost(renderer, command_buffer, pass)
 		draw_media_bin_thumbnails(renderer, command_buffer, pass)
 		draw_ui_icons(renderer, command_buffer, pass)
 		draw_media_drag_ghost(renderer, command_buffer, pass)

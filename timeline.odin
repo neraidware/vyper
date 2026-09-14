@@ -1439,6 +1439,49 @@ insert_track :: proc(order_pos: int) {
 	inject_at_elem(&timeline.track_order, pos, new_ti)
 }
 
+// move_track_to_row moves the track at STORAGE index `ti` so it occupies the
+// visual stack position `target_row` (0 = top, len(track_order) = bottom,
+// matching insert_track's order_pos and the gap keys the drag hovers).
+// Storage stays append-only -- the track array never moves -- so selected_track
+// and other STORAGE indices remain valid; only track_order changes.
+//
+// target_row == src_row is the track's own gap (no move) and target_row ==
+// src_row+1 is the gap immediately below it (the row already borders that gap,
+// so a swap in would be a no-op) -- both early-return. For any other target,
+// remove the source first: rows below it shift up one, so inserting below the
+// source lands one index earlier in the reduced order.
+//
+// Reordering changes which track paints on top, so the preview slots are
+// invalidated (slots' layer comes from the stack order).
+move_track_to_row :: proc(ti: int, target_row: int) {
+	sync_track_order()
+	if ti < 0 || ti >= len(timeline.tracks) {
+		return
+	}
+	src_row := order_row_of(ti)
+	if src_row < 0 {
+		return
+	}
+	// Negative target = "not over a gap" (drag cancelled); never clamp that
+	// into a move-to-top. Real gaps are always clamped into range below.
+	if target_row < 0 {
+		return
+	}
+	target := clamp(target_row, 0, len(timeline.track_order))
+	if target == src_row || target == src_row + 1 {
+		return
+	}
+	ordered_remove(&timeline.track_order, src_row)
+	// After the source is gone rows below it shifted up one, so a target below
+	// the source lands one index earlier in the reduced order.
+	insert_at := target
+	if target > src_row {
+		insert_at -= 1
+	}
+	inject_at_elem(&timeline.track_order, insert_at, ti)
+	invalidate_preview_slots()
+}
+
 // duplicate_track inserts a copy of the track directly ABOVE the original (one
 // row up in the visual stack), deep-copying every clip into a new dynamic array
 // so the two tracks are fully independent. The copy lands adjacent to its

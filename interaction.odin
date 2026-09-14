@@ -377,6 +377,19 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		return false
 	},
+	// Grab a track by its name gutter and drag it onto an insert gap to
+	// reorder the stack. Runs AFTER the duplicate/remove buttons (they live in
+	// the same gutter) so a press on those still wins; a plain click that never
+	// hovers a gap ends as a no-op.
+	proc(inp: Mouse_Input) -> bool {
+		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
+			if clay.PointerOver(clay.ID("TrackName", u32(track_idx))) {
+				begin_track_drag(track_idx)
+				return true
+			}
+		}
+		return false
+	},
 	// Resizing the selected clip's duration: grab its left/right edge. Takes
 	// precedence over selecting/dragging a clip, and only the currently
 	// selected clip can be resized.
@@ -443,6 +456,50 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 	},
 }
 
+// begin_track_drag arms a track-reorder drag: records the grabbed track's
+// storage index and starts following the hover into the insert gaps.
+begin_track_drag :: proc(track_idx: int) {
+	active_interaction = .Track_Drag
+	drag_track_idx = track_idx
+	drag_track_hover_row = -1
+	update_track_drag()
+}
+
+// update_track_drag recomputes which insert gap the pointer hovers while a
+// track-reorder drag is in flight (called every mouse-move while down). Gap
+// positions are keyed by ORDER row r (top-to-bottom across the strip), the
+// same r the ui.odin loop and insert_track use. The last gap (r == len) is
+// the strip below the final row.
+update_track_drag :: proc() {
+	if active_interaction != .Track_Drag {
+		return
+	}
+	sync_track_order()
+	hover := -1
+	for r := 0; r <= len(timeline.track_order); r += 1 {
+		if clay.PointerOver(clay.ID("TrackGap", u32(r))) {
+			hover = r
+			break
+		}
+	}
+	drag_track_hover_row = hover
+}
+
+// end_track_drag finishes a track-reorder drag: when released over a valid
+// gap, moves the track to that stack position, then clears the drag state.
+// Releasing nowhere (or over the track's own row) just cancels the drag.
+end_track_drag :: proc() {
+	if drag_track_idx >= 0 && drag_track_hover_row >= 0 {
+		move_track_to_row(drag_track_idx, drag_track_hover_row)
+		if vyper_trace {
+			fmt.printf("[tl] reordered track storage=%d to row=%d\n", drag_track_idx, drag_track_hover_row)
+		}
+	}
+	active_interaction = .None
+	drag_track_idx = -1
+	drag_track_hover_row = -1
+}
+
 // interaction_post_build runs after build_page: the click/press chain and the
 // live drag updates (both hit-test this frame's geometry), plus the jog buttons,
 // the playback-rate dropdown, the help overlay, and right-click context menus.
@@ -476,6 +533,8 @@ interaction_post_build :: proc(
 			// Releasing a bin drag commits the media (creates tracks as
 			// needed); releasing nowhere cancels it.
 			end_media_drag(inp.x, inp.y)
+		case .Track_Drag:
+			end_track_drag()
 		case .Clip_Move:
 			// Commit a vertical drop if the ghost hovers another track;
 			// horizontal drags already applied their new start live.
@@ -515,6 +574,9 @@ if len(drag_group_orig) > 1 {
 		case .Media_Bin_Drag:
 			// A bin drag in flight: recompute the hovered lane + ghost each frame.
 			update_media_drag_lanes(inp.x, inp.y)
+		case .Track_Drag:
+			// Track reorder in flight: recompute the hovered insert gap each frame.
+			update_track_drag()
 		case .Handle_Drag:
 			if sel, ok := transformable_selected(); ok {
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox

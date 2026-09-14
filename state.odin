@@ -351,6 +351,12 @@ drag_source_track: int = -1
 drag_source_index: int = -1
 drag_hover_track: int = -1
 drag_ghost_start: i64 = 0
+// Track-reorder drag: dragging a whole track row onto an insert gap (the
+// "New track" button strips between rows) to reorder the stack. drag_track_idx
+// is the STORAGE index grabbed; drag_track_hover_row is the VISUAL gap
+// position (0..=len(track_order)).
+drag_track_idx: int = -1
+drag_track_hover_row: int = -1
 // drag_group_delta is the group's mouse-driven horizontal offset while a LINKED
 // group is staged on another track (delta = hovered pointer frame - anchor's
 // original start). The vertical ghost follows it so the unit keeps sliding with
@@ -663,6 +669,7 @@ Interaction :: enum {
 	Preview_Move,  // dragging a clip's transform in the preview
 	Media_Bin_Drag,
 	Handle_Drag,   // dragging a preview resize/crop handle
+	Track_Drag,    // dragging a whole track onto an insert gap (reorder)
 }
 dragging_handle: Maybe(Handle)
 handle_kind: Handle_Kind = .None

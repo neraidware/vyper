@@ -401,6 +401,81 @@ test_resize_alignment :: proc() {
 	tl_assert_aligned("resize")
 }
 
+// tl_order_equals asserts the visual stack equals the given storage sequence.
+tl_order_equals :: proc(storage: []int) {
+	sync_track_order()
+	for i in 0 ..< min(len(storage), len(timeline.track_order)) {
+		tl_probe_check(
+			timeline.track_order[i] == storage[i],
+			"track_order[%d] == %d, expected %d (got %v)",
+			i,
+			timeline.track_order[i],
+			storage[i],
+			timeline.track_order[:],
+		)
+	}
+	tl_probe_check(
+		len(timeline.track_order) == len(storage),
+		"track_order len %d, expected %d",
+		len(timeline.track_order),
+		len(storage),
+	)
+}
+
+// test_track_reorder checks move_track_to_row's gap-target semantics on the
+// standard 3-track scene (storage 0,1,2 in visual order 0,1,2). The track
+// arrays themselves must never move (storage indices are stable); only
+// track_order changes.
+test_track_reorder :: proc() {
+	// Storage arrays stay put under any reorder.
+	sync_track_order()
+	pre_storage := make([dynamic]^Track, 0, 3, context.temp_allocator)
+	for i in 0 ..< 3 {
+		append(&pre_storage, &timeline.tracks[i])
+	}
+
+	// Move track 1 (middle) to the top.
+	move_track_to_row(1, 0)
+	tl_order_equals([]int{1, 0, 2})
+
+	// Move the now-bottom track 2 to the middle (target gap src_row+1 from
+	// its current row 2? no — from row 2, gap 1 is above row 1) → lands at row 1.
+	move_track_to_row(2, 1)
+	tl_order_equals([]int{1, 2, 0})
+
+	// Same-row gap (src_row == target_row): no-op.
+	move_track_to_row(1, 0)
+	tl_order_equals([]int{1, 2, 0})
+
+	// Gap immediately below the source (src_row+1): no-op (track already
+	// borders that gap).
+	move_track_to_row(1, 1)
+	tl_order_equals([]int{1, 2, 0})
+
+	// Move the top track to the bottom (gap len).
+	move_track_to_row(1, 3)
+	tl_order_equals([]int{2, 0, 1})
+
+	// Invalid targets are no-ops.
+	move_track_to_row(9, 0)
+	tl_order_equals([]int{2, 0, 1})
+	move_track_to_row(1, -3)
+	tl_order_equals([]int{2, 0, 1})
+
+	// The track ARRAYS never move: the pointers grabbed before still alias the
+	// same storage indices.
+	tl_probe_check(
+		&timeline.tracks[0] == pre_storage[0] &&
+			&timeline.tracks[1] == pre_storage[1] &&
+			&timeline.tracks[2] == pre_storage[2],
+		"reorder must not move the storage arrays",
+	)
+	tl_probe_check(
+		timeline.tracks[1].clips[0].clip_id == 1002,
+		"track 1 still holds its clip after reorder",
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_cut_resolves_playhead()
@@ -426,6 +501,14 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_resize_alignment()
 	fmt.println("[tl-probe] resize ok")
+
+	// Reorder-by-gap semantics of move_track_to_row: target_row is the visual
+	// stack position (0 = top, len = bottom); the same-row gap (src_row) and the
+	// gap immediately below (src_row+1) are no-ops, everything else lands the
+	// track at that visual position.
+	tl_scene()
+	test_track_reorder()
+	fmt.println("[tl-probe] track-reorder ok")
 
 	if tl_probe_fail {
 		fmt.println("[tl-probe] FAILED")

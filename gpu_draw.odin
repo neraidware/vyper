@@ -692,6 +692,57 @@ draw_drag_ghost :: proc(
 	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 }
 
+// draw_track_drag_ghost paints the drop preview while a whole track row is
+// being dragged onto an insert gap (track reorder): the source row is grayed
+// out (a translucent dark veil over its full gutter+clips band), and a ghost
+// track row -- same teal treatment as the clip ghosts -- sits in the hovered
+// gap, showing exactly which stack slot the reorder would fill. Nothing here
+// mutates the timeline; move_track_to_row commits only on release.
+draw_track_drag_ghost :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
+	if active_interaction != .Track_Drag || drag_track_idx < 0 {
+		return
+	}
+	// The whole tracks body (strip incl. the name column) is the safe clip
+	// region: a ghost/gray-out must never spill over the marker strip or out of
+	// the scroll view.
+	body := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	if body.width <= 0 || body.height <= 0 {
+		return
+	}
+	row_box := clay.GetElementData(clay.ID("TrackRow", u32(drag_track_idx))).boundingBox
+	if row_box.width <= 0 || row_box.height <= 0 {
+		return
+	}
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{c.int(body.x), c.int(body.y), c.int(body.width), c.int(body.height)},
+	)
+	// Gray out the row being dragged so it reads as "lifted out of the stack".
+	render_sdf_rect(renderer, command_buffer, pass, row_box, clay.Color{16, 20, 23, 160}, 4, 0)
+	// Ghost row in the hovered gap: a full-width translucent tile (gutter +
+	// clips band) centered on the gap strip, plus the gap itself highlighted so
+	// the exact "New track" slot the drop targets is unmistakable.
+	if drag_track_hover_row >= 0 {
+		gap := clay.GetElementData(clay.ID("TrackGap", u32(drag_track_hover_row))).boundingBox
+		if gap.width > 0 && gap.height > 0 {
+			highlight := gap
+			highlight.x = row_box.x
+			highlight.width = row_box.width
+			render_sdf_rect(renderer, command_buffer, pass, highlight, clay.Color{127, 187, 179, 140}, 3, 0)
+			render_sdf_rect(renderer, command_buffer, pass, highlight, clay.Color{127, 187, 179, 230}, 3, 2)
+			ghost := row_box
+			ghost.y = gap.y + (gap.height - ghost.height) / 2
+			render_sdf_rect(renderer, command_buffer, pass, ghost, clay.Color{127, 187, 179, 80}, 4, 0)
+			render_sdf_rect(renderer, command_buffer, pass, ghost, clay.Color{127, 187, 179, 220}, 4, 2)
+		}
+	}
+	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
+}
+
 // draw_marker_tooltip draws a small pill with the marker's label centered on
 // the marker's x position inside the reserved strip above the timeline rows.
 draw_marker_tooltip :: proc(
