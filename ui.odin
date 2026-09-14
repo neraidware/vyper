@@ -1233,6 +1233,7 @@ render_card :: proc() {
 		fmt.bprintf(out_buf[:], "Output: %s", render_output_name()),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words},
 	)
+	switch_toggle("RenderOverwrite", "Overwrite existing output", render_overwrite_out)
 	clay.Text(
 		render_status_text(),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words},

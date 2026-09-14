@@ -34,6 +34,60 @@ MAX_AUDIO_FRAME_SAMPLES :: 4096
 AAC_FRAME_SIZE :: 1024
 Render_Default_Path :: "render.mp4"
 
+// render_overwrite_out: when off (default) a render points itself at a free
+// <name>_<n>.<ext> instead of clobbering an existing file of the same name.
+render_overwrite_out: bool
+
+// resolve_out_scratch holds the resolved path; used at most once per render
+// start, so a single shared buffer is fine.
+resolve_out_scratch: [4096]u8
+
+// render_resolve_output_path returns the path a fresh render should write (the
+// plain target when overwrite is on or the file doesn't exist yet, else
+// <dir>/<base>_<n><ext> for the first n whose name is free) unless the name
+// cap is somehow exhausted, in which case it falls back to the raw target.
+render_resolve_output_path :: proc() -> string {
+	target := render_out_path()
+	if render_overwrite_out || !os.exists(target) {
+		return target
+	}
+	dir_end := 0
+	for i := len(target) - 1; i >= 0; i -= 1 {
+		if target[i] == '/' {
+			dir_end = i + 1
+			break
+		}
+	}
+	stem := target[dir_end:]
+	base, ext := stem, ""
+	if dot := strings.last_index(stem, "."); dot > 0 {
+		base, ext = stem[:dot], stem[dot:]
+	}
+	for n := 1; n < 1_000_000; n += 1 {
+		name := fmt.bprintf(resolve_out_scratch[:], "%s%s_%d%s", target[:dir_end], base, n, ext)
+		if !os.exists(name) {
+			return name
+		}
+	}
+	return target
+}
+
+// render_default_output_path computes the startup render path into `buf`:
+// <XDG videos dir>/render.mp4 ($HOME/Videos fallback), or the cwd-relative
+// render.mp4 when no home dir is resolvable.
+render_default_output_path :: proc(buf: []u8) -> string {
+	tmp: [512]u8
+	home, home_ok := os.user_home_dir(context.temp_allocator)
+	if home_ok != os.General_Error.None {
+		return string(Render_Default_Path)
+	}
+	videos := os.get_env("XDG_VIDEOS_DIR", context.temp_allocator)
+	if videos == "" {
+		videos = fmt.bprintf(tmp[:], "%s/Videos", home)
+	}
+	return fmt.bprintf(buf, "%s/render.mp4", strings.trim_suffix(videos, "/"))
+}
+
 // Output path chosen with the save dialog (fixed buffer, written by the SDL
 // callback, read on the main thread when starting a render).
 render_out_path_buf: [4096]u8
@@ -1285,6 +1339,12 @@ render_start :: proc() {
 		set_status(.Failed, "pick an output file path first")
 		return
 	}
+	// A rerender must not silently overwrite an earlier export: unless the
+	// toggle is on, point at a free <name>_<n>.<ext> (also updates the UI name).
+	resolved := render_resolve_output_path()
+	if resolved != render_out_path() {
+		render_set_out_path(resolved)
+	}
 	// Clean up a finished previous run.
 	poll_completed_thread()
 
@@ -1485,7 +1545,8 @@ render_free_workbook :: proc() {
 
 // init: default output name so Render works without picking a path.
 render_init :: proc() {
-	def := string(Render_Default_Path)
+	init_buf: [512]u8
+	def := render_default_output_path(init_buf[:])
 	render_out_path_len = len(def)
 	for i in 0 ..< len(def) {
 		render_out_path_buf[i] = u8(def[i])
@@ -1558,6 +1619,7 @@ render_test_run :: proc(paths: [2]string) {
 		}
 	}
 	render_set_out_path(paths[1])
+	render_overwrite_out = true // the test must write exactly the requested path
 	render_start()
 	for render_is_busy() {
 		time.sleep(50 * time.Millisecond)

@@ -42,8 +42,9 @@ read_mouse_input :: proc() -> Mouse_Input {
 // drag work on last frame's geometry. Also feeds clay the pointer state, which
 // must happen before build_page so PointerOver reflects this frame's layout.
 interaction_pre_build :: proc(inp: Mouse_Input) {
-	// Middle-button drag over the preview pans the camera (limited to ±one
-	// preview axis from the origin via clamp_preview_camera at render time).
+	// NOTE: Middle-button drag over the preview pans the camera (image-viewer bound:
+	// canvas edge may reach the panel edge, never cross it -- see
+	// clamp_preview_camera).
 	if inp.middle && clay.PointerOver(clay.ID("Preview")) {
 		if panning_preview {
 			preview_cam_ox += inp.x - pan_last_x
@@ -181,6 +182,7 @@ click_cases := []Click_Case{
 	{ id = "RenderPickButton", action = proc(_: Mouse_Input) { render_pick_output_path() } },
 	{ id = "RenderRunButton", action = proc(_: Mouse_Input) { render_start() } },
 	{ id = "RenderCancelButton", action = proc(_: Mouse_Input) { render_cancel() } },
+	{ id = "RenderOverwrite", action = proc(_: Mouse_Input) { render_overwrite_out = !render_overwrite_out } },
 	// Clicking the timeline ruler starts a scrub (drag to seek).
 	{ hit = proc(inp: Mouse_Input) -> bool {
 		return len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("Ruler"))

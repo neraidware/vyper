@@ -365,6 +365,24 @@ portal_save_file_picker :: proc() -> cstring {
 
 	add_option(dict, "handle_token", "vyper_save")
 	add_option(dict, "current_name", cstring(raw_data(default_name)))
+	// Open the dialog on the folder that holds the current output path (for
+	// the startup default, ~/Videos) instead of wherever the portal last was.
+	{
+		out := string(render_out_path_buf[:render_out_path_len])
+		dir_end := 0
+		for i := len(out) - 1; i >= 0; i -= 1 {
+			if out[i] == '/' {
+				dir_end = i
+				break
+			}
+		}
+		if dir_end > 0 {
+			uri_buf: [1024]u8
+			uri := fmt.bprintf(uri_buf[:], "file://%s", out[:dir_end])
+			uri_buf[len(uri)] = 0
+			add_option(dict, "current_folder", cstring(raw_data(uri)))
+		}
+	}
 	{ // filters (a(sa(us)) value, not a plain string)
 		filter := Portal_Filter{name = "MP4 video", patterns = {"*.mp4"}}
 		entry := g_variant_new_dict_entry(g_variant_new_string("filters"), g_variant_new_variant(portal_build_filters(filter)))

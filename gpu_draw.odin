@@ -987,8 +987,8 @@ draw_ui_icons :: proc(
 		playhead.playing && playback_dir == 1,
 		15,
 	)
-	// The Duplicate/Remove icons sit in the scrolled track-name gutters, so
-	// their clay boxes move off-window when a track scrolls out of view.
+	// NOTE: The Duplicate/Remove icons sit in the scrolled track-name gutters,
+	// so their clay boxes move off-window when a track scrolls out of view.
 	// render_icon draws with no scissor: clip the whole gutter-icon pass to the
 	// TracksSection viewport so off-screen gutter icons never paint over the
 	// ruler/timeline bar.
@@ -1561,8 +1561,8 @@ draw_preview :: proc(
 	view := preview_view(canvas)
 	render_sdf_rect(renderer, command_buffer, pass, view, clay.Color{0, 0, 0, 255}, 0, 0)
 
-	// The clip IMAGE must never paint outside the final rendered area (the
-	// project canvas). Clip it to the canvas rect ∩ the preview widget so a clip
+	// IMPORTANT: The clip IMAGE must never paint outside the final rendered area
+	// (the project canvas). Clip it to the canvas rect ∩ the preview widget so a clip
 	// dragged off-canvas stays hidden in the letterbox/GUI margin even when
 	// zoomed past the widget edge.
 	ix := max(view.x, bounds.x)

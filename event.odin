@@ -185,7 +185,10 @@ handle_sdl_events :: proc(running: ^bool) {
 					old_zoom := preview_cam_zoom
 					new_zoom := clamp(old_zoom * (1 + 0.1 * event.wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
 					if new_zoom != old_zoom {
-						preview_cam_ox = mx_c - (mx_c - preview_cam_ox) * (new_zoom / old_zoom)
+						// NOTE: cursor-anchored zoom -- the point under the cursor
+					// stays put, so pan (preview_cam_ox|oy) scales by the zoom
+					// ratio here and only gets clamped later at render time.
+					preview_cam_ox = mx_c - (mx_c - preview_cam_ox) * (new_zoom / old_zoom)
 						preview_cam_oy = my_c - (my_c - preview_cam_oy) * (new_zoom / old_zoom)
 						preview_cam_zoom = new_zoom
 					}

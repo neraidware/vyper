@@ -578,8 +578,9 @@ ui_playhead_frame: i64 // published playhead frame for the audio producer (atomi
 audio_dev_frame: i64
 
 // Preview camera: pan (in preview pixels, relative to the base canvas center)
-// and zoom. Pan/zoom is clamped so the view never travels more than one preview
-// axis from the origin, keeping the composited content near the window center.
+// and zoom. Pan is the image-viewer bound -- the canvas edge may reach the
+// panel edge, never cross it -- so the view roams past the canvas into the
+// workspace while the canvas always stays reachable (see clamp_preview_camera).
 PREVIEW_CAM_MIN_ZOOM :: 0.25
 PREVIEW_CAM_MAX_ZOOM :: 8.0
 preview_cam_ox: f32

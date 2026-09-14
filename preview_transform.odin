@@ -30,12 +30,29 @@ preview_canvas :: proc(bounds: clay.BoundingBox) -> clay.BoundingBox {
 	}
 }
 
-// clamp_preview_camera keeps the pan within one preview axis of the origin and
-// the zoom within its min/max range.
+// clamp_preview_camera keeps the zoom in range and the pan inside the
+// image-viewer bound: the canvas's on-screen edge may reach the panel edge,
+// never cross it. That single rule carries both properties the user wants --
+// the view roams freely into the workspace around the canvas (fully past it,
+// at the limit), and the canvas can't be lost, because its edge stays pinned
+// to the panel. The range grows with zoom: the canvas edge has to travel
+// ~zoom*axis/2 before it reaches the panel edge, so bigger zoom = more room,
+// and at zoom 1 the canvas still overlaps the panel. A fixed clamp (the old
+// "one canvas axis from the origin") was the drift: correct at zoom 1, it
+// became an arbitrary wall the moment the view outgrew the window.
 clamp_preview_camera :: proc(canvas: clay.BoundingBox) {
 	preview_cam_zoom = clamp(preview_cam_zoom, PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
-	preview_cam_ox = clamp(preview_cam_ox, -canvas.width, canvas.width)
-	preview_cam_oy = clamp(preview_cam_oy, -canvas.height, canvas.height)
+	panel := clay.GetElementData(clay.ID("Preview")).boundingBox
+	px := panel.width
+	py := panel.height
+	if px <= 0 {
+		px = canvas.width
+	}
+	if py <= 0 {
+		py = canvas.height
+	}
+	preview_cam_ox = clamp(preview_cam_ox, -(canvas.width * preview_cam_zoom + px) / 2, (canvas.width * preview_cam_zoom + px) / 2)
+	preview_cam_oy = clamp(preview_cam_oy, -(canvas.height * preview_cam_zoom + py) / 2, (canvas.height * preview_cam_zoom + py) / 2)
 }
 
 // preview_view applies the camera (pan + zoom, centered on the base canvas) to

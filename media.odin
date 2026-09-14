@@ -261,7 +261,9 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	if probe.has_video && probe.video_fps_num > 0 {
 		timeline.frame_rate = f64(probe.video_fps_num) / f64(probe.video_fps_den)
 	}
-	audio_frames := i64(probe.duration_sec * timeline.frame_rate)
+	// NOTE: audio has no fps of its own; size against the timeline clock
+	// (timeline_fps falls back to 60 before any video import).
+	audio_frames := i64(probe.duration_sec * timeline_fps())
 	if audio_frames < frame_count {
 		audio_frames = frame_count
 	}

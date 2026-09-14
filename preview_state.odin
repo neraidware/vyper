@@ -769,12 +769,12 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		need_base := base_bw * base_bh * 4
 		if need_base > len(slot.text_base_buf) {
 			delete(slot.text_base_buf)
-			slot.text_base_buf = {} // delete leaves a stale non-zero len; a later
+			slot.text_base_buf = {} // NOTE: delete leaves a stale non-zero len; a later
 			slot.text_base_buf = make([]u8, need_base) // grow-check must not see it
 		}
 		if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
 			delete(slot.text_scratch)
-			slot.text_scratch = {} // same stale-len hazard
+			slot.text_scratch = {} // NOTE: same stale-len hazard
 			slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
 		}
 		_, _, ink_w, ink_h := rasterize_lines_into_buffer(
