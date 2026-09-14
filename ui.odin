@@ -530,14 +530,17 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							clip = {vertical = true, childOffset = {0, -timeline_view_top}},
 						},
 						) {
-							for track_idx := 0; track_idx <= len(timeline.tracks); track_idx += 1 {
+							sync_track_order()
+							for r := 0; r <= len(timeline.track_order); r += 1 {
 								// Insert gap above each track: the "Add track"
 								// button is limited to the gutter column, and the
 								// strip's remaining space carries the track's
 								// point-marker triangles (drawn by
-								// draw_clip_markers).
-								gap_id := clay.ID("TrackGap", u32(track_idx))
-								button_id := clay.ID("AddTrack", u32(track_idx))
+								// draw_clip_markers). gap/add-track IDs are
+								// keyed by ORDER position r (insert_track uses
+								// the position to place the new row).
+								gap_id := clay.ID("TrackGap", u32(r))
+								button_id := clay.ID("AddTrack", u32(r))
 								button_hovered := clay.PointerOver(button_id)
 								if clay.UI(gap_id)(
 								{
@@ -575,230 +578,214 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										}
 									}
 								}
-								if track_idx >= len(timeline.tracks) {
-									break
-								}
-								track := &timeline.tracks[track_idx]
-								if clay.UI(clay.ID("TrackRow", u32(track_idx)))(
+							if r >= len(timeline.track_order) {
+								break
+							}
+							ti := timeline.track_order[r]
+							track := &timeline.tracks[ti]
+							if clay.UI(clay.ID("TrackRow", u32(ti)))(
+							{
+								layout = {
+									sizing = {
+										width = clay.SizingGrow({}),
+										height = clay.SizingFixed(TRACK_ROW_H),
+									},
+									layoutDirection = .LeftToRight,
+									childGap = SECTION_GAP,
+								},
+							},
+							) {
+								if clay.UI(clay.ID("TrackName", u32(ti)))(
 								{
 									layout = {
 										sizing = {
-											width = clay.SizingGrow({}),
-											height = clay.SizingFixed(TRACK_ROW_H),
+											width = clay.SizingFixed(GUTTER_WIDTH),
+											height = clay.SizingGrow({}),
 										},
-										layoutDirection = .LeftToRight,
-										childGap = SECTION_GAP,
+										layoutDirection = .TopToBottom,
+										childGap = 4,
+										childAlignment = {x = .Left, y = .Top},
 									},
+									backgroundColor = TRACK_GUTTER_BG,
 								},
 								) {
-									if clay.UI(clay.ID("TrackName", u32(track_idx)))(
-									{
-										layout = {
-											sizing = {
-												width = clay.SizingFixed(GUTTER_WIDTH),
-												height = clay.SizingGrow({}),
-											},
-											layoutDirection = .TopToBottom,
-											childGap = 4,
-											childAlignment = {x = .Left, y = .Top},
+									clay.Text(
+										track.name,
+										clay.TextElementConfig {
+											textColor = TEXT,
+											fontSize = FONT_HEADING,
 										},
-										backgroundColor = TRACK_GUTTER_BG,
-									},
-									) {
-										clay.Text(
-											track.name,
-											clay.TextElementConfig {
-												textColor = TEXT,
-												fontSize = FONT_HEADING,
-											},
-										)
-										if clay.UI(clay.ID("TrackButtons", u32(track_idx)))(
-										{
-											layout = {
-												sizing = {
-													width = clay.SizingGrow({}),
-													height = clay.SizingFit({}),
-												},
-												layoutDirection = .LeftToRight,
-												childGap = 4,
-											},
-										},
-										) {
-											if clay.UI(clay.ID("DuplicateTrack", u32(track_idx)))(
-											{
-												layout = {
-													sizing = {
-														width = clay.SizingFixed(30),
-														height = clay.SizingFixed(34),
-													},
-													childAlignment = {x = .Center, y = .Center},
-												},
-												backgroundColor = clay.PointerOver(clay.ID("DuplicateTrack", u32(track_idx))) ? BUTTON_HOVER : BUTTON,
-												border = {
-													color = clay.PointerOver(clay.ID("DuplicateTrack", u32(track_idx))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-													width = clay.BorderOutside(1),
-												},
-												cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-											},
-											) {
-												// Duplicate glyph is drawn as an embedded icon overlay.
-											}
-											if clay.UI(clay.ID("RemoveTrack", u32(track_idx)))(
-											{
-												layout = {
-													sizing = {
-														width = clay.SizingFixed(30),
-														height = clay.SizingFixed(34),
-													},
-													childAlignment = {x = .Center, y = .Center},
-												},
-												backgroundColor = clay.PointerOver(clay.ID("RemoveTrack", u32(track_idx))) ? BUTTON_HOVER : BUTTON,
-												border = {
-													color = clay.PointerOver(clay.ID("RemoveTrack", u32(track_idx))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-													width = clay.BorderOutside(1),
-												},
-												cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-											},
-											) {
-												// Remove glyph is drawn as an embedded icon overlay.
-											}
-										}
-									}
-									if clay.UI(clay.ID("ClipsSection", u32(track_idx)))(
+									)
+									if clay.UI(clay.ID("TrackButtons", u32(ti)))(
 									{
 										layout = {
 											sizing = {
 												width = clay.SizingGrow({}),
-												height = clay.SizingGrow({}),
+												height = clay.SizingFit({}),
 											},
 											layoutDirection = .LeftToRight,
-										},
-										backgroundColor = EDITOR_BG,
-										clip = {
-											horizontal = true,
-											vertical = true,
-											childOffset = {
-												-timeline_view_start * timeline_zoom,
-												0,
-											},
+											childGap = 4,
 										},
 									},
 									) {
-										clips_content_x: f32 = 0
-										for timeline_clip, index in track.clips {
-											// Each clip is laid out at its true timeline frame position
-											// (start_frame pixels from the row's origin at frame 0); the
-											// ClipsSection's childOffset translates the whole row by
-											// -view_start*zoom so panning slides every clip together and
-											// clips starting before the view go off the left edge instead
-											// of pinning to it.
-											// A running x keeps real gaps between clips exactly one
-											// spacer wide, so multi-clip tracks don't drift right as
-											// later clips each add another full start-frame spacer.
-											target_x :=
-												f32(timeline_clip.timeline_start_frame) *
-												timeline_zoom
-											if target_x > clips_content_x {
-												spacer_w := target_x - clips_content_x
-												clips_content_x = target_x
-												clay.UI(
-													clay.ID(
-														"ClipOffset",
-														u32(track_idx * 1000 + index),
-													),
-												)(
-													{
-														layout = {
-															sizing = {
-																width = clay.SizingFixed(spacer_w),
-																height = clay.SizingGrow({}),
-															},
-														},
-													},
-												)
-											}
-											clip_width :=
-												f32(max(timeline_clip.source_length_frames, 1)) *
-												timeline_zoom
-											clip_color := BUTTON
-											clip_border := BUTTON_BORDER
-											clip_border_w: u16 = 2
-											clip_label := timeline_clip.name
-											if timeline_clip.kind == .Audio {
-												clip_color = AUDIO_CLIP
-												if clip_label == "" {
-													clip_label = "Audio"
-												}
-											} else if clip_label == "" {
-												clip_label = "Clip"
-											}
-											// The anchor clip gets the blue selection border; linked members of its
-											// group keep the yellow border so the unit reads as one; any
-											// Shift+clicked extra is blue (or yellow when it is itself
-											// linked).
-											if track_idx == selected_track &&
-											   index == selected_index {
-												clip_border = SELECT_BORDER
-												clip_border_w = 3
-											} else if is_clip_selected(track_idx, index) {
-												if timeline_clip.link_id != 0 {
-													clip_border = MARKER_COLOR
-												} else {
-													clip_border = SELECT_BORDER
-												}
-												clip_border_w = 3
-											}
-											// Adjacent clips keep their corner radius but drop the
-											// shared border where this clip's end touches the next
-											// clip's start exactly; the neighbor's left border stays as
-											// a thin divider line at the intersection.
-											next_touches :=
-												index + 1 < len(track.clips) &&
-												track.clips[index + 1].timeline_start_frame ==
-													clip_timeline_end(timeline_clip)
-											bw := clip_border_w
-											border := clay.BorderWidth {
-												left   = bw,
-												top    = bw,
-												bottom = bw,
-											}
-											border.right = next_touches ? 0 : bw
-											if clay.UI(
+										if clay.UI(clay.ID("DuplicateTrack", u32(ti)))(
+										{
+											layout = {
+												sizing = {
+													width = clay.SizingFixed(30),
+													height = clay.SizingFixed(34),
+												},
+												childAlignment = {x = .Center, y = .Center},
+											},
+											backgroundColor = clay.PointerOver(clay.ID("DuplicateTrack", u32(ti))) ? BUTTON_HOVER : BUTTON,
+											border = {
+												color = clay.PointerOver(clay.ID("DuplicateTrack", u32(ti))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+												width = clay.BorderOutside(1),
+											},
+											cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+										},
+										) {
+											// Duplicate glyph is drawn as an embedded icon overlay.
+										}
+										if clay.UI(clay.ID("RemoveTrack", u32(ti)))(
+										{
+											layout = {
+												sizing = {
+													width = clay.SizingFixed(30),
+													height = clay.SizingFixed(34),
+												},
+												childAlignment = {x = .Center, y = .Center},
+											},
+											backgroundColor = clay.PointerOver(clay.ID("RemoveTrack", u32(ti))) ? BUTTON_HOVER : BUTTON,
+											border = {
+												color = clay.PointerOver(clay.ID("RemoveTrack", u32(ti))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+												width = clay.BorderOutside(1),
+											},
+											cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+										},
+										) {
+											// Remove glyph is drawn as an embedded icon overlay.
+										}
+									}
+								}
+								if clay.UI(clay.ID("ClipsSection", u32(ti)))(
+								{
+									layout = {
+										sizing = {
+											width = clay.SizingGrow({}),
+											height = clay.SizingGrow({}),
+										},
+										layoutDirection = .LeftToRight,
+									},
+									backgroundColor = EDITOR_BG,
+									clip = {
+										horizontal = true,
+										vertical = true,
+										childOffset = {
+											-timeline_view_start * timeline_zoom,
+											0,
+										},
+									},
+								},
+								) {
+									clips_content_x: f32 = 0
+									for timeline_clip, index in track.clips {
+										target_x :=
+											f32(timeline_clip.timeline_start_frame) *
+											timeline_zoom
+										if target_x > clips_content_x {
+											spacer_w := target_x - clips_content_x
+											clips_content_x = target_x
+											clay.UI(
 												clay.ID(
-													"TimelineClip",
-													u32(track_idx * 1000 + index),
+													"ClipOffset",
+													u32(ti * 1000 + index),
 												),
 											)(
 												{
 													layout = {
 														sizing = {
-															width = clay.SizingFixed(clip_width),
-															height = clay.SizingFixed(
-																CLIP_TILE_HEIGHT,
-															),
+															width = clay.SizingFixed(spacer_w),
+															height = clay.SizingGrow({}),
 														},
-														padding = clay.PaddingAll(CARD_GAP),
 													},
-													backgroundColor = clip_color,
-													cornerRadius = clay.CornerRadiusAll(
-														RADIUS_WIDGET,
-													),
-													border = {color = clip_border, width = border},
 												},
-											) {
-												clay.Text(
-													clip_label,
-													clay.TextElementConfig {
-														textColor = TEXT,
-														fontSize = FONT_HEADING,
-													},
-												)
-											}
-											clips_content_x += clip_width
+											)
 										}
+										clip_width :=
+											f32(max(timeline_clip.source_length_frames, 1)) *
+											timeline_zoom
+										clip_color := BUTTON
+										clip_border := BUTTON_BORDER
+										clip_border_w: u16 = 2
+										clip_label := timeline_clip.name
+										if timeline_clip.kind == .Audio {
+											clip_color = AUDIO_CLIP
+											if clip_label == "" {
+												clip_label = "Audio"
+											}
+										} else if clip_label == "" {
+											clip_label = "Clip"
+										}
+										if ti == selected_track &&
+										   index == selected_index {
+											clip_border = SELECT_BORDER
+											clip_border_w = 3
+										} else if is_clip_selected(ti, index) {
+											if timeline_clip.link_id != 0 {
+												clip_border = MARKER_COLOR
+											} else {
+												clip_border = SELECT_BORDER
+											}
+											clip_border_w = 3
+										}
+										next_touches :=
+											index + 1 < len(track.clips) &&
+											track.clips[index + 1].timeline_start_frame ==
+												clip_timeline_end(timeline_clip)
+										bw := clip_border_w
+										border := clay.BorderWidth {
+											left   = bw,
+											top    = bw,
+											bottom = bw,
+										}
+										border.right = next_touches ? 0 : bw
+										if clay.UI(
+											clay.ID(
+												"TimelineClip",
+												u32(ti * 1000 + index),
+											),
+										)(
+											{
+												layout = {
+													sizing = {
+														width = clay.SizingFixed(clip_width),
+														height = clay.SizingFixed(
+															CLIP_TILE_HEIGHT,
+														),
+													},
+													padding = clay.PaddingAll(CARD_GAP),
+												},
+												backgroundColor = clip_color,
+												cornerRadius = clay.CornerRadiusAll(
+													RADIUS_WIDGET,
+												),
+												border = {color = clip_border, width = border},
+											},
+										) {
+											clay.Text(
+												clip_label,
+												clay.TextElementConfig {
+													textColor = TEXT,
+													fontSize = FONT_HEADING,
+												},
+											)
+										}
+										clips_content_x += clip_width
 									}
 								}
 							}
+						}
 						}
 					}
 					// Bottom bar: the snap toggles that used to live in the top

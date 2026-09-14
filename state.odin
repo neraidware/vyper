@@ -226,7 +226,6 @@ Clip :: struct {
 	source_start_frame:   i64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
-	layer:                i32,
 	// Native source pixel size (0 = unknown). The clip image is drawn keeping
 	// this aspect inside its transform box instead of stretching to the canvas,
 	// so a video imported into a differently-shaped project is letterboxed.
@@ -252,9 +251,7 @@ Clip :: struct {
 }
 
 Track :: struct {
-	id:    u64,
 	name:  string,
-	layer: i32,
 	clips: [dynamic]Clip,
 }
 Playback_State :: enum {
@@ -264,7 +261,15 @@ Playback_State :: enum {
 	Seeking,
 }
 Timeline :: struct {
+	// tracks holds every track in creation/append order -- STORAGE only. The
+	// on-screen stacking order (which row is above which, which clip the preview
+	// considers topmost) lives in track_order, a top-to-bottom list of indices
+	// into tracks. Ordering is never inferrable from array position: a track
+	// can be moved/duplicated/reordered without touching tracks, so clip
+	// references (selected_track, drag targets, lane math) key on the STORAGE
+	// index and are stable across reordering.
 	tracks:         [dynamic]Track,
+	track_order:    [dynamic]int,
 	playhead_frame: i64,
 	playback:       Playback_State,
 	frame_rate:     f64,

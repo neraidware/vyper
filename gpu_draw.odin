@@ -612,11 +612,14 @@ draw_drag_ghost :: proc(
 	// slides with the drag. If any member can't land at that exact spot on its
 	// destination lane the drop is refused, shown red.
 	if len(drag_group_orig) > 1 {
-		track_delta := drag_hover_track - drag_source_track
-		refused := !group_vertical_feasible(track_delta, drag_group_delta)
+		// Visual-row delta through the stack order: storage indices may be
+		// scrambled, but the drop targets the visual row under the pointer.
+		delta_rows := order_row_of(drag_hover_track) - order_row_of(drag_source_track)
+		refused := !group_vertical_feasible(delta_rows, drag_group_delta)
 		for m in drag_group_orig {
-			dst := m.track + track_delta
-			if dst < 0 || dst >= len(timeline.tracks) {
+			src_row := order_row_of(m.track)
+			dst := src_row >= 0 ? track_at_row(src_row + delta_rows) : -1
+			if dst < 0 {
 				continue
 			}
 			lane := clay.GetElementData(clay.ID("ClipsSection", u32(dst))).boundingBox

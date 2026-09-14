@@ -114,9 +114,7 @@ seed_ui_probe_session :: proc() {
 	next_id: u64 = 1
 	for t in 0 ..< ui_probe_tracks {
 		track := Track {
-			id    = next_id,
-			name  = fmt.aprintf("track %d", t),
-			layer = i32(t),
+			name = fmt.aprintf("track %d", t),
 		}
 		track.clips = make([dynamic]Clip, 0, ui_probe_clips_per_track)
 		for c in 0 ..< ui_probe_clips_per_track {

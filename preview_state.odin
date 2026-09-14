@@ -178,8 +178,10 @@ update_preview_slots :: proc() -> bool {
 	// Warm the upcoming clip's decoder before the playhead crosses the
 	// boundary, so the transition hands over a warm decoder (no cut stall).
 	prewarm_next_clip()
-	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
-		track := &timeline.tracks[track_idx]
+	sync_track_order()
+	for w := 0; w < len(timeline.track_order); w += 1 {
+		ti := timeline.track_order[w]
+		track := &timeline.tracks[ti]
 		for i := 0; i < len(track.clips); i += 1 {
 			clip := &track.clips[i]
 			if clip.kind != .Video && clip.kind != .Text {

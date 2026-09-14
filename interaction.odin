@@ -347,9 +347,11 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		return false
 	},
 	// Adding a track is limited to the gutter-width button in the insert gap;
-	// the rest of the strip is the point-marker lane.
+	// the rest of the strip is the point-marker lane. Gap IDs are keyed by the
+	// ORDER position, and insert_track places the new row at that position.
 	proc(inp: Mouse_Input) -> bool {
-		for i := 0; i <= len(timeline.tracks); i += 1 {
+		sync_track_order()
+		for i := 0; i <= len(timeline.track_order); i += 1 {
 			if clay.PointerOver(clay.ID("AddTrack", u32(i))) {
 				insert_track(i)
 				return true
@@ -480,8 +482,13 @@ interaction_post_build :: proc(
 			if drag_hover_track != drag_source_track &&
 			   drag_hover_track >= 0 &&
 			   drag_source_track >= 0 {
-				if len(drag_group_orig) > 1 {
-					move_linked_group(drag_hover_track - drag_source_track)
+if len(drag_group_orig) > 1 {
+					// Vertical drop for a linked group is measured in VISUAL rows:
+					// the group shifts by the number of stack rows between the
+					// anchor's source track and the hovered lane, regardless of
+					// storage order.
+					delta_rows := order_row_of(drag_hover_track) - order_row_of(drag_source_track)
+					move_linked_group(delta_rows)
 				} else {
 					move_clip_to_track(
 						drag_source_track,

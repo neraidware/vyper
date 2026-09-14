@@ -32,7 +32,7 @@ subtitle_render_probe_run :: proc(out: string) {
 	project.end_frame = -1
 
 	src_id := subtitle_probe_srt()
-	append(&timeline.tracks, Track{id = 1, layer = 0, name = strings.clone("probe subtitles")})
+	append(&timeline.tracks, Track{name = strings.clone("probe subtitles")})
 	add_subtitle_generator_clip(&timeline.tracks[0], 0, src_id, strings.clone("probe.srt"))
 	clip := &timeline.tracks[0].clips[0]
 

@@ -1361,13 +1361,17 @@ render_start :: proc() {
 		set_status(.Failed, "render range is empty")
 		return
 	}
-	// Snapshots.
+	// Snapshots: walk the visual stack order (top to bottom) so the
+	// compositing arrays inherit the user-facing priority. Audio is
+	// order-independent but tracks follow the visual layout.
 	cls := [dynamic]Render_Video_Src{}
 	auds := [dynamic]Render_Audio_Src{}
 	txts := [dynamic]Render_Text_Src{}
 	subs := [dynamic]Render_Sub_Src{}
-	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
-		tr := &timeline.tracks[track_idx]
+	sync_track_order()
+	for w := 0; w < len(timeline.track_order); w += 1 {
+		ti := timeline.track_order[w]
+		tr := &timeline.tracks[ti]
 		for i := 0; i < len(tr.clips); i += 1 {
 			clip := &tr.clips[i]
 			switch clip.kind {

@@ -1186,21 +1186,28 @@ group_delta_feasible :: proc(delta: i64) -> bool {
 }
 
 // group_vertical_feasible reports whether every captured link-group member can
-// land on dst lane = m.track + track_delta at the mouse-aligned position
-// m.start + delta (clamped to >= 0) without overlapping a non-member clip there.
-// This is the same rule group_delta_feasible applies horizontally, shifted to
-// the destination lanes a vertical drop targets.
-group_vertical_feasible :: proc(track_delta: int, delta: i64) -> bool {
+// land on a destination lane `track_delta_visual` rows away in the visual stack
+// at the mouse-aligned position m.start + delta (clamped to >= 0) without
+// overlapping a non-member clip there.  track_delta_visual is the row distance
+// in the ORDERED stack (positive = downward), not a storage-index delta --
+// the group may span non-adjacent storage indices, but the overlap checks
+// target the correct destination track.
+group_vertical_feasible :: proc(track_delta_visual: int, delta: i64) -> bool {
 	if len(drag_group_orig) == 0 {
 		return false
 	}
+	sync_track_order()
 	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
 	for m in drag_group_orig {
 		members[m.clip_id] = true
 	}
 	for m in drag_group_orig {
-		dst := m.track + track_delta
-		if dst < 0 || dst >= len(timeline.tracks) {
+		src_row := order_row_of(m.track)
+		if src_row < 0 {
+			return false
+		}
+		dst := track_at_row(src_row + track_delta_visual)
+		if dst < 0 {
 			return false
 		}
 		ts := m.start + delta
@@ -1220,24 +1227,19 @@ group_vertical_feasible :: proc(track_delta: int, delta: i64) -> bool {
 }
 
 // move_linked_group relocates every clip captured in drag_group_orig by
-// track_delta tracks (the anchor's vertical drop), keeping each member
-// laid-out at the same mouse-aligned horizontal offset the ghost showed:
-// start = m.start + drag_group_delta. Refused (returns false, nothing moves)
-// unless EVERY member can land at that exact spot on its destination lane
-// without overlapping a non-member clip, then re-selects the anchor in its new
-// home.
-move_linked_group :: proc(track_delta: int) -> bool {
-	if track_delta == 0 || len(drag_group_orig) == 0 {
+// track_delta_visual rows in the visual stack (the anchor's vertical drop),
+// keeping each member laid-out at the same mouse-aligned horizontal offset the
+// ghost showed: start = m.start + drag_group_delta. Refused (returns false,
+// nothing moves) unless EVERY member can land at that exact spot on its
+// destination lane without overlapping a non-member clip, then re-selects the
+// anchor in its new home.
+move_linked_group :: proc(track_delta_visual: int) -> bool {
+	if track_delta_visual == 0 || len(drag_group_orig) == 0 {
 		return false
 	}
-	if !group_vertical_feasible(track_delta, drag_group_delta) {
+	sync_track_order()
+	if !group_vertical_feasible(track_delta_visual, drag_group_delta) {
 		return false
-	}
-	for m in drag_group_orig {
-		dst := m.track + track_delta
-		if dst < 0 || dst >= len(timeline.tracks) {
-			return false
-		}
 	}
 	PlannedMove :: struct {
 		src_track, dst_track: int,
@@ -1246,7 +1248,12 @@ move_linked_group :: proc(track_delta: int) -> bool {
 	}
 	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig), context.temp_allocator)
 	for m in drag_group_orig {
-		if m.track < 0 || m.track >= len(timeline.tracks) {
+		src_row := order_row_of(m.track)
+		if src_row < 0 {
+			return false
+		}
+		dst := track_at_row(src_row + track_delta_visual)
+		if dst < 0 {
 			return false
 		}
 		src := &timeline.tracks[m.track]
@@ -1255,18 +1262,10 @@ move_linked_group :: proc(track_delta: int) -> bool {
 			continue
 		}
 		clip := src.clips[idx]
-		dst_track := m.track + track_delta
-		if dst_track < 0 || dst_track >= len(timeline.tracks) {
-			return false
-		}
-		// group_vertical_feasible already proved every member fits exactly at
-		// the mouse-aligned slot (>= 0, no non-member overlap); commit exactly
-		// there — max(.,0) would clamp lone members against the left edge and
-		// split the group off the anchor.
 		start := m.start + drag_group_delta
 		append(
 			&planned,
-			PlannedMove{src_track = m.track, dst_track = dst_track, start = start, clip = clip},
+			PlannedMove{src_track = m.track, dst_track = dst, start = start, clip = clip},
 		)
 	}
 	// Commit every relocation. Source indices captured at planning time are NOT
@@ -1376,23 +1375,81 @@ next_track_name :: proc() -> string {
 	return fmt.aprintf("Track %d", next)
 }
 
-// insert_track inserts a new empty track at the given index (0-based) in the
-// timeline track list — e.g. between existing tracks.
-insert_track :: proc(index: int) {
-	track := Track {
-		name = next_track_name(),
+// sync_track_order restores the invariant that track_order is a permutation of
+// [0 .. len(tracks)) in top-to-bottom order. The mutators below keep that
+// invariant explicitly; direct `append(&timeline.tracks, ...)` sites (media
+// lane creation, probes) rely on this lazily rebuilding the missing tail in
+// storage order, which is exactly bottom-append semantics. Cheap when already
+// consistent, so order consumers (UI rows, preview walk, render) can call it
+// every frame without thinking.
+sync_track_order :: proc() {
+	if len(timeline.track_order) == len(timeline.tracks) {
+		seen := make(map[int]bool, len(timeline.track_order), context.temp_allocator)
+		consistent := true
+		for ti in timeline.track_order {
+			if ti < 0 || ti >= len(timeline.tracks) || ti in seen {
+				consistent = false
+				break
+			}
+			seen[ti] = true
+		}
+		if consistent {
+			return
+		}
 	}
-	inject_at_elem(&timeline.tracks, index, track)
+	clear(&timeline.track_order)
+	for i in 0 ..< len(timeline.tracks) {
+		append(&timeline.track_order, i)
+	}
 }
 
-// duplicate_track inserts a copy of the track directly ABOVE the original (at
-// index, pushing the original down one row), deep-copying every clip into a new
-// dynamic array so the two tracks are fully independent.
+// order_row_of returns the top-to-bottom row (position in track_order) of the
+// track at STORAGE index ti, or -1 if it isn't in the order. Note Odin's range
+// is (value, index) — the loop body destructures storage_idx, row.
+order_row_of :: proc(ti: int) -> int {
+	for storage_idx, row in timeline.track_order {
+		if storage_idx == ti {
+			return row
+		}
+	}
+	return -1
+}
+
+// track_at_row returns the STORAGE index of the track displayed at visual row
+// r, or -1 when r is outside the stack. All "N rows from X" math (clip drops,
+// group moves, ghost drawing) goes through this so the translation storage==
+// visual-order that used to be implicit in the array is explicit and correct
+// under any order.
+track_at_row :: proc(r: int) -> int {
+	if r < 0 || r >= len(timeline.track_order) {
+		return -1
+	}
+	return timeline.track_order[r]
+}
+
+// insert_track inserts a new empty track at visual position order_pos in the
+// track stack (0 = topmost, len = bottom): the row appears where the gap it
+// was clicked sits, and every row below shifts down. Storage is append-only,
+// so existing STORAGE indices (selected_track, drag targets) never move.
+insert_track :: proc(order_pos: int) {
+	sync_track_order()
+	append(&timeline.tracks, Track {name = next_track_name()})
+	new_ti := len(timeline.tracks) - 1
+	pos := clamp(order_pos, 0, len(timeline.track_order))
+	inject_at_elem(&timeline.track_order, pos, new_ti)
+}
+
+// duplicate_track inserts a copy of the track directly ABOVE the original (one
+// row up in the visual stack), deep-copying every clip into a new dynamic array
+// so the two tracks are fully independent. The copy lands adjacent to its
+// source no matter where the source sits on the stack -- it never jumps over
+// unrelated tracks to the very top, which is what silently reordered rows and
+// left the duplicated video stacked above things the user wasn't looking at.
 duplicate_track :: proc(index: int) {
+	sync_track_order()
 	src := &timeline.tracks[index]
 	new_track := Track {
-		name  = next_track_name(),
-		layer = src.layer,
+		name = next_track_name(),
 		// Deep copy array persists on the inserted track: context.allocator.
 		clips = make([dynamic]Clip, 0, len(src.clips)),
 	}
@@ -1401,8 +1458,13 @@ duplicate_track :: proc(index: int) {
 	// sever the ORIGINAL's link group.)
 	for i in 0 ..< len(src.clips) {
 		c := src.clips[i]
-		// A duplicated clip is an independent copy: sever its link group so
-		// selecting it never drags the original's partner tracks along.
+		// A duplicated clip is a NEW clip instance: mint a fresh identity so
+		// update_preview_slots claims its own slot instead of collapsing into
+		// the original's (same clip_id = same slot = the original's transform/
+		// layer wins and the copy's content never paints). Duplicated clips
+		// are independent copies: sever its link group so selecting it never
+		// drags the original's partner tracks along.
+		c.clip_id = new_clip_id()
 		c.link_id = 0
 		if len(c.markers) > 0 {
 			// Clone the markers array so the two tracks share no owned memory:
@@ -1416,7 +1478,13 @@ duplicate_track :: proc(index: int) {
 		}
 		append(&new_track.clips, c)
 	}
-	inject_at_elem(&timeline.tracks, index, new_track)
+	append(&timeline.tracks, new_track)
+	new_ti := len(timeline.tracks) - 1
+	// ABOVE the source: inject at the source's own row so the copy takes the
+	// source's slot in the visual stack and the original shifts down one.
+	src_row := order_row_of(index)
+	pos := clamp(src_row, 0, len(timeline.track_order))
+	inject_at_elem(&timeline.track_order, pos, new_ti)
 }
 
 // duplicate_clip inserts an independent copy of the clip at (track_idx,index)
@@ -1440,7 +1508,6 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 		source_start_frame   = src.source_start_frame,
 		source_length_frames = src.source_length_frames,
 		timeline_start_frame = src.timeline_start_frame,
-		layer                = src.layer,
 		source_w             = src.source_w,
 		source_h             = src.source_h,
 		transform_x          = src.transform_x,
@@ -1474,6 +1541,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 // selected_index is preserved), and invalidates the preview/audio state the
 // way every clip-delete path must (see delete_selected_clip_raw).
 remove_track :: proc(index: int) {
+	sync_track_order()
 	if index < 0 || index >= len(timeline.tracks) {
 		return
 	}
@@ -1484,6 +1552,17 @@ remove_track :: proc(index: int) {
 	delete(removed.clips)
 	delete(removed.name)
 	ordered_remove(&timeline.tracks, index)
+	// Drop the removed track from the visual stack and renumber every entry
+	// above it (track_order is a permutation, so this keeps it one).
+	for w := 0; w < len(timeline.track_order); w += 1 {
+		switch {
+		case timeline.track_order[w] == index:
+			ordered_remove(&timeline.track_order, w)
+			w -= 1
+		case timeline.track_order[w] > index:
+			timeline.track_order[w] -= 1
+		}
+	}
 	switch {
 	case selected_track == index:
 		selected_track = -1
