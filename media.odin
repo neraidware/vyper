@@ -3,9 +3,13 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import avcodec "vendor/ffmpeg/avcodec"
+import avfmt "vendor/ffmpeg/avformat"
+import avutil "vendor/ffmpeg/avutil"
 
 // ---------------------------------------------------------------------------
 // Media import: probing files with ffprobe, building Media_Asset/Track/Clip
@@ -44,61 +48,67 @@ set_project_orientation :: proc(vertical: bool) {
 }
 
 // probe_video_size returns the first video stream's pixel dimensions, or
-// ok=false if the file has no video stream / ffprobe fails.
+// ok=false if the file has no video stream. In-process via avformat; no
+// ffprobe subprocess.
 probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
-	out, code, okin := run_capture(
-		{
-			"ffprobe",
-			"-v",
-			"error",
-			"-select_streams",
-			"v:0",
-			"-show_entries",
-			"stream=width,height",
-			"-of",
-			"csv=p=0",
-			string(path),
-		},
-	)
-	defer delete(out)
-	if !okin || code != 0 {
-		return 0, 0, false
-	}
-	line := strings.trim_space(out)
-	parts := strings.split(line, ",")
-	if len(parts) != 2 {
-		return 0, 0, false
-	}
-	width, wok := strconv.parse_int(parts[0])
-	height, hok := strconv.parse_int(parts[1])
-	if !wok || !hok || width <= 0 || height <= 0 {
-		return 0, 0, false
-	}
-	return c.int(width), c.int(height), true
+	return probe_video_dimensions(path)
 }
 
+// probe_media builds the asset metadata blob in-process (avformat), replacing
+// the shelled-out ffprobe. It keeps the exact key=value line format the
+// parsers (media_frame_count, media_dur_us) consume: format_name=, duration=,
+// size=, codec_name=, nb_frames=, avg_frame_rate=. nb_frames comes from a
+// container scan (one read), so it reflects decodable reality rather than the
+// container's estimated count. Only the first real video stream gets a
+// nb_frames line: that is the count every downstream frame-count consumer
+// wants, and scanning once keeps import O(1 read).
 probe_media :: proc(path: cstring) -> string {
-	out, _, okin := run_capture(
-		{
-			"ffprobe",
-			"-v",
-			"error",
-			"-show_entries",
-			"format=format_name,duration,size:stream=codec_name,nb_frames,avg_frame_rate",
-			"-of",
-			"default=noprint_wrappers=1",
-			string(path),
-		},
-	)
-	if !okin {
-		return "Length: unavailable\nFormat: unavailable\nCodecs: unavailable\nSize: unavailable"
+	fmt_ctx: ^avfmt.FormatContext
+	unavail := "Length: unavailable\nFormat: unavailable\nCodecs: unavailable\nSize: unavailable"
+	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
+		return unavail
 	}
-	// Ignore the exit code explicitly: ffprobe can return non-zero on files it
-	// can partially inspect but still rejects at the end; we want whatever it
-	// printed. Clone into an owned string (the captured buffer is freed).
-	result := strings.clone(strings.trim_space(out))
-	delete(out)
-	return result
+	defer avfmt.close_input(&fmt_ctx)
+	if ret := avfmt.find_stream_info(fmt_ctx, nil); ret < 0 {
+		return unavail
+	}
+	sb := strings.builder_make(context.temp_allocator)
+	if fmt_ctx.iformat != nil && fmt_ctx.iformat.name != nil {
+		fmt.sbprintf(&sb, "format_name=%s\n", string(fmt_ctx.iformat.name))
+	}
+	fmt.sbprintf(&sb, "duration=%.6f\n", f64(fmt_ctx.duration) / 1_000_000)
+	if fi, serr := os.stat(string(path), context.temp_allocator); serr == os.ERROR_NONE {
+		fmt.sbprintf(&sb, "size=%d\n", fi.size)
+	}
+	for i in 0 ..< int(fmt_ctx.nb_streams) {
+		stream := fmt_ctx.streams[i]
+		if stream == nil || stream.codecpar == nil {
+			continue
+		}
+		codec_name := avcodec.get_name(stream.codecpar.codec_id)
+		#partial switch stream.codecpar.codec_type {
+		case avutil.MediaType.Video:
+			if .Attached_Pic in stream.disposition {
+				continue
+			}
+			if codec_name != nil {
+				fmt.sbprintf(&sb, "codec_name=%s\n", string(codec_name))
+			}
+			if count := first_video_packet_count(fmt_ctx); count > 0 {
+				fmt.sbprintf(&sb, "nb_frames=%d\n", count)
+			}
+			// Only the first video stream carries a frame count; break the
+			// scan once it's emitted so later streams don't re-scan.
+			fmt.sbprintf(&sb, "avg_frame_rate=%d/%d\n", stream.avg_frame_rate.num, max(stream.avg_frame_rate.den, 1))
+			return strings.clone(strings.to_string(sb))
+		case avutil.MediaType.Audio:
+			if codec_name != nil {
+				fmt.sbprintf(&sb, "codec_name=%s\n", string(codec_name))
+			}
+			fmt.sbprintf(&sb, "avg_frame_rate=%d/%d\n", stream.avg_frame_rate.num, max(stream.avg_frame_rate.den, 1))
+		}
+	}
+	return strings.clone(strings.to_string(sb))
 }
 
 media_frame_count :: proc(metadata: string) -> i64 {

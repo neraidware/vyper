@@ -771,6 +771,87 @@ probe_streams :: proc(path: cstring) -> Stream_Probe {
 	return probe
 }
 
+// first_video_packet_count scans the container for the first real video
+// stream's packet count. This is the in-process equivalent of ffprobe's
+// `-count_packets -show_entries stream=nb_read_packets`, and the source of the
+// authoritative count the import/proxy verification previously trusted ffprobe
+// for. fmt_ctx must already be opened + stream info found. Returns -1 on any
+// failure so callers share the same "unprobeable" sentinel the old ffprobe
+// path returned.
+first_video_packet_count :: proc(fmt_ctx: ^avfmt.FormatContext) -> i64 {
+	video_idx := c.int(-1)
+	for i in 0 ..< int(fmt_ctx.nb_streams) {
+		stream := fmt_ctx.streams[i]
+		if stream == nil || stream.codecpar == nil {
+			continue
+		}
+		if stream.codecpar.codec_type != avutil.MediaType.Video || .Attached_Pic in stream.disposition {
+			continue
+		}
+		video_idx = c.int(i)
+		break
+	}
+	if video_idx < 0 {
+		return -1
+	}
+	pkt := avcodec.packet_alloc()
+	defer avcodec.packet_free(&pkt)
+	count: i64 = 0
+	for {
+		if avfmt.read_frame(fmt_ctx, pkt) < 0 {
+			break
+		}
+		if pkt.stream_index == video_idx {
+			count += 1
+		}
+		avcodec.packet_unref(pkt)
+	}
+	if count <= 0 {
+		return -1
+	}
+	return count
+}
+
+// probe_video_packet_count opens a file in-process and counts the packets of
+// its first real video stream. Replaces the shelled-out
+// `ffprobe -count_packets -show_entries stream=nb_read_packets`.
+probe_video_packet_count :: proc(path: cstring) -> i64 {
+	fmt_ctx: ^avfmt.FormatContext
+	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
+		return -1
+	}
+	defer avfmt.close_input(&fmt_ctx)
+	if ret := avfmt.find_stream_info(fmt_ctx, nil); ret < 0 {
+		return -1
+	}
+	return first_video_packet_count(fmt_ctx)
+}
+
+// probe_video_dimensions returns the first real (non-attached-picture) video
+// stream's coded size. Replaces the shelled-out
+// `ffprobe -show_entries stream=width,height`.
+probe_video_dimensions :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
+	fmt_ctx: ^avfmt.FormatContext
+	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
+		return 0, 0, false
+	}
+	defer avfmt.close_input(&fmt_ctx)
+	if ret := avfmt.find_stream_info(fmt_ctx, nil); ret < 0 {
+		return 0, 0, false
+	}
+	for i in 0 ..< int(fmt_ctx.nb_streams) {
+		stream := fmt_ctx.streams[i]
+		if stream == nil || stream.codecpar == nil {
+			continue
+		}
+		if stream.codecpar.codec_type != avutil.MediaType.Video || .Attached_Pic in stream.disposition {
+			continue
+		}
+		return c.int(stream.codecpar.width), c.int(stream.codecpar.height), true
+	}
+	return 0, 0, false
+}
+
 // import_obs_chapters reads the chapter markers OBS links (hybrid MP4/MOV) embed
 // in QTFF: a 'text' sample-entry track (handler "OBS Chapter Handler") that
 // FFmpeg demuxes as a MOV_TEXT subtitle stream, one sample per chapter. Files

@@ -42,27 +42,25 @@ sched_frame :: proc() {
 	proxy_build_schedule()
 }
 
-// sched_pump advances the worker for up to deadline, running one scheduler
-// frame per tick so the request/consume lifecycle behaves like the live app.
-sched_wait_done :: proc(what: string) -> bool {
-	deadline := sdl.GetTicksNS() + 120_000_000_000
+// sched_wait_terminal polls the builder's LAST-RESULT snapshot (import_bg_window)
+// without consuming it: consuming reset phase to Idle, which made the old
+// phase-based wait always time out. Returns the phase a completed window
+// reached. The worker resolves a request on its own thread; the scheduler tick
+// is only needed to POST new requests, which the scenario does explicitly.
+sched_wait_terminal :: proc(want_lo, want_hi: int, what: string) -> (phase: Build_Phase) {
+	deadline := sdl.GetTicksNS() + 60_000_000_000
 	for sdl.GetTicksNS() < deadline {
-		sched_frame()
-		_, _, phase, _ := import_bg_status()
-		if phase == .Done_Ok {
-			return true
-		}
-		if phase == .Done_Cancelled || phase == .Done_Fail {
-			fmt.printf("[sched-probe] %s ended %v unexpectedly\n", what, phase)
-			return false
+		_, _, _, _, _, _, _, _, _, _, _, _, lr_phase, _, lr_lo, lr_hi := import_bg_window()
+		if lr_phase == .Done_Ok || lr_phase == .Done_Cancelled || lr_phase == .Done_Fail {
+			if lr_lo == want_lo && lr_hi == want_hi {
+				return lr_phase
+			}
 		}
 		time.sleep(20 * time.Millisecond)
 	}
-	fmt.printf("[sched-probe] %s timed out\n", what)
-	return false
+	fmt.printf("[sched-probe] %s never reached a terminal phase for [%d,%d)\n", what, want_lo, want_hi)
+	return .Idle
 }
-
-
 
 sched_window_done :: proc() -> (src: cstring, lo, hi: int, ok: bool) {
 	_, _, _, _, _, _, _, _, src, lo, hi, ok, _, _, _, _ = import_bg_window()
@@ -110,7 +108,17 @@ proxy_sched_probe_run :: proc(v: string) {
 }
 
 proxy_sched_scenario :: proc(v: string) -> bool {
-	file := v
+	// Copy into a stable NUL-terminated buffer: env strings from lookup_env_alloc
+	// are NOT NUL-terminated, and all avformat/ffmpeg entry points read cstrings
+	// past the visible bytes until a NUL (bg/root probes all do the same).
+	file_buf: [4096]u8
+	n := 0
+	for n < len(v) && n < len(file_buf) - 1 {
+		file_buf[n] = u8(v[n])
+		n += 1
+	}
+	file_buf[n] = 0
+	file := cstring(&file_buf[0])
 
 	preview_proxy_enabled = true
 	async_import_mode = true
@@ -120,7 +128,7 @@ proxy_sched_scenario :: proc(v: string) -> bool {
 
 	// Full import (bin + timeline) like the GUI. No proxy work happens at
 	// import under async_import_mode; the scheduler below drives everything.
-	import_media(cstring(raw_data(file)))
+	import_media(file)
 
 	asset := &media_assets[len(media_assets) - 1]
 	if asset == nil || asset.frame_count <= 0 || asset.dur_us <= 0 {
@@ -155,7 +163,7 @@ proxy_sched_scenario :: proc(v: string) -> bool {
 			r_hi,
 		)
 	}
-	sched_probe_check(sched_wait_done("S1 build [0,1)"), "S1 build failed")
+	sched_probe_check(sched_wait_terminal(0, 1, "S1 build") == .Done_Ok, "S1 build failed")
 	_, d_lo, d_hi, d_ok := sched_window_done()
 	sched_probe_check(d_ok && d_lo == 0 && d_hi == 1, "S1: done window [0,1), got [%d,%d) ok=%v", d_lo, d_hi, d_ok)
 	fmt.println("[sched-probe] S1 ok: initial window built")
@@ -190,9 +198,8 @@ proxy_sched_scenario :: proc(v: string) -> bool {
 
 	// S3b: cancel while [3,4) is building; expect Done_Cancelled, not Done_Ok.
 	import_bg_cancel()
-	if sched_wait_done("S3b cancelled build") {
-		sched_probe_check(false, "S3b: cancel should NOT finish ok")
-	}
+	ph := sched_wait_terminal(3, 4, "S3b cancelled build")
+	sched_probe_check(ph == .Done_Cancelled, "S3b: cancel should yield Done_Cancelled, got %v", ph)
 	fmt.println("[sched-probe] S3b ok: in-flight build cancelled after redefine")
 
 	// S4: suppression -- same playhead, same wanted window [3,4); the scheduler
@@ -218,20 +225,23 @@ proxy_sched_scenario :: proc(v: string) -> bool {
 		r_lo,
 		r_hi,
 	)
-	sched_probe_check(sched_wait_done("S5 build [2,3)"), "S5 build failed")
+	sched_probe_check(sched_wait_terminal(2, 3, "S5 build") == .Done_Ok, "S5 build failed")
 	_, d_lo, d_hi, d_ok = sched_window_done()
 	sched_probe_check(d_ok && d_lo == 2 && d_hi == 3, "S5: done window [2,3), got [%d,%d) ok=%v", d_lo, d_hi, d_ok)
 	fmt.println("[sched-probe] S5 ok: gap window built after suppression lifted")
 
-	// On-disk final state: segments 0,1,2 present and listed, segment 3 absent
-	// (its build was cancelled mid-flight) -> NOT a complete proxy.
+	// On-disk final state matches the script's trajectory: seg0 (S1) and seg2
+	// (S5) are present; seg1 is absent because S3's far-jump redefined the
+	// [1,2) build away before it produced anything; seg3 is absent because its
+	// build was cancelled in S3b. Sum = 1800, so the source MUST NOT read as a
+	// complete proxy.
 	idx: Proxy_Idx
 	has_idx := proxy_idx_load(src, &idx)
 	total: i64
 	for c in idx.segs {
 		total += c
 	}
-	frames_covered: i64 = 2700  // segments 0..2 -> 900*3; segment 3 build was cancelled
+	frames_covered: i64 = 1800  // seg0 + seg2 -> 900*2; seg1/seg3 never built
 	sched_probe_check(has_idx && total >= frames_covered - PROXY_FRAME_TOLERANCE,
 		"S6: expected ~%d frames on disk, got %d",
 		frames_covered,
@@ -241,12 +251,13 @@ proxy_sched_scenario :: proc(v: string) -> bool {
 		p, _ := proxy_segment_path_for(s, k, sb[:])
 		return p != nil && os.exists(string(p))
 	}
-	sched_probe_check(sched_seg_present(src, 0) && sched_seg_present(src, 1) && sched_seg_present(src, 2),
-		"S6: segments 0..2 should exist on disk")
+	sched_probe_check(sched_seg_present(src, 0) && sched_seg_present(src, 2),
+		"S6: segments 0 and 2 should exist on disk")
+	sched_probe_check(!sched_seg_present(src, 1), "S6: redefined-away segment 1 must be absent")
 	sched_probe_check(!sched_seg_present(src, 3), "S6: cancelled segment 3 must not exist")
 	sched_probe_check(!proxy_segments_complete(src, asset.frame_count),
 		"S6: a gap proxy must NOT read as complete")
-	fmt.println("[sched-probe] S6 ok: on-disk coverage matches the script (0-2 kept, 3 absent)")
+	fmt.println("[sched-probe] S6 ok: on-disk coverage matches the script (0+2 kept, 1+3 absent)")
 
 	delete(idx.segs)
 	proxy_cleanup_artifacts(src)

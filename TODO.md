@@ -1,6 +1,89 @@
 # vyper TODO
 
-## Active — Unicode text + GPU glyph cache (full font coverage)
+## Active 1 — Optimized playback pipeline: hw decode, in-process ffmpeg, true-rate preview
+
+**Why:** mpv plays 2x AV1 1080p60 pitch-preserved, smooth, full quality on this
+machine. We can't: our decoder is pure software (`avcodec.open2(ctx, codec, nil)`,
+decode.odin:355 — no `hw_device_ctx` anywhere), AV1 1080p60 software decode is
+one of the most expensive loop-carried jobs a CPU does and 2x doubles the per-
+wall-second decode load while the background proxy build software-encodes on top.
+We also never show the original: `proxy_pick_for_frame` serves the 768x432 proxy,
+so full quality is unreachable by design and host decode power goes unused.
+Audio speed is `SetAudioStreamFrequencyRatio` (audio.odin:347) — plain resampling,
+tape-style pitch shift. mpv pitch-preserves via WSOLA.
+
+**Core rule — no more ffmpeg binaries. Ever.** All ffmpeg/ffprobe shell-outs
+(import_bg.odin:552 encode, proxy.odin:165 frame-count probe, media.odin:49/81
+probes) become in-process calls into the vendored libav* bindings we already link
+for decode. No `process_start`, no `-progress` file, no PATH dependency.
+
+Design decisions (from 2026-09-14 review):
+- **HW decode**: `AVHWDeviceType` per platform (VA-API/Vulkan on Linux, D3D11,
+  VideoToolbox), best `hw_pix_fmt` chosen at open, `av_hwframe_transfer_data` to
+  a staging buffer for the existing texture-upload path (v1; GPU→GPU v2).
+- **Software fallback is measured, not assumed**: open with a performant default,
+  sample decode throughput against source rate at first enable; if the host can't
+  sustain >= source fps in real time, drop to proxy preview. Per-asset, re-tested
+  when the decoder setup changes.
+- **Preview the ORIGINAL, GPU-scaled, when the host keeps up** — the mpv path.
+  Proxy-window build (`proxy_build_schedule`) becomes the weak-host fallback and
+  stays for export/render reuse.
+- **Encode in-process**: segment/whole proxy transcode via `avcodec` (x264) + mux
+  via `avformat`. Verify each artifact by opening it in-process (avformat read +
+  frame count) — deletes the ffprobe verification round-trip that just produced
+  a silent `-1` on a fresh segment in the scheduler probe run.
+- **Pitch-preserving rate**: link `libavfilter`; `atempo` (WSOLA) one stage per
+  rate <=2, chained for >2x, inserted into the audio producer. Audio clock as
+  master clock for sync at rate (0/Auto = 1.0).
+- Probe/CI determinism keeps: probes must still pass offline; `odin build -vet`
+  clean baseline unchanged.
+
+Steps (each lands + probe + vet before the next):
+- [x] S1. In-process probe+verify: add `avfmt`-based `in_proc_frame_count(path)`
+      (read packets, count video frames) and replace the `ffprobe` shell-outs in
+      `proxy_probe_frame_count` (proxy.odin:162), `probe_video_size` +
+      `probe_media` (media.odin:46/80). Probe: frame counts match ffprobe on a
+      known file; the `-1` case now reports a reason, not code=1 empty.
+      DONE 2026-09-14 (`first_video_packet_count`, `probe_video_dimensions`,
+      in-process `probe_media` blob keeps key=value contract). Also fixed the
+      sched probe's non-NUL-terminated env path string (root cause of the
+      original ENOENT + seg-`-1` bug) and its consume-before-read waits;
+      `VYPER_PROXY_SCHED_TEST` + bg + tl probes all green.
+- [ ] S2. In-process proxy encode: segment encode via `avcodec` libx264 +
+      `avformat` muxer mirroring the current argv (all-intra, `-g 1`, 900-frame
+      segs, scale via `swscale` or libavfilter). Worker loop gains no subprocess;
+      segment progress = encoded frames counter. Verify v1: bg-test builds a full
+      window (tiny + med120) and artifacts byte-identical coverage (frame counts).
+- [ ] S3. Delete the subprocess encode path + ffprobe/fc-less imports that remain:
+      `subprocess.odin` ffmpeg helpers, `resolve_tool_argv` encode branch, the
+      shelled fallback in `proxy_transcode` sync mode. No `run_capture` of
+      ffmpeg/ffprobe left.
+- [ ] S4. HW decode in `Clip_Decoder`: enumerate hw devices, open with
+      `hw_device_ctx`, decode to hw frames, `av_hwframe_transfer_data` to a cached
+      YUV buffer, feed existing sws. Software path stays exact. Probe: hw vs
+      software decode of av1 1080p60 produce identical frame indices + scale;
+      deviceless run falls back clean.
+- [ ] S5. Original-rate preview: when decoder throughput sustains source fps,
+      `proxy_pick_for_frame` resolves the original path (decode from original,
+      GPU-or-sws scale to canvas). Deadline: one CPU core of air left on a
+      1080p60 playback.
+- [ ] S6. Pitch-preserving rate: `atempo` in former of audio producer; rate
+      dropdown (ui.odin:1486) pitch-preserves at 1.5/2 (and chords >2). Probe:
+      tempo up does not shift a tone's pitch; sync holds at 2x for 30s.
+- [ ] ACCEPT: 2x AV1 1080p60 plays smooth, pitch preserved, full-res, cores free;
+      re-check mpv does no better. Weak-host fallback still builds windowed
+      proxies via in-process encode. No `"ffmpeg"`/`"ffprobe"` strings in the
+      binary. Probes + vet green.
+
+Out of scope (future): GPU→GPU zero-copy compositing, hw-encode for proxies,
+ICC color management, video interpolation (motion-estimated), A/V drift autotune.
+
+Open bug (shelved, revisit against S1/S2): scheduler probe reported fresh
+segments verifying as `-1` (ffprobe code=1 empty stderr) while bg-test passes
+same file — subprocess-post-encode verification fragility; expected to disappear
+with in-process encode+verify.
+
+## Active 2 — Unicode text + GPU glyph cache (full font coverage)
 
 **Status:** UI text (`render_text`) bakes a fixed 512px atlas of 95 ASCII
 chars at 32px and loops bytes, so `é` (and any non-ASCII) is dropped both by
@@ -25,8 +108,8 @@ Design decisions (from 2026-09-12 review):
   (frame.odin, after thumbnail uploads, before AcquireSwapchainTexture)
   bake + upload only dirty cells via region copy.
 - **Grow = re-create texture 2x, re-bake all cached runes into it** (no
-   9MB CPU pixel mirror retained; re-bake is CPU-cheap, measure with
-   spall — one-time ~ms hitch on a rare event).
+  9MB CPU pixel mirror retained; re-bake is CPU-cheap, measure with
+  spall — one-time ~ms hitch on a rare event).
 - ASCII 0x20–0x7E prebaked in `upload_font_atlas` replacement.
 - Combining marks overlay naturally (zero-advance quads) — no shaping. Full
   harfbuzz shaping is a separate future task, explicitly out of scope here.
@@ -69,30 +152,19 @@ Out of scope (future): harfbuzz shaping, color/emoji glyphs, tofu box,
 per-size-bucket baking for >32px UI text, IME preedit UI, exact-advance
 text measurement for layout.
 
-## Phase 1 — Performance, Cleanup, Refactoring, Polish
+## Queued — Performance / Cleanup
 
-- Proxy lag: decode cost grows monotonically within a segment (file-position
-  dependent), resets at segment boundary when decoder reopens. Root cause and
-  fix remaining open.
 - Proxy cache directory: move proxies out of source dir into
   `$XDG_CACHE_HOME/vyper/proxies` keyed by stable source-path hash.
 - Per-asset decoder cache: share one decoder + pool across clips referencing
   the same source; current RAM frame cache exists but decoders are per-clip.
-- Hardware decode + encode for proxies (NVENC / AMF / VA-API / VideoToolbox):
-  detect at runtime, pick best available, fall back to libx264-ultrafast.
-  Near-real-time proxy builds with near-zero CPU on supported hardware.
-- `nice`/low-priority ffmpeg on POSIX so capped software encode yields to
-  interaction on small-core machines.
+- HW encode for proxies (NVENC / AMF / VA-API / VideoToolbox): detect at
+  runtime, pick best available, fall back to libx264-ultrafast.
 - Proxy re-encode on project resolution change.
 - Codebase cleanup: bare layout constants (z-index stacking 300/1000/2000/
   2001/3000) promoted to named constants.
-- Pitch-preserving playback rate via FFmpeg `atempo` post-mix time-stretch
-  (WSOLA), chained for rates >2x. Requires linking libavfilter.
-- Project persistence: save/load project file format (name, resolution, fps,
-  render range, export presets).
-- Overlapping-audio clip mixing (currently plays first active audio clip only).
-- Audio clock as master clock.
 - VFR-exact frame selection (currently timestamp-targeted via average frame rate).
+- Overlapping-audio clip mixing (currently plays first active audio clip only).
 - `odin check .` clean — zero warnings baseline for every change.
 
 ## Phase 2 — UX Overhaul
@@ -132,11 +204,15 @@ Details TBD when Phase 2 reaches maturity.
 - Double-buffered GPU preview texture (flicker-free).
 - Bounded MRU frame cache (`FRAME_CACHE_CAPACITY=24`).
 - Audio: live real-time rendering via `Audio_Clip_Decoder` + SDL3 AudioStream,
-  ~0.15s ahead of playhead, resyncs on play/seek/load.
+  ~0.15s ahead of playhead, resyncs on play/seek/load. Speed control is
+  resample-only (pitch shifts — the atempo/WSOLA fix is Active 1 S6).
 - `Clip` carries `path`; media probing done in-process (`probe_streams`).
 - Auto-created tracks/clips on import (video track + Audio N per audio stream).
 - Preview proxies: segmented all-intra (`-g 1`, 900-frame segments), low-res
   (768x432), transcoded at import, `proxy_pick_for_frame` resolves per-frame.
+- On-demand playhead-window proxy building (segment margin around playhead,
+  far-jump redefine, cancel suppression; `VYPER_PROXY_SCHED_TEST` probe).
+- Import progress: non-blocking corner badge with cancel (was a modal veil).
 - Clip resize: left/right edge drag for trim/extend, clamped to source bounds.
 - Clip slicing (`S` key): splits at playhead, both halves keep in-range markers.
 - Adjacent-clip visuals: shared-border divider, rounded corners preserved.

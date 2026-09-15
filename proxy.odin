@@ -158,35 +158,12 @@ proxy_scale :: proc(src_w, src_h: c.int) -> (w, h: c.int) {
 }
 
 // proxy_probe_frame_count returns the number of frames ffprobe attributes to
-// the proxy's video stream (for parity checking against the source).
+// the proxy's video stream (for parity checking against the source). In-process
+// now: the container packet scan (first_video_packet_count) is the exact
+// equivalent of ffprobe's -count_packets, with no subprocess. Returns -1 when
+// the file can't be scanned.
 proxy_probe_frame_count :: proc(path: cstring) -> i64 {
-	out, code, okin := run_capture(
-		{
-			"ffprobe",
-			"-v",
-			"error",
-			"-select_streams",
-			"v:0",
-			"-count_packets",
-			"-show_entries",
-			"stream=nb_read_packets",
-			"-of",
-			"csv=p=0",
-			string(path),
-		},
-	)
-	defer delete(out)
-	if !okin || code != 0 {
-		if vyper_trace {
-			fmt.printf("[proxy] ffprobe frame count failed for %q: out=%q code=%d\n", string(path), out, code)
-		}
-		return -1
-	}
-	v, ok := strconv.parse_i64(strings.trim_space(out))
-	if !ok {
-		return -1
-	}
-	return v
+	return probe_video_packet_count(path)
 }
 
 // proxy_encode_threads picks how many ffmpeg threads a proxy encode may use: at
