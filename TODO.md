@@ -49,11 +49,20 @@ Steps (each lands + probe + vet before the next):
       sched probe's non-NUL-terminated env path string (root cause of the
       original ENOENT + seg-`-1` bug) and its consume-before-read waits;
       `VYPER_PROXY_SCHED_TEST` + bg + tl probes all green.
-- [ ] S2. In-process proxy encode: segment encode via `avcodec` libx264 +
+- [x] S2. In-process proxy encode: segment encode via `avcodec` libx264 +
       `avformat` muxer mirroring the current argv (all-intra, `-g 1`, 900-frame
-      segs, scale via `swscale` or libavfilter). Worker loop gains no subprocess;
-      segment progress = encoded frames counter. Verify v1: bg-test builds a full
-      window (tiny + med120) and artifacts byte-identical coverage (frame counts).
+      segs, scale via `swscale` with libx264 ultrafast/fastdecode/crf=26,
+      threads). Worker loop gains no subprocess; segment progress = encoded
+      frames counter (`on_frames`/`cancelled` callbacks). Opening frame of each
+      segment lands on the exact source index via the keyframe-backward seek +
+      PTS walk (bounded by one GOP) that `decode_source_frame` uses; a VFR
+      overshoot encodes the held frame and queues the overshot one. Cancelled
+      out-of-segment kills the encode mid-flight (32-frame poll). Verified v1:
+      bg-test builds a full window (tiny + med120, incl. cancel-at-35%) with
+      artifacts byte-identical coverage (frame counts), `VYPER_PROXY_SCHED_TEST`
+      green (incl. far-jump retarget + cancel → Done_Cancelled + on-disk 0+2
+      coverage), tl probe green, libx264 / libav INFO chatter silenced via
+      `avutil.log_set_level(.Error)`.
 - [ ] S3. Delete the subprocess encode path + ffprobe/fc-less imports that remain:
       `subprocess.odin` ffmpeg helpers, `resolve_tool_argv` encode branch, the
       shelled fallback in `proxy_transcode` sync mode. No `run_capture` of
@@ -78,10 +87,10 @@ Steps (each lands + probe + vet before the next):
 Out of scope (future): GPU→GPU zero-copy compositing, hw-encode for proxies,
 ICC color management, video interpolation (motion-estimated), A/V drift autotune.
 
-Open bug (shelved, revisit against S1/S2): scheduler probe reported fresh
+Open bug (shelved, resolved by S2): scheduler probe reported fresh
 segments verifying as `-1` (ffprobe code=1 empty stderr) while bg-test passes
-same file — subprocess-post-encode verification fragility; expected to disappear
-with in-process encode+verify.
+same file — subprocess-post-encode verification fragility; gone with
+in-process encode+verify (probe is now a file handle open, decode-200, close).
 
 ## Active 2 — Unicode text + GPU glyph cache (full font coverage)
 

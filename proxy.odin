@@ -166,18 +166,18 @@ proxy_probe_frame_count :: proc(path: cstring) -> i64 {
 	return probe_video_packet_count(path)
 }
 
-// proxy_encode_threads picks how many ffmpeg threads a proxy encode may use: at
-// most half the logical cores. A full-resolution libx264 encode of a long
-// source saturates every core (decode + encode), starving the SDL loop and
+// proxy_encode_threads picks how many encode threads an in-process proxy encode
+// may use: at most half the logical cores. A full-resolution x264 encode of a
+// long source saturates every core (decode + encode), starving the SDL loop and
 // making the editor look frozen while the background builder runs. Half leaves
 // the interactive side air; the wall-clock cost is small (frame decode is the
-// bottleneck, not x264).
-proxy_encode_threads :: proc() -> string {
+// bottleneck, not x264). 0 means "let libav decide".
+proxy_encode_threads :: proc() -> c.int {
 	threads := sdl.GetNumLogicalCPUCores()
 	if threads > 0 {
 		threads = max(threads / 2, 2)
 	}
-	return fmt.aprintf("%d", threads)
+	return threads
 }
 
 // proxy_transcode builds (or rebuilds) the all-intra low-res proxy for a source
@@ -218,39 +218,25 @@ proxy_transcode :: proc(
 		return nil
 	}
 	// Synchronous build (probe/CI determinism). Encode settings must stay in
-	// lockstep with import_bg_build's background argv.
+	// lockstep with import_bg_build's background encode (same in-process
+	// libav path, just the whole file in one pass instead of segments).
 	w, h := proxy_scale(src_w, src_h)
-	filter := fmt.aprintf("scale=%d:%d", w, h)
-	threads := proxy_encode_threads()
-	defer delete(threads)
-	// Run ffmpeg with an argv (no shell), capturing (and discarding) its output.
-	run_capture(
-		{
-			"ffmpeg",
-			"-y",
-			"-i",
-			string(src),
-			"-an",
-			"-vf",
-			filter,
-			"-c:v",
-			"libx264",
-			"-preset",
-			"ultrafast",
-			"-tune",
-			"fastdecode",
-			"-crf",
-			"26",
-			"-g",
-			"1",
-			"-threads",
-			threads,
-			"-pix_fmt",
-			"yuv420p",
-			string(proxy),
+	result, _ := proxy_encode_range(
+		src, proxy,
+		0, src_frames,
+		w, h,
+		proxy_encode_threads(),
+		nil,
+		proc(ud: rawptr, frames_done: int) {},
+		proc(ud: rawptr) -> bool {
+			return false
 		},
 	)
+	if result != .Ok {
+		return nil
+	}
 	if !proxy_valid_cache_hit(proxy, src_frames) {
+		os.remove(string(proxy))
 		return nil
 	}
 	return proxy

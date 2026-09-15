@@ -8,6 +8,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import avutil "vendor/ffmpeg/avutil"
 import sdl "vendor:sdl3"
 
 // ---------------------------------------------------------------------------
@@ -855,6 +856,10 @@ main :: proc() {
 		win_ffmpeg_versions_diag()
 	}
 	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
+	// libav's INFO chatter (libx264 "using cpu capabilities", decoder open
+	// lines) used to go to a silenced ffmpeg subprocess (-loglevel error); it
+	// is in-process now, so quiet the library globally to match.
+	avutil.log_set_level(.Error)
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {
 		render_test_run(test_paths)
 		return
