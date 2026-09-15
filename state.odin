@@ -162,6 +162,10 @@ Media_Asset :: struct {
 	kind:            Media_Kind,
 	metadata:        string,
 	frame_count:     i64,
+	// dur_us is the source duration in microseconds, captured at import so the
+	// on-demand proxy scheduler can derive fps (frame_count / duration) without
+	// re-probing the file every time the playhead crosses a segment boundary.
+	dur_us:          i64,
 	// Native source pixel size (video clips land on the timeline at native
 	// scale, and the aspect drives fitting).
 	src_w:           c.int,

@@ -132,6 +132,22 @@ media_frame_count :: proc(metadata: string) -> i64 {
 	return 1
 }
 
+// media_dur_us parses the source duration in microseconds from an ffprobe
+// metadata blob. Returns 0 when the metadata lacks a usable duration. Kept
+// separate from media_frame_count so the scheduler can compute fps directly
+// (frame_count / duration) instead of trusting the source's frame-rate field.
+media_dur_us :: proc(metadata: string) -> i64 {
+	for line in strings.split_lines(metadata, context.temp_allocator) {
+		if strings.has_prefix(line, "duration=") {
+			if v, ok := strconv.parse_f64(line[len("duration="):]); ok && v > 0 {
+				return i64(v * 1_000_000)
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
 // project_preview_size returns the preview element's width/height so its aspect
 // matches the project resolution, fitting within the fixed operational
 // PREVIEW_W x PREVIEW_H bounds (no distortion; non-matching aspects letterbox).
@@ -293,6 +309,7 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 			kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
 			metadata = file_info_text,
 			frame_count = frame_count,
+			dur_us = i64(probe.duration_sec * 1_000_000),
 			src_w = src_w,
 			src_h = src_h,
 			audio_streams = c.int(probe.audio_streams),

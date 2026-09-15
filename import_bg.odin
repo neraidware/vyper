@@ -27,7 +27,7 @@ import sdl "vendor:sdl3"
 //   - ffmpeg's stdout/stderr are attached to nothing (`nil` handles = shut
 //     down) and the noise flags are dropped, so nothing can block on a full
 //     pipe;
-//   - the user can cancel from the modal progress overlay; the worker
+//   - the user can cancel from the corner status badge; the worker
 //     terminates ffmpeg and removes ONLY the in-flight segment -- completed
 //     segments (and their .idx entries) stay usable;
 //   - after each segment exits cleanly the worker verifies its frame count and
@@ -40,7 +40,7 @@ import sdl "vendor:sdl3"
 // they keep the historical synchronous whole-file `proxy_transcode` build.
 // ---------------------------------------------------------------------------
 
-// Build_Phase is the worker's coarse state, read by the modal progress overlay.
+// Build_Phase is the worker's coarse state, read by the corner build badge.
 Build_Phase :: enum i32 {
 	Idle = 0, // nothing to do
 	Building = 1, // ffmpeg is encoding (progress 0..1, -1 while estimating)
@@ -57,22 +57,55 @@ Proxy_Builder :: struct {
 	stop:   bool,
 
 	// Request (render thread writes under mutex; a new request overwrites a
-	// still-queued one -- latest wins).
-	req_valid: bool,
-	req_src:   [4096]u8, // NUL-terminated source path
+	// still-queued one -- latest wins). A request targets a SEGMENT WINDOW
+	// [req_seg_lo, req_seg_hi) rather than the whole source: the on-demand
+	// scheduler keeps one window live around the playhead, so the worker must
+	// be able to build a middle slice without demanding full coverage.
+	req_valid:  bool,
+	req_src:    [4096]u8, // NUL-terminated source path
 	req_frames: i64,
 	req_dur_us: i64, // source duration, microseconds (percent denominator)
 	req_w:      c.int,
-	req_h:      c.int,
+	req_h:       c.int,
+	req_seg_lo:  int,
+	req_seg_hi:  int,
 
-	// Running job's source (worker-owned, so building_for can compare against
-	// the request currently being built even after a newer req_src lands).
-	active_src: [4096]u8,
+	// Running job's source + window (worker-owned, so building_for can compare
+	// against the request currently being built even after a newer req_src
+	// lands, and the scheduler can see how far the in-flight build reaches).
+	active_src:  [4096]u8,
+	active_seg_lo: int,
+	active_seg_hi: int,
+
+	// done_window records the window a finished Done_Ok build covered, so the
+	// scheduler can extend from that frontier instead of re-requesting what's
+	// already on disk. Cleared by consume_done.
+	done_ok:     bool,
+	done_seg_lo: int,
+	done_seg_hi: int,
+
+	// last_result records the terminal outcome of the most recent job. The
+	// scheduler uses it to suppress re-posting a window the user just
+	// cancelled or the worker just failed, so a build the playhead still sits
+	// on isn't instantly re-queued every frame. It is NOT cleared on consume
+	// (the suppression must hold until the playhead leaves that window); a
+	// stale cancel/fail only re-asserts when a new identical window would be
+	// posted, and a genuinely new window never matches its (lo, hi) pair.
+	last_result_phase: Build_Phase,
+	last_result_src:   [4096]u8,
+	last_result_lo:    int,
+	last_result_hi:    int,
 
 	// cancel_pending is set by the user (or shutdown) to abort whatever is
 	// current: the running build terminates ffmpeg, a still-queued request is
 	// dropped. Cleared by the worker when the abort completes.
 	cancel_pending: bool,
+
+	// req_supersede is set by import_bg_redefine alongside cancel_pending: it
+	// tells the worker the cancel is a RETARGET (drop the old target, keep the
+	// freshly-posted replacement request) rather than a plain abort. The
+	// worker clears it when the cancel is resolved.
+	req_supersede: bool,
 
 	// Progress/result (worker writes under mutex; render thread reads).
 	phase:    Build_Phase,
@@ -81,10 +114,20 @@ Proxy_Builder :: struct {
 
 import_builder: Proxy_Builder
 
-// import_bg_request enqueues a proxy build for `src`. Safe to call with a
-// build already running (it becomes the next job). `dur_us` is the source
-// duration in microseconds, used to turn ffmpeg's out_time into a percentage.
-import_bg_request :: proc(src: cstring, frames: i64, dur_us: i64, w, h: c.int) {
+// import_bg_request enqueues a proxy build of the SEGMENT WINDOW
+// [seg_lo, seg_hi) of `src` (half-open; seg_lo..seg_hi-1). Safe to call with a
+// build already running (it becomes the next job). A request for a window that
+// is already fully built is a cheap no-op (the worker's reuse path skips it),
+// so the scheduler can re-anchor the window every time the playhead moves
+// without caring what's on disk. `dur_us` is the source duration in
+// microseconds, used to turn ffmpeg's out_time into a percentage.
+import_bg_request :: proc(
+	src: cstring,
+	frames: i64,
+	dur_us: i64,
+	w, h: c.int,
+	seg_lo, seg_hi: int,
+) {
 	ib := &import_builder
 	if ib.thread == nil {
 		return
@@ -98,6 +141,45 @@ import_bg_request :: proc(src: cstring, frames: i64, dur_us: i64, w, h: c.int) {
 	ib.req_dur_us = max(dur_us, 1)
 	ib.req_w = w
 	ib.req_h = h
+	ib.req_seg_lo = seg_lo
+	ib.req_seg_hi = seg_hi
+	ib.req_valid = true
+	sdl.SignalCondition(ib.cond)
+	sdl.UnlockMutex(ib.mutex)
+}
+
+// import_bg_redefine retargets the builder to `src`'s window [seg_lo, seg_hi),
+// ABANDONING whatever was in flight: a running build for a stale target is
+// terminated (its completed segments stay for reuse -- see the builder's
+// cancel semantics), and the new request wins. This is the on-demand
+// scheduler's "far jump" primitive: scrubbed to a distant region, so do not
+// finish encoding the region the playhead just left.
+import_bg_redefine :: proc(
+	src: cstring,
+	frames: i64,
+	dur_us: i64,
+	w, h: c.int,
+	seg_lo, seg_hi: int,
+) {
+	ib := &import_builder
+	if ib.thread == nil {
+		return
+	}
+	sdl.LockMutex(ib.mutex)
+	src_s := string(src)
+	n := min(len(src_s), len(ib.req_src) - 1)
+	copy(ib.req_src[:n], src_s[:n])
+	ib.req_src[n] = 0
+	ib.req_frames = frames
+	ib.req_dur_us = max(dur_us, 1)
+	ib.req_w = w
+	ib.req_h = h
+	ib.req_seg_lo = seg_lo
+	ib.req_seg_hi = seg_hi
+	// Mark that the cancel was issued holding this request: the worker must
+	// not drop a freshly-posted target the way it drops a cancelled one.
+	ib.req_supersede = true
+	ib.cancel_pending = true
 	ib.req_valid = true
 	sdl.SignalCondition(ib.cond)
 	sdl.UnlockMutex(ib.mutex)
@@ -134,8 +216,8 @@ import_bg_cancel :: proc() {
 	sdl.UnlockMutex(ib.mutex)
 }
 
-// import_bg_active reports whether the modal progress overlay should show (a
-// build is running or one is queued).
+// import_bg_active reports whether the corner build badge should show (a build
+// is running or one is queued).
 import_bg_active :: proc() -> bool {
 	ib := &import_builder
 	sdl.LockMutex(ib.mutex)
@@ -144,7 +226,7 @@ import_bg_active :: proc() -> bool {
 }
 
 // box_contains is a point-in-rect test for manual (non-clay) hit-testing, e.g.
-// the cancel button of the background-import modal.
+// the cancel button of the background-import badge.
 box_contains :: proc(b: clay.BoundingBox, x, y: f32) -> bool {
 	if b.width <= 0 || b.height <= 0 {
 		return false
@@ -152,8 +234,8 @@ box_contains :: proc(b: clay.BoundingBox, x, y: f32) -> bool {
 	return x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height
 }
 
-// import_bg_status snapshots the builder for the modal overlay. `src` points
-// into the builder's own buffers (stable until the next request/claim).
+// import_bg_status snapshots the builder for the corner build badge. `src`
+// points into the builder's own buffers (stable until the next request/claim).
 import_bg_status :: proc() -> (active: bool, frac: f64, phase: Build_Phase, src: cstring) {
 	ib := &import_builder
 	sdl.LockMutex(ib.mutex)
@@ -169,8 +251,14 @@ import_bg_status :: proc() -> (active: bool, frac: f64, phase: Build_Phase, src:
 	return
 }
 
-// import_bg_consume_done clears a finished job's terminal phase so the overlay
-// closes and the worker can start the next queued request.
+// import_bg_consume_done clears a finished job's terminal phase so the corner
+// badge closes, the overlay logic advances, and the worker can start the next
+// queued request. The done_window is NOT cleared here: the scheduler reads it
+// to avoid re-requesting a window the worker just built ("playhead hasn't left
+// it, nothing to encode"). last_result is likewise left alone -- the scheduler
+// uses it to suppress re-posting a window the user just cancelled or the worker
+// just failed until the playhead moves on. The worker clears both when it
+// claims the NEXT request.
 import_bg_consume_done :: proc() {
 	ib := &import_builder
 	sdl.LockMutex(ib.mutex)
@@ -181,6 +269,50 @@ import_bg_consume_done :: proc() {
 	case:
 		// still running or idle -- nothing to consume
 	}
+}
+
+import_bg_set_done_window :: proc(ib: ^Proxy_Builder, ok: bool, seg_lo, seg_hi: int) {
+	sdl.LockMutex(ib.mutex)
+	ib.done_ok = ok
+	ib.done_seg_lo = seg_lo
+	ib.done_seg_hi = seg_hi
+	sdl.UnlockMutex(ib.mutex)
+}
+
+// import_bg_window snapshots the builder's current in-flight target for the
+// on-demand scheduler: what src is active/queued, its window, whether a build
+// is actually running, and the last completed window. The scheduler uses it to
+// dedupe (extend, don't re-post an identical request) and to retarget
+// (redefine) when the playhead leaves the window.
+import_bg_window :: proc() -> (
+	req_src: cstring,
+	req_seg_lo, req_seg_hi: int,
+	has_request: bool,
+	active_src: cstring,
+	active_seg_lo, active_seg_hi: int,
+	building: bool,
+	done_src: cstring,
+	done_seg_lo, done_seg_hi: int,
+	done_ok: bool,
+	last_result_phase: Build_Phase,
+	last_result_src: cstring,
+	last_result_lo, last_result_hi: int,
+) {
+	ib := &import_builder
+	sdl.LockMutex(ib.mutex)
+	defer sdl.UnlockMutex(ib.mutex)
+	req_src = cstring(&ib.req_src[0])
+	req_seg_lo, req_seg_hi = ib.req_seg_lo, ib.req_seg_hi
+	has_request = ib.req_valid
+	active_src = cstring(&ib.active_src[0])
+	active_seg_lo, active_seg_hi = ib.active_seg_lo, ib.active_seg_hi
+	building = ib.phase == .Building || ib.phase == .Verifying
+	done_src = cstring(&ib.active_src[0])
+	done_seg_lo, done_seg_hi, done_ok = ib.done_seg_lo, ib.done_seg_hi, ib.done_ok
+	last_result_phase = ib.last_result_phase
+	last_result_src = cstring(&ib.last_result_src[0])
+	last_result_lo, last_result_hi = ib.last_result_lo, ib.last_result_hi
+	return
 }
 
 import_bg_init :: proc() {
@@ -228,13 +360,28 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 			sdl.UnlockMutex(ib.mutex)
 			break
 		}
-		// A cancel with no running build drops the queued request outright.
+		// A cancel with no running build drops the queued request outright --
+		// UNLESS the cancel is a redefine (req_supersede), in which case the
+		// freshly-posted replacement target wins and only the stale request
+		// semantics are abandoned.
 		if ib.cancel_pending && !busy && ib.req_valid {
-			ib.cancel_pending = false
-			ib.req_valid = false
-			ib.phase = .Done_Cancelled
-			sdl.UnlockMutex(ib.mutex)
-			continue
+			if ib.req_supersede {
+				ib.cancel_pending = false
+				ib.req_supersede = false
+			} else {
+				ib.cancel_pending = false
+				ib.req_valid = false
+				ib.phase = .Done_Cancelled
+				// Record the dropped request as the last result so the scheduler
+				// does not immediately re-request the exact window the user
+				// just cancelled while it still sits on the playhead.
+				ib.last_result_phase = .Done_Cancelled
+				ib.last_result_src = ib.req_src
+				ib.last_result_lo = ib.req_seg_lo
+				ib.last_result_hi = ib.req_seg_hi
+				sdl.UnlockMutex(ib.mutex)
+				continue
+			}
 		}
 		if ib.req_valid && !busy {
 			n := 0
@@ -247,12 +394,17 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 			dur_us := ib.req_dur_us
 			w := ib.req_w
 			h := ib.req_h
+			seg_lo := ib.req_seg_lo
+			seg_hi := ib.req_seg_hi
+			ib.active_seg_lo = seg_lo
+			ib.active_seg_hi = seg_hi
+			ib.done_ok = false
 			ib.req_valid = false
 			ib.phase = .Building
 			ib.progress = -1
 			sdl.UnlockMutex(ib.mutex)
 
-			import_bg_build(ib, cstring(&ib.active_src[0]), frames, dur_us, w, h)
+			import_bg_build(ib, cstring(&ib.active_src[0]), frames, dur_us, w, h, seg_lo, seg_hi)
 			continue
 		}
 		// Cancel pending while a build runs: the build loop polls it (it may
@@ -272,7 +424,13 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 // Cancelling keeps every completed segment and only drops the in-flight one.
 // The encode settings mirror proxy_transcode's synchronous whole-file build so
 // a proxied frame is pixel-identical on either path.
-import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i64, w, h: c.int) {
+//
+// A request targets the half-open SEGMENT WINDOW [seg_lo, seg_hi) of the
+// source, not the whole file: the on-demand scheduler keeps only the playhead's
+// neighbourhood being built. The index is seeded from any existing .idx so
+// segments outside the window survive the rewrite, and coverage is verified
+// window-relative (a mid-source window is not a failed whole-file build).
+import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i64, w, h: c.int, seg_lo, seg_hi: int) {
 	spall_scope(#procedure)
 	scale_w, scale_h := proxy_scale(w, h)
 	filter := fmt.aprintf("scale=%d:%d", scale_w, scale_h)
@@ -286,19 +444,51 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		if vyper_trace {
 			fmt.printf("[bg] bad segment plan for %q: frames=%d dur_us=%d\n", string(src), frames, dur_us)
 		}
-		import_bg_set_phase(ib, .Done_Fail)
+		import_bg_finish(ib, .Done_Fail)
+		return
+	}
+	lo := seg_lo
+	hi := seg_hi
+	if lo < 0 {
+		lo = 0
+	}
+	if hi > seg_total {
+		hi = seg_total
+	}
+	if hi <= lo {
+		if vyper_trace {
+			fmt.printf("[bg] empty window [%d,%d) for %q\n", lo, hi, string(src))
+		}
+		import_bg_finish(ib, .Done_Fail)
 		return
 	}
 
+	// Seed the index from disk so the rewrite below keeps every segment a
+	// previous window (or earlier session) completed: a windowed build owns
+	// the .idx file's whole lifetime, and dropping out-of-window entries would
+	// un-serve footage that's still proxied on disk. A mismatched seg size is
+	// a stale index from a different segmentation -- ignore it wholesale.
 	idx: Proxy_Idx
 	defer delete(idx.segs)
 	idx.seg_frames = PROXY_SEG_FRAMES
+	if proxy_idx_load(src, &idx) {
+		if idx.seg_frames != PROXY_SEG_FRAMES {
+			clear(&idx.segs)
+		}
+	}
 
-	// Completed frames so far, as a cumulative fraction of the source: the
-	// playhead sees a fully-proxied region equal to `completed*fps` seconds.
-	last_frac: f64 = -1
+	// Progress is a cumulative fraction of the SOURCE (what the playhead can
+	// actually play fast), so seed it from segments completed by earlier
+	// windows/sessions before this window adds its own.
 	completed_frames: i64
-	for k in 0 ..< seg_total {
+	for k in 0 ..< lo {
+		if k < len(idx.segs) {
+			completed_frames += idx.segs[k]
+		}
+	}
+
+	last_frac: f64 = -1
+	for k in lo ..< hi {
 		seg_start := i64(k) * PROXY_SEG_FRAMES
 		seg_want := min(PROXY_SEG_FRAMES, frames - seg_start)
 		if seg_want <= 0 {
@@ -309,7 +499,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		seg_buf: [4096]u8
 		seg, sok := proxy_segment_path_for(src, k, seg_buf[:])
 		if !sok {
-			import_bg_set_phase(ib, .Done_Fail)
+			import_bg_finish(ib, .Done_Fail)
 			return
 		}
 		progress_file := strings.concatenate({string(seg), ".progress"})
@@ -325,7 +515,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 				if vyper_trace {
 					fmt.printf("[bg] cancel between segments; keeping %d completed frames\n", completed_frames)
 				}
-				import_bg_set_phase(ib, .Done_Cancelled)
+				import_bg_finish(ib, .Done_Cancelled)
 				import_bg_clear_cancel(ib)
 				return
 			}
@@ -396,7 +586,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			}
 			os.remove(progress_file)
 			os.remove(string(seg))
-			import_bg_set_phase(ib, .Done_Fail)
+			import_bg_finish(ib, .Done_Fail)
 			return
 		}
 
@@ -412,7 +602,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 				_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
 				os.remove(string(seg))
 				os.remove(progress_file)
-				import_bg_set_phase(ib, .Done_Cancelled)
+				import_bg_finish(ib, .Done_Cancelled)
 				import_bg_clear_cancel(ib)
 				return
 			}
@@ -425,7 +615,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 				_, _ = os.process_wait(proc_handle, os.TIMEOUT_INFINITE)
 				os.remove(string(seg))
 				os.remove(progress_file)
-				import_bg_set_phase(ib, .Done_Fail)
+				import_bg_finish(ib, .Done_Fail)
 				return
 			}
 			if werr == nil && st.exited {
@@ -459,7 +649,7 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 				fmt.printf("[bg] segment %d short: wanted %d frames, got %d\n", k, seg_want, count)
 			}
 			os.remove(string(seg))
-			import_bg_set_phase(ib, .Done_Fail)
+			import_bg_finish(ib, .Done_Fail)
 			import_bg_set_progress(ib, -1)
 			return
 		}
@@ -484,24 +674,53 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 
 	import_bg_set_phase(ib, .Verifying)
 	phase: Build_Phase = .Done_Ok
-	sum: i64
-	for c in idx.segs {
-		sum += c
+	// Window-relative completion: a mid-source window must cover ITS window
+	// (the whole source is only required when the window is the whole source --
+	// that's what proxy_segments_complete checks for re-imports). Frames from
+	// segments outside the window are already on disk and seeded in idx; only
+	// the window's own frame budget is verified here.
+	window_want: i64
+	got: i64
+	for k in lo ..< hi {
+		seg_start := i64(k) * PROXY_SEG_FRAMES
+		window_want += min(PROXY_SEG_FRAMES, max(frames - seg_start, 0))
+		if k < len(idx.segs) {
+			got += idx.segs[k]
+		}
 	}
-	if sum < frames - PROXY_FRAME_TOLERANCE {
+	if got < window_want - PROXY_FRAME_TOLERANCE {
 		phase = .Done_Fail
 		import_bg_set_progress(ib, -1)
 	}
-	import_bg_set_phase(ib, phase)
+	import_bg_finish(ib, phase)
 	import_bg_clear_cancel(ib)
 	if vyper_trace {
-		fmt.printf("[bg] proxy %s -> %v (segments=%d, %d frames)\n", string(src), phase, seg_total, sum)
+		fmt.printf("[bg] proxy %s -> %v (window [%d,%d), %d frames)\n", string(src), phase, lo, hi, got)
 	}
+	// Record the covered window so the scheduler can extend from this frontier
+	// without re-requesting what's on disk. Worker writes, render thread reads
+	// under the same mutex import_bg_status uses.
+	import_bg_set_done_window(ib, phase == .Done_Ok, lo, hi)
 }
 
 import_bg_set_phase :: proc(ib: ^Proxy_Builder, phase: Build_Phase) {
 	sdl.LockMutex(ib.mutex)
 	ib.phase = phase
+	sdl.UnlockMutex(ib.mutex)
+}
+
+// import_bg_finish sets a terminal phase AND records it as last_result so the
+// scheduler can suppress re-posting the same window after a cancel/fail.
+// Caller must hold no mutex; the record carries the active window (the window
+// the worker was actually building -- for a cancel that aborted a build, that's
+// what got hit).
+import_bg_finish :: proc(ib: ^Proxy_Builder, phase: Build_Phase) {
+	sdl.LockMutex(ib.mutex)
+	ib.phase = phase
+	ib.last_result_phase = phase
+	copy(ib.last_result_src[:], ib.active_src[:])
+	ib.last_result_lo = ib.active_seg_lo
+	ib.last_result_hi = ib.active_seg_hi
 	sdl.UnlockMutex(ib.mutex)
 }
 

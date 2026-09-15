@@ -908,6 +908,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		proxy_bg_probe_run(xb)
 		return
 	}
+	if xs, _ := os.lookup_env_alloc("VYPER_PROXY_SCHED_TEST", context.temp_allocator); xs != "" {
+		proxy_sched_probe_run(xs)
+		return
+	}
 	if ps, _ := os.lookup_env_alloc("VYPER_PROXY_PICK_SCAN", context.temp_allocator); ps != "" {
 		proxy_pick_scan_run(ps)
 		return
@@ -1135,6 +1139,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		audio_update()
 		poll_completed_thread()
 		import_bg_consume_done()
+		proxy_build_schedule()
 		ui_frame_count += 1
 		if ui_report_tick == 0 {
 			ui_report_tick = now_ns

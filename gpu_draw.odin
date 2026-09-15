@@ -1166,9 +1166,9 @@ draw_preview_hud :: proc(
 	)
 }
 
-// import_cancel_box is the modal's Cancel button hit-box, set by
-// draw_import_progress each frame while the overlay is visible (main.odin uses
-// it for manual click dispatch).
+// import_cancel_box is the corner badge's Cancel button hit-box, set by
+// draw_import_progress each frame while the badge is visible (interaction.odin
+// uses it for manual click dispatch).
 import_cancel_box: clay.BoundingBox
 
 // draw_ui_notice paints the transient on-window notice (ui_notice_text) as a
@@ -1230,10 +1230,12 @@ draw_ui_notice :: proc(
 	)
 }
 
-// draw_import_progress paints the modal overlay for a background proxy build:
-// a dimmed full-window veil, a panel with the source name, phase label,
-// progress bar (indeterminate while ffmpeg estimates), percent, and a Cancel
-// button. Drawn last so it sits above every clay/gpu layer.
+// draw_import_progress paints the corner status badge for an on-demand proxy
+// build: a compact top-right panel with the source name, phase label, progress
+// bar (indeterminate while ffmpeg estimates), percent, and a Cancel button.
+// Deliberately NON-MODAL -- it never blocks editing or playback; the scheduler
+// keeps the needed window building in the background while the playhead sits on
+// it. Drawn last so it sits above every clay/gpu layer.
 draw_import_progress :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -1242,15 +1244,16 @@ draw_import_progress :: proc(
 ) {
 	active, frac, phase, src := import_bg_status()
 	if !active {
+		import_cancel_box = {}
 		return
 	}
-	render_sdf_rect(renderer, command_buffer, pass, {0, 0, win_w, win_h}, {6, 7, 10, 215}, 0, 0)
 
-	W: f32 = 440
-	H: f32 = 180
+	W: f32 = 300
+	H: f32 = 118
+	pad: f32 = 16
 	panel := clay.BoundingBox {
-		x      = (win_w - W) / 2,
-		y      = (win_h - H) / 2,
+		x      = win_w - W - pad,
+		y      = pad,
 		width  = W,
 		height = H,
 	}
@@ -1278,9 +1281,9 @@ draw_import_progress :: proc(
 		command_buffer,
 		pass,
 		clay.BoundingBox {
-			x = panel.x + 24,
-			y = panel.y + 22,
-			width = panel.width - 48,
+			x = panel.x + 14,
+			y = panel.y + 12,
+			width = panel.width - 28,
 			height = f32(FONT_NORMAL),
 		},
 		clay.TextRenderData {
@@ -1297,15 +1300,15 @@ draw_import_progress :: proc(
 
 	// Source name, truncated to the panel (raw byte clamp; typical files are ASCII).
 	name := string(src)
-	name_len := min(len(name), 52)
+	name_len := min(len(name), 34)
 	render_text(
 		renderer,
 		command_buffer,
 		pass,
 		clay.BoundingBox {
-			x = panel.x + 24,
-			y = panel.y + 50,
-			width = panel.width - 48,
+			x = panel.x + 14,
+			y = panel.y + 34,
+			width = panel.width - 28,
 			height = f32(FONT_SMALL),
 		},
 		clay.TextRenderData {
@@ -1328,9 +1331,9 @@ draw_import_progress :: proc(
 		fill_frac = 1
 	}
 	track := clay.BoundingBox {
-		x      = panel.x + 24,
-		y      = panel.y + 84,
-		width  = panel.width - 48,
+		x      = panel.x + 14,
+		y      = panel.y + 56,
+		width  = panel.width - 28,
 		height = 12,
 	}
 	render_sdf_rect(renderer, command_buffer, pass, track, HANDLE_FILL, 6, 0)
@@ -1352,9 +1355,9 @@ draw_import_progress :: proc(
 			command_buffer,
 			pass,
 			clay.BoundingBox {
-				x = panel.x + 24,
-				y = panel.y + 102,
-				width = panel.width - 48,
+				x = panel.x + 14,
+				y = panel.y + 74,
+				width = panel.width - 28,
 				height = f32(FONT_SMALL),
 			},
 			clay.TextRenderData {
@@ -1370,11 +1373,15 @@ draw_import_progress :: proc(
 		)
 	}
 
+	cancel_row_y := panel.y + 76
+	if frac < 0 || phase != .Building {
+		cancel_row_y = panel.y + 84
+	}
 	cancel := clay.BoundingBox {
-		x      = panel.x + panel.width - 104,
-		y      = panel.y + panel.height - 40,
-		width  = 80,
-		height = 26,
+		x      = panel.x + panel.width - 86,
+		y      = cancel_row_y,
+		width  = 72,
+		height = 24,
 	}
 	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON, 6, 0)
 	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON_BORDER, 6, 1)
@@ -1386,7 +1393,7 @@ draw_import_progress :: proc(
 		pass,
 		clay.BoundingBox {
 			x = cancel.x + 6,
-			y = cancel.y + 6,
+			y = cancel.y + 5,
 			width = cancel.width - 12,
 			height = f32(FONT_NORMAL),
 		},

@@ -252,9 +252,20 @@ proxy_bg_probe_run :: proc(v: string) {
 	keep_cache := os.get_env_alloc("VYPER_PROXY_BG_KEEP", context.temp_allocator) == "1"
 
 	// Full import: bin + timeline, mirroring the GUI's Open File flow. The
-	// proxy build must NOT block this call.
+	// proxy build must NOT block this call -- and under the on-demand model
+	// import does not enqueue anything at all (proxy_transcode returns nil):
+	// the request below drives the worker exactly like proxy_build_schedule
+	// would. The probe uses the full-source window [0, seg_total) so the
+	// whole-file verification below still holds.
 	import_media(path)
 	frame_count := media_frame_count(file_info_text)
+
+	// The imported asset carries dur_us/src size (set at import); reuse it so
+	// the request matches what the GUI scheduler would compute.
+	asset: ^Media_Asset
+	if len(media_assets) > 0 {
+		asset = &media_assets[len(media_assets) - 1]
+	}
 
 	deadline := sdl.GetTicksNS() + 300_000_000_000
 	last_report := sdl.GetTicksNS()
@@ -265,14 +276,28 @@ proxy_bg_probe_run :: proc(v: string) {
 		now := sdl.GetTicksNS()
 
 		// A proxy already complete at import (a prior session's build, cache
-		// kept) short-circuits: proxy_transcode never enqueued a rebuild, so
-		// there is nothing to wait for. Verify the artifacts directly.
+		// kept) short-circuits: there is nothing to wait for. Verify the
+		// artifacts directly.
 		if !active && phase == .Idle && !cancel_sent && cancel_pct < 0 && proxy_segments_complete(path, frame_count) {
 			if vyper_trace {
 				fmt.printf("[proxy-bg-test] proxy already complete at import; no build needed\n")
 			}
 			proxy_bg_verify_complete(path, frame_count, keep_cache, "proxy already complete (no rebuild)")
 			os.exit(0)
+		}
+
+		// First tick with no build in flight for this source: post the on-demand
+		// request (a no-op when already complete/queued, so harmless to repeat).
+		if !active && phase == .Idle && !cancel_sent {
+			if asset == nil || asset.dur_us <= 0 || asset.frame_count <= 0 {
+				fmt.println("[proxy-bg-test] FAIL: imported asset missing duration/frames for sizing")
+				os.exit(1)
+			}
+			seg_total := proxy_seg_count(asset.frame_count)
+			if vyper_trace {
+				fmt.printf("[proxy-bg-test] requesting window [0,%d)\n", seg_total)
+			}
+			import_bg_request(path, asset.frame_count, asset.dur_us, asset.src_w, asset.src_h, 0, seg_total)
 		}
 
 		pct := int(frac * 100)

@@ -177,6 +177,9 @@ proxy_probe_frame_count :: proc(path: cstring) -> i64 {
 	)
 	defer delete(out)
 	if !okin || code != 0 {
+		if vyper_trace {
+			fmt.printf("[proxy] ffprobe frame count failed for %q: out=%q code=%d\n", string(path), out, code)
+		}
 		return -1
 	}
 	v, ok := strconv.parse_i64(strings.trim_space(out))
@@ -228,20 +231,13 @@ proxy_transcode :: proc(
 		return proxy
 	}
 	if async_import_mode {
-		// A complete segmented proxy from a previous session is a cache hit:
-		// re-importing the same file must not re-encode it (proxy_valid_cache_hit
-		// above checks the legacy WHOLE file, which the segmented builder never
-		// writes, so a finished segmented proxy would otherwise be rebuilt every
-		// launch -- meanwhile the preview decodes full-res source until the
-		// rebuild head catches up, e.g. a 41s clip at 60fps ~ 30s of lag).
-		if proxy_segments_complete(src, src_frames) {
-			return nil
-		}
-		// Defer the encode to the worker: import returns immediately and the
-		// clip previews from the ORIGINAL until the opening segment lands.
-		// proxy_pick_for_frame refuses to latch a half-written artifact while
-		// a build is in flight (see import_bg_building_for).
-		import_bg_request(src, src_frames, src_dur_us, src_w, src_h)
+		// Proxy building is ON-DEMAND now (proxy_build_schedule asks the worker
+		// for the playhead's window), so import itself enqueues nothing: it
+		// returns immediately and the clip previews from the ORIGINAL until the
+		// scheduler's request lands. Idempotent on disk -- a re-import of an
+		// already-fully-built file is a cheap no-op when the scheduler reaches
+		// it. proxy_pick_for_frame refuses to latch a half-written artifact
+		// while a build is in flight (see import_bg_building_for).
 		return nil
 	}
 	// Synchronous build (probe/CI determinism). Encode settings must stay in
@@ -410,6 +406,183 @@ proxy_seg_count :: proc(frames: i64) -> int {
 		return 0
 	}
 	return int((frames + PROXY_SEG_FRAMES - 1) / PROXY_SEG_FRAMES)
+}
+
+// ---------------------------------------------------------------------------
+// On-demand proxy scheduler.
+//
+// The background builder builds SEGMENT WINDOWS, and something must decide
+// which window the preview actually needs right now. That is this proc, run
+// every frame. The policy: keep the segments around and AHEAD of the playhead
+// proxied, bounded to PROXY_MARGIN_SECONDS of source footage beyond the
+// playhead's current segment. Import no longer enqueues a whole-file build (see
+// proxy_transcode) -- the preview would otherwise sit on full-res source decode
+// for the entire import while the whole file encoded, which is the modal lag
+// this redesign exists to remove. Instead a freshly-imported clip gets proxied
+// on demand: when the playhead is on it, the scheduler requests [k..k+margin)
+// and the worker builds that window head-first while the playhead sits inside
+// the already-built head; playback + scrubbing within the built region is
+// proxy-fast, the unbuilt tail falls back to source (same as segmented preview
+// behaved before).
+//
+// Far jumps (a scrub that leaves the current request window entirely) retarget
+// the build via import_bg_redefine: the worker aborts its stale window and
+// starts the playhead's new region immediately instead of finishing what the
+// playhead just left. Playing/scrubbing WITHIN the requested window is a plain
+// request (latest-wins), so the worker keeps the head moving while a new tail
+// request waits -- no restart churn.
+// ---------------------------------------------------------------------------
+
+// PROXY_MARGIN_SECONDS is how much source footage the scheduler keeps proxied
+// ahead of the playhead (the "4 minutes of cached media" budget). Tuned to the
+// modal-lag case this feature killed: big enough that sustained playback never
+// outruns the builder, small enough that a scrub to the end of a long clip
+// retargets instead of enqueuing an hour of encodes nobody will watch.
+PROXY_MARGIN_SECONDS :: 240
+
+// proxy_sched_margin_seconds is how much source footage the scheduler keeps
+// proxied ahead of the playhead, read each scheduling tick. Defaults to
+// PROXY_MARGIN_SECONDS; probes/tuning override it (VYPER_PROXY_MARGIN_SECONDS).
+proxy_sched_margin_seconds: f64 = PROXY_MARGIN_SECONDS
+
+proxy_build_schedule :: proc() {
+	if !async_import_mode || !preview_proxy_enabled {
+		return
+	}
+	// The clip the user is actually looking at is the frontmost non-text video
+	// clip UNDER THE PLAYHEAD: same walk preview_state uses to pick its
+	// foreground face. A clip in the margin ahead is NOT scheduled -- its proxy
+	// is only built when the playhead arrives (preview falls back to source
+	// until then, exactly like an under-built edge segment).
+	clip := proxy_front_video_under_playhead()
+	if clip == nil {
+		return
+	}
+	asset := find_asset(clip.asset_id)
+	if asset == nil || asset.frame_count <= 0 || asset.dur_us <= 0 {
+		return
+	}
+	// Source frame under the playhead, then its segment.
+	src_frame := clip.source_start_frame + playhead.frame - clip.timeline_start_frame
+	if src_frame < 0 {
+		src_frame = 0
+	}
+	src := clip.path
+	if src == "" {
+		src = asset.path
+	}
+	if len(src) == 0 {
+		return
+	}
+
+	// Project the playhead's position forward PROXY_MARGIN_SECONDS of source
+	// footage: fps = frame_count / dur. The window is [w_lo, w_hi), where w_lo
+	// is the segment the playhead is in RIGHT NOW (its segment is always
+	// covered) and w_hi reaches one margin ahead, capped at the source's last
+	// segment.
+	fps := f64(asset.frame_count) * 1e6 / f64(asset.dur_us)
+	seg_total := proxy_seg_count(asset.frame_count)
+	seg_margin := max(1, int(proxy_sched_margin_seconds * fps / f64(PROXY_SEG_FRAMES)) + 1)
+	k := proxy_seg_for_frame(src_frame)
+	if k < 0 {
+		k = 0
+	}
+	if k >= seg_total {
+		return
+	}
+	w_lo := min(k, seg_total - 1)
+	w_hi := min(k + seg_margin, seg_total)
+	if w_hi <= w_lo {
+		return
+	}
+
+	// Dedupe against the current request/active/done state. Coverage is
+	// INTERVAL-based, not a high-water mark: after a far jump the finished
+	// window may sit ahead of a gap (built [0,1) then [3,4), playhead back in
+	// the [1,3) gap), so "proxy reaches segment N" does not mean every segment
+	// below N is on disk. A pending request / in-flight build / finished window
+	// suppresses today's post only when it CONTAINS the whole wanted window.
+	req_src, req_lo, req_hi, has_request, active_src, active_lo, active_hi, building, done_src, done_lo, done_hi, done_ok, last_result_phase, last_result_src, last_result_lo, last_result_hi :=
+		import_bg_window()
+
+	// Cancel/fail suppression: if the worker just finished (or dropped) the
+	// exact window the playhead still wants, respect that the user cancelled it
+	// or the build genuinely failed -- re-posting every frame would make cancel
+	// a no-op. Suppression lifts the moment the playhead wants a different
+	// window (a different (lo, hi) pair never matches).
+	if (last_result_phase == .Done_Cancelled || last_result_phase == .Done_Fail) &&
+		strings.compare(string(last_result_src), string(src)) == 0 &&
+		last_result_lo == w_lo && last_result_hi == w_hi {
+		return
+	}
+
+	contains := proc(f_src: cstring, f_lo, f_hi: int, t_src: cstring, t_lo, t_hi: int) -> bool {
+		if strings.compare(string(f_src), string(t_src)) != 0 {
+			return false
+		}
+		return f_lo <= t_lo && f_hi >= t_hi
+	}
+	if has_request && contains(req_src, req_lo, req_hi, src, w_lo, w_hi) {
+		return
+	}
+	if building && contains(active_src, active_lo, active_hi, src, w_lo, w_hi) {
+		return
+	}
+	if done_ok && contains(done_src, done_lo, done_hi, src, w_lo, w_hi) {
+		return
+	}
+
+	// Post. A build in flight for a DIFFERENT source, or for this source with a
+	// window lying wholly behind the playhead (a far jump past the in-flight
+	// frontier), retargets via import_bg_redefine so the worker aborts the
+	// stale window and starts the playhead's region now. Everything else --
+	// same-source adjacent/overlapping, an idle builder -- is a plain
+	// latest-wins request the worker picks up after its current window.
+	jumped := false
+	if building {
+		if strings.compare(string(active_src), string(src)) != 0 {
+			jumped = true
+		} else if active_hi < w_lo {
+			jumped = true
+		}
+	}
+	if !jumped && has_request && !contains(req_src, req_lo, req_hi, src, w_lo, w_hi) {
+		if strings.compare(string(req_src), string(src)) != 0 {
+			jumped = true
+		} else if req_hi < w_lo {
+			jumped = true
+		}
+	}
+
+	if jumped {
+		import_bg_redefine(src, asset.frame_count, asset.dur_us, asset.src_w, asset.src_h, w_lo, w_hi)
+	} else {
+		import_bg_request(src, asset.frame_count, asset.dur_us, asset.src_w, asset.src_h, w_lo, w_hi)
+	}
+}
+
+// proxy_front_video_under_playhead returns the frontmost (topmost in track
+// order) non-text media clip whose source interval contains the playhead, or
+// nil. Mirrors preview_state's front_video_slot selection (first Video/Text
+// claim in track order; here Text is skipped -- generators have no proxy).
+proxy_front_video_under_playhead :: proc() -> ^Clip {
+	sync_track_order()
+	for w in 0 ..< len(timeline.track_order) {
+		ti := timeline.track_order[w]
+		track := &timeline.tracks[ti]
+		for i in 0 ..< len(track.clips) {
+			clip := &track.clips[i]
+			if clip.kind != .Video {
+				continue
+			}
+			if playhead.frame < clip.timeline_start_frame ||
+			   playhead.frame >= clip.timeline_start_frame + clip.source_length_frames {
+				continue
+			}
+			return clip
+		}
+	}
+	return nil
 }
 
 // Proxy_Idx is the parsed form of a .idx file: the segment size plus one frame

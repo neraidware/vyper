@@ -126,7 +126,7 @@ Click_Case :: struct {
 
 click_cases := []Click_Case{
 	// Import-background cancel is top priority: aborting an active import
-	// swallows any click over its overlay box.
+	// swallows any click over its badge box.
 	{ hit = proc(inp: Mouse_Input) -> bool {
 		return import_bg_active() && box_contains(import_cancel_box, inp.x, inp.y)
 	}, action = proc(_: Mouse_Input) { import_bg_cancel() } },
