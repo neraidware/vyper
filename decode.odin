@@ -374,7 +374,7 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	// hardware frames automatically (its default get_format path). A deviceless
 	// run (no driver/device) falls back to pure software: hw_pix_fmt stays
 	// .None and the rest of the file is byte-identical to the old path.
-	hw_pix_fmt: avutil.PixelFormat = .None
+		hw_pix_fmt: avutil.PixelFormat = .None
 	if !hw_decode_enabled {
 		// VYPER_HW_DISABLE / probe comparison: pure software path.
 		dec.hw_pix_fmt = hw_pix_fmt
@@ -387,8 +387,19 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 			if .HW_Device_Ctx not_in cfg.methods {
 				continue
 			}
+			// h264's hw config list leads with NVIDIA's CUDA entry. On a host
+			// without libcuda the device-create probe fails in a way libav logs at
+			// ERROR ("Cannot load libcuda.so.1", "Could not dynamically load
+			// CUDA") even though the absence is expected and handled below (we
+			// continue to the next config). Suppress all avutil logging for the
+			// brief duration of the create call — no other avutil logging can
+			// fire during this single-threaded probe window.
+			probe_level := avutil.log_get_level()
+			avutil.log_set_level(.Quiet)
 			dev_ref: ^avutil.BufferRef
-			if avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, nil, nil, 0) != 0 {
+			create_ok := avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, nil, nil, 0)
+			avutil.log_set_level(probe_level)
+			if create_ok != 0 {
 				// Driver/device absent (e.g. CUDA with no libcuda): try the next
 				// hw config before falling back to software.
 				continue
