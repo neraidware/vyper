@@ -82,6 +82,12 @@ Clip_Decoder :: struct {
 	// for any rate-mapping one-frame overshoot).
 	hold:        ^avutil.Frame,
 	pkt:         ^avcodec.Packet,
+	// Hardware decode state: hw_pix_fmt != .None when the codec opened with a
+	// hardware device context. Every decoded hw frame is transferred to sw_frame
+	// (in decode_one_forward) before touching the existing RGBA sws path.
+	hw_pix_fmt:  avutil.PixelFormat,
+	hw_device:   ^avutil.BufferRef,
+	sw_frame:    ^avutil.Frame,
 	// dst is the fixed-size RGBA console buffer written by sws. dst honors the
 	// source aspect ratio (the source is fit, not stretched, into PREVIEW_W x
 	// PREVIEW_H) and fit_ox/fit_oy are the letterbox offsets in buffer pixels.
@@ -137,6 +143,11 @@ ff_err_str :: proc(code: c.int) -> string {
 	return strings.clone_from_cstring(cstring(&buf[0]), context.temp_allocator)
 }
 
+// hw_decode_enabled gates hardware decode globally. `VYPER_HW_DISABLE=1` forces
+// the software path; the hw probe (VYPER_HW_PROBE) toggles it to verify both
+// paths produce identical pixels.
+hw_decode_enabled: bool = true
+
 clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 	if vyper_trace {
 		fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)
@@ -148,6 +159,12 @@ clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 		avutil.frame_free(&dec.frame)
 		avutil.frame_free(&dec.hold)
 		avcodec.packet_free(&dec.pkt)
+		if dec.sw_frame != nil {
+			avutil.frame_free(&dec.sw_frame)
+		}
+		if dec.hw_device != nil {
+			avutil.buffer_unref(&dec.hw_device)
+		}
 	}
 	frame_cache_clear(dec)
 	// Wipe fully: neither path nor preview_path survives a reset. Callers that
@@ -352,10 +369,50 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		fmt.println("avcodec_parameters_to_context:", ff_err_str(ret))
 		return false
 	}
+	// Hardware decode: pick the codec's first HW_Device_Ctx config, create the
+	// device, and attach it to the codec context. The decoder then negotiates
+	// hardware frames automatically (its default get_format path). A deviceless
+	// run (no driver/device) falls back to pure software: hw_pix_fmt stays
+	// .None and the rest of the file is byte-identical to the old path.
+	hw_pix_fmt: avutil.PixelFormat = .None
+	if !hw_decode_enabled {
+		// VYPER_HW_DISABLE / probe comparison: pure software path.
+		dec.hw_pix_fmt = hw_pix_fmt
+	} else {
+		for i: c.int = 0; ; i += 1 {
+			cfg := avcodec.get_hw_config(codec, i)
+			if cfg == nil {
+				break
+			}
+			if .HW_Device_Ctx not_in cfg.methods {
+				continue
+			}
+			dev_ref: ^avutil.BufferRef
+			if avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, nil, nil, 0) != 0 {
+				// Driver/device absent (e.g. CUDA with no libcuda): try the next
+				// hw config before falling back to software.
+				continue
+			}
+			hw_pix_fmt = cfg.pix_fmt
+			dec.hw_device = dev_ref
+			dec_ctx.hw_device_ctx = avutil.buffer_ref(dev_ref)
+			dec.sw_frame = avutil.frame_alloc()
+			fmt.printf("decoded %s via %s hw output %d\n",
+				avcodec.get_name(par.codec_id),
+				avutil.hwdevice_get_type_name(cfg.device_type),
+				c.int(hw_pix_fmt))
+			break
+		}
+		dec.hw_pix_fmt = hw_pix_fmt
+	}
 	if ret := avcodec.open2(dec_ctx, codec, nil); ret < 0 {
 		fmt.println("avcodec_open2:", ff_err_str(ret))
 		return false
 	}
+	// For software decode the sws source format is the native codec pix_fmt and
+	// the scaler can be built up front. For hardware decode the transferred sw
+	// frame's format is only known after the first frame (VAAPI -> NV12, etc.),
+	// so sws is built lazily in scale_decoded_frame from the actual frame.
 	dec.src_w = dec_ctx.width
 	dec.src_h = dec_ctx.height
 
@@ -388,14 +445,16 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	dec.fps_num = fps.num
 	dec.fps_den = fps.den
 
-	dec.sws_ctx = sws.getContext(
-		dec.src_w, dec.src_h, dec_ctx.pix_fmt,
-		dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA,
-		sws.Flags{.Bilinear}, nil, nil, nil,
-	)
-	if dec.sws_ctx == nil {
-		fmt.println("sws_getContext failed")
-		return false
+	if hw_pix_fmt == .None {
+		dec.sws_ctx = sws.getContext(
+			dec.src_w, dec.src_h, dec_ctx.pix_fmt,
+			dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA,
+			sws.Flags{.Bilinear}, nil, nil, nil,
+		)
+		if dec.sws_ctx == nil {
+			fmt.println("sws_getContext failed")
+			return false
+		}
 	}
 	if avutil.image_alloc(&dec.dst[0], &dec.dst_linesize[0], dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA, 1) < 0 {
 		fmt.println("av_image_alloc failed")
@@ -463,6 +522,17 @@ decode_one_forward :: proc(dec: ^Clip_Decoder) -> bool {
 			}
 			if r < 0 {
 				return false
+			}
+			if dec.hw_pix_fmt != .None && avutil.PixelFormat(dec.frame.format) == dec.hw_pix_fmt {
+				// Hardware frame: pull the pixels into sw_frame, carry its
+				// props (PTS), and make the decoder's frame the transferred sw
+				// one so receive_frame()'s buffer can be unref'd / reused.
+				if avutil.hwframe_transfer_data(dec.sw_frame, dec.frame, 0) < 0 {
+					return false
+				}
+				_ = avutil.frame_copy_props(dec.sw_frame, dec.frame)
+				avutil.frame_unref(dec.frame)
+				avutil.frame_move_ref(dec.frame, dec.sw_frame)
 			}
 			dec.decoded_ahead += 1
 			return true
@@ -536,6 +606,18 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 }
 
 scale_decoded_frame :: proc(dec: ^Clip_Decoder) {
+	if dec.sws_ctx == nil {
+		// Hardware decode negotiated the sw format only now (first frame).
+		// Use the frame's own dims/format so crop differences can't drift.
+		dec.sws_ctx = sws.getContext(
+			dec.frame.width, dec.frame.height, avutil.PixelFormat(dec.frame.format),
+			dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA,
+			sws.Flags{.Bilinear}, nil, nil, nil,
+		)
+		if dec.sws_ctx == nil {
+			panic("sws_getContext (hw frame) failed")
+		}
+	}
 	sws.scale(
 		dec.sws_ctx,
 		cast([^][^]u8)&dec.frame.data[0],

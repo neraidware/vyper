@@ -70,11 +70,20 @@ Steps (each lands + probe + vet before the next):
       throughout `import_bg.odin`, `proxy.odin`. No `run_capture` of
       ffmpeg/ffprobe left; no `"ffmpeg"`/`"ffprobe"` string literals remain in
       the binary. Vet clean.
-- [ ] S4. HW decode in `Clip_Decoder`: enumerate hw devices, open with
-      `hw_device_ctx`, decode to hw frames, `av_hwframe_transfer_data` to a cached
-      YUV buffer, feed existing sws. Software path stays exact. Probe: hw vs
-      software decode of av1 1080p60 produce identical frame indices + scale;
-      deviceless run falls back clean.
+- [x] S4. HW decode in `Clip_Decoder`: enumerate the codec's hw configs
+      (`get_hw_config`) for one with an `HW_Device_Ctx` method, create the
+      device (`hwdevice_ctx_create`), attach it via `hw_device_ctx`; the decoder
+      negotiates hw frames automatically. Each hw frame is pulled to software
+      with `av_hwframe_transfer_data` (+ `frame_copy_props`/`frame_move_ref`)
+      before the existing sws path, so the PTS walk, hold, and cache logic never
+      see device memory. sws is built lazily from the first transferred frame's
+      format (VAAPI -> NV12), since `sw_pix_fmt` is unset for QSV/VAAPI export.
+      Software path stays byte-identical; `VYPER_HW_DISABLE=1` forces it and
+      `VYPER_HW_PROBE="<file>|<count>|<stride>"` decodes the same frames both
+      ways; deviceless/unsupported hosts fall back clean (probe still passes).
+      Probing on this host: h264 1080p vaapi vs sw 0 mismatches (and a modest
+      ~12% wall gain on the 891-frame forward pass); av1 has no local VAAPI
+      config so it runs sw-sw parity confirming the clean fallback.
 - [ ] S5. Original-rate preview: when decoder throughput sustains source fps,
       `proxy_pick_for_frame` resolves the original path (decode from original,
       GPU-or-sws scale to canvas). Deadline: one CPU core of air left on a

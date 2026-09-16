@@ -860,8 +860,15 @@ main :: proc() {
 	// lines) used to go to a silenced ffmpeg subprocess (-loglevel error); it
 	// is in-process now, so quiet the library globally to match.
 	avutil.log_set_level(.Error)
+	if os.get_env_alloc("VYPER_HW_DISABLE", context.temp_allocator) == "1" {
+		hw_decode_enabled = false
+	}
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {
 		render_test_run(test_paths)
+		return
+	}
+	if hw_probe, _ := os.lookup_env_alloc("VYPER_HW_PROBE", context.temp_allocator); hw_probe != "" {
+		preview_hw_probe_run(hw_probe)
 		return
 	}
 	if fp, _ := os.lookup_env_alloc("VYPER_FRAME_PROBE", context.temp_allocator); fp != "" {
