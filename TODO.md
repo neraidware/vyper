@@ -94,9 +94,12 @@ Steps (each lands + probe + vet before the next):
       decode at source fps. `VYPER_RATE_PROBE="<file>|<max_frames>"` confirms
       the deadline on any host: 14% cpu util on med120 1080p30 (hw vaapi) =
       one core of air, pass criterion `decode_ms < duration_ms / 2`.
-- [ ] S6. Pitch-preserving rate: `atempo` in former of audio producer; rate
+- [x] S6. Pitch-preserving rate: `atempo` in former of audio producer; rate
       dropdown (ui.odin:1486) pitch-preserves at 1.5/2 (and chords >2). Probe:
       tempo up does not shift a tone's pitch; sync holds at 2x for 30s.
+      (`VYPER_ATEMPO_PROBE=ALL` green: 440 Hz tone stays 440 at every rate,
+      out = in/rate balance within 3%; graph bypass at 1.0x; rate > 2 chains
+      atempo=2.0 stages multiplicatively + remainder stage.)
 - [ ] ACCEPT: 2x AV1 1080p60 plays smooth, pitch preserved, full-res, cores free;
       re-check mpv does no better. Weak-host fallback still builds windowed
       proxies via in-process encode. No `"ffmpeg"`/`"ffprobe"` strings in the

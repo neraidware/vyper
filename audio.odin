@@ -341,10 +341,13 @@ audio_device_ready: bool
 
 audio_stream: ^sdl.AudioStream
 
-// audio_freq_ratio is the last SetAudioStreamFrequencyRatio applied to
-// audio_stream. It mirrors playback_rate (0/Auto -> 1.0) so the device
-// reproduces audio at the chosen speed; changed only when playback_rate moves.
-audio_freq_ratio: f32 = 1.0
+// atempo_g is the pitch-preserving playback-rate graph (abuffer->atempo*->aformat
+// ->abuffersink) owned by the producer thread. SetAudioStreamFrequencyRatio is
+// replaced by this: the device always runs at 1.0, and the rate is applied as
+// time-stretch on the mix instead of resample. Rebuilt on rate change, jump,
+// and provision (the graph's internal window would otherwise leak pre-jump
+// samples). rate == 1.0 leaves the graph nil and bypasses it entirely.
+atempo_g: Atempo_Graph
 
 // AUDIO_CUSHION_SEC is how far ahead of the playhead the producer keeps the
 // device, and the queue-fill ceiling. On the producer thread this absorbs the
@@ -561,6 +564,7 @@ audio_note_edit :: proc() {
 // double-buffered geometry slab instead of live timeline memory, so it never
 // waits on the UI thread's edits.
 audio_provision :: proc(play_frame: i64) {
+	atempo_reset(&atempo_g) // graph window may hold pre-provision samples
 	audio_dec_dump_open()
 	audio_reset_play()
 	audio_play_frame = play_frame
@@ -784,6 +788,7 @@ audio_shutdown :: proc() {
 	}
 	audio_reset_play()
 	if audio_stream != nil {
+		atempo_graph_destroy(&atempo_g) // producer thread is joined by now; safe
 		sdl.DestroyAudioStream(audio_stream)
 		audio_stream = nil
 	}
@@ -842,22 +847,13 @@ audio_producer_feed :: proc() {
 	if !audio_device_ready || audio_stream == nil {
 		return
 	}
-	// Playback-rate: set the stream's frequency ratio so the device reproduces
-	// audio at the chosen speed (video already advances at playback_rate on the
-	// wall clock). Applied lazily — only when the rate changes — because the
-	// producer runs every ~2ms.
-	want_ratio := f32(max(0.0, playback_rate))
-	if want_ratio <= 0 {
-		want_ratio = 1.0
-	}
-	if want_ratio != audio_freq_ratio {
-		if sdl.SetAudioStreamFrequencyRatio(audio_stream, want_ratio) {
-			audio_freq_ratio = want_ratio
-			if audio_trace {
-				fmt.printf("[tr] stream frequency ratio -> %.2fx\n", want_ratio)
-			}
-		}
-	}
+	// Playback-rate: rebuild the atempo graph so the mix is time-stretched
+	// (pitch preserved) instead of the device resampling it (pitch shifts).
+	// Applied lazily — only when the rate changes — because the producer runs
+	// every ~2ms, and rebuilding a filter graph is cheap (a few ms) but not
+	// free per feed.
+	want_ratio := max(1.0, playback_rate)
+	atempo_rate_set(&atempo_g, want_ratio)
 	audio_pcm_dump_open()
 	audio_dec_dump_open()
 	fps := timeline_fps()
@@ -900,11 +896,17 @@ audio_producer_feed :: proc() {
 		}
 		audio_play_frame = jmp
 		sdl.ClearAudioStream(audio_stream)
+		atempo_reset(&atempo_g) // graph window holds pre-jump samples otherwise
 		sync.atomic_store(&audio_jump_frame, 0)
 	}
 	max_queue := c.int(f64(48000) * AUDIO_CUSHION_SEC * 2 * 2)
-	cushion_frames := i64(AUDIO_CUSHION_SEC * f64(fps) + 1)
-	queued_frames := i64(sdl.GetAudioStreamQueued(audio_stream)) / i64(spf * 2 * 2)
+	cushion_frames := i64(AUDIO_CUSHION_SEC * f64(fps) * want_ratio + 1)
+	// The device consumes 48k stream-samples/sec regardless of rate: atempo
+	// compresses content to spf/rate output samples per frame, so queued bytes
+	// represent content/rate worth — scale back up to content-frame depth so
+	// dev_pos stays honest at every rate.
+	rate_sc := max(1.0, want_ratio)
+	queued_frames := i64(f64(sdl.GetAudioStreamQueued(audio_stream)) * rate_sc / f64(spf * 2 * 2))
 	dev_pos := audio_play_frame - queued_frames
 	sync.atomic_store(&audio_dev_frame, dev_pos)
 	// The producer must pin to the playhead, not the device's own consumption
@@ -944,20 +946,33 @@ audio_producer_feed :: proc() {
 			sync.atomic_add(&audio_silence_holes, 1)
 		}
 		audio_rpt_mix_us += u64(sdl.GetTicksNS() - mix_t0)
-		for f in 0 ..< cur_spf {
-			l := mix[f * 2 + 0] * 32767.0
-			r := mix[f * 2 + 1] * 32767.0
+		// Playback-rate: atempo stretches mixed content to cur_spf/rate output
+		// samples with pitch preserved. Inactive graph (rate 1.0) feeds the mix
+		// through verbatim, identical to the pre-atempo path.
+		push_frames := cur_spf
+		src := mix[:]
+		if atempo_g.graph != nil {
+			atempo_process(&atempo_g, mix[:], cur_spf)
+			push_frames = atempo_g.out_n
+			src = atempo_g.out_buf[:]
+		}
+		for f in 0 ..< push_frames {
+			l := src[f * 2 + 0] * 32767.0
+			r := src[f * 2 + 1] * 32767.0
 			pcm[f * 2 + 0] = i16(clamp(l, -32768.0, 32767.0))
 			pcm[f * 2 + 1] = i16(clamp(r, -32768.0, 32767.0))
 		}
-		sdl.PutAudioStreamData(audio_stream, raw_data(pcm[:]), c.int(cur_spf * 2 * 2))
-		audio_total_fed_bytes += u64(cur_spf * 2 * 2)
+		out_bytes := push_frames * 2 * 2
+		if out_bytes > 0 {
+			sdl.PutAudioStreamData(audio_stream, raw_data(pcm[:]), c.int(out_bytes))
+			audio_total_fed_bytes += u64(out_bytes)
+		}
 		audio_rpt_push += 1
 		qnow := i64(sdl.GetAudioStreamQueued(audio_stream))
 		audio_rpt_min_q = min(audio_rpt_min_q, qnow)
 		audio_rpt_max_q = max(audio_rpt_max_q, qnow)
 		if audio_pcm_dump != nil {
-			dump_bytes := mem.slice_ptr(cast([^]u8)raw_data(pcm[:]), spf * 2 * 2)
+			dump_bytes := mem.slice_ptr(cast([^]u8)raw_data(pcm[:]), out_bytes)
 			if _, werr := os.write(audio_pcm_dump, dump_bytes); werr != nil {
 				os.close(audio_pcm_dump)
 				audio_pcm_dump = nil
@@ -1012,13 +1027,14 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				queued_bytes := sdl.GetAudioStreamQueued(audio_stream)
 				fps := timeline_fps()
 				spf := int(48000.0 / fps + 0.5)
-				queued_frames := int(queued_bytes) / (spf * 2 * 2)
+				rate_sc := max(1.0, playback_rate)
+				queued_frames := int(f64(queued_bytes) * rate_sc) / (spf * 2 * 2)
 				cursor := audio_play_frame - i64(queued_frames)
 				rate_fps := elapsed > 0 && delta >= 0 ? f64(delta) / elapsed : 0
 				queued_delta := f64(i64(queued_bytes) - i64(audio_report_queued))
-				consumed_bytes := f64(delta) * f64(spf) * 4.0 - queued_delta
+				consumed_bytes := f64(audio_total_fed_bytes - audio_report_fed) - queued_delta
 				drain_hz := elapsed > 0 && consumed_bytes > 0 ? consumed_bytes / 4.0 / elapsed : 0
-				dev_hz := elapsed > 0 ? (f64(audio_total_fed_bytes - audio_report_fed) - queued_delta) / 4.0 / elapsed : 0
+				dev_hz := elapsed > 0 ? consumed_bytes / 4.0 / elapsed : 0
 				dev_ratio := audio_device_spec.freq > 0 ? dev_hz / f64(audio_device_spec.freq) : 0
 				max_queue := c.int(f64(48000) * AUDIO_CUSHION_SEC * 2 * 2)
 				holes := sync.atomic_load(&audio_silence_holes)

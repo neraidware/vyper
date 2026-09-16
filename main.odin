@@ -939,6 +939,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		duplicate_probe_run(dp)
 		return
 	}
+	if atp, _ := os.lookup_env_alloc("VYPER_ATEMPO_PROBE", context.temp_allocator); atp != "" {
+		atempo_probe_run(atp)
+		return
+	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.
