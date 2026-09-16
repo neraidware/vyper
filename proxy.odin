@@ -142,26 +142,27 @@ proxy_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
 // proxy_scale computes the proxy's pixel size: the source-fit rect of the
 // source's aspect within the PREVIEW bounds, so letterboxing is idempotent
 // (a proxied frame reproduces the same filled preview rectangle as decoding
-// the original). Returns fitted w,h for ffmpeg's scale filter, or original
-// dims if the source aspect is unknown/invalid.
+// the original). Returns fitted w,h for the proxy encoder's sws scale, or
+// original dims if the source aspect is unknown/invalid.
 proxy_scale :: proc(src_w, src_h: c.int) -> (w, h: c.int) {
 	if src_w <= 0 || src_h <= 0 {
 		return PREVIEW_W, PREVIEW_H
 	}
 	fw, fh, _, _ := source_fit_in_buffer(src_w, src_h, PREVIEW_W, PREVIEW_H)
 	// yuv420p requires even width and height; an odd fitted dim (common for
-	// portrait sources, e.g. fit width 243) makes ffmpeg fail and leave a
-	// 0-byte proxy. Snap to even so transcoding always succeeds.
+	// portrait sources, e.g. fit width 243) would make the encode reject the
+	// buffer and leave a 0-byte proxy. Snap to even so transcoding always
+	// succeeds.
 	fw = c.int((fw / 2) * 2)
 	fh = c.int((fh / 2) * 2)
 	return fw, fh
 }
 
-// proxy_probe_frame_count returns the number of frames ffprobe attributes to
-// the proxy's video stream (for parity checking against the source). In-process
-// now: the container packet scan (first_video_packet_count) is the exact
-// equivalent of ffprobe's -count_packets, with no subprocess. Returns -1 when
-// the file can't be scanned.
+// proxy_probe_frame_count returns the number of frames the proxy's video stream
+// holds (for parity checking against the source). In-process now: the container
+// packet scan (first_video_packet_count) is the exact equivalent of the old
+// `ffprobe -count_packets`, with no subprocess. Returns -1 when the file can't
+// be scanned.
 proxy_probe_frame_count :: proc(path: cstring) -> i64 {
 	return probe_video_packet_count(path)
 }
@@ -259,7 +260,7 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 	}
 	pf := proxy_probe_frame_count(proxy)
 	if pf < src_frames - PROXY_FRAME_TOLERANCE {
-		// A corrupt/empty proxy (ffprobe returns -1) must be removed too, or
+		// A corrupt/empty proxy (frame scan returns -1) must be removed too, or
 		// it lingers forever and proxy_pick keeps declining it while proxy_transcode
 		// never rebuilds (the 0-byte portrait case). Remove any invalid artifact.
 		os.remove(string(proxy))
@@ -658,7 +659,7 @@ proxy_idx_store :: proc(src: cstring, idx: ^Proxy_Idx) {
 }
 
 // proxy_resolver_entry is the single-slot destination cache kept between decodes
-// so a scrub does not re-probe the on-disk index (and never re-runs ffprobe)
+// so a scrub does not re-probe the on-disk index (the count is read from the idx sidecar, no re-scan)
 // for the actively scrubbed file. One slot is enough: the playhead is in ONE
 // clip at a time, and a slow crossfade opens both slots over the same source.
 // The whole_proxy leg preserves old monolithic artifacts (and the synchronous

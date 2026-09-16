@@ -15,20 +15,20 @@ import sdl "vendor:sdl3"
 // order, so the head of the timeline goes proxy-fast almost immediately while
 // the tail still encodes (see proxy.odin's progressive-proxy design). The
 // worker's export loop does NOT block the editor: importing footage is supposed
-// to be instant, and the render-loop-driven decoders can't pause while ffmpeg
-// runs on the calling thread. So the proxy encode runs on this dedicated worker:
+// to be instant, and the render-loop-driven decoders can't pause while the
+// encode runs on the calling thread. So the proxy encode runs on this dedicated
+// worker, in-process via libx264 (no ffmpeg subprocess; proxy_encode.odin):
 //   - the import thread (`proxy_transcode`) enqueues a request and returns at
 //     once -- the clip is on the timeline and previews from the ORIGINAL until
 //     the opening segment lands (~1s in);
 //   - the worker encodes PROXY_SEG_FRAMES-sized segments head-first, each
-//     writing to its own `-progress` file, polling every 50ms and publishing a
-//     0..1 cumulative fraction;
-//   - ffmpeg's stdout/stderr are attached to nothing (`nil` handles = shut
-//     down) and the noise flags are dropped, so nothing can block on a full
-//     pipe;
-//   - the user can cancel from the corner status badge; the worker
-//     terminates ffmpeg and removes ONLY the in-flight segment -- completed
-//     segments (and their .idx entries) stay usable;
+//     reporting a 0..1 cumulative fraction through the on_frames callback;
+//   - encodes are single-threaded into the worker (a shared libav encode
+//     context is never written from another thread), so there is no stdout/
+//     stderr to attach and nothing that can block on a full pipe;
+//   - the user can cancel from the corner status badge; the worker polls the
+//     cancel flag every 32 frames and removes ONLY the in-flight segment --
+//     completed segments (and their .idx entries) stay usable;
 //   - after each segment exits cleanly the worker verifies its frame count and
 //     republishes the sidecar .idx so the resolver serves it immediately;
 //   - exactly one build runs at a time; a request posted while a build is
@@ -42,7 +42,7 @@ import sdl "vendor:sdl3"
 // Build_Phase is the worker's coarse state, read by the corner build badge.
 Build_Phase :: enum i32 {
 	Idle = 0, // nothing to do
-	Building = 1, // ffmpeg is encoding (progress 0..1, -1 while estimating)
+	Building = 1, // segment encode in progress (progress 0..1, -1 while estimating)
 	Verifying = 2, // frame-count parity check on the finished output
 	Done_Ok = 3,
 	Done_Fail = 4,
@@ -96,8 +96,8 @@ Proxy_Builder :: struct {
 	last_result_hi:    int,
 
 	// cancel_pending is set by the user (or shutdown) to abort whatever is
-	// current: the running build terminates ffmpeg, a still-queued request is
-	// dropped. Cleared by the worker when the abort completes.
+	// current: the running build aborts via its cancel poll, a still-queued
+	// request is dropped. Cleared by the worker when the abort completes.
 	cancel_pending: bool,
 
 	// req_supersede is set by import_bg_redefine alongside cancel_pending: it
@@ -118,8 +118,8 @@ import_builder: Proxy_Builder
 // build already running (it becomes the next job). A request for a window that
 // is already fully built is a cheap no-op (the worker's reuse path skips it),
 // so the scheduler can re-anchor the window every time the playhead moves
-// without caring what's on disk. `dur_us` is the source duration in
-// microseconds, used to turn ffmpeg's out_time into a percentage.
+// without caring what's on disk. `dur_us` names the source duration for the
+// failed-build log; the progress fraction is frame-based (encoder callback).
 import_bg_request :: proc(
 	src: cstring,
 	frames: i64,
@@ -187,7 +187,7 @@ import_bg_redefine :: proc(
 // import_bg_building_for reports whether a proxy build is in flight (or queued)
 // for `src`. proxy_pick_for_frame uses it to refuse latching a half-written whole
 // proxy while segmentation is being established: validating a partial file
-// against the source's frame count would delete it while ffmpeg is still
+// against the source's frame count would delete it while the worker is still
 // writing (a lost artifact + a removed artifact from under its open handle).
 import_bg_building_for :: proc(src: string) -> bool {
 	ib := &import_builder
@@ -202,8 +202,7 @@ import_bg_building_for :: proc(src: string) -> bool {
 }
 
 // import_bg_cancel aborts the current proxy job (running or queued). The worker
-// picks it up on its next poll and, if ffmpeg was running, terminates it and
-// deletes the partial proxy.
+// aborts on its next cancel poll and deletes the partial proxy it was on.
 import_bg_cancel :: proc() {
 	ib := &import_builder
 	if ib.thread == nil {
@@ -324,8 +323,8 @@ import_bg_init :: proc() {
 }
 
 // import_bg_shutdown stops the worker and frees its resources. A build in
-// flight is cancelled (ffmpeg terminated, partial proxy removed) rather than
-// waited out.
+// flight is cancelled (in-flight encode aborted, partial proxy removed) rather
+// than waited out.
 import_bg_shutdown :: proc() {
 	ib := &import_builder
 	if ib.thread == nil {
@@ -342,7 +341,7 @@ import_bg_shutdown :: proc() {
 	ib.thread = nil
 }
 
-// import_bg_worker owns the ffmpeg build loop (see the module comment).
+// import_bg_worker owns the in-process proxy build loop (see the module comment).
 import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 	context = runtime.default_context()
 	ib := (^Proxy_Builder)(data)

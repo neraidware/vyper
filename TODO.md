@@ -63,10 +63,13 @@ Steps (each lands + probe + vet before the next):
       green (incl. far-jump retarget + cancel → Done_Cancelled + on-disk 0+2
       coverage), tl probe green, libx264 / libav INFO chatter silenced via
       `avutil.log_set_level(.Error)`.
-- [ ] S3. Delete the subprocess encode path + ffprobe/fc-less imports that remain:
-      `subprocess.odin` ffmpeg helpers, `resolve_tool_argv` encode branch, the
-      shelled fallback in `proxy_transcode` sync mode. No `run_capture` of
-      ffmpeg/ffprobe left.
+- [x] S3. Delete the subprocess encode path + ffprobe/fc-less imports that remain:
+      `subprocess.odin` stripped to just `run_capture`/`resolve_tool_argv` for
+      fontconfig's `fc-match` (Linux only); `ffmpeg_argv_from_command`,
+      `discard_stderr` removed; stale ffmpeg-subprocess comments neutralized
+      throughout `import_bg.odin`, `proxy.odin`. No `run_capture` of
+      ffmpeg/ffprobe left; no `"ffmpeg"`/`"ffprobe"` string literals remain in
+      the binary. Vet clean.
 - [ ] S4. HW decode in `Clip_Decoder`: enumerate hw devices, open with
       `hw_device_ctx`, decode to hw frames, `av_hwframe_transfer_data` to a cached
       YUV buffer, feed existing sws. Software path stays exact. Probe: hw vs
