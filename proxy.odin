@@ -706,6 +706,7 @@ proxy_pick_for_frame :: proc(
 	src_frames: i64,
 	frame: i64,
 	out_buf: []u8,
+	prefer_source: bool,
 ) -> (
 	cstring,
 	i64,
@@ -714,6 +715,13 @@ proxy_pick_for_frame :: proc(
 		return nil, 0
 	}
 	spall_scope(#procedure)
+	// S5 original-rate preview: during forward playback a hw-backed decoder
+	// sustains source fps (deadline: one CPU core of air left on 1080p60),
+	// so serve the original instead of the lossy proxy. Scrubbing keeps
+	// prefer_source=false so the gop=1 proxy still handles instant seeks.
+	if prefer_source {
+		return nil, 0
+	}
 	// Resolution per frame: source frame -> segment index.
 	k := proxy_seg_for_frame(frame)
 

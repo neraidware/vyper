@@ -871,6 +871,10 @@ main :: proc() {
 		preview_hw_probe_run(hw_probe)
 		return
 	}
+	if rp, _ := os.lookup_env_alloc("VYPER_RATE_PROBE", context.temp_allocator); rp != "" {
+		preview_rate_probe_run(rp)
+		return
+	}
 	if fp, _ := os.lookup_env_alloc("VYPER_FRAME_PROBE", context.temp_allocator); fp != "" {
 		preview_framecheck_run(fp)
 		return

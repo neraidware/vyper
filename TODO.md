@@ -84,10 +84,16 @@ Steps (each lands + probe + vet before the next):
       Probing on this host: h264 1080p vaapi vs sw 0 mismatches (and a modest
       ~12% wall gain on the 891-frame forward pass); av1 has no local VAAPI
       config so it runs sw-sw parity confirming the clean fallback.
-- [ ] S5. Original-rate preview: when decoder throughput sustains source fps,
+- [x] S5. Original-rate preview: when decoder throughput sustains source fps,
       `proxy_pick_for_frame` resolves the original path (decode from original,
       GPU-or-sws scale to canvas). Deadline: one CPU core of air left on a
-      1080p60 playback.
+      1080p60 playback. Gate: `playhead.playing && playback_dir == 1` plus the
+      physical decoder's `hw_pix_fmt != .None` (worker's own flag published
+      atomically for the front slot; per-slot decoder for background). On
+      switch: one reopen + seek to the new keyframe, then steady forward
+      decode at source fps. `VYPER_RATE_PROBE="<file>|<max_frames>"` confirms
+      the deadline on any host: 14% cpu util on med120 1080p30 (hw vaapi) =
+      one core of air, pass criterion `decode_ms < duration_ms / 2`.
 - [ ] S6. Pitch-preserving rate: `atempo` in former of audio producer; rate
       dropdown (ui.odin:1486) pitch-preserves at 1.5/2 (and chords >2). Probe:
       tempo up does not shift a tone's pitch; sync holds at 2x for 30s.

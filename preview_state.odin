@@ -103,11 +103,19 @@ prewarm_next_clip :: proc() {
 			// the background builder lands more segments); each decoded warm
 			// frame may come from a different segment than the last, and the
 			// decoder reopens when the physical file changes.
+			//
+			// prefer_source follows the same S5 gate as the front slot: once
+			// the warm decoder is hw-backed, cache the ORIGINAL so the primed
+			// slot never degrades to the proxy mid-transition. Stale until the
+			// first warm open of the next clip (hw_pix_fmt reflects the PREVIOUS
+			// file); self-corrects on the first decode. Pause/scrub never reach
+			// here (the prewarm guard demands forward playback).
 			warm_pick, warm_base := proxy_pick_for_frame(
 				next.path,
 				next.source_length_frames,
 				next.source_start_frame,
 				warm_proxy_buf[:],
+				warm_decoder.hw_pix_fmt != .None,
 			)
 			decoder_set_preview(&warm_decoder, warm_pick, warm_base)
 			if !decode_clip_frame_sync(
@@ -126,6 +134,7 @@ prewarm_next_clip :: proc() {
 					next.source_length_frames,
 					wf,
 					warm_proxy_buf[:],
+					warm_decoder.hw_pix_fmt != .None,
 				)
 				decoder_set_preview(&warm_decoder, warm_pick, warm_base)
 				if !decode_clip_frame_sync(&warm_decoder, next.path, wf, warm_buf[:]) {
@@ -526,12 +535,31 @@ update_preview_slots :: proc() -> bool {
 			// as the playhead crosses a segment boundary mid-build. The decoder
 			// reopens on the physical-file change; render/probe paths are
 			// unaffected because they never set a preview target.
+			//
+			// S5 original-rate: during steady forward playback a hw-backed
+			// decoder serves the ORIGINAL source (full quality at source fps,
+			// deadline: a CPU core of air left on 1080p60); every other mode
+			// -- scrub, pause, reverse, sw decode -- keeps the gop=1 proxy so
+			// arbitrary seeks stay instant. The front slot asks the worker
+			// (its decoder), other slots ask their own. Both flags are stale
+			// for the very first request of a freshly-assigned clip (decoder
+			// not open yet -> proxy for one frame) and self-correct on the
+			// next decode; a pick flip mid-clip is a single one-time reopen.
+			prefer_source := false
+			if playhead.playing && playback_dir == 1 {
+				if slot_idx == front_video_slot && async_has_worker() {
+					prefer_source = async_dec_hw()
+				} else {
+					prefer_source = slot.dec.hw_pix_fmt != .None
+				}
+			}
 			pick_buf: [4096]u8
 			slot_pick, slot_base := proxy_pick_for_frame(
 				clip.path,
 				clip.source_length_frames,
 				clip_frame,
 				pick_buf[:],
+				prefer_source,
 			)
 			// Idle-skip: when the playhead is parked and this slot already
 			// shows the exact frame decoded through the exact same proxy file

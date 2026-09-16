@@ -62,7 +62,7 @@ proxy_probe_run :: proc(v: string) {
 
 	// 2. proxy_pick_for_frame resolves frame 0 (whole proxy path, no .idx):
 	// the legacy fast path runs the frame-suffcient check once and latches it.
-	picked, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf[:])
+	picked, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf[:], false)
 	if picked == nil {
 		fmt.println("[proxy-probe] FAIL: proxy_pick_for_frame rejected the built proxy")
 		os.exit(1)
@@ -126,9 +126,9 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 	// fully-built background proxy is the complete segment set -- there is no
 	// whole-file artifact to check).
 	pbuf0: [4096]u8
-	pfirst, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf0[:])
+	pfirst, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf0[:], false)
 	plast_buf: [4096]u8
-	plast, _ := proxy_pick_for_frame(path, frame_count, frame_count - 1, plast_buf[:])
+	plast, _ := proxy_pick_for_frame(path, frame_count, frame_count - 1, plast_buf[:], false)
 	if pfirst == nil || plast == nil {
 		fmt.println("[proxy-bg-test] FAIL: complete but frames not covered by segments")
 		os.exit(1)
@@ -155,7 +155,7 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 	check_frames := []i64{0, frame_count - 3}
 	check_fbuf: [4096]u8
 	for f, i in check_frames {
-		pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:])
+		pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:], false)
 		if pick == nil {
 			fmt.printf("[proxy-bg-test] FAIL: frame %d unresolved\n", f)
 			os.exit(1)
@@ -413,7 +413,7 @@ proxy_pick_scan_run :: proc(v: string) {
 	buf: [4096]u8
 	flips: [dynamic]int
 	for f := i64(0); f < frame_count + 4; f += 1 {
-		pick, base := proxy_pick_for_frame(path, frame_count, f, buf[:])
+		pick, base := proxy_pick_for_frame(path, frame_count, f, buf[:], false)
 		seg := -1
 		if pick != nil && base > 0 {
 			seg = int(base / PROXY_SEG_FRAMES)
