@@ -354,8 +354,24 @@ atempo_g: Atempo_Graph
 // whole UI frame cost; only stalls longer than this resync.
 AUDIO_CUSHION_SEC :: 0.25
 
-// MAX_PLAY_AUDIO bounds simultaneous playback decoders (one per audio clip).
+// MAX_PLAY_AUDIO bounds simultaneous playback decoders. One decoder serves a
+// whole source stream (every contiguous split segment shares it), so this
+// bounds STREAMS, not clips.
 MAX_PLAY_AUDIO :: 32
+
+// MAX_PLAY_SEGMENTS bounds the timeline segments one decoder serves. A run that
+// exceeds it starts a second decoder rather than growing the array.
+MAX_PLAY_SEGMENTS :: 256
+
+// AUDIO_SEEK_PREROLL_SEC seeks a clip's decoder this far BEFORE its content
+// origin. av_seek_frame(.Backward) on this container lands the first decoded
+// frame up to ~0.1s AFTER the requested time (measured: AAC/MP4 priming +
+// edit-list slack, +0.076..+0.112s across segments). The mixer treats samples
+// before the landing PTS as a hole, so without a preroll every split opened
+// with ~0.1s of silence. Preroll must exceed the demuxer's late-landing slack;
+// the fifo base stays at the real landing PTS (audio_mix_frame trims the
+// extra), so the preroll content is skipped, not duplicated or shifted.
+AUDIO_SEEK_PREROLL_SEC :: 0.5
 
 // Audio_Ring is a growable circular buffer of interleaved stereo f32
 // sample-frames. It replaces a plain [dynamic]f32 drained by shifting the
@@ -462,23 +478,40 @@ ring_destroy :: proc(r: ^Audio_Ring) {
 	r^ = {}
 }
 
-// Play_Src is one audio clip's 48 kHz stereo S16 decoder + content-relative
-// fifo. The clip is snapshotted at provision (start_s/start_a/len_a/path) so
-// playback is independent of later timeline edits.
+// Play_Seg is one timeline segment of a source stream: where it sits on the
+// timeline (start_a/len_a) and where its content starts in the source
+// (start_s). len_a is both the timeline length and the source length (clips are
+// not time-stretched), so a segment's source range is [start_s, start_s+len_a).
+Play_Seg :: struct {
+	start_a: i64, // timeline_start_frame
+	start_s: i64, // source_start_frame
+	len_a:   i64, // source_length_frames
+}
+
+// Play_Src is one source stream's 48 kHz stereo S16 decoder + content-relative
+// fifo, shared by every contiguous segment of that stream. Splits are
+// contiguous in both timeline and source, so a single forward-only decoder
+// plays straight through them with no per-segment reopen/seek — the old
+// one-decoder-per-clip model re-seeked at every split (opening a ~0.1s silence
+// hole at each boundary) and capped playback at MAX_PLAY_AUDIO CLIPS, silently
+// dropping whole tracks once a few linked tracks were split a few times. The
+// segment set is snapshotted at provision so playback never reads live clips.
 Play_Src :: struct {
-	start_a:      i64, // clip.timeline_start_frame at provision
-	start_s:      i64, // clip.source_start_frame at provision
-	len_a:        i64, // clip.source_length_frames at provision
 	path:         cstring, // cloned at provision, freed on reset
 	stream_index: c.int,
 	dec:          Audio_Clip_Decoder,
 	fifo:         Audio_Ring, // content-relative stereo f32 at 48 kHz
-	first48:      i64,          // content 48 kHz sample of fifo's head
-	have48:       i64,          // content 48 kHz samples produced so far
+	first48:      i64,        // content 48 kHz sample of fifo's head
+	have48:       i64,        // content 48 kHz samples produced so far
+	seg:          [MAX_PLAY_SEGMENTS]Play_Seg, // in timeline order
+	seg_count:    int,
 }
 
 play_srcs: [MAX_PLAY_AUDIO]Play_Src
 play_src_count: int
+// audio_src_overflow logs once when more source streams than MAX_PLAY_AUDIO are
+// present, so silent clip-drop on that path is never invisible.
+audio_src_overflow: bool
 // audio_play_frame is the next timeline frame for the producer to mix/feed.
 audio_play_frame: i64
 
@@ -576,29 +609,41 @@ audio_pcm_dump_open :: proc() {
 audio_dbg_budget: int
 // The producer never touches live timeline memory. The UI thread publishes the
 // audio clip geometry into a double-buffered slab (audio_geometry_commit on
-// every edit); the producer reads whichever slot is active, lock-free. A slot
-// being read is never rebuilt: the publisher always writes the slot the
-// producer is NOT currently on, and only holds paths until the swap, so chips
-// stay alive for the whole provision read.
-AUDIO_GEOM_MAX_CLIPS :: 128
-AUDIO_GEOM_PATH_CAP :: 4096
+// every edit); the producer reads whichever slot is active, lock-free. Both
+// slots are fixed arrays with permanent addresses, so a swap is a single atomic
+// index store and the publisher never frees memory the producer may still be
+// reading. Paths are packed into a per-slot byte arena instead of inlined in
+// each chip: a chip stays ~50 bytes, so the bound is memory-proportional rather
+// than 4 KB per clip, and it sits far above any real project.
+AUDIO_GEOM_MAX_CLIPS :: 4096
+AUDIO_GEOM_PATH_ARENA :: 1 << 20 // bytes of packed path data per slot
 
 Audio_Geom_Chip :: struct {
 	timeline_start: i64,
 	source_start:   i64,
 	source_len:     i64,
 	stream_index:   c.int,
+	path_off:       int, // offset into Audio_Geom_Slot.paths
 	path_len:       int,
-	path:           [AUDIO_GEOM_PATH_CAP]u8,
 }
 
 Audio_Geom_Slot :: struct {
-	n:    int,
-	chip: [AUDIO_GEOM_MAX_CLIPS]Audio_Geom_Chip,
+	n:         int,
+	path_used: int,
+	paths:     [AUDIO_GEOM_PATH_ARENA]u8,
+	chip:      [AUDIO_GEOM_MAX_CLIPS]Audio_Geom_Chip,
 }
 
 audio_geom: [2]Audio_Geom_Slot
 audio_geom_idx: u32 // atomic: active slot
+// audio_geom_overflow logs once when the timeline holds more audio clips (or
+// more path bytes) than a fixed slab can carry, so the dropped tail is visible.
+audio_geom_overflow: bool
+
+// audio_chip_path resolves a chip's path from its slot's packed arena.
+audio_chip_path :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chip) -> string {
+	return string(slot.paths[chip.path_off : chip.path_off + chip.path_len])
+}
 
 audio_src_reset :: proc(s: ^Play_Src) {
 	if s.dec.opened {
@@ -629,30 +674,35 @@ audio_reset_play :: proc() {
 audio_geometry_commit :: proc() {
 	write := 1 - int(sync.atomic_load(&audio_geom_idx))
 	slot := &audio_geom[write]
-	n := 0
+	slot.n = 0
+	slot.path_used = 0
 	for tr in 0 ..< len(timeline.tracks) {
 		for c in 0 ..< len(timeline.tracks[tr].clips) {
-			if n >= AUDIO_GEOM_MAX_CLIPS {
-				slot.n = n
-				sync.atomic_store(&audio_geom_idx, u32(write))
-				return
-			}
 			clip := &timeline.tracks[tr].clips[c]
 			if clip.kind != .Audio {
 				continue
 			}
-			chip := &slot.chip[n]
+			path := string(clip.path)
+			if slot.n >= AUDIO_GEOM_MAX_CLIPS || slot.path_used + len(path) > AUDIO_GEOM_PATH_ARENA {
+				if !audio_geom_overflow {
+					fmt.printf("[audio] geometry truncated (max %d clips / %d path bytes); later timeline clips are muted\n", AUDIO_GEOM_MAX_CLIPS, AUDIO_GEOM_PATH_ARENA)
+					audio_geom_overflow = true
+				}
+				sync.atomic_store(&audio_geom_idx, u32(write))
+				return
+			}
+			chip := &slot.chip[slot.n]
 			chip.timeline_start = clip.timeline_start_frame
 			chip.source_start = clip.source_start_frame
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
-			path := string(clip.path)
-			chip.path_len = min(len(path), AUDIO_GEOM_PATH_CAP)
-			mem.copy(raw_data(chip.path[:]), raw_data(path), chip.path_len)
-			n += 1
+			chip.path_off = slot.path_used
+			chip.path_len = len(path)
+			mem.copy(raw_data(slot.paths[slot.path_used:]), raw_data(path), len(path))
+			slot.path_used += len(path)
+			slot.n += 1
 		}
 	}
-	slot.n = n
 	sync.atomic_store(&audio_geom_idx, u32(write))
 }
 
@@ -668,10 +718,59 @@ audio_note_edit :: proc() {
 	audio_seek(playhead.frame)
 }
 
-// audio_provision (re)opens a decoder for every audio clip, seeked so that
-// play_frame is its content origin. Producer-thread only; reads the committed
-// double-buffered geometry slab instead of live timeline memory, so it never
-// waits on the UI thread's edits.
+// play_src_seg_at returns the segment of s covering timeline frame f, or nil.
+// Segments of one source are non-overlapping in timeline order (an overlapping
+// or reordered run is given its own Play_Src at provision).
+play_src_seg_at :: proc(s: ^Play_Src, f: i64) -> ^Play_Seg {
+	for i in 0 ..< s.seg_count {
+		sg := &s.seg[i]
+		if f >= sg.start_a && f < sg.start_a + sg.len_a {
+			return sg
+		}
+	}
+	return nil
+}
+
+// play_src_first_seg_at returns the first segment of s ending after frame f
+// (the one whose content the decoder should be anchored to), or nil if the
+// whole stream is behind the playhead.
+play_src_first_seg_at :: proc(s: ^Play_Src, f: i64) -> ^Play_Seg {
+	for i in 0 ..< s.seg_count {
+		sg := &s.seg[i]
+		if f < sg.start_a + sg.len_a {
+			return sg
+		}
+	}
+	return nil
+}
+
+// audio_provision_find_group returns the existing group that chip continues
+// exactly (same path/stream, contiguous with its last segment in both timeline
+// and source), or nil when chip must start a new group. A split produces the
+// contiguous case; everything else keeps a forward-only fifo correct.
+audio_provision_find_group :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chip) -> ^Play_Src {
+	chip_path := audio_chip_path(slot, chip)
+	for k in 0 ..< play_src_count {
+		g := &play_srcs[k]
+		if g.seg_count == 0 || g.stream_index != chip.stream_index {
+			continue
+		}
+		if string(g.path) != chip_path {
+			continue
+		}
+		last := &g.seg[g.seg_count - 1]
+		if last.start_a + last.len_a == chip.timeline_start &&
+		   last.start_s + last.len_a == chip.source_start {
+			return g
+		}
+	}
+	return nil
+}
+
+// audio_provision (re)opens one decoder per source stream, anchored so
+// play_frame is covered by that stream's first segment at or after it.
+// Producer-thread only; reads the committed double-buffered geometry slab
+// instead of live timeline memory, so it never waits on the UI thread's edits.
 audio_provision :: proc(play_frame: i64) {
 	sync.atomic_store(&audio_provisioning, true)
 	defer sync.atomic_store(&audio_provisioning, false)
@@ -683,43 +782,63 @@ audio_provision :: proc(play_frame: i64) {
 	audio_dbg_budget = 8
 	fps := timeline_fps()
 	slot := &audio_geom[sync.atomic_load(&audio_geom_idx)]
+	// Pass 1: fold the committed chips into one group per contiguous run of a
+	// source stream. Every split of a linked group lands in one group, so a
+	// project with N tracks and any number of splits needs N decoders.
 	for i in 0 ..< slot.n {
-		if play_src_count >= MAX_PLAY_AUDIO {
-			return
-		}
 		chip := &slot.chip[i]
-		seek_frame := max(play_frame, chip.timeline_start)
-		content_sec := f64(seek_frame - chip.timeline_start + chip.source_start) / fps
-		s := &play_srcs[play_src_count]
-		s.start_a = chip.timeline_start
-		s.start_s = chip.source_start
-		s.len_a = chip.source_len
-		s.path = strings.clone_to_cstring(string(chip.path[:chip.path_len]))
-		s.stream_index = chip.stream_index
-		if !open_audio_decoder_resampled(&s.dec, s.path, s.stream_index, 48000, 2) {
-			audio_src_reset(s)
+		g := audio_provision_find_group(slot, chip)
+		if g == nil {
+			if play_src_count >= MAX_PLAY_AUDIO {
+				if !audio_src_overflow {
+					fmt.printf(
+						"[audio] provision: %d source streams exceed MAX_PLAY_AUDIO=%d; later clips are muted\n",
+						play_src_count + 1, MAX_PLAY_AUDIO,
+					)
+					audio_src_overflow = true
+				}
+				continue
+			}
+			g = &play_srcs[play_src_count]
+			g.path = strings.clone_to_cstring(audio_chip_path(slot, chip))
+			g.stream_index = chip.stream_index
+			play_src_count += 1
+		}
+		if g.seg_count >= MAX_PLAY_SEGMENTS {
 			continue
 		}
-		if !seek_audio(&s.dec, content_sec) {
-			audio_src_reset(s)
-			continue
+		g.seg[g.seg_count] = Play_Seg{
+			start_a = chip.timeline_start,
+			start_s = chip.source_start,
+			len_a   = chip.source_len,
 		}
-			// Align the fifo base to the decoder's real landing PTS, not the
-		// asked position. An AAC seek can land tens of ms off; labeling the
-		// fifo with the asked time compounds that offset every frame and the
-		// content drifts against the playhead (reads as half-speed).
-		n := decode_audio_chunk(&s.dec, content_sec)
-		if n <= 0 {
-			audio_src_reset(s)
-			continue
-		}
-		real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
-		s.first48 = i64(real_sec * 48000)
-		s.have48 = s.first48 + i64(n)
-		audio_src_dump_dec(s, n)
-		audio_src_append(s, n)
-		play_src_count += 1
+		g.seg_count += 1
 	}
+	// Pass 2: open + anchor each group, compacting out any that failed. A group
+	// whose whole stream is behind the playhead has no future content and is
+	// dropped.
+	w := 0
+	for r in 0 ..< play_src_count {
+		s := &play_srcs[r]
+		anchored := false
+		if seg := play_src_first_seg_at(s, play_frame); seg != nil {
+			seek_frame := max(play_frame, seg.start_a)
+			content_sec := f64(seek_frame - seg.start_a + seg.start_s) / fps
+			if audio_src_open(s, content_sec) {
+				anchored = true
+			}
+		}
+		if !anchored {
+			audio_src_reset(s)
+			continue
+		}
+		if w != r {
+			play_srcs[w] = play_srcs[r]
+			play_srcs[r] = {}
+		}
+		w += 1
+	}
+	play_src_count = w
 	sync.atomic_store(&audio_src_count_ui, i64(play_src_count))
 }
 
@@ -756,7 +875,8 @@ audio_src_append :: proc(s: ^Play_Src, n: int) {
 
 // audio_src_pull decodes forward until the fifo covers up_to48 content samples.
 // The decoder continues sequentially from wherever it is; re-anchoring happens
-// only via audio_provision.
+// via audio_provision (fresh group) or audio_src_seek_anchor (a jump that
+// advanced past content still needed).
 audio_src_pull :: proc(s: ^Play_Src, up_to48: i64) {
 	for s.have48 < up_to48 {
 		n := decode_audio_chunk(&s.dec, -1.0)
@@ -768,6 +888,38 @@ audio_src_pull :: proc(s: ^Play_Src, up_to48: i64) {
 	}
 }
 
+// audio_src_open opens s's decoder and anchors it at content second
+// `content_sec` (see audio_src_seek_anchor). Returns false on open/seek failure
+// so the caller can drop the group.
+audio_src_open :: proc(s: ^Play_Src, content_sec: f64) -> bool {
+	if !open_audio_decoder_resampled(&s.dec, s.path, s.stream_index, 48000, 2) {
+		return false
+	}
+	return audio_src_seek_anchor(s, content_sec)
+}
+
+// audio_src_seek_anchor (re)seeks s's decoder to content second `content_sec`
+// with AUDIO_SEEK_PREROLL_SEC of headroom and refills the fifo, relabeling its
+// base to the decoder's real landing PTS. An AAC seek can land tens of ms after
+// the asked position; labeling the fifo with the asked time would compound that
+// offset every frame and drift the content against the playhead (reads as
+// half-speed), while not seeking early enough leaves the segment head silent.
+audio_src_seek_anchor :: proc(s: ^Play_Src, content_sec: f64) -> bool {
+	if !seek_audio(&s.dec, max(f64(0), content_sec - AUDIO_SEEK_PREROLL_SEC)) {
+		return false
+	}
+	n := decode_audio_chunk(&s.dec, content_sec)
+	if n <= 0 {
+		return false
+	}
+	real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
+	s.first48 = i64(real_sec * 48000)
+	s.have48 = s.first48 + i64(n)
+	audio_src_dump_dec(s, n)
+	audio_src_append(s, n)
+	return true
+}
+
 // audio_frame_boundary48 returns the exact (fractional, floor-truncated) 48kHz
 // sample index at which timeline frame `frame` begins, relative to the start
 // of the timeline (frame 0). Used to derive the true per-frame sample count
@@ -777,13 +929,13 @@ audio_frame_boundary48 :: proc(frame: i64, fps: f64) -> i64 {
 	return i64(f64(frame) * 48000.0 / fps)
 }
 
-// audio_mix_frame zeros mix[0..spf*2) and sums every covering clip's window,
+// audio_mix_frame zeros mix[0..spf*2) and sums every covering segment's window,
 // exactly like the render loop (render.odin render_worker_run). Pure snapshot
-// math (start_a/start_s/len_a) so the producer thread never reads live clips.
-// The consumed fifo head is trimmed each frame so playback memory stays flat.
-// Returns true if any covering clip actually delivered samples into mix (false
-// means the frame was fed to the device as silence while a clip covered it —
-// a decode/seek hole).
+// math (segment start_a/start_s/len_a) so the producer thread never reads live
+// clips. The consumed fifo head is trimmed each frame so playback memory stays
+// flat. Returns true if any covering segment actually delivered samples into
+// mix (false means the frame was fed to the device as silence while a segment
+// covered it — a decode/seek hole).
 audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 	for i in 0 ..< len(mix) {
 		mix[i] = 0
@@ -795,13 +947,28 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if !s.dec.opened {
 			continue
 		}
-		if frame < s.start_a || frame >= s.start_a + s.len_a {
+		seg := play_src_seg_at(s, frame)
+		if seg == nil {
 			continue
 		}
-		start48 := i64(f64(frame - s.start_a + s.start_s) * 48000.0 / fps)
-		if start48 < s.first48 {
-			continue
+		demand48 := i64(f64(frame - seg.start_a + seg.start_s) * 48000.0 / fps)
+		if demand48 < s.first48 {
+			// The fifo head is ahead of the needed sample. A gap within one
+			// frame is a boundary-rounding artifact at non-integer fps (the
+			// floor step can differ from 48000/fps by one): mix from the head.
+			// A larger gap means a forward jump advanced past content still
+			// needed: re-anchor this stream instead of feeding silence.
+			if s.first48 - demand48 > i64(spf) {
+				content_sec := f64(frame - seg.start_a + seg.start_s) / fps
+				if !audio_src_seek_anchor(s, content_sec) {
+					continue
+				}
+			}
+			if demand48 < s.first48 {
+				demand48 = s.first48
+			}
 		}
+		start48 := demand48
 		audio_src_pull(s, start48 + i64(spf))
 		if s.have48 < start48 + i64(spf) {
 			continue
@@ -815,8 +982,8 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		delivered = true
 		if audio_trace {
 			fmt.printf(
-				"[tr mix] fr=%d k=%d start48=%d have48=%d fifo=%d del=%v\n",
-				frame, k, start48, s.have48, ring_len(&s.fifo), delivered,
+				"[tr mix] fr=%d k=%d seg0=%d start48=%d have48=%d fifo=%d del=%v\n",
+				frame, k, seg.start_a, start48, s.have48, ring_len(&s.fifo), delivered,
 			)
 		}
 		// Drop everything up to and including this frame from the fifo. O(1):
@@ -916,12 +1083,12 @@ audio_reset_for_load :: proc() {
 	sync.atomic_store(&audio_run_flag, false)
 }
 
-// audio_src_covers_frame reports whether any provisioned clip covers timeline
-// frame f, i.e. the producer has valid content to play there.
+// audio_src_covers_frame reports whether any provisioned segment covers
+// timeline frame f, i.e. the producer has valid content to play there.
 audio_src_covers_frame :: proc(f: i64) -> bool {
 	for k in 0 ..< play_src_count {
 		s := &play_srcs[k]
-		if s.dec.opened && f >= s.start_a && f < s.start_a + s.len_a {
+		if s.dec.opened && play_src_seg_at(s, f) != nil {
 			return true
 		}
 	}
@@ -1189,15 +1356,14 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 						at := i64(-1)
 						covered := false
 						in_fifo := false
-						if audio_play_frame >= s.start_a && audio_play_frame < s.start_a + s.len_a {
+						if seg := play_src_seg_at(s, audio_play_frame); seg != nil {
 							covered = true
-							at = i64(f64(audio_play_frame - s.start_a + s.start_s) * 48000.0 / fps)
+							at = i64(f64(audio_play_frame - seg.start_a + seg.start_s) * 48000.0 / fps)
 							in_fifo = at >= s.first48 && at < s.have48
 						}
-						fmt.printf("[src %d] %s dec=%t in=%dHz/%dch out=%dHz/%dch a=%d s=%d len=%d first48=%d have48=%d fifo=%dfr decoded=%dfr/%dch mix_at=%d(into %t) cov=%t\n",
-							k, s.path, s.dec.opened,
+						fmt.printf("[src %d] %s segs=%d dec=%t in=%dHz/%dch out=%dHz/%dch first48=%d have48=%d fifo=%dfr decoded=%dfr/%dch mix_at=%d(into %t) cov=%t\n",
+							k, s.path, s.seg_count, s.dec.opened,
 							s.dec.input_rate, s.dec.input_channels, s.dec.out_rate, s.dec.out_channels,
-							s.start_a, s.start_s, s.len_a,
 							s.first48, s.have48, ring_len(&s.fifo),
 							s.dec.decoded_frames, s.dec.decoded_chunks,
 							at, in_fifo, covered)
