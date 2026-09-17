@@ -782,31 +782,63 @@ play_project_area :: proc() {
 	}
 }
 
-// MAX_FRAME_DT_S caps how much wall-clock time a single playback_update tick
-// is allowed to treat as "real" elapsed playtime. Normally one tick is a
-// UI-frame's worth of time (a few ms to a few tens of ms); but if the thread
-// was blocked between ticks -- e.g. update_preview_slots synchronously
-// cold-decoding several preview slots at once after a ripple cut -- the
-// measured wall delta can balloon to well over a second. Feeding that
-// straight into playhead_accumulator produces a single giant "catchup" burst
-// that jumps the playhead dozens of frames in one shot, which is exactly what
-// shows up downstream as an audio/video delta spike and audio_update's
-// forward-skip firing. Clamping here doesn't fix a stall's root cause, but it
-// keeps a stall from also corrupting the playback clock: the playhead simply
-// falls a bit behind wall time and catches up over the next few ticks instead
-// of leaping. Left unclamped when PLAYBACK_MAGIC_MS is in use since that's an
-// explicit diagnostic override, not a measured delta.
-MAX_FRAME_DT_S :: 0.1
+// playback_publish records (frame, wall-time) for the audio producer under a
+// seqlock: a reader that samples the pair while the UI is mid-publish retries
+// instead of reading a torn frame/time mismatch.
+playback_publish :: proc(frame: i64, now_ns: sdl.Uint64) {
+	sync.atomic_add(&playback_seq, 1)
+	sync.atomic_store(&ui_playhead_frame, frame)
+	sync.atomic_store(&ui_playhead_ns, i64(now_ns))
+	sync.atomic_add(&playback_seq, 1)
+}
+
+// playback_read_snapshot returns the last published (frame, wall-time) pair,
+// retrying until a consistent one is observed.
+playback_read_snapshot :: proc() -> (frame: i64, ns: i64) {
+	for {
+		s0 := sync.atomic_load(&playback_seq)
+		if s0 & 1 != 0 {
+			continue
+		}
+		frame = sync.atomic_load(&ui_playhead_frame)
+		ns = sync.atomic_load(&ui_playhead_ns)
+		if sync.atomic_load(&playback_seq) == s0 {
+			return
+		}
+	}
+}
+
+// playback_playhead_at advances the last published playhead to now_ns using the
+// wall clock and the rate audio is actually feeding at. The UI publishes the
+// frame it just computed the same tick, so its elapsed is ~0; the producer
+// calls this mid-tick, including across a UI stall, so the playhead it targets
+// is where playback really is rather than where the UI last managed to render.
+// Only forward extrapolation is meaningful -- audio is forward-only.
+playback_playhead_at :: proc(now_ns: sdl.Uint64, rate: f64) -> i64 {
+	frame, ns := playback_read_snapshot()
+	fps := timeline_fps()
+	elapsed := f64(i64(now_ns) - ns) / 1e9
+	if ns <= 0 || fps <= 0 || elapsed <= 0 {
+		return frame
+	}
+	return frame + i64(elapsed * fps * max(1.0, rate))
+}
 
 playback_update :: proc(now_ns: sdl.Uint64) {
 	if last_tick_ns == 0 {
 		last_tick_ns = now_ns
 	}
 	if playhead.playing {
+		// Playback is real-time: consume the true wall delta, never a clamped
+		// one. A clamp silently drops the unapplied remainder, which strands the
+		// playhead behind the wall clock permanently and desyncs it from the
+		// audio producer (which extrapolates this same clock). A long stall
+		// therefore jumps the playhead to where it should be, and audio_update's
+		// forward-skip resyncs the producer if it had fallen behind.
 		// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
 		// delta so the cadence is perfectly jitter-free (or any fixed rate).
 		dt_s :=
-			PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : min(f64(now_ns - last_tick_ns) / 1_000_000_000, MAX_FRAME_DT_S)
+			PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
 		// The playhead advances +dir frames at effective_playback_rate against
 		// the wall clock (rate * jog boost). Audio pacing at non-1x is the
 		// producer's stream frequency ratio; audio is muted going backward.
@@ -1187,7 +1219,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 
 		now_ns := sdl.GetTicksNS()
 		playback_update(now_ns)
-		sync.atomic_store(&ui_playhead_frame, playhead.frame)
+		playback_publish(playhead.frame, now_ns)
 		audio_update()
 		poll_completed_thread()
 		import_bg_consume_done()

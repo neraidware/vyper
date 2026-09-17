@@ -596,7 +596,19 @@ Preview_Slot :: struct {
 
 preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot
 
-ui_playhead_frame: i64 // published playhead frame for the audio producer (atomic)
+// Playback clock snapshot published by the UI thread for the audio producer.
+// The producer must not read playhead.frame directly (cross-thread data race)
+// and must not treat the last published value as frozen: a blocking swapchain
+// acquire can hold the render loop for a second while the sound device keeps
+// consuming, so a frozen frame would starve the producer and a value that
+// free-runs on the device would lock a permanent offset after the stall.
+// Publishing (frame, wall-time) together lets the producer extrapolate the
+// playhead on its own, from the same monotonic clock the UI uses, across any
+// UI update gap. Guarded by a seqlock (playback_seq) so the pair is never read
+// torn; non-explicit Odin atomics are sequentially consistent.
+ui_playhead_frame: i64 // atomic, guarded by playback_seq
+ui_playhead_ns:    i64 // atomic, sdl.GetTicksNS() when ui_playhead_frame was current
+playback_seq:      u64 // atomic seqlock: odd while publishing
 // audio_dev_frame is the content frame the sound device has actually consumed
 // (everything the producer pushed minus what is still queued); published every
 // feed pass so the preview HUD can show the audio clock next to the video one.
