@@ -1017,12 +1017,16 @@ audio_producer_feed :: proc() {
 	queued_frames := i64(f64(sdl.GetAudioStreamQueued(audio_stream)) * rate_sc / f64(spf * 2 * 2))
 	dev_pos := audio_play_frame - queued_frames
 	sync.atomic_store(&audio_dev_frame, dev_pos)
-	// The producer must pin to the playhead, not the device's own consumption
-	// clock: video advances on the wall clock, so audio content has to stay
-	// glued to the playhead position too. dev_pos only caps how far ahead the
-	// queue may run. target = the nearest of (playhead, device) + cushion.
-	ph := sync.atomic_load(&ui_playhead_frame)
-	target := max(dev_pos, ph) + cushion_frames
+	// Pin the queue to the playhead, extrapolated from the UI's published clock
+	// snapshot across any UI update gap (the render loop can block for a second
+	// on the swapchain acquire while the device keeps consuming). Freezing at
+	// the last published frame would starve the producer during a stall; driving
+	// off dev_pos (the device's own consumption clock) free-runs past a stalled
+	// playhead and locks a permanent offset after the stall. Extrapolating the
+	// same wall clock the UI uses keeps audio glued to where the playhead really
+	// is. dev_pos is kept only as the telemetry/health signal stored above.
+	ph := playback_playhead_at(sdl.GetTicksNS(), want_ratio)
+	target := ph + cushion_frames
 	if target <= audio_play_frame {
 		return
 	}
@@ -1090,7 +1094,7 @@ audio_producer_feed :: proc() {
 		if audio_trace {
 			fmt.printf(
 				"[tr feed] fr=%d devpos=%d target=%d q=%db ph=%d prod=%d dev=%d mix=%.2fs\n",
-				audio_play_frame - 1, dev_pos, target, qnow, sync.atomic_load(&ui_playhead_frame), audio_play_frame, audio_dev_frame, f64(sdl.GetTicksNS() - feed_t0) / 1e9,
+				audio_play_frame - 1, dev_pos, target, qnow, ph, audio_play_frame, audio_dev_frame, f64(sdl.GetTicksNS() - feed_t0) / 1e9,
 			)
 		}
 	}
