@@ -148,6 +148,37 @@ ff_err_str :: proc(code: c.int) -> string {
 // paths produce identical pixels.
 hw_decode_enabled: bool = true
 
+// find_hw_decoder returns the decoder to use for a codec id, preferring one with
+// hardware configs. find_decoder() returns the FIRST registered decoder for the
+// id, which for AV1 is libdav1d (software-only, no hw configs); the native "av1"
+// decoder carries the vaapi/cuda configs but registered later. The by-name
+// lookup (avcodec's canonical lowercase name) is what the CLI picks for hwaccel.
+// Falls back to the plain find_decoder() result, since that is correct for
+// h264/vp9/etc. and the fallback is the old behavior.
+find_hw_decoder :: proc(codec_id: avcodec.CodecID) -> ^avcodec.Codec {
+	if !hw_decode_enabled {
+		// Software mode: the plain id lookup (libdav1d for AV1) is fast and
+		// correct; the native decoder is only needed to reach hw configs.
+		return avcodec.find_decoder(codec_id)
+	}
+	codec := avcodec.find_decoder(codec_id)
+	if codec != nil {
+		for i: c.int = 0; ; i += 1 {
+			cfg := avcodec.get_hw_config(codec, i)
+			if cfg == nil {
+				break
+			}
+			if .HW_Device_Ctx in cfg.methods {
+				return codec
+			}
+		}
+	}
+	if better := avcodec.find_decoder_by_name(avcodec.get_name(codec_id)); better != nil {
+		return better
+	}
+	return codec
+}
+
 // asset_source_hw returns whether THIS asset's SOURCE file opens with a
 // hardware decoder on this machine, probing once and latching the answer for
 // the session. Its consumer is the S5 original-rate pick: during forward
@@ -381,7 +412,7 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	dec.stream = fmt_ctx.streams[idx]
 
 	par := dec.stream.codecpar
-	codec := avcodec.find_decoder(par.codec_id)
+	codec := find_hw_decoder(par.codec_id)
 	if codec == nil {
 		fmt.println("no decoder for codec", avcodec.get_name(par.codec_id))
 		return false

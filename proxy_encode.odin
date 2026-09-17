@@ -39,6 +39,8 @@ encode_decode_step :: proc(
 	dec: ^avcodec.CodecContext,
 	pkt: ^avcodec.Packet,
 	frame: ^avutil.Frame,
+	hw_pix_fmt: avutil.PixelFormat,
+	sw_frame: ^avutil.Frame,
 ) -> DecodeStep {
 	for {
 		if ret := avfmt.read_frame(in_fmt, pkt); ret < 0 {
@@ -61,6 +63,17 @@ encode_decode_step :: proc(
 			if r < 0 {
 				fmt.printf("[enc] avcodec_receive_frame error %d\n", r)
 				return .Error
+			}
+			if hw_pix_fmt != .None && avutil.PixelFormat(frame.format) == hw_pix_fmt {
+				// Hardware frame: transfer into sw_frame so the sws scale in
+				// encode_scale_send sees CPU-accessable pixels, mirroring the
+				// playback decoder's decode_one_forward.
+				if avutil.hwframe_transfer_data(sw_frame, frame, 0) < 0 {
+					return .Error
+				}
+				_ = avutil.frame_copy_props(sw_frame, frame)
+				avutil.frame_unref(frame)
+				avutil.frame_move_ref(frame, sw_frame)
 			}
 			return .Ok
 		}
@@ -107,7 +120,7 @@ proxy_encode_range :: proc(
 	st := in_fmt.streams[video_idx]
 	par := st.codecpar
 
-	codec := avcodec.find_decoder(par.codec_id)
+	codec := find_hw_decoder(par.codec_id)
 	if codec == nil {
 		fmt.printf("[enc] no decoder for %s\n", avcodec.get_name(par.codec_id))
 		return .Fail, 0
@@ -118,11 +131,52 @@ proxy_encode_range :: proc(
 		fmt.printf("[enc] avcodec_parameters_to_context: %s\n", ff_err_str(ret))
 		return .Fail, 0
 	}
+	// The proxy build decodes the SOURCE (often a fat AV1 recording) while the
+	// playback decoders and the audio producer need the same cores. Open the
+	// encoder's decoder through the same hardware path the preview uses so the
+	// transcode doesn't swallow the CPU the UI and audio are running on; fall
+	// back to software when no device is available. hw_pix_fmt/.None means the
+	// software path below (encode_decode_step skips the hw->sw transfer).
+	hw_pix_fmt: avutil.PixelFormat = .None
+	hw_dev: ^avutil.BufferRef
+	enc_sw_frame: ^avutil.Frame
+	if hw_decode_enabled {
+		for i: c.int = 0; ; i += 1 {
+			cfg := avcodec.get_hw_config(codec, i)
+			if cfg == nil {
+				break
+			}
+			if .HW_Device_Ctx not_in cfg.methods {
+				continue
+			}
+			probe_level := avutil.log_get_level()
+			avutil.log_set_level(.Quiet)
+			create_ok := avutil.hwdevice_ctx_create(&hw_dev, cfg.device_type, nil, nil, 0)
+			avutil.log_set_level(probe_level)
+			if create_ok != 0 {
+				continue
+			}
+			hw_pix_fmt = cfg.pix_fmt
+			dec.hw_device_ctx = avutil.buffer_ref(hw_dev)
+			enc_sw_frame = avutil.frame_alloc()
+			if vyper_trace {
+				fmt.printf("[enc] hw-decode %s via %s\n",
+					string(avcodec.get_name(par.codec_id)),
+					string(avutil.hwdevice_get_type_name(cfg.device_type)))
+			}
+			break
+		}
+	}
+	defer if hw_pix_fmt != .None {
+		avutil.buffer_unref(&hw_dev)
+		if enc_sw_frame != nil {
+			avutil.frame_free(&enc_sw_frame)
+		}
+	}
 	if ret := avcodec.open2(dec, codec, nil); ret < 0 {
 		fmt.printf("[enc] avcodec_open2 (decoder): %s\n", ff_err_str(ret))
 		return .Fail, 0
 	}
-	src_w, src_h := dec.width, dec.height
 
 	fps := st.r_frame_rate
 	if fps.num <= 0 || fps.den <= 0 {
@@ -157,7 +211,7 @@ proxy_encode_range :: proc(
 		defer avutil.frame_free(&held)
 		have_held := false
 		for {
-			step := encode_decode_step(in_fmt, video_idx, dec, in_pkt, in_frame)
+			step := encode_decode_step(in_fmt, video_idx, dec, in_pkt, in_frame, hw_pix_fmt, enc_sw_frame)
 			if step != .Ok {
 				// A segment cannot begin where the source has no frames.
 				return .Fail, 0
@@ -215,16 +269,14 @@ proxy_encode_range :: proc(
 		return .Fail, 0
 	}
 
-	sws_ctx := sws.getContext(
-		src_w, src_h, dec.pix_fmt,
-		out_w, out_h, avutil.PixelFormat.YUV420P,
-		sws.Flags{.Bilinear}, nil, nil, nil,
-	)
-	if sws_ctx == nil {
-		fmt.println("[enc] sws_getContext failed")
-		return .Fail, 0
+	// sws is built lazily from the first decoded frame's actual format: the
+	// hw-decode path transfers to a sw frame whose format (NV12, etc.) differs
+	// from dec.pix_fmt, and the sw path's dims can differ from the coded size
+	// (crop). Mirror the playback decoder's scale_decoded_frame.
+	sws_ctx: ^sws.Context
+	defer if sws_ctx != nil {
+		sws.freeContext(sws_ctx)
 	}
-	defer sws.freeContext(sws_ctx)
 
 	out_frame := avutil.frame_alloc()
 	defer avutil.frame_free(&out_frame)
@@ -276,14 +328,14 @@ proxy_encode_range :: proc(
 			enc_src := staged[0]
 			staged[0], staged[1] = staged[1], nil
 			staged_n -= 1
-			if !encode_scale_send(enc_src, out_frame, sws_ctx, enc, enc_pkt, oc, ost, done) {
+			if !encode_scale_send(enc_src, out_frame, &sws_ctx, out_w, out_h, enc, enc_pkt, oc, ost, done) {
 				return .Fail, done
 			}
 			done += 1
 			on_frames(ud, int(done))
 			continue
 		}
-		switch encode_decode_step(in_fmt, video_idx, dec, in_pkt, in_frame) {
+		switch encode_decode_step(in_fmt, video_idx, dec, in_pkt, in_frame, hw_pix_fmt, enc_sw_frame) {
 		case .Error:
 			avcodec.packet_unref(enc_pkt)
 			return .Fail, done
@@ -298,7 +350,7 @@ proxy_encode_range :: proc(
 			return .Ok, done
 		case .Ok:
 		}
-		if !encode_scale_send(in_frame, out_frame, sws_ctx, enc, enc_pkt, oc, ost, done) {
+		if !encode_scale_send(in_frame, out_frame, &sws_ctx, out_w, out_h, enc, enc_pkt, oc, ost, done) {
 			return .Fail, done
 		}
 		done += 1
@@ -318,18 +370,31 @@ proxy_encode_range :: proc(
 
 // encode_scale_send scales one decoded frame to the proxy's yuv420p buffer,
 // encodes it, and muxes all drained packets. Returns false on a hard libav
-// error (the caller drops the artifact).
+// error (the caller drops the artifact). sws_ctx is built lazily from the first
+// frame's real format/dims (hw decode transfers to NV12 etc., which dec.pix_fmt
+// doesn't name); `out_w/out_h` are the proxy's fixed output size.
 encode_scale_send :: proc(
 	src_frame, out_frame: ^avutil.Frame,
-	sws_ctx: ^sws.Context,
+	sws_ctx: ^^sws.Context,
+	out_w, out_h: c.int,
 	enc: ^avcodec.CodecContext,
 	enc_pkt: ^avcodec.Packet,
 	oc: ^avfmt.FormatContext,
 	ost: ^avfmt.Stream,
 	done: i64,
 ) -> bool {
+	if sws_ctx^ == nil {
+		sws_ctx^ = sws.getContext(
+			src_frame.width, src_frame.height, avutil.PixelFormat(src_frame.format),
+			out_w, out_h, avutil.PixelFormat.YUV420P,
+			sws.Flags{.Bilinear}, nil, nil, nil,
+		)
+		if sws_ctx^ == nil {
+			return false
+		}
+	}
 	_ = sws.scale(
-		sws_ctx,
+		sws_ctx^,
 		cast([^][^]u8)&src_frame.data[0],
 		cast([^]c.int)&src_frame.linesize[0],
 		0, src_frame.height,
