@@ -76,14 +76,17 @@ render_resolve_output_path :: proc() -> string {
 // trailing slash): $XDG_VIDEOS_DIR when set, else $HOME/Videos. Returns ""
 // when the home directory is not resolvable, letting the caller fall back.
 render_videos_dir :: proc(buf: []u8) -> string {
-	tmp: [512]u8
 	home, home_ok := os.user_home_dir(context.temp_allocator)
 	if home_ok != os.General_Error.None {
 		return ""
 	}
 	videos := os.get_env("XDG_VIDEOS_DIR", context.temp_allocator)
 	if videos == "" {
-		videos = fmt.bprintf(tmp[:], "%s/Videos", home)
+		// Format into the CALLER's buf, not a local array: a string returned
+		// from this proc must stay valid after the stack frame is gone, and a
+		// local array here does not (see render_default_output_path, which
+		// passes its own dir_buf through for exactly this reason).
+		videos = fmt.bprintf(buf, "%s/Videos", home)
 	}
 	return strings.trim_suffix(videos, "/")
 }

@@ -175,11 +175,6 @@ update_preview_slots :: proc() -> bool {
 	// (the track-order walk position), NOT the slot index.
 	claimed: [MAX_PREVIEW_SLOTS]bool
 	layer: u8
-	// front_video_slot is the slot of the topmost non-text clip at the
-	// playhead: the foreground face. Only it is decoded on the async worker
-	// (probe mode below waits for the result); all other slots decode
-	// synchronously.
-	front_video_slot := -1
 	if active_interaction == .Playhead_Scrub {
 		scrub_tick += 1
 	}
@@ -228,9 +223,6 @@ update_preview_slots :: proc() -> bool {
 			layer += 1
 			slot := &preview_slots[slot_idx]
 			slot.layer = layer
-			if clip.kind != .Text && front_video_slot < 0 {
-				front_video_slot = slot_idx
-			}
 			// Identity is the clip instance (clip_id), not its asset or its
 			// position: asset_id alone would conflate two different clips of
 			// the same source file, and timeline_start_frame changes under a
@@ -517,16 +509,19 @@ update_preview_slots :: proc() -> bool {
 			// Scrub throttle: a drag fires many mousemoves, which would otherwise
 			// force an exact-seek decode per UI frame per slot. Decimate: decode
 			// exact frames on every SCRUB_DECIMATION-th update only, showing the
-			// last decoded face between. The foreground slot is exempt when its
-			// decode runs on the async worker: that path is non-blocking, so it
-			// chases the pointer every update and scrubbing the visible face stays
-			// live. A slot that has not yet covered its current frame still
+			// last decoded face between. EVERY slot is exempt now that every
+			// slot decodes on its own async worker (async_decoders[slot_idx]):
+			// that path is non-blocking, so it chases the pointer every update
+			// and scrubbing every layer -- not just the top one -- stays live.
+			// A slot without a worker (e.g. a probe that never called
+			// async_dec_init) falls back to the old throttled/synchronous
+			// behavior. A slot that has not yet covered its current frame still
 			// decodes on the first throttled tick so a clip crossing the playhead
 			// mid-drag shows immediately.
 			scrub_skip :=
 				active_interaction == .Playhead_Scrub &&
 				scrub_tick % SCRUB_DECIMATION != 0 &&
-				(slot_idx != front_video_slot || !async_has_worker())
+				!async_has_worker(slot_idx)
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
 			// the background builder lands more segments, so the frame the
@@ -578,7 +573,7 @@ update_preview_slots :: proc() -> bool {
 				continue
 			}
 			if !scrub_skip || !slot.has_frame {
-				if slot_idx == front_video_slot && async_has_worker() {
+				if async_has_worker(slot_idx) {
 					if slot.prime_from_warm {
 						// Transition frame: the decoder handed over by prewarm
 						// already holds this clip's first frames in its RAM cache,
@@ -602,24 +597,30 @@ update_preview_slots :: proc() -> bool {
 							changed = true
 						}
 					} else {
-						// Foreground clip decodes on the async worker: the render
-						// loop never blocks on its seek/decode, so scrubbing the
-						// top layer stays fluid even on a slow keyframe seek. The
-						// worker resolves its own proxy (preview path passed
-						// through); probe mode waits so asserts are deterministic.
+						// Every slot decodes on its OWN async worker
+						// (async_decoders[slot_idx]): the render loop never
+						// blocks on any slot's seek/decode, so an edit that
+						// shifts several clips at once (a ripple cut) can no
+						// longer stall this thread -- and with it
+						// playback_update/audio_update, which run right after
+						// update_preview_slots on the same thread (see
+						// main.odin). Each worker resolves its own proxy
+						// (preview path passed through); probe mode waits so
+						// asserts are deterministic.
 						//
 						// Consume the worker's NEWEST completed decode, not an
 						// exact frame match: an exact-only consume succeeds only
-						// when the playhead sits still, so once the worker lags
-						// even one tick behind moving playback the preview freezes
-						// until pause. Consuming the newest keeps a freshly-
-						// decoded face on screen every update (dropped-frame
-						// preview) regardless of how far behind the worker falls;
-						// the worker selects the newest posted request, so it
-						// converges toward the playhead on its own.
-						async_post_request(slot.path, slot_pick, slot_base, clip_frame)
+						// when the playhead sits still, so once a worker lags
+						// even one tick behind moving playback that slot's
+						// preview freezes until pause. Consuming the newest
+						// keeps a freshly-decoded face on screen every update
+						// (dropped-frame preview) regardless of how far behind
+						// the worker falls; each worker selects the newest
+						// request posted to IT, so it converges toward the
+						// playhead on its own, independently per slot.
+						async_post_request(slot_idx, slot.path, slot_pick, slot_base, clip_frame)
 						if !async_live_mode {
-							async_wait_idle()
+							async_wait_idle(slot_idx)
 						}
 						// The worker serves the newest COMPLETED decode, which lags
 						// the requested frame during playback (dropped-frame). It
@@ -634,6 +635,7 @@ update_preview_slots :: proc() -> bool {
 						// identity that matches no real decode and the preview
 						// re-decodes/serves the wrong thing across the boundary.
 						if ok, dyn_frame, served_pick := async_try_consume_latest(
+							slot_idx,
 							slot.path,
 							clip_frame,
 							slot.buffer[:],
@@ -644,10 +646,14 @@ update_preview_slots :: proc() -> bool {
 							slot.tex_dirty = true
 							changed = true
 						} else if vyper_trace {
-							fmt.printf("[vf] async miss req=%d ph=%d\n", req, playhead.frame)
+							fmt.printf("[vf] async miss slot=%d req=%d ph=%d\n", slot_idx, req, playhead.frame)
 						}
 					}
 				} else {
+					// No worker for this slot (async subsystem not initialized --
+					// some headless probes never call async_dec_init). Same
+					// synchronous path as before; these probes don't exercise the
+					// ripple-cut multi-slot scenario this fix targets.
 					decoder_set_preview(&slot.dec, slot_pick, slot_base)
 					if decode_clip_frame_sync(&slot.dec, slot.path, clip_frame, slot.buffer[:]) {
 						slot.displayed_frame = clip_frame
@@ -656,7 +662,7 @@ update_preview_slots :: proc() -> bool {
 						slot.tex_dirty = true
 						changed = true
 					} else if vyper_trace {
-						fmt.printf("[vf] miss req=%d ph=%d\n", req, playhead.frame)
+						fmt.printf("[vf] miss slot=%d req=%d ph=%d\n", slot_idx, req, playhead.frame)
 					}
 				}
 			}

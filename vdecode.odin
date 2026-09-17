@@ -5,34 +5,64 @@ import "base:runtime"
 import "core:fmt"
 import sdl "vendor:sdl3"
 
-// Async_Decoder runs decode from the FRONTMOST video clip on a dedicated worker
-// thread so that a slow keyframe seek never blocks the render loop (which also
-// feeds audio). The worker is the only user of its Clip_Decoder; the render
-// thread only copies a finished RGBA frame out of display_buf under the mutex.
+// Async_Decoder runs decode for ONE preview slot on its own dedicated worker
+// thread, so a slow keyframe seek for that slot never blocks the render loop
+// (which also drives playback_update/audio_update -- see main.odin). There is
+// one Async_Decoder per preview slot (async_decoders[slot_idx]), not one
+// global instance: previously only the frontmost clip got this treatment and
+// every OTHER slot decoded synchronously on the render thread, so an edit
+// that shifted several clips at once (a ripple cut moves every downstream
+// clip's timeline_start_frame in one go) forced multiple synchronous cold
+// seeks back-to-back on the render thread -- a multi-hundred-ms-to-second
+// stall that also delayed playback_update/audio_update, which run right
+// after update_preview_slots on the same thread, producing a real audio/video
+// desync. Giving every slot its own worker removes decode from the render
+// thread's blocking path entirely, for every slot, not just the top one.
 //
-// Protocol (render thread <-> worker):
-//   - Render posts a request with async_post_request(path, preview, clip_frame).
-//     Each post bumps req_seq. The worker picks up the latest pending request,
-//     decodes it, records (res_path, res_frame) + pixels in display_buf, sets
-//     res_valid, bumps done_seq. If it drains all requests it waits on cond.
-//   - Render consumes a result with async_try_consume(path, clip_frame, out):
-//     if the worker finished EXACTLY that request (res_valid && res_frame ==
-//     clip_frame && res_path == path) it copies the pixels to out and clears
-//     res_valid. Else it fails so the caller keeps its last good frame.
-//   - async_wait_idle() blocks until done_seq reaches req_seq; used only by the
-//     headless probes, which step the playhead and then immediately assert the
-//     slot buffer, so they need the decode deterministically caught up.
+// Protocol (render thread <-> worker), unchanged per-slot from the original
+// single-worker design:
+//   - Render posts a request with async_post_request(slot_idx, path, preview,
+//     frame_base, clip_frame). Each post bumps req_seq. The worker picks up
+//     the latest pending request, decodes it, records (res_path, res_frame) +
+//     pixels in display_buf, sets res_valid, bumps done_seq. If it drains all
+//     requests it waits on cond.
+//   - Render consumes a result with async_try_consume(slot_idx, path,
+//     clip_frame, out): if the worker finished EXACTLY that request
+//     (res_valid && res_frame == clip_frame && res_path == path) it copies
+//     the pixels to out and clears res_valid. Else it fails so the caller
+//     keeps its last good frame.
+//   - async_wait_idle(slot_idx) blocks until that slot's done_seq reaches
+//     req_seq; used only by the headless probes, which step the playhead and
+//     then immediately assert the slot buffer, so they need the decode
+//     deterministically caught up.
 //
-// Latest-wins: the worker always re-renders the newest posted request, so a
-// fast-moving playhead converges to the current frame without buffering.
+// Latest-wins per slot: each worker always re-renders the newest posted
+// request for ITS slot, so a fast-moving playhead converges to the current
+// frame without buffering, independently per layer.
 //
-// The worker is a SEPARATE decoder from the per-slot decode_clip_frame_sync
-// decoders; it is only used for the foreground clip and does not touch the slot
-// structs (slot.buffer is written solely by the render thread via
-// async_try_consume). Its decode path (vdec_decode) mirrors decode_clip_frame_sync
-// and must keep the cache-hit/last_frame guard in lockstep; VYPER_CACHE_PROBE
-// stays at 0 mismatches for that reason.
+// Each worker owns its own Clip_Decoder, separate from the slot's own
+// decode_clip_frame_sync decoder (slot.dec in preview_slots): the render
+// thread never touches a decoder a worker thread might concurrently be
+// seeking with, avoiding races. slot.buffer is written solely by the render
+// thread via async_try_consume/async_try_consume_latest. Its decode path
+// (vdec_decode) mirrors decode_clip_frame_sync and must keep the
+// cache-hit/last_frame guard in lockstep; VYPER_CACHE_PROBE stays at 0
+// mismatches for that reason.
+//
+// Trade-off: MAX_PREVIEW_SLOTS worker threads (and MAX_PREVIEW_SLOTS extra
+// Clip_Decoders) are alive whenever the async subsystem is initialized,
+// instead of just one. Each is blocked on its condition variable and does
+// nothing when its slot has no pending request, so the idle CPU cost is
+// negligible -- but this DOES mean up to MAX_PREVIEW_SLOTS decoders (on top
+// of the MAX_PREVIEW_SLOTS the slots themselves already hold in slot.dec) can
+// have a source file open concurrently, which matters on machines with a
+// limited number of concurrent hardware decode sessions. If that becomes a
+// real constraint, the fix is to turn this into a small worker POOL (fewer
+// threads than slots, each picking up whichever slot's request is pending)
+// rather than reducing back to a single front-slot worker.
 Async_Decoder :: struct {
+	slot_idx: int, // which preview slot this worker serves (for tracing)
+
 	thread: ^sdl.Thread,
 	mutex:  ^sdl.Mutex,
 	cond:   ^sdl.Condition,
@@ -71,9 +101,12 @@ Async_Decoder :: struct {
 	wbuf:            [PREVIEW_W * PREVIEW_H * 4]u8,
 }
 
-async_decoder: Async_Decoder
+// async_decoders holds one worker per preview slot, indexed by slot_idx
+// (0 ..< MAX_PREVIEW_SLOTS). All decode routed through update_preview_slots
+// goes through async_decoders[slot_idx] rather than a single shared instance.
+async_decoders: [MAX_PREVIEW_SLOTS]Async_Decoder
 
-// async_live_mode selects how the preview consumes the async worker's result.
+// async_live_mode selects how the preview consumes each worker's result.
 // Live (GUI) mode is non-blocking: keep the last good frame until the worker
 // lands the current one. Probe/test mode waits (async_wait_idle) so the
 // playhead steps are deterministic and the sync-contract probes stay valid.
@@ -96,7 +129,8 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_b
 	if !ad.dec.opened || ad.dec_path != path || string(ad.dec.opened_path) != string(want) {
 		if vyper_trace {
 			fmt.printf(
-				"[vdec] REOPEN src_f=%d want=%q opened=%v opened_path=%q preview=%q\n",
+				"[vdec s=%d] REOPEN src_f=%d want=%q opened=%v opened_path=%q preview=%q\n",
+				ad.slot_idx,
 				frame_idx + frame_base,
 				string(want),
 				ad.dec.opened,
@@ -196,34 +230,49 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 	return 0
 }
 
+// async_dec_init spawns one worker thread per preview slot.
 async_dec_init :: proc() {
-	ad := &async_decoder
-	ad.mutex = sdl.CreateMutex()
-	ad.cond = sdl.CreateCondition()
-	ad.thread = sdl.CreateThread(vdec_worker, "vdecode", ad)
-}
-
-// async_dec_shutdown stops the worker and frees its resources.
-async_dec_shutdown :: proc() {
-	ad := &async_decoder
-	if ad.thread == nil {
-		return
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		ad := &async_decoders[i]
+		ad.slot_idx = i
+		ad.mutex = sdl.CreateMutex()
+		ad.cond = sdl.CreateCondition()
+		ad.thread = sdl.CreateThread(vdec_worker, "vdecode", ad)
 	}
-	sdl.LockMutex(ad.mutex)
-	ad.stop = true
-	sdl.SignalCondition(ad.cond)
-	sdl.UnlockMutex(ad.mutex)
-	sdl.WaitThread(ad.thread, nil)
-	sdl.DestroyCondition(ad.cond)
-	sdl.DestroyMutex(ad.mutex)
-	ad.thread = nil
 }
 
-// async_dec_reset tells the worker to drop its decoder and cached frames (e.g.
-// ahead of importing a new file). Safe to call even if not running. Also clears
-// any posted request and stale result so old pixels are never consumed.
-async_dec_reset :: proc() {
-	ad := &async_decoder
+// async_dec_shutdown stops every worker and frees its resources.
+async_dec_shutdown :: proc() {
+	// Signal all workers to stop before joining any of them, so shutdown time
+	// is roughly one wakeup latency total rather than MAX_PREVIEW_SLOTS of them
+	// serialized.
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		ad := &async_decoders[i]
+		if ad.thread == nil {
+			continue
+		}
+		sdl.LockMutex(ad.mutex)
+		ad.stop = true
+		sdl.SignalCondition(ad.cond)
+		sdl.UnlockMutex(ad.mutex)
+	}
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		ad := &async_decoders[i]
+		if ad.thread == nil {
+			continue
+		}
+		sdl.WaitThread(ad.thread, nil)
+		sdl.DestroyCondition(ad.cond)
+		sdl.DestroyMutex(ad.mutex)
+		ad.thread = nil
+	}
+}
+
+// async_dec_reset_slot tells ONE slot's worker to drop its decoder and cached
+// frames. Safe to call even if that worker is not running. Also clears any
+// posted request and stale result so old pixels are never consumed.
+async_dec_reset_slot :: proc(slot_idx: int) {
+	ad := &async_decoders[slot_idx]
 	if ad.thread == nil {
 		return
 	}
@@ -235,13 +284,24 @@ async_dec_reset :: proc() {
 	sdl.UnlockMutex(ad.mutex)
 }
 
-// async_post_request asks the worker to decode the given clip frame of `path`
-// as soon as it is free. `preview` is the preview-path proxy to decode through
-// (nil decodes the source) and `frame_base` is its source-frame base (see
-// decode.odin's Clip_Decoder.frame_base). Non-blocking. The worker always
-// converges to the most recent request.
-async_post_request :: proc(path: cstring, preview: cstring, frame_base: i64, clip_frame: i64) {
-	ad := &async_decoder
+// async_dec_reset tells EVERY worker to drop its decoder and cached frames
+// (e.g. ahead of importing a new file, or any full timeline invalidation).
+// Kept as the zero-arg entry point so existing "reset everything" call sites
+// (media.odin's post-import teardown) don't need to know about individual
+// slots.
+async_dec_reset :: proc() {
+	for i in 0 ..< MAX_PREVIEW_SLOTS {
+		async_dec_reset_slot(i)
+	}
+}
+
+// async_post_request asks slot_idx's worker to decode the given clip frame of
+// `path` as soon as it is free. `preview` is the preview-path proxy to decode
+// through (nil decodes the source) and `frame_base` is its source-frame base
+// (see decode.odin's Clip_Decoder.frame_base). Non-blocking. That slot's
+// worker always converges to the most recent request posted to it.
+async_post_request :: proc(slot_idx: int, path: cstring, preview: cstring, frame_base: i64, clip_frame: i64) {
+	ad := &async_decoders[slot_idx]
 	if ad.thread == nil {
 		return
 	}
@@ -270,12 +330,12 @@ async_post_request :: proc(path: cstring, preview: cstring, frame_base: i64, cli
 	sdl.UnlockMutex(ad.mutex)
 }
 
-// async_try_consume copies the worker's decoded frame into `out` if and only if
-// it is the result for EXACTLY (path, clip_frame). Returns false if the worker
-// has not produced that exact frame yet (caller keeps its last good frame) or
-// if a stale result for a different request is present.
-async_try_consume :: proc(path: cstring, clip_frame: i64, out: []u8) -> bool {
-	ad := &async_decoder
+// async_try_consume copies slot_idx's worker's decoded frame into `out` if and
+// only if it is the result for EXACTLY (path, clip_frame). Returns false if
+// the worker has not produced that exact frame yet (caller keeps its last
+// good frame) or if a stale result for a different request is present.
+async_try_consume :: proc(slot_idx: int, path: cstring, clip_frame: i64, out: []u8) -> bool {
+	ad := &async_decoders[slot_idx]
 	if ad.thread == nil {
 		return false
 	}
@@ -289,15 +349,16 @@ async_try_consume :: proc(path: cstring, clip_frame: i64, out: []u8) -> bool {
 	return true
 }
 
-// async_try_consume_latest copies the worker's most recently completed frame
-// into `out` even when it does not match the requested clip_frame, returning
-// the decoded frame. Used while scrubbing: the frontier races ahead of the
-// worker, so exact-consume would only ever succeed on release; this shows the
-// newest completed decode so the preview chases the pointer in real time.
-// Only honored when the result belongs to the same source path. Returns false
-// when no completed result is present yet (caller keeps its last good frame).
-async_try_consume_latest :: proc(path: cstring, clip_frame: i64, out: []u8) -> (bool, i64, u32) {
-	ad := &async_decoder
+// async_try_consume_latest copies slot_idx's worker's most recently completed
+// frame into `out` even when it does not match the requested clip_frame,
+// returning the decoded frame. Used while scrubbing/playing: the frontier
+// races ahead of the worker, so exact-consume would only ever succeed on
+// release; this shows the newest completed decode so the preview chases the
+// pointer in real time. Only honored when the result belongs to the same
+// source path. Returns false when no completed result is present yet (caller
+// keeps its last good frame).
+async_try_consume_latest :: proc(slot_idx: int, path: cstring, clip_frame: i64, out: []u8) -> (bool, i64, u32) {
+	ad := &async_decoders[slot_idx]
 	if ad.thread == nil {
 		return false, clip_frame, 0
 	}
@@ -313,17 +374,19 @@ async_try_consume_latest :: proc(path: cstring, clip_frame: i64, out: []u8) -> (
 	return true, frame, pick
 }
 
-// async_has_worker reports whether the async worker is initialized (render
-// thread should fall back to synchronous decode when it is not, e.g. probes).
-async_has_worker :: proc() -> bool {
-	return async_decoder.thread != nil
+// async_has_worker reports whether slot_idx's async worker is initialized
+// (render thread should fall back to synchronous decode for that slot when it
+// is not, e.g. probes that never call async_dec_init).
+async_has_worker :: proc(slot_idx: int) -> bool {
+	return async_decoders[slot_idx].thread != nil
 }
 
-// async_wait_idle blocks until every posted request has been decoded. Used ONLY
-// by the headless probes (and tests) that step the playhead then immediately
-// assert the slot buffer: it makes the async decode deterministic.
-async_wait_idle :: proc() {
-	ad := &async_decoder
+// async_wait_idle blocks until every request posted to slot_idx's worker has
+// been decoded. Used ONLY by the headless probes (and tests) that step the
+// playhead then immediately assert the slot buffer: it makes that slot's
+// async decode deterministic.
+async_wait_idle :: proc(slot_idx: int) {
+	ad := &async_decoders[slot_idx]
 	if ad.thread == nil {
 		return
 	}

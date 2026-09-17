@@ -782,6 +782,22 @@ play_project_area :: proc() {
 	}
 }
 
+// MAX_FRAME_DT_S caps how much wall-clock time a single playback_update tick
+// is allowed to treat as "real" elapsed playtime. Normally one tick is a
+// UI-frame's worth of time (a few ms to a few tens of ms); but if the thread
+// was blocked between ticks -- e.g. update_preview_slots synchronously
+// cold-decoding several preview slots at once after a ripple cut -- the
+// measured wall delta can balloon to well over a second. Feeding that
+// straight into playhead_accumulator produces a single giant "catchup" burst
+// that jumps the playhead dozens of frames in one shot, which is exactly what
+// shows up downstream as an audio/video delta spike and audio_update's
+// forward-skip firing. Clamping here doesn't fix a stall's root cause, but it
+// keeps a stall from also corrupting the playback clock: the playhead simply
+// falls a bit behind wall time and catches up over the next few ticks instead
+// of leaping. Left unclamped when PLAYBACK_MAGIC_MS is in use since that's an
+// explicit diagnostic override, not a measured delta.
+MAX_FRAME_DT_S :: 0.1
+
 playback_update :: proc(now_ns: sdl.Uint64) {
 	if last_tick_ns == 0 {
 		last_tick_ns = now_ns
@@ -790,7 +806,7 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
 		// delta so the cadence is perfectly jitter-free (or any fixed rate).
 		dt_s :=
-			PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
+			PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : min(f64(now_ns - last_tick_ns) / 1_000_000_000, MAX_FRAME_DT_S)
 		// The playhead advances +dir frames at effective_playback_rate against
 		// the wall clock (rate * jog boost). Audio pacing at non-1x is the
 		// producer's stream frequency ratio; audio is muted going backward.
@@ -889,9 +905,9 @@ main :: proc() {
 	}
 	if probe_path_ok, probe_paths := preview_probe_env(); probe_path_ok {
 		// These probes step the playhead through update_preview_slots, which
-		// routes the foreground clip through the async worker. Start it in
-		// probe mode (deterministic: every step waits for the decode) and tear
-		// it down before asserting.
+		// routes every slot through its own async worker. Start it in probe
+		// mode (deterministic: every step waits for each slot's decode) and
+		// tear it down before asserting.
 		async_live_mode = false
 		async_dec_init()
 		defer async_dec_shutdown()
