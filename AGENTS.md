@@ -115,6 +115,29 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   `defer` per acquisition so cleanup is automatic, rather than hand-writing
   the unwind at each early return.
 
+### Hot-path data structures: the shape must fit the access pattern, the score must implement the policy
+
+- **A FIFO on a real-time thread is a ring buffer, not a shifting slice.**
+  Fixed capacity, head/tail indices, wrap — never `mem.copy` the tail down
+  and `resize` per pushed element. An O(n) move per element is O(n²) per
+  second, and each `resize` is exactly the per-frame allocation the ownership
+  rules above forbid, on the one thread that must never stall. The per-source
+  audio fifo is the reference: a shifting array there re-copied the whole
+  queue every mixed frame per source.
+- **A cache's eviction score must compute the policy its name and comment
+  claim.** A monotonic `uses` counter is "most-frequently-ever", not LRU;
+  recency needs a stamp that advances (a `last_touch` from a clock), not a
+  counter that only ever increases. The decode cache called its counter LRU
+  while it never decayed. When the comment and the score disagree, the
+  comment is a lie the compiler cannot catch — fix the score, not the
+  comment.
+- **The tell for both is structural, not behavioral:** an allocation or an
+  O(n) move inside a per-frame or per-sample loop, or a metric that only ever
+  increases. Neither shows up in review because both read plausibly — the
+  container "works", the eviction "picks something". Name the access pattern
+  (push/pop at one end, recency) and pick the structure from that, not from
+  the shape that was easiest to write.
+
 ## 2. Write Odin, not generic code translated to Odin
 
 - Compiler happy first: `-vet` clean, no hacks aimed at another toolchain's
