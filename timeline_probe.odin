@@ -476,6 +476,40 @@ test_track_reorder :: proc() {
 	)
 }
 
+// test_ripple_right_edge_head_trim: a clip whose head starts INSIDE the
+// deleted region and extends past its right edge must advance its source by
+// the trimmed head length (region_end - clip_start), not by (clip_start -
+// region_start). Those coincide only when the clip head sits at the region
+// midpoint; everywhere else the wrong value desyncs A/V after a ripple cut.
+test_ripple_right_edge_head_trim :: proc() {
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 2, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	// Head [120,150) sits inside the region [100,150); tail [150,220) survives.
+	clip := mk_tl_clip(2001, 0, 0, 100, 120, .Video)
+	clip.source_start_frame = 1000
+	append(&timeline.tracks[0].clips, clip)
+
+	ripple_delete_region(100, 50)
+
+	tl_probe_check(
+		len(timeline.tracks[0].clips) == 1,
+		"head-trim: want 1 surviving clip, got %d",
+		len(timeline.tracks[0].clips),
+	)
+	if len(timeline.tracks[0].clips) == 1 {
+		k := timeline.tracks[0].clips[0]
+		tl_probe_check(
+			k.timeline_start_frame == 100 && k.source_start_frame == 1030 && k.source_length_frames == 70,
+			"head-trim: want tl=100 src=1030 len=70, got tl=%d src=%d len=%d",
+			k.timeline_start_frame,
+			k.source_start_frame,
+			k.source_length_frames,
+		)
+	}
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_cut_resolves_playhead()
@@ -501,6 +535,10 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_resize_alignment()
 	fmt.println("[tl-probe] resize ok")
+
+	tl_scene()
+	test_ripple_right_edge_head_trim()
+	fmt.println("[tl-probe] ripple-head-trim ok")
 
 	// Reorder-by-gap semantics of move_track_to_row: target_row is the visual
 	// stack position (0 = top, len = bottom); the same-row gap (src_row) and the

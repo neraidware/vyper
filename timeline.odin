@@ -796,8 +796,13 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			delete(old_markers)
 		case ce > end:
 			// Overlaps the right edge only: trim its head, shifted to start.
+			// The trimmed head is [cs, end), so the source advances by end - cs
+			// -- the same value the straddle-split's right piece uses. Using
+			// cs - start here advances by the wrong amount whenever the clip
+			// head is not exactly at the region midpoint, leaving the clip
+			// reading the wrong source frames under the playhead (A/V desync).
 			old_markers := c.markers
-			c.source_start_frame += cs - start
+			c.source_start_frame += end - cs
 			c.source_length_frames = ce - end
 			c.timeline_start_frame = start
 			c.markers = filter_markers_in_range(

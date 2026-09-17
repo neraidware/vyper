@@ -1794,13 +1794,13 @@ preview_probe_run :: proc(paths: [2]string) {
 		}
 	}
 
-	// The ripple case shifted the video clip (source_start stays at the
-	// split point) but the audio track was never split — split only touches
-	// the selected clip — so ripple trimmed its head and left it at src=0.
-	// That is an A/V desync bug by itself (audio at tl=0 plays src 0 while the
-	// video at tl=0 shows src=split_at). Report it, then rebuild the scene the
-	// way the DRAG path does it: split, delete the left half raw, drag the right
-	// half back with clip_slide_in_track (gap-preserving move).
+	// A linked split fans out to the audio member, so the ripple region then
+	// rips the same span from every track and both lanes must keep matching
+	// source offsets. This is the A/V-glue invariant after a ripple cut: a
+	// mismatch means one lane advanced its source by the wrong amount (the
+	// head-trim bug). Report it, then rebuild the scene the way the DRAG path
+	// does it: split, delete the left half raw, drag the right half back with
+	// clip_slide_in_track (gap-preserving move).
 	fmt.printf(
 		"[probe] AUDIO_DESYNC_CHECK: video_clip src_start=%d, audio_clip src_start=%d (should match for A/V glue)\n",
 		timeline.tracks[0].clips[0].source_start_frame,
