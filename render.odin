@@ -370,8 +370,8 @@ Render_Audio_Src :: struct {
 	source_start_frame:   i64,
 	source_length_frames: i64,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
-	fifo:                 [dynamic]f32, // converted stereo f32, content-relative
-	first48:              i64, // content 48 kHz frame of fifo[0]
+	fifo:                 Audio_Ring, // converted stereo f32, content-relative
+	first48:              i64, // content 48 kHz frame of fifo's head
 	have48:               i64, // content frames produced so far (next un-produced)
 }
 
@@ -761,10 +761,7 @@ render_audio_pull :: proc(a: ^Render_Audio_Src, up_to48: i64) {
 		if n <= 0 {
 			break
 		}
-		for j in 0 ..< n {
-			append(&a.fifo, f32(a.dec.s16[j * 2 + 0]) / 32768.0)
-			append(&a.fifo, f32(a.dec.s16[j * 2 + 1]) / 32768.0)
-		}
+		ring_push_pcm(&a.fifo, a.dec.s16[:n * 2], n)
 		a.have48 += i64(n)
 	}
 }
@@ -798,10 +795,7 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 		1e6
 	a.first48 = i64(real_sec * f64(RENDER_AUDIO_RATE))
 	a.have48 = a.first48 + i64(n)
-	for j in 0 ..< n {
-		append(&a.fifo, f32(a.dec.s16[j * 2 + 0]) / 32768.0)
-		append(&a.fifo, f32(a.dec.s16[j * 2 + 1]) / 32768.0)
-	}
+	ring_push_pcm(&a.fifo, a.dec.s16[:n * 2], n)
 	return true
 }
 
@@ -1126,24 +1120,18 @@ render_worker_run :: proc() {
 				}
 				base := int(start48 - a.first48)
 				for s in 0 ..< cur_spf {
-					mix[s * 2 + 0] += a.fifo[(base + s) * 2 + 0]
-					mix[s * 2 + 1] += a.fifo[(base + s) * 2 + 1]
+					l, r := ring_at(&a.fifo, base + s)
+					mix[s * 2 + 0] += l
+					mix[s * 2 + 1] += r
 				}
 				// Trim the consumed fifo head so decode stays forward-only and
 				// long renders don't accumulate the whole clip in memory
-				// (mirrors playback's per-frame trim).
-				drop := int(start48 - a.first48) + cur_spf
+				// (mirrors playback's per-frame trim). O(1) head move, not a
+				// per-frame mem.copy of the whole queue.
+				drop := base + cur_spf
 				if drop > 0 {
 					a.first48 += i64(drop)
-					remain := len(a.fifo) - drop * 2
-					if remain > 0 {
-						mem.copy(
-							raw_data(a.fifo[0:]),
-							raw_data(a.fifo[drop * 2:]),
-							remain * size_of(f32),
-						)
-					}
-					resize(&a.fifo, remain)
+					ring_drop(&a.fifo, drop)
 				}
 			}
 			if !rend_enc_push_audio(&e, mix[:cur_spf * 2]) {
@@ -1539,6 +1527,7 @@ render_free_workbook :: proc() {
 		if a.path != nil {
 			mem.delete_cstring(a.path)
 		}
+		ring_destroy(&a.fifo)
 	}
 	for &t in render_job_texts {
 		if t.name != "" {
