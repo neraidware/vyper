@@ -1117,6 +1117,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		preview.playing = true
 		playhead_accumulator = 0
 		last_tick_ns = sdl.GetTicksNS()
+		if sec := os.get_env_alloc("VYPER_PLAY_SEC", context.temp_allocator); sec != "" {
+			if v, ok := strconv.parse_f64(sec); ok && v > 0 {
+				playback_stop_frame = i64(v * timeline_fps())
+				if vyper_trace {
+					fmt.printf("[autoplay] VYPER_PLAY_SEC=%.0f -> stop=%d\n", v, playback_stop_frame)
+				}
+			}
+		}
 		audio_note_edit()
 	}
 
