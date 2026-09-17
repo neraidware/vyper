@@ -357,6 +357,111 @@ AUDIO_CUSHION_SEC :: 0.25
 // MAX_PLAY_AUDIO bounds simultaneous playback decoders (one per audio clip).
 MAX_PLAY_AUDIO :: 32
 
+// Audio_Ring is a growable circular buffer of interleaved stereo f32
+// sample-frames. It replaces a plain [dynamic]f32 drained by shifting the
+// remaining content down to index 0 on every consume: that pattern is O(n)
+// in however much is currently buffered, on EVERY mixed frame, on the
+// real-time audio producer thread, for every active source -- exactly the
+// place a wasted memmove is least affordable. Here, dropping consumed
+// samples (ring_drop) is O(1): it only moves `head`/`count`, never the
+// buffered samples. Growth (ring_reserve) is doubling and therefore rare and
+// amortized; it's the only O(n) operation left, and it only runs when a
+// source's buffered depth reaches a new high-water mark, not every frame.
+Audio_Ring :: struct {
+	buf:   [dynamic]f32, // backing storage; len(buf)/2 == capacity in sample-frames
+	head:  int,          // sample-frame index of the oldest buffered sample
+	count: int,          // number of valid sample-frames currently buffered
+}
+
+// ring_cap returns the ring's current capacity in sample-frames (0 if the
+// backing buffer has never been allocated).
+ring_cap :: proc(r: ^Audio_Ring) -> int {
+	return len(r.buf) / 2
+}
+
+// ring_len returns how many sample-frames are currently buffered.
+ring_len :: proc(r: ^Audio_Ring) -> int {
+	return r.count
+}
+
+// ring_reserve grows the backing buffer, if needed, to hold `extra` more
+// sample-frames than are currently buffered. Doubling growth amortizes the
+// cost across many pushes. Existing content is copied out UNWRAPPED into the
+// fresh buffer starting at index 0 (head resets to 0); this only happens on
+// a new high-water mark, never on a routine push once warmed up.
+ring_reserve :: proc(r: ^Audio_Ring, extra: int) {
+	need := r.count + extra
+	cap_now := ring_cap(r)
+	if need <= cap_now {
+		return
+	}
+	new_cap := max(cap_now * 2, need, 256)
+	new_buf := make([dynamic]f32, new_cap * 2)
+	for i in 0 ..< r.count {
+		src := (r.head + i) % cap_now
+		new_buf[i * 2 + 0] = r.buf[src * 2 + 0]
+		new_buf[i * 2 + 1] = r.buf[src * 2 + 1]
+	}
+	if r.buf != nil {
+		delete(r.buf)
+	}
+	r.buf = new_buf
+	r.head = 0
+}
+
+// ring_push_pcm converts and appends `n` stereo sample-frames from
+// interleaved i16 PCM (`pcm[i*2+0]`/`pcm[i*2+1]`, i in 0..<n) to the tail of
+// the ring, growing the backing buffer first if needed. O(n) to write the
+// NEW samples in -- unavoidable, every fill path pays this -- but existing
+// buffered content is never touched, unlike appending one sample at a time
+// via a plain dynamic array (repeated length-check/grow overhead per
+// sample instead of one reservation for the whole chunk).
+ring_push_pcm :: proc(r: ^Audio_Ring, pcm: []i16, n: int) {
+	if n <= 0 {
+		return
+	}
+	ring_reserve(r, n)
+	cap_now := ring_cap(r)
+	tail := (r.head + r.count) % cap_now
+	for i in 0 ..< n {
+		dst := (tail + i) % cap_now
+		r.buf[dst * 2 + 0] = f32(pcm[i * 2 + 0]) / 32768.0
+		r.buf[dst * 2 + 1] = f32(pcm[i * 2 + 1]) / 32768.0
+	}
+	r.count += n
+}
+
+// ring_at returns the stereo sample-frame at logical offset `idx` from the
+// current head (idx 0 = oldest buffered sample). Caller must ensure
+// 0 <= idx < ring_len(r).
+ring_at :: proc(r: ^Audio_Ring, idx: int) -> (l, rr: f32) {
+	cap_now := ring_cap(r)
+	pos := (r.head + idx) % cap_now
+	return r.buf[pos * 2 + 0], r.buf[pos * 2 + 1]
+}
+
+// ring_drop discards the oldest `n` sample-frames (clamped to what's
+// buffered). O(1): only head/count bookkeeping moves.
+ring_drop :: proc(r: ^Audio_Ring, n: int) {
+	if n <= 0 {
+		return
+	}
+	n := min(n, r.count)
+	cap_now := ring_cap(r)
+	if cap_now > 0 {
+		r.head = (r.head + n) % cap_now
+	}
+	r.count -= n
+}
+
+// ring_destroy frees the backing buffer and zeroes the ring.
+ring_destroy :: proc(r: ^Audio_Ring) {
+	if r.buf != nil {
+		delete(r.buf)
+	}
+	r^ = {}
+}
+
 // Play_Src is one audio clip's 48 kHz stereo S16 decoder + content-relative
 // fifo. The clip is snapshotted at provision (start_s/start_a/len_a/path) so
 // playback is independent of later timeline edits.
@@ -367,8 +472,8 @@ Play_Src :: struct {
 	path:         cstring, // cloned at provision, freed on reset
 	stream_index: c.int,
 	dec:          Audio_Clip_Decoder,
-	fifo:         [dynamic]f32, // content-relative stereo f32 at 48 kHz
-	first48:      i64,          // content 48 kHz sample of fifo[0]
+	fifo:         Audio_Ring, // content-relative stereo f32 at 48 kHz
+	first48:      i64,          // content 48 kHz sample of fifo's head
 	have48:       i64,          // content 48 kHz samples produced so far
 }
 
@@ -499,10 +604,7 @@ audio_src_reset :: proc(s: ^Play_Src) {
 	if s.dec.opened {
 		audio_decoder_reset(&s.dec)
 	}
-	if s.fifo != nil {
-		delete(s.fifo)
-		s.fifo = nil
-	}
+	ring_destroy(&s.fifo)
 	if s.path != nil {
 		mem.delete_cstring(s.path)
 		s.path = nil
@@ -642,11 +744,14 @@ audio_src_dump_dec :: proc(s: ^Play_Src, n: int) {
 		audio_dec_dump = nil
 	}
 }
+// audio_src_append converts+enqueues the n newly-decoded stereo sample-frames
+// in s.dec.s16 to the tail of s.fifo in one bulk operation (see
+// ring_push_pcm), instead of two per-sample append() calls in a loop -- each
+// append() pays a length-check/possible-growth branch; reserving once for the
+// whole chunk avoids that per-sample overhead on the real-time producer
+// thread.
 audio_src_append :: proc(s: ^Play_Src, n: int) {
-	for j in 0 ..< n {
-		append(&s.fifo, f32(s.dec.s16[j * 2 + 0]) / 32768.0)
-		append(&s.fifo, f32(s.dec.s16[j * 2 + 1]) / 32768.0)
-	}
+	ring_push_pcm(&s.fifo, s.dec.s16[:n * 2], n)
 }
 
 // audio_src_pull decodes forward until the fifo covers up_to48 content samples.
@@ -703,26 +808,24 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		}
 		base := int(start48 - s.first48)
 		for f in 0 ..< spf {
-			mix[f * 2 + 0] += s.fifo[(base + f) * 2 + 0]
-			mix[f * 2 + 1] += s.fifo[(base + f) * 2 + 1]
+			l, r := ring_at(&s.fifo, base + f)
+			mix[f * 2 + 0] += l
+			mix[f * 2 + 1] += r
 		}
 		delivered = true
 		if audio_trace {
 			fmt.printf(
 				"[tr mix] fr=%d k=%d start48=%d have48=%d fifo=%d del=%v\n",
-				frame, k, start48, s.have48, len(s.fifo), delivered,
+				frame, k, start48, s.have48, ring_len(&s.fifo), delivered,
 			)
 		}
-		// Drop everything up to and including this frame from the fifo. The fifo
-		// is interleaved stereo, so the byte/float offset for `consumed` sample
-		// frames is consumed*2 (the forward-skip trim below uses the same rule).
+		// Drop everything up to and including this frame from the fifo. O(1):
+		// see ring_drop -- this used to be a mem.copy shifting the remaining
+		// buffered content down to index 0 plus a resize, on every mixed frame,
+		// per source, on the real-time producer thread.
 		consumed := base + spf
 		if consumed > 0 {
-			remain := len(s.fifo) - consumed * 2
-			if remain > 0 {
-				mem.copy(raw_data(s.fifo[0:]), raw_data(s.fifo[consumed * 2:]), remain * size_of(f32))
-			}
-			resize(&s.fifo, remain)
+			ring_drop(&s.fifo, consumed)
 			s.first48 += i64(consumed)
 		}
 	}
@@ -890,17 +993,13 @@ audio_producer_feed :: proc() {
 		}
 		for k in 0 ..< play_src_count {
 			s := &play_srcs[k]
-			if !s.dec.opened || s.fifo == nil || delta48 <= 0 {
+			if !s.dec.opened || s.fifo.buf == nil || delta48 <= 0 {
 				continue
 			}
-			drop := int(min(delta48, i64(len(s.fifo)) / 2))
+			drop := int(min(delta48, i64(ring_len(&s.fifo))))
 			if drop > 0 {
 				s.first48 += i64(drop)
-				remain := len(s.fifo) - drop * 2
-				if remain > 0 {
-					mem.copy(raw_data(s.fifo[0:]), raw_data(s.fifo[drop * 2:]), remain * size_of(f32))
-				}
-				resize(&s.fifo, remain)
+				ring_drop(&s.fifo, drop)
 			}
 		}
 		audio_play_frame = jmp
@@ -1095,7 +1194,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 							k, s.path, s.dec.opened,
 							s.dec.input_rate, s.dec.input_channels, s.dec.out_rate, s.dec.out_channels,
 							s.start_a, s.start_s, s.len_a,
-							s.first48, s.have48, len(s.fifo) / 2,
+							s.first48, s.have48, ring_len(&s.fifo),
 							s.dec.decoded_frames, s.dec.decoded_chunks,
 							at, in_fifo, covered)
 					}
