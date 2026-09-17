@@ -51,6 +51,22 @@ tl_scene :: proc() {
 	clear(&drag_group_orig)
 }
 
+// tl_single_clip_scene replaces the timeline with one unlinked clip on one
+// track, for the ripple playhead-follow checks (which only care about the
+// playhead frame and one clip's placement).
+tl_single_clip_scene :: proc(clip_start, clip_len: i64) {
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	append(
+		&timeline.tracks[0].clips,
+		mk_tl_clip(3001, 0, 0, clip_len, clip_start, .Video),
+	)
+	selected_track = -1
+	selected_index = -1
+}
+
 // tl_group_starts returns the current timeline starts of the two L1 members
 // (video clip 1001, then audio clip 1002) for the standard scene. Resolves by
 // clip id — vertical drops relocate members to other tracks.
@@ -510,6 +526,51 @@ test_ripple_right_edge_head_trim :: proc() {
 	}
 }
 
+// test_ripple_playhead_follow: the playhead follows a ripple delete the same
+// way the content does -- it shifts left with the closed gap when it was at or
+// after the region, clamps to the cut when it was inside the region, and stays
+// put when it was before it. A linked-group ripple follows the SELECTED
+// member's span (the clip the user deleted), not another member's lane.
+test_ripple_playhead_follow :: proc() {
+	// After the region: shift left by the removed span.
+	tl_single_clip_scene(200, 50)
+	playhead.frame = 300
+	ripple_delete_region(100, 50)
+	tl_probe_check(playhead.frame == 250, "after-region: want 250, got %d", playhead.frame)
+
+	// Inside the region: clamp to the cut.
+	tl_single_clip_scene(200, 50)
+	playhead.frame = 120
+	ripple_delete_region(100, 50)
+	tl_probe_check(playhead.frame == 100, "inside-region: want 100, got %d", playhead.frame)
+
+	// Before the region: untouched.
+	tl_single_clip_scene(200, 50)
+	playhead.frame = 50
+	ripple_delete_region(100, 50)
+	tl_probe_check(playhead.frame == 50, "before-region: want 50, got %d", playhead.frame)
+
+	// Exactly at the cut: unchanged (the cut is where it already is).
+	tl_single_clip_scene(200, 50)
+	playhead.frame = 100
+	ripple_delete_region(100, 50)
+	tl_probe_check(playhead.frame == 100, "at-cut: want 100, got %d", playhead.frame)
+
+	// Linked group: playhead follows the selected member's span.
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 2, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(3101, 777, 0, 50, 200, .Video))
+	append(&timeline.tracks[1].clips, mk_tl_clip(3102, 777, 0, 50, 200, .Audio))
+	selected_track = 0
+	selected_index = 0
+	playhead.frame = 250
+	ripple_delete_linked_group(777)
+	tl_probe_check(playhead.frame == 200, "linked-group: want 200, got %d", playhead.frame)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_cut_resolves_playhead()
@@ -539,6 +600,10 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_ripple_right_edge_head_trim()
 	fmt.println("[tl-probe] ripple-head-trim ok")
+
+	tl_scene()
+	test_ripple_playhead_follow()
+	fmt.println("[tl-probe] ripple-playhead-follow ok")
 
 	// Reorder-by-gap semantics of move_track_to_row: target_row is the visual
 	// stack position (0 = top, len = bottom); the same-row gap (src_row) and the

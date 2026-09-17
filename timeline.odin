@@ -821,6 +821,20 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 	track.clips = new_clips
 }
 
+// ripple_playhead_after_region moves the playhead to follow a ripple that
+// removed [start, end) and slid everything after it left by `length`. A
+// playhead at/after the region end tracks the same content and moves left by
+// the removed span; one inside the region clamps to the cut; one before the
+// region is untouched. Callers must move the playhead BEFORE audio_note_edit so
+// the audio producer re-seeks to the new frame.
+ripple_playhead_after_region :: proc(start, end, length: i64) {
+	if playhead.frame >= end {
+		playhead.frame -= length
+	} else if playhead.frame > start {
+		playhead.frame = start
+	}
+}
+
 // ripple_delete_region removes the timeline region [start, start+length) from
 // EVERY track at once (the "delete the clip area for all tracks" edit) and then
 // closes the gap: clips fully after the region shift left by `length`, clips
@@ -833,6 +847,7 @@ ripple_delete_region :: proc(start, length: i64) {
 	for ti in 0 ..< len(timeline.tracks) {
 		ripple_delete_track_region(ti, start, length)
 	}
+	ripple_playhead_after_region(start, start + length, length)
 	// The edit may have removed/replaced the dragged clip and the decoded state
 	// cached for it: cancel any in-flight drag and drop the preview slots so the
 	// next update re-derives them purely from the edited timeline.
@@ -876,6 +891,24 @@ ripple_delete_linked_group :: proc(link: u64) {
 	if len(spans) == 0 {
 		return
 	}
+	// Capture the anchor span (the clip the user deleted) before the ripple
+	// invalidates indices and before the selection is cleared below. The
+	// playhead follows that span's shift, the same way the single-region ripple
+	// moves it -- the other members ripple their own lanes, not the playhead's
+	// frame of reference.
+	anchor_start, anchor_len: i64
+	have_anchor := false
+	if selected_track >= 0 &&
+	   selected_track < len(timeline.tracks) &&
+	   selected_index >= 0 &&
+	   selected_index < len(timeline.tracks[selected_track].clips) {
+		anchor := timeline.tracks[selected_track].clips[selected_index]
+		if anchor.link_id == link {
+			anchor_start = anchor.timeline_start_frame
+			anchor_len = anchor.source_length_frames
+			have_anchor = true
+		}
+	}
 	// Sort by (track asc, start DESC).
 	for a in 0 ..< len(spans) {
 		for b := a + 1; b < len(spans); b += 1 {
@@ -889,6 +922,13 @@ ripple_delete_linked_group :: proc(link: u64) {
 	}
 	for s in spans {
 		ripple_delete_track_region(s.track, s.start, s.length)
+	}
+	if have_anchor {
+		ripple_playhead_after_region(
+			anchor_start,
+			anchor_start + anchor_len,
+			anchor_len,
+		)
 	}
 	active_interaction = .None
 	drag_clip = nil
