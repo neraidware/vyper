@@ -856,6 +856,14 @@ main :: proc() {
 		win_ffmpeg_versions_diag()
 	}
 	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
+	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
+	// the audio producer reads playback_rate for its atempo graph and cushion.
+	if v := os.get_env_alloc("VYPER_RATE", context.temp_allocator); v != "" {
+		playback_rate, _ = strconv.parse_f64(v)
+		if vyper_trace {
+			fmt.printf("[main] VYPER_RATE -> playback_rate=%.2f\n", playback_rate)
+		}
+	}
 	// libav's INFO chatter (libx264 "using cpu capabilities", decoder open
 	// lines) used to go to a silenced ffmpeg subprocess (-loglevel error); it
 	// is in-process now, so quiet the library globally to match.
