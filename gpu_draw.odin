@@ -1626,6 +1626,30 @@ drain_pending_text_releases :: proc(device: ^sdl.GPUDevice) {
 // fit (aspect-preserving, letterboxed) into it and the quad samples only the
 // fit region so the image is never stretched to the (possibly differently
 // shaped) project canvas.
+// draw_image_layer draws one textured quad (the unit quad transformed by
+// `uniforms`) with the shared preview pipeline. `uniforms.viewport` is the
+// target's pixel size, passed explicitly rather than read from renderer.viewport
+// so the export compositor can render into an offscreen target of a different
+// size than the window without racing the main thread. This is the seam the
+// preview and export compositors share: identical transform/UV/blend plumbing.
+draw_image_layer :: proc(
+	renderer: ^GPU_Renderer,
+	pass: ^sdl.GPURenderPass,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	texture: ^sdl.GPUTexture,
+	sampler: ^sdl.GPUSampler,
+	uniforms: TextVertexUniforms,
+) {
+	sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
+	binding := sdl.GPUTextureSamplerBinding{texture = texture, sampler = sampler}
+	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
+	// PushGPUVertexUniformData takes a rawptr; a parameter has no address, so
+	// copy to a local first.
+	u := uniforms
+	sdl.PushGPUVertexUniformData(command_buffer, 0, &u, sdl.Uint32(size_of(u)))
+	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+}
+
 draw_preview :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -1746,19 +1770,14 @@ draw_preview :: proc(
 			_padding = {},
 			uv       = {u0, v0, u1, v1},
 		}
-		sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
-		binding := sdl.GPUTextureSamplerBinding {
-			texture = slot.texture,
-			sampler = renderer.preview_sampler,
-		}
-		sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-		sdl.PushGPUVertexUniformData(
+		draw_image_layer(
+			renderer,
+			pass,
 			command_buffer,
-			0,
-			&vertex_uniforms,
-			sdl.Uint32(size_of(vertex_uniforms)),
+			slot.texture,
+			renderer.preview_sampler,
+			vertex_uniforms,
 		)
-		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 	}
 	// Draw a border box around the currently-selected clip's image rect.
 	// Border/handles are editor affordances: restore the widget-level scissor so

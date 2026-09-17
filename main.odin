@@ -1066,6 +1066,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		fmt.println("Could not create rounded rectangle GPU pipeline")
 		return
 	}
+	// Publish the renderer for off-main-thread subsystems (the export worker's
+	// GPU compositor). `renderer` is a local of main that lives until shutdown,
+	// so this pointer is valid for every worker's lifetime.
+	gpu_renderer = &renderer
 	defer sdl.ReleaseGPUGraphicsPipeline(device, renderer.pipeline)
 	defer sdl.ReleaseGPUGraphicsPipeline(device, renderer.text_pipeline)
 	defer sdl.ReleaseGPUGraphicsPipeline(device, renderer.preview_pipeline)

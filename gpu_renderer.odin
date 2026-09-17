@@ -227,8 +227,18 @@ glyph_ensure :: proc(a: ^Glyph_Atlas, r: rune) -> (slot: u32, ok: bool, is_new: 
 	return s, true, true
 }
 
+// gpu_renderer points at the single device renderer created at startup so
+// subsystems spawned off the main thread -- the export worker's GPU compositor
+// -- can reach the shared device/pipelines/samplers. Set once in main before
+// any worker starts, and never repointed (the renderer outlives every worker).
+gpu_renderer: ^GPU_Renderer
+
 GPU_Renderer :: struct {
 	device: ^sdl.GPUDevice,
+	// format is the swapchain texture format. Offscreen render targets must use
+	// the same format because a pipeline's color target description is fixed at
+	// creation, and the shared pipelines were built for this one.
+	format: sdl.GPUTextureFormat,
 	pipeline: ^sdl.GPUGraphicsPipeline,
 	text_pipeline: ^sdl.GPUGraphicsPipeline,
 	preview_pipeline: ^sdl.GPUGraphicsPipeline,
@@ -257,6 +267,7 @@ preview_fragment_spirv := #load("shaders/preview.frag.spv")
 
 create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat, width, height: c.int) -> (result: GPU_Renderer, ok: bool) {
 	result.device = device
+	result.format = format
 	result.viewport = {f32(width), f32(height)}
 	if !glyph_atlas_init(&result.font) {
 		fmt.println("Could not allocate glyph atlas tables")
