@@ -1448,6 +1448,36 @@ release_slot_owned_texture :: proc(device: ^sdl.GPUDevice, slot: ^Preview_Slot) 
 	}
 }
 
+// gpu_upload_tb returns a transfer buffer of at least `size` bytes, reusing
+// *tb when it already fits and growing it otherwise. The caller maps it with
+// cycle=true so a still-in-flight upload of the previous frame is preserved
+// (SDL cycles the internal resource); creating/releasing one per upload was a
+// driver allocation on every dirty preview slot, every frame.
+gpu_upload_tb :: proc(
+	device: ^sdl.GPUDevice,
+	tb: ^^sdl.GPUTransferBuffer,
+	capacity: ^int,
+	size: int,
+) -> ^sdl.GPUTransferBuffer {
+	if tb^ != nil && capacity^ >= size {
+		return tb^
+	}
+	if tb^ != nil {
+		sdl.ReleaseGPUTransferBuffer(device, tb^)
+		tb^ = nil
+	}
+	tb^ = sdl.CreateGPUTransferBuffer(
+		device,
+		sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = u32(size)},
+	)
+	if tb^ == nil {
+		capacity^ = 0
+		return nil
+	}
+	capacity^ = size
+	return tb^
+}
+
 // upload_preview_slot copies tightly-packed RGBA pixels into a slot's GPU
 // texture using a transfer buffer + copy pass on the given command buffer. A
 // text slot uploads its tight text_buf into its owned tight texture; a video
@@ -1465,15 +1495,16 @@ upload_preview_slot :: proc(
 		upload_text_slot(renderer, command_buffer, slot)
 		return
 	}
-	transfer := sdl.CreateGPUTransferBuffer(
+	transfer := gpu_upload_tb(
 		renderer.device,
-		sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = PREVIEW_W * PREVIEW_H * 4},
+		&renderer.preview_upload_tb,
+		&renderer.preview_upload_capacity,
+		PREVIEW_W * PREVIEW_H * 4,
 	)
 	if transfer == nil {
 		return
 	}
-	defer sdl.ReleaseGPUTransferBuffer(renderer.device, transfer)
-	mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, false)
+	mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, true)
 	if mapped == nil {
 		return
 	}
@@ -1510,15 +1541,16 @@ upload_text_slot :: proc(
 		return
 	}
 	n := int(w) * int(h) * 4
-	transfer := sdl.CreateGPUTransferBuffer(
+	transfer := gpu_upload_tb(
 		renderer.device,
-		sdl.GPUTransferBufferCreateInfo{usage = .UPLOAD, size = u32(n)},
+		&renderer.text_upload_tb,
+		&renderer.text_upload_capacity,
+		n,
 	)
 	if transfer == nil {
 		return
 	}
-	defer sdl.ReleaseGPUTransferBuffer(renderer.device, transfer)
-	mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, false)
+	mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, true)
 	if mapped == nil {
 		return
 	}

@@ -237,6 +237,15 @@ GPU_Renderer :: struct {
 	preview_sampler: ^sdl.GPUSampler,
 	icon_textures: [Icon_Id]^sdl.GPUTexture,
 	viewport: [2]f32,
+	// Persistent upload staging, reused across frames. Creating and releasing a
+	// transfer buffer per dirty slot per frame was a driver allocation churn on
+	// the preview hot path; SDL's pair to that is one grow-only buffer with the
+	// map cycled (see sdl-gpu-concepts-cycling). Capacity tracks the current
+	// allocation so a same-size re-upload never touches the driver.
+	preview_upload_tb:       ^sdl.GPUTransferBuffer,
+	preview_upload_capacity: int,
+	text_upload_tb:          ^sdl.GPUTransferBuffer,
+	text_upload_capacity:    int,
 }
 
 rounded_rect_vertex_spirv := #load("shaders/rounded_rect.vert.spv")

@@ -1073,6 +1073,12 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	defer sdl.ReleaseGPUSampler(device, renderer.font.sampler)
 	defer glyph_atlas_destroy(&renderer.font)
 	defer release_preview_textures(device, renderer.preview_textures[:])
+	defer if renderer.preview_upload_tb != nil {
+		sdl.ReleaseGPUTransferBuffer(device, renderer.preview_upload_tb)
+	}
+	defer if renderer.text_upload_tb != nil {
+		sdl.ReleaseGPUTransferBuffer(device, renderer.text_upload_tb)
+	}
 	defer release_slot_owned_textures(device)
 	defer sdl.ReleaseGPUSampler(device, renderer.preview_sampler)
 	defer for id in Icon_Id {
