@@ -148,6 +148,33 @@ ff_err_str :: proc(code: c.int) -> string {
 // paths produce identical pixels.
 hw_decode_enabled: bool = true
 
+// asset_source_hw returns whether THIS asset's SOURCE file opens with a
+// hardware decoder on this machine, probing once and latching the answer for
+// the session. Its consumer is the S5 original-rate pick: during forward
+// playback, serve the source instead of the proxy only when the source itself
+// is hw-backed. The gate must NOT read the hw state of whatever file is
+// currently open in a slot's decoder -- picking the source opens it, which
+// changes its hw_pix_fmt, which flips the gate, which reopens the proxy, and
+// so on, reopening both decoders every frame wherever source and proxy differ
+// in hw support (e.g. a source VAAPI declines + a proxy it accepts). A stable
+// per-asset latch breaks the feedback loop.
+asset_source_hw :: proc(a: ^Media_Asset) -> bool {
+	if a.src_hw_known {
+		return a.src_hw
+	}
+	a.src_hw_known = true
+	if a.path == nil {
+		return false
+	}
+	probe: Clip_Decoder
+	defer clip_decoder_reset(&probe)
+	if !open_clip_decoder(&probe, a.path) {
+		return false
+	}
+	a.src_hw = probe.hw_pix_fmt != .None
+	return a.src_hw
+}
+
 clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 	if vyper_trace {
 		fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)

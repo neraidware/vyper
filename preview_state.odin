@@ -106,16 +106,15 @@ prewarm_next_clip :: proc() {
 			//
 			// prefer_source follows the same S5 gate as the front slot: once
 			// the warm decoder is hw-backed, cache the ORIGINAL so the primed
-			// slot never degrades to the proxy mid-transition. Stale until the
-			// first warm open of the next clip (hw_pix_fmt reflects the PREVIOUS
-			// file); self-corrects on the first decode. Pause/scrub never reach
-			// here (the prewarm guard demands forward playback).
+			// slot never degrades to the proxy mid-transition. N/A for clips
+			// outside the media bin (path has no asset entry -> false).
+			warm_asset := find_asset(next.asset_id)
 			warm_pick, warm_base := proxy_pick_for_frame(
 				next.path,
 				next.source_length_frames,
 				next.source_start_frame,
 				warm_proxy_buf[:],
-				warm_decoder.hw_pix_fmt != .None,
+				warm_asset != nil && asset_source_hw(warm_asset),
 			)
 			decoder_set_preview(&warm_decoder, warm_pick, warm_base)
 			if !decode_clip_frame_sync(
@@ -134,7 +133,7 @@ prewarm_next_clip :: proc() {
 					next.source_length_frames,
 					wf,
 					warm_proxy_buf[:],
-					warm_decoder.hw_pix_fmt != .None,
+					warm_asset != nil && asset_source_hw(warm_asset),
 				)
 				decoder_set_preview(&warm_decoder, warm_pick, warm_base)
 				if !decode_clip_frame_sync(&warm_decoder, next.path, wf, warm_buf[:]) {
@@ -540,18 +539,21 @@ update_preview_slots :: proc() -> bool {
 			// decoder serves the ORIGINAL source (full quality at source fps,
 			// deadline: a CPU core of air left on 1080p60); every other mode
 			// -- scrub, pause, reverse, sw decode -- keeps the gop=1 proxy so
-			// arbitrary seeks stay instant. The front slot asks the worker
-			// (its decoder), other slots ask their own. Both flags are stale
-			// for the very first request of a freshly-assigned clip (decoder
-			// not open yet -> proxy for one frame) and self-correct on the
-			// next decode; a pick flip mid-clip is a single one-time reopen.
+			// arbitrary seeks stay instant. Whether the physical decoder would
+			// be hw-backed is a property of the SOURCE FILE on this machine,
+			// latched per asset (asset_source_hw) -- never of whichever file
+			// the slot decoder happens to hold right now. A gate reading the
+			// currently-open file's hw state is self-referential: picking the
+			// source opens it, its hw_pix_fmt flips the gate, which reopens the
+			// proxy, whose hw_pix_fmt flips it back -- two full decoder
+			// reopens per frame on machines where source and proxy differ in
+			// hw support (source sw + proxy vaapi = the user's stutter). The
+			// latch stays put until the asset changes. Clips outside the media
+			// bin (no asset entry) fall back to the proxy.
 			prefer_source := false
 			if playhead.playing && playback_dir == 1 {
-				if slot_idx == front_video_slot && async_has_worker() {
-					prefer_source = async_dec_hw()
-				} else {
-					prefer_source = slot.dec.hw_pix_fmt != .None
-				}
+				asset := find_asset(clip.asset_id)
+				prefer_source = asset != nil && asset_source_hw(asset)
 			}
 			pick_buf: [4096]u8
 			slot_pick, slot_base := proxy_pick_for_frame(

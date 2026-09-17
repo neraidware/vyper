@@ -176,6 +176,16 @@ Media_Asset :: struct {
 	// audio_frames is the clip length for the audio stream(s), derived from the
 	// duration at import (never shorter than the video frame count).
 	audio_frames:    i64,
+	// src_hw latches whether THIS source file opens with a hardware decoder on
+	// this machine (hw_pix_fmt != .None). Stable per asset: the S5 original-rate
+	// pick must gate on the SOURCE's capability, never on whichever file a slot
+	// decoder happens to have open right now -- a self-referential gate there
+	// (pick <- hw-pix-fmt-of-current-open <- pick) flips every frame on machines
+	// where source (sw) and proxy (hw) differ in hw support, reopening both
+	// decoders in a loop (render-thread stalls -> playhead bursts -> audio
+	// forward-skips). Probed lazily once by asset_source_hw.
+	src_hw:          bool,
+	src_hw_known:    bool,
 	// srt_id is the session srt-cache id for a .Subtitles asset (the srt text
 	// lives in the immortal append-only cache). -1 for non-subtitle assets; a
 	// drop of the asset derives its timeline clip length from frame_count.

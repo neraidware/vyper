@@ -3,7 +3,6 @@ package main
 import "core:c"
 import "base:runtime"
 import "core:fmt"
-import "core:sync"
 import sdl "vendor:sdl3"
 
 // Async_Decoder runs decode from the FRONTMOST video clip on a dedicated worker
@@ -73,20 +72,6 @@ Async_Decoder :: struct {
 }
 
 async_decoder: Async_Decoder
-
-// async_dec_hw_flag is set by the worker to 1 when its Clip_Decoder opened
-// with a hardware device (hw_pix_fmt != .None), 0 otherwise. Published after
-// every decode so the render thread can gate the S5 original-rate pick (serve
-// the ORIGINAL during forward playback only when the physical decoder that
-// will produce the frame is hw-backed). A stale value survives a clip change
-// for one request: the worker reopens the new file, decodes one frame, and
-// republishes -- an earlier-slot flag can only briefly pick source when it
-// should have picked proxy, never the reverse (proxy is the safe default).
-async_dec_hw_flag: i64
-
-async_dec_hw :: proc() -> bool {
-	return sync.atomic_load(&async_dec_hw_flag) != 0
-}
 
 // async_live_mode selects how the preview consumes the async worker's result.
 // Live (GUI) mode is non-blocking: keep the last good frame until the worker
@@ -169,7 +154,6 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 			ad.done_seq = ad.req_seq
 			sdl.UnlockMutex(ad.mutex)
 			clip_decoder_reset(&ad.dec)
-			sync.atomic_store(&async_dec_hw_flag, 0)
 			ad.dec_path = ""
 			ad.dec_preview_buf = {}
 			continue
@@ -204,7 +188,6 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 			ad.res_frame = req_frame
 			ad.res_pick_hash = req_pick_hash
 		}
-		sync.atomic_store(&async_dec_hw_flag, i64(ad.dec.hw_pix_fmt != .None))
 		ad.done_seq += 1
 		sdl.UnlockMutex(ad.mutex)
 	}
