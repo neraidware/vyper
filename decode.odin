@@ -114,20 +114,33 @@ Clip_Decoder :: struct {
 	decoded_ahead: i64,
 	// Bounded RAM cache of decoded frames (RGBA, tightly packed). Keeps the
 	// decoded frame data resident in memory and avoids re-decoding recent
-	// frames when the playhead moves back a little. Evicts oldest on write.
+	// frames when the playhead moves back a little. Evicts the LEAST
+	// RECENTLY TOUCHED entry on write once at capacity (see cache_clock).
 	// NOTE: the cache key is a frame index, UNRELATED to last_frame. A cache
 	// hit returns pixels WITHOUT moving the physical decoder — which is why
 	// cache hits must use the last_frame guard, never a blind assignment.
 	cache:         [dynamic]Frame_Cache_Entry,
+	// cache_clock is a per-decoder monotonic counter, incremented on every
+	// cache_find hit and cache_store touch, and stamped onto the touched
+	// entry's last_touch. This is what makes eviction genuinely
+	// least-recently-used: comparing last_touch values orders entries by
+	// recency. A plain "times used" counter that only ever increments (the
+	// previous design) is NOT LRU -- an entry visited many times early in a
+	// session accumulates a use-count that can never be beaten by later
+	// entries (which all start at 1), so it squats in the cache forever even
+	// after becoming irrelevant, silently degrading the cache over a long
+	// session despite comments elsewhere claiming LRU/oldest-evicted
+	// behavior.
+	cache_clock:   u64,
 }
 
-// Frame_Cache_Entry is one cached decoded RGBA frame plus a use counter for
-// simple MRU eviction. Pixel data lives in a separate heap buffer so the
-// header stays small (no 1.3MB by-value copies).
+// Frame_Cache_Entry is one cached decoded RGBA frame plus a recency stamp
+// (see Clip_Decoder.cache_clock) for true LRU eviction. Pixel data lives in a
+// separate heap buffer so the header stays small (no 1.3MB by-value copies).
 Frame_Cache_Entry :: struct {
-	frame:  i64,
-	uses:   u64,
-	data:   []u8,
+	frame:      i64,
+	last_touch: u64,
+	data:       []u8,
 }
 
 frame_cache_clear :: proc(dec: ^Clip_Decoder) {
@@ -243,44 +256,46 @@ FRAME_CACHE_CAPACITY :: 24
 cache_find :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> []u8 {
 	for i := 0; i < len(dec.cache); i += 1 {
 		if dec.cache[i].frame == frame_idx {
-			dec.cache[i].uses += 1
+			dec.cache_clock += 1
+			dec.cache[i].last_touch = dec.cache_clock
 			return dec.cache[i].data
 		}
 	}
 	return nil
 }
 
-// cache_store inserts/updates a cached frame, evicting the least-used entry
-// (freeing its buffer) when at capacity.
+// cache_store inserts/updates a cached frame, evicting the LEAST RECENTLY
+// TOUCHED entry (freeing its buffer, well, reusing it) when at capacity.
 cache_store :: proc(dec: ^Clip_Decoder, frame_idx: i64, data: []u8) {
 	if frame_idx < 0 {
 		return
 	}
+	dec.cache_clock += 1
 	for i := 0; i < len(dec.cache); i += 1 {
 		if dec.cache[i].frame == frame_idx {
 			copy(dec.cache[i].data, data)
-			dec.cache[i].uses += 1
+			dec.cache[i].last_touch = dec.cache_clock
 			return
 		}
 	}
 	if len(dec.cache) < FRAME_CACHE_CAPACITY {
 		buf := make([]u8, PREVIEW_W * PREVIEW_H * 4)
 		copy(buf, data)
-		append(&dec.cache, Frame_Cache_Entry{frame = frame_idx, uses = 1, data = buf})
+		append(&dec.cache, Frame_Cache_Entry{frame = frame_idx, last_touch = dec.cache_clock, data = buf})
 		return
 	}
-	// Evict least recently used, reusing its buffer.
+	// Evict the least recently touched entry, reusing its buffer.
 	evict := 0
-	lowest := dec.cache[0].uses
+	oldest := dec.cache[0].last_touch
 	for i := 1; i < len(dec.cache); i += 1 {
-		if dec.cache[i].uses < lowest {
-			lowest = dec.cache[i].uses
+		if dec.cache[i].last_touch < oldest {
+			oldest = dec.cache[i].last_touch
 			evict = i
 		}
 	}
 	copy(dec.cache[evict].data, data)
 	dec.cache[evict].frame = frame_idx
-	dec.cache[evict].uses = 1
+	dec.cache[evict].last_touch = dec.cache_clock
 }
 
 // open_clip_decoder opens the file's best video stream for interactive preview,
