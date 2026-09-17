@@ -397,7 +397,14 @@ audio_prod_frame: i64
 // playhead, the engine is silently dead — force a re-provision rather than play
 // muted for the rest of the run. (A transient open/seek failure in
 // audio_provision can otherwise drop the only clip and never recover.)
+//
+// audio_provisioning is true while a provision is in flight (producer thread).
+// A provision zeroes the count during its run, so the self-heal must NOT fire
+// on that transient zero — that turns every slow re-open into a re-provision
+// storm (see audio_update). The self-heal may only trip once a provision has
+// COMPLETED with zero surviving sources.
 audio_src_count_ui: i64
+audio_provisioning: bool
 
 // audio_jump_frame is a forward-only skip target (0 = none). The UI sets it when
 // the playhead outruns the audio producer; the producer trims its fifos and
@@ -564,6 +571,8 @@ audio_note_edit :: proc() {
 // double-buffered geometry slab instead of live timeline memory, so it never
 // waits on the UI thread's edits.
 audio_provision :: proc(play_frame: i64) {
+	sync.atomic_store(&audio_provisioning, true)
+	defer sync.atomic_store(&audio_provisioning, false)
 	atempo_reset(&atempo_g) // graph window may hold pre-provision samples
 	audio_dec_dump_open()
 	audio_reset_play()
@@ -1180,7 +1189,15 @@ audio_update :: proc() {
 	// producer has zero sources, yet the current timeline still has audio
 	// covering the playhead, force a re-seed. Coalesced above so a healthy
 	// producer (which always has >=1 source) never hits this.
-	if sync.atomic_load(&audio_src_count_ui) == 0 && timeline_has_audio_at(playhead.frame) {
+	//
+	// audio_provisioning guards the transient zero: a provision that is STILL
+	// RUNNING has count==0 by construction, but the producer is alive and about
+	// to repopulate the sources. Firing here re-anchors mid-provision, bumps
+	// the resync evt, and the producer clears the stream and re-provisions from
+	// scratch every 200 ms — a self-sustaining re-open storm on slow files
+	// (5 FLAC decoders, ~300 ms total). Only a COMPLETED provision with zero
+	// survivors is a genuinely dead engine.
+	if sync.atomic_load(&audio_src_count_ui) == 0 && !sync.atomic_load(&audio_provisioning) && timeline_has_audio_at(playhead.frame) {
 		if audio_trace {
 			fmt.printf("[ph] self-heal: playing but 0 audio sources at ph=%d -> re-seed\n", playhead.frame)
 		}
