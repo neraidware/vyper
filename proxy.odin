@@ -658,6 +658,13 @@ proxy_idx_store :: proc(src: cstring, idx: ^Proxy_Idx) {
 	_ = os.write_entire_file(string(idx_path), sb.buf[:])
 }
 
+// PROXY_IDX_RECHECK_SEC bounds how often proxy_pick_for_frame re-stats the
+// on-disk .idx while the playhead is ahead of the built segments. The builder
+// is the only writer, so noticing a new segment a fraction of a second late
+// only costs a few frames of source decode -- far cheaper than an os.stat
+// syscall on every render frame.
+PROXY_IDX_RECHECK_SEC :: 0.25
+
 // proxy_resolver_entry is the single-slot destination cache kept between decodes
 // so a scrub does not re-probe the on-disk index (the count is read from the idx sidecar, no re-scan)
 // for the actively scrubbed file. One slot is enough: the playhead is in ONE
@@ -673,6 +680,11 @@ proxy_resolver_entry :: struct {
 	// so playback ahead of the build no longer re-reads + re-parses the file
 	// every render frame just because the playhead sits in unbuilt territory.
 	idx_mtime:   time.Time,
+	// idx_last_check throttles the .idx re-consult (an os.stat syscall) while
+	// the playhead sits in unbuilt territory: a stat every frame is a real
+	// syscall on the render-loop critical path, so it runs at most once per
+	// PROXY_IDX_RECHECK_SEC instead.
+	idx_last_check: time.Time,
 	whole_proxy: [4096]u8,
 	whole_valid: bool,
 	// valid_k_ok + valid_k record the last segment index whose on-disk file this
@@ -792,24 +804,35 @@ proxy_pick_for_frame :: proc(
 	idx_path_buf: [4096]u8
 	idx_path, idx_ok := proxy_idx_path_for(src, idx_path_buf[:])
 	if idx_ok && (!rc.idx_valid || k >= len(rc.idx.segs)) {
-		if info, serr := os.stat(string(idx_path), context.temp_allocator);
-		   serr == os.ERROR_NONE && info.modification_time != rc.idx_mtime {
-			delete(rc.idx.segs)
-			rc.idx = {}
-			rc.idx_valid = proxy_idx_load(src, &rc.idx)
-			rc.idx_mtime = info.modification_time
-			if vyper_trace {
-				fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
-			}
-			if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
-				seg, sok := proxy_segment_path_for(src, k, out_buf)
-				if sok {
-					if !os.exists(string(seg)) {
-						return nil, 0
-					}
-					return seg, i64(k) * PROXY_SEG_FRAMES
+		// Throttle the stat: while the playhead is ahead of the build this
+		// branch is entered every frame, and an os.stat is a syscall (plus a
+		// temp-arena File_Info) on the render-loop critical path. First consult
+		// of a source is always due; afterwards at most once per interval.
+		now := time.now()
+		due :=
+			!rc.idx_valid ||
+			time.duration_seconds(time.since(rc.idx_last_check)) >= PROXY_IDX_RECHECK_SEC
+		if due {
+			rc.idx_last_check = now
+			if info, serr := os.stat(string(idx_path), context.temp_allocator);
+			   serr == os.ERROR_NONE && info.modification_time != rc.idx_mtime {
+				delete(rc.idx.segs)
+				rc.idx = {}
+				rc.idx_valid = proxy_idx_load(src, &rc.idx)
+				rc.idx_mtime = info.modification_time
+				if vyper_trace {
+					fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
 				}
-				return nil, 0
+				if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
+					seg, sok := proxy_segment_path_for(src, k, out_buf)
+					if sok {
+						if !os.exists(string(seg)) {
+							return nil, 0
+						}
+						return seg, i64(k) * PROXY_SEG_FRAMES
+					}
+					return nil, 0
+				}
 			}
 		}
 	}

@@ -1428,24 +1428,21 @@ next_track_name :: proc() -> string {
 // consistent, so order consumers (UI rows, preview walk, render) can call it
 // every frame without thinking.
 sync_track_order :: proc() {
-	if len(timeline.track_order) == len(timeline.tracks) {
-		seen := make(map[int]bool, len(timeline.track_order), context.temp_allocator)
-		consistent := true
-		for ti in timeline.track_order {
-			if ti < 0 || ti >= len(timeline.tracks) || ti in seen {
-				consistent = false
-				break
-			}
-			seen[ti] = true
-		}
-		if consistent {
-			return
-		}
+	// Direct `append(&timeline.tracks, ...)` sites (media lane creation,
+	// probes) grow storage without touching the order, and they only ever add
+	// a new max index at the bottom -- extending the missing tail in storage
+	// order is exactly those bottom-append semantics. Every other mutator
+	// (insert_track, move_track_to_row, duplicate_track, remove_track) keeps
+	// track_order a permutation of [0 .. len(tracks)) explicitly, so a length
+	// mismatch here is a mutator that dropped that invariant -- a bug, not a
+	// state to silently rebuild.
+	for len(timeline.track_order) < len(timeline.tracks) {
+		append(&timeline.track_order, len(timeline.track_order))
 	}
-	clear(&timeline.track_order)
-	for i in 0 ..< len(timeline.tracks) {
-		append(&timeline.track_order, i)
-	}
+	assert(
+		len(timeline.track_order) == len(timeline.tracks),
+		"sync_track_order: track_order longer than tracks",
+	)
 }
 
 // order_row_of returns the top-to-bottom row (position in track_order) of the
