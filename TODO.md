@@ -82,8 +82,10 @@ Steps (each lands + probe + vet before the next):
       `VYPER_HW_PROBE="<file>|<count>|<stride>"` decodes the same frames both
       ways; deviceless/unsupported hosts fall back clean (probe still passes).
       Probing on this host: h264 1080p vaapi vs sw 0 mismatches (and a modest
-      ~12% wall gain on the 891-frame forward pass); av1 has no local VAAPI
-      config so it runs sw-sw parity confirming the clean fallback.
+      ~12% wall gain on the 891-frame forward pass); av1 ran sw-sw parity at
+      first because `find_decoder` returns libdav1d (sw-only) for AV1 by id —
+      corrected later via `find_hw_decoder` resolving the native 'av1' decoder
+      which does carry VAAPI (see note at ACCEPT, 2026-09-16).
 - [x] S5. Original-rate preview: when decoder throughput sustains source fps,
       `proxy_pick_for_frame` resolves the original path (decode from original,
       GPU-or-sws scale to canvas). Deadline: one CPU core of air left on a
@@ -104,6 +106,17 @@ Steps (each lands + probe + vet before the next):
       re-check mpv does no better. Weak-host fallback still builds windowed
       proxies via in-process encode. No `"ffmpeg"`/`"ffprobe"` strings in the
       binary. Probes + vet green.
+      NOTE (2026-09-16): two playback blockers fixed since the last probe.
+      Audio self-heal fired on the in-flight provision's transient zero-count
+      and re-provisioned every ~200ms (re-open storm, 282 resyncs/83s on the
+      7.8GB source) — fixed by 801026f, gating on `audio_provisioning`.
+      Hardware AV1 decode was dead in-process: `find_decoder(AV1)` returns
+      libdav1d (registered first, sw-only) so the native 'av1' decoder with
+      the usable VAAPI config was never chosen; 7c193e5 adds `find_hw_decoder`
+      backing both playback decode and proxy_encode_range. Verified:
+      AV1 hw vs sw pixel-identical (mismatches=0), proxy bg-build hw-decodes
+      per segment, seek-forward soak at 2x holds pace with resync=3 and
+      proxy-build CPU footprint 274%->151%.
 
 Out of scope (future): GPU→GPU zero-copy compositing, hw-encode for proxies,
 ICC color management, video interpolation (motion-estimated), A/V drift autotune.
