@@ -117,6 +117,10 @@ Steps (each lands + probe + vet before the next):
       AV1 hw vs sw pixel-identical (mismatches=0), proxy bg-build hw-decodes
       per segment, seek-forward soak at 2x holds pace with resync=3 and
       proxy-build CPU footprint 274%->151%.
+      2x soak (2026-09-16, post-fix): 65s AV1 at VYPER_RATE=2, 20 content-s:
+      resync=3, holes=0, pace=ok, ~120fps (2x of 60), source decoded via
+      vaapi hw (pixfmt 44), process CPU ~20% during playback (frac of one
+      core — cores free). GUI confirm + mpv recheck still outstanding.
 
 Out of scope (future): GPU→GPU zero-copy compositing, hw-encode for proxies,
 ICC color management, video interpolation (motion-estimated), A/V drift autotune.
