@@ -344,13 +344,17 @@ clip_prev_end :: proc(track: ^Track, idx: int) -> i64 {
 // or extending the tail. Length is clamped to >= 1 frame, to the source frames
 // available after the head (so a file-backed clip never overruns its media), and
 // so the tail never passes the next clip's start. Generator clips (no source
-// cap) grow freely until a neighbor. Returns the applied length.
+// cap) grow freely until a neighbor. A still image has no time-varying source,
+// so it grows freely too: its synthetic one-second frame count is a default
+// length, not a media bound. Returns the applied length.
 resize_clip_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 	c := &track.clips[idx]
 	start := c.timeline_start_frame
 	max_len := i64(1) << 50
-	if src_total := asset_source_frames(c.asset_id); src_total > 0 {
-		max_len = max(1, src_total - c.source_start_frame)
+	if !c.is_still {
+		if src_total := asset_source_frames(c.asset_id); src_total > 0 {
+			max_len = max(1, src_total - c.source_start_frame)
+		}
 	}
 	next := clip_next_start(track, idx)
 	lo := start + 1
@@ -366,8 +370,10 @@ resize_clip_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 // resize_clip_left moves the clip's head (timeline start) to new_head while
 // keeping the tail anchored. The head shifts source_start_frame with it, and is
 // clamped so the clip never overlaps the previous neighbor, never drops below 1
-// frame, and never extends before the source (source_start_frame >= 0). Returns
-// the applied length.
+// frame, and never extends before the source (source_start_frame >= 0). A still
+// image has no time-varying source, so its head extends left freely (bounded
+// only by the previous neighbor and frame 0) and keeps source_start_frame at 0.
+// Returns the applied length.
 resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	c := &track.clips[idx]
 	start := c.timeline_start_frame
@@ -375,6 +381,9 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	end := start + c.source_length_frames
 	// The head may extend left only as far as source frames precede the head.
 	min_start := start - ssrc
+	if c.is_still {
+		min_start = 0
+	}
 	prev := clip_prev_end(track, idx)
 	lo := max(min_start, prev)
 	hi := end - 1
@@ -383,7 +392,9 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	}
 	head := clamp(new_head, lo, hi)
 	delta := head - start
-	c.source_start_frame += delta
+	if !c.is_still {
+		c.source_start_frame += delta
+	}
 	c.timeline_start_frame = head
 	c.source_length_frames = end - head
 	return c.source_length_frames
@@ -488,7 +499,12 @@ split_clip_at_playhead :: proc() {
 		// the prewarm decoder handoff).
 		right.clip_id = new_clip_id()
 		right.link_id = right_link
-		right.source_start_frame += left_len
+		// A still image shows the same frame everywhere; its source offset must
+		// stay 0 or the right half would ask the decoder for a frame the image
+		// doesn't have. Only time-varying sources advance the right half's start.
+		if !c.is_still {
+			right.source_start_frame += left_len
+		}
 		right.source_length_frames = right_len
 		right.timeline_start_frame = frame
 		old_markers := c.markers
@@ -772,7 +788,9 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			)
 			append(&new_clips, left)
 			right := c
-			right.source_start_frame += end - cs
+			if !right.is_still {
+				right.source_start_frame += end - cs
+			}
 			right.source_length_frames = ce - end
 			right.timeline_start_frame = start
 			right.markers = filter_markers_in_range(
@@ -802,7 +820,9 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			// head is not exactly at the region midpoint, leaving the clip
 			// reading the wrong source frames under the playhead (A/V desync).
 			old_markers := c.markers
-			c.source_start_frame += end - cs
+			if !c.is_still {
+				c.source_start_frame += end - cs
+			}
 			c.source_length_frames = ce - end
 			c.timeline_start_frame = start
 			c.markers = filter_markers_in_range(

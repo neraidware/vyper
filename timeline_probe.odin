@@ -571,6 +571,47 @@ test_ripple_playhead_follow :: proc() {
 	tl_probe_check(playhead.frame == 200, "linked-group: want 200, got %d", playhead.frame)
 }
 
+// test_still_resize_free: a still image's synthetic one-second length (its
+// synthetic frame_count) is a default length, NOT a media bound, so both edges
+// resize freely and source_start_frame stays 0 across resize and split (the
+// image shows the same frame everywhere).
+test_still_resize_free :: proc() {
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	c := mk_tl_clip(4001, 0, 0, 60, 100, .Video)
+	c.is_still = true
+	append(&timeline.tracks[0].clips, c)
+	selected_track = 0
+	selected_index = 0
+
+	// Right edge: grow far past the 60-frame (1 s) default.
+	got := resize_clip_right(&timeline.tracks[0], 0, 100 + 600)
+	tl_probe_check(got == 600, "still resize right: want 600, got %d", got)
+
+	// Left edge: grow left to frame 0; a still never advances its source.
+	got = resize_clip_left(&timeline.tracks[0], 0, 0)
+	tl_probe_check(
+		got == 700 && timeline.tracks[0].clips[0].source_start_frame == 0,
+		"still resize left: want len 700 src 0, got len %d src %d",
+		got,
+		timeline.tracks[0].clips[0].source_start_frame,
+	)
+
+	// Split at the middle: the right half must keep source offset 0.
+	playhead.frame = 350
+	split_clip_at_playhead()
+	tl_probe_check(
+		len(timeline.tracks[0].clips) == 2 &&
+		timeline.tracks[0].clips[1].source_start_frame == 0 &&
+		timeline.tracks[0].clips[1].is_still,
+		"still split: want 2 stills, right src 0; got %d clips, right src %d",
+		len(timeline.tracks[0].clips),
+		len(timeline.tracks[0].clips) == 2 ? timeline.tracks[0].clips[1].source_start_frame : -1,
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_cut_resolves_playhead()
@@ -596,6 +637,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_resize_alignment()
 	fmt.println("[tl-probe] resize ok")
+
+	test_still_resize_free()
+	fmt.println("[tl-probe] still-resize ok")
 
 	tl_scene()
 	test_ripple_right_edge_head_trim()
