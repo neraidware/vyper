@@ -4,6 +4,12 @@ Speculative directions, parked for when a roadmap phase reaches them. Not
 commitments — TODO.md is the work queue; this is the bank. When an idea here
 gets picked up, move it to TODO.md with a concrete design and steps.
 
+## Working assumption: no backward compatibility
+
+vyper is a single-user editor. There is no stable-format promise: project files,
+session state, proxy layouts, undo histories can be reshaped freely. Persistence
+decisions (AGENTS §3c) are cheap. This holds until a second person is affected.
+
 ## Audio: plugin hosting (LV2 / VST3) + built-in DSP
 
 **Question:** does it make sense to eventually support LV2/VST3 plugins for audio
@@ -81,5 +87,192 @@ proxy pipeline, not a feature.
 (gain/pan/volume/envelope) and automation first; add LV2 as the first host
 adapter once that interface is stable; treat VST3 and the process sandbox as
 later, demand-driven steps.
+
+## 1.0 milestone: undo/redo tree with branching
+
+**Why:** the editing model already has the undo seam — AGENTS §1's discrete edits
+build a candidate and commit, and the commit bumps a generation (caches keyed on
+it drop stale entries for free). That is exactly the "future undo model" hook.
+
+**The constraint that kills a stack:** editing after an undo must not destroy the
+undone work. History is a tree, not a stack.
+
+- Undo/redo walk a branch; every new edit forks a child of the current node
+  (Godot-style). Moving a clip while one step under forks a branch instead of
+  throwing the discarded tail away.
+- Redo is enabled only down the current branch; a non-leaf edit forks, so the
+  work you stepped back from survives and stays reachable.
+- Commit nodes wrap the existing per-edit commit; session-side only to start —
+  persisting history across sessions is a later call (and cheap, given the no
+  back-compat assumption above).
+
+**Rework-later note:** the current commit seam is one-edit-per-commit. A real
+undo tree wants compound grouping (ripple delete, group move, paste = one node)
+and a cheap session-heap delta capture per node so jump-to-ancestor restores
+exactly. Don't build that up front — start the branch model over today's commits.
+
+## 1.0 milestone: project manager (Godot-style)
+
+**Position:** a launcher / session window, NOT an import or asset manager.
+
+- Two project sources: **self-managed** (a folder the user picks, holding the
+  `.vyproj` + its proxy cache) and **vyper-managed** (a directory inside vyper's
+  own data folder — e.g. `~/.local/share/vyper/bank/<slug>/` — for fast throwaway
+  sessions). Session-open lists both; creating a project chooses managed or not.
+- Asset links resolve by absolute path (today's model) with a relative-path
+  fallback so a self-managed folder can be moved. Proxies are per-project and
+  regenerable, so a missing proxy is a recoverable error, never a blocker.
+- The vyper bank directory is the only place the app writes outside the user's
+  project; keep it behind one accessor (AGENTS §3c).
+
+**Rework-later note:** do not build a file-metadata/asset database now. A manager
+that lists folders covers 1.0; the metadata layer the NLE compositor will want
+can replace the folder listing later.
+
+## 1.0 milestone: audio clip properties (pan, volume)
+
+**Position:** per-clip pan + volume now, kept automation-ready from the start.
+
+- Values are normalized 0..1 parameters (volume as linear amplitude with a dB
+  readout; pan as L/R balance), named — the same parameter representation the
+  plugin section below routes through. This is deliberately the first slice of
+  that parameter model: gain/pan/volume are built-ins there.
+- Held on the Clip, applied in the audio path under the current
+  single-active-audio-clip model. Editing a property = a discrete commit, so it
+  rides the undo seam.
+- UI: Inspector fields first; an on-clip envelope overlay can come with keyframes
+  below.
+
+**Rework-later note:** per-clip properties will have to reconcile with a
+per-track/per-clip effect insert chain when that lands; pick the same data shape
+up front so the migration is renaming, not reshaping.
+
+## 1.0 milestone: keyframes for common settings
+
+**Why:** animate/automate the properties that already exist — clip position,
+scale, opacity, volume, pan — with on-clip keyframes. Later this is the
+automation lane system; 1.0 keeps the minimal shape that can grow into it.
+
+- A keyframeable property is a named parameter from the closure above; keyframes
+  are `(frame, value)` pairs stored on the clip, linearly interpolated for 1.0
+  (no easing/bezier yet).
+- Editing = one discrete commit per keyframe change (undo seam). Playback
+  evaluates against the running frame and rides the same fixed per-frame buffers
+  as the transform path — no allocation on the hot path.
+- Evaluation slots into clip evaluation: the preview/render pipeline already
+  re-derives per frame, so a keyframe-aware parameter just supplies the value.
+
+**Rework-later note:** the frame→value store is the germ of the automation curve
+store. Keep it property-id-addressed (never a bare index) so automation lanes can
+adopt it wholesale later.
+
+## 1.0 milestone: voiceover recording
+
+**Desire:** record a mic voiceover against the timeline from the track itself.
+
+- Entry point: a **voiceover** item on the track's right-click context menu.
+- Behavior: picking it **starts mic capture AND starts playback together**, so the
+  recording lands in time against what the editor is playing.
+- **No clip while recording — a ghost.** Recording shows only a ghost tile (like
+  the drag ghost) of the soon-to-be clip, growing in the track under the playhead;
+  nothing is committed until recording stops.
+- **Collision policy (the key rule):** if the recording can't fit in that track
+  — it collides with existing clips while playing — keep recording in the same
+  track anyway; the collision is resolved **after** playback/recording stops, when
+  the ghost materializes — spilled onto a **newly created track** so nothing is
+  lost. The user then arranges or trims the result.
+- Mic/input configuration (device, levels) comes later; 1.0 uses the default
+  capture device.
+
+### Staging sketches (order up when picked up)
+
+- **Capture:** SDL audio capture device (or pipewire) → session-heap PCM buffer,
+  written to a media file on stop (backed by the normal media/watch path so it
+  shows up in the bin like any other clip).
+- **Sync:** the recording's timeline start = playback start under the running
+  clock; sample-accurate placement rides the same clock the audio render thread
+  follows.
+- **Ghost during record:** a semi-transparent tile (same visuals as the drag
+  ghost — see `gpu_draw.odin`) grows from the playhead as the take advances,
+  staying inside the lane even mid-collision; it is layout/draw-only and never
+  a real clip, so nothing is committed or collided until stop.
+- **Placement (on stop):** the ghost materializes via the existing
+  `clip_place_in_track` at the playhead; the "overflow" pass runs once: if the
+  recorded range overlaps an existing clip even after seeking to the first
+  non-colliding slot in that track, create a new track and drop the clip there.
+  No partial trimming, no prompts — record always, place generously.
+
+### Open questions
+
+- Pause/resume during record, and pre-roll countdown before playback starts.
+- Where the file is written before the user commits to it (project-local scratch,
+  deleted if the recording is discarded).
+- Length cap / disk guard for a long take left on record.
+
+## Later: NLE compositor (the end goal)
+
+The whole goal of vyper is a simple-but-powerful **NLE-DAW hybrid**. The
+compositor is the visual half of that: nested scenes, blend modes, transforms,
+and split CANVAS vs. full-project rendering. Not for 1.0 — the four milestones
+above are the 1.0 bar — but this is the direction, not a parked possibility.
+
+## Later: automation, LV2 / VST3 plugins
+
+Already scoped in the plugin section above. Sequence when picked up: audio
+parameter + insert model with built-ins and automation lanes first; the 1.0
+per-clip pan/volume/keyframe work is the first built-in implementation; LV2
+adapter next, then VST3 + the process sandbox. Automation lanes and the keyframe
+store share the property-id-addressed curve shape.
+
+## Later: skew, rotation, warp (transform extrapolation)
+
+Today's clip transform is axis-aligned (scale + position + crop, corner/edge
+handles, aspect lock). Skew/rotation/warp are the step up: the axis-aligned box
+becomes a four-corner (homography) model, with rotation as the first cheap case
+(a rigid corner move). Non-axis-aligned geometry reaches rendering, the drag
+math, snapping, and the corner-snap family; keep `transform_probe.odin` as the
+parity harness so the new model must reproduce current behavior exactly before
+extending it.
+
+## Later: multi-editor-window UI, UI/render thread split
+
+Today's model is one main loop: clay layout pass → GPU render → one surface.
+Split the question in two:
+
+- **UI vs. rendering threads:** layout and draw already ride per-frame state;
+  the render worker already parallelizes export. The open part is separating the
+  presentation/main-loop thread from layout + any blocking work.
+- **Multiple editor windows:** e.g. keep the NLE compositor on a second monitor.
+  Clay is a single-layout engine, so this is one layout pass per top-level
+  surface, same renderer, per-surface input routing. The main loop fans out per
+  surface; per-frame buffer and probe structure largely survive.
+
+## Idea: keyboard-first quick editing
+
+**Desire:** make vyper mostly keyboard-drivable for quick edits — split, trim,
+nudge, ripple-delete, playhead jumping — without leaving the keys.
+
+**Position:** worth doing, but the shape is unresolved — how to fit a keyboard
+workflow onto a timeline UI (mark-in/out? playlist-style QWL? modal keys vs.
+always-on shortcuts?) needs thought before committing. Parked until the mapping
+is sketched.
+
+- Grounding: shortcuts today live in one always-available switch in
+  `event.odin` (F1 reference, space play/pause, H/L jog, ctrl+space project-area
+  play) plus per-field edits. A keyboard-first mode extends this block with the
+  timeline edit verbs, each a discrete commit so it rides the undo seam.
+- The shortcut reference (F1) is the natural home for the bindings list; a
+  reachable, discoverable layout is the point — hidden/undocumented keys defeat
+  the goal.
+
+### Open questions (resolve before picking up)
+
+- Which verbs, and do any need tool-state changes (e.g. a mode) rather than a
+  plain key?
+- Modal (vi-style) vs. ambient: does the editor switch "modes", or is it keys
+  all the time with text fields intercepting first (as they do today)?
+- Structure: keep the single switch and grow it, or table-driven bindings
+  (rebindable) once the set is large enough to justify the machinery (AGENTS §2)
+  — the map comes after the closed set is known, not before.
 
 ## (Add new ideas below, newest first.)
