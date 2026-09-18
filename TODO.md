@@ -1,5 +1,27 @@
 # vyper TODO
 
+## Pending (2026-09-18)
+
+- [ ] **Windows import segfault** — reported by user, not reproduced on Linux
+      (no Windows host). Candidate defect: `portal_windows.odin`'s persistent
+      path buffers `win32_picked_path: [1024]byte` (line 22) and
+      `win32_save_picked_path` (line 103) — the `copy(dst, path_utf8)` result
+      `n` is then used as `buf[n] = 0`, so a picked UTF-8 path >= 1024 bytes
+      writes one past the buffer. Unconfirmed as the real crash. Need:
+      `vyper_crash.log` (exception code + fault address) and the `[win-ff]`
+      DLL-majors line, or a Windows repro. Note: the CI smoke test
+      (`VYPER_PROXY_PROBE`, decode + proxy) passes on Windows, so the common
+      probe/thumbnail/proxy import path is healthy — the picker path is not
+      exercised by CI.
+- [ ] **CI artifact upload vs quota** — Windows workflow `.github/workflows/
+      windows.yml` upload step. The account artifact quota filled (3.18 GB /
+      43 `nered-windows` artifacts, all <= 2026-09-11); cleared them via the
+      API and set `retention-days: 7` (`2998b3c`). Uploads still fail until
+      GitHub recalculates usage (every 6-12h). Decide: `continue-on-error:
+      true` on the upload step (recommended) or gate the upload to tags/manual
+      dispatch, so a quota hiccup can't red a green build + smoke. Build and
+      smoke pass; only the upload fails the job.
+
 ## Active 1 — Optimized playback pipeline: hw decode, in-process ffmpeg, true-rate preview
 
 **Why:** mpv plays 2x AV1 1080p60 pitch-preserved, smooth, full quality on this
