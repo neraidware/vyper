@@ -32,6 +32,10 @@ RENDER_AUDIO_RATE :: 48000
 MAX_AUDIO_FRAME_SAMPLES :: 4096
 // AAC encodes in fixed 1024-sample frames.
 AAC_FRAME_SIZE :: 1024
+// RENDER_VIDEO_PRESET is the libx264 speed/quality preset. Left unset, libx264
+// defaults to "medium"; "fast" is the quality-preserving step down (measured on
+// a 30s 1080p60 clip: medium 14.2s, fast 12.2s, faster 9.4s, veryfast 6.2s).
+RENDER_VIDEO_PRESET :: "fast"
 Render_Default_Path :: "render.mp4"
 
 // render_overwrite_out: when off (default) a render points itself at a free
@@ -528,6 +532,13 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c
 	ctx.gop_size = 120
 	ctx.max_b_frames = 2
 	ctx.bit_rate = 8_000_000
+	if ret := avutil.opt_set(ctx.priv_data, "preset", RENDER_VIDEO_PRESET, 0); ret < 0 {
+		// A hardcoded, known-valid preset on a known encoder: failing here means
+		// the build's libx264 disagrees, and silently running "medium" hides the
+		// very slowdown this exists to remove.
+		fmt.println("av_opt_set (preset):", ff_err_str(ret))
+		return false
+	}
 	if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
 		fmt.println("avcodec_open2 (h264):", ff_err_str(ret))
 		return false
