@@ -3,10 +3,9 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:os"
-import "base:runtime"
 import "core:strings"
+import "core:sync"
 import clay "clay-odin"
-import sdl "vendor:sdl3"
 
 // ---------------------------------------------------------------------------
 // Background proxy builder.
@@ -50,10 +49,11 @@ Build_Phase :: enum i32 {
 }
 
 Proxy_Builder :: struct {
-	thread: ^sdl.Thread,
-	mutex:  ^sdl.Mutex,
-	cond:   ^sdl.Condition,
-	stop:   bool,
+	// worker is the shared thread + wake-channel substrate. The request/result
+	// fields below stay owned by this struct because they encode build-job
+	// semantics (latest-wins window request, cancel/supersede, phase+progress)
+	// that no other worker shares.
+	worker: Worker,
 
 	// Request (render thread writes under mutex; a new request overwrites a
 	// still-queued one -- latest wins). A request targets a SEGMENT WINDOW
@@ -128,10 +128,10 @@ import_bg_request :: proc(
 	seg_lo, seg_hi: int,
 ) {
 	ib := &import_builder
-	if ib.thread == nil {
+	if ib.worker.thread == nil {
 		return
 	}
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	src_s := string(src)
 	n := min(len(src_s), len(ib.req_src) - 1)
 	copy(ib.req_src[:n], src_s[:n])
@@ -143,8 +143,8 @@ import_bg_request :: proc(
 	ib.req_seg_lo = seg_lo
 	ib.req_seg_hi = seg_hi
 	ib.req_valid = true
-	sdl.SignalCondition(ib.cond)
-	sdl.UnlockMutex(ib.mutex)
+	worker_wake(&ib.worker)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 // import_bg_redefine retargets the builder to `src`'s window [seg_lo, seg_hi),
@@ -161,10 +161,10 @@ import_bg_redefine :: proc(
 	seg_lo, seg_hi: int,
 ) {
 	ib := &import_builder
-	if ib.thread == nil {
+	if ib.worker.thread == nil {
 		return
 	}
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	src_s := string(src)
 	n := min(len(src_s), len(ib.req_src) - 1)
 	copy(ib.req_src[:n], src_s[:n])
@@ -180,8 +180,8 @@ import_bg_redefine :: proc(
 	ib.req_supersede = true
 	ib.cancel_pending = true
 	ib.req_valid = true
-	sdl.SignalCondition(ib.cond)
-	sdl.UnlockMutex(ib.mutex)
+	worker_wake(&ib.worker)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 // import_bg_building_for reports whether a proxy build is in flight (or queued)
@@ -191,8 +191,8 @@ import_bg_redefine :: proc(
 // writing (a lost artifact + a removed artifact from under its open handle).
 import_bg_building_for :: proc(src: string) -> bool {
 	ib := &import_builder
-	sdl.LockMutex(ib.mutex)
-	defer sdl.UnlockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
+	defer sync.mutex_unlock(&ib.worker.mutex)
 	if ib.phase == .Building || ib.phase == .Verifying {
 		if strings.compare(string(cstring(&ib.active_src[0])), src) == 0 {
 			return true
@@ -205,21 +205,21 @@ import_bg_building_for :: proc(src: string) -> bool {
 // aborts on its next cancel poll and deletes the partial proxy it was on.
 import_bg_cancel :: proc() {
 	ib := &import_builder
-	if ib.thread == nil {
+	if ib.worker.thread == nil {
 		return
 	}
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.cancel_pending = true
-	sdl.SignalCondition(ib.cond)
-	sdl.UnlockMutex(ib.mutex)
+	worker_wake(&ib.worker)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 // import_bg_active reports whether the corner build badge should show (a build
 // is running or one is queued).
 import_bg_active :: proc() -> bool {
 	ib := &import_builder
-	sdl.LockMutex(ib.mutex)
-	defer sdl.UnlockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
+	defer sync.mutex_unlock(&ib.worker.mutex)
 	return ib.phase == .Building || ib.phase == .Verifying || ib.req_valid
 }
 
@@ -236,8 +236,8 @@ box_contains :: proc(b: clay.BoundingBox, x, y: f32) -> bool {
 // points into the builder's own buffers (stable until the next request/claim).
 import_bg_status :: proc() -> (active: bool, frac: f64, phase: Build_Phase, src: cstring) {
 	ib := &import_builder
-	sdl.LockMutex(ib.mutex)
-	defer sdl.UnlockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
+	defer sync.mutex_unlock(&ib.worker.mutex)
 	active = ib.phase == .Building || ib.phase == .Verifying || ib.req_valid
 	frac = ib.progress
 	phase = ib.phase
@@ -259,8 +259,8 @@ import_bg_status :: proc() -> (active: bool, frac: f64, phase: Build_Phase, src:
 // claims the NEXT request.
 import_bg_consume_done :: proc() {
 	ib := &import_builder
-	sdl.LockMutex(ib.mutex)
-	defer sdl.UnlockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
+	defer sync.mutex_unlock(&ib.worker.mutex)
 	#partial switch ib.phase {
 	case .Done_Ok, .Done_Fail, .Done_Cancelled:
 		ib.phase = .Idle
@@ -270,11 +270,11 @@ import_bg_consume_done :: proc() {
 }
 
 import_bg_set_done_window :: proc(ib: ^Proxy_Builder, ok: bool, seg_lo, seg_hi: int) {
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.done_ok = ok
 	ib.done_seg_lo = seg_lo
 	ib.done_seg_hi = seg_hi
-	sdl.UnlockMutex(ib.mutex)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 // import_bg_window snapshots the builder's current in-flight target for the
@@ -297,8 +297,8 @@ import_bg_window :: proc() -> (
 	last_result_lo, last_result_hi: int,
 ) {
 	ib := &import_builder
-	sdl.LockMutex(ib.mutex)
-	defer sdl.UnlockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
+	defer sync.mutex_unlock(&ib.worker.mutex)
 	req_src = cstring(&ib.req_src[0])
 	req_seg_lo, req_seg_hi = ib.req_seg_lo, ib.req_seg_hi
 	has_request = ib.req_valid
@@ -315,11 +315,9 @@ import_bg_window :: proc() -> (
 
 import_bg_init :: proc() {
 	ib := &import_builder
-	ib.mutex = sdl.CreateMutex()
-	ib.cond = sdl.CreateCondition()
 	ib.phase = .Idle
 	ib.progress = -1
-	ib.thread = sdl.CreateThread(import_bg_worker, "import_bg", ib)
+	worker_start(&ib.worker, import_bg_worker, ib)
 }
 
 // import_bg_shutdown stops the worker and frees its resources. A build in
@@ -327,35 +325,31 @@ import_bg_init :: proc() {
 // than waited out.
 import_bg_shutdown :: proc() {
 	ib := &import_builder
-	if ib.thread == nil {
+	if ib.worker.thread == nil {
 		return
 	}
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.cancel_pending = true
-	ib.stop = true
-	sdl.SignalCondition(ib.cond)
-	sdl.UnlockMutex(ib.mutex)
-	sdl.WaitThread(ib.thread, nil)
-	sdl.DestroyCondition(ib.cond)
-	sdl.DestroyMutex(ib.mutex)
-	ib.thread = nil
+	worker_wake(&ib.worker)
+	sync.mutex_unlock(&ib.worker.mutex)
+	worker_request_stop(&ib.worker)
+	worker_join(&ib.worker)
 }
 
 // import_bg_worker owns the in-process proxy build loop (see the module comment).
-import_bg_worker :: proc "c" (data: rawptr) -> c.int {
-	context = runtime.default_context()
-	ib := (^Proxy_Builder)(data)
+import_bg_worker :: proc(worker: ^Worker) {
+	ib := (^Proxy_Builder)(worker.owner)
 	spall_thread_init("import_bg")
 	defer spall_thread_term()
 	for {
-		sdl.LockMutex(ib.mutex)
+		sync.mutex_lock(&ib.worker.mutex)
 		busy := ib.phase == .Building || ib.phase == .Verifying
-		for !ib.stop && !ib.req_valid && !ib.cancel_pending && !busy {
-			sdl.WaitCondition(ib.cond, ib.mutex)
+		for !worker.stop && !ib.req_valid && !ib.cancel_pending && !busy {
+			sync.cond_wait(&ib.worker.cond, &ib.worker.mutex)
 			busy = ib.phase == .Building || ib.phase == .Verifying
 		}
-		if ib.stop {
-			sdl.UnlockMutex(ib.mutex)
+		if worker.stop {
+			sync.mutex_unlock(&ib.worker.mutex)
 			break
 		}
 		// A cancel with no running build drops the queued request outright --
@@ -377,7 +371,7 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 				ib.last_result_src = ib.req_src
 				ib.last_result_lo = ib.req_seg_lo
 				ib.last_result_hi = ib.req_seg_hi
-				sdl.UnlockMutex(ib.mutex)
+				sync.mutex_unlock(&ib.worker.mutex)
 				continue
 			}
 		}
@@ -400,7 +394,7 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 			ib.req_valid = false
 			ib.phase = .Building
 			ib.progress = -1
-			sdl.UnlockMutex(ib.mutex)
+			sync.mutex_unlock(&ib.worker.mutex)
 
 			import_bg_build(ib, cstring(&ib.active_src[0]), frames, dur_us, w, h, seg_lo, seg_hi)
 			continue
@@ -408,9 +402,8 @@ import_bg_worker :: proc "c" (data: rawptr) -> c.int {
 		// Cancel pending while a build runs: the build loop polls it (it may
 		// legitimately be mid-encode on this same thread right now), so just
 		// re-wait.
-		sdl.UnlockMutex(ib.mutex)
+		sync.mutex_unlock(&ib.worker.mutex)
 	}
-	return 0
 }
 
 // Bg_Encode_Progress carries the window-relative progress accumulator for the
@@ -436,9 +429,9 @@ bg_encode_on_frames :: proc(ud: rawptr, frames_done: int) {
 // in-flight artifact and returns .Cancelled when this turns true.
 bg_encode_cancelled :: proc(ud: rawptr) -> bool {
 	env := cast(^Bg_Encode_Progress)ud
-	sdl.LockMutex(env.ib.mutex)
+	sync.mutex_lock(&env.ib.worker.mutex)
 	pending := env.ib.cancel_pending
-	sdl.UnlockMutex(env.ib.mutex)
+	sync.mutex_unlock(&env.ib.worker.mutex)
 	return pending
 }
 
@@ -533,9 +526,9 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		// A cancel between segments keeps everything built so far (the head is
 		// still fully usable); only the untouched tail is forgone.
 		{
-			sdl.LockMutex(ib.mutex)
+			sync.mutex_lock(&ib.worker.mutex)
 			pending := ib.cancel_pending
-			sdl.UnlockMutex(ib.mutex)
+			sync.mutex_unlock(&ib.worker.mutex)
 			if pending {
 				if vyper_trace {
 					fmt.printf("[bg] cancel between segments; keeping %d completed frames\n", env.completed_frames)
@@ -674,9 +667,9 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 }
 
 import_bg_set_phase :: proc(ib: ^Proxy_Builder, phase: Build_Phase) {
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.phase = phase
-	sdl.UnlockMutex(ib.mutex)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 // import_bg_finish sets a terminal phase AND records it as last_result so the
@@ -685,23 +678,23 @@ import_bg_set_phase :: proc(ib: ^Proxy_Builder, phase: Build_Phase) {
 // the worker was actually building -- for a cancel that aborted a build, that's
 // what got hit).
 import_bg_finish :: proc(ib: ^Proxy_Builder, phase: Build_Phase) {
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.phase = phase
 	ib.last_result_phase = phase
 	copy(ib.last_result_src[:], ib.active_src[:])
 	ib.last_result_lo = ib.active_seg_lo
 	ib.last_result_hi = ib.active_seg_hi
-	sdl.UnlockMutex(ib.mutex)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 import_bg_set_progress :: proc(ib: ^Proxy_Builder, frac: f64) {
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.progress = frac
-	sdl.UnlockMutex(ib.mutex)
+	sync.mutex_unlock(&ib.worker.mutex)
 }
 
 import_bg_clear_cancel :: proc(ib: ^Proxy_Builder) {
-	sdl.LockMutex(ib.mutex)
+	sync.mutex_lock(&ib.worker.mutex)
 	ib.cancel_pending = false
-	sdl.UnlockMutex(ib.mutex)
+	sync.mutex_unlock(&ib.worker.mutex)
 }

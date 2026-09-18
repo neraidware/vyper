@@ -1,9 +1,8 @@
 package main
 
-import "core:c"
-import "base:runtime"
 import "core:fmt"
-import sdl "vendor:sdl3"
+import "core:sync"
+import "core:time"
 
 // Async_Decoder runs decode for ONE preview slot on its own dedicated worker
 // thread, so a slow keyframe seek for that slot never blocks the render loop
@@ -63,12 +62,12 @@ import sdl "vendor:sdl3"
 Async_Decoder :: struct {
 	slot_idx: int, // which preview slot this worker serves (for tracing)
 
-	thread: ^sdl.Thread,
-	mutex:  ^sdl.Mutex,
-	cond:   ^sdl.Condition,
-
-	stop:  bool,
-	reset: bool,
+	// worker is the shared thread + wake-channel substrate. The request/result
+	// fields below stay owned by this struct because they encode preview-slot
+	// semantics (latest-wins frame request, double-buffered pixel handoff) that
+	// no other worker shares.
+	worker: Worker,
+	reset:  bool,
 
 	// Request side (render thread posts, worker reads).
 	req_valid:    bool,
@@ -172,18 +171,17 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_b
 	return true
 }
 
-vdec_worker :: proc "c" (data: rawptr) -> c.int {
-	context = runtime.default_context()
-	ad := (^Async_Decoder)(data)
+vdec_worker :: proc(w: ^Worker) {
+	ad := (^Async_Decoder)(w.owner)
 	spall_thread_init("vdecode")
 	defer spall_thread_term()
 	for {
-		sdl.LockMutex(ad.mutex)
-		for !ad.stop && ad.reset == false && !ad.req_valid {
-			sdl.WaitCondition(ad.cond, ad.mutex)
+		sync.mutex_lock(&w.mutex)
+		for !w.stop && ad.reset == false && !ad.req_valid {
+			sync.cond_wait(&w.cond, &w.mutex)
 		}
-		if ad.stop {
-			sdl.UnlockMutex(ad.mutex)
+		if w.stop {
+			sync.mutex_unlock(&w.mutex)
 			break
 		}
 		if ad.reset {
@@ -194,7 +192,7 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 			// reset; reconcile the sequence counters so async_wait_idle sees the
 			// worker idle instead of waiting forever on a dropped request.
 			ad.done_seq = ad.req_seq
-			sdl.UnlockMutex(ad.mutex)
+			sync.mutex_unlock(&w.mutex)
 			clip_decoder_reset(&ad.dec)
 			ad.dec_path = ""
 			ad.dec_preview_buf = {}
@@ -218,11 +216,11 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 			req_preview = cstring(&ad.dec_preview_buf[0])
 		}
 		ad.req_valid = false
-		sdl.UnlockMutex(ad.mutex)
+		sync.mutex_unlock(&w.mutex)
 
 		ok := vdec_decode(ad, req_path, req_preview, req_base, req_frame)
 
-		sdl.LockMutex(ad.mutex)
+		sync.mutex_lock(&w.mutex)
 		if ok {
 			// Publish by swapping the fill/display pointers rather than copying
 			// the whole frame: the just-decoded buffer becomes display_buf and
@@ -234,11 +232,10 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 			ad.res_pick_hash = req_pick_hash
 		}
 		ad.done_seq += 1
-		sdl.UnlockMutex(ad.mutex)
+		sync.mutex_unlock(&w.mutex)
 	}
 	clip_decoder_reset(&ad.dec)
 	ad.dec_path = ""
-	return 0
 }
 
 // async_dec_init spawns one worker thread per preview slot.
@@ -246,13 +243,11 @@ async_dec_init :: proc() {
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		ad := &async_decoders[i]
 		ad.slot_idx = i
-		ad.mutex = sdl.CreateMutex()
-		ad.cond = sdl.CreateCondition()
 		// Point the fill/display pair at the backing buffers BEFORE the worker
 		// starts; the worker and every consumer assume both are non-nil.
 		ad.wbuf = &ad.frame_a
 		ad.display_buf = &ad.frame_b
-		ad.thread = sdl.CreateThread(vdec_worker, "vdecode", ad)
+		worker_start(&ad.worker, vdec_worker, ad)
 	}
 }
 
@@ -263,23 +258,14 @@ async_dec_shutdown :: proc() {
 	// serialized.
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		ad := &async_decoders[i]
-		if ad.thread == nil {
+		if ad.worker.thread == nil {
 			continue
 		}
-		sdl.LockMutex(ad.mutex)
-		ad.stop = true
-		sdl.SignalCondition(ad.cond)
-		sdl.UnlockMutex(ad.mutex)
+		worker_request_stop(&ad.worker)
 	}
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		ad := &async_decoders[i]
-		if ad.thread == nil {
-			continue
-		}
-		sdl.WaitThread(ad.thread, nil)
-		sdl.DestroyCondition(ad.cond)
-		sdl.DestroyMutex(ad.mutex)
-		ad.thread = nil
+		worker_join(&ad.worker)
 	}
 }
 
@@ -288,15 +274,15 @@ async_dec_shutdown :: proc() {
 // posted request and stale result so old pixels are never consumed.
 async_dec_reset_slot :: proc(slot_idx: int) {
 	ad := &async_decoders[slot_idx]
-	if ad.thread == nil {
+	if ad.worker.thread == nil {
 		return
 	}
-	sdl.LockMutex(ad.mutex)
+	sync.mutex_lock(&ad.worker.mutex)
 	ad.reset = true
 	ad.req_valid = false
 	ad.res_valid = false
-	sdl.SignalCondition(ad.cond)
-	sdl.UnlockMutex(ad.mutex)
+	worker_wake(&ad.worker)
+	sync.mutex_unlock(&ad.worker.mutex)
 }
 
 // async_dec_reset tells EVERY worker to drop its decoder and cached frames
@@ -317,10 +303,10 @@ async_dec_reset :: proc() {
 // worker always converges to the most recent request posted to it.
 async_post_request :: proc(slot_idx: int, path: cstring, preview: cstring, frame_base: i64, clip_frame: i64) {
 	ad := &async_decoders[slot_idx]
-	if ad.thread == nil {
+	if ad.worker.thread == nil {
 		return
 	}
-	sdl.LockMutex(ad.mutex)
+	sync.mutex_lock(&ad.worker.mutex)
 	ad.req_path = path
 	ad.req_frame = clip_frame
 	ad.req_base = frame_base
@@ -341,8 +327,8 @@ async_post_request :: proc(slot_idx: int, path: cstring, preview: cstring, frame
 		ad.req_valid = true
 	}
 	ad.req_seq += 1
-	sdl.SignalCondition(ad.cond)
-	sdl.UnlockMutex(ad.mutex)
+	worker_wake(&ad.worker)
+	sync.mutex_unlock(&ad.worker.mutex)
 }
 
 // async_try_consume copies slot_idx's worker's decoded frame into `out` if and
@@ -351,11 +337,11 @@ async_post_request :: proc(slot_idx: int, path: cstring, preview: cstring, frame
 // good frame) or if a stale result for a different request is present.
 async_try_consume :: proc(slot_idx: int, path: cstring, clip_frame: i64, out: []u8) -> bool {
 	ad := &async_decoders[slot_idx]
-	if ad.thread == nil {
+	if ad.worker.thread == nil {
 		return false
 	}
-	sdl.LockMutex(ad.mutex)
-	defer sdl.UnlockMutex(ad.mutex)
+	sync.mutex_lock(&ad.worker.mutex)
+	defer sync.mutex_unlock(&ad.worker.mutex)
 	if !ad.res_valid || ad.res_path != path || ad.res_frame != clip_frame {
 		return false
 	}
@@ -374,11 +360,11 @@ async_try_consume :: proc(slot_idx: int, path: cstring, clip_frame: i64, out: []
 // keeps its last good frame).
 async_try_consume_latest :: proc(slot_idx: int, path: cstring, clip_frame: i64, out: []u8) -> (bool, i64, u32) {
 	ad := &async_decoders[slot_idx]
-	if ad.thread == nil {
+	if ad.worker.thread == nil {
 		return false, clip_frame, 0
 	}
-	sdl.LockMutex(ad.mutex)
-	defer sdl.UnlockMutex(ad.mutex)
+	sync.mutex_lock(&ad.worker.mutex)
+	defer sync.mutex_unlock(&ad.worker.mutex)
 	if !ad.res_valid || ad.res_path != path {
 		return false, clip_frame, 0
 	}
@@ -393,7 +379,7 @@ async_try_consume_latest :: proc(slot_idx: int, path: cstring, clip_frame: i64, 
 // (render thread should fall back to synchronous decode for that slot when it
 // is not, e.g. probes that never call async_dec_init).
 async_has_worker :: proc(slot_idx: int) -> bool {
-	return async_decoders[slot_idx].thread != nil
+	return async_decoders[slot_idx].worker.thread != nil
 }
 
 // async_wait_idle blocks until every request posted to slot_idx's worker has
@@ -402,16 +388,16 @@ async_has_worker :: proc(slot_idx: int) -> bool {
 // async decode deterministic.
 async_wait_idle :: proc(slot_idx: int) {
 	ad := &async_decoders[slot_idx]
-	if ad.thread == nil {
+	if ad.worker.thread == nil {
 		return
 	}
 	for {
-		sdl.LockMutex(ad.mutex)
+		sync.mutex_lock(&ad.worker.mutex)
 		idle := ad.done_seq >= ad.req_seq
-		sdl.UnlockMutex(ad.mutex)
+		sync.mutex_unlock(&ad.worker.mutex)
 		if idle {
 			return
 		}
-		sdl.Delay(1)
+		time.sleep(time.Millisecond)
 	}
 }
