@@ -176,6 +176,11 @@ Media_Asset :: struct {
 	// audio_frames is the clip length for the audio stream(s), derived from the
 	// duration at import (never shorter than the video frame count).
 	audio_frames:    i64,
+	// is_image marks a still-image source. A still has a single decodable frame
+	// but is placed on the timeline with a one-second length (like every other
+	// import's default), so its frames map to source frame 0 for the whole
+	// span; see Clip.is_still.
+	is_image:        bool,
 	// src_hw latches whether THIS source file opens with a hardware decoder on
 	// this machine (hw_pix_fmt != .None). Stable per asset: the S5 original-rate
 	// pick must gate on the SOURCE's capability, never on whichever file a slot
@@ -227,6 +232,10 @@ Clip :: struct {
 	// title that will be rendered; for file-backed clips it's a display name.
 	name:                 string,
 	kind:                 Media_Kind,
+	// is_still marks a clip whose source is a single still image: every timeline
+	// frame in the clip maps to the source's one frame (frame 0), so the image
+	// holds across the clip's length instead of the decoder seeking past EOF.
+	is_still:             bool,
 	// generator identifies this clip as a generator (programmatic output).
 	// .None for ordinary file-backed clips; .Text for the text generator;
 	// .Subtitles for the subtitle (.srt) generator.

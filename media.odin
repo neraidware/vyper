@@ -111,6 +111,24 @@ probe_media :: proc(path: cstring) -> string {
 	return strings.clone(strings.to_string(sb))
 }
 
+// IMAGE_EXTENSIONS are the still-image formats the importers accept. A still
+// decodes as a one-frame video stream, so nothing downstream would otherwise
+// know it is not footage; this is the only place that distinction is made.
+IMAGE_EXTENSIONS :: []string{".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+
+// media_is_image reports whether a path names a still image, by extension. The
+// file picker filters and the proxy/probe paths do not expose a reliable
+// content flag, and an extension check is what the picker itself uses.
+media_is_image :: proc(path: cstring) -> bool {
+	lower := strings.to_lower(string(path), context.temp_allocator)
+	for ext in IMAGE_EXTENSIONS {
+		if strings.has_suffix(lower, ext) {
+			return true
+		}
+	}
+	return false
+}
+
 media_frame_count :: proc(metadata: string) -> i64 {
 	duration: f64
 	frame_rate: f64
@@ -284,7 +302,15 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	file_info_text = probe_media(path)
 	frame_count := media_frame_count(file_info_text)
 	probe := probe_streams(path)
-	if probe.has_video && probe.video_fps_num > 0 {
+	// A still image probes as a one-frame video stream. It has no duration and
+	// no meaningful frame rate, so place it with the default one-second clip
+	// length instead of a single frame, and never let its fake fps retime the
+	// project.
+	is_image := media_is_image(path)
+	if is_image {
+		frame_count = max(1, i64(math.round(timeline_fps())))
+	}
+	if probe.has_video && probe.video_fps_num > 0 && !is_image {
 		timeline.frame_rate = f64(probe.video_fps_num) / f64(probe.video_fps_den)
 	}
 	// NOTE: audio has no fps of its own; size against the timeline clock
@@ -324,6 +350,7 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 			src_h = src_h,
 			audio_streams = c.int(probe.audio_streams),
 			audio_frames = audio_frames,
+			is_image = is_image,
 			thumb_tex_dirty = true,
 		},
 	)
@@ -333,8 +360,9 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	// fluid scrubbing instead of re-decoding whole groups-of-pictures from the
 	// original. Build it now, at import, so the preview is ready immediately;
 	// the render pass always uses the original (fidelity). Non-fatal: a video
-	// with no proxy just previews from the source.
-	if probe.has_video {
+	// with no proxy just previews from the source. A still image has nothing to
+	// transcode.
+	if probe.has_video && !is_image {
 		proxy_buf: [4096]u8
 		_ = proxy_transcode(
 			path,
@@ -465,6 +493,7 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			path                 = is_sub ? nil : asset.path,
 			name                 = is_sub ? strings.clone(path_basename(asset.path)) : "",
 			kind                 = is_video ? .Video : (is_sub ? .Text : .Audio),
+			is_still             = asset.is_image,
 			generator            = is_sub ? .Subtitles : .None,
 			srt_id               = is_sub ? asset.srt_id : -1,
 			stream_index         = is_sub ? c.int(-1) : c.int(offset - (asset.kind == .Video ? 1 : 0)),

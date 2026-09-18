@@ -1587,6 +1587,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 		path                 = src.path,
 		name                 = strings.clone(src.name),
 		kind                 = src.kind,
+		is_still             = src.is_still,
 		generator            = src.generator,
 		srt_id               = src.srt_id,
 		stream_index         = src.stream_index,

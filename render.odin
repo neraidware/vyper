@@ -182,6 +182,9 @@ Render_Video_Src :: struct {
 	stream_index:         c.int,
 	source_start_frame:   i64,
 	source_length_frames: i64,
+	// is_still marks a single-frame image source; every timeline frame maps to
+	// source_start_frame (see media_is_image / Clip.is_still).
+	is_still:             bool,
 	timeline_start_frame: i64,
 	transform_x:          f32,
 	transform_y:          f32,
@@ -970,7 +973,12 @@ render_worker_run :: proc() {
 			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
 				continue
 			}
-			src_frame := v.source_start_frame + timeline_frame - v.timeline_start_frame
+			// A still image has one source frame; map every timeline frame in
+			// its span to it so the image holds instead of seeking past EOF.
+			src_frame := v.source_start_frame
+			if !v.is_still {
+				src_frame += timeline_frame - v.timeline_start_frame
+			}
 			if !decode_source_frame(&v.dec, src_frame) {
 				continue
 			}
@@ -1386,6 +1394,7 @@ render_start :: proc() {
 						stream_index = clip.stream_index,
 						source_start_frame = clip.source_start_frame,
 						source_length_frames = clip.source_length_frames,
+						is_still = clip.is_still,
 						timeline_start_frame = clip.timeline_start_frame,
 						transform_x = clip.transform_x,
 						transform_y = clip.transform_y,

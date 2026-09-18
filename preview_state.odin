@@ -126,6 +126,10 @@ prewarm_next_clip :: proc() {
 				return
 			}
 			// Buttress the cache with a few following frames (cheap forward steps).
+			// A still image has no following frames to decode.
+			if next.is_still {
+				return
+			}
 			for kf in i64(1) ..< 4 {
 				wf := next.source_start_frame + kf
 				warm_pick, warm_base = proxy_pick_for_frame(
@@ -523,6 +527,10 @@ update_preview_slots :: proc() -> bool {
 				scrub_tick % SCRUB_DECIMATION != 0 &&
 				!async_has_worker(slot_idx)
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
+			if clip.is_still {
+				// A still has one source frame: hold it for the whole clip span.
+				clip_frame = clip.source_start_frame
+			}
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
 			// the background builder lands more segments, so the frame the
 			// decoder serves may switch files (segment N -> source, or N -> N+1)
