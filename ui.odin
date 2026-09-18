@@ -1335,11 +1335,18 @@ v_scrollbar :: proc(tag: string, scroll, content_h, view_h: f32) {
 // stays held (highlighted border + label) when active reports true. This is
 // used for both mutually-exclusive presets (resolution/fps, where only the
 // matching one is held) and standalone toggles (orientation, held on its own).
-settings_button :: proc(name: string, label: string, active: bool) {
+// fill_width stretches the button to its container's cross axis -- used for
+// dropdown menu rows, which should span the full menu width instead of hugging
+// their label.
+settings_button :: proc(name: string, label: string, active: bool, fill_width := false) {
+	width := clay.SizingFit({})
+	if fill_width {
+		width = clay.SizingGrow({})
+	}
 	if clay.UI(clay.ID(name))(
 	{
 		layout = {
-			sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(BUTTON_HEIGHT)},
+			sizing = {width = width, height = clay.SizingFixed(BUTTON_HEIGHT)},
 			padding = clay.Padding{left = BUTTON_H_PAD, right = BUTTON_H_PAD},
 			childAlignment = {x = .Center, y = .Center},
 		},
@@ -1565,6 +1572,7 @@ playback_rate_dropdown :: proc() {
 					playback_rate_name(rate, UI_TEXT_RATE_MENU[i].name[:]),
 					playback_rate_label(rate, UI_TEXT_RATE_MENU[i].label[:]),
 					playback_rate == rate,
+					fill_width = true,
 				)
 			}
 		}
