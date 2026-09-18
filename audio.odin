@@ -1294,6 +1294,18 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				had_evt = true
 				sdl.ResumeAudioDevice(audio_device)
 				audio_provision(sync.atomic_load(&audio_anchor_frame))
+				// Provisioning reopens every decoder synchronously -- hundreds
+				// of ms once several sources are open. Video runs on the wall
+				// clock the whole time, so the playhead has moved past the
+				// anchor that was sampled before the open. Anchor to the stale
+				// frame and the offset never closes: the queue ceiling caps how
+				// far ahead the producer may fill, so once both clocks advance
+				// at realtime the lag is frozen in (measurably ~the provision
+				// duration, which is exactly why a manual seek clears it).
+				// Skip forward to where playback actually is instead.
+				if hop := playback_playhead_at(sdl.GetTicksNS(), max(1.0, playback_rate)); hop > audio_play_frame {
+					sync.atomic_store(&audio_jump_frame, hop)
+				}
 				if audio_trace {
 					fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", play_src_count, sync.atomic_load(&audio_anchor_frame), f64(sdl.GetTicksNS()-open_start)/1e6)
 				}
