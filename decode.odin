@@ -83,8 +83,11 @@ Clip_Decoder :: struct {
 	hold:        ^avutil.Frame,
 	pkt:         ^avcodec.Packet,
 	// Hardware decode state: hw_pix_fmt != .None when the codec opened with a
-	// hardware device context. Every decoded hw frame is transferred to sw_frame
-	// (in decode_one_forward) before touching the existing RGBA sws path.
+	// hardware device context. Each delivered hw frame is transferred to
+	// sw_frame (in scale_decoded_frame) before touching the existing RGBA sws
+	// path. sw_frame is a PERSISTENT transfer destination: it keeps its buffer
+	// between frames so av_hwframe_transfer_data reuses it instead of taking
+	// its allocate-a-fresh-sw-frame path on every frame.
 	hw_pix_fmt:  avutil.PixelFormat,
 	hw_device:   ^avutil.BufferRef,
 	sw_frame:    ^avutil.Frame,
@@ -607,17 +610,14 @@ decode_one_forward :: proc(dec: ^Clip_Decoder) -> bool {
 			if r < 0 {
 				return false
 			}
-			if dec.hw_pix_fmt != .None && avutil.PixelFormat(dec.frame.format) == dec.hw_pix_fmt {
-				// Hardware frame: pull the pixels into sw_frame, carry its
-				// props (PTS), and make the decoder's frame the transferred sw
-				// one so receive_frame()'s buffer can be unref'd / reused.
-				if avutil.hwframe_transfer_data(dec.sw_frame, dec.frame, 0) < 0 {
-					return false
-				}
-				_ = avutil.frame_copy_props(dec.sw_frame, dec.frame)
-				avutil.frame_unref(dec.frame)
-				avutil.frame_move_ref(dec.frame, dec.sw_frame)
-			}
+			// A hardware frame is left in dec.frame here; the transfer to the
+			// persistent sw_frame happens once, in scale_decoded_frame. Doing it
+			// there (rather than here) keeps sw_frame's buffer alive between
+			// frames, so av_hwframe_transfer_data takes its reuse path. The old
+			// code moved sw_frame into dec.frame every frame, which emptied
+			// sw_frame and made the next transfer allocate a fresh full-size
+			// software frame (plus free the previous) on every decoded frame --
+			// the entire hardware-decode penalty.
 			dec.decoded_ahead += 1
 			return true
 		}
@@ -660,8 +660,7 @@ decode_forward_to_target :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 			dec.last_frame = frame_idx
 			dec.have_last = true
 			dec.last_emitted_ts = dec.frame.best_effort_timestamp
-			scale_decoded_frame(dec)
-			return true
+			return scale_decoded_frame(dec)
 		}
 		// Frame is before the target: remember it as the last acceptable one.
 		_ = avutil.frame_replace(dec.hold, dec.frame)
@@ -690,8 +689,7 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		dec.last_frame = frame_idx
 		dec.have_last = true
 		dec.last_emitted_ts = dec.frame.best_effort_timestamp
-		scale_decoded_frame(dec)
-		return true
+		return scale_decoded_frame(dec)
 	}
 	// Forward streaming: the request is ahead by more than one frame. Keep
 	// decoding forward in place rather than seeking, while the gap is small
@@ -714,12 +712,27 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 	return decode_forward_to_target(dec, frame_idx)
 }
 
-scale_decoded_frame :: proc(dec: ^Clip_Decoder) {
+// scale_decoded_frame scales dec.frame into the decoder's RGBA dst buffer,
+// transferring hardware frames to the persistent sw_frame first. Returns false
+// if the hardware readback fails, so the caller can treat it as a decode
+// failure rather than serving a stale or half-written dst.
+scale_decoded_frame :: proc(dec: ^Clip_Decoder) -> bool {
+	src := dec.frame
+	if dec.hw_pix_fmt != .None && avutil.PixelFormat(dec.frame.format) == dec.hw_pix_fmt {
+		// Read the hw surface into the persistent sw_frame. sw_frame retains
+		// its buffer across calls, so this is a straight readback with no
+		// allocation -- allocating a fresh sw frame per decoded frame was the
+		// dominant hardware-decode cost (see decode_one_forward).
+		if avutil.hwframe_transfer_data(dec.sw_frame, dec.frame, 0) < 0 {
+			return false
+		}
+		src = dec.sw_frame
+	}
 	if dec.sws_ctx == nil {
 		// Hardware decode negotiated the sw format only now (first frame).
 		// Use the frame's own dims/format so crop differences can't drift.
 		dec.sws_ctx = sws.getContext(
-			dec.frame.width, dec.frame.height, avutil.PixelFormat(dec.frame.format),
+			src.width, src.height, avutil.PixelFormat(src.format),
 			dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA,
 			sws.Flags{.Bilinear}, nil, nil, nil,
 		)
@@ -729,13 +742,17 @@ scale_decoded_frame :: proc(dec: ^Clip_Decoder) {
 	}
 	sws.scale(
 		dec.sws_ctx,
-		cast([^][^]u8)&dec.frame.data[0],
-		cast([^]c.int)&dec.frame.linesize[0],
-		0, dec.frame.height,
+		cast([^][^]u8)&src.data[0],
+		cast([^]c.int)&src.linesize[0],
+		0, src.height,
 		cast([^][^]u8)&dec.dst[0],
 		cast([^]c.int)&dec.dst_linesize[0],
 	)
+	// Unref the decoder's frame (the hw surface for a hw frame) so its buffer
+	// can be recycled. sw_frame is deliberately NOT unref'd: keeping its buffer
+	// is what makes the next transfer reuse instead of realloc.
 	avutil.frame_unref(dec.frame)
+	return true
 }
 
 // frame_data returns a slice of the decoder's RGBA output buffer, row-aligned.
