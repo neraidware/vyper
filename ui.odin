@@ -207,7 +207,9 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					},
 					image = {imageData = nil},
 				},
-				) {}
+				) {
+					preview_fit_button()
+				}
 				// Transport strip: jog / play / rate, then the frame counter.
 				if clay.UI(clay.ID("ActionsArea"))(
 				{
@@ -1589,6 +1591,46 @@ jog_button :: proc(name: string, dir: int) {
 	},
 	) {
 		// The skip glyph is drawn as an embedded icon over this element.
+	}
+}
+
+// preview_fit_button is the small toggle floating in the preview's top-right
+// corner. While armed the camera is pinned to the contain-fit of the canvas
+// (preview_fit_reset); panning or zooming releases it (interaction/event), so
+// the held border reads whether the canvas is currently fit to the panel.
+preview_fit_button :: proc() {
+	active := preview_fit_to_window
+	if clay.UI(clay.ID("PreviewFitButton"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(BUTTON_HEIGHT)},
+			padding = clay.Padding{left = BUTTON_H_PAD, right = BUTTON_H_PAD},
+			childAlignment = {x = .Center, y = .Center},
+		},
+		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
+		border = {
+			color = active ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			width = clay.BorderOutside(active ? 2 : 1),
+		},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+		floating = {
+			offset = {-PREVIEW_FIT_MARGIN, PREVIEW_FIT_MARGIN},
+			parentId = clay.ID("Preview").id,
+			zIndex = 100,
+			attachment = {element = .RightTop, parent = .RightTop},
+			attachTo = .ElementWithId,
+			pointerCaptureMode = .Capture,
+			clipTo = .None,
+		},
+	},
+	) {
+		clay.Text(
+			"Fit",
+			clay.TextElementConfig {
+				textColor = active ? BUTTON_BORDER_HOVER : TEXT,
+				fontSize = FONT_SMALL,
+			},
+		)
 	}
 }
 

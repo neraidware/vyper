@@ -65,5 +65,9 @@ MEDIA_LABEL_H :: f32(16)  // Basename line height under the thumbnail.
 MEDIA_BIN_MIN_W :: 210    // MediaBin column sizing bounds (wider than before so the
 MEDIA_BIN_MAX_W :: 360    // grid can reach 2 columns without cramping).
 
+// Preview overlay: the fit-to-window toggle floats in the preview's top-right
+// corner, inset by this margin.
+PREVIEW_FIT_MARGIN :: f32(8)
+
 // Text input field glyph size (shared by the popup layout and the caret draw).
 TEXT_INPUT_FONT :: u16(18)

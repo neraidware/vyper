@@ -17,6 +17,7 @@ package main
 // Each case builds a full-canvas box, grabs the handle ON its border, then
 // asserts the pointer/border behavior. pixel<->project is identity here.
 
+import "core:c"
 import "core:fmt"
 import "core:os"
 import clay "clay-odin"
@@ -53,6 +54,17 @@ probe_visible_edges :: proc(c: ^Clip) -> (l, r, t, b: f32) {
 }
 
 transform_probe_run :: proc(v: string) {
+	// preview_view -> clamp_preview_camera reads clay element bounding boxes, so
+	// clay must be initialized before this math runs. With no layout built it
+	// returns the not-found default and the clamp falls back to the canvas size.
+	// (main.odin dispatches probes before its own clay.Initialize.)
+	memory := make([^]u8, clay.MinMemorySize())
+	clay.Initialize(
+		clay.CreateArenaWithCapacityAndMemory(c.size_t(clay.MinMemorySize()), memory),
+		{WINDOW_WIDTH, WINDOW_HEIGHT},
+		{handler = clay_probe_error},
+	)
+
 	PW := f32(project.width)
 	PH := f32(project.height)
 	canvas := probe_canvas()
@@ -338,6 +350,50 @@ transform_probe_run :: proc(v: string) {
 		l, r, t, b = probe_visible_edges(&c)
 		check(&fail, abs(r - PW) > 50, "br single-axis: box detaches as soon as one axis returns inside", l, r, t, b)
 		check(&fail, abs(b - PH) > 50, "br single-axis: driven corner follows the pointer again", l, r, t, b)
+	}
+
+	// --- Case 23: the fit-to-window toggle pins the camera to the contain-fit
+	// even when zoom/pan were dirtied, and releasing it lets the manual camera
+	// apply. This is the "always fits" invariant the toolbar toggle relies on.
+	{
+		preview_fit_to_window = true
+		preview_cam_zoom = 4
+		preview_cam_ox = 123
+		preview_cam_oy = -45
+		v := preview_view(canvas)
+		check(
+			&fail,
+			abs(preview_cam_zoom - 1) <= 0.0001 &&
+			abs(preview_cam_ox) <= 0.0001 &&
+			abs(preview_cam_oy) <= 0.0001,
+			"fit: dirty camera must snap back to zoom 1 / no pan",
+			v.x,
+			v.x + v.width,
+			v.y,
+			v.y + v.height,
+		)
+		check(
+			&fail,
+			abs(v.x - canvas.x) <= 0.0001 && abs(v.width - canvas.width) <= 0.0001,
+			"fit: view must equal the base canvas",
+			v.x,
+			v.x + v.width,
+			v.y,
+			v.y + v.height,
+		)
+		preview_fit_to_window = false
+		preview_cam_zoom = 2
+		v = preview_view(canvas)
+		check(
+			&fail,
+			abs(v.width - canvas.width * 2) <= 0.0001,
+			"released: manual zoom must apply",
+			v.x,
+			v.x + v.width,
+			v.y,
+			v.y + v.height,
+		)
+		preview_fit_to_window = true
 	}
 
 	if !fail {

@@ -30,6 +30,15 @@ preview_canvas :: proc(bounds: clay.BoundingBox) -> clay.BoundingBox {
 	}
 }
 
+// preview_fit_reset snaps the camera to the contain-fit of the canvas in the
+// panel: zoom 1, no pan. preview_view then renders exactly preview_canvas, so
+// the whole frame is visible. Called when the fit toggle is re-armed.
+preview_fit_reset :: proc() {
+	preview_cam_zoom = 1.0
+	preview_cam_ox = 0
+	preview_cam_oy = 0
+}
+
 // clamp_preview_camera keeps the zoom in range and the pan inside the
 // image-viewer bound: the canvas's on-screen edge may reach the panel edge,
 // never cross it. That single rule carries both properties the user wants --
@@ -41,6 +50,13 @@ preview_canvas :: proc(bounds: clay.BoundingBox) -> clay.BoundingBox {
 // "one canvas axis from the origin") was the drift: correct at zoom 1, it
 // became an arbitrary wall the moment the view outgrew the window.
 clamp_preview_camera :: proc(canvas: clay.BoundingBox) {
+	// While the fit toggle is armed, the camera is defined to be the contain-fit
+	// every frame. The pan/zoom handlers clear the flag before touching the
+	// camera, so this enforcement only re-asserts the fit (e.g. after a resize)
+	// -- it never fights a user's pan.
+	if preview_fit_to_window {
+		preview_fit_reset()
+	}
 	preview_cam_zoom = clamp(preview_cam_zoom, PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
 	panel := clay.GetElementData(clay.ID("Preview")).boundingBox
 	px := panel.width

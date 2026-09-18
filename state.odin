@@ -632,6 +632,11 @@ PREVIEW_CAM_MAX_ZOOM :: 8.0
 preview_cam_ox: f32
 preview_cam_oy: f32
 preview_cam_zoom: f32 = 1.0
+// preview_fit_to_window pins the camera to the contain-fit of the canvas in the
+// preview panel (zoom 1, no pan) so the whole frame is always visible, including
+// after a panel resize. Panning or zooming clears it (the user took the camera),
+// and the toolbar toggle re-arms it and snaps the camera back (preview_fit_reset).
+preview_fit_to_window: bool = true
 panning_preview: bool
 pan_last_x: f32
 pan_last_y: f32

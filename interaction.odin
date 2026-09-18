@@ -47,8 +47,15 @@ interaction_pre_build :: proc(inp: Mouse_Input) {
 	// clamp_preview_camera).
 	if inp.middle && clay.PointerOver(clay.ID("Preview")) {
 		if panning_preview {
-			preview_cam_ox += inp.x - pan_last_x
-			preview_cam_oy += inp.y - pan_last_y
+			dx := inp.x - pan_last_x
+			dy := inp.y - pan_last_y
+			if dx != 0 || dy != 0 {
+				// The user is steering the camera, so the fit toggle releases and
+				// the pan sticks at the dragged position.
+				preview_fit_to_window = false
+				preview_cam_ox += dx
+				preview_cam_oy += dy
+			}
 		}
 		panning_preview = true
 		pan_last_x = inp.x
@@ -811,6 +818,14 @@ if len(drag_group_orig) > 1 {
 			help_open = !help_open
 		} else if help_open && !clay.PointerOver(clay.ID("HelpPanel")) {
 			help_open = false
+		}
+	}
+	// Preview fit toggle: re-arming it snaps the camera to the contain-fit;
+	// panning/zooming already cleared it (interaction_pre_build / event).
+	if was_click && clay.PointerOver(clay.ID("PreviewFitButton")) {
+		preview_fit_to_window = !preview_fit_to_window
+		if preview_fit_to_window {
+			preview_fit_reset()
 		}
 	}
 	// Right-click: a clip gets a clip menu; empty space gets the track menu.

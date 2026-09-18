@@ -185,6 +185,8 @@ handle_sdl_events :: proc(running: ^bool) {
 					old_zoom := preview_cam_zoom
 					new_zoom := clamp(old_zoom * (1 + 0.1 * event.wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
 					if new_zoom != old_zoom {
+						// Zooming steers the camera, so the fit toggle releases.
+						preview_fit_to_window = false
 						// NOTE: cursor-anchored zoom -- the point under the cursor
 					// stays put, so pan (preview_cam_ox|oy) scales by the zoom
 					// ratio here and only gets clamped later at render time.
