@@ -34,6 +34,7 @@ building. If building locally, you must do the same:
 
 ```powershell
 Copy-Item deps\lib\avcodec.lib   vendor\ffmpeg\avcodec\avcodec.lib -Force
+Copy-Item deps\lib\avfilter.lib  vendor\ffmpeg\avfilter\avfilter.lib -Force
 Copy-Item deps\lib\avformat.lib  vendor\ffmpeg\avformat\avformat.lib -Force
 Copy-Item deps\lib\avutil.lib    vendor\ffmpeg\avutil\avutil.lib -Force
 Copy-Item deps\lib\swresample.lib vendor\ffmpeg\swresample\swresample.lib -Force
@@ -53,6 +54,7 @@ SDL3.dll
 ffmpeg.exe        ← vyper shells out to this for transcoding
 ffprobe.exe       ← vyper shells out to this for probing
 avcodec-63.dll    ← ffmpeg runtime DLLs (version numbers vary by BtbN build)
+avfilter-N.dll
 avformat-63.dll
 avutil-61.dll
 swresample-7.dll

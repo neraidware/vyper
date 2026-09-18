@@ -62,7 +62,7 @@ jobs:
           Copy-Item "$src\bin\ffprobe.exe" deps\ -Force
           # Drop import libs into vendor/ffmpeg/<lib>/<lib>.lib for the libs the
           # app actually binds (relative foreign-import resolution).
-          foreach ($l in @("avcodec","avformat","avutil","swresample","swscale")) {
+          foreach ($l in @("avcodec","avfilter","avformat","avutil","swresample","swscale")) {
             Copy-Item "deps\lib\$l.lib" "vendor\ffmpeg\$l\$l.lib" -Force
           }
 
