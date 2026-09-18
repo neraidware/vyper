@@ -106,6 +106,18 @@ interaction_pre_build :: proc(inp: Mouse_Input) {
 		inspector_content_height(),
 		inspector_view_height(),
 	)
+	if undo_hist.view_open {
+		scroll_drag_update(
+			"UndoViewer",
+			inp.left,
+			inp.y,
+			&undo_view_scroll_dragging,
+			&undo_view_scroll_grab,
+			&undo_hist.view_scroll,
+			undo_view_rows_height(),
+			undo_view_clip_height(),
+		)
+	}
 	clay.SetPointerState({inp.x, inp.y}, inp.left)
 }
 
@@ -116,6 +128,7 @@ clamp_view_scrolls :: proc() {
 		timeline_view_top = clamp(timeline_view_top, 0, timeline_tracks_max_top())
 	}
 	inspector_scroll = clamp(inspector_scroll, 0, inspector_max_scroll())
+	undo_hist.view_scroll = clamp(undo_hist.view_scroll, 0, undo_view_max_scroll())
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +252,27 @@ dispatch_click_fallback :: proc(inp: Mouse_Input) -> bool {
 // click_fallbacks: the chain's trailing else block, as order-kept probes. Each
 // returns true when it consumed the click.
 click_fallbacks := []proc(inp: Mouse_Input) -> bool{
+	// Undo-tree viewer (when open): a click on a tree row moves the cursor to
+	// that action. First in the chain so the open panel claims its own rows
+	// before anything underneath.
+	proc(inp: Mouse_Input) -> bool {
+		return undo_view_row_click(inp)
+	},
+	// Undo-tree viewer scrollbar (thumb drag / strip jump).
+	proc(inp: Mouse_Input) -> bool {
+		if !undo_hist.view_open {
+			return false
+		}
+		if scroll_press(
+			"UndoViewer",
+			inp.y,
+			&undo_view_scroll_dragging,
+			&undo_view_scroll_grab,
+		) {
+			return true
+		}
+		return false
+	},
 	// Scrollbar: pressing the thumb starts a drag; pressing anywhere else on
 	// the strip jumps the thumb to the cursor. One stack per scrollable column
 	// (inspector cards only — the timeline scrolls by wheel/pan).
@@ -548,7 +582,7 @@ interaction_post_build :: proc(
 			if drag_hover_track != drag_source_track &&
 			   drag_hover_track >= 0 &&
 			   drag_source_track >= 0 {
-if len(drag_group_orig) > 1 {
+				if len(drag_group_orig) > 1 {
 					// Vertical drop for a linked group is measured in VISUAL rows:
 					// the group shifts by the number of stack rows between the
 					// anchor's source track and the hovered lane, regardless of
@@ -564,6 +598,33 @@ if len(drag_group_orig) > 1 {
 					)
 				}
 			}
+			// Record the move only if the gesture actually changed something:
+			// same-track drags already applied their start live, so compare
+			// against the capture-time snapshot.
+			{
+				moved := false
+				if len(drag_group_orig) > 1 {
+					moved =
+						drag_group_delta != 0 ||
+						(drag_hover_track >= 0 &&
+							drag_hover_track != drag_source_track &&
+							order_row_of(drag_hover_track) != order_row_of(drag_source_track))
+				} else if len(drag_group_orig) > 0 && drag_clip != nil {
+					moved =
+						drag_clip.timeline_start_frame != drag_group_orig[0].start ||
+						(drag_hover_track >= 0 && drag_hover_track != drag_source_track)
+				}
+				if moved {
+					label := len(drag_group_orig) > 1 ? "Move clip(s)" : "Move clip"
+					undo_push(.Move, label)
+				}
+			}
+		case .Clip_Resize:
+			// Resize is applied live during the drag; capture the gesture as one
+			// undo node on release.
+			if resize_moved {
+				undo_push(.Resize, len(drag_group_orig) > 1 ? "Resize clip(s)" : "Resize clip")
+			}
 		}
 		active_interaction = .None
 		dragging_handle = nil
@@ -576,6 +637,7 @@ if len(drag_group_orig) > 1 {
 		drag_group_delta = 0
 		clear(&drag_group_orig)
 		resize_edge = -1
+		resize_moved = false
 	} else {
 		switch active_interaction {
 		case .Media_Bin_Drag:
@@ -655,6 +717,7 @@ if len(drag_group_orig) > 1 {
 						resize_clip_right(&timeline.tracks[selected_track], selected_index, i64(frame))
 					}
 				}
+				resize_moved = true
 				audio_note_edit()
 			}
 		case .Clip_Move:
@@ -818,6 +881,17 @@ if len(drag_group_orig) > 1 {
 			help_open = !help_open
 		} else if help_open && !clay.PointerOver(clay.ID("HelpPanel")) {
 			help_open = false
+		}
+	}
+	// Undo-tree viewer: the Undo button toggles it; any other click outside the
+	// panel dismisses it (the viewer closes like the help overlay, not on every
+	// action). Row clicks inside the panel are claimed earlier by
+	// undo_view_row_click and only move the cursor.
+	if was_click {
+		if clay.PointerOver(clay.ID("UndoViewButton")) {
+			undo_hist.view_open = !undo_hist.view_open
+		} else if undo_hist.view_open && !clay.PointerOver(clay.ID("UndoPanel")) {
+			undo_hist.view_open = false
 		}
 	}
 	// Preview fit toggle: re-arming it snaps the camera to the contain-fit;

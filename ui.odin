@@ -117,6 +117,32 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			if clay.UI(clay.ID("AppSpacer"))(
 			{layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}}},
 			) {}
+			// Undo-tree viewer toggle.
+			if clay.UI(clay.ID("UndoViewButton"))(
+			{
+				layout = {
+					sizing = {
+						width = clay.SizingFixed(56),
+						height = clay.SizingFixed(BUTTON_HEIGHT),
+					},
+					childAlignment = {x = .Center, y = .Center},
+				},
+				backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
+				border = {
+					color = undo_hist.view_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+					width = clay.BorderOutside(undo_hist.view_open ? 2 : 1),
+				},
+				cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+			},
+			) {
+				clay.Text(
+					"Undo",
+					clay.TextElementConfig {
+						textColor = undo_hist.view_open ? BUTTON_BORDER_HOVER : TEXT,
+						fontSize = FONT_NORMAL,
+					},
+				)
+			}
 			// Help overlay toggle ("?" / F1).
 			if clay.UI(clay.ID("HelpButton"))(
 			{
@@ -818,6 +844,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		}
 	}
 	draw_context_menu()
+	draw_undo_view(width, height)
 	draw_help_overlay(width, height)
 	draw_text_input_popup(width, height)
 
@@ -1905,6 +1932,9 @@ HELP_SHORTCUTS :: []Help_Shortcut {
 	{"Delete", "Delete selected clip (raw)"},
 	{"Esc", "Dismiss menu / dialog"},
 	{"F1 / ?", "Toggle this overlay"},
+	{"F2 / Undo button", "Toggle the undo-tree viewer"},
+	{"Ctrl+Z", "Undo (move up the undo tree)"},
+	{"Ctrl+Shift+Z / Ctrl+Y", "Redo (move down the undo tree)"},
 	{"Wheel over ruler/timeline", "Zoom about the playhead"},
 	{"Wheel over track lanes", "Scroll the track list"},
 	{"Drag timeline scrollbar", "Scroll the track list"},

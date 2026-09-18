@@ -330,6 +330,7 @@ escape_dismiss :: proc() {
 	close_context_menu()
 	playback_rate_open = false
 	help_open = false
+	undo_hist.view_open = false
 }
 
 // begin_clip_rename opens the generic text field to edit the selected clip's
@@ -353,10 +354,20 @@ apply_rename :: proc() {
 		}
 	}
 	if _, clip, ok := find_clip_by_id(ti.target); ok {
+		new_name := strings.trim_space(name)
+		changed := clip.name != new_name
 		if clip.name != "" {
 			delete(clip.name)
 		}
-		clip.name = strings.clone(name)
+		clip.name = strings.clone(new_name)
+		if ti.is_create {
+			// The create-mode rename is what keeps the just-inserted clip: an
+			// empty/cancelled name already deleted it above, so reaching here
+			// means a real text clip was added.
+			undo_push(.Text, "Add text clip")
+		} else if changed {
+			undo_push(.Rename, "Rename clip")
+		}
 	}
 }
 
@@ -678,6 +689,8 @@ add_subtitle_clip_at :: proc() {
 
 	selected_track = ctx_menu.target_track
 	selected_index = idx
+
+	undo_push(.Text, "Add subtitle clip")
 }
 
 // is_srt_pick reports whether a picked path is a subtitle file (".srt" suffix,
@@ -1002,6 +1015,11 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if ap, _ := os.lookup_env_alloc("VYPER_AUDIO_PROBE", context.temp_allocator); ap != "" {
 		os.exit(audio_probe_run(ap))
 	}
+	// Headless undo-tree probe: validates the history tree and the viewer's row
+	// renderer without a display (needs no fonts / SDL).
+	if handle_undo_probe() {
+		return
+	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.
@@ -1112,6 +1130,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	defer async_dec_shutdown()
 	import_bg_init()
 	defer import_bg_shutdown()
+	undo_init()
 	defer if warm_valid {
 		clip_decoder_reset(&warm_decoder)
 	}

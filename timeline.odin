@@ -521,6 +521,7 @@ split_clip_at_playhead :: proc() {
 	if vyper_trace {
 		fmt.printf("[tl] split group link=%d (%d clips) @ %d\n", link, len(targets), frame)
 	}
+	undo_push(.Split, "Split clip(s)")
 	audio_note_edit()
 }
 
@@ -746,6 +747,7 @@ delete_selected_clip_raw :: proc() {
 	drag_source_index = -1
 	drag_hover_track = -1
 	invalidate_preview_slots()
+	undo_push(.Delete, "Delete clip")
 	audio_note_edit()
 }
 
@@ -895,6 +897,7 @@ ripple_delete_region :: proc(start, length: i64) {
 	}
 	selected_track = -1
 	selected_index = -1
+	undo_push(.Delete, "Delete region")
 	audio_note_edit()
 }
 
@@ -974,6 +977,7 @@ ripple_delete_linked_group :: proc(link: u64) {
 	}
 	selected_track = -1
 	selected_index = -1
+	undo_push(.Delete, "Delete group")
 	audio_note_edit()
 }
 
@@ -1651,6 +1655,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 		insert_at += 1
 	}
 	inject_at_elem(&track.clips, insert_at, c)
+	undo_push(.Duplicate, "Duplicate clip")
 	return insert_at
 }
 

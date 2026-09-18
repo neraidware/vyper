@@ -358,6 +358,10 @@ SCRUB_DECIMATION :: 4
 upper_area_height: f32 = 560
 // resize_edge 0 = left (trim/extend head), 1 = right (trim/extend tail).
 resize_edge: int = -1
+// resize_moved marks that an edge-drag gesture actually resized (set live during
+// the drag, cleared on release) so its one undo node is recorded only on a real
+// trim, not on a handle click without a drag.
+resize_moved: bool = false
 // _timeline_resize_cursor and _timeline_arrow_cursor are lazily-created SDL
 // cursors: the horizontal-resize one is shown while dragging/hovering a clip's
 // duration edge, and the arrow is explicitly restored the rest of the time
@@ -649,6 +653,9 @@ timeline_pan_last_y: f32
 inspector_scroll: f32
 inspector_scroll_dragging: bool
 inspector_scroll_grab: f32
+// Undo-viewer scrollbar drag (same mechanics as the inspector cards column).
+undo_view_scroll_dragging: bool
+undo_view_scroll_grab: f32
 
 // Transient on-window notice (e.g. "couldn't load subtitles"): text owned by
 // the notice path, shown until ui_notice_until (ms) passes.

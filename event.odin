@@ -55,6 +55,23 @@ handle_sdl_events :: proc(running: ^bool) {
 				case sdl.K_F1:
 					// Always-available shortcut reference.
 					help_open = !help_open
+				case sdl.K_F2:
+					// Toggle the undo-tree viewer.
+					undo_hist.view_open = !undo_hist.view_open
+				case sdl.K_Z:
+					mods := sdl.GetModState()
+					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
+						if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
+							undo_redo()
+						} else {
+							undo_undo()
+						}
+					}
+				case sdl.K_Y:
+					mods := sdl.GetModState()
+					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
+						undo_redo()
+					}
 				case sdl.K_SPACE:
 					mods := sdl.GetModState()
 					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
@@ -125,6 +142,23 @@ handle_sdl_events :: proc(running: ^bool) {
 				}
 			}
 		case .MOUSE_WHEEL:
+			// Scroll over the undo-tree viewer scrolls its tree. The viewer is
+			// mouse-modal while open, so it claims the wheel before anything
+			// behind it.
+			if undo_hist.view_open {
+				up := clay.GetElementData(clay.ID("UndoPanel")).boundingBox
+				if up.height > 0 && event.wheel.mouse_x >= up.x && event.wheel.mouse_x <= up.x + up.width &&
+					event.wheel.mouse_y >= up.y && event.wheel.mouse_y <= up.y + up.height {
+					if event.wheel.y != 0 {
+						undo_hist.view_scroll = clamp(
+							undo_hist.view_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP,
+							0,
+							undo_view_max_scroll(),
+						)
+						break
+					}
+				}
+			}
 			// Scroll over the inspector column scrolls its card stack when
 			// the cards outgrow the viewport.
 			ic := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
