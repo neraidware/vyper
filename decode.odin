@@ -624,11 +624,57 @@ decode_one_forward :: proc(dec: ^Clip_Decoder) -> bool {
 	}
 }
 
+// FORWARD_STREAM_MAX_SEC bounds how far ahead a forward request may be served
+// by streaming decode in place before falling back to a keyframe seek. Below
+// this gap streaming never costs more than the seek it replaces -- the keyframe
+// before the target is no closer than the decoder's current position, so it
+// would re-decode the same frames from the start -- and it keeps the decoder in
+// its sequential fast mode instead of re-seeking on every displayed frame
+// whenever the playhead outruns the decoder (any rate above 1x, or a transient
+// lag). Beyond it (a far scrub or jump) the keyframe is genuinely closer.
+FORWARD_STREAM_MAX_SEC :: 1
+
+// decode_forward_to_target decodes forward from the decoder's current physical
+// position until the emitted frame's PTS reaches the target for frame_idx, then
+// leaves the delivered frame scaled in dec.dst. Stops at the LAST frame whose
+// PTS is at/below the target, so a one-frame overshoot (VFR, rate mapping) still
+// delivers the frame occupying the target's play position. Does NOT seek; the
+// caller positions the decoder first (streamed forward or after a seek).
+// Termination compares PTS directly against the target -- never a PTS->index
+// back conversion through an assumed frame rate, which drifted on odd files.
+decode_forward_to_target :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
+	target := frames_to_stream_ts(dec, frame_idx)
+	held := false
+	for {
+		if !decode_one_forward(dec) {
+			return false
+		}
+		pts := dec.frame.best_effort_timestamp
+		if pts >= target {
+			// Current frame reaches/exceeds the target. Deliver it when it is
+			// exactly the target (normal CFR) or when nothing earlier was held;
+			// otherwise the held frame (last pts < target) is the requested one.
+			if pts != target && held {
+				_ = avutil.frame_replace(dec.frame, dec.hold)
+			}
+			dec.last_frame = frame_idx
+			dec.have_last = true
+			dec.last_emitted_ts = dec.frame.best_effort_timestamp
+			scale_decoded_frame(dec)
+			return true
+		}
+		// Frame is before the target: remember it as the last acceptable one.
+		_ = avutil.frame_replace(dec.hold, dec.frame)
+		held = true
+	}
+}
+
 // decode_source_frame decodes the given source frame index into the decoder's
 // internal RGBA dst buffer. Returns true on success. The caller may read it via
-// decode_into_buffer() after a successful call. Forward-sequential requests
-// decode the next frame without seeking; anything else re-seeks to the
-// keyframe before the target and decodes forward.
+// decode_into_buffer() after a successful call. Consecutive forward requests
+// decode the next frame in place; a small forward gap streams forward in place
+// (no seek); everything else (backward jump, cold decoder, far forward jump)
+// re-seeks to the keyframe before the target and decodes forward from there.
 decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 	if !dec.opened {
 		return false
@@ -647,46 +693,25 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		scale_decoded_frame(dec)
 		return true
 	}
-	// Discontiguous: re-seek to the keyframe before the target, then decode
-	// forward until the emitted frame's PTS reaches the target timestamp. Stop at
-	// the LAST frame whose best_effort_timestamp is at/below the target (that is
-	// frame `frame_idx` for exact-rate CFR; for VFR or a one-frame overshoot it
-	// is the frame actually occupying the target's play position). Termination
-	// compares PTS directly against the target -- never a PTS->index back
-	// conversion through an assumed frame rate, which drifted on odd files.
+	// Forward streaming: the request is ahead by more than one frame. Keep
+	// decoding forward in place rather than seeking, while the gap is small
+	// enough that streaming cannot cost more than the keyframe re-decode it
+	// replaces (see FORWARD_STREAM_MAX_SEC). This is the path playback takes
+	// whenever the playhead outruns the decoder by >1 frame; without it every
+	// such frame paid avformat seek + flush + decode-from-keyframe.
+	if dec.have_last {
+		gap := frame_idx - dec.last_frame
+		max_gap := i64(dec.fps_num / dec.fps_den) * FORWARD_STREAM_MAX_SEC
+		if gap > 1 && gap <= max_gap {
+			return decode_forward_to_target(dec, frame_idx)
+		}
+	}
+	// Backward jump, cold decoder, or a forward jump beyond the streaming
+	// bound: seek to the keyframe before the target, then decode forward.
 	if !seek_to_source_frame(dec, frame_idx) {
 		return false
 	}
-	target := frames_to_stream_ts(dec, frame_idx)
-	held := false
-	for {
-		if !decode_one_forward(dec) {
-			return false
-		}
-		pts := dec.frame.best_effort_timestamp
-		if pts >= target {
-			// Current frame reaches/exceeds the target. If it is exactly the
-			// target (normal CFR case) deliver it; if it overshot, the previous
-			// held frame (last pts < target) is the requested one.
-			if pts == target || !held {
-				dec.last_frame = frame_idx
-				dec.have_last = true
-				dec.last_emitted_ts = pts
-				scale_decoded_frame(dec)
-				return true
-			}
-			// Overshot: deliver the held (earlier) frame instead.
-			_ = avutil.frame_replace(dec.frame, dec.hold)
-			dec.last_frame = frame_idx
-			dec.have_last = true
-			dec.last_emitted_ts = dec.frame.best_effort_timestamp
-			scale_decoded_frame(dec)
-			return true
-		}
-		// Frame is before the target: remember it as the last acceptable one.
-		_ = avutil.frame_replace(dec.hold, dec.frame)
-		held = true
-	}
+	return decode_forward_to_target(dec, frame_idx)
 }
 
 scale_decoded_frame :: proc(dec: ^Clip_Decoder) {
