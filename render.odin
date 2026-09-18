@@ -152,7 +152,7 @@ render_status_text :: proc() -> string {
 			return "Rendering..."
 		}
 		pct := i64(100) * done / total
-		text := fmt.bprintf(status_text_buf[:], "Rendering %lld / %lld (%d%%)", done, total, pct)
+		text := fmt.bprintf(status_text_buf[:], "Rendering %d / %d (%d%%)", done, total, pct)
 		return string(text)
 	case .Done:
 		return "Render complete"
