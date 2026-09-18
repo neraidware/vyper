@@ -90,7 +90,15 @@ Async_Decoder :: struct {
 	res_frame:   i64,
 	res_pick_hash: u32,
 	done_seq:    u64,
-	display_buf: [PREVIEW_W * PREVIEW_H * 4]u8,
+	// display_buf/wbuf point into frame_a/frame_b. The worker decodes into
+	// wbuf with no lock held, then swaps the two pointers under the mutex so
+	// the freshly decoded frame BECOMES display_buf with no full-frame copy;
+	// the worker's next fill is whichever buffer the swap displaced. Both the
+	// swap and every read of these pointers happen under `mutex`, so no reader
+	// can still hold the displaced buffer.
+	display_buf: ^[PREVIEW_W * PREVIEW_H * 4]u8,
+	frame_a:     [PREVIEW_W * PREVIEW_H * 4]u8,
+	frame_b:     [PREVIEW_W * PREVIEW_H * 4]u8,
 
 	// Worker-owned (touched only by the worker thread).
 	dec:             Clip_Decoder,
@@ -98,7 +106,7 @@ Async_Decoder :: struct {
 	// dec_preview_buf holds the preview path captured from the latest request
 	// for the CURRENT identity; it is stable for the decoder's lifetime.
 	dec_preview_buf: [4096]u8,
-	wbuf:            [PREVIEW_W * PREVIEW_H * 4]u8,
+	wbuf:            ^[PREVIEW_W * PREVIEW_H * 4]u8,
 }
 
 // async_decoders holds one worker per preview slot, indexed by slot_idx
@@ -216,7 +224,10 @@ vdec_worker :: proc "c" (data: rawptr) -> c.int {
 
 		sdl.LockMutex(ad.mutex)
 		if ok {
-			copy(ad.display_buf[:], ad.wbuf[:])
+			// Publish by swapping the fill/display pointers rather than copying
+			// the whole frame: the just-decoded buffer becomes display_buf and
+			// the old display buffer becomes the next fill target.
+			ad.wbuf, ad.display_buf = ad.display_buf, ad.wbuf
 			ad.res_valid = true
 			ad.res_path = req_path
 			ad.res_frame = req_frame
@@ -237,6 +248,10 @@ async_dec_init :: proc() {
 		ad.slot_idx = i
 		ad.mutex = sdl.CreateMutex()
 		ad.cond = sdl.CreateCondition()
+		// Point the fill/display pair at the backing buffers BEFORE the worker
+		// starts; the worker and every consumer assume both are non-nil.
+		ad.wbuf = &ad.frame_a
+		ad.display_buf = &ad.frame_b
 		ad.thread = sdl.CreateThread(vdec_worker, "vdecode", ad)
 	}
 }
