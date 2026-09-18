@@ -47,6 +47,7 @@ tl_scene :: proc() {
 	selected_track = -1
 	selected_index = -1
 	playhead.frame = 0
+	timeline_view_start = 0
 	drag_group_delta = 0
 	clear(&drag_group_orig)
 }
@@ -65,6 +66,7 @@ tl_single_clip_scene :: proc(clip_start, clip_len: i64) {
 	)
 	selected_track = -1
 	selected_index = -1
+	timeline_view_start = 0
 }
 
 // tl_group_starts returns the current timeline starts of the two L1 members
@@ -555,6 +557,31 @@ test_ripple_playhead_follow :: proc() {
 	playhead.frame = 100
 	ripple_delete_region(100, 50)
 	tl_probe_check(playhead.frame == 100, "at-cut: want 100, got %d", playhead.frame)
+
+	// The view pans by the playhead's delta, so the playhead keeps its on-screen
+	// position while the gap collapses.
+	tl_single_clip_scene(200, 50)
+	timeline_view_start = 200
+	playhead.frame = 300
+	ripple_delete_region(100, 50)
+	tl_probe_check(
+		playhead.frame == 250 && timeline_view_start == 150,
+		"view-pan after-region: want ph 250 view 150, got ph %d view %.0f",
+		playhead.frame,
+		timeline_view_start,
+	)
+
+	// Before the region: the playhead doesn't move, so the view doesn't pan.
+	tl_single_clip_scene(200, 50)
+	timeline_view_start = 200
+	playhead.frame = 50
+	ripple_delete_region(100, 50)
+	tl_probe_check(
+		playhead.frame == 50 && timeline_view_start == 200,
+		"view-pan before-region: want ph 50 view 200, got ph %d view %.0f",
+		playhead.frame,
+		timeline_view_start,
+	)
 
 	// Linked group: playhead follows the selected member's span.
 	timeline = Timeline {

@@ -847,11 +847,24 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 // the removed span; one inside the region clamps to the cut; one before the
 // region is untouched. Callers must move the playhead BEFORE audio_note_edit so
 // the audio producer re-seeks to the new frame.
+//
+// The timeline view pans by the same frame delta, so the playhead keeps its
+// on-screen position and the content at/after it stays put while the removed
+// span collapses behind it. Without this the view holds still and the playhead
+// (with every downstream clip) flies off to the left.
 ripple_playhead_after_region :: proc(start, end, length: i64) {
+	before := playhead.frame
 	if playhead.frame >= end {
 		playhead.frame -= length
 	} else if playhead.frame > start {
 		playhead.frame = start
+	}
+	if delta := playhead.frame - before; delta != 0 {
+		timeline_view_start = clamp(
+			timeline_view_start + f32(delta),
+			0,
+			f32(timeline_duration()),
+		)
 	}
 }
 
