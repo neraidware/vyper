@@ -57,11 +57,12 @@ probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
 // probe_media builds the asset metadata blob in-process (avformat), replacing
 // the shelled-out ffprobe. It keeps the exact key=value line format the
 // parsers (media_frame_count, media_dur_us) consume: format_name=, duration=,
-// size=, codec_name=, nb_frames=, avg_frame_rate=. nb_frames comes from a
-// container scan (one read), so it reflects decodable reality rather than the
-// container's estimated count. Only the first real video stream gets a
-// nb_frames line: that is the count every downstream frame-count consumer
-// wants, and scanning once keeps import O(1 read).
+// size=, codec_name=, nb_frames=, avg_frame_rate=. nb_frames prefers the
+// container's own sample count (MP4 stsz, etc.) so a multi-GB file imports
+// without an O(file) demux; only when the container leaves the count unknown
+// (some Matroska/MPEG-TS) does it fall back to a full container scan. Only the
+// first real video stream gets a nb_frames line: that is the count every
+// downstream frame-count consumer wants.
 probe_media :: proc(path: cstring) -> string {
 	fmt_ctx: ^avfmt.FormatContext
 	unavail := "Length: unavailable\nFormat: unavailable\nCodecs: unavailable\nSize: unavailable"
@@ -94,7 +95,11 @@ probe_media :: proc(path: cstring) -> string {
 			if codec_name != nil {
 				fmt.sbprintf(&sb, "codec_name=%s\n", string(codec_name))
 			}
-			if count := first_video_packet_count(fmt_ctx); count > 0 {
+			count: i64 = stream.nb_frames
+			if count <= 0 {
+				count = first_video_packet_count(fmt_ctx)
+			}
+			if count > 0 {
 				fmt.sbprintf(&sb, "nb_frames=%d\n", count)
 			}
 			// Only the first video stream carries a frame count; break the
