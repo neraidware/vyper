@@ -584,7 +584,11 @@ if len(drag_group_orig) > 1 {
 				update_handle_drag(sel, canvas, inp.x, inp.y, inp.shift)
 			}
 		case .Panel_Resize:
-			upper_area_height = inp.y - 8
+			// The divider sits in the root column below the app bar, so the
+			// pointer's y is offset by APP_BAR_H; center the grab strip on the
+			// cursor by subtracting half its height. Without the app-bar term
+			// the handle leads the cursor by exactly that strip's height.
+			upper_area_height = inp.y - APP_BAR_H - EDITOR_DIVIDER_H * 0.5
 			// Keep a lower-bound that scales with the window so a short window
 			// never lets the upper and lower areas collide (the old hardcoded
 			// 460/180 bounds collapsed on windows shorter than ~640px).

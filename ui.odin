@@ -335,7 +335,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		if clay.UI(clay.ID("EditorDivider"))(
 		{
 			layout = {
-				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(16)},
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(EDITOR_DIVIDER_H)},
 				childAlignment = {x = .Center, y = .Center},
 			},
 		},
