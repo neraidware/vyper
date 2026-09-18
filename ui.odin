@@ -219,6 +219,17 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					},
 				},
 				) {
+					// Empty balance spacer. Paired with TransportRight
+					// (equal SizingGrow), it splits the strip's free width
+					// evenly so PlayRow lands centered under the preview
+					// instead of hugging the left edge.
+					if clay.UI(clay.ID("TransportSpacerL"))(
+					{
+						layout = {
+							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+						},
+					},
+					) {}
 					if clay.UI(clay.ID("PlayRow"))(
 					{
 						layout = {
@@ -265,23 +276,30 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						jog_button("PlayFwd", 1)
 						playback_rate_dropdown()
 					}
-					if clay.UI(clay.ID("TransportSpacer"))(
+					// TopToBottom so childAlignment.x = .Right is honored
+					// (Clay ignores .Right on a LeftToRight main axis); the
+					// equal-grow pairing with TransportSpacerL keeps the
+					// counter flush right while PlayRow stays centered.
+					if clay.UI(clay.ID("TransportRight"))(
 					{
 						layout = {
 							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+							layoutDirection = .TopToBottom,
+							childAlignment = {x = .Right, y = .Center},
 						},
 					},
-					) {}
-					clay.Text(
-						fmt.bprintf(
-							UI_TEXT_STATE[:],
-							"%d / %d  ·  %gfps",
-							playhead.frame,
-							timeline_duration(),
-							timeline_fps(),
-						),
-						clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
-					)
+					) {
+						clay.Text(
+							fmt.bprintf(
+								UI_TEXT_STATE[:],
+								"%d / %d  ·  %gfps",
+								playhead.frame,
+								timeline_duration(),
+								timeline_fps(),
+							),
+							clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+						)
+					}
 				}
 			}
 			// Column 3: Inspector -- Project / Clip / Render cards. The cards
