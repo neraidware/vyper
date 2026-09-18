@@ -1516,6 +1516,7 @@ insert_track :: proc(order_pos: int) {
 	new_ti := len(timeline.tracks) - 1
 	pos := clamp(order_pos, 0, len(timeline.track_order))
 	inject_at_elem(&timeline.track_order, pos, new_ti)
+	undo_push(.Track, "Add track")
 }
 
 // move_track_to_row moves the track at STORAGE index `ti` so it occupies the
@@ -1559,6 +1560,7 @@ move_track_to_row :: proc(ti: int, target_row: int) {
 	}
 	inject_at_elem(&timeline.track_order, insert_at, ti)
 	invalidate_preview_slots()
+	undo_push(.Track, fmt.tprintf("Reorder track \"%s\"", timeline.tracks[ti].name))
 }
 
 // duplicate_track inserts a copy of the track directly ABOVE the original (one
@@ -1607,6 +1609,7 @@ duplicate_track :: proc(index: int) {
 	src_row := order_row_of(index)
 	pos := clamp(src_row, 0, len(timeline.track_order))
 	inject_at_elem(&timeline.track_order, pos, new_ti)
+	undo_push(.Duplicate, fmt.tprintf("Duplicate track \"%s\"", src.name))
 }
 
 // duplicate_clip inserts an independent copy of the clip at (track_idx,index)
@@ -1674,6 +1677,8 @@ remove_track :: proc(index: int) {
 		delete(c.markers)
 	}
 	delete(removed.clips)
+	name_buf: [128]u8
+	label := fmt.bprintf(name_buf[:], "Remove track \"%s\"", removed.name)
 	delete(removed.name)
 	ordered_remove(&timeline.tracks, index)
 	// Drop the removed track from the visual stack and renumber every entry
@@ -1703,5 +1708,6 @@ remove_track :: proc(index: int) {
 	// dropped or they keep painting at the playhead. Same rule as any delete.
 	invalidate_preview_slots()
 	audio_note_edit()
+	undo_push(.Track, label)
 	return
 }
