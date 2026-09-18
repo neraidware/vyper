@@ -429,36 +429,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
 				},
 				) {
-					// Timeline toolbar: snapping and zoom, always visible above the
-					// ruler so the whole timeline is controllable without hunting.
-					if clay.UI(clay.ID("TimelineBar"))(
-					{
-						layout = {
-							sizing = {
-								width = clay.SizingGrow({}),
-								height = clay.SizingFixed(TIMELINE_BAR_H),
-							},
-							layoutDirection = .LeftToRight,
-							childGap = BUTTON_ROW_GAP,
-							childAlignment = {x = .Left, y = .Center},
-						},
-					},
-					) {
-						if clay.UI(clay.ID("TimelineBarSpacer"))(
-						{
-							layout = {
-								sizing = {
-									width = clay.SizingGrow({}),
-									height = clay.SizingGrow({}),
-								},
-							},
-						},
-						) {}
-						bar_caption("Zoom:")
-						tool_button("TimelineZoomOut", "−")
-						tool_button("TimelineZoomFit", "Fit")
-						tool_button("TimelineZoomIn", "+")
-					}
 					// Timing ruler bar: mirrors the track rows' left gutter so its
 					// x-origin (frame 0) aligns exactly with the clip lanes.
 					if clay.UI(clay.ID("RulerRow"))(
@@ -808,8 +778,9 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						}
 						}
 					}
-					// Bottom bar: the snap toggles that used to live in the top
-					// toolbar, now under the tracks so the top bar stays zoom-only.
+					// Bottom bar: the snap toggles on the left, the zoom controls
+					// on the right, all under the tracks so the timeline is
+					// controllable without a separate top toolbar.
 					if clay.UI(clay.ID("TimelineBottomBar"))(
 					{
 						layout = {
@@ -825,6 +796,22 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					) {
 						settings_icon_button("SnapClipToPh", snap_clips_to_playhead)
 						settings_icon_button("SnapPhToClip", snap_playhead_to_clips)
+						// Grow spacer pushes the zoom group to the right edge,
+						// keeping the snap toggles pinned left.
+						if clay.UI(clay.ID("TimelineBottomSpacer"))(
+						{
+							layout = {
+								sizing = {
+									width = clay.SizingGrow({}),
+									height = clay.SizingGrow({}),
+								},
+							},
+						},
+						) {}
+						bar_caption("Zoom:")
+						tool_button("TimelineZoomOut", "−")
+						tool_button("TimelineZoomFit", "Fit")
+						tool_button("TimelineZoomIn", "+")
 					}
 				}
 			}

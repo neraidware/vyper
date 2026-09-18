@@ -51,7 +51,7 @@ TSCROLLBAR_MIN_H :: f32(28) // Smallest rendered scrollbar thumb.
 // and the timeline (Media | Preview | Inspector).
 APP_BAR_H :: f32(44)       // Top app bar strip (app name, project, help).
 EDITOR_DIVIDER_H :: f32(16) // Grab strip between the editor column band and the timeline.
-TIMELINE_BAR_H :: f32(36)  // Timeline toolbar above the ruler (snaps, zoom).
+TIMELINE_BAR_H :: f32(36)  // Timeline bottom bar height (snap toggles, zoom).
 INSPECTOR_MIN_W :: 296     // Right inspector column width bounds.
 INSPECTOR_MAX_W :: 356
 FIELD_H :: f32(30)         // Inline property field (X/Y/Scale/crop) height.
