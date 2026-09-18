@@ -507,8 +507,14 @@ draw_clip_markers :: proc(
 	restore_full := false
 	for track, track_idx in timeline.tracks {
 		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
-		gap := clay.GetElementData(clay.ID("TrackGap", u32(track_idx))).boundingBox
-		gap_bounds = gap
+		// The gap above a track is laid out per ORDER row (ui.odin keys
+		// TrackGap by r while it keys ClipsSection by storage index), so the
+		// tile's gap is the row this track occupies in the visual stack, not
+		// its storage index. Storage==row only until the first reorder.
+		gap :=
+			clay.GetElementData(
+				clay.ID("TrackGap", u32(order_row_of(track_idx))),
+			).boundingBox
 		if lane.width > 0 && lane.height > 0 {
 			lo_y := min(lane.y, gap.y)
 			hi_y := max(lane.y + lane.height, gap.y + gap.height)
@@ -572,6 +578,10 @@ draw_clip_markers :: proc(
 						best_dist = d
 						hover_label = m.label
 						hover_x = line_x
+						// The tooltip renders in the gap strip above the marker's
+						// OWN track, so the strip travels with the winning marker
+						// rather than whichever track was processed last.
+						gap_bounds = gap
 					}
 				}
 			}
