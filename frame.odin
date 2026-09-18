@@ -33,7 +33,7 @@ render_ui_frame :: proc(
 	}
 	dec_t0 := sdl.GetTicksNS()
 	update_preview_slots()
-	ui_dec_us^ += i64(sdl.GetTicksNS() - dec_t0)
+	ui_dec_us^ += i64(sdl.GetTicksNS() - dec_t0) / 1000
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		slot := &preview_slots[i]
 		if !slot.in_use {
