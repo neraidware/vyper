@@ -39,9 +39,12 @@ FONT_HEADING :: 18 // track names, clip labels, big buttons
 // Fixed structural sizes.
 GUTTER_WIDTH :: 140        // Track-name / ruler-gutter column width.
 CLIP_TILE_HEIGHT :: f32(56) // Height of one timeline clip tile.
-TRACK_ROW_H :: f32(64)     // Height of one full timeline track row (fixed, so track
-                           // list scroll geometry is a pure function of the track
-                           // count and never re-derived from laid-out boxes).
+TRACK_ROW_H :: CLIP_TILE_HEIGHT // One track row is exactly one clip tile tall. The
+                                // name gutter fits the same 56px (heading text 18 +
+                                // 4px childGap + 34px buttons), so neither the clip
+                                // lane nor the gutter leaves slack at the row's
+                                // bottom. Fixed (not measured) so track-list scroll
+                                // geometry stays a pure function of the track count.
 TRACK_GAP_H :: 18          // Height of the insert gap above each track row.
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 TSCROLLBAR_W :: f32(10)    // Width of the timeline's vertical scrollbar strip.
