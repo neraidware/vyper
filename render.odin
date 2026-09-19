@@ -532,6 +532,10 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c
 	ctx.gop_size = 120
 	ctx.max_b_frames = 2
 	ctx.bit_rate = 8_000_000
+	// Thread count 0 = auto-detect: libx264 frames threads across cores. The
+	// FFmpeg default is 1 (single-threaded encode) unless opted in explicitly;
+	// leaving it defaulted wastes every core past the first on encode.
+	ctx.thread_count = 0
 	if ret := avutil.opt_set(ctx.priv_data, "preset", RENDER_VIDEO_PRESET, 0); ret < 0 {
 		// A hardcoded, known-valid preset on a known encoder: failing here means
 		// the build's libx264 disagrees, and silently running "medium" hides the
