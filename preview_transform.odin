@@ -523,6 +523,9 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: Handle,
 	ib := clip_image_bounds(canvas, clip)
 	handle_start_box_w = ib.width
 	handle_start_box_h = ib.height
+	// Scale/crop is applied live during the drag; capture the pre-edit document
+	// here so releasing commits the whole gesture as one transform node.
+	undo_begin()
 }
 
 // handle_drag_frozen reports whether a corner-handle drag must hold its box

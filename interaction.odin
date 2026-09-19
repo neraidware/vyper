@@ -364,6 +364,12 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			pcx, pcy := pixel_to_project_unclamped(canvas, inp.x, inp.y)
 			preview_drag_offset_x = pcx - sel.transform_x
 			preview_drag_offset_y = pcy - sel.transform_y
+			// handle_start_tx/ty double as the drag-start transform for the
+			// release-time change check; the move is applied live, so begin the
+			// pre-edit capture now and push one transform node on release.
+			handle_start_tx = sel.transform_x
+			handle_start_ty = sel.transform_y
+			undo_begin()
 			active_interaction = .Preview_Move
 			return true
 		}
@@ -626,6 +632,29 @@ interaction_post_build :: proc(
 			// undo node on release.
 			if resize_moved {
 				undo_push(.Resize, len(drag_group_orig) > 1 ? "Resize clip(s)" : "Resize clip")
+			}
+		case .Handle_Drag:
+			// Scale/crop is applied live; commit the gesture as one transform
+			// node only if the box actually changed.
+			if sel, ok := transformable_selected(); ok {
+				if sel.scale != handle_start_scale ||
+				   sel.crop_l != handle_start_crop_l ||
+				   sel.crop_r != handle_start_crop_r ||
+				   sel.crop_t != handle_start_crop_t ||
+				   sel.crop_b != handle_start_crop_b ||
+				   sel.transform_x != handle_start_tx ||
+				   sel.transform_y != handle_start_ty {
+					undo_push(.Transform, handle_kind == .Crop ? "Crop clip" : "Scale clip")
+				}
+			}
+		case .Preview_Move:
+			// A preview move is applied live; commit it as one transform node if
+			// the clip actually moved, against the drag-start capture.
+			if sel, ok := transformable_selected(); ok {
+				if sel.transform_x != handle_start_tx ||
+				   sel.transform_y != handle_start_ty {
+					undo_push(.Transform, "Move transform")
+				}
 			}
 		}
 		active_interaction = .None

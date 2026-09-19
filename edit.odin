@@ -55,29 +55,55 @@ edit_field_over :: proc() -> bool {
 
 edit_commit :: proc() {
 	defer edit_cancel()
-	if sel, ok := transformable_selected(); ok {
-		value, ok := strconv.parse_f32(string(edit_chars[:edit_len]))
-		if !ok {
-			return
-		}
-		switch editing_field {
-		case .X:
-			sel.transform_x = value
-		case .Y:
-			sel.transform_y = value
-		case .Scale:
-			sel.scale = max(value, 0.01)
-		case .Crop_L:
-			sel.crop_l = clamp(value / 100, 0, 1)
-		case .Crop_R:
-			sel.crop_r = clamp(value / 100, 0, 1)
-		case .Crop_T:
-			sel.crop_t = clamp(value / 100, 0, 1)
-		case .Crop_B:
-			sel.crop_b = clamp(value / 100, 0, 1)
-		case .None:
-		}
+	sel, ok := transformable_selected()
+	if !ok {
+		return
 	}
+	value, parsed_ok := strconv.parse_f32(string(edit_chars[:edit_len]))
+	if !parsed_ok {
+		return
+	}
+	// Resolve the edited field to its storage plus the clamped value and label.
+	// A parse that changes nothing (click in, click out) is not an edit and must
+	// not add a node, so the compare gates the commit below.
+	field: ^f32
+	label := "Edit clip transform"
+	switch editing_field {
+	case .X:
+		field = &sel.transform_x
+		label = "Set clip X"
+	case .Y:
+		field = &sel.transform_y
+		label = "Set clip Y"
+	case .Scale:
+		field = &sel.scale
+		value = max(value, 0.01)
+		label = "Set clip scale"
+	case .Crop_L:
+		field = &sel.crop_l
+		value = clamp(value / 100, 0, 1)
+		label = "Set clip crop"
+	case .Crop_R:
+		field = &sel.crop_r
+		value = clamp(value / 100, 0, 1)
+		label = "Set clip crop"
+	case .Crop_T:
+		field = &sel.crop_t
+		value = clamp(value / 100, 0, 1)
+		label = "Set clip crop"
+	case .Crop_B:
+		field = &sel.crop_b
+		value = clamp(value / 100, 0, 1)
+		label = "Set clip crop"
+	case .None:
+		return
+	}
+	if field^ == value {
+		return
+	}
+	undo_begin()
+	field^ = value
+	undo_push(.Transform, label)
 }
 
 edit_append :: proc(ch: u8) {

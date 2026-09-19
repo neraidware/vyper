@@ -466,6 +466,9 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	// One import that lands on several lanes ships one link group: the video
 	// clip plus one clip per audio stream are cut/moved/selected/deleted as a
 	// unit, so a video edit never leaves its audio behind.
+	// Every guard has passed, so this drop mutates the document: capture the
+	// pre-edit state and commit the placement as one media node below.
+	undo_begin()
 	link := new_clip_id()
 	first_placed := anchor_placed
 	for offset in 0 ..< n_lanes {
@@ -542,6 +545,7 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			first_placed = placed
 		}
 	}
+	undo_push(.Media, fmt.tprintf("Add \"%s\"", path_basename(asset.path)))
 
 	// Post-edit: point the playhead at the placed content, select ONLY the newly
 	// added clips, and tear down stale decode/playback state like every other

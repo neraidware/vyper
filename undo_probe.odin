@@ -166,6 +166,29 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	rcheck(clip_start() == 10, "redo restores m1", fail)
 	undo_redo()
 	rcheck(clip_start() == 99, "redo restores m2", fail)
+
+	// A numeric transform edit is a discrete node: committing a property field
+	// records it and undo brings the old value back. Reset to a clean base first.
+	undo_init()
+	selected_track = 0
+	selected_index = 0
+	before_x := timeline.tracks[0].clips[0].transform_x
+	editing_field = .X
+	edit_chars[0] = '2'
+	edit_chars[1] = '5'
+	edit_chars[2] = '0'
+	edit_len = 3
+	edit_commit()
+	rcheck(undo_count() == 1, "transform edit adds one node", fail)
+	rcheck(timeline.tracks[0].clips[0].transform_x == 250, "transform field applied", fail)
+	undo_undo()
+	rcheck(
+		timeline.tracks[0].clips[0].transform_x == before_x,
+		"undo restores pre-edit transform",
+		fail,
+	)
+	undo_redo()
+	rcheck(timeline.tracks[0].clips[0].transform_x == 250, "redo restores transform", fail)
 }
 
 // handle_undo_probe runs the probe when VYPER_UNDO_PROBE is set (headless; runs
