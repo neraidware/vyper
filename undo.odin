@@ -44,6 +44,11 @@ Undo_Node :: struct {
 	seq:          u32, // 1-based creation sequence (chronological order)
 	kind:         Undo_Kind,
 	label:        string, // short human line, session-heap clone
+	// snap is the editable timeline (tracks/clips/track_order) as it stood
+	// immediately AFTER this action. Restoring a node clones snap back into the
+	// live timeline, so a stored snapshot is never mutated by later edits. The
+	// root's snap is the session baseline (the timeline at undo_init).
+	snap:         Timeline,
 }
 
 Undo_History :: struct {
@@ -51,12 +56,99 @@ Undo_History :: struct {
 	current:    i32,                // slot the live document matches; 0 = pristine
 	seq:        u32,                // next sequence number
 	view_scroll: f32,               // scroll offset of the tree in the media bin view
+	// pending is the pre-edit capture taken by undo_begin; undo_push folds it into
+	// the cursor node's snapshot so an edit with no node of its own (import,
+	// transform, value) is not lost when the next recorded action is undone.
+	pending:       Timeline,
+	pending_valid: bool,
 }
 
 undo_hist: Undo_History
 
-undo_init :: proc() {
+// ---------------------------------------------------------------------------
+// Snapshot ownership. A snapshot duplicates the owned dynamic arrays and the
+// owned string fields (track.name, clip.name) — the two the live code also
+// frees (remove_track, rename) — so a stored snapshot never dangles when the
+// live copy is freed, and free_timeline can release both without leaking on
+// repeated undo. clip.path (asset-owned) and marker labels (shared by
+// duplicate_track, never freed) are shared as-is and never freed here.
+// ---------------------------------------------------------------------------
+
+clone_timeline :: proc(src: Timeline) -> Timeline {
+	out := Timeline {
+		track_order    = make([dynamic]int, len(src.track_order)),
+		playhead_frame = src.playhead_frame,
+		playback       = src.playback,
+		frame_rate     = src.frame_rate,
+	}
+	if len(src.tracks) == 0 {
+		return out
+	}
+	out.tracks = make([dynamic]Track, len(src.tracks))
+	for i in 0 ..< len(src.tracks) {
+		st := src.tracks[i]
+		nt := Track {
+			name  = strings.clone(st.name),
+			clips = make([dynamic]Clip, len(st.clips)),
+		}
+		for j in 0 ..< len(st.clips) {
+			c := st.clips[j]
+			c.name = strings.clone(c.name)
+			if len(c.markers) > 0 {
+				c.markers = make([dynamic]Clip_Marker, len(c.markers))
+				copy(c.markers[:], st.clips[j].markers[:])
+			} else {
+				c.markers = nil
+			}
+			nt.clips[j] = c
+		}
+		out.tracks[i] = nt
+	}
+	copy(out.track_order[:], src.track_order[:])
+	return out
+}
+
+free_timeline :: proc(t: ^Timeline) {
+	for &tr in t.tracks {
+		for &c in tr.clips {
+			if c.markers != nil {
+				delete(c.markers)
+			}
+			if c.name != "" {
+				delete(c.name)
+			}
+		}
+		if tr.clips != nil {
+			delete(tr.clips)
+		}
+		if tr.name != "" {
+			delete(tr.name)
+		}
+	}
+	if t.tracks != nil {
+		delete(t.tracks)
+	}
+	if t.track_order != nil {
+		delete(t.track_order)
+	}
+	t^ = {}
+}
+
+undo_free_all :: proc() {
+	for &n in undo_hist.slots {
+		free_timeline(&n.snap)
+	}
+	if undo_hist.pending_valid {
+		free_timeline(&undo_hist.pending)
+	}
+	if undo_hist.slots != nil {
+		delete(undo_hist.slots)
+	}
 	undo_hist = Undo_History{}
+}
+
+undo_init :: proc() {
+	undo_free_all()
 	append(
 		&undo_hist.slots,
 		Undo_Node {
@@ -66,9 +158,22 @@ undo_init :: proc() {
 			next_sibling = -1,
 			kind         = .None,
 			label        = "start",
+			snap         = clone_timeline(timeline),
 		},
 	)
 	undo_hist.current = 0
+}
+
+// undo_begin captures the document BEFORE a recorded edit mutates it. undo_push
+// folds this capture into the cursor node, so any change made since the cursor's
+// action (an untracked import/transform/value) survives undoing the edit.
+// Call it at the top of a discrete edit verb, or at the start of a drag gesture.
+undo_begin :: proc() {
+	if undo_hist.pending_valid {
+		free_timeline(&undo_hist.pending)
+	}
+	undo_hist.pending = clone_timeline(timeline)
+	undo_hist.pending_valid = true
 }
 
 // undo_push records a committed edit as the next action and moves the cursor to
@@ -78,6 +183,15 @@ undo_push :: proc(kind: Undo_Kind, label: string) -> i32 {
 	assert(undo_hist.slots != nil, "undo_push before undo_init")
 	p := undo_hist.current
 	assert(p >= 0 && p < i32(len(undo_hist.slots)), "undo cursor out of range")
+	// Fold an untracked edit since the cursor's action into the cursor snapshot,
+	// so undoing back to it keeps that edit. A drag sets pending at gesture
+	// start; a discrete verb at its top.
+	if undo_hist.pending_valid {
+		free_timeline(&undo_hist.slots[p].snap)
+		undo_hist.slots[p].snap = undo_hist.pending
+		undo_hist.pending = {}
+		undo_hist.pending_valid = false
+	}
 	idx := i32(len(undo_hist.slots))
 	undo_hist.seq += 1
 	append(
@@ -90,6 +204,7 @@ undo_push :: proc(kind: Undo_Kind, label: string) -> i32 {
 			seq          = undo_hist.seq,
 			kind         = kind,
 			label        = strings.clone(label),
+			snap         = clone_timeline(timeline),
 		},
 	)
 	parent := &undo_hist.slots[p]
@@ -105,34 +220,79 @@ undo_push :: proc(kind: Undo_Kind, label: string) -> i32 {
 	return idx
 }
 
-// undo_undo moves the cursor to the current action's parent — the document
-// "returns to" that step's state (payload application is the next milestone;
-// today this is tree navigation only). No-op at the pristine root.
+// undo_sync_current folds any change made since the cursor's action into the
+// cursor's snapshot before the cursor leaves it: the live document is the state
+// after that action plus untracked edits, and those must survive undoing the
+// action.
+undo_sync_current :: proc() {
+	free_timeline(&undo_hist.slots[undo_hist.current].snap)
+	undo_hist.slots[undo_hist.current].snap = clone_timeline(timeline)
+}
+
+// undo_restore makes the live document match slot idx: a fresh clone of the
+// snapshot is adopted (never aliased) and every piece of state keyed to the old
+// clips — selection, in-flight drag, decoded previews — is dropped, the same
+// rule any delete follows.
+undo_restore :: proc(idx: i32) {
+	assert(idx >= 0 && idx < i32(len(undo_hist.slots)), "undo_restore index out of range")
+	new_timeline := clone_timeline(undo_hist.slots[idx].snap)
+	free_timeline(&timeline)
+	timeline = new_timeline
+	undo_hist.current = idx
+	undo_hist.pending = {}
+	undo_hist.pending_valid = false
+	selected_track = -1
+	selected_index = -1
+	clear(&selected_set)
+	dragging_handle = nil
+	handle_kind = .None
+	active_interaction = .None
+	drag_clip = nil
+	drag_source_track = -1
+	drag_source_index = -1
+	drag_hover_track = -1
+	drag_group_delta = 0
+	clear(&drag_group_orig)
+	resize_edge = -1
+	resize_moved = false
+	invalidate_preview_slots()
+	audio_note_edit()
+}
+
+// undo_undo returns the document to the state before the current action. No-op
+// at the pristine root.
 undo_undo :: proc() {
 	if undo_hist.current <= 0 {
 		return
 	}
-	undo_hist.current = undo_hist.slots[undo_hist.current].parent
+	undo_sync_current()
+	undo_restore(undo_hist.slots[undo_hist.current].parent)
 }
 
-// undo_redo moves the cursor to the current action's MOST RECENT child — the
-// branch tip you undid — which is what vim undotree's redo does.
+// undo_redo moves to the current action's MOST RECENT child — the branch tip you
+// undid — which is what vim undotree's redo does.
 undo_redo :: proc() {
 	c := undo_hist.current
-	if c <= 0 || c >= i32(len(undo_hist.slots)) {
+	if c < 0 || c >= i32(len(undo_hist.slots)) {
 		return
 	}
 	if undo_hist.slots[c].last_child >= 0 {
-		undo_hist.current = undo_hist.slots[c].last_child
+		undo_sync_current()
+		undo_restore(undo_hist.slots[c].last_child)
 	}
 }
 
-// undo_go_to sends the cursor to any node in the tree (the viewer's click).
+// undo_go_to sends the document to any node in the tree (the viewer's click).
 undo_go_to :: proc(idx: int) {
 	if idx < 0 || idx >= len(undo_hist.slots) {
 		return
 	}
-	undo_hist.current = i32(idx)
+	if i32(idx) == undo_hist.current {
+		undo_sync_current()
+		return
+	}
+	undo_sync_current()
+	undo_restore(i32(idx))
 }
 
 undo_count :: proc() -> int { return max(len(undo_hist.slots) - 1, 0) }

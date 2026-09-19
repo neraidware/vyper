@@ -104,12 +104,68 @@ undo_probe_run :: proc() {
 	undo_undo()
 	check(int(undo_hist.current) == 5, "undo from Duplicate -> Rename", &fail)
 
+	fmt.printf(
+		"[undo-probe] ok: count=%d current=%d max_depth=%d\n",
+		undo_count(),
+		undo_hist.current,
+		undo_depth(7),
+	)
+
+	// Snapshot restore runs last: it rebuilds the timeline and tree.
+	undo_probe_restore_checks(&fail)
+
 	if fail > 0 {
 		fmt.printf("[undo-probe] %d failure(s)\n", fail)
 		os.exit(1)
 	}
-	fmt.printf("[undo-probe] ok: count=%d current=%d max_depth=%d\n", undo_count(), undo_hist.current, undo_depth(7))
 	os.exit(0)
+}
+
+// undo_probe_restore_checks proves undo/redo restore the DOCUMENT, not just the
+// cursor: a recorded move plus a pre-edit capture (undo_begin) must come back
+// exactly on undo and redo, including the clip that existed before the first
+// recorded action.
+undo_probe_restore_checks :: proc(fail: ^int) {
+	rcheck :: proc(cond: bool, msg: string, fail: ^int) {
+		if !cond {
+			fmt.printf("[undo-probe] FAIL: %s\n", msg)
+			fail^ += 1
+		}
+	}
+	clip_start :: proc() -> i64 { return timeline.tracks[0].clips[0].timeline_start_frame }
+
+	undo_init()
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 1)})
+	append(
+		&timeline.tracks[0].clips,
+		Clip {
+			clip_id = 1,
+			kind = .Video,
+			source_length_frames = 50,
+			timeline_start_frame = 10,
+		},
+	)
+
+	// The clip was built with no node of its own; the pre-edit capture at m1
+	// must fold it into the base so undoing m1 does not delete it.
+	undo_begin()
+	undo_push(.Move, "m1")
+	timeline.tracks[0].clips[0].timeline_start_frame = 99
+	undo_push(.Move, "m2")
+
+	rcheck(int(undo_hist.current) == 2, "cursor on m2", fail)
+	undo_undo()
+	rcheck(clip_start() == 10, "undo restores m1 state (start 10)", fail)
+	undo_undo()
+	rcheck(len(timeline.tracks[0].clips) == 1, "undo to base keeps the pre-edit clip", fail)
+	rcheck(clip_start() == 10, "base clip still at start 10", fail)
+	undo_redo()
+	rcheck(clip_start() == 10, "redo restores m1", fail)
+	undo_redo()
+	rcheck(clip_start() == 99, "redo restores m2", fail)
 }
 
 // handle_undo_probe runs the probe when VYPER_UNDO_PROBE is set (headless; runs

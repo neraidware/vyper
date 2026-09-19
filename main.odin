@@ -345,7 +345,8 @@ begin_clip_rename :: proc() {
 // empty/whitespace name removes the just-created clip instead of capturing it.
 apply_rename :: proc() {
 	name := text_input_string()
-	if ti.is_create {
+	was_create := ti.is_create
+	if was_create {
 		ti.is_create = false
 		if strings.trim_space(name) == "" {
 			delete_selected_clip_raw()
@@ -355,11 +356,17 @@ apply_rename :: proc() {
 	if _, clip, ok := find_clip_by_id(ti.target); ok {
 		new_name := strings.trim_space(name)
 		changed := clip.name != new_name
+		// In create mode the pre-insert capture (add_text_clip_at) is still
+		// pending: the whole create+name is one "Add text clip" node, so the
+		// insertion belongs to this node's parent, not to a separate capture.
+		if !was_create {
+			undo_begin()
+		}
 		if clip.name != "" {
 			delete(clip.name)
 		}
 		clip.name = strings.clone(new_name)
-		if ti.is_create {
+		if was_create {
 			// The create-mode rename is what keeps the just-inserted clip: an
 			// empty/cancelled name already deleted it above, so reaching here
 			// means a real text clip was added.
@@ -637,10 +644,12 @@ timeline_zoom_fit :: proc() {
 // the frame captured when the context menu was opened (right-click), one second
 // long (shortened to fit its free gap). After insert the new clip becomes the
 // timeline selection.
-add_text_clip_at :: proc() {if ctx_menu.target_track < 0 ||
+add_text_clip_at :: proc() {
+	if ctx_menu.target_track < 0 ||
 	   ctx_menu.target_track >= len(timeline.tracks) {
 		return
 	}
+	undo_begin()
 	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame)
 	audio_note_edit()
 
@@ -678,6 +687,7 @@ add_subtitle_clip_at :: proc() {
 		return
 	}
 	name := strings.clone(path_basename(path))
+	undo_begin()
 	idx := add_subtitle_generator_clip(
 		&timeline.tracks[ctx_menu.target_track],
 		ctx_menu.frame,

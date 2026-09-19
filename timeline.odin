@@ -445,6 +445,7 @@ split_clip_at_playhead :: proc() {
 	if local <= 0 || local >= clip.source_length_frames {
 		return
 	}
+	undo_begin()
 	link := clip.link_id
 	right_link := u64(0)
 	if link != 0 {
@@ -682,6 +683,7 @@ delete_selected_clip_raw :: proc() {
 	if selected_index < 0 || selected_index >= len(track.clips) {
 		return
 	}
+	undo_begin()
 	link := track.clips[selected_index].link_id
 	Target :: struct {
 		track, index: int,
@@ -882,6 +884,7 @@ ripple_delete_region :: proc(start, length: i64) {
 	if length <= 0 {
 		return
 	}
+	undo_begin()
 	for ti in 0 ..< len(timeline.tracks) {
 		ripple_delete_track_region(ti, start, length)
 	}
@@ -930,6 +933,7 @@ ripple_delete_linked_group :: proc(link: u64) {
 	if len(spans) == 0 {
 		return
 	}
+	undo_begin()
 	// Capture the anchor span (the clip the user deleted) before the ripple
 	// invalidates indices and before the selection is cleared below. The
 	// playhead follows that span's shift, the same way the single-region ripple
@@ -1514,6 +1518,7 @@ track_at_row :: proc(r: int) -> int {
 // was clicked sits, and every row below shifts down. Storage is append-only,
 // so existing STORAGE indices (selected_track, drag targets) never move.
 insert_track :: proc(order_pos: int) {
+	undo_begin()
 	sync_track_order()
 	append(&timeline.tracks, Track {name = next_track_name()})
 	new_ti := len(timeline.tracks) - 1
@@ -1554,6 +1559,7 @@ move_track_to_row :: proc(ti: int, target_row: int) {
 	if target == src_row || target == src_row + 1 {
 		return
 	}
+	undo_begin()
 	ordered_remove(&timeline.track_order, src_row)
 	// After the source is gone rows below it shifted up one, so a target below
 	// the source lands one index earlier in the reduced order.
@@ -1573,6 +1579,7 @@ move_track_to_row :: proc(ti: int, target_row: int) {
 // unrelated tracks to the very top, which is what silently reordered rows and
 // left the duplicated video stacked above things the user wasn't looking at.
 duplicate_track :: proc(index: int) {
+	undo_begin()
 	sync_track_order()
 	src := &timeline.tracks[index]
 	new_track := Track {
@@ -1593,6 +1600,10 @@ duplicate_track :: proc(index: int) {
 		// drags the original's partner tracks along.
 		c.clip_id = new_clip_id()
 		c.link_id = 0
+		// Clone the name so the two tracks never share one owned string:
+		// rename frees the old name, and the undo snapshot reader frees titles
+		// per clip, so a shared pointer would dangle/double-free.
+		c.name = strings.clone(c.name)
 		if len(c.markers) > 0 {
 			// Clone the markers array so the two tracks share no owned memory:
 			// deleting one track (remove_track frees per-clip markers) must not
@@ -1621,6 +1632,7 @@ duplicate_track :: proc(index: int) {
 // clip_id, link_id 0) with cloned name and markers, so the two never share
 // state -- mirroring duplicate_track's copy-by-value semantics.
 duplicate_clip :: proc(track_idx, index: int) -> int {
+	undo_begin()
 	track := &timeline.tracks[track_idx]
 	src := &track.clips[index]
 	c := Clip {
@@ -1675,6 +1687,7 @@ remove_track :: proc(index: int) {
 	if index < 0 || index >= len(timeline.tracks) {
 		return
 	}
+	undo_begin()
 	removed := timeline.tracks[index]
 	for &c in removed.clips {
 		delete(c.markers)

@@ -448,6 +448,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				if edge := timeline_resize_edge_at(track_idx, index, inp.x, inp.y); edge >= 0 {
 					selected_track = track_idx
 					selected_index = index
+					undo_begin()
 					active_interaction = .Clip_Resize
 					resize_edge = edge
 					capture_link_group(&track.clips[index], track_idx)
@@ -484,6 +485,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 					drag_source_track = track_idx
 					drag_source_index = index
 					drag_hover_track = track_idx
+					undo_begin()
 					active_interaction = .Clip_Move
 					clip_drag_offset =
 						inp.x -
