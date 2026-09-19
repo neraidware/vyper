@@ -106,7 +106,7 @@ interaction_pre_build :: proc(inp: Mouse_Input) {
 		inspector_content_height(),
 		inspector_view_height(),
 	)
-	if undo_hist.view_open {
+	if media_bin_view == .Undo {
 		scroll_drag_update(
 			"UndoViewer",
 			inp.left,
@@ -252,15 +252,15 @@ dispatch_click_fallback :: proc(inp: Mouse_Input) -> bool {
 // click_fallbacks: the chain's trailing else block, as order-kept probes. Each
 // returns true when it consumed the click.
 click_fallbacks := []proc(inp: Mouse_Input) -> bool{
-	// Undo-tree viewer (when open): a click on a tree row moves the cursor to
-	// that action. First in the chain so the open panel claims its own rows
-	// before anything underneath.
+	// Undo-tree viewer (media bin Undo view): a click on a tree row moves the
+	// cursor to that action. First in the chain so the undo view claims its own
+	// rows before anything underneath.
 	proc(inp: Mouse_Input) -> bool {
 		return undo_view_row_click(inp)
 	},
 	// Undo-tree viewer scrollbar (thumb drag / strip jump).
 	proc(inp: Mouse_Input) -> bool {
-		if !undo_hist.view_open {
+		if media_bin_view != .Undo {
 			return false
 		}
 		if scroll_press(
@@ -883,15 +883,20 @@ interaction_post_build :: proc(
 			help_open = false
 		}
 	}
-	// Undo-tree viewer: the Undo button toggles it; any other click outside the
-	// panel dismisses it (the viewer closes like the help overlay, not on every
-	// action). Row clicks inside the panel are claimed earlier by
-	// undo_view_row_click and only move the cursor.
+	// View-separator tabs: a click on a bottom-of-panel tab switches that
+	// panel's view. The selected tab is always actionable (re-clicking reselects
+	// the same view, a no-op).
 	if was_click {
-		if clay.PointerOver(clay.ID("UndoViewButton")) {
-			undo_hist.view_open = !undo_hist.view_open
-		} else if undo_hist.view_open && !clay.PointerOver(clay.ID("UndoPanel")) {
-			undo_hist.view_open = false
+		if clay.PointerOver(clay.ID("MediaTabBin")) {
+			media_bin_view = .Bin
+		} else if clay.PointerOver(clay.ID("MediaTabUndo")) {
+			media_bin_view = .Undo
+		} else if clay.PointerOver(clay.ID("InspTabClip")) {
+			inspector_view = .Clip
+		} else if clay.PointerOver(clay.ID("InspTabProject")) {
+			inspector_view = .Project
+		} else if clay.PointerOver(clay.ID("InspTabRender")) {
+			inspector_view = .Render
 		}
 	}
 	// Preview fit toggle: re-arming it snaps the camera to the contain-fit;

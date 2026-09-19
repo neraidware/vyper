@@ -55,9 +55,6 @@ handle_sdl_events :: proc(running: ^bool) {
 				case sdl.K_F1:
 					// Always-available shortcut reference.
 					help_open = !help_open
-				case sdl.K_F2:
-					// Toggle the undo-tree viewer.
-					undo_hist.view_open = !undo_hist.view_open
 				case sdl.K_Z:
 					mods := sdl.GetModState()
 					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
@@ -142,21 +139,22 @@ handle_sdl_events :: proc(running: ^bool) {
 				}
 			}
 		case .MOUSE_WHEEL:
-			// Scroll over the undo-tree viewer scrolls its tree. The viewer is
-			// mouse-modal while open, so it claims the wheel before anything
-			// behind it.
-			if undo_hist.view_open {
-				up := clay.GetElementData(clay.ID("UndoPanel")).boundingBox
-				if up.height > 0 && event.wheel.mouse_x >= up.x && event.wheel.mouse_x <= up.x + up.width &&
-					event.wheel.mouse_y >= up.y && event.wheel.mouse_y <= up.y + up.height {
-					if event.wheel.y != 0 {
+			// Scroll over the media bin scrolls its active view: the thumbnail
+			// grid in the Media Bin view, the undo tree in the Undo Tree view.
+			mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
+			if mb.width > 0 && event.wheel.mouse_x >= mb.x && event.wheel.mouse_x <= mb.x + mb.width &&
+				event.wheel.mouse_y >= mb.y && event.wheel.mouse_y <= mb.y + mb.height {
+				if event.wheel.y != 0 {
+					if media_bin_view == .Undo {
 						undo_hist.view_scroll = clamp(
 							undo_hist.view_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP,
 							0,
 							undo_view_max_scroll(),
 						)
-						break
+					} else if len(media_assets) > 0 {
+						media_bin_scroll = clamp(media_bin_scroll - f32(event.wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
 					}
+					break
 				}
 			}
 			// Scroll over the inspector column scrolls its card stack when
@@ -166,16 +164,6 @@ handle_sdl_events :: proc(running: ^bool) {
 				event.wheel.mouse_y >= ic.y && event.wheel.mouse_y <= ic.y + ic.height {
 				if event.wheel.y != 0 {
 					inspector_scroll = clamp(inspector_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
-					break
-				}
-			}
-			// Scroll over the media bin scrolls its thumbnail grid (manual
-			// clip scroll, like the tracks section).
-			mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
-			if mb.width > 0 && event.wheel.mouse_x >= mb.x && event.wheel.mouse_x <= mb.x + mb.width &&
-				event.wheel.mouse_y >= mb.y && event.wheel.mouse_y <= mb.y + mb.height {
-				if len(media_assets) > 0 && event.wheel.y != 0 {
-					media_bin_scroll = clamp(media_bin_scroll - f32(event.wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
 					break
 				}
 			}

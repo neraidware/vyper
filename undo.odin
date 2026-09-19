@@ -50,8 +50,7 @@ Undo_History :: struct {
 	slots:      [dynamic]Undo_Node, // index 0 = implicit root ("before anything")
 	current:    i32,                // slot the live document matches; 0 = pristine
 	seq:        u32,                // next sequence number
-	view_open:  bool,               // undo-tree viewer visibility
-	view_scroll: f32,               // viewer scroll offset
+	view_scroll: f32,               // scroll offset of the tree in the media bin view
 }
 
 undo_hist: Undo_History

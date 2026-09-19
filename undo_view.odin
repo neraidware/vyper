@@ -1,14 +1,13 @@
 package main
 
 import clay "clay-odin"
-import "core:c"
 import "core:fmt"
 
 // ---------------------------------------------------------------------------
-// Undo-tree viewer: a toggled floating panel that renders the undo history as
-// a tree, vim-undotree style. Rows run NEWEST at the top to OLDEST at the
-// bottom ("bottom to top in sequence"); each row is indented to its parent's
-// column and connected to it with box-drawing lines.
+// Undo-tree viewer: fills the media bin's "Undo Tree" view (see state.odin).
+// Renders the undo history as a tree, vim-undotree style. Rows run NEWEST at
+// the top to OLDEST at the bottom ("bottom to top in sequence"); each row is
+// indented to its parent's column and connected to it with box-drawing lines.
 //
 // Rows are ordered chronologically (append order = slot order, newest first).
 // Parent rows always sit BELOW their children, so all connectors run upward.
@@ -38,7 +37,10 @@ undo_rows_ensure :: proc() {
 //     newer content above this row (undo_newest_descendant(A) > idx);
 //   - the parent's column ends with "└──" when this node is its newest child,
 //     else passes through with "├──".
-undo_row_text :: proc(idx: int, buf: []byte) {
+// Returns the number of bytes written so the caller passes exactly that span
+// to clay.Text (a fixed buffer passed whole would measure 256 wide and expand
+// the layout).
+undo_row_text :: proc(idx: int, buf: []byte) -> int {
 	line: [256]u8
 	w: int
 
@@ -82,10 +84,11 @@ undo_row_text :: proc(idx: int, buf: []byte) {
 	w += copy(line[w:], undo_hist.slots[idx].label)
 
 	copy(buf, line[:w])
+	return w
 }
 
 // ---------------------------------------------------------------------------
-// Viewer panel (floating overlay, z-order under the help overlay).
+// Embedded tree (the media bin panel's "Undo Tree" view).
 // ---------------------------------------------------------------------------
 
 undo_view_rows_height :: proc() -> f32 {
@@ -121,125 +124,111 @@ undo_row :: proc(idx: int) {
 			},
 		},
 	) {
+		n := undo_row_text(idx, undo_row_bufs[idx][:])
 		clay.Text(
-			string(undo_row_bufs[idx][:]),
-			clay.TextElementConfig{textColor = cur ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_SMALL, lineHeight = UNDO_ROW_TEXT},
+			string(undo_row_bufs[idx][:n]),
+			clay.TextElementConfig{
+				textColor = cur ? BUTTON_BORDER_HOVER : TEXT,
+				fontSize = FONT_SMALL,
+				lineHeight = UNDO_ROW_TEXT,
+				// Rows must render on one line even when a deep chain scrolls
+				// the text past the clip: wrapping a long row into several
+				// lines overlaps the rows below it and reads as garbage.
+				wrapMode = .None,
+			},
 		)
 	}
 }
 
-// draw_undo_view renders the undo-tree panel as a floating overlay. Mirrors
-// draw_help_overlay's placement, with its own scrollport (clip + childOffset)
-// and a v_scrollbar when the tree outgrows the panel.
-draw_undo_view :: proc(width, height: c.int) {
-	if !undo_hist.view_open {
+// undo_view_header renders the one-line title plus live stats for the embedded
+// tree.
+undo_view_header :: proc() {
+	stats := fmt.bprintf(
+		undo_view_stats_buf[:],
+		"Undo tree · %d action%s · cursor %d",
+		undo_count(),
+		undo_count() == 1 ? "" : "s",
+		undo_hist.current,
+	)
+	clay.Text(
+		stats,
+		clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL},
+	)
+}
+
+// undo_view_content fills its parent with the tree — the "no actions yet" hint
+// until the first action exists, then the scrollable row clip plus a
+// v_scrollbar when the tree outgrows the body.
+undo_view_content :: proc() {
+	undo_rows_ensure()
+	if len(undo_hist.slots) <= 1 {
+		clay.Text(
+			"no actions yet",
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+		)
+		clay.Text(
+			"move, split, resize or delete a clip and it shows up here",
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+		)
 		return
 	}
-	undo_rows_ensure()
-
-	pw := min(f32(640), f32(width) * 0.9)
-	px := (f32(width) - pw) / 2
-	ph := min(f32(height) * 0.6, 500)
-	py := max(PANEL_PADDING, (f32(height) - ph) / 2)
-
-	if clay.UI(clay.ID("UndoPanel"))(
+	// Width is plain grow: the row text is sliced to its written length (see
+	// undo_row_text) so the content measures real width — a fixed 256-byte
+	// buffer passed whole once false-expanded this area past the panel.
+	if clay.UI(clay.ID("UndoRowsArea"))(
 		{
 			layout = {
-				sizing = {width = clay.SizingFixed(pw), height = clay.SizingFixed(ph)},
-				layoutDirection = .TopToBottom,
-				childGap = BUTTON_ROW_GAP,
-				padding = clay.PaddingAll(PANEL_PADDING),
-				childAlignment = {x = .Left, y = .Top},
-			},
-			backgroundColor = BUTTON,
-			border = {color = BUTTON_BORDER, width = clay.BorderOutside(2)},
-			cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
-			floating = {
-				offset = {px, py},
-				zIndex = 250,
-				attachTo = .Root,
-				pointerCaptureMode = .Capture,
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				layoutDirection = .LeftToRight,
+				childGap = 0,
 			},
 		},
 	) {
-		clay.Text(
-			"Undo tree",
-			clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_HEADING},
-		)
-		clay.Text(
-			"In-memory edit history — F2 toggles · Ctrl+Z / Ctrl+Shift+Z walk the tree · state apply next",
-			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
-		)
-		stats := fmt.bprintf(
-			undo_view_stats_buf[:],
-			"%d action%s · cursor at act %d%s",
-			undo_count(),
-			undo_count() == 1 ? "" : "s",
-			undo_hist.current,
-			"",
-		)
-		clay.Text(
-			stats,
-			clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL},
-		)
-
-		if len(undo_hist.slots) <= 1 {
-			clay.Text(
-				"no actions yet — move, split, resize or delete a clip and it shows up here",
-				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
-			)
-		} else if clay.UI(clay.ID("UndoRowsArea"))(
+		if clay.UI(clay.ID("UndoRowsClip"))(
 			{
 				layout = {
 					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-					layoutDirection = .LeftToRight,
-					childGap = 0,
+					layoutDirection = .TopToBottom,
+					childAlignment = {x = .Left, y = .Top},
 				},
+				// horizontal clip: a deep ancestor chain's row text runs past
+				// the clip; cut it at the clip edge instead of spilling into
+				// the preview column.
+				clip = {horizontal = true, vertical = true, childOffset = {0, -undo_hist.view_scroll}},
 			},
 		) {
-			if clay.UI(clay.ID("UndoRowsClip"))(
+			if clay.UI(clay.ID("UndoRows"))(
 				{
 					layout = {
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+						sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
 						layoutDirection = .TopToBottom,
-						childAlignment = {x = .Left, y = .Top},
+						childGap = 0,
 					},
-					clip = {vertical = true, childOffset = {0, -undo_hist.view_scroll}},
 				},
 			) {
-				if clay.UI(clay.ID("UndoRows"))(
-					{
-						layout = {
-							sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-							layoutDirection = .TopToBottom,
-							childGap = 0,
-						},
-					},
-				) {
-					// Newest first: rows run top (newest) to bottom (oldest).
-					for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {
-						undo_row(i)
-					}
+				// Newest first: rows run top (newest) to bottom (oldest).
+				for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {
+					undo_row(i)
 				}
 			}
-			v_scrollbar(
-				"UndoViewer",
-				undo_hist.view_scroll,
-				undo_view_rows_height(),
-				undo_view_clip_height(),
-			)
 		}
+		v_scrollbar(
+			"UndoViewer",
+			undo_hist.view_scroll,
+			undo_view_rows_height(),
+			undo_view_clip_height(),
+		)
 	}
 }
 
 undo_view_stats_buf: [128]u8
 
 // undo_view_row_click wires row clicks: any click inside a tree row moves the
-// cursor to that action. Added first in the click chain so an open viewer
+// cursor to that action. Added first in the click chain so the undo view
 // claims its own rows before anything underneath. Returns false when the
-// viewer is closed (never intercepts anything).
+// media bin isn't showing the tree (never intercepts anything).
 undo_view_row_click :: proc(inp: Mouse_Input) -> bool {
-	if !undo_hist.view_open || len(undo_hist.slots) <= 1 {
+	if media_bin_view != .Undo || len(undo_hist.slots) <= 1 {
 		return false
 	}
 	for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {

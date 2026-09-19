@@ -21,6 +21,7 @@ BUTTON_H_PAD :: 10         // Padding{left/right} inside small buttons/fields.
 SWITCH_W :: f32(40)        // Binary toggle (switch_toggle) track width.
 SWITCH_H :: f32(22)        // Binary toggle (switch_toggle) track height.
 SWITCH_KNOB :: f32(16)     // Binary toggle (switch_toggle) knob diameter.
+TAB_H :: f32(24)           // Bottom-of-panel view-separator tab height.
 
 // Corner radii (visual hierarchy: container > panel > widget > button).
 RADIUS_CONTAINER :: 8

@@ -330,7 +330,6 @@ escape_dismiss :: proc() {
 	close_context_menu()
 	playback_rate_open = false
 	help_open = false
-	undo_hist.view_open = false
 }
 
 // begin_clip_rename opens the generic text field to edit the selected clip's

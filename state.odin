@@ -441,6 +441,14 @@ media_bin_scroll: f32 = 0
 MEDIA_BIN_SCROLL_STEP :: 44
 TIMELINE_SCROLL_STEP :: 44 // Wheel scroll per notch over the track lanes.
 
+// View separators: the bottom-of-panel tab rows pick which sub-view each panel
+// shows. The media bin switches between the thumbnail grid and the undo tree;
+// the inspector switches between its three property cards.
+MediaBin_View :: enum { Bin, Undo }
+Inspector_View :: enum { Clip, Project, Render }
+media_bin_view: MediaBin_View = .Bin
+inspector_view: Inspector_View = .Clip
+
 // selected_asset_id is the media-bin item currently highlighted. 0 = none.
 selected_asset_id: u64 = 0
 

@@ -117,32 +117,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			if clay.UI(clay.ID("AppSpacer"))(
 			{layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}}},
 			) {}
-			// Undo-tree viewer toggle.
-			if clay.UI(clay.ID("UndoViewButton"))(
-			{
-				layout = {
-					sizing = {
-						width = clay.SizingFixed(56),
-						height = clay.SizingFixed(BUTTON_HEIGHT),
-					},
-					childAlignment = {x = .Center, y = .Center},
-				},
-				backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
-				border = {
-					color = undo_hist.view_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-					width = clay.BorderOutside(undo_hist.view_open ? 2 : 1),
-				},
-				cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-			},
-			) {
-				clay.Text(
-					"Undo",
-					clay.TextElementConfig {
-						textColor = undo_hist.view_open ? BUTTON_BORDER_HOVER : TEXT,
-						fontSize = FONT_NORMAL,
-					},
-				)
-			}
 			// Help overlay toggle ("?" / F1).
 			if clay.UI(clay.ID("HelpButton"))(
 			{
@@ -203,8 +177,29 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 				cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
 			},
 			) {
-				media_bin_header()
-				media_bin_grid()
+				// The view body grows to fill the panel so the tab row stays
+				// pinned to the panel's bottom edge regardless of how much
+				// content the active view has (an empty bin must not pull the
+				// tabs up under the header).
+				if clay.UI(clay.ID("MediaBinBody"))(
+				{
+					layout = {
+						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+						layoutDirection = .TopToBottom,
+						childGap = CARD_GAP,
+					},
+				},
+				) {
+					switch media_bin_view {
+					case .Bin:
+						media_bin_header()
+						media_bin_grid()
+					case .Undo:
+						undo_view_header()
+						undo_view_content()
+					}
+				}
+				media_bin_tabs()
 			}
 			// Column 2: Preview with the transport strip beneath it.
 			if clay.UI(clay.ID("PreviewColumn"))(
@@ -330,9 +325,10 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					}
 				}
 			}
-			// Column 3: Inspector -- Project / Clip / Render cards. The cards
-			// stack in their own scrollport (InspectorContent) with a draggable
-			// vertical strip when they outgrow the column.
+			// Column 3: Inspector -- Clip / Project / Render view. The bottom
+			// tab row picks which card the scrollport shows; the active card
+			// scrolls in its own scrollport (InspectorContent) with a draggable
+			// vertical strip when it outgrows the column.
 			if clay.UI(clay.ID("InspectorColumn"))(
 			{
 				layout = {
@@ -340,42 +336,58 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						width = clay.SizingGrow({min = INSPECTOR_MIN_W, max = INSPECTOR_MAX_W}),
 						height = clay.SizingGrow({}),
 					},
-					layoutDirection = .LeftToRight,
+					layoutDirection = .TopToBottom,
 					childGap = 0,
 				},
 				backgroundColor = EDITOR_BG,
 			},
 			) {
-				if clay.UI(clay.ID("Inspector"))(
+				if clay.UI(clay.ID("InspectorArea"))(
 				{
 					layout = {
 						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-						layoutDirection = .TopToBottom,
+						layoutDirection = .LeftToRight,
 						childGap = 0,
 					},
-					clip = {vertical = true, childOffset = {0, -inspector_scroll}},
 				},
 				) {
-					if clay.UI(clay.ID("InspectorContent"))(
+					if clay.UI(clay.ID("Inspector"))(
 					{
 						layout = {
-							sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
 							layoutDirection = .TopToBottom,
-							childGap = SECTION_GAP,
+							childGap = 0,
 						},
+						clip = {vertical = true, childOffset = {0, -inspector_scroll}},
 					},
 					) {
-						project_card()
-						clip_card()
-						render_card()
+						if clay.UI(clay.ID("InspectorContent"))(
+						{
+							layout = {
+								sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+								layoutDirection = .TopToBottom,
+								childGap = SECTION_GAP,
+							},
+						},
+						) {
+							switch inspector_view {
+							case .Clip:
+								clip_card()
+							case .Project:
+								project_card()
+							case .Render:
+								render_card()
+							}
+						}
 					}
+					v_scrollbar(
+						"InspectorV",
+						inspector_scroll,
+						inspector_content_height(),
+						inspector_view_height(),
+					)
 				}
-				v_scrollbar(
-					"InspectorV",
-					inspector_scroll,
-					inspector_content_height(),
-					inspector_view_height(),
-				)
+				inspector_tabs()
 			}
 		}
 		if clay.UI(clay.ID("EditorDivider"))(
@@ -844,7 +856,6 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		}
 	}
 	draw_context_menu()
-	draw_undo_view(width, height)
 	draw_help_overlay(width, height)
 	draw_text_input_popup(width, height)
 
@@ -1342,6 +1353,71 @@ v_scrollbar :: proc(tag: string, scroll, content_h, view_h: f32) {
 			cornerRadius = clay.CornerRadiusAll(4),
 		},
 		) {}
+	}
+}
+
+// tab_button renders one low-profile view-separator tab: no chrome when idle,
+// a subtle highlight when it is the active view. Active state is decided by the
+// caller; clicks are handled in interaction.odin (was_click block).
+tab_button :: proc(id_name: string, label: string, active: bool) {
+	if clay.UI(clay.ID(id_name))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFit({}), height = clay.SizingFixed(TAB_H)},
+			padding = clay.Padding{left = 10, right = 10},
+			childAlignment = {x = .Center, y = .Center},
+		},
+		backgroundColor = active ? BUTTON_HOVER : clay.Color{0, 0, 0, 0},
+		border = {
+			color = active ? BUTTON_BORDER_HOVER : clay.Color{0, 0, 0, 0},
+			width = clay.BorderOutside(active ? 1 : 0),
+		},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	},
+	) {
+		clay.Text(
+			label,
+			clay.TextElementConfig{textColor = active ? BUTTON_BORDER_HOVER : TEXT, fontSize = FONT_SMALL},
+		)
+	}
+}
+
+// media_bin_tabs renders the bottom separator row of the media-bin panel:
+// "Media Bin | Undo Tree".
+media_bin_tabs :: proc() {
+	if clay.UI(clay.ID("MediaBinTabs"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(TAB_H)},
+			layoutDirection = .LeftToRight,
+			childGap = 6,
+			childAlignment = {x = .Left, y = .Center},
+		},
+		border = {color = BUTTON_BORDER, width = clay.BorderWidth{top = 1}},
+	},
+	) {
+		tab_button("MediaTabBin", "Media Bin", media_bin_view == .Bin)
+		tab_button("MediaTabUndo", "Undo Tree", media_bin_view == .Undo)
+	}
+}
+
+// inspector_tabs renders the bottom separator row of the inspector column:
+// "Clip | Project | Render".
+inspector_tabs :: proc() {
+	if clay.UI(clay.ID("InspectorTabs"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(TAB_H)},
+			layoutDirection = .LeftToRight,
+			childGap = 6,
+			childAlignment = {x = .Left, y = .Center},
+		},
+		border = {color = BUTTON_BORDER, width = clay.BorderWidth{top = 1}},
+	},
+	) {
+		tab_button("InspTabClip", "Clip", inspector_view == .Clip)
+		tab_button("InspTabProject", "Project", inspector_view == .Project)
+		tab_button("InspTabRender", "Render", inspector_view == .Render)
 	}
 }
 
@@ -1932,7 +2008,8 @@ HELP_SHORTCUTS :: []Help_Shortcut {
 	{"Delete", "Delete selected clip (raw)"},
 	{"Esc", "Dismiss menu / dialog"},
 	{"F1 / ?", "Toggle this overlay"},
-	{"F2 / Undo button", "Toggle the undo-tree viewer"},
+	{"Media Bin tabs", "Switch between the media grid and the undo tree"},
+	{"Inspector tabs", "Switch between clip, project and render views"},
 	{"Ctrl+Z", "Undo (move up the undo tree)"},
 	{"Ctrl+Shift+Z / Ctrl+Y", "Redo (move down the undo tree)"},
 	{"Wheel over ruler/timeline", "Zoom about the playhead"},

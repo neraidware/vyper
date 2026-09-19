@@ -75,22 +75,18 @@ undo_probe_run :: proc() {
 	}
 	buf: [256]u8
 	for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {
-		undo_row_text(i, buf[:])
-		got := string(buf[:])
+		n := undo_row_text(i, buf[:])
+		got := string(buf[:n])
 		want := expected[len(undo_hist.slots) - 1 - i]
-		check(
-			strings.starts_with(got, want),
-			fmt.tprintf("row %d text mismatch: got %q want %q", i, got, want),
-			&fail,
-		)
+		check(got == want, fmt.tprintf("row %d text mismatch: got %q want %q", i, got, want), &fail)
 	}
 
 	// Cursor movement must not fight the marker above (cursor was 7 while the
 	// expected rows rendered; move it now and re-render the new row).
 	undo_go_to(4)
 	check(int(undo_hist.current) == 4, "go_to(4)", &fail)
-	undo_row_text(4, buf[:])
-	check(strings.starts_with(string(buf[:]), "→ "), "cursor marker tracks current", &fail)
+	n := undo_row_text(4, buf[:])
+	check(strings.starts_with(string(buf[:n]), "→ "), "cursor marker tracks current", &fail)
 	undo_go_to(7)
 
 	// undo/redo cursor walking.
