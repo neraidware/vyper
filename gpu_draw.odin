@@ -1193,6 +1193,25 @@ draw_icon_in_element_color :: proc(
 // two sides this whole session with a number everyone can see: does the audio
 // content position (A, from the device clock) fall behind the video content
 // position (V, the playhead) — and at what delta.
+//
+// When the audio clock lags the playhead by more than AUDIO_DESYNC_ALERT_SEC,
+// one console line is dumped (at most once per second) with the producer-side
+// state that distinguishes why: prod (where mixing is), q (content queued in
+// the stream) vs d (what the device has played), rsync + prov (a provision/
+// reopen just happened — the audio clock is parked on a stale anchor for the
+// whole reopen), holes + ncov (the producer cannot keep up or finds no covered
+// source — the forward-skip should have fired but may be gated), boost (the
+// jog boost that only the video side honors).
+AUDIO_DESYNC_ALERT_SEC :: 0.4
+
+audio_skew_diag_tick: u64
+audio_skew_diag_prev_rsync: i64
+audio_skew_diag_prev_holes: i64
+audio_skew_diag_prev_ncov: u64
+audio_skew_diag_prev_full: u64
+audio_skew_diag_prev_wedge: u64
+audio_skew_diag_prev_rebuilt: u64
+
 draw_preview_hud :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -1206,14 +1225,43 @@ draw_preview_hud :: proc(
 	if fps <= 0 {
 		return
 	}
+	dev := sync.atomic_load(&audio_dev_frame)
 	label_buf: [64]u8
 	label := fmt.bprintf(
 		label_buf[:],
 		"A %6.2f  V %6.2f  d %+.2f",
-		f64(sync.atomic_load(&audio_dev_frame)) / fps,
+		f64(dev) / fps,
 		f64(playhead.frame) / fps,
-		f64(sync.atomic_load(&audio_dev_frame) - playhead.frame) / fps,
+		f64(dev - playhead.frame) / fps,
 	)
+	if now := sdl.GetTicksNS(); dev - playhead.frame < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag_tick >= u64(1_000_000_000) {
+		rsync := sync.atomic_load(&audio_resync_evt)
+		prod := sync.atomic_load(&audio_prod_frame)
+		holes := sync.atomic_load(&audio_silence_holes)
+		anchor := sync.atomic_load(&audio_anchor_frame)
+		fmt.printf(
+			"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
+			f64(dev-playhead.frame)/fps,
+			f64(prod)/fps,
+			f64(prod-dev)/fps,
+			f64(anchor)/fps,
+			rsync, rsync-audio_skew_diag_prev_rsync,
+			sync.atomic_load(&audio_provisioning) ? 1 : 0,
+			holes, holes-audio_skew_diag_prev_holes,
+			audio_rpt_skip_nocov, audio_rpt_skip_nocov-audio_skew_diag_prev_ncov,
+			audio_rpt_skip_full, audio_rpt_skip_full-audio_skew_diag_prev_full,
+			audio_wedge_heal, audio_wedge_heal-audio_skew_diag_prev_wedge,
+			audio_rate_rebuilt, audio_rate_rebuilt-audio_skew_diag_prev_rebuilt,
+			playback_rate, playback_boost,
+		)
+		audio_skew_diag_tick = now
+		audio_skew_diag_prev_rsync = rsync
+		audio_skew_diag_prev_holes = holes
+		audio_skew_diag_prev_ncov = audio_rpt_skip_nocov
+		audio_skew_diag_prev_full = audio_rpt_skip_full
+		audio_skew_diag_prev_wedge = audio_wedge_heal
+		audio_skew_diag_prev_rebuilt = audio_rate_rebuilt
+	}
 	fs: u16 = FONT_SMALL
 	text_w := f32(len(label)) * f32(fs) * 0.6
 	pill := clay.BoundingBox {

@@ -354,6 +354,15 @@ atempo_g: Atempo_Graph
 // whole UI frame cost; only stalls longer than this resync.
 AUDIO_CUSHION_SEC :: 0.25
 
+// AUDIO_AUDIBLE_SKEW_TOL is the maximum wall-time the audible content position
+// (audio_dev_frame) may trail the playhead before audio_update forces a
+// re-anchor. Healthy steady playback keeps it at ~0; a deficit this large means
+// the producer is throttled at the queue cap and can never close the gap on its
+// own. Kept well under the ~0.25s cushion so a snappable defect is caught
+// rather than tolerated; the 200ms post-seek coalesce gate above prevents
+// firing during legitimate queue-ramp transients.
+AUDIO_AUDIBLE_SKEW_TOL :: 0.1
+
 // MAX_PLAY_AUDIO bounds simultaneous playback decoders. One decoder serves a
 // whole source stream (every contiguous split segment shares it), so this
 // bounds STREAMS, not clips.
@@ -564,6 +573,8 @@ audio_ph_catch: i64 // frames jumped in the last auto catch-up burst (atomic on 
 audio_rpt_push: u64       // pushes into the SDL stream
 audio_rpt_skip_full: u64  // feed() exits because the stream hit max_queue
 audio_rpt_skip_nocov: u64 // feed() exits because no clip covers the next frame
+audio_rate_rebuilt: u64   // rate-graph (re)builds that re-anchored to the playhead
+audio_wedge_heal: u64     // backlog drops when prod was queue-capped short of target
 audio_rpt_mix_us: u64     // time spent inside audio_mix_frame (decode + resample + mix)
 audio_rpt_feed_us: u64    // time spent in audio_producer_feed outside mix
 audio_rpt_min_q: i64      // smallest queued bytes seen in the window
@@ -1132,7 +1143,21 @@ audio_producer_feed :: proc() {
 	// every ~2ms, and rebuilding a filter graph is cheap (a few ms) but not
 	// free per feed.
 	want_ratio := max(1.0, playback_rate)
-	atempo_rate_set(&atempo_g, want_ratio)
+	if atempo_rate_set(&atempo_g, want_ratio) {
+		// The playhead and the device both kept running while the graph was
+		// being built, so audio_play_frame is stale by the build duration (which
+		// scales with the playhead once the rate is live: a ~150ms build at 4x
+		// strands content ~0.6s behind) and the queued stream holds samples
+		// mixed at the previous rate. Re-anchor to the live playhead: the
+		// forward-skip below clears the stale queue, trims the fifos and jumps
+		// the mix position to where playback actually is. Without this the
+		// born deficit never closes — the queue cap throttles prod to the
+		// device's drain rate, which equals the playhead's rate, and the
+		// prod-keyed forward-skip in audio_update can't see the audible
+		// position that is behind.
+		sync.atomic_store(&audio_jump_frame, playback_playhead_at(sdl.GetTicksNS(), want_ratio))
+		audio_rate_rebuilt += 1
+	}
 	audio_pcm_dump_open()
 	audio_dec_dump_open()
 	fps := timeline_fps()
@@ -1194,6 +1219,23 @@ audio_producer_feed :: proc() {
 	// is. dev_pos is kept only as the telemetry/health signal stored above.
 	ph := playback_playhead_at(sdl.GetTicksNS(), want_ratio)
 	target := ph + cushion_frames
+	// Wedge watchdog: at the queue cap, prod is throttled to the device drain
+	// rate — exactly the playhead's rate — so any deficit born while the device
+	// kept running and prod didn't (a producer block, e.g. the atempo graph
+	// rebuild at a rate change the playhead ran through) can never close on its
+	// own, and the prod-keyed forward-skip in audio_update can't see the
+	// audible position that is behind. When the queue is full yet prod is still
+	// short of target beyond the skew tolerance, drop the backlog: audible snaps
+	// to prod, the fill loop re-fills against the true target, and dev lands
+	// back on the playhead. Self-limiting — after the heal prod sits at target,
+	// so the condition stops.
+	if target > audio_play_frame && i64(sdl.GetAudioStreamQueued(audio_stream)) >= i64(max_queue) && audio_play_frame < target-i64(AUDIO_AUDIBLE_SKEW_TOL*want_ratio*f64(fps)) {
+		sdl.ClearAudioStream(audio_stream)
+		queued_frames = 0
+		dev_pos = audio_play_frame
+		sync.atomic_store(&audio_dev_frame, dev_pos)
+		audio_wedge_heal += 1
+	}
 	if target <= audio_play_frame {
 		return
 	}

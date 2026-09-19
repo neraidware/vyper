@@ -329,15 +329,20 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 }
 
 // atempo_rate_set ensures the graph matches `rate` (rebuilt when it changes).
-// Producer-thread only, like every other atempo operation.
-atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64) {
+// Producer-thread only, like every other atempo operation. Returns true when
+// the graph was (re)built, so the caller can re-anchor to the current playhead
+// — the rebuild is not cheap enough to tolerate the playhead racing while the
+// producer is blocked building it.
+atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
 	r := rate
 	if r <= 0.0 {
 		r = 1.0
 	}
 	if g.rate != r || (g.graph == nil) != (r == 1.0) {
 		atempo_graph_build(g, r)
+		return true
 	}
+	return false
 }
 
 // atempo_reset clears the graph's internal window so stale buffered samples
