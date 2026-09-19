@@ -931,6 +931,10 @@ main :: proc() {
 	if os.get_env_alloc("VYPER_HW_DISABLE", context.temp_allocator) == "1" {
 		hw_decode_enabled = false
 	}
+	// Probes below drive real edit paths (split, delete, duplicate, track
+	// reorder) that record undo history, so the history must exist before any
+	// probe runs. The normal path re-inits at startup; probes return first.
+	undo_init()
 	if test_path_ok, test_paths := render_test_env(); test_path_ok {
 		render_test_run(test_paths)
 		return

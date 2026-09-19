@@ -309,13 +309,16 @@ clip_slide_in_track :: proc(
 	return clamp(desired, lo, hi)
 }
 
-// asset_source_frames returns the total source frame count for a clip's asset,
-// or -1 when unknown (no asset / generator clip). Used to cap lengthening so a
-// clip never references past the end of its source media.
-asset_source_frames :: proc(asset_id: u64) -> i64 {
+// asset_source_frames returns the total source frame count available to a clip
+// of `kind` on its asset, or -1 when unknown (no asset / generator clip). An
+// audio clip's media is bounded by the asset's audio_frames, NOT frame_count:
+// an audio-only file probes no video stream, so frame_count falls back to 1 and
+// capping on it would lock the clip to a single frame. Used to cap lengthening
+// so a clip never references past the end of its source media.
+asset_source_frames :: proc(asset_id: u64, kind: Media_Kind) -> i64 {
 	for &a in media_assets {
 		if a.id == asset_id {
-			return a.frame_count
+			return kind == .Audio ? a.audio_frames : a.frame_count
 		}
 	}
 	return -1
@@ -352,7 +355,7 @@ resize_clip_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 	start := c.timeline_start_frame
 	max_len := i64(1) << 50
 	if !c.is_still {
-		if src_total := asset_source_frames(c.asset_id); src_total > 0 {
+		if src_total := asset_source_frames(c.asset_id, c.kind); src_total > 0 {
 			max_len = max(1, src_total - c.source_start_frame)
 		}
 	}

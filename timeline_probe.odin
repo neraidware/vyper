@@ -639,6 +639,48 @@ test_still_resize_free :: proc() {
 	)
 }
 
+// test_audio_resize_source_bound: an audio clip's source bound is the asset's
+// audio_frames, not its video frame_count. An audio-only import has no video
+// stream, so frame_count falls back to 1; capping on that locked the clip to a
+// single frame. The audio lane grows to its real duration and can regrow after
+// a shrink, while a video clip on a video asset still caps at frame_count.
+test_audio_resize_source_bound :: proc() {
+	clear(&media_assets)
+	append(&media_assets, Media_Asset{id = 7001, kind = .Audio, frame_count = 1, audio_frames = 500})
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+	ac := mk_tl_clip(7001, 0, 0, 100, 0, .Audio)
+	ac.asset_id = 7001
+	append(&timeline.tracks[0].clips, ac)
+
+	got := resize_clip_right(&timeline.tracks[0], 0, 400)
+	tl_probe_check(got == 400, "audio resize right: want 400, got %d", got)
+
+	// Still bounded by the real audio length, not unbounded.
+	got = resize_clip_right(&timeline.tracks[0], 0, 9999)
+	tl_probe_check(got == 500, "audio resize right cap: want 500, got %d", got)
+
+	// Shrink then regrow: the bug locked it at one frame, so this must recover.
+	got = resize_clip_right(&timeline.tracks[0], 0, 250)
+	tl_probe_check(got == 250, "audio resize shrink: want 250, got %d", got)
+	got = resize_clip_right(&timeline.tracks[0], 0, 480)
+	tl_probe_check(got == 480, "audio resize regrow: want 480, got %d", got)
+
+	// A video lane on a video asset still caps at frame_count.
+	clear(&media_assets)
+	append(&media_assets, Media_Asset{id = 7002, kind = .Video, frame_count = 300, audio_frames = 500})
+	timeline.tracks[0].clips = nil
+	vc := mk_tl_clip(7002, 0, 0, 100, 0, .Video)
+	vc.asset_id = 7002
+	append(&timeline.tracks[0].clips, vc)
+	got = resize_clip_right(&timeline.tracks[0], 0, 9999)
+	tl_probe_check(got == 300, "video resize right cap: want 300, got %d", got)
+
+	clear(&media_assets)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_cut_resolves_playhead()
@@ -667,6 +709,9 @@ timeline_probe_run :: proc(_: string) {
 
 	test_still_resize_free()
 	fmt.println("[tl-probe] still-resize ok")
+
+	test_audio_resize_source_bound()
+	fmt.println("[tl-probe] audio-resize ok")
 
 	tl_scene()
 	test_ripple_right_edge_head_trim()
