@@ -736,3 +736,180 @@ timeline_probe_run :: proc(_: string) {
 	fmt.println("[tl-probe] all checks passed")
 	os.exit(0)
 }
+
+// drag_probe_run (VYPER_DRAG_PROBE) replays a FAST same-lane flick through the
+// LIVE drag model (drag_move_in_place -> clip_slide_in_track) to prove the
+// model itself can never "cut short": large per-frame cursor-jump targets must
+// park the clip FLUSH against its neighbor, never a few frames before it. The
+// historic symptom (clip stops mid-stroke when the cursor flees the clip)
+// lived in the caller's lane gate; the model must be lane- and speed-blind.
+drag_probe_run :: proc(seed: string) {
+	snap_clips_to_playhead = true
+	timeline_zoom = 1.0
+
+	drag_scene :: proc() {
+		timeline = Timeline {
+			tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+		}
+		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+		append(&timeline.tracks[0].clips, mk_tl_clip(7001, 0, 50, 100, 50, .Video))    // dragged
+		append(&timeline.tracks[0].clips, mk_tl_clip(7002, 0, 500, 100, 500, .Video))  // right neighbor
+		drag_clip = &timeline.tracks[0].clips[0]
+		drag_source_track = 0
+		drag_source_index = 0
+		drag_hover_track = 0
+		clear(&drag_group_orig)
+		playhead.frame = 250
+	}
+
+	// Case 1: violent rightward flick (up to 250 frames per poll), playhead parked
+	// inside the band but far from the flush line. Must park flush at 400.
+	drag_scene()
+	drag_move_in_place(f32(60))
+	drag_move_in_place(f32(161))
+	drag_move_in_place(f32(330))
+	drag_move_in_place(f32(401))
+	drag_move_in_place(f32(520))
+	drag_move_in_place(f32(700))
+	tl_probe_check(
+		drag_clip.timeline_start_frame == 400,
+		"fast rightward flick parked %d, want 400 (flush with neighbor@500, len 100)",
+		drag_clip.timeline_start_frame,
+	)
+
+	// Case 2: pointer resting mid-gap must track EXACTLY (no truncation lag).
+	drag_scene()
+	drag_move_in_place(f32(234))
+	tl_probe_check(
+		drag_clip.timeline_start_frame == 234,
+		"mid-gap target parked %d, want 234",
+		drag_clip.timeline_start_frame,
+	)
+
+	// Case 3: live-follow must continue even while the pointer rests in a DIFFERENT
+	// lane (the model is lane-blind; hover only picks the ghost/drop target).
+	drag_scene()
+	drag_hover_track = 1
+	drag_move_in_place(f32(330))
+	drag_move_in_place(f32(520))
+	tl_probe_check(
+		drag_clip.timeline_start_frame == 400,
+		"cross-lane flick parked %d, want 400 (flush)",
+		drag_clip.timeline_start_frame,
+	)
+
+	// Case 4: leftward from a position already FLUSH against a left neighbor
+	// (packed timeline): the neighbor's body sits between the clip and the
+	// leftward free zone, so the slide is legitimately blocked and must stay
+	// pinned at the flush line — never slide onto/over the neighbor.
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(7003, 0, 300, 100, 300, .Video))  // left neighbor covers [300,400)
+	append(&timeline.tracks[0].clips, mk_tl_clip(7004, 0, 400, 100, 400, .Video))  // dragged, flush at 400
+	drag_clip = &timeline.tracks[0].clips[1]
+	drag_source_track = 0
+	drag_source_index = 1
+	drag_hover_track = 0
+	clear(&drag_group_orig)
+	playhead.frame = 250
+	drag_move_in_place(f32(380))
+	drag_move_in_place(f32(260))
+	drag_move_in_place(f32(120))
+	drag_move_in_place(f32(10))
+	tl_probe_check(
+		drag_clip.timeline_start_frame == 400,
+		"leftward from flush-against-left-neighbor slipped to %d, want 400 (blocked; neighbor body in the way)",
+		drag_clip.timeline_start_frame,
+	)
+
+	// Case 4b: leftward APPROACH toward a left neighbor (clip starts right of a
+	// gap) must park FLUSH against the neighbor's end.
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(7008, 0, 300, 100, 300, .Video))  // left neighbor covers [300,400)
+	append(&timeline.tracks[0].clips, mk_tl_clip(7009, 0, 450, 100, 450, .Video))  // dragged, in gap [400,..)
+	drag_clip = &timeline.tracks[0].clips[1]
+	drag_source_track = 0
+	drag_source_index = 1
+	drag_hover_track = 0
+	clear(&drag_group_orig)
+	playhead.frame = 250
+	drag_move_in_place(f32(430))
+	drag_move_in_place(f32(410))
+	drag_move_in_place(f32(395))
+	drag_move_in_place(f32(300))
+	tl_probe_check(
+		drag_clip.timeline_start_frame == 400,
+		"leftward approach parked %d, want 400 (flush with left neighbour end)",
+		drag_clip.timeline_start_frame,
+	)
+
+	// Case 5: packed timeline (dragged clip already flush against a LEFT
+	// neighbor), fast RIGHTWARD approach toward a right neighbor. Must park
+	// flush against the RIGHT neighbor — and must NOT let the boundary union
+	// throw the clip into the left neighbor's band.
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 3, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(7005, 0, 0, 100, 0, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(7006, 0, 100, 100, 100, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(7007, 0, 320, 100, 320, .Video))
+	drag_clip = &timeline.tracks[0].clips[1]
+	drag_source_track = 0
+	drag_source_index = 1
+	drag_hover_track = 0
+	clear(&drag_group_orig)
+	playhead.frame = 250
+	drag_move_in_place(f32(130))
+	drag_move_in_place(f32(240))
+	drag_move_in_place(f32(310))
+	drag_move_in_place(f32(450))
+	drag_move_in_place(f32(620))
+	tl_probe_check(
+		drag_clip.timeline_start_frame == 220,
+		"packed rightward approach parked %d, want 220 (flush with right neighbor@320)",
+		drag_clip.timeline_start_frame,
+	)
+
+	// Case 6: the traced STALL — a linked group flicked LEFT with a member
+	// blocked on its own lane, cursor target jumping WELL past the blocker in
+	// one frame. The old feasibility gate froze the whole group at the last
+	// sampled target (anchor mid-band, "cut short"); the delta clamp must park
+	// the group FLUSH against the binding member's blocker instead.
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 2, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(1001, 9003, 100, 50, 100, .Video))
+	append(&timeline.tracks[1].clips, mk_tl_clip(1002, 9003, 100, 50, 100, .Audio))
+	append(&timeline.tracks[1].clips, mk_tl_clip(6003, 0, 25, 40, 25, .Audio)) // blocker [25,65)
+	capture_link_group(&timeline.tracks[0].clips[0], 0)
+	drag_clip = &timeline.tracks[0].clips[0]
+	drag_source_track = 0
+	drag_source_index = 0
+	drag_hover_track = 0
+	// One violent left flick to frame 50 (delta -50, lands the audio member
+	// ON the blocker). Clamp must park BOTH at 65 (delta -35, flush right of
+	// X's end), not freeze the anchor at 100.
+	drag_move_in_place(f32(50))
+	v, a := tl_group_starts()
+	tl_probe_check(
+		v == 65 && a == 65,
+		"fast left group flick over a member blocker parked V@%d A@%d, want 65/65 (flush right of blocker end)",
+		v,
+		a,
+	)
+
+	if tl_probe_fail {
+		fmt.println("[drag-probe] FAILED")
+		os.exit(1)
+	}
+	fmt.println("[drag-probe] all checks passed")
+	os.exit(0)
+}

@@ -465,6 +465,9 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		return false
 	},
 	// Find which (if any) clip the pointer is over and start dragging it.
+	// NOTE: this runs ONLY on a fresh press (inp.left && !prev_mouse_down) —
+	// while the button is HELD the drag must follow the cursor past the clip,
+	// the lane, even the timeline panel, so nothing here may gate the move.
 	proc(inp: Mouse_Input) -> bool {
 		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 			track := &timeline.tracks[track_idx]
@@ -487,6 +490,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 					// Shift+clicked extras and grab the clip.
 					clear(&selected_set)
 					drag_group_delta = 0
+					drag_lane_dwell = 0
 					drag_clip = &track.clips[index]
 					drag_source_track = track_idx
 					drag_source_index = index
@@ -547,6 +551,63 @@ end_track_drag :: proc() {
 	active_interaction = .None
 	drag_track_idx = -1
 	drag_track_hover_row = -1
+}
+
+// drag_move_in_place advances the dragged clip (or whole linked group) to
+// `frame` on its source lane, clamped so it never overlaps a neighbor. Shared
+// by the plain same-lane drag and the dwell frames of a potential vertical
+// drop: a fast flick that skitters across a lane boundary must keep the clip
+// glued to the cursor, so the horizontal follow can't live inside the
+// hover==source branch alone.
+drag_move_in_place :: proc(frame: f32) {
+	if drag_clip == nil {
+		return
+	}
+	if len(drag_group_orig) > 1 {
+		// Linked group: the whole unit shifts by deltas every member can honor
+		// exactly -- the anchor never moves into a slot a partner can't reach.
+		// A fast flick whose target overshoots a member's blocker is clamped to
+		// the binding wall (flush) instead of freezing the group at a stale
+		// sampled position; it parks where a slow drag to the same wall would.
+		delta := i64(max(frame, 0)) - drag_group_orig[0].start
+		delta = group_clamp_delta(delta)
+		if group_delta_feasible(delta) {
+			if drag_clip.timeline_start_frame != drag_group_orig[0].start + delta {
+				if vyper_trace {
+					fmt.printf(
+						"[tl] drag group link=%d (%d clips) delta=%d\n",
+						drag_clip.link_id,
+						len(drag_group_orig),
+						delta,
+					)
+				}
+				drag_clip.timeline_start_frame = drag_group_orig[0].start + delta
+			}
+			apply_group_drag_to_members(delta)
+		}
+	} else {
+		// Horizontal move: keep the live-follow behavior but clamp so the clip
+		// can never overlap a neighbor on this track.
+		new_start := clip_slide_in_track(
+			&timeline.tracks[drag_source_track],
+			drag_source_index,
+			drag_clip.source_length_frames,
+			i64(max(frame, 0)),
+			drag_clip.timeline_start_frame,
+		)
+		if drag_clip.timeline_start_frame != new_start {
+			if vyper_trace {
+				fmt.printf(
+					"[tl] drag clip src=%s len=%d start=%d -> %d\n",
+					drag_clip.path,
+					drag_clip.source_length_frames,
+					drag_clip.timeline_start_frame,
+					new_start,
+				)
+			}
+			drag_clip.timeline_start_frame = new_start
+		}
+	}
 }
 
 // interaction_post_build runs after build_page: the click/press chain and the
@@ -665,6 +726,7 @@ interaction_post_build :: proc(
 		drag_source_track = -1
 		drag_source_index = -1
 		drag_hover_track = -1
+		drag_lane_dwell = 0
 		drag_group_delta = 0
 		clear(&drag_group_orig)
 		resize_edge = -1
@@ -785,66 +847,62 @@ interaction_post_build :: proc(
 					}
 				}
 				if hover == drag_source_track {
+					drag_lane_dwell = 0
 					drag_hover_track = hover
-					if len(drag_group_orig) > 1 {
-						// Linked group: the whole unit shifts by deltas every
-						// member can honor exactly -- the anchor never moves into
-						// a slot a partner can't reach. It sticks at the last
-						// feasible position when the mouse keeps dragging past a
-						// blocked slot.
-						delta := i64(max(frame, 0)) - drag_group_orig[0].start
-						if group_delta_feasible(delta) {
-							if drag_clip.timeline_start_frame != drag_group_orig[0].start + delta {
-								if vyper_trace {
-									fmt.printf(
-										"[tl] drag group link=%d (%d clips) delta=%d\n",
-										drag_clip.link_id,
-										len(drag_group_orig),
-										delta,
-									)
-								}
-								drag_clip.timeline_start_frame = drag_group_orig[0].start + delta
-							}
-							apply_group_drag_to_members(delta)
-						}
-					} else {
-						// Horizontal move: keep the live-follow behavior but clamp so
-						// the clip can never overlap a neighbor on this track.
-						new_start := clip_slide_in_track(
-							&timeline.tracks[drag_source_track],
-							drag_source_index,
+				} else {
+					// Pointer left the source lane. A vertical drop is staged only
+					// once the pointer has RESTED here for DRAG_LANE_DWELL_FRAMES:
+					// a fast horizontal flick often skitters across a lane
+					// boundary for a frame or two, and staging the ghost instantly
+					// froze the source clip mid-stroke so it detached from the
+					// cursor before touching its neighbor. Until the dwell clears
+					// the clip keeps following the cursor on its own lane (the
+					// drag_move_in_place call below is outside this branch).
+					drag_lane_dwell += 1
+					if drag_lane_dwell >= DRAG_LANE_DWELL_FRAMES {
+						drag_hover_track = hover
+						// Vertical: clamp to nearest valid slot on the hovered
+						// track and show it as a ghost (committed on release).
+						// Linked groups slide the whole unit with the mouse's
+						// horizontal offset (drag_group_delta) on every member's lane.
+						drag_ghost_start = clip_place_in_track(
+							&timeline.tracks[hover],
+							-1,
 							drag_clip.source_length_frames,
 							i64(max(frame, 0)),
-							drag_clip.timeline_start_frame,
 						)
-						if drag_clip.timeline_start_frame != new_start {
-							if vyper_trace {
-								fmt.printf(
-									"[tl] drag clip src=%s len=%d start=%d -> %d\n",
-									drag_clip.path,
-									drag_clip.source_length_frames,
-									drag_clip.timeline_start_frame,
-									new_start,
-								)
-							}
-							drag_clip.timeline_start_frame = new_start
+						if len(drag_group_orig) > 1 {
+							drag_group_delta = i64(max(frame, 0)) - drag_group_orig[0].start
 						}
 					}
-				} else {
-					// Vertical: clamp to nearest valid slot on the hovered track
-					// and show it as a ghost (committed on release). Linked
-					// groups slide the whole unit with the mouse's horizontal
-					// offset (drag_group_delta) on every member's lane.
-					drag_hover_track = hover
-					drag_ghost_start = clip_place_in_track(
-						&timeline.tracks[hover],
-						-1,
-						drag_clip.source_length_frames,
-						i64(max(frame, 0)),
-					)
-					if len(drag_group_orig) > 1 {
-						drag_group_delta = i64(max(frame, 0)) - drag_group_orig[0].start
+				}
+				// Live horizontal move: keeps the clip glued to the cursor's X on
+				// its source lane regardless of which lane the pointer flicked
+				// into, so the drag can never detach under fast motion. When a
+				// vertical drop IS staged this previews the X the ghost follows.
+				drag_move_in_place(frame)
+				// Stall tracer (VYPER_TRACE): logs the first frame where the
+				// cursor's frame target advanced but the clip's start did not —
+				// the exact moment a drag would be "cut short", with the lane/
+				// pointer context that differs at that frame.
+				if vyper_trace {
+					tf := i64(max(frame, 0))
+					if tf != drag_trace_last_target &&
+					   drag_trace_last_start == drag_clip.timeline_start_frame {
+						fmt.printf(
+							"[drag] STALL target=%d (last=%d) clip=%d hover=%d src=%d y=%.0f x=%.0f snap=%v\n",
+							tf,
+							drag_trace_last_target,
+							drag_clip.timeline_start_frame,
+							hover,
+							drag_source_track,
+							inp.y,
+							inp.x,
+							snap_clips_to_playhead,
+						)
 					}
+					drag_trace_last_target = tf
+					drag_trace_last_start = drag_clip.timeline_start_frame
 				}
 				audio_note_edit()
 			}

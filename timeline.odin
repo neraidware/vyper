@@ -1274,6 +1274,56 @@ group_delta_feasible :: proc(delta: i64) -> bool {
 	return true
 }
 
+// group_clamp_delta clamps a group-drag delta to the nearest position every
+// captured member can land at, WITHOUT any member crossing its nearest
+// non-member blocker: the group parks FLUSH against the binding member's wall.
+// A group flick is lockstep — the feasibility gate never moves members to an
+// exact infeasible delta — so a fast cursor jump that overshoots a wall used
+// to FREEZE the whole group at the last sampled target (possibly many frames
+// short of the wall), with the cursor flying past while the anchor sits in
+// open band: "drag cut short before touching." Clamping to the current
+// interval's walls makes a fast and a slow drag park at the same flush spot.
+// The walls are the blockers at-or-left / at-or-right of each member's CURRENT
+// position, so the clamp never jumps a band (matching single-clip behavior).
+group_clamp_delta :: proc(delta: i64) -> i64 {
+	if len(drag_group_orig) <= 1 {
+		return delta
+	}
+	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
+	for m in drag_group_orig {
+		members[m.clip_id] = true
+	}
+	d_cur := drag_clip.timeline_start_frame - drag_group_orig[0].start
+	lo, hi := i64(-1 << 40), i64(1 << 40)
+	for m in drag_group_orig {
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			return delta
+		}
+		t := &timeline.tracks[m.track]
+		ts := m.start + d_cur
+		mlow := -m.start
+		mhigh := i64(1 << 40)
+		for &c in t.clips {
+			if c.clip_id in members {
+				continue
+			}
+			cend := c.timeline_start_frame + c.source_length_frames
+			if cend <= ts {
+				mlow = max(mlow, cend - m.start)
+			}
+			if ts + m.length <= c.timeline_start_frame {
+				mhigh = min(mhigh, c.timeline_start_frame - m.start - m.length)
+			}
+		}
+		lo = max(lo, mlow)
+		hi = min(hi, mhigh)
+	}
+	if hi < lo {
+		return delta
+	}
+	return clamp(delta, lo, hi)
+}
+
 // group_vertical_feasible reports whether every captured link-group member can
 // land on a destination lane `track_delta_visual` rows away in the visual stack
 // at the mouse-aligned position m.start + delta (clamped to >= 0) without

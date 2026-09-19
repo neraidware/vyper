@@ -69,7 +69,7 @@ snap_playhead_to_clips: bool = true
 // project info panel.
 snap_center_to_canvas: bool = true
 SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
-TIMELINE_MIN_ZOOM :: f32(0.01)
+TIMELINE_MIN_ZOOM :: f32(0.001)
 TIMELINE_MAX_ZOOM :: f32(16)
 
 // timeline_fps returns the timeline's frame rate (the source video's native
@@ -378,6 +378,20 @@ drag_source_track: int = -1
 drag_source_index: int = -1
 drag_hover_track: int = -1
 drag_ghost_start: i64 = 0
+// DRAG_LANE_DWELL_FRAMES is how many consecutive frames the pointer must rest
+// in a different lane than the dragged clip's source before a vertical drop is
+// staged (ghost shown, drop committed on release). A fast horizontal flick
+// often skitters across a lane boundary for a frame or two; staging the ghost
+// instantly froze the source clip mid-stroke, detaching it from the cursor
+// before it touched its neighbor. The dwell makes a deliberate drop (move + hold)
+// still work while a quick cross-lane wobble reads as part of the same-track drag.
+DRAG_LANE_DWELL_FRAMES :: 4
+drag_lane_dwell: u32 = 0
+// Drag stall tracer: last cursor-target frame and clip start seen by the
+// .Clip_Move handler, used by the VYPER_TRACE stall line to pinpoint the frame
+// where a drag stops following the cursor.
+drag_trace_last_target: i64 = -1
+drag_trace_last_start: i64 = -1
 // Track-reorder drag: dragging a whole track row onto an insert gap (the
 // "New track" button strips between rows) to reorder the stack. drag_track_idx
 // is the STORAGE index grabbed; drag_track_hover_row is the VISUAL gap
