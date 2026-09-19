@@ -189,6 +189,15 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	)
 	undo_redo()
 	rcheck(timeline.tracks[0].clips[0].transform_x == 250, "redo restores transform", fail)
+	// undo/redo both re-adopted the timeline above; selection must survive the
+	// restore by clip_id (indices shift), not get wiped.
+	rcheck(
+		selected_track == 0 &&
+			selected_index == 0 &&
+			timeline.tracks[0].clips[0].clip_id == 1,
+		"selection survives undo/redo",
+		fail,
+	)
 }
 
 // handle_undo_probe runs the probe when VYPER_UNDO_PROBE is set (headless; runs

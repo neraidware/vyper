@@ -232,18 +232,43 @@ undo_sync_current :: proc() {
 // undo_restore makes the live document match slot idx: a fresh clone of the
 // snapshot is adopted (never aliased) and every piece of state keyed to the old
 // clips — selection, in-flight drag, decoded previews — is dropped, the same
-// rule any delete follows.
+// rule any delete follows. Selection survives when the state allows it: the
+// anchor and multi-select set are re-resolved by clip_id against the restored
+// document (indices shift), and members the restored state no longer contains
+// are dropped.
 undo_restore :: proc(idx: i32) {
 	assert(idx >= 0 && idx < i32(len(undo_hist.slots)), "undo_restore index out of range")
+	sel_id: u64
+	has_sel := false
+	if _, c, ok := selected_clip(); ok {
+		sel_id = c.clip_id
+		has_sel = true
+	}
+	extra_ids := make([dynamic]u64, 0, len(selected_set), context.temp_allocator)
+	for id in selected_set {
+		append(&extra_ids, id)
+	}
+
 	new_timeline := clone_timeline(undo_hist.slots[idx].snap)
 	free_timeline(&timeline)
 	timeline = new_timeline
 	undo_hist.current = idx
 	undo_hist.pending = {}
 	undo_hist.pending_valid = false
+	clear(&selected_set)
 	selected_track = -1
 	selected_index = -1
-	clear(&selected_set)
+	if has_sel {
+		if tr, c, ok := find_clip_by_id(sel_id); ok {
+			selected_track = track_index_of(tr)
+			selected_index = clip_index_on_track(tr, c)
+		}
+	}
+	for id in extra_ids {
+		if _, _, ok := find_clip_by_id(id); ok {
+			selected_set[id] = true
+		}
+	}
 	dragging_handle = nil
 	handle_kind = .None
 	active_interaction = .None
