@@ -2,14 +2,14 @@ package main
 
 import "core:fmt"
 import "core:os"
-import "core:strings"
 
 // ---------------------------------------------------------------------------
 // VYPER_UNDO_PROBE: headless validation of the undo-tree data structure and the
-// viewer's bottom-up row renderer. Seeds a history with deliberate undo/redo
-// FORKING, then asserts tree invariants and byte-for-byte row text (the expected
-// strings below were hand-derived from the tree rule, not from the code under
-// test, so a regression in either the tree or the renderer fails loudly).
+// viewer's vim-undotree line renderer. Seeds a history with deliberate
+// undo/redo FORKING, then asserts tree invariants and byte-for-byte gutter line
+// text (the expected strings below were hand-derived from the undotree rule, not
+// from the code under test, so a regression in either the tree or the renderer
+// fails loudly).
 //
 // History under test (slot, label, parent):
 //   1 Move clip         -> root
@@ -54,6 +54,8 @@ undo_probe_run :: proc() {
 	s := undo_hist.slots
 	check(s[0].last_child == 1 && s[1].last_child == 2, "root/Move last_child", &fail)
 	check(s[2].last_child == 5, "Split last_child is Rename (fork)", &fail)
+	check(s[2].first_child == 3 && s[3].next_sibling == 5, "Split child sibling chain reaches both children", &fail)
+	check(s[5].next_sibling == -1, "tail sibling terminates", &fail)
 	check(s[3].last_child == 4, "Resize last_child is Delete", &fail)
 	check(s[4].last_child == -1 && s[7].last_child == -1, "leaf last_child == -1", &fail)
 	check(s[5].last_child == 6 && s[6].last_child == 7, "Rename/Duplicate last_child", &fail)
@@ -62,31 +64,35 @@ undo_probe_run :: proc() {
 	check(undo_newest_descendant(3) == 4, "Resize trunk runs to Delete", &fail)
 	check(int(undo_hist.slots[7].seq) == 7, "seq counter", &fail)
 
-	// Row renderer, expected strings hand-derived. Render order is newest-first
-	// top-down; '→' marks the current row (action 7).
+	// Line renderer, expected strings hand-derived from the undotree gutter
+	// rule (newest-first; '|' vertical, '/' split, '\' return, '*' node marker;
+	// connector-only lines carry no action). The branch (5->6->7) is the newer
+	// child of Split, so it takes the left column and Resize->Delete indents.
 	expected := []string{
-		"→ 7 " + "   " + "   " + "   " + "   " + "└── " + "Add text clip",
-		"  6 " + "│  " + "│  " + "│  " + "└── " + "Duplicate clip",
-		"  5 " + "│  " + "│  " + "└── " + "Rename clip",
-		"  4 " + "│  " + "│  " + "│  " + "└── " + "Delete clip",
-		"  3 " + "│  " + "│  " + "├── " + "Resize clip",
-		"  2 " + "│  " + "└── " + "Split clip",
-		"  1 " + "└── " + "Move clip",
+		" *    7   Add text clip",
+		" *    6   Duplicate clip",
+		" *    5   Rename clip",
+		" | *    4   Delete clip",
+		" | *    3   Resize clip",
+		" |/",
+		" *    2   Split clip",
+		" *    1   Move clip",
+		" *    0   start",
 	}
-	buf: [256]u8
-	for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {
-		n := undo_row_text(i, buf[:])
-		got := string(buf[:n])
-		want := expected[len(undo_hist.slots) - 1 - i]
-		check(got == want, fmt.tprintf("row %d text mismatch: got %q want %q", i, got, want), &fail)
+	want_nodes := []i32{7, 6, 5, 4, 3, -1, 2, 1, 0}
+	undo_view_rebuild()
+	check(len(undo_view_lines) == len(expected), "line count", &fail)
+	for i := 0; i < min(len(undo_view_lines), len(expected)); i += 1 {
+		got := string(undo_view_line_bufs[i][:undo_view_lines[i].text_len])
+		want := expected[i]
+		check(got == want, fmt.tprintf("line %d text mismatch: got %q want %q", i, got, want), &fail)
+		check(undo_view_lines[i].node == want_nodes[i], fmt.tprintf("line %d node mismatch", i), &fail)
 	}
 
-	// Cursor movement must not fight the marker above (cursor was 7 while the
-	// expected rows rendered; move it now and re-render the new row).
+	// Rebuild is keyed on tree growth: a cursor move must NOT re-run it.
 	undo_go_to(4)
 	check(int(undo_hist.current) == 4, "go_to(4)", &fail)
-	n := undo_row_text(4, buf[:])
-	check(strings.starts_with(string(buf[:n]), "→ "), "cursor marker tracks current", &fail)
+	check(undo_view_built_count == len(undo_hist.slots), "rebuild key stays valid", &fail)
 	undo_go_to(7)
 
 	// undo/redo cursor walking.

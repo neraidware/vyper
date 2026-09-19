@@ -5,86 +5,238 @@ import "core:fmt"
 
 // ---------------------------------------------------------------------------
 // Undo-tree viewer: fills the media bin's "Undo Tree" view (see state.odin).
-// Renders the undo history as a tree, vim-undotree style. Rows run NEWEST at
-// the top to OLDEST at the bottom ("bottom to top in sequence"); each row is
-// indented to its parent's column and connected to it with box-drawing lines.
+// Renders the history with vim-undotree's ASCII gutter: fixed columns drawn with
+// '|' (vertical), '/' (fork split) and '\' (branch return), a '*' node marker at
+// each action's column, and the sequence + label text to the right. Rows run
+// NEWEST at the top to the root at the bottom.
 //
-// Rows are ordered chronologically (append order = slot order, newest first).
-// Parent rows always sit BELOW their children, so all connectors run upward.
-// The cursor's row is highlighted; clicking a row sends the cursor there
-// (state application is the next milestone — today this is tree navigation).
+// The gutter is a faithful port of undotree's Render() slot machine, so a linear
+// history is a single flat column and the line only indents where an edit
+// actually forked a new branch (an edit made after undoing to a previous state).
+// Connector-only rows ('|/', '\') are emitted between action rows, exactly as
+// undotree does, so the display is a list of LINES: action lines carry a slot
+// index, connector lines do not.
+//
+// The whole line list is rebuilt only when the tree GROWS (a push), never per
+// frame; the cursor only changes which row is highlighted.
 // ---------------------------------------------------------------------------
 
 UNDO_ROW_H :: f32(24)     // one tree row
 UNDO_ROW_TEXT :: u16(18)  // layout height of the row text
 
-// Per-row text buffers. Clay does NOT copy text: it keeps the slice until
-// draw later in the same frame, so each row needs a buffer that outlives
-// build_page. The pool is session-owned and grows only when a new action is
-// recorded (never per frame).
-undo_row_bufs: [dynamic][256]u8
-
-undo_rows_ensure :: proc() {
-	for len(undo_row_bufs) < len(undo_hist.slots) {
-		append(&undo_row_bufs, [256]u8{})
-	}
+// One emitted display line. `node` is the undo slot for an action line and -1
+// for a connector-only line (never clickable, never highlighted). `text_len` is
+// the bytes actually written into undo_view_line_bufs for this line — clay does
+// not copy text and a whole fixed buffer would measure 256 columns wide.
+Undo_View_Line :: struct {
+	node:     i32,
+	text_len: int,
 }
 
-// undo_row_text renders one row: cursor marker, sequence number, the tree
-// prefix (indent columns + connector), then the action label. The columns are
-// built with the classic tree rule mirrored for bottom-up rendering:
-//   - a column for ancestor A shows a trunk ("│") while A's subtree still has
-//     newer content above this row (undo_newest_descendant(A) > idx);
-//   - the parent's column ends with "└──" when this node is its newest child,
-//     else passes through with "├──".
-// Returns the number of bytes written so the caller passes exactly that span
-// to clay.Text (a fixed buffer passed whole would measure 256 wide and expand
-// the layout).
-undo_row_text :: proc(idx: int, buf: []byte) -> int {
-	line: [256]u8
-	w: int
+undo_view_lines: [dynamic]Undo_View_Line
+undo_view_line_bufs: [dynamic][256]u8
+undo_view_built_count: int = -1 // len(slots) the lines were built from
 
-	if idx == int(undo_hist.current) {
-		w += copy(line[w:], "→ ")
-	} else {
-		w += copy(line[w:], "  ")
+// ---------------------------------------------------------------------------
+// undotree slot machine (port of mbbill/undotree Render()).
+//
+// Each slot is one display column: E = the next action to print, P = a fork (a
+// run of not-yet-printed siblings sharing a column), X = a dead column. Every
+// pass prints the oldest remaining action, prepends its line, then advances that
+// column to its child or collapses it.
+// ---------------------------------------------------------------------------
+Undo_View_Slot_Kind :: enum {
+	E,
+	P,
+	X,
+}
+
+Undo_View_Slot :: struct {
+	kind:  Undo_View_Slot_Kind,
+	node:  i32, // E: action slot; P: first sibling in the chain
+	count: int, // P: number of siblings
+}
+
+undo_view_scratch: [dynamic]Undo_View_Slot
+
+undo_view_rebuild :: proc() {
+	n := len(undo_hist.slots)
+	clear(&undo_view_lines)
+	clear(&undo_view_line_bufs)
+	// Scratch holds one slot per display column; a fork P expansion inserts two
+	// slots where one was, so give it two slots of headroom.
+	if len(undo_view_scratch) < n + 2 {
+		resize(&undo_view_scratch, n + 2)
 	}
-	seq := fmt.bprintf(line[w:], "%d ", undo_hist.slots[idx].seq)
-	w += len(seq)
 
-	// Ancestor path along the parent chain, path[0] = idx, path[^1] = root.
-	path: [96]i32
-	depth := 0
-	for n := i32(idx); n >= 0 && depth < len(path); n = undo_hist.slots[n].parent {
-		path[depth] = n
-		depth += 1
+	scratch := undo_view_scratch[:]
+	scratch[0] = Undo_View_Slot{kind = .E, node = 0}
+	nslots := 1
+
+	for nslots > 0 {
+		// Prefer collapsing a dead column; otherwise print the oldest action.
+		foundx := false
+		index := 0
+		for i in 0 ..< nslots {
+			if scratch[i].kind == .X {
+				foundx = true
+				index = i
+				break
+			}
+		}
+		minseq := i32(0x7fffffff)
+		minnode := i32(-1)
+		if !foundx {
+			for i in 0 ..< nslots {
+				s := scratch[i]
+				if s.kind == .E {
+					if undo_hist.slots[s.node].seq < u32(minseq) {
+						minseq = i32(undo_hist.slots[s.node].seq)
+						index = i
+						minnode = s.node
+					}
+				} else if s.kind == .P {
+					for c := s.node; c >= 0; c = undo_hist.slots[c].next_sibling {
+						if undo_hist.slots[c].seq < u32(minseq) {
+							minseq = i32(undo_hist.slots[c].seq)
+							index = i
+							minnode = c
+						}
+					}
+				}
+			}
+		}
+
+		line: [256]u8
+		w := 0
+		w += copy(line[w:], " ")
+		slot := scratch[index]
+		kind := slot.kind
+		line_node := i32(-1)
+
+		// Gutter is 2 bytes per column; the E line also carries the seq and
+		// label. Fail loudly rather than corrupt the stack line.
+		if kind == .E {
+			assert(nslots*2 + 16 + len(undo_hist.slots[slot.node].label) <= len(line), "undo line too deep")
+		} else {
+			assert(nslots*2 <= len(line), "undo line too deep")
+		}
+
+		if kind == .X {
+			// A returning branch: '|' to the left, '\' to the right of the
+			// collapsed column.
+			if index+1 != nslots {
+				for i in 0 ..< nslots {
+					if i < index {
+						w += copy(line[w:], "| ")
+					}
+					if i > index {
+						w += copy(line[w:], " \\")
+					}
+				}
+			}
+			for i := index; i < nslots-1; i += 1 {
+				scratch[i] = scratch[i+1]
+			}
+			nslots -= 1
+		}
+
+		if kind == .E {
+			for i in 0 ..< nslots {
+				if i == index {
+					w += copy(line[w:], "* ")
+				} else {
+					w += copy(line[w:], "| ")
+				}
+			}
+			w += copy(line[w:], "   ")
+			seq := fmt.bprintf(line[w:], "%d", undo_hist.slots[slot.node].seq)
+			w += len(seq)
+			w += copy(line[w:], "   ")
+			w += copy(line[w:], undo_hist.slots[slot.node].label)
+			line_node = slot.node
+
+			c := undo_hist.slots[slot.node].first_child
+			if c < 0 {
+				scratch[index] = Undo_View_Slot{kind = .X}
+			} else if undo_hist.slots[c].next_sibling < 0 {
+				scratch[index] = Undo_View_Slot{kind = .E, node = c}
+			} else {
+				count := 0
+				for s := c; s >= 0; s = undo_hist.slots[s].next_sibling {
+					count += 1
+				}
+				scratch[index] = Undo_View_Slot{kind = .P, node = c, count = count}
+			}
+		}
+
+		if kind == .P {
+			for k in 0 ..< nslots {
+				if k < index {
+					w += copy(line[w:], "| ")
+				}
+				if k == index {
+					w += copy(line[w:], "|/ ")
+				}
+				if k > index {
+					w += copy(line[w:], " / ")
+				}
+			}
+			for i := index; i < nslots-1; i += 1 {
+				scratch[i] = scratch[i+1]
+			}
+			nslots -= 1
+
+			// The oldest sibling becomes this column's E; the rest stay as a
+			// P in the next column. Two siblings split into two E columns
+			// (undotree puts the newer one on the left).
+			first := slot.node
+			if slot.count == 2 {
+				a := first
+				b := undo_hist.slots[a].next_sibling
+				left, right := a, b
+				if undo_hist.slots[a].seq < undo_hist.slots[b].seq {
+					left, right = b, a
+				}
+				for i := nslots - 1; i >= index; i -= 1 {
+					scratch[i+2] = scratch[i]
+				}
+				nslots += 2
+				scratch[index] = Undo_View_Slot{kind = .E, node = left}
+				scratch[index+1] = Undo_View_Slot{kind = .E, node = right}
+			} else {
+				// Children are linked in ascending seq order, so the oldest
+				// (minimum-seq) sibling is always the chain head; the rest is
+				// the chain minus that head.
+				assert(first == minnode, "undotree sibling chain out of seq order")
+				rest_first := undo_hist.slots[first].next_sibling
+				for i := nslots - 1; i >= index; i -= 1 {
+					scratch[i+2] = scratch[i]
+				}
+				nslots += 2
+				scratch[index] = Undo_View_Slot{kind = .P, node = rest_first, count = slot.count - 1}
+				scratch[index+1] = Undo_View_Slot{kind = .E, node = minnode}
+			}
+		}
+
+		// Strip trailing spaces; an empty line means this pass drew nothing.
+		for w > 0 && line[w-1] == ' ' {
+			w -= 1
+		}
+		if w > 1 {
+			append(&undo_view_line_bufs, [256]u8{})
+			copy(undo_view_line_bufs[len(undo_view_line_bufs)-1][:], line[:w])
+			append(&undo_view_lines, Undo_View_Line{node = line_node, text_len = w})
+		}
 	}
-	// depth = edges to root; path[k] = ancestor at tree-depth k (path[D]=root).
 
-	// Columns for every ancestor strictly above the parent (edge-depth 0..D-2:
-	// root, ..., grandparent). path[depth-1-k] is the ancestor at edge-depth k
-	// (path[0] = this node at edge-depth D, path[depth-1] = root).
-	for k := 0; k < depth - 2; k += 1 {
-		a := path[depth - 1 - k]
-		bar := undo_newest_descendant(int(a)) > idx
-		chunk := bar ? "│  " : "   "
-		assert(w + len(chunk) <= len(line))
-		w += copy(line[w:], chunk)
+	// The machine emits root-first; the view is newest-first.
+	for i := 0; i < len(undo_view_lines) / 2; i += 1 {
+		j := len(undo_view_lines) - 1 - i
+		undo_view_lines[i], undo_view_lines[j] = undo_view_lines[j], undo_view_lines[i]
+		undo_view_line_bufs[i], undo_view_line_bufs[j] = undo_view_line_bufs[j], undo_view_line_bufs[i]
 	}
-	last := depth > 1 && idx == int(undo_hist.slots[path[1]].last_child)
-	conn := last ? "└── " : "├── "
-	if depth == 0 {
-		conn = "" // the root itself (not rendered, but safe)
-	}
-	assert(w + len(conn) <= len(line))
-	w += copy(line[w:], conn)
-
-	// label
-	assert(w + len(undo_hist.slots[idx].label) <= len(line))
-	w += copy(line[w:], undo_hist.slots[idx].label)
-
-	copy(buf, line[:w])
-	return w
+	undo_view_built_count = n
 }
 
 // ---------------------------------------------------------------------------
@@ -103,10 +255,11 @@ undo_view_max_scroll :: proc() -> f32 {
 	return max(undo_view_rows_height() - undo_view_clip_height(), 0)
 }
 
-undo_row :: proc(idx: int) {
-	cur := idx == int(undo_hist.current)
-	id := clay.ID("UndoRow", u32(idx))
-	hovered := clay.PointerOver(id)
+undo_row :: proc(line_i: int) {
+	line := undo_view_lines[line_i]
+	cur := line.node >= 0 && int(line.node) == int(undo_hist.current)
+	id := clay.ID("UndoRow", u32(line_i))
+	hovered := line.node >= 0 && clay.PointerOver(id)
 	if clay.UI(id)(
 		{
 			layout = {
@@ -124,9 +277,8 @@ undo_row :: proc(idx: int) {
 			},
 		},
 	) {
-		n := undo_row_text(idx, undo_row_bufs[idx][:])
 		clay.Text(
-			string(undo_row_bufs[idx][:n]),
+			string(undo_view_line_bufs[line_i][:line.text_len]),
 			clay.TextElementConfig{
 				textColor = cur ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_SMALL,
@@ -157,10 +309,9 @@ undo_view_header :: proc() {
 }
 
 // undo_view_content fills its parent with the tree — the "no actions yet" hint
-// until the first action exists, then the scrollable row clip plus a
+// until the first action exists, then the scrollable line clip plus a
 // v_scrollbar when the tree outgrows the body.
 undo_view_content :: proc() {
-	undo_rows_ensure()
 	if len(undo_hist.slots) <= 1 {
 		clay.Text(
 			"no actions yet",
@@ -172,9 +323,11 @@ undo_view_content :: proc() {
 		)
 		return
 	}
-	// Width is plain grow: the row text is sliced to its written length (see
-	// undo_row_text) so the content measures real width — a fixed 256-byte
-	// buffer passed whole once false-expanded this area past the panel.
+	// Structure only changes on a push; cursor moves reuse the built lines.
+	if undo_view_built_count != len(undo_hist.slots) {
+		undo_view_rebuild()
+	}
+	// Width is plain grow: every line is a fixed slice sized to its real text.
 	if clay.UI(clay.ID("UndoRowsArea"))(
 		{
 			layout = {
@@ -206,8 +359,7 @@ undo_view_content :: proc() {
 					},
 				},
 			) {
-				// Newest first: rows run top (newest) to bottom (oldest).
-				for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {
+				for i in 0 ..< len(undo_view_lines) {
 					undo_row(i)
 				}
 			}
@@ -223,17 +375,23 @@ undo_view_content :: proc() {
 
 undo_view_stats_buf: [128]u8
 
-// undo_view_row_click wires row clicks: any click inside a tree row moves the
-// cursor to that action. Added first in the click chain so the undo view
-// claims its own rows before anything underneath. Returns false when the
-// media bin isn't showing the tree (never intercepts anything).
+// undo_view_row_click wires row clicks: any click inside an action row moves the
+// cursor to that action. Connector rows are inert. Added first in the click
+// chain so the undo view claims its own rows before anything underneath.
+// Returns false when the media bin isn't showing the tree.
 undo_view_row_click :: proc(inp: Mouse_Input) -> bool {
 	if media_bin_view != .Undo || len(undo_hist.slots) <= 1 {
 		return false
 	}
-	for i := len(undo_hist.slots) - 1; i >= 1; i -= 1 {
+	if undo_view_built_count != len(undo_hist.slots) {
+		undo_view_rebuild()
+	}
+	for i in 0 ..< len(undo_view_lines) {
+		if undo_view_lines[i].node < 0 {
+			continue
+		}
 		if clay.PointerOver(clay.ID("UndoRow", u32(i))) {
-			undo_go_to(i)
+			undo_go_to(int(undo_view_lines[i].node))
 			return true
 		}
 	}

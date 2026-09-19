@@ -95,6 +95,10 @@ undo_push :: proc(kind: Undo_Kind, label: string) -> i32 {
 	parent := &undo_hist.slots[p]
 	if parent.first_child < 0 {
 		parent.first_child = idx
+	} else {
+		// Link onto the sibling chain so first_child -> next_sibling reaches
+		// every child (the renderer walks this chain; last_child alone can't).
+		undo_hist.slots[parent.last_child].next_sibling = idx
 	}
 	parent.last_child = idx
 	undo_hist.current = idx
