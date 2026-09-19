@@ -298,15 +298,80 @@ render_clay :: proc(
 				   clay.PointerOver(clay.ID("OpenFileButton")) {
 					color = BUTTON_BORDER_HOVER
 				}
-				render_sdf_rect(
-					renderer,
-					command_buffer,
-					pass,
-					bounds,
-					color,
-					config.cornerRadius.topLeft,
-					f32(config.width.left),
-				)
+				// render_sdf_rect's last arg is a single uniform band width
+				// (0 = fill the whole quad). A per-side border therefore
+				// cannot go through it directly: passing .left makes a
+				// bottom-only border (e.g. the app-bar separator) a border=0
+				// fill that paints over the element's own children, which are
+				// drawn before the border command. Decompose it into one thin
+				// quad per non-zero side instead.
+				w := config.width
+				if w.left == w.right && w.right == w.top && w.top == w.bottom {
+					render_sdf_rect(
+						renderer,
+						command_buffer,
+						pass,
+						bounds,
+						color,
+						config.cornerRadius.topLeft,
+						f32(w.left),
+					)
+				} else {
+					if w.top > 0 {
+						render_sdf_rect(
+							renderer,
+							command_buffer,
+							pass,
+							clay.BoundingBox{bounds.x, bounds.y, bounds.width, f32(w.top)},
+							color,
+							0,
+							0,
+						)
+					}
+					if w.bottom > 0 {
+						render_sdf_rect(
+							renderer,
+							command_buffer,
+							pass,
+							clay.BoundingBox {
+								bounds.x,
+								bounds.y + bounds.height - f32(w.bottom),
+								bounds.width,
+								f32(w.bottom),
+							},
+							color,
+							0,
+							0,
+						)
+					}
+					if w.left > 0 {
+						render_sdf_rect(
+							renderer,
+							command_buffer,
+							pass,
+							clay.BoundingBox{bounds.x, bounds.y, f32(w.left), bounds.height},
+							color,
+							0,
+							0,
+						)
+					}
+					if w.right > 0 {
+						render_sdf_rect(
+							renderer,
+							command_buffer,
+							pass,
+							clay.BoundingBox {
+								bounds.x + bounds.width - f32(w.right),
+								bounds.y,
+								f32(w.right),
+								bounds.height,
+							},
+							color,
+							0,
+							0,
+						)
+					}
+				}
 			}
 		case .Text:
 			if !suppressed {
