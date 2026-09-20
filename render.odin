@@ -159,8 +159,47 @@ render_progress: struct {
 // and hands it to clay in the same frame, so a single shared buffer is fine.
 status_text_buf: [256]u8
 
+// Render FPS meter: the worker writes frames_done atomically; the UI samples it
+// here each tick. EWMA over ~250 ms windows — a bare instant per UI tick would
+// jitter with the 16 ms frame cadence. Only the UI thread touches the window.
+RENDER_FPS_WINDOW_S :: 0.25
+render_fps_wnd: struct {
+	prev_ns:   i64,
+	prev_done: i64,
+	fps:       f64,
+}
+render_fps_buf: [32]u8
+
 render_status :: proc() -> Render_Status {
 	return Render_Status(sync.atomic_load(&render_progress.status))
+}
+
+// render_fps_text samples the meter and returns a " · N fps" suffix ("" until
+// the first window has completed frames). done < prev_done means a new render
+// run reset frames_done to 0, which (re)anchors the window.
+render_fps_text :: proc(done: i64) -> string {
+	wnd := &render_fps_wnd
+	now := i64(sdl.GetTicksNS())
+	if wnd.prev_ns == 0 || done < wnd.prev_done {
+		wnd.prev_ns = now
+		wnd.prev_done = done
+		wnd.fps = 0
+		return ""
+	}
+	dt := f64(now - wnd.prev_ns) / 1e9
+	if dt >= RENDER_FPS_WINDOW_S {
+		if done > wnd.prev_done {
+			inst := f64(done - wnd.prev_done) / dt
+			wnd.fps = wnd.fps == 0 ? inst : 0.5 * wnd.fps + 0.5 * inst
+		}
+		wnd.prev_ns = now
+		wnd.prev_done = done
+	}
+	if wnd.fps <= 0 {
+		return ""
+	}
+	text := fmt.bprintf(render_fps_buf[:], " · %.1f fps", wnd.fps)
+	return string(text)
 }
 
 render_status_text :: proc() -> string {
@@ -175,7 +214,7 @@ render_status_text :: proc() -> string {
 			return "Rendering..."
 		}
 		pct := i64(100) * done / total
-		text := fmt.bprintf(status_text_buf[:], "Rendering %d / %d (%d%%)", done, total, pct)
+		text := fmt.bprintf(status_text_buf[:], "Rendering %d / %d (%d%%)%s", done, total, pct, render_fps_text(done))
 		return string(text)
 	case .Done:
 		return "Render complete"
