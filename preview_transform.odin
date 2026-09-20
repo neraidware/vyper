@@ -727,10 +727,6 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		return
 	}
 	h := dragging_handle.?
-	cx := handle_start_center_x
-	cy := handle_start_center_y
-	bw := handle_start_box_w
-	bh := handle_start_box_h
 
 	// Text clips use a different transform model than video: transform_x/y is
 	// the text's TOP-LEFT corner (in project units), not its center, and the box
@@ -944,9 +940,9 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			// the box never drifts. The center is the transform shifted by the
 			// crop asymmetry ((dr-dl)/2), so a cropped clip still resizes about
 			// what the user sees.
-			cx := handle_start_tx + (dl0 - dr0) / 2
-			cy := handle_start_ty + (dt0 - db0) / 2
-			k := max(handle_center_pivot_scale(h, cx, cy, pmx, pmy, w0, h0), 0.01)
+			pivot_cx := handle_start_tx + (dl0 - dr0) / 2
+			pivot_cy := handle_start_ty + (dt0 - db0) / 2
+			k := max(handle_center_pivot_scale(h, pivot_cx, pivot_cy, pmx, pmy, w0, h0), 0.01)
 			s := scale0 * k
 			cw, ch := clip_full_box_dims(clip, PW * s, PH * s)
 			dl := (0.5 - cl) * cw
@@ -954,8 +950,8 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			dt := (0.5 - ct) * ch
 			db := (0.5 - cb) * ch
 			clip.scale = clamp(s, 0.05, 100.0)
-			clip.transform_x = cx + (dl - dr) / 2
-			clip.transform_y = cy + (dt - db) / 2
+			clip.transform_x = pivot_cx + (dl - dr) / 2
+			clip.transform_y = pivot_cy + (dt - db) / 2
 			snap_driven_handle(clip, h, clamp(s, 0.05, 100.0), clip.transform_x, clip.transform_y, cw, ch, snap_margin(canvas, SNAP_MARGIN_PX), true)
 			return
 		}

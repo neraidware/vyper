@@ -963,6 +963,24 @@ interaction_post_build :: proc(
 	if was_click {
 		handle_playback_rate_click(rate_clicked)
 	}
+	// Export-encoder dropdown: same toggle/select/dismiss shape as the rate
+	// menu. Changing the choice only affects the next render, never a live one.
+	enc_clicked := was_click && clay.PointerOver(clay.ID("RenderEncoderButton"))
+	if was_click {
+		if enc_clicked {
+			render_encoder_menu_open = !render_encoder_menu_open
+		} else if render_encoder_menu_open && clay.PointerOver(clay.ID("RenderEncoderMenu")) {
+			if clay.PointerOver(clay.ID("EncChoiceCPU")) {
+				render_encoder_choice = .CPU
+				render_encoder_menu_open = false
+			} else if clay.PointerOver(clay.ID("EncChoiceGPU")) {
+				render_encoder_choice = .GPU
+				render_encoder_menu_open = false
+			}
+		} else if render_encoder_menu_open {
+			render_encoder_menu_open = false
+		}
+	}
 	// Help overlay: the "?" button toggles it; any other click outside the
 	// panel dismisses it.
 	if was_click {

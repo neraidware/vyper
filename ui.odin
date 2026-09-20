@@ -1193,12 +1193,82 @@ clip_card :: proc() {
 	}
 }
 
+// render_encoder_label returns the export encoder choices' display text: GPU
+// means "the first hardware H.264 encoder that opens" (quality traded for
+// speed), CPU the libx264 baseline.
+render_encoder_label :: proc(choice: Render_Encoder_Choice) -> string {
+	if choice == .GPU {
+		return "Fast (GPU)"
+	}
+	return "High quality (CPU)"
+}
+
+// render_encoder_dropdown renders the export encoder selector in the render
+// panel: a collapsed button toggling a floating menu of the two choices, the
+// same shape as the playback-rate dropdown. Choosing one sets the choice and
+// closes the menu. A GPU choice that finds no working hardware encoder on this
+// machine falls back to libx264 at render time (never a failed render).
+render_encoder_dropdown :: proc() {
+	enc_border := clay.BorderOutside(1)
+	if clay.UI(clay.ID("RenderEncoderButton"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFixed(170), height = clay.SizingFixed(BUTTON_HEIGHT)},
+			padding = clay.Padding{left = 8, right = 8},
+			childAlignment = {x = .Center, y = .Center},
+		},
+		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
+		border = {
+			color = render_encoder_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			width = enc_border,
+		},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	},
+	) {
+		clay.Text(
+			render_encoder_label(render_encoder_choice),
+			clay.TextElementConfig {
+				textColor = render_encoder_menu_open ? BUTTON_BORDER_HOVER : TEXT,
+				fontSize = FONT_SMALL,
+			},
+		)
+	}
+	if render_encoder_menu_open {
+		if clay.UI(clay.ID("RenderEncoderMenu"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingFixed(170), height = clay.SizingFit({})},
+				layoutDirection = .TopToBottom,
+				childGap = 2,
+				padding = clay.PaddingAll(4),
+			},
+			backgroundColor = BUTTON,
+			border = {color = BUTTON_BORDER, width = enc_border},
+			cornerRadius = clay.CornerRadiusAll(4),
+			floating = {
+				offset = {0, 4},
+				parentId = clay.ID("RenderEncoderButton").id,
+				zIndex = 1000,
+				attachment = {element = .LeftTop, parent = .LeftBottom},
+				attachTo = .ElementWithId,
+				pointerCaptureMode = .Capture,
+				clipTo = .None,
+			},
+		},
+		) {
+			settings_button("EncChoiceCPU", "High quality (CPU)", render_encoder_choice == .CPU, fill_width = true)
+			settings_button("EncChoiceGPU", "Fast (GPU)", render_encoder_choice == .GPU, fill_width = true)
+		}
+	}
+}
+
 // render_card is the "Render" inspector card: pick an output path, start/cancel
 // an export, and show progress.
 render_card :: proc() {
 	if !card_open("RenderCard", "Render") {
 		return
 	}
+	render_encoder_dropdown()
 	if clay.UI(clay.ID("RenderButtonsRow"))(
 	{
 		layout = {

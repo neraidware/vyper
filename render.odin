@@ -42,6 +42,25 @@ Render_Default_Path :: "render.mp4"
 // <name>_<n>.<ext> instead of clobbering an existing file of the same name.
 render_overwrite_out: bool
 
+// render_encoder_choice picks the export video encoder family: .CPU is libx264
+// ("High quality"), .GPU tries the first hardware H.264 encoder that actually
+// opens on this machine (falling back to libx264 if none does — a GPU choice
+// must never fail the render just because the device is absent). Hardware
+// encoders trade quality for speed; the choice is explicit, never implicit.
+Render_Encoder_Choice :: enum u32 {
+	CPU,
+	GPU,
+}
+render_encoder_choice: Render_Encoder_Choice = .CPU
+render_encoder_menu_open: bool
+
+// Encoder candidate order per platform, most platform-appropriate first (probed
+// in order; each is only accepted when a real open succeeds — see
+// enc_open_video). libx264 is appended as the universal last resort.
+ENC_CANDIDATES_LINUX := []cstring{"h264_nvenc", "h264_vaapi", "h264_qsv", "h264_amf"}
+ENC_CANDIDATES_MACOS := []cstring{"h264_videotoolbox"}
+ENC_CANDIDATES_WINDOWS := []cstring{"h264_nvenc", "h264_qsv", "h264_amf"}
+
 // resolve_out_scratch holds the resolved path; used at most once per render
 // start, so a single shared buffer is fine.
 resolve_out_scratch: [4096]u8
@@ -440,6 +459,16 @@ Render_Enc :: struct {
 	audio_plane:     bool,
 	vpkt:            ^avcodec.Packet,
 	apkt:            ^avcodec.Packet,
+	// Encoder identity, resolved at open: the codec name actually encoding and
+	// the pixel format the RGBA canvas is converted into before send. Hardware
+	// encoders take NV12 in system memory; hw-upload encoders (VAAPI) get an
+	// extra sw->hw transfer into an AVHWFramesContext-backed surface.
+	enc_name:        [64]u8,
+	enc_name_len:    int,
+	enc_sw_pix_fmt:  avutil.PixelFormat,
+	enc_hw_upload:   bool,
+	enc_hw_device:   ^avutil.BufferRef,
+	enc_hw_frames:   ^avutil.BufferRef,
 	// Pending audio holds the largest push (MAX_AUDIO_FRAME_SAMPLES*2 stereo
 	// samples) plus the sub-AAC residue a flush leaves behind; a 4096-cap
 	// alone overflowed whenever residue + chunk crossed it (bounds trap at
@@ -470,6 +499,12 @@ enc_cleanup :: proc(e: ^Render_Enc) {
 	}
 	if e.sws_rgb_yuv != nil {
 		sws.freeContext(e.sws_rgb_yuv)
+	}
+	if e.enc_hw_device != nil {
+		avutil.buffer_unref(&e.enc_hw_device)
+	}
+	if e.enc_hw_frames != nil {
+		avutil.buffer_unref(&e.enc_hw_frames)
 	}
 	if e.yuv_avail {
 		avutil.freep(&e.yuv_data[0])
@@ -503,19 +538,59 @@ enc_drain :: proc(
 	return true
 }
 
-// enc_open_video configures the H.264 encoder and its mux stream.
-enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c.int) -> bool {
-	codec := avcodec.find_encoder_by_name("libx264")
-	if codec == nil {
-		fmt.println("no libx264 encoder")
-		return false
+// HwFramesContext mirrors the public AVHWFramesContext layout
+// (libavutil/hwcontext.h) up through height — the binding keeps the type
+// opaque, but the encoder probe must fill format/sw_format/dimensions before
+// av_hwframe_ctx_init. Only initial_pool_size.format/.sw_format/width/height
+// are written; the rest of the head exists so the written fields land at the
+// true offsets (av_class, device_ref, device_ctx, hwctx, free, user_opaque
+// precede pool), and the tail pins the ABI.
+HwFramesContext :: struct {
+	av_class:          rawptr, // const AVClass*
+	device_ref:        ^avutil.BufferRef,
+	device_ctx:        rawptr, // AVHWDeviceContext* (filled by init)
+	hwctx:             rawptr,
+	free:              rawptr,
+	user_opaque:       rawptr,
+	pool:              rawptr, // AVBufferPool*
+	initial_pool_size: c.int,
+	format:            avutil.PixelFormat,
+	sw_format:         avutil.PixelFormat,
+	width:             c.int,
+	height:            c.int,
+	_pad:              [64]u8, // internal union — pin ABI past the writes
+}
+
+// enc_encoder_candidates returns the encoder names to try, in order. CPU runs
+// libx264 directly; GPU probes the platform's hardware encoders first and ends
+// with libx264 as the guaranteed last resort.
+enc_encoder_candidates :: proc() -> (names: [dynamic]cstring) {
+	if render_encoder_choice == .CPU {
+		append(&names, "libx264")
+		return
 	}
-	ctx := avcodec.alloc_context3(codec)
-	if ctx == nil {
-		fmt.println("avcodec_alloc_context3 (h264) failed")
-		return false
+	when ODIN_OS == .Linux {
+		for n in ENC_CANDIDATES_LINUX {
+			append(&names, n)
+		}
+	} else when ODIN_OS == .Darwin {
+		for n in ENC_CANDIDATES_MACOS {
+			append(&names, n)
+		}
+	} else when ODIN_OS == .Windows {
+		for n in ENC_CANDIDATES_WINDOWS {
+			append(&names, n)
+		}
 	}
-	e.vcodec_ctx = ctx
+	append(&names, "libx264")
+	return
+}
+
+// enc_ctx_common fills the encoder context fields shared by every H.264
+// encoder (libx264 and hardware alike). libx264-specific options (preset) are
+// set by the open path that owns libx264; hardware encoders accept these
+// generic fields and ignore what they don't understand.
+enc_ctx_common :: proc(ctx: ^avcodec.CodecContext, width, height: c.int, fps_num, fps_den: c.int) {
 	ctx.width = width
 	ctx.height = height
 	// The output canvas ticks the source/timeline frame rate, not a fixed 60,
@@ -528,46 +603,101 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c
 		num = fps_num,
 		den = fps_den,
 	}
-	ctx.pix_fmt = .YUV420P
 	ctx.gop_size = 120
 	ctx.max_b_frames = 2
 	ctx.bit_rate = 8_000_000
-	// Thread count 0 = auto-detect: libx264 frames threads across cores. The
-	// FFmpeg default is 1 (single-threaded encode) unless opted in explicitly;
-	// leaving it defaulted wastes every core past the first on encode.
+	// The reference vaapi_encode example pins SAR to 1:1; the default (0:1)
+	// trips the SAR validity check path in avcodec_open2 on some builds.
+	ctx.sample_aspect_ratio = avutil.Rational {num = 1, den = 1}
+	// Thread count 0 = auto-detect. libx264 frames threads across cores; the
+	// FFmpeg default is 1 (single-threaded encode) unless opted in explicitly,
+	// wasting every core past the first. Hardware encoders ignore it.
 	ctx.thread_count = 0
-	if ret := avutil.opt_set(ctx.priv_data, "preset", RENDER_VIDEO_PRESET, 0); ret < 0 {
-		// A hardcoded, known-valid preset on a known encoder: failing here means
-		// the build's libx264 disagrees, and silently running "medium" hides the
-		// very slowdown this exists to remove.
-		fmt.println("av_opt_set (preset):", ff_err_str(ret))
-		return false
-	}
-	if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
-		fmt.println("avcodec_open2 (h264):", ff_err_str(ret))
-		return false
-	}
-	stream := avfmt.new_stream(e.fmt_ctx, codec)
-	if stream == nil {
-		fmt.println("avformat_new_stream (video) failed")
-		return false
-	}
-	e.vstream = stream
-	stream.time_base = ctx.time_base
-	if ret := avcodec.parameters_from_context(stream.codecpar, ctx); ret < 0 {
-		fmt.println("avcodec_parameters_from_context:", ff_err_str(ret))
-		return false
-	}
-	stream.codecpar.width = width
-	stream.codecpar.height = height
+}
 
+// enc_hw_upload_open tries the encoder's hardware-frames path: create the
+// device, build a frames context for the codec's hw format with NV12 as the
+// software carrier, and open with the ctx receiving hardware surfaces. The
+// frame-send path then uploads each sw NV12 frame into a hw surface. Fails
+// cleanly (releases everything acquired) when no config opens — the sw-input
+// path is tried next.
+enc_hw_upload_open :: proc(
+	e: ^Render_Enc,
+	ctx: ^avcodec.CodecContext,
+	codec: ^avcodec.Codec,
+	width, height: c.int,
+) -> bool {
+	for i: c.int = 0; ; i += 1 {
+		cfg := avcodec.get_hw_config(codec, i)
+		if cfg == nil {
+			break
+		}
+		if .HW_Frames_Ctx not_in cfg.methods && .HW_Device_Ctx not_in cfg.methods {
+			continue
+		}
+		// A config whose pixel format isn't a real format is a sw-input hint,
+		// not a hw-upload target (the sw branch handles those).
+		if cfg.pix_fmt == .None {
+			continue
+		}
+		// A driver/device absence is expected and handled (we move on) but
+		// libav logs it at ERROR; suppress logging for the probe window, same
+		// as the decode probe does.
+		probe_level := avutil.log_get_level()
+		avutil.log_set_level(.Quiet)
+		dev_ref: ^avutil.BufferRef
+		dev_ok := avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, nil, nil, 0)
+		if dev_ok != 0 && cfg.device_type == .Vaapi {
+			dev_ok = avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, "/dev/dri/renderD128", nil, 0)
+		}
+		avutil.log_set_level(probe_level)
+		if dev_ok != 0 {
+			continue
+		}
+		frames_ref := avutil.hwframe_ctx_alloc(dev_ref)
+		if frames_ref == nil {
+			avutil.buffer_unref(&dev_ref)
+			continue
+		}
+		frm := (^HwFramesContext)(frames_ref.data)
+		frm.format = cfg.pix_fmt
+		frm.sw_format = .NV12
+		frm.width = width
+		frm.height = height
+		if ret := avutil.hwframe_ctx_init(frames_ref); ret < 0 {
+			avutil.buffer_unref(&frames_ref)
+			avutil.buffer_unref(&dev_ref)
+			continue
+		}
+		ctx.hw_device_ctx = avutil.buffer_ref(dev_ref)
+		ctx.hw_frames_ctx = avutil.buffer_ref(frames_ref)
+		ctx.pix_fmt = cfg.pix_fmt
+		if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
+			// ctx owns the refs avcodec_free_context will release; free only
+			// our own duplicates. Unref'ing ctx's here and again later is a
+			// double-free crash.
+			avutil.buffer_unref(&frames_ref)
+			avutil.buffer_unref(&dev_ref)
+			continue
+		}
+		e.enc_hw_device = dev_ref
+		e.enc_hw_frames = frames_ref
+		e.enc_hw_upload = true
+		return true
+	}
+	return false
+}
+
+// enc_convert_finish wires the RGBA -> encoder-input scaler + buffer for the
+// chosen software pixel format (the hardware-upload path scales into NV12).
+enc_convert_finish :: proc(e: ^Render_Enc, width, height: c.int) -> bool {
 	e.sws_rgb_yuv = sws.getContext(
 		width,
 		height,
 		avutil.PixelFormat.RGBA,
 		width,
 		height,
-		avutil.PixelFormat.YUV420P,
+		e.enc_sw_pix_fmt,
 		sws.Flags{.Bilinear},
 		nil,
 		nil,
@@ -577,21 +707,119 @@ enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c
 		fmt.println("sws_getContext (rgb->yuv) failed")
 		return false
 	}
-	if avutil.image_alloc(
-		   &e.yuv_data[0],
-		   &e.yuv_linesize[0],
-		   width,
-		   height,
-		   avutil.PixelFormat.YUV420P,
-		   32,
-	   ) <
-	   0 {
+	if avutil.image_alloc(&e.yuv_data[0], &e.yuv_linesize[0], width, height, e.enc_sw_pix_fmt, 32) < 0 {
 		fmt.println("av_image_alloc (yuv) failed")
 		return false
 	}
 	e.yuv_avail = true
-	e.vpkt = avcodec.packet_alloc()
 	return true
+}
+
+// enc_open_one tries a single named encoder and, on success, keeps its context
+// plus the RGBA->input conversion. Hardware candidates are accepted only when
+// a real open succeeds: an encoder can be registered in the build yet fail to
+// open without the device/driver behind it, exactly like the decode probe
+// handles. Each attempt gets a fresh context — a failed avcodec_open2 leaves
+// context state undefined.
+enc_open_one :: proc(
+	e: ^Render_Enc,
+	name: cstring,
+	width, height: c.int,
+	fps_num, fps_den: c.int,
+) -> bool {
+	codec := avcodec.find_encoder_by_name(name)
+	if codec == nil {
+		return false
+	}
+	ctx := avcodec.alloc_context3(codec)
+	if ctx == nil {
+		return false
+	}
+	enc_ctx_common(ctx, width, height, fps_num, fps_den)
+	if name == "libx264" {
+		ctx.pix_fmt = .YUV420P
+		if ret := avutil.opt_set(ctx.priv_data, "preset", RENDER_VIDEO_PRESET, 0); ret < 0 {
+			// A hardcoded, known-valid preset on a known encoder: failing here
+			// means the build's libx264 disagrees, and silently running
+			// "medium" hides the very slowdown this exists to remove.
+			fmt.println("av_opt_set (preset):", ff_err_str(ret))
+			avcodec.free_context(&ctx)
+			return false
+		}
+		if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
+			fmt.println("avcodec_open2 (h264):", ff_err_str(ret))
+			avcodec.free_context(&ctx)
+			return false
+		}
+		e.enc_sw_pix_fmt = .YUV420P
+	} else if enc_hw_upload_open(e, ctx, codec, width, height) {
+		// The frame-send path scales into NV12 and uploads it (sw carrier).
+		e.enc_sw_pix_fmt = .NV12
+	} else {
+		sw_candidates := [?]avutil.PixelFormat{.NV12, .YUV420P}
+		opened := false
+		for pix_fmt in sw_candidates {
+			fctx := avcodec.alloc_context3(codec)
+			if fctx == nil {
+				break
+			}
+			enc_ctx_common(fctx, width, height, fps_num, fps_den)
+			fctx.pix_fmt = pix_fmt
+			if ret := avcodec.open2(fctx, codec, nil); ret == 0 {
+				avcodec.free_context(&ctx)
+				ctx = fctx
+				e.enc_sw_pix_fmt = pix_fmt
+				opened = true
+				break
+			}
+			avcodec.free_context(&fctx)
+		}
+		if !opened {
+			avcodec.free_context(&ctx)
+			return false
+		}
+	}
+	e.vcodec_ctx = ctx
+	n := 0
+	namep := ([^]u8)(name)
+	for n < len(e.enc_name) - 1 && namep[n] != 0 {
+		e.enc_name[n] = namep[n]
+		n += 1
+	}
+	e.enc_name_len = n
+	if !enc_convert_finish(e, width, height) {
+		fmt.println("failed to prepare convert path for", string(name))
+		return false
+	}
+	return true
+}
+
+// enc_open_video configures the video encoder and its mux stream. It tries the
+// encoder candidates (per the export-panel choice) until one opens, then wires
+// its stream.
+enc_open_video :: proc(e: ^Render_Enc, width, height: c.int, fps_num, fps_den: c.int) -> bool {
+	for name in enc_encoder_candidates() {
+		if enc_open_one(e, name, width, height, fps_num, fps_den) {
+			codec := avcodec.find_encoder_by_name(name)
+			stream := avfmt.new_stream(e.fmt_ctx, codec)
+			if stream == nil {
+				fmt.println("avformat_new_stream (video) failed")
+				return false
+			}
+			e.vstream = stream
+			stream.time_base = e.vcodec_ctx.time_base
+			if ret := avcodec.parameters_from_context(stream.codecpar, e.vcodec_ctx); ret < 0 {
+				fmt.println("avcodec_parameters_from_context:", ff_err_str(ret))
+				return false
+			}
+			stream.codecpar.width = width
+			stream.codecpar.height = height
+			e.vpkt = avcodec.packet_alloc()
+			return true
+		}
+	}
+	fmt.println("no usable H.264 encoder")
+	return false
 }
 
 // enc_open_audio configures the AAC encoder + FIFO staging. Returns false if no
@@ -710,7 +938,7 @@ rend_enc_video_frame :: proc(
 		return false
 	}
 	defer avutil.frame_free(&frame)
-	frame.format = c.int(avutil.PixelFormat.YUV420P)
+	frame.format = c.int(e.enc_sw_pix_fmt)
 	frame.width = width
 	frame.height = height
 	for i in 0 ..< 4 {
@@ -718,7 +946,32 @@ rend_enc_video_frame :: proc(
 		frame.linesize[i] = e.yuv_linesize[i]
 	}
 	frame.pts = frame_index
-	if ret := avcodec.send_frame(e.vcodec_ctx, frame); ret < 0 {
+	to_send := frame
+	defer if to_send != frame {
+		avutil.frame_free(&to_send)
+	}
+	if e.enc_hw_upload {
+		// Hardware-surfaces encoder (VAAPI): move the NV12 frame into a hw
+		// surface before sending. The encoder holds its own refs on the
+		// surface buffers when it accepts the frame, but our AVFrame wrapper
+		// must stay alive until the send returns — the proc-scoped defer
+		// below (to_send != frame) frees it once, after the send.
+		hw_frame := avutil.frame_alloc()
+		if hw_frame == nil {
+			return false
+		}
+		if ret := avutil.hwframe_get_buffer(e.vcodec_ctx.hw_frames_ctx, hw_frame, 0); ret < 0 {
+			fmt.println("av_hwframe_get_buffer:", ff_err_str(ret))
+			return false
+		}
+		if ret := avutil.hwframe_transfer_data(hw_frame, frame, 0); ret < 0 {
+			fmt.println("av_hwframe_transfer_data:", ff_err_str(ret))
+			return false
+		}
+		hw_frame.pts = frame_index
+		to_send = hw_frame
+	}
+	if ret := avcodec.send_frame(e.vcodec_ctx, to_send); ret < 0 {
 		fmt.println("avcodec_send_frame (video):", ff_err_str(ret))
 		return false
 	}
@@ -857,6 +1110,11 @@ render_worker_run :: proc() {
 		status := fail ? Render_Status.Failed : (cancelled() ? .Cancelled : .Done)
 		if fail && len(err_msg) > 0 {
 			set_status(.Failed, err_msg)
+		} else if status == .Done && e.enc_name_len > 0 {
+			// Report which encoder actually produced the file: a GPU choice may
+			// have fallen back to libx264, and the message makes that visible.
+			name_buf: [80]u8
+			set_status(status, fmt.bprintf(name_buf[:], "export OK (%s)", string(e.enc_name[:e.enc_name_len])))
 		} else {
 			set_status(status, "")
 		}
@@ -2102,7 +2360,7 @@ boundary_probe_run :: proc(v: string) {
 	// labeling it the tail's frame.
 	fmt.println("[bprobe] replay pass: prime tail cache, scrub to head, cross again")
 	invalidate_preview_slots()
-	for ph := i64(0); ph < 220; ph += 1 {
+	for rp := i64(0); rp < 220; rp += 1 {
 		playhead.frame = ph
 		playhead.playing = true
 		update_preview_slots()
@@ -2120,7 +2378,7 @@ boundary_probe_run :: proc(v: string) {
 		}
 	}
 	fmt.print("\n")
-	for ph := i64(63); ph < 80; ph += 1 {
+	for rp := i64(63); rp < 80; rp += 1 {
 		playhead.frame = ph
 		playhead.playing = true
 		update_preview_slots()
