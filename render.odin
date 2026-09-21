@@ -1152,6 +1152,46 @@ render_dec_stop:        bool  // atomic: worker sets, producer polls (also in wa
 render_dec_produced:    i64   // atomic: frames decoded+published by the producer
 render_dec_consumed:    i64   // atomic: frames composited by the worker
 
+// P6 encode pipeline: a third thread (render_enc_thread) owns the muxer and both
+// encoders after render_open_output. The composite thread fills a
+// RENDER_ENC_SLOTS-deep ring of {canvas, audio mix} slots and publishes
+// produced; the encoder converts/uploads/sends/drains/muxes each slot and
+// publishes consumed. Slot N&(SLOTS-1) is safe to refill once the encoder has
+// finished frame N-SLOTS (consumed >= N-SLOTS+1) — same release/acquire shape as
+// the decode ring. Teardown rides render_enc_stop; the encoder drains whatever
+// was produced and finalizes only when every frame was produced, so a cancel or
+// early failure leaves a partial, trailerless file exactly as the old inline
+// path did. A canvas per slot is the cost of letting the encoder run ahead of
+// the compositor (SLOTS*w*h*4 bytes: 33 MB at 1080p).
+RENDER_ENC_SLOTS :: 4
+Render_Enc_Slot :: struct {
+	canvas: []u8,
+	mix:    []f32,
+	spf:    int,
+}
+render_enc_thread:    ^thread.Thread
+render_enc_stop:      bool // atomic: worker sets at EOF/cancel; encoder polls
+render_enc_produced:  i64  // atomic: slots filled by the composite thread
+render_enc_consumed:  i64  // atomic: slots encoded by the encoder thread
+render_enc_has_audio: bool
+render_enc_fail:      bool // encoder set a failure; worker reports it after join
+render_enc_err:       [128]u8
+render_enc_err_len:   int
+// Blocking slot handoff (futex-backed semaphores): free counts slots the
+// composite may write, ready counts slots the encoder may read. A spin-yield
+// here starves the encoder's own worker threads and buys nothing — the wait is
+// long (encode outlasts composite), so the threads must actually sleep. The
+// counts are self-balancing across a render: every ready post is matched by one
+// ready wait and every free wait by one free post, including the cancel drain.
+render_enc_free:  sync.Sema
+render_enc_ready: sync.Sema
+render_enc_sema_init: bool
+// Encoder-thread timing, written before it exits and read after the join.
+render_enc_video_ns: i64
+render_enc_audio_ns: i64
+render_enc_slots: [RENDER_ENC_SLOTS]Render_Enc_Slot
+render_enc_ptr: ^Render_Enc
+
 render_worker :: proc(t: ^thread.Thread) {
 	render_worker_run()
 }
@@ -1218,6 +1258,105 @@ render_decode :: proc(t: ^thread.Thread) {
 	render_decode_proc()
 }
 
+// render_enc_fail_set records an encoder-thread failure for the worker to pick
+// up after the join. Encoder-thread only, read by the worker only post-join.
+render_enc_fail_set :: proc(msg: string) {
+	n := min(len(msg), len(render_enc_err))
+	copy(render_enc_err[:n], msg[:n])
+	render_enc_err_len = n
+	render_enc_fail = true
+}
+
+// render_enc_encode_slot converts+encodes+muxes one composited slot and, if the
+// job carries audio, its mixed PCM. Encoder-thread only.
+render_enc_encode_slot :: proc(e: ^Render_Enc, fi: i64) {
+	slot := &render_enc_slots[fi & (RENDER_ENC_SLOTS - 1)]
+	t0 := time.now()._nsec
+	if !rend_enc_video_frame(e, slot.canvas, render_job_width, render_job_height, fi) {
+		render_enc_fail_set("video encoding failed")
+		return
+	}
+	render_enc_video_ns += time.now()._nsec - t0
+	if render_enc_has_audio && slot.spf > 0 {
+		t1 := time.now()._nsec
+		if !rend_enc_push_audio(e, slot.mix[:slot.spf * 2]) {
+			render_enc_fail_set("audio encoding failed")
+			return
+		}
+		render_enc_audio_ns += time.now()._nsec - t1
+	}
+}
+
+// render_enc_flush drains the encoders and finalizes the container. Encoder
+// thread only, and only when every frame was produced.
+render_enc_flush :: proc(e: ^Render_Enc) -> bool {
+	avcodec.send_frame(e.vcodec_ctx, nil)
+	if !enc_drain(e, e.vcodec_ctx, e.vstream, e.vpkt) {
+		render_enc_fail_set("video flush failed")
+		return false
+	}
+	if render_enc_has_audio {
+		avcodec.send_frame(e.acodec_ctx, nil)
+		if !enc_drain(e, e.acodec_ctx, e.astream, e.apkt) {
+			render_enc_fail_set("audio flush failed")
+			return false
+		}
+	}
+	if ret := avfmt.write_trailer(e.fmt_ctx); ret < 0 {
+		fmt.println("avformat_write_trailer:", ff_err_str(ret))
+		render_enc_fail_set("finalizing file failed")
+		return false
+	}
+	return true
+}
+
+// render_enc_proc is the consumer half of the P6 encode pipeline. It reads the
+// slot the composite thread published (acquire load of produced), encodes it,
+// then publishes consumed. On failure it stops doing work but keeps advancing
+// consumed so the composite thread can never stall waiting for a slot; the
+// failure is reported to the worker through render_enc_fail after the join.
+render_enc_proc :: proc() {
+	e := render_enc_ptr
+	dead := false
+	for {
+		if sync.atomic_load(&render_enc_stop) {
+			// Consume the ready tokens for the frames the composite posted but
+			// we have not taken (each is guaranteed available), drain them, and
+			// release their slots so the counts stay balanced. Finalize only a
+			// complete render (cancel/early-fail: no trailer).
+			for sync.atomic_load(&render_enc_consumed) < sync.atomic_load(&render_enc_produced) {
+				sync.sema_wait(&render_enc_ready)
+				fi := sync.atomic_load(&render_enc_consumed)
+				if !dead {
+					render_enc_encode_slot(e, fi)
+					dead = render_enc_fail
+				}
+				sync.atomic_store(&render_enc_consumed, fi + 1)
+				sync.sema_post(&render_enc_free)
+			}
+			if !dead && sync.atomic_load(&render_enc_produced) >= render_job_nframes {
+				render_enc_flush(e)
+			}
+			return
+		}
+		// Wake periodically to re-check stop (a cancel joins this thread).
+		if !sync.sema_wait_with_timeout(&render_enc_ready, 5 * time.Millisecond) {
+			continue
+		}
+		fi := sync.atomic_load(&render_enc_consumed)
+		if !dead {
+			render_enc_encode_slot(e, fi)
+			dead = render_enc_fail
+		}
+		sync.atomic_store(&render_enc_consumed, fi + 1)
+		sync.sema_post(&render_enc_free)
+	}
+}
+
+render_enc :: proc(t: ^thread.Thread) {
+	render_enc_proc()
+}
+
 render_worker_run :: proc() {
 	// Whole-job arena: every allocation the worker makes — blit buffers, canvas,
 	// text/subtitle rasters, the setup scratch, audio fifos — carves from this
@@ -1233,6 +1372,18 @@ render_worker_run :: proc() {
 	fail := false
 	e := Render_Enc{}
 	err_msg := ""
+	render_enc_thread = nil
+	render_enc_fail = false
+	render_enc_err_len = 0
+	// Per-frame split timing (VYPER_FRAME_TIME="1"): wall time for the
+	// composite + audio pull/mix block on this thread vs the video-encode and
+	// audio-encode blocks on the encoder thread, printed once at the end. The
+	// P6 pipeline runs composite and encode on different threads, so the
+	// percentages are now a per-thread CPU split (they sum to combined work,
+	// not wall time); the ratio is the signal. Declared in scope before the
+	// defer so the report can read them on any exit path.
+	split_timing := os.get_env_alloc("VYPER_FRAME_TIME", context.temp_allocator) != ""
+	audio_ns, composite_ns, loop_start := i64(0), i64(0), i64(0)
 	defer {
 		// Stop+join the decode producer BEFORE resetting the decoders: the
 		// producer owns them (single-writer), so a reset while it is in a
@@ -1242,6 +1393,22 @@ render_worker_run :: proc() {
 			sync.atomic_store(&render_dec_stop, true)
 			thread.destroy(render_decode_thread)
 			render_decode_thread = nil
+		}
+		// Stop+join the encode consumer before enc_cleanup: after the handoff
+		// the encoder thread owns e (muxer + codecs), so cleanup must follow the
+		// join. Its drain-on-stop finalizes the file when every frame was
+		// produced.
+		sync.atomic_store(&render_enc_stop, true)
+		if render_enc_thread != nil {
+			thread.destroy(render_enc_thread)
+			render_enc_thread = nil
+		}
+		render_enc_ptr = nil
+		if render_enc_fail {
+			fail = true
+			if render_enc_err_len > 0 {
+				err_msg = string(render_enc_err[:render_enc_err_len])
+			}
 		}
 		enc_cleanup(&e)
 		for &v in render_job_videos {
@@ -1268,6 +1435,22 @@ render_worker_run :: proc() {
 			set_status(status, fmt.bprintf(name_buf[:], "export OK (%s)", string(e.enc_name[:e.enc_name_len])))
 		} else {
 			set_status(status, "")
+		}
+		if split_timing && (composite_ns + audio_ns + render_enc_video_ns + render_enc_audio_ns) > 0 {
+			total := f64(composite_ns + audio_ns + render_enc_video_ns + render_enc_audio_ns)
+			frames := max(1, render_job_nframes)
+			fmt.printf(
+				"[frame-time] composite=%.2f%% (%gs, %.2fms/f) videoenc=%.2f%% (%gs, %.2fms/f) audio=%.2f%% (%gs, %.2fms/f)\n",
+				100 * f64(composite_ns + audio_ns) / total,
+				f64(composite_ns + audio_ns) / 1e9,
+				f64(composite_ns + audio_ns) / 1e6 / f64(frames),
+				100 * f64(render_enc_video_ns) / total,
+				f64(render_enc_video_ns) / 1e9,
+				f64(render_enc_video_ns) / 1e6 / f64(frames),
+				100 * f64(render_enc_audio_ns) / total,
+				f64(render_enc_audio_ns) / 1e9,
+				f64(render_enc_audio_ns) / 1e6 / f64(frames),
+			)
 		}
 	}
 
@@ -1434,9 +1617,33 @@ render_worker_run :: proc() {
 		has_audio = false
 	}
 
-	canvas := make([]u8, int(render_job_width) * int(render_job_height) * 4)
-	// canvas + all per-clip rasters live in the job arena (job_arena above),
-	// freed wholesale when the worker unwinds — no per-buffer deletes.
+	// P6 encode ring: one canvas + one audio-mix buffer per slot, carved from
+	// the job arena (freed wholesale when the worker unwinds). Then hand e to
+	// the encoder thread; the worker touches no encoder/muxer field after this
+	// point (only e.enc_name after the join). Slots + header must exist before
+	// the thread starts.
+	for i in 0 ..< RENDER_ENC_SLOTS {
+		render_enc_slots[i].canvas = make([]u8, int(render_job_width) * int(render_job_height) * 4)
+		render_enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
+	}
+	render_enc_stop, render_enc_produced, render_enc_consumed = false, 0, 0
+	render_enc_has_audio = has_audio
+	render_enc_fail, render_enc_err_len = false, 0
+	render_enc_video_ns, render_enc_audio_ns = 0, 0
+	// One-time semaphore priming: counts are self-balancing across renders, so
+	// only the very first job needs the initial SLOTS free tokens.
+	if !render_enc_sema_init {
+		sync.sema_post(&render_enc_free, RENDER_ENC_SLOTS)
+		render_enc_sema_init = true
+	}
+	render_enc_ptr = &e
+	render_enc_thread = thread.create(render_enc)
+	if render_enc_thread == nil {
+		err_msg = "could not start encode thread"
+		fail = true
+		return
+	}
+	thread.start(render_enc_thread)
 
 	// Text compositing: each text clip gets a precomputed raster (baked font)
 	// + blit box built once below, then alpha-blitted on the canvas each frame.
@@ -1481,8 +1688,21 @@ render_worker_run :: proc() {
 				thread.yield()
 			}
 		}
+		// P6 encode back-pressure: wait (blocking) for a free ring slot. The
+		// counting semaphore guarantees at most SLOTS frames are outstanding;
+		// frame N always maps to slot N&(SLOTS-1) because both sides consume in
+		// order. The timeout lets a cancel be observed promptly.
+		for !sync.sema_wait_with_timeout(&render_enc_free, 5 * time.Millisecond) {
+			if poll_cancel() {
+				return
+			}
+		}
+		if split_timing {
+			loop_start = time.now()._nsec
+		}
 		slot_idx := int(frame_idx & 1)
-		mem.zero(raw_data(canvas), len(canvas))
+		eslot := &render_enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
+		mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
 		for i := len(render_job_videos) - 1; i >= 0; i -= 1 {
 			v := &render_job_videos[i]
 			if timeline_frame < v.timeline_start_frame ||
@@ -1497,7 +1717,7 @@ render_worker_run :: proc() {
 			if !slot.ok {
 				continue
 			}
-			render_blit(canvas, render_job_width, render_job_height, v, slot)
+			render_blit(eslot.canvas, render_job_width, render_job_height, v, slot)
 		}
 		// Composite all text clips covering this frame (after the decodable
 		// clips, alpha-blended on top, matching the preview layering).
@@ -1515,7 +1735,7 @@ render_worker_run :: proc() {
 				continue
 			}
 			render_text_blit(
-				canvas,
+				eslot.canvas,
 				render_job_width,
 				render_job_height,
 				j.raster,
@@ -1589,7 +1809,7 @@ render_worker_run :: proc() {
 				)
 			}
 			render_text_blit(
-				canvas,
+				eslot.canvas,
 				render_job_width,
 				render_job_height,
 				jc.raster,
@@ -1603,14 +1823,16 @@ render_worker_run :: proc() {
 				1,
 			)
 		}
-		if !rend_enc_video_frame(&e, canvas, render_job_width, render_job_height, frame_idx) {
-			err_msg = "video encoding failed"
-			fail = true
-			return
+		if split_timing {
+			now := time.now()._nsec
+			composite_ns += now - loop_start
+			loop_start = now
 		}
 
+		eslot.spf = 0
 		if has_audio && spf > 0 {
-			mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+			mix := eslot.mix
+			mem.zero(raw_data(mix), len(mix) * size_of(f32))
 			// Exact per-frame sample count: difference of consecutive 48 kHz
 			// frame boundaries, not a fixed rounded 48000/fps. For fps that
 			// don't evenly divide 48000 (23.976/29.97/59.94) this alternates
@@ -1656,42 +1878,26 @@ render_worker_run :: proc() {
 					ring_drop(&a.fifo, drop)
 				}
 			}
-			if !rend_enc_push_audio(&e, mix[:cur_spf * 2]) {
-				err_msg = "audio encoding failed"
-				fail = true
-				return
-			}
+			// Publish the mixed PCM for the encoder thread; it owns the AAC
+			// encoder + muxer, so no encode call happens here anymore.
+			eslot.spf = cur_spf
+		}
+		if split_timing {
+			audio_ns += time.now()._nsec - loop_start
 		}
 
+		// Release: the canvas + mix writes above are visible to the encoder's
+		// acquire load of produced before it encodes frame frame_idx. The ready
+		// post wakes it; posting after the store orders the slot writes first.
+		sync.atomic_store(&render_enc_produced, frame_idx + 1)
+		sync.sema_post(&render_enc_ready)
 		sync.atomic_store(&render_progress.frames_done, frame_idx + 1)
 		if len(render_job_videos) > 0 {
-			// Release: this frame's slot is no longer being read, so the
+			// Release: this frame's decode slot is no longer being read, so the
 			// producer can reuse it (its slot-reuse bound is consumed >= N-1
 			// before writing frame N, i.e. this frame's parity slot).
 			sync.atomic_store(&render_dec_consumed, frame_idx + 1)
 		}
-	}
-
-	// Flush encoders.
-	avcodec.send_frame(e.vcodec_ctx, nil)
-	if !enc_drain(&e, e.vcodec_ctx, e.vstream, e.vpkt) {
-		fail = true
-		err_msg = "video flush failed"
-		return
-	}
-	if has_audio {
-		avcodec.send_frame(e.acodec_ctx, nil)
-		if !enc_drain(&e, e.acodec_ctx, e.astream, e.apkt) {
-			fail = true
-			err_msg = "audio flush failed"
-			return
-		}
-	}
-	if ret := avfmt.write_trailer(e.fmt_ctx); ret < 0 {
-		fmt.println("avformat_write_trailer:", ff_err_str(ret))
-		fail = true
-		err_msg = "finalizing file failed"
-		return
 	}
 }
 
