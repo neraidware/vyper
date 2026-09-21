@@ -262,7 +262,24 @@ Render_Video_Src :: struct {
 	rw, rh:               c.int, // display (cropped box) rect size in output pixels
 	ox, oy:               c.int, // rounded top-left offset on the canvas
 	fw, fh:               c.int, // full (pre-crop) box size the frame decodes into
-	blit:                 []u8, // fw*fh*4 scaled frame
+	// Pipeline (P5): the producer decode thread scales frame N into
+	// blit_slots[N & 1] while the worker composites frame N-1 out of
+	// blit_slots[(N-1) & 1], overlapped via the produced/consumed atomics
+	// (render_dec_pipe). Buffer lifetime: job arena, both filled per frame.
+	blit_slots:           [2]Render_Blit_Slot, // fw*fh*4 scaled frame each
+}
+
+// Render_Blit_Slot is one frame's worth of decode output. The producer writes
+// the full box + the geometry the worker needs to place it (crop region + dst),
+// so the worker composite never reads the decoder (v.dec) — decoder structs are
+// single-writer, owned by the producer thread alone.
+Render_Blit_Slot :: struct {
+	blit:   []u8, // fw*fh*4 scaled frame (crop region placed at fit_ox/oy)
+	ok:     bool, // decode+scale succeeded this round; worker skips if false
+	crop_w: c.int, // dec.crop_px_w the producer resolved (0 = no render crop)
+	crop_h: c.int, // dec.crop_px_h
+	fit_ox: c.int, // dec.fit_ox (dst placement inside the box)
+	fit_oy: c.int, // dec.fit_oy
 }
 
 // Render_Text_Src snapshots a .Text generator clip for the worker. It carries
@@ -1115,8 +1132,81 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 
 render_worker_thread: ^thread.Thread
 
+// P5 decode pipeline: a second thread (render_decode_thread) owns every video
+// decoder and scales frame N into blit_slots[N & 1] while the worker composites
+// frame N-1 out of blit_slots[(N-1) & 1]. Handoff is two release/acquire
+// counters with a two-slot depth (see render_decode_proc for the slot-reuse
+// bound); cancellation/teardown rides render_dec_stop. The worker touches no
+// decoder field after this split — decoders are single-writer, producer-owned.
+render_decode_thread:   ^thread.Thread
+render_dec_stop:        bool  // atomic: worker sets, producer polls (also in waits)
+render_dec_produced:    i64   // atomic: frames decoded+published by the producer
+render_dec_consumed:    i64   // atomic: frames composited by the worker
+
 render_worker :: proc(t: ^thread.Thread) {
 	render_worker_run()
+}
+
+// render_decode_proc is the producer half of the P5 decode-ahead pipeline. It
+// decodes+scales every covering clip for frame N into that frame's blit slot,
+// then publishes produced = N+1 so the worker can composite. It may run up to
+// two frames ahead of the worker (the slot depth); the consumed bound below
+// keeps it from reusing a slot the worker is still reading — slot N&1 was last
+// read by the worker for frame N-2, which is done only once consumed >= N-1.
+// The decode path makes no Odin-side allocations (FFmpeg allocates internally),
+// so this thread's default allocator is never touched.
+render_decode_proc :: proc() {
+	for frame_idx in 0 ..< render_job_nframes {
+		for sync.atomic_load(&render_dec_consumed) < frame_idx - 1 {
+			if sync.atomic_load(&render_dec_stop) {
+				return
+			}
+			thread.yield()
+		}
+		if sync.atomic_load(&render_dec_stop) {
+			return
+		}
+		slot_idx := int(frame_idx & 1)
+		timeline_frame := render_job_start + frame_idx
+		for i in 0 ..< len(render_job_videos) {
+			v := &render_job_videos[i]
+			if timeline_frame < v.timeline_start_frame ||
+			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
+				continue
+			}
+			// Fully off-canvas clips were never opened (v.fw == 0 in setup).
+			if v.fw <= 0 {
+				continue
+			}
+			slot := &v.blit_slots[slot_idx]
+			// A still image has one source frame; map every timeline frame in
+			// its span to it so the image holds instead of seeking past EOF.
+			src_frame := v.source_start_frame
+			if !v.is_still {
+				src_frame += timeline_frame - v.timeline_start_frame
+			}
+			if !decode_source_frame(&v.dec, src_frame) {
+				slot.ok = false
+				continue
+			}
+			decode_into_buffer(&v.dec, slot.blit, v.fw, v.fh)
+			slot.ok = true
+			// Publish the crop geometry the worker's render_blit needs; the
+			// resolution is decoder-side (can change on the first hardware
+			// frame when the crop is dropped), so it rides out with the data.
+			slot.crop_w = v.dec.crop_px_w
+			slot.crop_h = v.dec.crop_px_h
+			slot.fit_ox = v.dec.fit_ox
+			slot.fit_oy = v.dec.fit_oy
+		}
+		// Release: the slot writes above are visible to the worker's acquire
+		// load of produced before it composites frame frame_idx.
+		sync.atomic_store(&render_dec_produced, frame_idx + 1)
+	}
+}
+
+render_decode :: proc(t: ^thread.Thread) {
+	render_decode_proc()
 }
 
 render_worker_run :: proc() {
@@ -1135,6 +1225,15 @@ render_worker_run :: proc() {
 	e := Render_Enc{}
 	err_msg := ""
 	defer {
+		// Stop+join the decode producer BEFORE resetting the decoders: the
+		// producer owns them (single-writer), so a reset while it is in a
+		// decode call is a use-after-free. destroy() joins, and the producer
+		// polls stop in both its waits, so this cannot hang.
+		if render_decode_thread != nil {
+			sync.atomic_store(&render_dec_stop, true)
+			thread.destroy(render_decode_thread)
+			render_decode_thread = nil
+		}
 		enc_cleanup(&e)
 		for &v in render_job_videos {
 			clip_decoder_reset(&v.dec)
@@ -1188,10 +1287,10 @@ render_worker_run :: proc() {
 		// Visible rect = canvas-clipped display rect. Decode and sws-scale
 		// only this region (render.odin perf brief P3) so resample work tracks
 		// the pixels that are actually drawn; the region maps 1:1 to itself
-		// because the box is the full frame at uniform scale. v.blit stays the
-		// full box size so the decoder's crop-dropped fallback and the uncrop
-		// paths keep working, and the crop lives in v.dec (cleared by the
-		// decoder's reset when zero).
+		// because the box is the full frame at uniform scale. Each blit slot
+		// stays the full box size so the decoder's crop-dropped fallback and
+		// the uncrop paths keep working, and the crop lives in v.dec (cleared
+		// by the decoder's reset when zero).
 		vis_left := max(0, c.int(l + 0.5))
 		vis_top := max(0, c.int(t + 0.5))
 		vis_right := min(render_job_width, c.int(r + 0.5))
@@ -1214,12 +1313,29 @@ render_worker_run :: proc() {
 			v.dec.crop_full_w = v.fw
 			v.dec.crop_full_h = v.fh
 		}
-		v.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
+		for &slot in &v.blit_slots {
+			slot.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
+		}
 		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
 			err_msg = "failed to open video source"
 			fail = true
 			return
 		}
+	}
+
+	// Start the P5 decode-ahead producer once every decoder is open and its
+	// blit slots are allocated. The producer owns all decoders from here on;
+	// the composite below reads only the published slots. A fresh default
+	// context is fine: the decode path makes no Odin allocations.
+	render_dec_stop, render_dec_produced, render_dec_consumed = false, 0, 0
+	if len(render_job_videos) > 0 {
+		render_decode_thread = thread.create(render_decode)
+		if render_decode_thread == nil {
+			err_msg = "could not start decode thread"
+			fail = true
+			return
+		}
+		thread.start(render_decode_thread)
 	}
 
 	// The output frame rate: an explicit project fps wins; otherwise it comes
@@ -1314,7 +1430,20 @@ render_worker_run :: proc() {
 		}
 		timeline_frame := render_job_start + frame_idx
 		// Composite all video clips covering this frame (bottom track first so
-		// the top track paints last, matching the preview).
+		// the top track paints last, matching the preview). With the P5
+		// pipeline the decode for this frame is produced ahead on the second
+		// thread: wait for it, then read only the published slot (never the
+		// decoder). The acquire load on produced pairs with the producer's
+		// release store, ordering every slot write before this read.
+		if len(render_job_videos) > 0 {
+			for sync.atomic_load(&render_dec_produced) <= frame_idx {
+				if poll_cancel() {
+					return
+				}
+				thread.yield()
+			}
+		}
+		slot_idx := int(frame_idx & 1)
 		mem.zero(raw_data(canvas), len(canvas))
 		for i := len(render_job_videos) - 1; i >= 0; i -= 1 {
 			v := &render_job_videos[i]
@@ -1326,17 +1455,11 @@ render_worker_run :: proc() {
 			if v.fw <= 0 {
 				continue
 			}
-			// A still image has one source frame; map every timeline frame in
-			// its span to it so the image holds instead of seeking past EOF.
-			src_frame := v.source_start_frame
-			if !v.is_still {
-				src_frame += timeline_frame - v.timeline_start_frame
-			}
-			if !decode_source_frame(&v.dec, src_frame) {
+			slot := &v.blit_slots[slot_idx]
+			if !slot.ok {
 				continue
 			}
-			decode_into_buffer(&v.dec, v.blit, v.fw, v.fh)
-			render_blit(canvas, render_job_width, render_job_height, v)
+			render_blit(canvas, render_job_width, render_job_height, v, slot)
 		}
 		// Composite all text clips covering this frame (after the decodable
 		// clips, alpha-blended on top, matching the preview layering).
@@ -1503,6 +1626,12 @@ render_worker_run :: proc() {
 		}
 
 		sync.atomic_store(&render_progress.frames_done, frame_idx + 1)
+		if len(render_job_videos) > 0 {
+			// Release: this frame's slot is no longer being read, so the
+			// producer can reuse it (its slot-reuse bound is consumed >= N-1
+			// before writing frame N, i.e. this frame's parity slot).
+			sync.atomic_store(&render_dec_consumed, frame_idx + 1)
+		}
 	}
 
 	// Flush encoders.
@@ -1529,9 +1658,10 @@ render_worker_run :: proc() {
 }
 
 // render_blit copies the clip's scaled frame onto the canvas, clipped to bounds.
-// The blit holds the full (pre-crop) frame; crop insets select the visible
+// The slot holds the full (pre-crop) frame plus the crop geometry the producer
+// resolved; crop insets select the visible
 // source sub-region that fills the display box (matching the preview's UV crop).
-render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
+render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, slot: ^Render_Blit_Slot) {
 	top := max(v.oy, 0)
 	bottom := min(v.oy + v.rh, draw_h)
 	left := max(v.ox, 0)
@@ -1539,17 +1669,17 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 	if bottom <= top || right <= left {
 		return
 	}
-	if v.dec.crop_px_w > 0 && v.dec.crop_px_h > 0 {
+	if slot.crop_w > 0 && slot.crop_h > 0 {
 		// Render-path P3: the decoder already scaled only the visible region
 		// into the full box at fit_ox/oy (see Render_Video_Src setup), so this
 		// is a straight region copy — no sampling, matching the sws bilinear
 		// crop 1:1 on the region.
-		scol := c.int(v.dec.fit_ox)
-		srow := c.int(v.dec.fit_oy)
+		scol := slot.fit_ox
+		srow := slot.fit_oy
 		rows := bottom - top
 		cols := right - left
 		for row in 0 ..< rows {
-			src := v.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
 			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
 			copy(dst, src)
 		}
@@ -1561,7 +1691,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 		rows := bottom - top
 		cols := right - left
 		for row in 0 ..< rows {
-			src := v.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
 			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
 			copy(dst, src)
 		}
@@ -1581,7 +1711,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 	for row in 0 ..< bottom - top {
 		sy := int(sy0 + (f64(top - v.oy + row) + 0.5) * src_rows / f64(v.rh))
 		sy = max(0, min(int(v.fh) - 1, sy))
-		src_row := v.blit[uint(sy) * uint(v.fw) * 4:]
+		src_row := slot.blit[uint(sy) * uint(v.fw) * 4:]
 		for col in 0 ..< right - left {
 			sx := int(sx0 + (f64(left - v.ox + col) + 0.5) * src_cols / f64(v.rw))
 			sx = max(0, min(int(v.fw) - 1, sx))
