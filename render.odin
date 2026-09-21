@@ -267,6 +267,15 @@ Render_Video_Src :: struct {
 	// blit_slots[(N-1) & 1], overlapped via the produced/consumed atomics
 	// (render_dec_pipe). Buffer lifetime: job arena, both filled per frame.
 	blit_slots:           [2]Render_Blit_Slot, // fw*fh*4 scaled frame each
+	// Crop-inset resample (P4): crop_l/r/t/b select a source sub-rect of the
+	// full-box blit that fills the display box. That resample is one RGBA→RGBA
+	// sws.scale into a fixed scratch (SIMD bilinear), not a per-pixel scalar
+	// loop. ctx is worker-owned, built at setup, freed via sws.freeContext;
+	// scratch lives in the job arena (v.rw*v.rh*4).
+	crop_ctx:             ^sws.Context,
+	crop_scratch:         []u8,
+	crop_sx, crop_sy:     c.int, // quantized source sub-rect origin (in blit px)
+	crop_sw, crop_sh:     c.int, // sws source dims (== ctx src dims)
 }
 
 // Render_Blit_Slot is one frame's worth of decode output. The producer writes
@@ -1236,6 +1245,10 @@ render_worker_run :: proc() {
 		}
 		enc_cleanup(&e)
 		for &v in render_job_videos {
+			if v.crop_ctx != nil {
+				sws.freeContext(v.crop_ctx)
+				v.crop_ctx = nil
+			}
 			clip_decoder_reset(&v.dec)
 		}
 		for &a in render_job_audios {
@@ -1315,6 +1328,31 @@ render_worker_run :: proc() {
 		}
 		for &slot in &v.blit_slots {
 			slot.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
+		}
+		// P4: build the crop-inset resampler once. crop insets select a source
+		// sub-rect of the full-box blit that fills the display box (rw x rh).
+		// The near-identity crop is one SIMD bilinear sws.scale into a fixed
+		// scratch, replacing the old per-pixel nearest-neighbor loop. Source
+		// rect is quantized to whole blit pixels; bilinear filtering makes the
+		// sub-pixel remainder a quality improvement, not a bug.
+		if v.crop_l != 0 || v.crop_r != 0 || v.crop_t != 0 || v.crop_b != 0 {
+			sx := int(f64(v.crop_l) * f64(v.fw) + 0.5)
+			sy := int(f64(v.crop_t) * f64(v.fh) + 0.5)
+			sw := int(f64(v.fw) * f64(1 - v.crop_l - v.crop_r) + 0.5)
+			sh := int(f64(v.fh) * f64(1 - v.crop_t - v.crop_b) + 0.5)
+			sx = clamp(sx, 0, int(v.fw) - 1)
+			sy = clamp(sy, 0, int(v.fh) - 1)
+			sw = clamp(sw, 1, int(v.fw) - sx)
+			sh = clamp(sh, 1, int(v.fh) - sy)
+			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(sx), c.int(sy), c.int(sw), c.int(sh)
+			v.crop_ctx = sws.getContext(
+				c.int(sw), c.int(sh), avutil.PixelFormat.RGBA,
+				v.rw, v.rh, avutil.PixelFormat.RGBA,
+				sws.Flags{.Bilinear}, nil, nil, nil,
+			)
+			if v.crop_ctx != nil {
+				v.crop_scratch = make([]u8, int(v.rw) * int(v.rh) * 4)
+			}
 		}
 		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
 			err_msg = "failed to open video source"
@@ -1697,27 +1735,41 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		}
 		return
 	}
-	// Cropped: sample the source sub-region
-	// [crop_l*fw, crop_t*fh) -> [(1-crop_r)*fw, (1-crop_b)*fh) and scale it to
-	// fill the display box. The source is a 1:1 region-to-box fit after crop
-	// (same math as the preview), so artifacts are minimal.
-	src_cols := f64(v.fw) * f64(1 - v.crop_l - v.crop_r)
-	src_rows := f64(v.fh) * f64(1 - v.crop_t - v.crop_b)
-	if src_cols <= 0 || src_rows <= 0 {
+	// Cropped (P4): crop insets select source sub-rect
+	// [crop_sx, crop_sy) -> [crop_sx+crop_sw, crop_sy+crop_sh) of the full-box
+	// blit, scaled to fill the display box. One SIMD bilinear sws.scale into
+	// the fixed scratch replaces the old per-pixel nearest-neighbor sampler;
+	// bilinear order is the intended quality upgrade. The dst is the canvas-
+	// clipped intersection copied out of the full display-box scratch.
+	if v.crop_ctx == nil {
+		// Degenerate crop: insets collapse the region (clip invisible).
 		return
 	}
-	sx0 := f64(v.crop_l) * f64(v.fw)
-	sy0 := f64(v.crop_t) * f64(v.fh)
-	for row in 0 ..< bottom - top {
-		sy := int(sy0 + (f64(top - v.oy + row) + 0.5) * src_rows / f64(v.rh))
-		sy = max(0, min(int(v.fh) - 1, sy))
-		src_row := slot.blit[uint(sy) * uint(v.fw) * 4:]
-		for col in 0 ..< right - left {
-			sx := int(sx0 + (f64(left - v.ox + col) + 0.5) * src_cols / f64(v.rw))
-			sx = max(0, min(int(v.fw) - 1, sx))
-			dst := canvas[(uint(top + row) * uint(draw_w) + uint(left + col)) * 4:][:4]
-			copy(dst, src_row[uint(sx) * 4:][:4])
-		}
+	src_ptr := cast([^]u8)(uintptr(raw_data(slot.blit)) +
+		uintptr((int(v.crop_sy) * int(v.fw) + int(v.crop_sx)) * 4))
+	dst_ptr := cast([^]u8)raw_data(v.crop_scratch)
+	sln: [1][^]u8 = {src_ptr}
+	ls:  [4]c.int = {c.int(v.fw) * 4, 0, 0, 0}
+	dln: [4]c.int = {c.int(v.rw) * 4, 0, 0, 0}
+	dsln: [1][^]u8 = {dst_ptr}
+	if ret := sws.scale(
+		v.crop_ctx,
+		cast([^][^]u8)&sln[0],
+		cast([^]c.int)&ls[0],
+		0, v.crop_sh,
+		cast([^][^]u8)&dsln[0],
+		cast([^]c.int)&dln[0],
+	); ret < 0 {
+		return
+	}
+	scol := left - v.ox
+	srow := top - v.oy
+	rows := bottom - top
+	cols := right - left
+	for row in 0 ..< rows {
+		src := v.crop_scratch[uint(srow + row) * uint(v.rw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
+		copy(dst, src)
 	}
 }
 
