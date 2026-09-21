@@ -14,6 +14,7 @@ import avcodec "vendor/ffmpeg/avcodec"
 import avfmt "vendor/ffmpeg/avformat"
 import avutil "vendor/ffmpeg/avutil"
 import sws "vendor/ffmpeg/swscale"
+import yuvconv "vendor/yuv"
 import sdl "vendor:sdl3"
 import stb "vendor:stb/truetype"
 
@@ -520,6 +521,16 @@ Render_Enc :: struct {
 	yuv_data:        [4][^]u8,
 	yuv_linesize:    [4]c.int,
 	yuv_avail:       bool,
+	// VYPER_YUV="1" A/B gate: when set, the RGBA->encoder-input conversion
+	// runs through our hand-written SIMD kernels (vendor/yuv, the in-repo
+	// replacement for the old libyuv dependency; ~4-5x faster than swscale)
+	// instead of swscale. The scratch buffer below is the intermediate NV12
+	// plane pair for the planar-YUV420P (libx264) path only — the NV12 path
+	// (hardware encoders) writes straight into yuv_data.
+	use_fast_yuv:          bool,
+	yuv_scratch:       [4][^]u8,
+	yuv_scratch_ls:    [4]c.int,
+	yuv_scratch_avail: bool,
 	audio_frame:     ^avutil.Frame,
 	audio_plane:     bool,
 	vpkt:            ^avcodec.Packet,
@@ -573,6 +584,9 @@ enc_cleanup :: proc(e: ^Render_Enc) {
 	}
 	if e.yuv_avail {
 		avutil.freep(&e.yuv_data[0])
+	}
+	if e.yuv_scratch_avail {
+		avutil.freep(&e.yuv_scratch[0])
 	}
 	if e.fmt_ctx != nil {
 		avfmt.free_context(e.fmt_ctx)
@@ -755,7 +769,15 @@ enc_hw_upload_open :: proc(
 
 // enc_convert_finish wires the RGBA -> encoder-input scaler + buffer for the
 // chosen software pixel format (the hardware-upload path scales into NV12).
+// The source and destination are the same size, so this is a pure colorspace
+// conversion with no resampling. The scaler flag is left at Bilinear because
+// the cheaper Point path changes the output bytes (swscale still filters at
+// 1:1), and the export matrix must stay byte-identical. VYPER_YUV="1"
+// swaps this conversion for our SIMD kernels (use_fast_yuv below); that
+// path is byte-different by design (different chroma subsample), so it is
+// off by default.
 enc_convert_finish :: proc(e: ^Render_Enc, width, height: c.int) -> bool {
+	e.use_fast_yuv = os.get_env_alloc("VYPER_YUV", context.temp_allocator) == "1"
 	e.sws_rgb_yuv = sws.getContext(
 		width,
 		height,
@@ -777,6 +799,68 @@ enc_convert_finish :: proc(e: ^Render_Enc, width, height: c.int) -> bool {
 		return false
 	}
 	e.yuv_avail = true
+	if e.use_fast_yuv && e.enc_sw_pix_fmt == .YUV420P {
+		if avutil.image_alloc(&e.yuv_scratch[0], &e.yuv_scratch_ls[0], width, height, avutil.PixelFormat.NV12, 32) < 0 {
+			fmt.println("av_image_alloc (yuv scratch) failed")
+			return false
+		}
+		e.yuv_scratch_avail = true
+	}
+	return true
+}
+
+// enc_convert_rgba_fast replaces swscale for the 1:1 RGBA->encoder-input
+// conversion with our hand-written SIMD kernels (VYPER_YUV gate). NV12
+// (hardware encoders) is one rgba_to_nv12 pass; YUV420P (libx264) chains a
+// nv12_to_i420 deinterleave whose chroma samples are unchanged by the plane
+// split. Returns false only on an actual kernel failure — the caller falls
+// back to swscale then.
+enc_convert_rgba_fast :: proc(e: ^Render_Enc, src_rgba: [^]u8, width, height: c.int) -> bool {
+	src_stride := c.int(width * 4)
+	#partial switch e.enc_sw_pix_fmt {
+	case .NV12:
+		if !yuvconv.rgba_to_nv12(
+			int(width),
+			int(height),
+			src_rgba,
+			int(src_stride),
+			e.yuv_data[0],
+			int(e.yuv_linesize[0]),
+			e.yuv_data[1],
+			int(e.yuv_linesize[1]),
+		) {
+			return false
+		}
+	case .YUV420P:
+		if !yuvconv.rgba_to_nv12(
+			int(width),
+			int(height),
+			src_rgba,
+			int(src_stride),
+			e.yuv_scratch[0],
+			int(e.yuv_scratch_ls[0]),
+			e.yuv_scratch[1],
+			int(e.yuv_scratch_ls[1]),
+		) {
+			return false
+		}
+		yuvconv.nv12_to_i420(
+			int(width),
+			int(height),
+			e.yuv_scratch[0],
+			int(e.yuv_scratch_ls[0]),
+			e.yuv_scratch[1],
+			int(e.yuv_scratch_ls[1]),
+			e.yuv_data[0],
+			int(e.yuv_linesize[0]),
+			e.yuv_data[1],
+			int(e.yuv_linesize[1]),
+			e.yuv_data[2],
+			int(e.yuv_linesize[2]),
+		)
+	case:
+		return false
+	}
 	return true
 }
 
@@ -989,15 +1073,26 @@ rend_enc_video_frame :: proc(
 ) -> bool {
 	slice: [1][^]u8 = {raw_data(rgb)}
 	ls: [4]c.int = {width * 4, 0, 0, 0}
-	sws.scale(
-		e.sws_rgb_yuv,
-		cast([^][^]u8)&slice[0],
-		cast([^]c.int)&ls[0],
-		0,
-		height,
-		cast([^][^]u8)&e.yuv_data[0],
-		cast([^]c.int)&e.yuv_linesize[0],
-	)
+	t_sws := time.now()._nsec
+	converted := false
+	if e.use_fast_yuv {
+		converted = enc_convert_rgba_fast(e, raw_data(rgb), width, height)
+		if !converted {
+			fmt.println("fast-yuv conversion failed; falling back to swscale")
+		}
+	}
+	if !converted {
+		sws.scale(
+			e.sws_rgb_yuv,
+			cast([^][^]u8)&slice[0],
+			cast([^]c.int)&ls[0],
+			0,
+			height,
+			cast([^][^]u8)&e.yuv_data[0],
+			cast([^]c.int)&e.yuv_linesize[0],
+		)
+	}
+	render_enc_sws_ns += time.now()._nsec - t_sws
 	frame := avutil.frame_alloc()
 	if frame == nil {
 		return false
@@ -1025,6 +1120,7 @@ rend_enc_video_frame :: proc(
 		if hw_frame == nil {
 			return false
 		}
+		t_up := time.now()._nsec
 		if ret := avutil.hwframe_get_buffer(e.vcodec_ctx.hw_frames_ctx, hw_frame, 0); ret < 0 {
 			fmt.println("av_hwframe_get_buffer:", ff_err_str(ret))
 			return false
@@ -1033,14 +1129,20 @@ rend_enc_video_frame :: proc(
 			fmt.println("av_hwframe_transfer_data:", ff_err_str(ret))
 			return false
 		}
+		render_enc_upload_ns += time.now()._nsec - t_up
 		hw_frame.pts = frame_index
 		to_send = hw_frame
 	}
+	t_send := time.now()._nsec
 	if ret := avcodec.send_frame(e.vcodec_ctx, to_send); ret < 0 {
 		fmt.println("avcodec_send_frame (video):", ff_err_str(ret))
 		return false
 	}
-	return enc_drain(e, e.vcodec_ctx, e.vstream, e.vpkt)
+	render_enc_send_ns += time.now()._nsec - t_send
+	t_drain := time.now()._nsec
+	ok := enc_drain(e, e.vcodec_ctx, e.vstream, e.vpkt)
+	render_enc_drain_ns += time.now()._nsec - t_drain
+	return ok
 }
 
 // enc_push_audio_stereo stages an interleaved stereo chunk and flushes full AAC
@@ -1189,6 +1291,13 @@ render_enc_sema_init: bool
 // Encoder-thread timing, written before it exits and read after the join.
 render_enc_video_ns: i64
 render_enc_audio_ns: i64
+// Sub-split of render_enc_video_ns for the hw-upload path probe: how much is
+// CPU RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
+// send+drain (encoder wait).
+render_enc_sws_ns:    i64
+render_enc_upload_ns: i64
+render_enc_send_ns:   i64
+render_enc_drain_ns:  i64
 render_enc_slots: [RENDER_ENC_SLOTS]Render_Enc_Slot
 render_enc_ptr: ^Render_Enc
 
@@ -1451,6 +1560,13 @@ render_worker_run :: proc() {
 				f64(render_enc_audio_ns) / 1e9,
 				f64(render_enc_audio_ns) / 1e6 / f64(frames),
 			)
+			fmt.printf(
+				"[frame-time]   videoenc split: sws=%.2fms/f upload=%.2fms/f send=%.2fms/f drain=%.2fms/f\n",
+				f64(render_enc_sws_ns) / 1e6 / f64(frames),
+				f64(render_enc_upload_ns) / 1e6 / f64(frames),
+				f64(render_enc_send_ns) / 1e6 / f64(frames),
+				f64(render_enc_drain_ns) / 1e6 / f64(frames),
+			)
 		}
 	}
 
@@ -1630,6 +1746,7 @@ render_worker_run :: proc() {
 	render_enc_has_audio = has_audio
 	render_enc_fail, render_enc_err_len = false, 0
 	render_enc_video_ns, render_enc_audio_ns = 0, 0
+	render_enc_sws_ns, render_enc_upload_ns, render_enc_send_ns, render_enc_drain_ns = 0, 0, 0, 0
 	// One-time semaphore priming: counts are self-balancing across renders, so
 	// only the very first job needs the initial SLOTS free tokens.
 	if !render_enc_sema_init {
@@ -2407,6 +2524,16 @@ render_test_run :: proc(paths: [2]string) {
 		}
 	}
 	render_set_out_path(paths[1])
+	// VYPER_ENC="GPU" selects the hardware-encoder path (libx264 stays the CPU
+	// default); used alongside VYPER_FRAME_TIME to split encoder-architecture
+	// timings headlessly.
+	if oc, oc_ok := os.lookup_env_alloc("VYPER_ENC", context.allocator); oc_ok && oc != "" {
+		if oc == "GPU" {
+			render_encoder_choice = .GPU
+		} else {
+			render_encoder_choice = .CPU
+		}
+	}
 	render_overwrite_out = true // the test must write exactly the requested path
 	render_start()
 	for render_is_busy() {
