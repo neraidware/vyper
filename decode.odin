@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:strings"
 import avcodec "vendor/ffmpeg/avcodec"
@@ -98,6 +99,20 @@ Clip_Decoder :: struct {
 	dst_linesize: [4]c.int,
 	dst_w, dst_h: c.int,
 	fit_ox, fit_oy: c.int,
+	// Render-path decode crop: which sub-rect of the decoded FRAME fills the
+	// clip's on-canvas region. Set by the render worker before open; the zero
+	// value (crop_fw/crop_fh <= 0) decodes the full frame like every other
+	// consumer. crop_f* are fractions of the frame (0..1); crop_px_* resolve
+	// them to integer source pixels once src_w/src_h are known; crop_dst_*
+	// are the region's integer placement into the full-box blit (output px);
+	// crop_full_* the clip's full box. crop_dropped records that the frame
+	// format is not in the x-crop plane-offset table, so the decode ran
+	// uncropped and render_blit keeps its sampling path.
+	crop_fx0, crop_fy0, crop_fw, crop_fh: f32,
+	crop_px_x, crop_px_y, crop_px_w, crop_px_h: c.int,
+	crop_dst_x, crop_dst_y, crop_dst_w, crop_dst_h: c.int,
+	crop_full_w, crop_full_h: c.int,
+	crop_dropped:           bool,
 	// last_frame is the index of the source frame the physical FFmpeg decoder
 	// is CURRENTLY parked on (see the struct invariant above). A request for
 	// last_frame+1 decodes forward in place; anything else forces a re-seek.
@@ -356,6 +371,12 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		copy(preview_buf[:preview_len], src_s[:preview_len])
 		preview_buf[preview_len] = 0
 	}
+	// The render worker's decode crop is also a decode TARGET (caller-owned,
+	// re-supplied every open), not decoder state: carry it across the reset so
+	// a reopen keeps cropping instead of silently decoding the full box again.
+	crop_fx0, crop_fy0, crop_fw, crop_fh := dec.crop_fx0, dec.crop_fy0, dec.crop_fw, dec.crop_fh
+	crop_dst_x, crop_dst_y, crop_dst_w, crop_dst_h := dec.crop_dst_x, dec.crop_dst_y, dec.crop_dst_w, dec.crop_dst_h
+	crop_full_w, crop_full_h := dec.crop_full_w, dec.crop_full_h
 	saved_base := dec.frame_base
 	if dec.opened {
 		clip_decoder_reset(dec)
@@ -380,6 +401,9 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		open_path = dec.preview_path
 	}
 	dec.frame_base = saved_base
+	dec.crop_fx0, dec.crop_fy0, dec.crop_fw, dec.crop_fh = crop_fx0, crop_fy0, crop_fw, crop_fh
+	dec.crop_dst_x, dec.crop_dst_y, dec.crop_dst_w, dec.crop_dst_h = crop_dst_x, crop_dst_y, crop_dst_w, crop_dst_h
+	dec.crop_full_w, dec.crop_full_h = crop_full_w, crop_full_h
 
 	fmt_ctx: ^avfmt.FormatContext
 	if ret := avfmt.open_input(&fmt_ctx, open_path, nil, nil); ret < 0 {
@@ -503,11 +527,49 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	dec.src_w = dec_ctx.width
 	dec.src_h = dec_ctx.height
 
+	// Render-path decode crop: resolve the worker's requested sub-rect (see
+	// dec.crop_f*) to source pixels, then size dst to the on-canvas region.
+	// The buffer allocation stays FULL box below so the crop-dropped fallback
+	// (uncropable frame format) has room; dec.dst_w/h select which part the
+	// scale writes and decode_into_buffer copies into the full-box blit.
+	have_crop := dec.crop_fw > 0 && dec.crop_fh > 0
+	dec.crop_px_x, dec.crop_px_y, dec.crop_px_w, dec.crop_px_h = 0, 0, 0, 0
+	dec.crop_dropped = false
+	if have_crop {
+		// Software decode knows its frame format here: formats outside the
+		// x-crop plane-offset table decode the full box and render_blit
+		// samples it (see src_crop_plane_offsets). Hardware decode defers the
+		// same check to scale_decoded_frame, where the transferred frame's
+		// format first appears (VAAPI -> NV12, etc. are all in the table).
+		if hw_pix_fmt == .None {
+			if _, _, _, croppable := src_crop_plane_offsets(dec_ctx.pix_fmt, 0); !croppable {
+				have_crop = false
+				dec.crop_dropped = true
+			}
+		}
+	}
+	if have_crop {
+		dec.crop_px_x, dec.crop_px_y, dec.crop_px_w, dec.crop_px_h = dec_crop_px(dec, dec.src_w, dec.src_h)
+	}
+
 	// Fit the source into the fixed preview buffer preserving its aspect, so a
 	// video whose aspect differs from the project's canvas is letterboxed
 	// instead of stretched. Render path (fit=false) uses the exact dst dims.
 	if fit {
 		dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy = source_fit_in_buffer(dec.src_w, dec.src_h, dst_w, dst_h)
+	} else if have_crop {
+		// dst is the on-canvas region, placed into the full-box blit at
+		// crop_dst_x/y by decode_into_buffer. render_blit direct-copies the
+		// same region back out — see Render_Video_Src.crop_px_w.
+		dec.dst_w = dec.crop_dst_w
+		dec.dst_h = dec.crop_dst_h
+		dec.fit_ox = dec.crop_dst_x
+		dec.fit_oy = dec.crop_dst_y
+		if vyper_trace {
+			fmt.printf("[dec] crop-render src(%d,%d %dx%d) dst %dx%d @ (%d,%d)\n",
+				dec.crop_px_x, dec.crop_px_y, dec.crop_px_w, dec.crop_px_h,
+				dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy)
+		}
 	} else {
 		dec.dst_w = dst_w
 		dec.dst_h = dst_h
@@ -533,8 +595,17 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	dec.fps_den = fps.den
 
 	if hw_pix_fmt == .None {
+		// The sws source window is the crop region itself when cropping:
+		// scale_decoded_frame hands sws the advanced plane pointers plus a
+		// slice from row 0 of that window (0 + crop_h == ctx height, which is
+		// the FFmpeg-9-valid "start of frame" slice), so the ctx dims must
+		// match the cropped extents or sws would scale past the source.
+		sw, sh := dec.src_w, dec.src_h
+		if have_crop {
+			sw, sh = dec.crop_px_w, dec.crop_px_h
+		}
 		dec.sws_ctx = sws.getContext(
-			dec.src_w, dec.src_h, dec_ctx.pix_fmt,
+			sw, sh, dec_ctx.pix_fmt,
 			dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA,
 			sws.Flags{.Bilinear}, nil, nil, nil,
 		)
@@ -543,7 +614,13 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 			return false
 		}
 	}
-	if avutil.image_alloc(&dec.dst[0], &dec.dst_linesize[0], dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA, 1) < 0 {
+	// Allocate the FULL box even when cropping: the crop-dropped fallback
+	// (uncropable frame format) decodes the whole frame and needs the space.
+	alloc_w, alloc_h := dec.dst_w, dec.dst_h
+	if have_crop {
+		alloc_w, alloc_h = dec.crop_full_w, dec.crop_full_h
+	}
+	if avutil.image_alloc(&dec.dst[0], &dec.dst_linesize[0], alloc_w, alloc_h, avutil.PixelFormat.RGBA, 1) < 0 {
 		fmt.println("av_image_alloc failed")
 		return false
 	}
@@ -728,11 +805,34 @@ scale_decoded_frame :: proc(dec: ^Clip_Decoder) -> bool {
 		}
 		src = dec.sw_frame
 	}
+	// Hardware decode negotiates the transfer format only now (first frame).
+	// Formats outside the x-crop offset table can't be cropped: widen dst to
+	// the full box (the allocation was sized for it at open), drop the crop,
+	// and let render_blit sample as it always has.
+	if dec.crop_px_w > 0 && dec.crop_px_h > 0 && dec.hw_pix_fmt != .None {
+		if _, _, _, croppable := src_crop_plane_offsets(avutil.PixelFormat(src.format), 0); !croppable {
+			dec.crop_px_x, dec.crop_px_y, dec.crop_px_w, dec.crop_px_h = 0, 0, 0, 0
+			dec.crop_dropped = true
+			dec.dst_w, dec.dst_h = dec.crop_full_w, dec.crop_full_h
+			dec.fit_ox, dec.fit_oy = 0, 0
+			if vyper_trace {
+				fmt.printf("[dec] crop dropped: %s not in x-crop table\n",
+					string(avutil.get_pix_fmt_name(avutil.PixelFormat(src.format))))
+			}
+		}
+	}
+	crop_active := dec.crop_px_w > 0 && dec.crop_px_h > 0
 	if dec.sws_ctx == nil {
 		// Hardware decode negotiated the sw format only now (first frame).
 		// Use the frame's own dims/format so crop differences can't drift.
+		// The source window is the crop region when cropping (the advanced
+		// pointers are the slice, so ctx dims track the region -- see open).
+		sw, sh := src.width, src.height
+		if crop_active {
+			sw, sh = dec.crop_px_w, dec.crop_px_h
+		}
 		dec.sws_ctx = sws.getContext(
-			src.width, src.height, avutil.PixelFormat(src.format),
+			sw, sh, avutil.PixelFormat(src.format),
 			dec.dst_w, dec.dst_h, avutil.PixelFormat.RGBA,
 			sws.Flags{.Bilinear}, nil, nil, nil,
 		)
@@ -740,14 +840,47 @@ scale_decoded_frame :: proc(dec: ^Clip_Decoder) -> bool {
 			panic("sws_getContext (hw frame) failed")
 		}
 	}
-	sws.scale(
-		dec.sws_ctx,
-		cast([^][^]u8)&src.data[0],
-		cast([^]c.int)&src.linesize[0],
-		0, src.height,
-		cast([^][^]u8)&dec.dst[0],
-		cast([^]c.int)&dec.dst_linesize[0],
-	)
+	if crop_active {
+		// sws_scale has no source-x crop and (in this FFmpeg) no mid-frame
+		// vertical slices, so the whole crop is a pointer walk: each plane
+		// starts at the crop column + row via src_crop_plane_advance, and the
+		// slice handed to sws is the region's full height from its row 0
+		// (0 + crop_h == the ctx's source height, a legal "frame start").
+		// The format was verified against the table at open (soft) or above.
+		planes := src.data
+		p0, p1, p2, ok := src_crop_plane_advance(
+			avutil.PixelFormat(src.format),
+			dec.crop_px_x, dec.crop_px_y,
+			src.linesize,
+		)
+		assert(ok)
+		if p0 > 0 {
+			planes[0] = cast([^]u8)(uintptr(planes[0]) + uintptr(p0))
+		}
+		if p1 > 0 {
+			planes[1] = cast([^]u8)(uintptr(planes[1]) + uintptr(p1))
+		}
+		if p2 > 0 {
+			planes[2] = cast([^]u8)(uintptr(planes[2]) + uintptr(p2))
+		}
+		sws.scale(
+			dec.sws_ctx,
+			cast([^][^]u8)&planes[0],
+			cast([^]c.int)&src.linesize[0],
+			0, dec.crop_px_h,
+			cast([^][^]u8)&dec.dst[0],
+			cast([^]c.int)&dec.dst_linesize[0],
+		)
+	} else {
+		sws.scale(
+			dec.sws_ctx,
+			cast([^][^]u8)&src.data[0],
+			cast([^]c.int)&src.linesize[0],
+			0, src.height,
+			cast([^][^]u8)&dec.dst[0],
+			cast([^]c.int)&dec.dst_linesize[0],
+		)
+	}
 	// Unref the decoder's frame (the hw surface for a hw frame) so its buffer
 	// can be recycled. sw_frame is deliberately NOT unref'd: keeping its buffer
 	// is what makes the next transfer reuse instead of realloc.
@@ -784,6 +917,97 @@ source_fit_in_buffer :: proc(src_w, src_h, buf_w, buf_h: c.int) -> (fw, fh, ox, 
 	ox = (buf_w - fw) / 2
 	oy = (buf_h - fh) / 2
 	return
+}
+
+// dec_crop_px resolves the decoder's crop fractions (see Clip_Decoder) to
+// integer pixels in a `sw x sh` frame. Zero fractions (the zero value) resolve
+// to "no crop" (x/y/w/h all zero). The caller derives the frame dims: coded
+// dims at open for software decode, the transferred frame's dims for hardware.
+dec_crop_px :: proc(dec: ^Clip_Decoder, sw, sh: c.int) -> (x, y, w, h: c.int) {
+	if dec.crop_fw <= 0 || dec.crop_fh <= 0 {
+		return 0, 0, 0, 0
+	}
+	x = clamp(c.int(math.round(f64(dec.crop_fx0) * f64(sw))), 0, sw - 1)
+	y = clamp(c.int(math.round(f64(dec.crop_fy0) * f64(sh))), 0, sh - 1)
+	w = min(max(1, c.int(math.round(f64(dec.crop_fw) * f64(sw)))), sw - x)
+	h = min(max(1, c.int(math.round(f64(dec.crop_fh) * f64(sh)))), sh - y)
+	return
+}
+
+// src_crop_plane_offsets returns the per-plane byte offset a `cx`-pixel left
+// crop needs on the sws source planes, for the YUV 4:2:0 / 4:2:2 family the
+// decoders here actually produce (and the plainer RGB/gray layouts). The
+// vendored sws_scale only crops vertically (srcSliceY/H); a horizontal crop
+// must advance each plane's data pointer, and that takes per-format chroma
+// geometry. ok=false for any layout the table doesn't cover — the caller then
+// decodes the full frame and saves the region only in the destination buffer
+// (render_blit's sampling branch), rather than guessing at byte offsets.
+src_crop_plane_offsets :: proc(pix_fmt: avutil.PixelFormat, cx: c.int) -> (p0, p1, p2: c.int, ok: bool) {
+	#partial switch pix_fmt {
+	case .YUV420P, .YUVJ420P:
+		// 8-bit planar 4:2:0: 1 byte/sample; chroma subsampled 2x both axes.
+		// chroma px at half the columns, so the byte skip is cx/2 (a sample
+		// is one byte on the U/V planes).
+		return cx, cx / 2, cx / 2, true
+	case .YUV420P9LE, .YUV420P9BE, .YUV420P10LE, .YUV420P10BE,
+	     .YUV420P12LE, .YUV420P12BE, .YUV420P14LE, .YUV420P14BE,
+	     .YUV420P16LE, .YUV420P16BE:
+		// 2-byte planar 4:2:0 (9..16 bit): step 2, chroma 4:2:0.
+		return 2 * cx, 2 * (cx / 2), 2 * (cx / 2), true
+	case .YUV444P, .YUVJ444P:
+		// 8-bit planar 4:4:4: no chroma subsampling anywhere.
+		return cx, cx, cx, true
+	case .NV12, .NV21:
+		// Y plane + interleaved UV (2 bytes/chroma pair), 4:2:0 subsampling.
+		return cx, 2 * (cx / 2), 0, true
+	case .P010LE, .P010BE, .P012LE, .P012BE, .P016LE, .P016BE:
+		// 10/12/16-bit 4:2:0, UV interleaved at 4 bytes/chroma pair.
+		return 2 * cx, 2 * cx, 0, true
+	case .YUYV422, .UYVY422:
+		// Single interleaved plane, 2 bytes/pixel, no chroma x subsampling.
+		return 2 * cx, 0, 0, true
+	case .GRAY8:
+		return cx, 0, 0, true
+	case:
+		return 0, 0, 0, false
+	}
+}
+
+// src_crop_plane_advance returns the per-plane byte prefix a (cx, cy) source
+// crop needs (column offsets from the x table plus cy rows walked down each
+// plane's own stride), so the slice handed to sws starts exactly at the crop
+// and only the region is scaled. sws_scale in this FFmpeg rejects mid-frame
+// vertical slices outright ("Slices start in the middle!" unless srcSliceY is
+// the frame start), so the row crop must advance the pointers rather than
+// rely on srcSliceY -- unlike the x crop, which sws has no concept of at all.
+// cy is snapped even because every format here subsamples chroma vertically
+// by 2 on its second/third plane where it exists.
+src_crop_plane_advance :: proc(pix_fmt: avutil.PixelFormat, cx, cy: c.int, ls: [8]c.int) -> (p0, p1, p2: c.int, ok: bool) {
+	x0, x1, x2, xok := src_crop_plane_offsets(pix_fmt, cx)
+	if !xok {
+		return 0, 0, 0, false
+	}
+	cy0 := cy - cy % 2
+	p0 = x0 + cy0 * ls[0]
+	#partial switch pix_fmt {
+	case .YUV420P, .YUVJ420P,
+	     .YUV420P9LE, .YUV420P9BE, .YUV420P10LE, .YUV420P10BE,
+	     .YUV420P12LE, .YUV420P12BE, .YUV420P14LE, .YUV420P14BE,
+	     .YUV420P16LE, .YUV420P16BE,
+	     .NV12, .NV21,
+	     .P010LE, .P010BE, .P012LE, .P012BE, .P016LE, .P016BE:
+		// Chroma (where present) is subsampled 2x vertically: rows come at
+		// half rate, so the crop advances them by cy/2 rows.
+		p1 = x1 + (cy0 / 2) * ls[1]
+		p2 = x2 + (cy0 / 2) * ls[2]
+	case .YUYV422, .UYVY422, .GRAY8:
+		// Single-plane formats: leave the null trailing planes untouched.
+		p1, p2 = 0, 0
+	case:
+		p1 = x1 + cy0 * ls[1]
+		p2 = x2 + cy0 * ls[2]
+	}
+	return p0, p1, p2, true
 }
 
 // decoder_set_preview_path copies `path` into the decoder's own preview_path_buf
@@ -827,7 +1051,16 @@ decode_into_buffer :: proc(dec: ^Clip_Decoder, out: []u8, w, h: c.int) {
 	if stride <= 0 {
 		return
 	}
-	mem.zero(raw_data(out), len(out))
+	// Zero the whole box only for the uncropped path: there the dst may cover
+	// just the letterboxed region and the rest of the box is read by
+	// render_blit (or shown by the preview). When render-path cropping is
+	// active the decode writes every pixel of the visible region and nothing
+	// outside it is ever read, so zeroing would be per-frame waste equal to
+	// the very box area P3 is trying not to touch.
+	cropped := dec.crop_px_w > 0 && dec.crop_px_h > 0
+	if !cropped {
+		mem.zero(raw_data(out), len(out))
+	}
 	dw := int(dec.dst_w)
 	dh := int(dec.dst_h)
 	ox := int(dec.fit_ox)

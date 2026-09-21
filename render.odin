@@ -1177,6 +1177,43 @@ render_worker_run :: proc() {
 		)
 		v.fw = max(1, c.int(cw + 0.5))
 		v.fh = max(1, c.int(ch + 0.5))
+		// Fully off-canvas: never drawn, so no decode at all. The frame loop
+		// skips v.fw <= 0 before touching the decoder.
+		if c.int(r) <= 0 || c.int(l) >= render_job_width ||
+		   c.int(b) <= 0 || c.int(t) >= render_job_height {
+			v.fw = 0
+			v.fh = 0
+			continue
+		}
+		// Visible rect = canvas-clipped display rect. Decode and sws-scale
+		// only this region (render.odin perf brief P3) so resample work tracks
+		// the pixels that are actually drawn; the region maps 1:1 to itself
+		// because the box is the full frame at uniform scale. v.blit stays the
+		// full box size so the decoder's crop-dropped fallback and the uncrop
+		// paths keep working, and the crop lives in v.dec (cleared by the
+		// decoder's reset when zero).
+		vis_left := max(0, c.int(l + 0.5))
+		vis_top := max(0, c.int(t + 0.5))
+		vis_right := min(render_job_width, c.int(r + 0.5))
+		vis_bottom := min(render_job_height, c.int(b + 0.5))
+		box_left := v.transform_x - cw / 2
+		box_top := v.transform_y - ch / 2
+		box_ox := c.int(box_left + 0.5)
+		box_oy := c.int(box_top + 0.5)
+		visible_covers_box := vis_left <= box_ox && vis_top <= box_oy &&
+			vis_right >= box_ox + v.fw && vis_bottom >= box_oy + v.fh
+		if vis_right > vis_left && vis_bottom > vis_top && !visible_covers_box {
+			v.dec.crop_fx0 = (f32(vis_left) - box_left) / cw
+			v.dec.crop_fy0 = (f32(vis_top) - box_top) / ch
+			v.dec.crop_fw = (f32(vis_right) - box_left) / cw - v.dec.crop_fx0
+			v.dec.crop_fh = (f32(vis_bottom) - box_top) / ch - v.dec.crop_fy0
+			v.dec.crop_dst_x = vis_left - box_ox
+			v.dec.crop_dst_y = vis_top - box_oy
+			v.dec.crop_dst_w = vis_right - vis_left
+			v.dec.crop_dst_h = vis_bottom - vis_top
+			v.dec.crop_full_w = v.fw
+			v.dec.crop_full_h = v.fh
+		}
 		v.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
 		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
 			err_msg = "failed to open video source"
@@ -1283,6 +1320,10 @@ render_worker_run :: proc() {
 			v := &render_job_videos[i]
 			if timeline_frame < v.timeline_start_frame ||
 			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
+				continue
+			}
+			// Fully off-canvas clips were never opened (v.fw == 0 in setup).
+			if v.fw <= 0 {
 				continue
 			}
 			// A still image has one source frame; map every timeline frame in
@@ -1496,6 +1537,22 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src) {
 	left := max(v.ox, 0)
 	right := min(v.ox + v.rw, draw_w)
 	if bottom <= top || right <= left {
+		return
+	}
+	if v.dec.crop_px_w > 0 && v.dec.crop_px_h > 0 {
+		// Render-path P3: the decoder already scaled only the visible region
+		// into the full box at fit_ox/oy (see Render_Video_Src setup), so this
+		// is a straight region copy — no sampling, matching the sws bilinear
+		// crop 1:1 on the region.
+		scol := c.int(v.dec.fit_ox)
+		srow := c.int(v.dec.fit_oy)
+		rows := bottom - top
+		cols := right - left
+		for row in 0 ..< rows {
+			src := v.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
+			copy(dst, src)
+		}
 		return
 	}
 	if v.crop_l == 0 && v.crop_r == 0 && v.crop_t == 0 && v.crop_b == 0 {
@@ -1944,6 +2001,20 @@ render_test_run :: proc(paths: [2]string) {
 				vclip.crop_r = f32(vals[1])
 				vclip.crop_t = f32(vals[2])
 				vclip.crop_b = f32(vals[3])
+			}
+		}
+		// VYPER_TX="x,y,scale" overrides the first clip's transform so the
+		// render can be exercised off-canvas / scaled headlessly.
+		if tv, tv_ok := os.lookup_env_alloc("VYPER_TX", context.allocator); tv_ok && tv != "" {
+			parts := strings.split(tv, ",")
+			if len(parts) == 3 {
+				vals := [3]f64{}
+				for i in 0 ..< 3 {
+					vals[i], _ = strconv.parse_f64(parts[i])
+				}
+				vclip.transform_x = f32(vals[0])
+				vclip.transform_y = f32(vals[1])
+				vclip.scale = f32(vals[2])
 			}
 		}
 	}
