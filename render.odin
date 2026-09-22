@@ -1253,6 +1253,11 @@ render_decode_thread:   ^thread.Thread
 render_dec_stop:        bool  // atomic: worker sets, producer polls (also in waits)
 render_dec_produced:    i64   // atomic: frames decoded+published by the producer
 render_dec_consumed:    i64   // atomic: frames composited by the worker
+// Producer-side wall time: decode + scale + transfer into the blit slot.
+render_dec_ns:          i64
+// Sub-split: codec+frame-cache/transfer versus the scale into the blit slot.
+render_dec_codec_ns:    i64
+render_dec_scale_ns:    i64
 
 // P6 encode pipeline: a third thread (render_enc_thread) owns the muxer and both
 // encoders after render_open_output. The composite thread fills a
@@ -1324,9 +1329,10 @@ render_decode_proc :: proc() {
 		if sync.atomic_load(&render_dec_stop) {
 			return
 		}
-		slot_idx := int(frame_idx & 1)
-		timeline_frame := render_job_start + frame_idx
-		for i in 0 ..< len(render_job_videos) {
+slot_idx := int(frame_idx & 1)
+	timeline_frame := render_job_start + frame_idx
+	t_frame := time.now()._nsec
+	for i in 0 ..< len(render_job_videos) {
 			v := &render_job_videos[i]
 			if timeline_frame < v.timeline_start_frame ||
 			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
@@ -1343,11 +1349,15 @@ render_decode_proc :: proc() {
 			if !v.is_still {
 				src_frame += timeline_frame - v.timeline_start_frame
 			}
+			t_src := time.now()._nsec
 			if !decode_source_frame(&v.dec, src_frame) {
 				slot.ok = false
 				continue
 			}
+			render_dec_codec_ns += time.now()._nsec - t_src
+			t_scale := time.now()._nsec
 			decode_into_buffer(&v.dec, slot.blit, v.fw, v.fh)
+			render_dec_scale_ns += time.now()._nsec - t_scale
 			slot.ok = true
 			// Publish the crop geometry the worker's render_blit needs; the
 			// resolution is decoder-side (can change on the first hardware
@@ -1360,6 +1370,7 @@ render_decode_proc :: proc() {
 		// Release: the slot writes above are visible to the worker's acquire
 		// load of produced before it composites frame frame_idx.
 		sync.atomic_store(&render_dec_produced, frame_idx + 1)
+		render_dec_ns += time.now()._nsec - t_frame
 	}
 }
 
@@ -1567,6 +1578,10 @@ render_worker_run :: proc() {
 				f64(render_enc_send_ns) / 1e6 / f64(frames),
 				f64(render_enc_drain_ns) / 1e6 / f64(frames),
 			)
+			fmt.printf("[frame-time]   decode(producer)=%.2fms/f (codec=%.2fms/f scale=%.2fms/f)\n",
+				f64(render_dec_ns) / 1e6 / f64(frames),
+				f64(render_dec_codec_ns) / 1e6 / f64(frames),
+				f64(render_dec_scale_ns) / 1e6 / f64(frames))
 		}
 	}
 
@@ -1665,6 +1680,8 @@ render_worker_run :: proc() {
 	// the composite below reads only the published slots. A fresh default
 	// context is fine: the decode path makes no Odin allocations.
 	render_dec_stop, render_dec_produced, render_dec_consumed = false, 0, 0
+	render_dec_ns = 0
+	render_dec_codec_ns, render_dec_scale_ns = 0, 0
 	if len(render_job_videos) > 0 {
 		render_decode_thread = thread.create(render_decode)
 		if render_decode_thread == nil {

@@ -174,10 +174,13 @@ ff_err_str :: proc(code: c.int) -> string {
 	return strings.clone_from_cstring(cstring(&buf[0]), context.temp_allocator)
 }
 
-// hw_decode_enabled gates hardware decode globally. `VYPER_HW_DISABLE=1` forces
-// the software path; the hw probe (VYPER_HW_PROBE) toggles it to verify both
-// paths produce identical pixels.
-hw_decode_enabled: bool = true
+// hw_decode_enabled gates hardware decode globally; disabled by default --
+// empirically VAAPI decode+transfer here is ~4x slower than 4-threaded
+// software decode (7.7ms/f vs 1.9ms/f producer), so the GPU path is opted in
+// via VYPER_HW_ENABLE=1 where it wins (weak CPU/strong GPU).
+// `VYPER_HW_ENABLE=1` forces the hardware path; the hw probe (VYPER_HW_PROBE)
+// toggles both to verify they produce identical pixels.
+hw_decode_enabled: bool = false
 
 // find_hw_decoder returns the decoder to use for a codec id, preferring one with
 // hardware configs. find_decoder() returns the FIRST registered decoder for the
@@ -476,7 +479,7 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	// .None and the rest of the file is byte-identical to the old path.
 		hw_pix_fmt: avutil.PixelFormat = .None
 	if !hw_decode_enabled {
-		// VYPER_HW_DISABLE / probe comparison: pure software path.
+		// Probe comparison: pure software path.
 		dec.hw_pix_fmt = hw_pix_fmt
 	} else {
 		for i: c.int = 0; ; i += 1 {
@@ -515,6 +518,13 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 			break
 		}
 		dec.hw_pix_fmt = hw_pix_fmt
+	}
+	if hw_pix_fmt == .None {
+		// Software decoder defaults to a single thread; frame threading splits
+		// the decode across cores. Hardware decoders must not thread the codec.
+		// 4 is the practical ceiling: decoded-frame threading flattens after
+		// ~3 threads at 1080p, more threads only adds dispatch overhead.
+		dec_ctx.thread_count = 4
 	}
 	if ret := avcodec.open2(dec_ctx, codec, nil); ret < 0 {
 		fmt.println("avcodec_open2:", ff_err_str(ret))

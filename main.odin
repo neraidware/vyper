@@ -938,8 +938,8 @@ main :: proc() {
 	// lines) used to go to a silenced ffmpeg subprocess (-loglevel error); it
 	// is in-process now, so quiet the library globally to match.
 	avutil.log_set_level(.Error)
-	if os.get_env_alloc("VYPER_HW_DISABLE", context.temp_allocator) == "1" {
-		hw_decode_enabled = false
+	if os.get_env_alloc("VYPER_HW_ENABLE", context.temp_allocator) == "1" {
+		hw_decode_enabled = true
 	}
 	// Probes below drive real edit paths (split, delete, duplicate, track
 	// reorder) that record undo history, so the history must exist before any
