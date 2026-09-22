@@ -1677,6 +1677,19 @@ render_worker_run :: proc() {
 		}
 	}
 
+	// A full-cover layout needs no zero fill: every canvas pixel is
+	// overwritten by an opaque blit on every frame, so mem.zero in the frame
+	// loop is dead work. Only clips whose range encloses the whole render
+	// range are counted — a clip absent on some frame leaves stale pixels
+	// behind, which is exactly why the zero exists.
+	skip_canvas_zero := len(render_job_videos) > 0 && render_span_cover_canvas(
+		render_job_videos,
+		render_job_start,
+		render_job_nframes,
+		render_job_width,
+		render_job_height,
+	)
+
 	// Start the P5 decode-ahead producer once every decoder is open and its
 	// blit slots are allocated. The producer owns all decoders from here on;
 	// the composite below reads only the published slots. A fresh default
@@ -1838,7 +1851,9 @@ render_worker_run :: proc() {
 		}
 		slot_idx := int(frame_idx & 1)
 		eslot := &render_enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
-		mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
+		if !skip_canvas_zero {
+			mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
+		}
 		for i := len(render_job_videos) - 1; i >= 0; i -= 1 {
 			v := &render_job_videos[i]
 			if timeline_frame < v.timeline_start_frame ||
@@ -2035,6 +2050,76 @@ render_worker_run :: proc() {
 			sync.atomic_store(&render_dec_consumed, frame_idx + 1)
 		}
 	}
+}
+
+// render_span_cover_canvas reports whether the union of the full-range clips'
+// display rects tiles the whole canvas. render_blit copies opaque bytes, so a
+// pixel under a rect is fully overwritten; when every pixel is covered on every
+// frame the pre-composite mem.zero is dead work and may be skipped. Only clips
+// whose timeline range encloses the entire render range count — a clip absent on
+// some frame leaves stale pixels behind, which is exactly what the zero exists
+// to prevent. Text/subtitle rasters alpha-blend (render_text_blit) and never
+// cover opaquely, so they contribute nothing here by construction.
+render_span_cover_canvas :: proc(
+	videos: []Render_Video_Src,
+	start, nframes: i64,
+	draw_w, draw_h: c.int,
+) -> bool {
+	rspan := start + nframes
+	spans := make([]struct{a, b: c.int}, len(videos))
+	defer delete(spans)
+	for row: c.int = 0; row < draw_h; row += 1 {
+		n := 0
+		for i in 0 ..< len(videos) {
+			v := &videos[i]
+			if v.fw <= 0 ||
+			   v.timeline_start_frame > start ||
+			   v.timeline_start_frame + v.source_length_frames < rspan {
+				continue
+			}
+			top := max(v.oy, 0)
+			bottom := min(v.oy + v.rh, draw_h)
+			if top > row || row >= bottom {
+				continue
+			}
+			left := max(v.ox, 0)
+			right := min(v.ox + v.rw, draw_w)
+			if right <= left {
+				continue
+			}
+			spans[n] = struct{a, b: c.int}{left, right}
+			n += 1
+		}
+		if n == 0 {
+			return false
+		}
+		for i := 1; i < n; i += 1 {
+			key := spans[i]
+			j := i - 1
+			for j >= 0 && spans[j].a > key.a {
+				spans[j + 1] = spans[j]
+				j -= 1
+			}
+			spans[j + 1] = key
+		}
+		cov: c.int
+		for i in 0 ..< n {
+			if spans[i].b <= cov {
+				continue
+			}
+			if spans[i].a > cov {
+				return false
+			}
+			cov = spans[i].b
+			if cov >= draw_w {
+				break
+			}
+		}
+		if cov < draw_w {
+			return false
+		}
+	}
+	return true
 }
 
 // render_blit copies the clip's scaled frame onto the canvas, clipped to bounds.

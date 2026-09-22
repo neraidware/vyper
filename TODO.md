@@ -223,6 +223,32 @@ text measurement for layout.
 
 ## Queued — Performance / Cleanup
 
+- **HW-encode tail is cadence-sensitive (the last GOP)** — with byte-identical
+  composite input (verified via per-frame canvas dump), the h264 VA-API tail
+  frames (last 4 of ~240) render differently depending on compositor pacing:
+  the full-canvas mem.zero skip shifted composite 1.14 -> 0.99 ms/f and the
+  *tail* of the exported file changed while the canvas input did not (both
+  builds also show their own tail artifact: base froze the final frames ~4 late,
+  skip kept "motion" past a frozen clip end; no frame-shift alignment exists).
+  Same binary = deterministic output; any code-path/cadence change = new tail.
+  Suspect the encoder's async EOF drain (`render_enc_flush` / drain-on-stop)
+  racing packet delivery. Fix: make the tail cadence-independent (flush until
+  the decoder returns consistent last-frame content) or pin encoder pacing;
+  otherwise a cadence-only change can non-deterministically alter the last GOP
+  of an export.
+- **GPU-side encode (NOT planned)** — Export is CPU-pipeline-bound; the
+  encoder thread is the gate at 3.74 ms/f for 240x1080p60 (RGB->NV12 SIMD
+  1.87 + VAAPI surface upload 1.03 + h264_vaapi 0.84), everything else
+  (producer 1.97, composite+audio 2.20) sits under it. The only meaningful
+  remaining win is removing that conversion+upload from the encoder thread
+  via Vulkan<->VAAPI dma-buf interop (VK_EXT_external_memory_dma_buf ->
+  prime fd into the VAAPI surface). Risky/hard: FFmpeg's vaapi encode path
+  always copies sw frames into its own surfaces, so raw-VAAPI or forked
+  send is involved; NVIDIA would be CUDA-only (this box is Intel). Floor if
+  it works ~1.18s -> ~0.7s (240f). Decided against for now. If ever picked
+  up, start with a 2-3 day spike: render one NV12 frame into a dma-buf,
+  import it into a VAAPI surface, check whether iHD encodes it without a
+  copy; only proceed on a pass.
 - Proxy cache directory: move proxies out of source dir into
   `$XDG_CACHE_HOME/vyper/proxies` keyed by stable source-path hash.
 - Per-asset decoder cache: share one decoder + pool across clips referencing
@@ -292,3 +318,9 @@ Details TBD when Phase 2 reaches maturity.
 - Subtitle generator clip (.srt): context menu → file picker → parsed cues,
   center-anchored box, cue-change resizes, static snapshot v1.
 - Building clay + nanosvg from vendored source at build time (no prebuilt binaries).
+- **Export encoder defaults to hardware (GPU), software = fallback** — GPU
+  encoding officially confirmed faster than libx264 by a large margin
+  (1080p60 export wall 1.13s vs 1.68s CPU, ~33% end-to-end; encoder thread
+  ~2.4 vs ~5.5 ms/f). Default is `h264_nvenc → h264_vaapi → h264_qsv →
+  h264_amf → libx264`, so software runs only when no hardware encoder opens.
+  Manual "High quality (CPU)" still available in the encoder menu.
