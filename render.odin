@@ -43,16 +43,18 @@ Render_Default_Path :: "render.mp4"
 // <name>_<n>.<ext> instead of clobbering an existing file of the same name.
 render_overwrite_out: bool
 
-// render_encoder_choice picks the export video encoder family: .CPU is libx264
-// ("High quality"), .GPU tries the first hardware H.264 encoder that actually
-// opens on this machine (falling back to libx264 if none does — a GPU choice
-// must never fail the render just because the device is absent). Hardware
-// encoders trade quality for speed; the choice is explicit, never implicit.
+// render_encoder_choice picks the export video encoder family: .GPU is the
+// default -- it tries the first hardware H.264 encoder that actually opens on
+// this machine and ends with libx264 as the guaranteed fallback, because a
+// GPU choice must never fail the render just because the device is absent.
+// .CPU is explicitly libx264 ("High quality"), for when the user wants
+// x264's better compression efficiency per bit. Hardware encoders trade
+// quality for speed; the choice is explicit, never implicit.
 Render_Encoder_Choice :: enum u32 {
 	CPU,
 	GPU,
 }
-render_encoder_choice: Render_Encoder_Choice = .CPU
+render_encoder_choice: Render_Encoder_Choice = .GPU
 render_encoder_menu_open: bool
 
 // Encoder candidate order per platform, most platform-appropriate first (probed
