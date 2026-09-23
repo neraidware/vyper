@@ -180,7 +180,13 @@ snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 			}
 		}
 	}
-	return best
+	// A clip end edge is exclusive -- one frame PAST its last content frame --
+	// so snapping onto the FINAL clip's end parks the playhead in the void
+	// (timeline_duration() is that same exclusive end; frame == dur has no
+	// frame to show, and scrubbing already refuses it). Interior end edges
+	// (a following clip's start) survive the clamp because dur is the LAST
+	// clip's end: only the final edge exceeds it.
+	return clamp(best, 0, max(0, timeline_duration() - 1))
 }
 
 // clip_track_gaps returns the free (non-covered) bands of `track`, ignoring the

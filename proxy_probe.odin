@@ -152,7 +152,7 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 	// not -1: the duration*fps estimate overshoots the real end-of-stream on
 	// exact-duration synthetic media (see proxy_probe_run's scrub test), so the
 	// tail frames do not reliably decode as ground truth.
-	check_frames := []i64{0, frame_count - 3}
+	check_frames := []i64{0, frame_count - 3, frame_count - 1}
 	check_fbuf: [4096]u8
 	for f, i in check_frames {
 		pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:], false)

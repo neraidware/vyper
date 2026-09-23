@@ -130,6 +130,17 @@ Clip_Decoder :: struct {
 	// decoded_ahead counts frames received since the last seek, so a
 	// forward request knows it only needs to pull the next frame.
 	decoded_ahead: i64,
+	// EOF-tail queue. When the demuxer reports EOF, the decoder's reorder
+	// buffer (B-frame display delay) still holds the last frames of the
+	// stream; they only surface after avcodec_send_packet NULL + drain. The
+	// drain moves them here, one per decode_one_forward call, so the tail is
+	// never silently dropped. eof_drained latches that the flush ran (a
+	// second send NULL is rejected by avcodec). Dynamic: the reorder depth is
+	// decoder-version-dependent, unbounded by has_b_frames alone, and this is
+	// a cold path at stream end -- grow-only is honest here.
+	eof_tail:     [dynamic]^avutil.Frame,
+	eof_tail_pos: int,
+	eof_drained:  bool,
 	// Bounded RAM cache of decoded frames (RGBA, tightly packed). Keeps the
 	// decoded frame data resident in memory and avoids re-decoding recent
 	// frames when the playhead moves back a little. Evicts the LEAST
@@ -259,6 +270,12 @@ clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 		}
 	}
 	frame_cache_clear(dec)
+	// Drop any EOF-tail frames parked by decode_one_forward. Each is a cloned
+	// avutil.Frame owning its buffer; frame_free the shell, then the slice.
+	for &f in dec.eof_tail {
+		avutil.frame_free(&f)
+	}
+	delete(dec.eof_tail)
 	// Wipe fully: neither path nor preview_path survives a reset. Callers that
 	// want a proxy re-supply it via decoder_set_preview before the next
 	// decode; every caller that leaves preview_path nil decodes the source
@@ -659,6 +676,15 @@ seek_to_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 	}
 	avcodec.flush_buffers(dec.dec_ctx)
 	dec.decoded_ahead = 0
+	// A seek repositions the decoder; any EOF-tail frames parked by
+	// decode_one_forward belong to the OLD position and must not be served
+	// for a new scrub target. Drop them and allow a fresh EOF drain.
+	for &f in dec.eof_tail {
+		avutil.frame_free(&f)
+	}
+	clear(&dec.eof_tail)
+	dec.eof_tail_pos = 0
+	dec.eof_drained = false
 	return true
 }
 
@@ -676,8 +702,51 @@ frames_to_stream_ts :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> c.int64_t {
 // frame was produced. Uses dec.video_idx and skips other packets.
 decode_one_forward :: proc(dec: ^Clip_Decoder) -> bool {
 	for {
+		// EOF-tail entry: after the demuxer hit EOF the decoder's reorder
+		// buffer still held the stream's last frames; serve them one per call
+		// before admitting there is nothing left. last_emitted_ts / have_last
+		// advance normally because these frames ARE the remainder of the
+		// stream in order.
+		if dec.eof_tail_pos < len(dec.eof_tail) {
+			f := dec.eof_tail[dec.eof_tail_pos]
+			dec.eof_tail_pos += 1
+			// frame_replace gives dec.frame its OWN reference (src is not
+			// emptied), so dec.frame stays valid while the clone remains
+			// owned by eof_tail and is freed exactly once at reset/seek.
+			if r := avutil.frame_replace(dec.frame, f); r < 0 {
+				return false
+			}
+			dec.decoded_ahead += 1
+			return true
+		}
 		ret := avfmt.read_frame(dec.fmt_ctx, dec.pkt)
 		if ret < 0 {
+			// Demux EOF: the decoder may still hold reordering-buffer frames
+			// (B-frame delay) that only an explicit flush drains. Callers
+			// that decode forward to the very end of a stream would otherwise
+			// silently lose the last max_b_frames frames. Flush once and park
+			// the drained frames for the loop above to serve in order.
+			if !dec.eof_drained {
+				dec.eof_drained = true
+				if r := avcodec.send_packet(dec.dec_ctx, nil); r < 0 {
+					return false
+				}
+				for {
+					r := avcodec.receive_frame(dec.dec_ctx, dec.frame)
+					if r == avutil.AVERROR_EAGAIN || r == avutil.AVERROR_EOF {
+						break
+					}
+					if r < 0 {
+						return false
+					}
+					c := avutil.frame_clone(dec.frame)
+					if c == nil {
+						return false
+					}
+					append(&dec.eof_tail, c)
+				}
+				continue
+			}
 			return false
 		}
 		if dec.pkt.stream_index != c.int(dec.video_idx) {

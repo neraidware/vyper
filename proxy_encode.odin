@@ -264,6 +264,12 @@ proxy_encode_range :: proc(
 		avutil.opt_set(enc, "tune", "fastdecode", 0)
 		avutil.opt_set(enc, "crf", "26", 0)
 	}
+	// Without this flag avcodec_send_frame zeroes frame.duration, so libx264
+	// emits pkt.duration=0 and the mp4 muxer sizes the final stts sample to
+	// zero — the last proxy frame becomes unaddressable by pts, which the
+	// timeline preview (frame -> pts -> seek) needs. Same defect + fix as the
+	// render path.
+	enc.flags += {avcodec.CodecFlag.Frame_Duration}
 	if ret := avcodec.open2(enc, enc_codec, nil); ret < 0 {
 		fmt.printf("[enc] avcodec_open2 (encoder): %s\n", ff_err_str(ret))
 		return .Fail, 0
@@ -402,6 +408,7 @@ encode_scale_send :: proc(
 		cast([^]c.int)&out_frame.linesize[0],
 	)
 	out_frame.pts = done
+	out_frame.duration = 1
 	if send_r := avcodec.send_frame(enc, out_frame); send_r < 0 {
 		fmt.printf("[enc] avcodec_send_frame: %s\n", ff_err_str(send_r))
 		avcodec.packet_unref(enc_pkt)
@@ -437,6 +444,10 @@ mux_packet :: proc(
 	}
 	enc_pkt.pts = rescale_q_to_tb(enc_pkt.pts, enc_tb, ost.time_base.num, ost.time_base.den)
 	enc_pkt.dts = rescale_q_to_tb(enc_pkt.dts, enc_tb, ost.time_base.num, ost.time_base.den)
+	// Duration gets the same rescale: without it the final stts sample sizes
+	// to the encoder's raw tick (1/256 of a frame period) once libx264 keeps
+	// the last frame's duration, so the last proxy frame stays unaddressable.
+	enc_pkt.duration = rescale_q_to_tb(enc_pkt.duration, enc_tb, ost.time_base.num, ost.time_base.den)
 	enc_pkt.stream_index = ost.index
 	if ret := avfmt.interleaved_write_frame(oc, enc_pkt); ret < 0 {
 		fmt.printf("[enc] av_interleaved_write_frame: %s\n", ff_err_str(ret))

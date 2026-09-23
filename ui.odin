@@ -317,7 +317,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 								UI_TEXT_STATE[:],
 								"%d / %d  ·  %gfps",
 								playhead.frame,
-								timeline_duration(),
+								max(0, timeline_duration() - 1),
 								timeline_fps(),
 							),
 							clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},

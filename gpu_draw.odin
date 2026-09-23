@@ -55,7 +55,11 @@ draw_timeline_ruler :: proc(
 	minor_h := ruler.height * 0.35
 	major_h := ruler.height * 0.6
 	start_f := i64(f32(i64(timeline_view_start / f32(minor))) * f32(minor))
-	for f := start_f; f <= dur + 1; f += minor {
+	// Ticks span [0, dur): dur is the exclusive end and holds no frame (the
+	// last content frame is dur-1), so a tick/label there reads as a phantom
+	// "one frame above the clip's frame count" -- the playhead's max is
+	// already dur-1, which draws the boundary instead.
+	for f := start_f; f < dur; f += minor {
 		x := ruler.x + (f32(f) - timeline_view_start) * timeline_zoom
 		if x < ruler.x {
 			continue

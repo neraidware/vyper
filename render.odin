@@ -694,6 +694,10 @@ enc_ctx_common :: proc(ctx: ^avcodec.CodecContext, width, height: c.int, fps_num
 	// FFmpeg default is 1 (single-threaded encode) unless opted in explicitly,
 	// wasting every core past the first. Hardware encoders ignore it.
 	ctx.thread_count = 0
+	// Without this flag avcodec_send_frame zeroes frame.duration before the
+	// encoder sees it, so libx264 emits pkt.duration=0 and the mp4 muxer sizes
+	// the final stts sample (track_duration = last dts + pkt.duration) to zero.
+	ctx.flags += {avcodec.CodecFlag.Frame_Duration}
 }
 
 // enc_hw_upload_open tries the encoder's hardware-frames path: create the
@@ -1108,6 +1112,11 @@ rend_enc_video_frame :: proc(
 		frame.linesize[i] = e.yuv_linesize[i]
 	}
 	frame.pts = frame_index
+	// The mp4 muxer sizes the final stts sample from the last packet's
+	// duration; libx264 forwards frame.duration as pkt.duration. Without
+	// this the last frame gets a zero-length sample and playback truncates
+	// the export by one frame.
+	frame.duration = 1
 	to_send := frame
 	defer if to_send != frame {
 		avutil.frame_free(&to_send)
@@ -1133,6 +1142,7 @@ rend_enc_video_frame :: proc(
 		}
 		render_enc_upload_ns += time.now()._nsec - t_up
 		hw_frame.pts = frame_index
+		hw_frame.duration = 1
 		to_send = hw_frame
 	}
 	t_send := time.now()._nsec
