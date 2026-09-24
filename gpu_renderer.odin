@@ -20,6 +20,7 @@ RectVertexUniforms :: struct {
 RectFragmentUniforms :: struct {
 	color: [4]f32,
 	shape: [4]f32,
+	mode:  [4]f32, // x: 0 = circular-arc corner, 1 = squircle
 }
 
 TextVertexUniforms :: struct {
@@ -77,6 +78,11 @@ Glyph_Atlas :: struct {
 	sampler:          ^sdl.GPUSampler,
 	font:             stb.fontinfo,
 	font_ready:       bool,
+	// Bake-space vertical metrics (GLYPH_BAKE_PX units): the face's true
+	// baseline sits `ascent_bake` below the box top, not a full em down.
+	// render_text centers on these so ink lines up with clay's measured box.
+	ascent_bake:      f32,
+	descent_bake:     f32,
 	cells_x:          u32, // current grid side in cells
 	generation:       u32, // bumped every grid re-create
 	next_cell:        u32, // cells handed out so far
@@ -180,6 +186,17 @@ glyph_atlas_cell_xy :: proc(a: ^Glyph_Atlas, cell: u32) -> (x, y: u32) {
 // A rune the face lacks resolves once to missing and never re-probes.
 // "Unicode support" here is literally whatever the rasterizing face
 // provides; no shaping, no fallback faces.
+// glyph_atlas_read_metrics caches the face's bake-space ascent/descent so
+// render_text can place the baseline at the true ink origin instead of a
+// whole em below the box top (which pushed every line off-center).
+glyph_atlas_read_metrics :: proc(a: ^Glyph_Atlas) {
+	ascent, descent, _: c.int
+	stb.GetFontVMetrics(&a.font, &ascent, &descent, nil)
+	scale := stb.ScaleForPixelHeight(&a.font, GLYPH_BAKE_PX)
+	a.ascent_bake = f32(ascent) * scale
+	a.descent_bake = f32(descent) * scale
+}
+
 glyph_ensure :: proc(a: ^Glyph_Atlas, r: rune) -> (slot: u32, ok: bool, is_new: bool) {
 	if s, cached := glyph_atlas_slot(a, r); cached {
 		return s, true, false
@@ -194,6 +211,7 @@ glyph_ensure :: proc(a: ^Glyph_Atlas, r: rune) -> (slot: u32, ok: bool, is_new: 
 	assert(a.slot_count < MAX_GLYPH_SLOTS, "glyph atlas: slot table full")
 	if !a.font_ready {
 		stb.InitFont(&a.font, raw_data(font_data), 0)
+		glyph_atlas_read_metrics(a)
 		a.font_ready = true
 	}
 	scale := stb.ScaleForPixelHeight(&a.font, GLYPH_BAKE_PX)
@@ -434,6 +452,7 @@ glyph_atlas_ensure_ascii :: proc(a: ^Glyph_Atlas) {
 glyph_atlas_bake_pending_ink :: proc(a: ^Glyph_Atlas) {
 	if !a.font_ready {
 		stb.InitFont(&a.font, raw_data(font_data), 0)
+		glyph_atlas_read_metrics(a)
 		a.font_ready = true
 	}
 	scale := stb.ScaleForPixelHeight(&a.font, GLYPH_BAKE_PX)

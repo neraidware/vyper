@@ -75,3 +75,9 @@ PREVIEW_FIT_MARGIN :: f32(8)
 
 // Text input field glyph size (shared by the popup layout and the caret draw).
 TEXT_INPUT_FONT :: u16(18)
+
+// Command-line prompt (":") geometry: a pill bar half the window's width, one
+// font-height tall plus half a font of vertical padding around the text, with
+// a fully-round accent border.
+CMDLINE_WIDTH_FRAC :: 0.5
+CMDLINE_PAD_FRAC :: 0.5 // of TEXT_INPUT_FONT: padding above/below the text

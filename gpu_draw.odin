@@ -292,6 +292,7 @@ render_clay :: proc(
 					color,
 					config.cornerRadius.topLeft,
 					0,
+					corner_mode_for(command.id),
 				)
 			}
 		case .Border:
@@ -319,6 +320,7 @@ render_clay :: proc(
 						color,
 						config.cornerRadius.topLeft,
 						f32(w.left),
+						corner_mode_for(command.id),
 					)
 				} else {
 					if w.top > 0 {
@@ -889,11 +891,16 @@ render_text :: proc(
 		return
 	}
 
-	// Clay's text command gives us the laid-out origin. The atlas bakes a
-	// baseline origin at GLYPH_BAKE_PX, so start one font height below.
+	// Clay's text command gives us the laid-out origin. The atlas bakes glyphs
+	// with the baseline at the face's true ascent (not a full em) below the
+	// box top, so the ink sits vertically centered in clay's measured box.
+	// fall back to one em when the face metrics aren't in yet.
 	scale := f32(text.fontSize) / f32(GLYPH_BAKE_PX)
 	x: f32 = 0
-	baseline: f32 = f32(GLYPH_BAKE_PX)
+	baseline: f32 = renderer.font.ascent_bake
+	if baseline <= 0 {
+		baseline = f32(GLYPH_BAKE_PX)
+	}
 	line_height := f32(text.lineHeight)
 	if line_height <= 0 {
 		line_height = f32(text.fontSize)
@@ -964,6 +971,16 @@ render_text :: proc(
 	}
 }
 
+// corner_mode_for picks the SDF corner primitive for a clay element: the ":" 
+// command line draws its pill as a squircle (superellipse corners); everything
+// else keeps the plain circular arc.
+corner_mode_for :: proc(id: u32) -> f32 {
+	if id == clay.ID("CmdlinePopup").id {
+		return 1
+	}
+	return 0
+}
+
 render_sdf_rect :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -971,6 +988,7 @@ render_sdf_rect :: proc(
 	bounds: clay.BoundingBox,
 	color: clay.Color,
 	radius, border: f32,
+	corner_mode: f32 = 0,
 ) {
 	vertex_uniforms := RectVertexUniforms {
 		bounds   = {bounds.x, bounds.y, bounds.width, bounds.height},
@@ -984,6 +1002,7 @@ render_sdf_rect :: proc(
 			f32(color[3]) / 255,
 		},
 		shape = {bounds.width, bounds.height, radius, border},
+		mode  = {corner_mode, 0, 0, 0},
 	}
 	sdl.PushGPUVertexUniformData(
 		command_buffer,

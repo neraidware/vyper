@@ -223,6 +223,25 @@ text measurement for layout.
 
 ## Queued — Performance / Cleanup
 
+- **Consolidate top-level mutable globals into named state structs** — the
+  globals namespace is polluted with ~140 top-level vars. Three clean groups,
+  each to fold behind one owner, in order of payoff:
+  1. **UI per-frame scratch text buffers** (`ui.odin:31-49`, ~11 buffers like
+     `UI_TEXT_STATE`, `UI_TEXT_RULER`, `UI_TEXT_OUT`). Each is used inside a
+     single proc; today they share index space with real state. Fold each into
+     the one proc/struct that writes it (a HUD row struct). Small, safe, no
+     behavior change.
+  2. **Encoder identity globals** — `proxy.odin` encoder constants/version and
+     `clip_id_seed` (media.odin:220). Group into a `Proxy_Encoder` /
+     `Clip_Id` struct so cache-key derivation lives with its inputs.
+  3. **Audio state block** — `audio.odin:340-652` (~15 mutables: audio_play_frame,
+     audio_jump_frame, audio_provisioning, audio_play_frame, audio_report_*,
+     audio_silence_holes, audio_geom_overflow…). Fold into one `Audio_State`
+     struct owned by the audio thread. Largest refactor; do last.
+
+  Rule of thumb: a top-level `: var` that isn't config, a scratch buffer, or a
+  seed belongs in the struct of the subsystem that owns its lifetime.
+
 - **HW-encode tail is cadence-sensitive (the last GOP)** — with byte-identical
   composite input (verified via per-frame canvas dump), the h264 VA-API tail
   frames (last 4 of ~240) render differently depending on compositor pacing:
