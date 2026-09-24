@@ -60,95 +60,128 @@ prewarm_next_clip :: proc() {
 	if !playhead.playing || playback_dir != 1 {
 		return
 	}
+	// The single handoff decoder can warm only ONE upcoming clip per call.
+	// Pick the clip that will next need a fresh, non-trivial claim -- the one
+	// earliest to start within WARM_LOOKAHEAD across ALL tracks. The old code
+	// only looked at each active clip's same-track successor and ABORTED the
+	// whole scan on `return`s, so a clip starting fresh on a track where
+	// nothing currently covers the playhead (a still landing on a cut -- its
+	// left edge flush with the split boundary) was invisible until the playhead
+	// was already inside it, cold-claiming and blanking for the decode
+	// round-trip. That was the still flash.
+	best: ^Clip
+	best_start := max(i64)
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		track := &timeline.tracks[t]
+		active: ^Clip
 		for i := 0; i < len(track.clips); i += 1 {
 			c := &track.clips[i]
-			if c.kind != .Video {
+			if c.kind != .Video || c.path == nil {
 				continue
 			}
-			if playhead.frame < c.timeline_start_frame ||
-			   playhead.frame >= c.timeline_start_frame + c.source_length_frames {
-				continue
+			if playhead.frame >= c.timeline_start_frame &&
+			   playhead.frame < c.timeline_start_frame + c.source_length_frames {
+				active = c
+				break
 			}
-			// c is the frontmost active video clip; warm what plays next on this track.
-			end := c.timeline_start_frame + c.source_length_frames
-			if end - playhead.frame > WARM_LOOKAHEAD {
-				return
-			}
-			next := next_clip_on_track(track, i, end)
-			if next == nil {
-				return
-			}
-			// Adjacent same-asset hop (split halves, duplicated clips): the slot's
-			// decoder-preserve path (update_preview_slots) already turns it into a
-			// single cheap forward decode, so a pre-open here would be wasted work
-			// (an extra open + keyframe seek into the file during the current
-			// clip's tail). Only pre-warm when the boundary is a source-index gap
-			// or a cross-asset leap -- the cases that would otherwise cold-seek.
-			if next.path == c.path &&
-			   next.source_start_frame == c.source_start_frame + c.source_length_frames {
-				return
-			}
-			if warm_valid && warm_clip_id == next.clip_id {
-				// Target unchanged; nothing new to decode (cached frames persist).
-				return
-			}
-			if warm_valid {
-				clip_decoder_reset(&warm_decoder)
-				warm_valid = false
-			}
-			warm_proxy_buf: [4096]u8
-			// Resolve the preview target PER FRAME (segmented proxies grow as
-			// the background builder lands more segments); each decoded warm
-			// frame may come from a different segment than the last, and the
-			// decoder reopens when the physical file changes.
-			//
-			// prefer_source follows the same S5 gate as the front slot: once
-			// the warm decoder is hw-backed, cache the ORIGINAL so the primed
-			// slot never degrades to the proxy mid-transition. N/A for clips
-			// outside the media bin (path has no asset entry -> false).
-			warm_asset := find_asset(next.asset_id)
-			warm_pick, warm_base := proxy_pick_for_frame(
-				next.path,
-				next.source_length_frames,
-				next.source_start_frame,
-				warm_proxy_buf[:],
-				warm_asset != nil && asset_source_hw(warm_asset),
-			)
-			decoder_set_preview(&warm_decoder, warm_pick, warm_base)
-			if !decode_clip_frame_sync(
-				&warm_decoder,
-				next.path,
-				next.source_start_frame,
-				warm_buf[:],
-			) {
-				return
-			}
-			// Buttress the cache with a few following frames (cheap forward steps).
-			// A still image has no following frames to decode.
-			if next.is_still {
-				return
-			}
-			for kf in i64(1) ..< 4 {
-				wf := next.source_start_frame + kf
-				warm_pick, warm_base = proxy_pick_for_frame(
-					next.path,
-					next.source_length_frames,
-					wf,
-					warm_proxy_buf[:],
-					warm_asset != nil && asset_source_hw(warm_asset),
-				)
-				decoder_set_preview(&warm_decoder, warm_pick, warm_base)
-				if !decode_clip_frame_sync(&warm_decoder, next.path, wf, warm_buf[:]) {
-					break
-				}
-			}
-			warm_clip_id = next.clip_id
-			warm_valid = true
-			return
+		}
+		// Look for the next clip to consider: the successor of the active clip
+		// (if flush/gap), or the first clip at/after the playhead when nothing
+		// covers it yet (a still landing on a cut). Anchoring the search at the
+		// active clip's END rather than the playhead keeps the flush-boundary
+		// predecessor check below honest -- searching from the playhead would
+		// return the active clip itself when the playhead sits exactly on.
+		at_or_after := playhead.frame
+		if active != nil {
+			at_or_after = active.timeline_start_frame + active.source_length_frames
+		}
+		next := next_clip_on_track(track, 0, at_or_after)
+		if next == nil {
+			continue
+		}
+		if next.timeline_start_frame > playhead.frame + WARM_LOOKAHEAD {
+			continue
+		}
+		// Flush same-asset boundary (split halves, duplicated clips): the slot's
+		// decoder-preserve path (update_preview_slots) already turns a clip
+		// covering the playhead RIGHT NOW into a single cheap forward decode, so
+		// a pre-open here would be wasted work (an extra open + keyframe seek
+		// into the file during the current clip's tail). Only pre-warm when the
+		// boundary is a source-index gap, a cross-asset leap, or a fresh start
+		// with no live predecessor -- the cases that would otherwise cold-seek.
+		if active != nil &&
+		   next.timeline_start_frame == active.timeline_start_frame + active.source_length_frames &&
+		   next.path == active.path &&
+		   next.source_start_frame == active.source_start_frame + active.source_length_frames {
+			continue
+		}
+		if next.timeline_start_frame < best_start {
+			best_start = next.timeline_start_frame
+			best = next
 		}
 	}
+	if best == nil {
+		return
+	}
+	if warm_valid && warm_clip_id == best.clip_id {
+		// Target unchanged; nothing new to decode (cached frames persist).
+		return
+	}
+	if warm_valid {
+		clip_decoder_reset(&warm_decoder)
+		warm_valid = false
+	}
+	warm_proxy_buf: [4096]u8
+	// Resolve the preview target PER FRAME (segmented proxies grow as the
+	// background builder lands more segments); each decoded warm frame may come
+	// from a different segment than the last, and the decoder reopens when the
+	// physical file changes.
+	//
+	// prefer_source follows the same S5 gate as the front slot: once the warm
+	// decoder is hw-backed, cache the ORIGINAL so the primed slot never
+	// degrades to the proxy mid-transition. N/A for clips outside the media
+	// bin (path has no asset entry -> false).
+	warm_asset := find_asset(best.asset_id)
+	warm_pick, warm_base := proxy_pick_for_frame(
+		best.path,
+		best.source_length_frames,
+		best.source_start_frame,
+		warm_proxy_buf[:],
+		warm_asset != nil && asset_source_hw(warm_asset),
+	)
+	decoder_set_preview(&warm_decoder, warm_pick, warm_base)
+	if !decode_clip_frame_sync(
+		&warm_decoder,
+		best.path,
+		best.source_start_frame,
+		warm_buf[:],
+	) {
+		return
+	}
+	// Buttress the cache with a few following frames (cheap forward steps). A
+	// still image has no following frames to decode -- its single frame was
+	// just decoded, and that one frame is the whole clip.
+	if best.is_still {
+		warm_clip_id = best.clip_id
+		warm_valid = true
+		return
+	}
+	for kf in i64(1) ..< 4 {
+		wf := best.source_start_frame + kf
+		warm_pick, warm_base = proxy_pick_for_frame(
+			best.path,
+			best.source_length_frames,
+			wf,
+			warm_proxy_buf[:],
+			warm_asset != nil && asset_source_hw(warm_asset),
+		)
+		decoder_set_preview(&warm_decoder, warm_pick, warm_base)
+		if !decode_clip_frame_sync(&warm_decoder, best.path, wf, warm_buf[:]) {
+			break
+		}
+	}
+	warm_clip_id = best.clip_id
+	warm_valid = true
 }
 
 // pick_hash_u32 fingerprints a proxy pick path (a cstring resolving to a
@@ -227,6 +260,7 @@ update_preview_slots :: proc() -> bool {
 			layer += 1
 			slot := &preview_slots[slot_idx]
 			slot.layer = layer
+			fresh_claim := !slot.in_use || slot.clip_id != clip.clip_id
 			// Identity is the clip instance (clip_id), not its asset or its
 			// position: asset_id alone would conflate two different clips of
 			// the same source file, and timeline_start_frame changes under a
@@ -273,6 +307,7 @@ update_preview_slots :: proc() -> bool {
 					delete(slot.text_scratch)
 					slot.text_scratch = nil
 				}
+				flash_rec_note_kill(slot_idx, "reassign-to-other-clip")
 				slot^ = {}
 				if same_asset {
 					slot.dec = saved_dec
@@ -346,7 +381,17 @@ update_preview_slots :: proc() -> bool {
 				if drag_clip == clip || active_interaction == .Clip_Resize {
 					// Leave has_frame as-is: paint the stale face through the
 					// drag (the decode below chases the clip's new position).
+				} else if fresh_claim {
+					// Fresh claim, no stale pixels to clear: the slot was just
+					// zeroed (or taken from another clip) this update. The
+					// anchor-shift blank below exists to clear a persisting
+					// slot's stale frame when ITS clip moved; skipping it here
+					// is required or a warm decoder handed off by prewarm (for
+					// exactly this clip, keeping its buffer) is wiped by the
+					// 0 != clip.start anchor compare before prime_from_warm can
+					// serve it -- the still flash at a freshly-covering clip.
 				} else {
+					flash_rec_note_kill(slot_idx, "anchor-shift")
 					slot.has_frame = false
 					slot.tex_dirty = false
 					mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
@@ -685,6 +730,7 @@ update_preview_slots :: proc() -> bool {
 			// released via the render loop's pending-release queue (no device
 			// on this thread).
 			slot := &preview_slots[s]
+			flash_rec_note_kill(s, "sweep")
 			clip_decoder_reset(&slot.dec)
 			if slot.is_text && slot.texture != nil {
 				queue_text_texture_release(slot.texture)
