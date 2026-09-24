@@ -672,7 +672,12 @@ playback_seq:      u64 // atomic seqlock: odd while publishing
 // audio_dev_frame is the content frame the sound device has actually consumed
 // (everything the producer pushed minus what is still queued); published every
 // feed pass so the preview HUD can show the audio clock next to the video one.
+// audio_dev_at_ns is the GetTicksNS() that belonged to the same feed pass, so
+// a reader can extrapolate the device position to its own "now" and compare
+// against the extrapolated playhead at the same instant -- the stepped publish
+// alone would show a full frame of phantom skew (dev != playhead.frame).
 audio_dev_frame: i64
+audio_dev_at_ns: i64
 
 // Preview camera: pan (in preview pixels, relative to the base canvas center)
 // and zoom. Pan is the image-viewer bound -- the canvas edge may reach the

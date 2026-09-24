@@ -1283,6 +1283,10 @@ audio_producer_feed :: proc() {
 	rate_sc := max(1.0, want_ratio)
 	queued_frames := i64(f64(sdl.GetAudioStreamQueued(audio_stream)) * rate_sc / f64(spf * 2 * 2))
 	dev_pos := audio_play_frame - queued_frames
+	// Publish at_ns BEFORE dev: a reader sampling dev then at_ns under-extrapolates
+	// (at_ns can only be newer), which is the safe direction — never a position
+	// ahead of what the device truly consumed.
+	sync.atomic_store(&audio_dev_at_ns, i64(sdl.GetTicksNS()))
 	sync.atomic_store(&audio_dev_frame, dev_pos)
 	// Fold live gain edits (knob drag) into provisioned segments before mixing.
 	// The epoch check is cheap; folding only runs when the UI published a gain
@@ -1316,6 +1320,7 @@ audio_producer_feed :: proc() {
 		sdl.ClearAudioStream(audio_stream)
 		queued_frames = 0
 		dev_pos = audio_play_frame
+		sync.atomic_store(&audio_dev_at_ns, i64(sdl.GetTicksNS()))
 		sync.atomic_store(&audio_dev_frame, dev_pos)
 		audio_wedge_heal += 1
 	}

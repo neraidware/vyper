@@ -1326,23 +1326,38 @@ draw_preview_hud :: proc(
 	if fps <= 0 {
 		return
 	}
-	dev := sync.atomic_load(&audio_dev_frame)
+	// Sample both clocks at this instant, not at their last publish: dev is
+	// stepped by producer feed passes and playhead.frame steps once per UI
+	// frame, so comparing them raw bounces a full frame (~16ms at 60fps) of
+	// phantom skew that is never audible. Extrapolate both off the same wall
+	// clock (the way the producer pins its queue target) — the residual is the
+	// true device-vs-playhead offset, a few ms at most.
+	now := sdl.GetTicksNS()
+	dev_at := sync.atomic_load(&audio_dev_at_ns)
+	dev_raw := sync.atomic_load(&audio_dev_frame)
+	rate_sc := max(1.0, playback_rate)
+	dev_now := dev_raw + (dev_at > 0 ? i64(f64(now - u64(dev_at)) / 1e9 * rate_sc * f64(fps)) : 0)
+	// playhead.frame is the last UI-frame publish; extrapolate it to now like
+	// the producer does (audio.odin .feed) so both ends share the same clock.
+	dev := dev_now
+	ph_now := max(playback_playhead_at(now, rate_sc), i64(0))
+	ph := ph_now
 	label_buf: [64]u8
 	label := fmt.bprintf(
 		label_buf[:],
 		"A %6.2f  V %6.2f  d %+.2f",
 		f64(dev) / fps,
-		f64(playhead.frame) / fps,
-		f64(dev - playhead.frame) / fps,
+		f64(ph) / fps,
+		f64(dev - ph) / fps,
 	)
-	if now := sdl.GetTicksNS(); dev - playhead.frame < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag_tick >= u64(1_000_000_000) {
+	if now := sdl.GetTicksNS(); dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag_tick >= u64(1_000_000_000) {
 		rsync := sync.atomic_load(&audio_resync_evt)
 		prod := sync.atomic_load(&audio_prod_frame)
 		holes := sync.atomic_load(&audio_silence_holes)
 		anchor := sync.atomic_load(&audio_anchor_frame)
 		fmt.printf(
 			"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
-			f64(dev-playhead.frame)/fps,
+			f64(dev-ph)/fps,
 			f64(prod)/fps,
 			f64(prod-dev)/fps,
 			f64(anchor)/fps,
