@@ -53,9 +53,22 @@ TRACK_ROW_H :: CLIP_TILE_HEIGHT // One track row is exactly one clip tile tall. 
                                 // name gutter fits the same 56px (heading text 18 +
                                 // 4px childGap + 34px buttons), so neither the clip
                                 // lane nor the gutter leaves slack at the row's
-                                // bottom. Fixed (not measured) so track-list scroll
-                                // geometry stays a pure function of the track count.
+                                // bottom. A track carrying keyframed clips grows by
+                                // KF_ROW_H per lane (see kf_rows_for). Fixed (not
+                                // measured) so track-list scroll geometry stays a pure
+                                // function of the track count and their keyframe
+                                // lane counts, never of layout timing.
 TRACK_GAP_H :: 18          // Height of the insert gap above each track row.
+// Keyframe lanes: one KF_ROW_H strip below a keyframed clip tile holds that
+// clip's keyframe diamonds; a track row grows by KF_ROW_H per lane the tallest
+// clip in it carries. A diamond is the 45°-rotated square SDF (KF_DIAMOND_ROT),
+// corners rounded just enough to stay crisp.
+KF_ROW_H :: f32(22)        // One keyframe lane height.
+KF_DIAMOND_R :: f32(4)     // Half of the diamond's bounding square (8px across).
+KF_DIAMOND_ROT :: [2]f32{0.70710678, 0.70710678} // cos/sin of 45°: squares up at the screen.
+KF_DIAMOND_CORNER :: 2     // Diamond corner rounding, keeps a point on each axis.
+KF_DIAMOND_BORDER :: 1     // 1px border, drawn inside the diamond.
+KF_HIT_MARGIN :: f32(6)    // Diamond pick radius: pointer within this of a key's center selects it.
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 TSCROLLBAR_W :: f32(10)    // Width of the timeline's vertical scrollbar strip.
 TSCROLLBAR_MIN_H :: f32(28) // Smallest rendered scrollbar thumb.

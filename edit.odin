@@ -16,6 +16,8 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 	case .X, .Y, .None:
 	case .Scale:
 		prec = 2
+	case .Kf_Value:
+		prec = 2
 	case .Gain:
 		prec = 1
 	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
@@ -51,6 +53,8 @@ edit_field_over :: proc() -> bool {
 		return clay.PointerOver(clay.ID("PropCropB"))
 	case .Gain:
 		return clay.PointerOver(clay.ID("PropFieldGain"))
+	case .Kf_Value:
+		return clay.PointerOver(clay.ID("PropFieldKf"))
 	case .None:
 		return false
 	}
@@ -61,6 +65,23 @@ edit_commit :: proc() {
 	defer edit_cancel()
 	val, parsed_ok := strconv.parse_f32(string(edit_chars[:edit_len]))
 	if !parsed_ok {
+		return
+	}
+	// Keyframe value edits target the keyframe selection, which is the ONLY
+	// selection while active (S3 exclusivity) — so it can't ride the
+	// selected_clip() resolve the clip fields use. Write through the live key;
+	// undo snapshots the whole timeline, so the replace is a plain commit.
+	if editing_field == .Kf_Value {
+		_, _, k, ok := kf_selected()
+		if !ok {
+			return
+		}
+		if k.value == val {
+			return
+		}
+		undo_begin()
+		k.value = val
+		undo_push(.Value, "Set keyframe value")
 		return
 	}
 	// The gain field is the one edit that targets audio clips, which
@@ -131,7 +152,9 @@ edit_commit :: proc() {
 		field = &cl.gain
 		label = "Set clip gain"
 		kind = .Value
-	case .None:
+	// Keyframe value edits are committed by the early return above, so this
+	// case is unreachable — but the switch must stay exhaustive over the enum.
+	case .Kf_Value, .None:
 		return
 	}
 	if field^ == val {

@@ -48,6 +48,9 @@ UI_TEXT_B:           [64]u8
 UI_TEXT_OUT:         [128]u8
 UI_TEXT_RATE:        [64]u8
 UI_TEXT_HINT:        [512]u8
+UI_TEXT_KF_NAME:     [128]u8 // keyframe readout: track name
+UI_TEXT_KF_FRAME:    [64]u8 // keyframe readout: absolute timeline frame
+UI_TEXT_KF_VAL:      [64]u8 // keyframe readout: value field text
 
 // One label+name buffer per rate for the playback-rate dropdown items. Each
 // menu row must keep its own buffer alive until draw (clay keeps the slices),
@@ -612,12 +615,13 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							}
 							ti := timeline.track_order[r]
 							track := &timeline.tracks[ti]
+							kf_rows := kf_rows_for(track)
 							if clay.UI(clay.ID("TrackRow", u32(ti)))(
 							{
 								layout = {
 									sizing = {
 										width = clay.SizingGrow({}),
-										height = clay.SizingFixed(TRACK_ROW_H),
+										height = clay.SizingFixed(TRACK_ROW_H + f32(kf_rows) * KF_ROW_H),
 									},
 									layoutDirection = .LeftToRight,
 									childGap = SECTION_GAP,
@@ -694,6 +698,46 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										},
 										) {
 											// Remove glyph is drawn as an embedded icon overlay.
+										}
+									}
+									if kf_rows > 0 {
+										// Keyframe property labels: one KF_ROW_H line per
+										// visible lane, stacked under the buttons so they
+										// line up with the diamond lanes beside them.
+										kf_names: [32]string
+										kf_count := kf_gutter_names(track, kf_rows, kf_names[:])
+										if clay.UI(clay.ID("KfGutterNames", u32(ti)))(
+										{
+											layout = {
+												sizing = {
+													width = clay.SizingGrow({}),
+													height = clay.SizingFit({}),
+												},
+												layoutDirection = .TopToBottom,
+											},
+										},
+										) {
+											for i in 0 ..< kf_count {
+												if clay.UI(clay.ID("KfGutterName", u32(ti * 1000 + i)))(
+												{
+													layout = {
+														sizing = {
+															width = clay.SizingGrow({}),
+															height = clay.SizingFixed(KF_ROW_H),
+														},
+														childAlignment = {x = .Left, y = .Center},
+													},
+												},
+												) {
+													clay.Text(
+														kf_names[i],
+														clay.TextElementConfig {
+															textColor = RULER_LABEL_COLOR,
+															fontSize = FONT_SMALL,
+														},
+													)
+												}
+											}
 										}
 									}
 								}
@@ -779,9 +823,17 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 											bottom = bw,
 										}
 										border.right = next_touches ? 0 : bw
+										// The tile is wrapped so a keyframed clip grows
+										// DOWNWARD: a fixed-height tile (markers, selection,
+										// hit tests all key off it) plus one KF_ROW_H lane per
+										// keyframe track. The lane elements reserve the space
+										// the diamond overlay (draw_keyframes) paints into and
+										// give the interaction slice click targets; a hairline
+										// on each lane's top makes the stack read as a strip.
+										kf_n := len(timeline_clip.keyframe_tracks)
 										if clay.UI(
 											clay.ID(
-												"TimelineClip",
+												"TimelineClipWrap",
 												u32(ti * 1000 + index),
 											),
 										)(
@@ -790,25 +842,63 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 													sizing = {
 														width = clay.SizingFixed(clip_width),
 														height = clay.SizingFixed(
-															CLIP_TILE_HEIGHT,
+															CLIP_TILE_HEIGHT + f32(kf_n) * KF_ROW_H,
 														),
 													},
-													padding = clay.PaddingAll(CARD_GAP),
+													layoutDirection = .TopToBottom,
 												},
-												backgroundColor = clip_color,
-												cornerRadius = clay.CornerRadiusAll(
-													RADIUS_WIDGET,
-												),
-												border = {color = clip_border, width = border},
 											},
 										) {
-											clay.Text(
-												clip_label,
-												clay.TextElementConfig {
-													textColor = TEXT,
-													fontSize = FONT_HEADING,
+											if clay.UI(
+												clay.ID(
+													"TimelineClip",
+													u32(ti * 1000 + index),
+												),
+											)(
+												{
+													layout = {
+														sizing = {
+															width = clay.SizingGrow({}),
+															height = clay.SizingFixed(CLIP_TILE_HEIGHT),
+														},
+														padding = clay.PaddingAll(CARD_GAP),
+													},
+													backgroundColor = clip_color,
+													cornerRadius = clay.CornerRadiusAll(
+														RADIUS_WIDGET,
+													),
+													border = {color = clip_border, width = border},
 												},
-											)
+											) {
+												clay.Text(
+													clip_label,
+													clay.TextElementConfig {
+														textColor = TEXT,
+														fontSize = FONT_HEADING,
+													},
+												)
+											}
+											for tr in 0 ..< kf_n {
+												if clay.UI(
+													clay.ID(
+														"KeyframeLane",
+														u32((ti * 1000 + index) * 1000 + tr),
+													),
+												)(
+													{
+														layout = {
+															sizing = {
+																width = clay.SizingGrow({}),
+																height = clay.SizingFixed(KF_ROW_H),
+															},
+														},
+														border = {
+															color = RULER_TICK_COLOR,
+															width = clay.BorderWidth{top = 1},
+														},
+													},
+												) {}
+											}
 										}
 										clips_content_x += clip_width
 									}
@@ -861,6 +951,35 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	draw_text_input_popup(width, height)
 
 	return clay.EndLayout(0)
+}
+
+// kf_gutter_names collects the distinct keyframe-track names the track-name
+// gutter (KfGutterNames) labels one visible lane each: every clip's tracks in
+// clip order, deduplicated. Capped at `rows` (the row only has room for that
+// many lines); clips keyframing paths others omit still read because each
+// label row is aligned to the same KF_ROW_H lanes above the tiles.
+kf_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
+	n := 0
+	for &c in track.clips {
+		for &t in c.keyframe_tracks {
+			dup := false
+			for i in 0 ..< n {
+				if out[i] == t.name {
+					dup = true
+					break
+				}
+			}
+			if dup {
+				continue
+			}
+			if n >= rows || n >= len(out) {
+				return n
+			}
+			out[n] = t.name
+			n += 1
+		}
+	}
+	return n
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +1141,15 @@ clip_card :: proc() {
 	if !card_open("ClipCard", "Clip") {
 		return
 	}
-	if tr, cl, ok := selected_clip(); !ok {
+	tr, cl, ok := selected_clip()
+	if !ok {
+		// A selected keyframe substitutes for the clip in this card: the
+		// keyframe readout (property, frame, editable value). The clip fields
+		// below are skipped because the two selections never coexist (S3).
+		if kcl, klane, kf, kok := kf_selected(); kok {
+			keyframe_readout(kcl, klane, kf)
+			return
+		}
 		clay.Text(
 			"No clip selected",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
@@ -1250,6 +1377,65 @@ clip_card :: proc() {
 					)
 				}
 			}
+		}
+	}
+}
+
+// keyframe_readout is the "Clip" inspector's keyframe slot, shown in place of
+// the clip fields while a diamond is selected (S3): the property lane's name,
+// the absolute timeline frame the key sits on, and the value field. Fields
+// click-to-edit like the clip properties and commit a kf value edit through
+// edit_commit (S3 already wires the store side; S4 adds drag-move/delete).
+keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
+	panel_caption("Keyframe")
+	name_buf := UI_TEXT_KF_NAME[:]
+	clay.Text(
+		fmt.bprintf(name_buf[:], "%s", cl.keyframe_tracks[lane].name),
+		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
+	)
+	frame_buf := UI_TEXT_KF_FRAME[:]
+	clay.Text(
+		fmt.bprintf(frame_buf[:], "frame %d", cl.timeline_start_frame + i64(kf.frame_off)),
+		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
+	)
+	if clay.UI(clay.ID("KfValRow"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+			layoutDirection = .LeftToRight,
+			childGap = BUTTON_ROW_GAP,
+			childAlignment = {x = .Left, y = .Center},
+		},
+	},
+	) {
+		clay.Text(
+			"Value",
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+		)
+		v_buf := UI_TEXT_KF_VAL[:]
+		v_str := fmt.bprintf(v_buf[:], "%.2f", kf.value)
+		if editing_field == .Kf_Value {
+			v_str = string(edit_chars[:edit_len])
+		}
+		if clay.UI(clay.ID("PropFieldKf"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingFixed(KNOB_VALUE_W), height = clay.SizingFixed(FIELD_H)},
+				childAlignment = {x = .Left, y = .Center},
+				padding = clay.PaddingAll(6),
+			},
+			backgroundColor = editing_field == .Kf_Value ? BUTTON_HOVER : BUTTON,
+			border = {
+				color = editing_field == .Kf_Value ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+				width = clay.BorderOutside(editing_field == .Kf_Value ? 2 : 1),
+			},
+			cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+		},
+		) {
+			clay.Text(
+				v_str,
+				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
+			)
 		}
 	}
 }

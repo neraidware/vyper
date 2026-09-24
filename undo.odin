@@ -263,6 +263,11 @@ undo_restore :: proc(idx: i32) {
 	clear(&selected_set)
 	selected_track = -1
 	selected_index = -1
+	// The keyframe selection is INDEX-keyed to whatever document was live; the
+	// restore has replaced it wholesale, and a keyframe has no stable id to
+	// re-resolve the way clips do — so drop it rather than alias whatever now
+	// sits at the old indices (same rule any delete follows).
+	kf_sel = {}
 	if has_sel {
 		if tr, c, ok := find_clip_by_id(sel_id); ok {
 			selected_track = track_index_of(tr)

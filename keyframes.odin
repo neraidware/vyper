@@ -65,7 +65,18 @@ kf_track_index :: proc(clip: Clip, name: string) -> int {
 // second property mints its own track. The name is cloned here so the live
 // clip owns the string (free_timeline deletes track names; a literal would
 // crash the delete).
+// kf_bump_structure flags that a keyframe sequence has shifted, invalidating
+// any live index-based selection (see kf_structure_gen). Wrap to skip 0 so a
+// full-cycle wrap can't accidentally match a selection made at gen 0.
+kf_bump_structure :: proc() {
+	kf_structure_gen += 1
+	if kf_structure_gen == 0 {
+		kf_structure_gen = 1
+	}
+}
+
 kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32, step: f32 = KF_DEFAULT_STEP_PER_FRAME) {
+	kf_bump_structure()
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
 		append(&clip.keyframe_tracks, Kf_Track {name = strings.clone(name), step = step})
@@ -98,6 +109,7 @@ kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32, step: 
 // kf_del_key removes the key at frame_off from `name`'s track; drops the track
 // once it empties (a track exists <=> it holds a key).
 kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
+	kf_bump_structure()
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
 		return
@@ -256,6 +268,7 @@ kf_split_parts :: proc(left, right: ^Clip, cut: i32) {
 	if len(left.keyframe_tracks) == 0 {
 		return
 	}
+	kf_bump_structure()
 	old := left.keyframe_tracks
 	left.keyframe_tracks = kf_rebuild_tracks(old, 0, cut)
 	right.keyframe_tracks = kf_rebuild_tracks(old, cut, KF_MAX_OFFSET)
@@ -268,6 +281,7 @@ kf_trim_head :: proc(clip: ^Clip, cut: i32) {
 	if len(clip.keyframe_tracks) == 0 {
 		return
 	}
+	kf_bump_structure()
 	old := clip.keyframe_tracks
 	clip.keyframe_tracks = kf_rebuild_tracks(old, cut, KF_MAX_OFFSET)
 	kf_free_tracks(old)
@@ -279,7 +293,22 @@ kf_trim_tail :: proc(clip: ^Clip, keep: i32) {
 	if len(clip.keyframe_tracks) == 0 {
 		return
 	}
+	kf_bump_structure()
 	old := clip.keyframe_tracks
 	clip.keyframe_tracks = kf_rebuild_tracks(old, 0, keep)
 	kf_free_tracks(old)
+}
+
+// kf_rows_for is how many keyframe lanes a track's row shows: the most keyframe
+// tracks any single clip in the track carries, so the row is tall enough for
+// the tallest clip. Clips with fewer tracks leave their own lanes shorter (the
+// wrap is only as tall as it needs) and top-align with the rest of the row.
+kf_rows_for :: proc(track: ^Track) -> int {
+	rows := 0
+	for &c in track.clips {
+		if len(c.keyframe_tracks) > rows {
+			rows = len(c.keyframe_tracks)
+		}
+	}
+	return rows
 }

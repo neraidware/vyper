@@ -4,6 +4,7 @@ import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:strings"
 import "core:sync"
 import sdl "vendor:sdl3"
 
@@ -277,38 +278,69 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		return false
 	},
-	// Clicking an X/Y/Scale/crop property field focuses it for typing.
+	// Clicking an X/Y/Scale/crop property field focuses it for typing;
+	// Shift+click instead adds a keyframe for that property at the playhead.
+	// The track name is minted HERE (the consumer owns the property→name
+	// mapping; the store never interprets it) — see kf_add_prop.
 	proc(inp: Mouse_Input) -> bool {
 		sel, ok := transformable_selected()
 		if !ok {
 			return false
 		}
 		if clay.PointerOver(clay.ID("PropFieldX")) {
-			edit_begin(.X, sel.transform_x)
+			if inp.shift {
+				kf_add_prop(sel, "transform.x", sel.transform_x)
+			} else {
+				edit_begin(.X, sel.transform_x)
+			}
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldY")) {
-			edit_begin(.Y, sel.transform_y)
+			if inp.shift {
+				kf_add_prop(sel, "transform.y", sel.transform_y)
+			} else {
+				edit_begin(.Y, sel.transform_y)
+			}
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldS")) {
-			edit_begin(.Scale, sel.scale)
+			if inp.shift {
+				kf_add_prop(sel, "scale", sel.scale)
+			} else {
+				edit_begin(.Scale, sel.scale)
+			}
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropL")) {
-			edit_begin(.Crop_L, sel.crop_l * 100)
+			if inp.shift {
+				kf_add_prop(sel, "crop.l", sel.crop_l)
+			} else {
+				edit_begin(.Crop_L, sel.crop_l * 100)
+			}
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropR")) {
-			edit_begin(.Crop_R, sel.crop_r * 100)
+			if inp.shift {
+				kf_add_prop(sel, "crop.r", sel.crop_r)
+			} else {
+				edit_begin(.Crop_R, sel.crop_r * 100)
+			}
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropT")) {
-			edit_begin(.Crop_T, sel.crop_t * 100)
+			if inp.shift {
+				kf_add_prop(sel, "crop.t", sel.crop_t)
+			} else {
+				edit_begin(.Crop_T, sel.crop_t * 100)
+			}
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropB")) {
-			edit_begin(.Crop_B, sel.crop_b * 100)
+			if inp.shift {
+				kf_add_prop(sel, "crop.b", sel.crop_b)
+			} else {
+				edit_begin(.Crop_B, sel.crop_b * 100)
+			}
 			return true
 		}
 		return false
@@ -330,8 +362,28 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldGain")) {
-			edit_begin(.Gain, cl.gain)
+			if inp.shift {
+				kf_add_prop(cl, "gain", cl.gain)
+			} else {
+				edit_begin(.Gain, cl.gain)
+			}
 			return true
+		}
+		return false
+	},
+	// Keyframe value field (Clip inspector keyframe readout): focuses for
+	// typing like the clip fields. Targets the KEYFRAME selection, which the
+	// X/Y/Scale/crop and gain handlers above can't see — they resolve
+	// selected_clip(), and the two selections are mutually exclusive.
+	proc(inp: Mouse_Input) -> bool {
+		if !kf_sel.active {
+			return false
+		}
+		if clay.PointerOver(clay.ID("PropFieldKf")) {
+			if _, _, k, ok := kf_selected(); ok {
+				edit_begin(.Kf_Value, k.value)
+				return true
+			}
 		}
 		return false
 	},
@@ -476,6 +528,28 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		return false
 	},
+	// Selecting a keyframe diamond: geometry hit (the diamonds paint in the
+	// post-layout overlay, so no clay element sits under them). Runs before the
+	// clip press below so a diamond can never fall through to a tile drag.
+	// kf_select makes the keyframe the sole selection, dropping any clip set.
+	proc(inp: Mouse_Input) -> bool {
+		if ti, ci, lane, key, ok := kf_key_at(inp.x, inp.y); ok {
+			kf_select(ti, ci, lane, key)
+			// The same press that selects ALSO arms the horizontal move gesture
+			// (S4). A drag is only distinguishable from a click at release, so
+			// arming here with a frame-at-press capture + release-time compare
+			// is the honest shape: a click that never slides commits nothing
+			// (the clip-stutter rule) and the capture doubles as the pre-move
+			// snapshot hook (undo_begin) for the live drag.
+			if _, _, k, kok := kf_selected(); kok {
+				kf_drag_start_frame = k.frame_off
+			}
+			undo_begin()
+			active_interaction = .Keyframe_Move
+			return true
+		}
+		return false
+	},
 	// Find which (if any) clip the pointer is over and start dragging it.
 	// NOTE: this runs ONLY on a fresh press (inp.left && !prev_mouse_down) —
 	// while the button is HELD the drag must follow the cursor past the clip,
@@ -485,6 +559,10 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			track := &timeline.tracks[track_idx]
 			for index := 0; index < len(track.clips); index += 1 {
 				if clay.PointerOver(clay.ID("TimelineClip", u32(track_idx * 1000 + index))) {
+					// Pressing a tile replaces any keyframe selection (S3: the
+					// two are mutually exclusive), both for the plain-click
+					// reselect and for a Shift+click multi-toggle.
+					kf_sel = {}
 					selected_track = track_idx
 					selected_index = index
 					if inp.shift {
@@ -622,6 +700,76 @@ drag_move_in_place :: proc(frame: f32) {
 	}
 }
 
+// update_keyframe_drag follows the pointer while a Keyframe_Move drag is in
+// flight (called every mouse-move while down, like the clip/gain updates). The
+// target frame is derived straight from the pointer against the wrap box — the
+// exact inverse of kf_key_center's cx mapping — so the diamond can never
+// detach from the cursor (no per-frame delta drift), and clamped into the
+// clip's extent.
+update_keyframe_drag :: proc(mx: f32) {
+	if kf_sel.track_idx < 0 || kf_sel.clip_index < 0 {
+		return
+	}
+	cl, _, k, ok := kf_selected()
+	if !ok {
+		return
+	}
+	box :=
+		clay.GetElementData(clay.ID("TimelineClipWrap", u32(kf_sel.track_idx * 1000 + kf_sel.clip_index))).boundingBox
+	if box.width <= 0 {
+		return
+	}
+	k.frame_off = clamp(i32((mx - box.x) / timeline_zoom), 0, i32(cl.source_length_frames))
+}
+
+// commit_keyframe_drag is the Keyframe_Move release path: the frame was applied
+// live during the gesture (the keys array may be transiently out of order), so
+// it captures one undo node (the press already ran undo_begin, so the pre-drag
+// tree is pending) only if the key actually moved. A no-move click reselects and
+// nothing else — no reseek, no reset, no node. The move is normalized as a pure
+// store pair, del(old frame) + set(final frame), so the array comes back sorted
+// and unique from wherever the drag landed; the selection is re-picked by the
+// landed frame because those store ops bumped the structure gen.
+commit_keyframe_drag :: proc() {
+	if !kf_sel.active {
+		kf_drag_start_frame = 0
+		return
+	}
+	cl, lane, k, ok := kf_selected()
+	if !ok {
+		kf_drag_start_frame = 0
+		return
+	}
+	if k.frame_off == kf_drag_start_frame {
+		return
+	}
+	// Capture everything before the store ops — the keys buffer reallocates and
+	// the track can even drop/re-mint, so every pointer or borrowed string held
+	// across the ops would dangle. The name is cloned because del() frees the
+	// track's name string when the last key leaves; set() then re-clones from
+	// our copy instead of freed memory.
+	name := strings.clone(cl.keyframe_tracks[lane].name)
+	defer delete(name)
+	start_off := kf_drag_start_frame
+	final_off := k.frame_off
+	value := k.value
+	kf_del_key(cl, name, start_off)
+	kf_set_key(cl, name, final_off, value)
+	// Re-select the moved key by name + landed frame (the lane index may have
+	// shifted if the track emptied and re-minted), under the fresh gen.
+	fresh_lane := kf_track_index(cl^, name)
+	if fresh_lane >= 0 {
+		fresh := &cl.keyframe_tracks[fresh_lane]
+		for ki in 0 ..< len(fresh.keys) {
+			if fresh.keys[ki].frame_off == final_off {
+				kf_select(kf_sel.track_idx, kf_sel.clip_index, fresh_lane, ki)
+				break
+			}
+		}
+	}
+	undo_push(.Value, "Move keyframe")
+}
+
 // interaction_post_build runs after build_page: the click/press chain and the
 // live drag updates (both hit-test this frame's geometry), plus the jog buttons,
 // the playback-rate dropdown, the help overlay, and right-click context menus.
@@ -738,6 +886,8 @@ interaction_post_build :: proc(
 			if gain_drag_clip != nil && gain_drag_clip.gain != gain_drag_start_db {
 				undo_push(.Value, "Set clip gain")
 			}
+		case .Keyframe_Move:
+			commit_keyframe_drag()
 		}
 		active_interaction = .None
 		dragging_handle = nil
@@ -745,6 +895,7 @@ interaction_post_build :: proc(
 		handle_corner_snapped = false
 		drag_clip = nil
 		gain_drag_clip = nil
+		kf_drag_start_frame = 0
 		drag_source_track = -1
 		drag_source_index = -1
 		drag_hover_track = -1
@@ -854,6 +1005,8 @@ interaction_post_build :: proc(
 			// gesture (play pressed while the knob is held) hears it; the release
 			// commits nothing because the producer's live fold already applied it.
 			audio_geometry_commit()
+		case .Keyframe_Move:
+			update_keyframe_drag(inp.x)
 		case .Clip_Move:
 			if drag_clip != nil {
 				clip_x := inp.x - clip_drag_offset

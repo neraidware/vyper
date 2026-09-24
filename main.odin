@@ -170,12 +170,15 @@ timeline_resize_hover :: proc(mx, my: f32) -> bool {
 
 // timeline_tracks_content_height is the full height of the track list (every
 // track row plus one insert gap above the first and below the last), computed
-// purely from the track count and the fixed geometry constants. The track
-// region scrolls exactly this far, so content and viewport never disagree
-// regardless of layout timing.
+// purely from the track count, each track's keyframe lane count, and the fixed
+// geometry constants. The track region scrolls exactly this far, so content and
+// viewport never disagree regardless of layout timing.
 timeline_tracks_content_height :: proc() -> f32 {
-	n := len(timeline.tracks)
-	return f32(n + 1) * TRACK_GAP_H + f32(n) * TRACK_ROW_H
+	total := f32(len(timeline.tracks) + 1) * TRACK_GAP_H
+	for &t in timeline.tracks {
+		total += TRACK_ROW_H + f32(kf_rows_for(&t)) * KF_ROW_H
+	}
+	return total
 }
 
 // timeline_tracks_max_top returns how far the track list can scroll vertically:
@@ -586,7 +589,8 @@ handle_ctx_option :: proc(mx, my: f32) {
 	close_context_menu()
 }
 
-// select_clip makes (track_idx,index) the sole timeline selection.
+// select_clip makes (track_idx,index) the sole timeline selection. Selecting a
+// clip deselects any keyframe (S3: the two selections are mutually exclusive).
 select_clip :: proc(track_idx, index: int) {
 	if track_idx < 0 || track_idx >= len(timeline.tracks) {
 		return
@@ -594,10 +598,95 @@ select_clip :: proc(track_idx, index: int) {
 	if index < 0 || index >= len(timeline.tracks[track_idx].clips) {
 		return
 	}
+	kf_sel = {}
 	selected_track = track_idx
 	selected_index = index
 	clear(&selected_set)
 	selected_set[timeline.tracks[track_idx].clips[index].clip_id] = true
+}
+
+// kf_select makes (track_idx,clip_index,lane,key) the sole keyframe selection,
+// which deselects the clip selection (the two never coexist, S3).
+kf_select :: proc(track_idx, clip_index, lane, key: int) {
+	kf_sel.active = true
+	kf_sel.track_idx = track_idx
+	kf_sel.clip_index = clip_index
+	kf_sel.lane = lane
+	kf_sel.key = key
+	kf_sel.gen = kf_structure_gen
+	selected_track = -1
+	selected_index = -1
+	clear(&selected_set)
+}
+
+kf_clear :: proc() {
+	kf_sel = {}
+}
+
+// kf_add_prop records a new key on `clip` for track-name `name` at the playhead
+// (clip-relative, clamped into the clip's extent) with the property's current
+// resting value. Discrete edit on the undo seam. Minting the track name is the
+// CONSUMER's job — the store never interprets what `name` means, so the caller
+// chooses it because it owns the property→name mapping (interaction.odin's
+// field handlers).
+kf_add_prop :: proc(clip: ^Clip, name: string, value: f32) {
+	off := clamp(i32(playhead.frame - clip.timeline_start_frame), 0, i32(clip.source_length_frames))
+	undo_begin()
+	kf_set_key(clip, name, off, value)
+	undo_push(.Value, "Add keyframe")
+}
+
+// delete_selected_keyframe removes the selected keyframe as one undoable
+// discrete edit; returns false when no keyframe is selected so callers fall
+// through to their clip-delete path. A stale selection (structure gen drifted)
+// resolves to "gone" and is just dropped, never aliased.
+delete_selected_keyframe :: proc() -> bool {
+	if !kf_sel.active {
+		return false
+	}
+	cl, lane, k, ok := kf_selected()
+	if !ok {
+		kf_clear()
+		return true
+	}
+	name := cl.keyframe_tracks[lane].name
+	frame := k.frame_off
+	undo_begin()
+	kf_del_key(cl, name, frame)
+	kf_sel = {}
+	undo_push(.Value, "Delete keyframe")
+	return true
+}
+
+// kf_selected resolves the keyframe selection against the LIVE timeline, or
+// reports false when nothing is selected or the indices have gone stale (clip
+// deleted, track removed, lane dropped). The stale case must read as "no
+// selection" — never alias what now lives at the old indices.
+kf_selected :: proc() -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
+	if !kf_sel.active {
+		return nil, -1, nil, false
+	}
+	// A keyframe sequence shift (kf_structure_gen bumped by set/del/split/trim)
+	// invalidates the whole index selection: slots may have been reused.
+	if kf_sel.gen != kf_structure_gen {
+		return nil, -1, nil, false
+	}
+	if kf_sel.track_idx < 0 || kf_sel.track_idx >= len(timeline.tracks) {
+		return nil, -1, nil, false
+	}
+	trn := &timeline.tracks[kf_sel.track_idx]
+	if kf_sel.clip_index < 0 || kf_sel.clip_index >= len(trn.clips) {
+		return nil, -1, nil, false
+	}
+	clip := &trn.clips[kf_sel.clip_index]
+	if kf_sel.lane < 0 || kf_sel.lane >= len(clip.keyframe_tracks) {
+		return nil, -1, nil, false
+	}
+	trk := &clip.keyframe_tracks[kf_sel.lane]
+	if kf_sel.key < 0 || kf_sel.key >= len(trk.keys) {
+		return nil, -1, nil, false
+	}
+	return clip, kf_sel.lane, &trk.keys[kf_sel.key], true
 }
 
 // clip_under_pointer returns the (track_idx, index) of the clip currently under
@@ -611,6 +700,37 @@ clip_under_pointer :: proc() -> (int, int) {
 		}
 	}
 	return -1, -1
+}
+
+// kf_key_at hit-tests the pointer against every keyframe diamond on the live
+// timeline (geometry, not clay: the diamonds paint in the post-layout overlay
+// pass, so no element exists under them to PointerOver-test). Returns the
+// reselect target (track, clip, lane, key indices) for the FIRST hit, or
+// ok=false. Uses the same kf_key_center geometry draw_keyframes paints with,
+// so the pickable spot IS the painted diamond — a key clamped at a trimmed
+// edge stays pickable exactly where it paints.
+kf_key_at :: proc(mx, my: f32) -> (track_idx, clip_index, lane, key: int, ok: bool) {
+	for track, ti in timeline.tracks {
+		for clip, ci in track.clips {
+			if len(clip.keyframe_tracks) == 0 {
+				continue
+			}
+			box :=
+				clay.GetElementData(clay.ID("TimelineClipWrap", u32(ti * 1000 + ci))).boundingBox
+			if box.width <= 0 || box.height <= 0 {
+				continue
+			}
+			for tr in 0 ..< len(clip.keyframe_tracks) {
+				for k, ki in clip.keyframe_tracks[tr].keys {
+					cx, cy := kf_key_center(box, tr, k.frame_off)
+					if abs(mx - cx) <= KF_HIT_MARGIN && abs(my - cy) <= KF_HIT_MARGIN {
+						return ti, ci, tr, ki, true
+					}
+				}
+			}
+		}
+	}
+	return -1, -1, -1, -1, false
 }
 
 // open_clip_context_menu opens the right-click menu anchored at (mx,my) for the

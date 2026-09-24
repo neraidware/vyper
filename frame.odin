@@ -136,6 +136,7 @@ render_ui_frame :: proc(
 		render_clay(renderer, command_buffer, pass, commands, OVERLAY_ABOVE_PREVIEW_Z, max(i16))
 		draw_text_input_caret(renderer, command_buffer, pass)
 		draw_clip_markers(renderer, command_buffer, pass)
+		draw_keyframes(renderer, command_buffer, pass)
 		draw_timeline_resize_focus(renderer, command_buffer, pass)
 		draw_drag_ghost(renderer, command_buffer, pass)
 		draw_track_drag_ghost(renderer, command_buffer, pass)

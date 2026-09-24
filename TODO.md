@@ -259,6 +259,16 @@ is wired into playback/preview yet; that is a follow-up.
   free_timeline free what they replace. Untouched/edit sites keep the shared
   marker-style convention.
 
+**Clip transform semantics (for the wiring follow-up):**
+- `scale` is relative to the clip's **original source proportions**, not to
+  the canvas. A clip at scale 1 keeps its native aspect box; scaling up from
+  there never fights where it sits on the canvas (today it's canvas-relative,
+  so the same value letterboxes differently per project resolution).
+- New `zoom` property: upscales **only the clip's content, never the bounding
+  box** — a magnification at the same box, so a camera-style zoom stays fluid
+  (no box/layout math during the move). Distinct from `scale` (box) and `crop`
+  (insets the edges): zoom keeps the box and the aspect untouched.
+
 **Timeline UI (the "keyframe timelines"):**
 - Keyframes render in a **dedicated row below their assigned clip**, spanning the
   clip's extent. "Piano sheet" per-value lines: each keyframed value gets its
@@ -294,25 +304,56 @@ is wired into playback/preview yet; that is a follow-up.
   duplicates, delete paths, clone/free.
 
 **Steps** (each lands + probe + vet before the next):
-- [ ] S1. Data model: `Keyframe` / `Kf_Track` (name-opaque) /
-      `Clip.keyframe_tracks` + store helpers (set/del/sample);
+- [x] S1. Data model: `Keyframe` / `Kf_Track` (name-opaque) /
+      `Clip.keyframe_tracks` + store helpers, incl. the move-toward eval
+      (`kf_sample` / `kf_sample_for`) with step semantics pinned by probe;
       `clone_timeline`/`free_timeline`, duplicates, delete paths, and the
-      split/trim remaps all own keyframes; `VYPER_KEYFRAME_PROBE`. Probe:
-      insert/sort/replace, move-toward samples (default + track step), split
-      remap offsets, clone round-trip, zero-value `Clip{}` safe.
-- [ ] S2. Evaluation wiring: `kf_sample_for` into a consumer (step semantics
-      already pinned by probe).
-- [ ] S3. Render: growable track-row height + gutter property labels + diamond
-      draw (45° rect, 1 px border, neutral fill, light when selected).
-- [ ] S4. Selection + inspector: exclusive keyframe/clip selection; keyframe
-      value field.
-- [ ] S5. Interaction: Shift+click property input adds key; drag diamond to move;
-      Delete removes; undo commits. Probes: add/move/delete round-trip, exclusive
-      selection transitions, no-op drag leaves state untouched.
-- [ ] ACCEPT: Shift+click adds a row under the clip showing the diamond; dragging
+      split/trim remaps all own keyframes; `VYPER_KEYFRAME_PROBE` green.
+      (No property wired into playback/preview anywhere — decision #3 holds
+      for the whole slice; the row itself is the demo.)
+- [x] S2. Render: growable track-row height + gutter property labels + diamond
+      draw (45° rect, 1 px border, neutral fill, light when selected). Row grows
+      per `KF_ROW_H` lane (a clip's keyframe tracks), clip tile is wrapped so
+      it grows DOWNWARD with one lane per track, gutter stacks a label line per
+      lane, `timeline_tracks_content_height` sums per-track lanes, diamonds are
+      the rotated-SDF overlay `draw_keyframes` (scissored per track), and
+      `VYPER_UI_PROBE` seeds a two-track keyframed clip and asserts the grown
+      row/tile/gutter geometry. Selected-fill color (KF_DIAMOND_FILL_SELECTED)
+      is defined but the light state lands with the S3 selection.
+- [x] S3. Selection + inspector: exclusive keyframe/clip selection; keyframe
+      value field. `Keyframe_Selection` (state.odin) is index-keyed to the
+      live tree with a `kf_structure_gen` guard (bumped by set/del/split/trim)
+      so a shifted key can never alias a reused slot; `kf_select` clears the
+      clip selection, `select_clip`/clip-press clear the keyframe, `kf_selected`
+      bounds+gen-checks every resolve. Click hit-tests diamonds via the shared
+      `kf_key_center` geometry (`draw_keyframes` and the hit-test use one
+      source of truth), and the Clip inspector swaps to a keyframe readout
+      (prop name, absolute frame, editable value field) while a diamond is
+      selected — value edits commit through `edit_commit` as a `.Value` undo
+      node. `undo_restore`/media import drop the selection (indices can't
+      survive a wholesale tree swap). Verified by `VYPER_UNDO_PROBE` (S3
+      section: exclusivity both ways, value-edit add/undo/redo, gen
+      invalidation) — probes + `-vet` green.
+- [x] S4. Interaction: Shift+click property input adds key; drag diamond to move;
+      Delete removes; undo commits. Add = `kf_add_prop` (main.odin): minting the
+      track name is the CONSUMER's job — the X/Y/Scale/crop/gain field handlers
+      Shift+click into `kf_add_prop(sel, "transform.x"..., value)` and it records
+      the field's current value at the playhead (clip-relative, clamped), as one
+      `.Value` node. Diamond drag = new `Interaction.Keyframe_Move`: the same
+      press that selects (S3) arms it, `update_keyframe_drag` slides the key with
+      the pointer (frame derived straight from the wrap box — the exact inverse
+      of `kf_key_center`'s cx mapping, so the diamond never detaches), and
+      `commit_keyframe_drag` on release commits only when the frame actually
+      moved — normalized as a pure store pair del(old)+set(new) so the track
+      stays sorted and unique from wherever the drag landed (the no-move click
+      reselects and leaves state untouched — the clip-stutter rule). Backspace/
+      Delete hit `delete_selected_keyframe()` when a diamond is selected, else
+      fall through to the clip delete. Verified by `VYPER_UNDO_PROBE` (S4
+      section: add/move/delete round-trips, move-is-a-move not a copy, no-op
+      drag off the undo trail, delete fallthrough) — probes + `-vet` green.
+- [x] ACCEPT: Shift+click adds a row under the clip showing the diamond; dragging
       moves it; selection flips between clip and keyframe exclusively; all edits
-      clean on undo/redo; probes + `-vet` green. (No property wired yet — the
-      row itself is the demo.)
+      clean on undo/redo; probes + `-vet` green.
 
 ## Queued — Performance / Cleanup
 

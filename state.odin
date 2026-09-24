@@ -40,6 +40,10 @@ SWITCH_TRACK_ON :: clay.Color{66, 80, 71, 255} // bg_green — muted green switc
 AUDIO_CLIP :: clay.Color{84, 58, 72, 255} // bg_visual — muted purple clip fill
 SELECT_BORDER :: clay.Color{127, 187, 179, 255} // blue — selection
 MARKER_COLOR :: clay.Color{219, 188, 127, 255} // yellow — clip markers
+// Keyframe diamond fills: neutral by default, light (fg) when selected. The
+// selected state lands with the keyframe selection slice.
+KF_DIAMOND_FILL :: clay.Color{79, 88, 94, 255} // bg4 — neutral keyframe diamond fill
+KF_DIAMOND_FILL_SELECTED :: clay.Color{211, 198, 170, 255} // fg — light when selected
 TOOLTIP_BG :: clay.Color{61, 72, 77, 255} // bg2 — popup/tooltip surface
 TOOLTIP_TEXT :: clay.Color{211, 198, 170, 255} // fg
 RANGE_COLOR :: clay.Color{167, 192, 128, 255} // green — active range chevrons
@@ -490,6 +494,33 @@ selected_index: int = -1
 // link/unlink a deliberate multi-clip set with U.
 selected_set: map[u64]bool
 
+// Keyframe selection (S3): one keyframe on the live timeline, resolved by
+// indices (not pointers) so dynamic-array reallocations can't dangle it. It is
+// MUTUALLY EXCLUSIVE with the clip selection above — selecting a keyframe
+// clears selected_track/selected_index/selected_set, and every clip-selection
+// path clears this. Indices go stale the moment the structure moves, so every
+// resolve re-bounds-checks against the live tree; a stale selection reads as
+// "nothing selected" (kf_selected) rather than aliasing a burned slot.
+Keyframe_Selection :: struct {
+	active:     bool,
+	track_idx:  int, // storage track index
+	clip_index: int, // clip within that track
+	lane:       int, // into the clip's keyframe_tracks
+	key:        int, // into the lane's keys
+	gen:        u32, // kf_structure_gen when the selection was made
+}
+kf_sel: Keyframe_Selection // zero value = nothing selected
+
+// kf_structure_gen increments whenever a keyframe SEQUENCE can shift: a key
+// inserted or deleted (kf_set_key/kf_del_key) or a lane remapped (split/trim).
+// Index-based keyframe selections record the gen they were made under and
+// refuse to resolve once it drifts — a deleted key's slot can silently be
+// reused by the next key, so without the gen a stale selection would alias a
+// key that slid into the old index (AGENTS: never let an old handle alias a
+// reused slot). On gen mismatch kf_selected reports "nothing selected", and
+// the user re-picks the diamond.
+kf_structure_gen: u32
+
 // Transform dragging: moving the selected clip around within the preview.
 preview_drag_offset_x: f32
 preview_drag_offset_y: f32
@@ -506,6 +537,7 @@ Edit_Field :: enum {
 	Crop_T,
 	Crop_B,
 	Gain,
+	Kf_Value, // selected keyframe's value (Clip inspector keyframe readout)
 }
 
 editing_field: Edit_Field
@@ -775,6 +807,7 @@ Interaction :: enum {
 	Handle_Drag,   // dragging a preview resize/crop handle
 	Track_Drag,    // dragging a whole track onto an insert gap (reorder)
 	Gain_Drag,     // dragging an audio clip's gain knob in the inspector
+	Keyframe_Move, // dragging a keyframe diamond horizontally in its lane
 }
 
 // Gain knob constants. Gain is edited in decibels; the knob sweeps the
@@ -794,6 +827,11 @@ GAIN_COARSE_PX_PER_STEP :: 10
 gain_drag_clip: ^Clip
 gain_drag_start_x: f32
 gain_drag_start_db: f32
+// kf_drag_start_frame captures the selected key's frame_off at diamond press,
+// so the release-time compare decides whether the gesture actually moved it (a
+// no-move click commits nothing — the clip-stutter rule). Meaningful only while
+// active_interaction == .Keyframe_Move.
+kf_drag_start_frame: i32
 dragging_handle: Maybe(Handle)
 handle_kind: Handle_Kind = .None
 handle_start_mx: f32

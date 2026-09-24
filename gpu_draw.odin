@@ -671,6 +671,105 @@ draw_clip_markers :: proc(
 	}
 }
 
+// kf_key_center maps a key to its diamond's center on screen from the clip wrap
+// box. Single source of truth for the diamond geometry, shared by draw_keyframes
+// and the click hit-test (interaction.odin) so the pickable spot always lines up
+// with the painted diamond. Lane tr hugs the tile's bottom edge (ui.odin keys
+// KeyframeLane by tr below the fixed-height tile), so y derives from the box and
+// the LANE ELEMENT's layout; cx clamps to the wrap so a key that drifted past a
+// trimmed edge paints at the edge rather than outside the row.
+kf_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32, f32) {
+	cy := box.y + CLIP_TILE_HEIGHT + (f32(lane) + 0.5) * KF_ROW_H
+	cx := clamp(
+		box.x + f32(frame_off) * timeline_zoom,
+		box.x + KF_DIAMOND_R,
+		box.x + box.width - KF_DIAMOND_R,
+	)
+	return cx, cy
+}
+
+// diamond_at paints one keyframe diamond centered on (cx, cy); selected uses
+// the light fill so the keyframe cursor reads against the neutral rest state.
+diamond_at :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+	cx, cy: f32,
+	fill: clay.Color,
+) {
+	render_sdf_rect(
+		renderer,
+		command_buffer,
+		pass,
+		clay.BoundingBox {
+			x = cx - KF_DIAMOND_R,
+			y = cy - KF_DIAMOND_R,
+			width = KF_DIAMOND_R * 2,
+			height = KF_DIAMOND_R * 2,
+		},
+		fill,
+		KF_DIAMOND_CORNER,
+		KF_DIAMOND_BORDER,
+		rotation = KF_DIAMOND_ROT,
+	)
+}
+
+// draw_keyframes paints each keyframed clip's diamond lane rows below its tile:
+// one lane per keyframe track (the KeyframeLane elements in ui.odin), diamonds
+// centered on the lane at the key's clip-relative frame. A diamond is the
+// 45°-rotated rect SDF — the same rotation path the gain knob's needle uses.
+// Overlay after the Clay batch because the wrapper's box only exists via
+// GetElementData, and scissored per track so a key that drifted past a trimmed
+// edge can never overpaint the gutter or a neighboring row.
+draw_keyframes :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
+	if len(timeline.tracks) == 0 {
+		return
+	}
+	for track, track_idx in timeline.tracks {
+		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
+		if lane.width <= 0 || lane.height <= 0 {
+			continue
+		}
+		sdl.SetGPUScissor(
+			pass,
+			sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+		)
+		for clip, index in track.clips {
+			rows := len(clip.keyframe_tracks)
+			if rows == 0 {
+				continue
+			}
+			box :=
+				clay.GetElementData(clay.ID("TimelineClipWrap", u32(track_idx * 1000 + index))).boundingBox
+			if box.width <= 0 || box.height <= 0 {
+				continue
+			}
+			for tr in 0 ..< rows {
+				for k, k_idx in clip.keyframe_tracks[tr].keys {
+					cx, cy := kf_key_center(box, tr, k.frame_off)
+					fill := KF_DIAMOND_FILL
+					if kf_sel.active &&
+					   kf_sel.track_idx == track_idx &&
+					   kf_sel.clip_index == index &&
+					   kf_sel.lane == tr &&
+					   kf_sel.key == k_idx {
+						fill = KF_DIAMOND_FILL_SELECTED
+					}
+					diamond_at(renderer, command_buffer, pass, cx, cy, fill)
+				}
+			}
+		}
+		sdl.SetGPUScissor(
+			pass,
+			sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+		)
+	}
+}
+
 // draw_drag_ghost paints the translucent drop preview for a clip being dragged
 // onto another track: a ghost tile in the hovered lane at the nearest
 // non-overlapping slot. Same width as the dragged clip, positioned from

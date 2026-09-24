@@ -131,7 +131,8 @@ handle_sdl_events :: proc(running: ^bool) {
 					// unlinks its group; several Shift+clicked clips join into
 					// one link group (or all split apart when already linked).
 					toggle_links_for_selection()
-				case sdl.K_BACKSPACE:
+case sdl.K_BACKSPACE:
+				if !delete_selected_keyframe() {
 					// Delete the selected clip's timeline area and close the
 					// gap (ripple). A linked clip rips the WHOLE group: every
 					// member's own span on its own track, so a ripple cut
@@ -144,9 +145,12 @@ handle_sdl_events :: proc(running: ^bool) {
 							ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
 						}
 					}
-				case sdl.K_DELETE:
+				}
+			case sdl.K_DELETE:
+				if !delete_selected_keyframe() {
 					// Delete the clip raw, nothing else.
 					delete_selected_clip_raw()
+				}
 				case sdl.K_I:
 					// Set the render-range start at the playhead; collapsing the
 					// range to a single frame clears it.

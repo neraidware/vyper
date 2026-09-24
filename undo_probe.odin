@@ -189,6 +189,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	)
 	undo_redo()
 	rcheck(timeline.tracks[0].clips[0].transform_x == 250, "redo restores transform", fail)
+
 	// undo/redo both re-adopted the timeline above; selection must survive the
 	// restore by clip_id (indices shift), not get wiped.
 	rcheck(
@@ -198,6 +199,200 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 		"selection survives undo/redo",
 		fail,
 	)
+
+	// --- S3: keyframe selection + value edit ---------------------------------
+	// Exclusivity both ways, live-resolve, a value field committing through
+	// undo, and the structure-gen guard against an index selection silently
+	// aliasing a key that slid into its slot. Runs AFTER the selection check
+	// above because it ends with the keyframe selected (the two never coexist).
+	undo_init()
+	clip0 := &timeline.tracks[0].clips[0]
+	kf_set_key(clip0, "transform.x", 5, 100.0)
+	kf_set_key(clip0, "transform.x", 20, 50.0)
+	selected_track = 0
+	selected_index = 0
+	kf_select(0, 0, 0, 0)
+	rcheck(
+		selected_track == -1 && selected_index == -1 && len(selected_set) == 0,
+		"keyframe selection clears the clip selection",
+		fail,
+	)
+	rcheck(
+		kf_sel.active && kf_sel.track_idx == 0 &&
+			kf_sel.clip_index == 0 && kf_sel.lane == 0 && kf_sel.key == 0,
+		"keyframe selection recorded",
+		fail,
+	)
+	if kcl, klane, k, kok := kf_selected(); kok {
+		rcheck(
+			kcl == clip0 && klane == 0 && k.frame_off == 5 && k.value == 100.0,
+			"kf_selected resolves the picked key",
+			fail,
+		)
+	} else {
+		rcheck(false, "kf_selected must resolve a live selection", fail)
+	}
+	// Back the other way: selecting a clip drops the keyframe.
+	select_clip(0, 0)
+	rcheck(!kf_sel.active, "select_clip drops the keyframe selection", fail)
+
+	// A keyframe value edit commits through undo like a numeric field.
+	kf_select(0, 0, 0, 0)
+	editing_field = .Kf_Value
+	edit_chars[0] = '4'
+	edit_chars[1] = '2'
+	edit_len = 2
+	edit_commit()
+	rcheck(undo_count() == 1, "keyframe value edit adds one node", fail)
+	rcheck(
+		clip0.keyframe_tracks[0].keys[0].value == 42.0,
+		"keyframe value edit applied",
+		fail,
+	)
+	undo_undo()
+	// undo_restore replaced the timeline wholesale; re-resolve the clip before
+	// touching it (the captured pointer dangles into the freed tree).
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(
+		clip0.keyframe_tracks[0].keys[0].value == 100.0,
+		"undo restores pre-edit keyframe value",
+		fail,
+	)
+	rcheck(!kf_sel.active, "undo restore drops the keyframe selection (indices don't survive)", fail)
+	undo_redo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(
+		clip0.keyframe_tracks[0].keys[0].value == 42.0,
+		"redo restores edited keyframe value",
+		fail,
+	)
+
+	// A store edit that slides keys must invalidate the selection: inserting a
+	// key before the picked one moves the picked key's slot, so resolving the
+	// OLD indices would alias the newly inserted key.
+	kf_select(0, 0, 0, 0)
+	kf_set_key(clip0, "transform.x", 1, 60.0)
+	_, _, _, stale_ok := kf_selected()
+	rcheck(!stale_ok, "insert before the selected key kills the selection (structure gen)", fail)
+
+	// --- S4: add / move / delete round-trips + the no-op click --------------
+	// Shift+click (kf_add_prop) mints a row at the playhead with the field's
+	// value; a diamond drag commits ONE move node only when the key actually
+	// slid (the no-move click leaves state untouched — the clip-stutter rule);
+	// Delete drops the key and, with it, the now-empty track's row. Fresh base
+	// first; the timeline survives from the sections above (clip 0 at start
+	// frame 10, length 50, one transform.x track from S3).
+	undo_init()
+	kf_clear()
+	select_clip(0, 0)
+	// The earlier m2 test left the clip parked at start 99; pin it back to the
+	// canonical 10 for this section so the playhead math below is exact.
+	clip0 = &timeline.tracks[0].clips[0]
+	clip0.timeline_start_frame = 10
+	playhead.frame = 15 // clip-relative 5
+	kf_add_prop(clip0, "scale", 1.0)
+	rcheck(undo_count() == 1, "add keyframe adds one node", fail)
+	rcheck(
+		selected_track == 0 && selected_index == 0,
+		"add keyframe leaves the clip selection alone",
+		fail,
+	)
+	rcheck(
+		len(clip0.keyframe_tracks) == 2 &&
+			clip0.keyframe_tracks[1].name == "scale" &&
+			len(clip0.keyframe_tracks[1].keys) == 1 &&
+			clip0.keyframe_tracks[1].keys[0].frame_off == 5 &&
+			clip0.keyframe_tracks[1].keys[0].value == 1.0,
+		"add keyframe lands at the playhead with the field value (row minted on first key)",
+		fail,
+	)
+	undo_undo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(len(clip0.keyframe_tracks) == 1, "undo removes the added key's track", fail)
+	undo_redo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(
+		len(clip0.keyframe_tracks) == 2 && clip0.keyframe_tracks[1].keys[0].frame_off == 5,
+		"redo restores the added key",
+		fail,
+	)
+
+	// A diamond drag: the press captures the frame, the live update slides the
+	// key, and the release commits one node only when the frame changed. The
+	// frame math (pointer vs wrap-box) needs the layout, so the probe drives
+	// the update's mutation directly and exercises the commit path.
+	kf_select(0, 0, 1, 0)
+	rcheck(kf_sel.active, "drag press selects the key", fail)
+	undo_begin()
+	if _, _, k, kok := kf_selected(); kok {
+		kf_drag_start_frame = k.frame_off // press
+		k.frame_off += 7                  // the per-frame update applied 7 frames
+		commit_keyframe_drag()            // release
+	}
+	rcheck(undo_count() == 2, "move keyframe adds one node", fail)
+	rcheck(
+		kf_sel.active && kf_sel.gen == kf_structure_gen,
+		"moved key re-selected under the fresh structure gen",
+		fail,
+	)
+	if _, _, k, kok := kf_selected(); kok {
+		rcheck(
+			k.frame_off == 12 && k.value == 1.0,
+			"move lands at the dragged frame with the value intact",
+			fail,
+		)
+	}
+	if _, lane, _, _ := kf_selected(); lane >= 0 {
+		keys := &clip0.keyframe_tracks[lane].keys
+		rcheck(
+			len(keys^) == 1,
+			"move is a move, not a copy (old frame is not left behind)",
+			fail,
+		)
+		sorted := true
+		for ki in 1 ..< len(keys^) {
+			sorted &= keys^[ki-1].frame_off < keys^[ki].frame_off
+		}
+		rcheck(sorted, "move keeps the track sorted and frame-unique", fail)
+	}
+	undo_undo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(clip0.keyframe_tracks[1].keys[0].frame_off == 5, "undo restores the pre-move frame", fail)
+	undo_redo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(clip0.keyframe_tracks[1].keys[0].frame_off == 12, "redo restores the dragged frame", fail)
+
+	// A click that never slides must not reseek/reset anything: no undo node,
+	// the selection kept. undo_restore dropped the gen when it rebuilt the tree,
+	// so re-select the key first (a real release always has kf_selected live).
+	kf_select(0, 0, 1, 0)
+	undo_begin()
+	if _, _, k, kok := kf_selected(); kok {
+		kf_drag_start_frame = k.frame_off // the update ran at the same position
+		commit_keyframe_drag()
+	}
+	rcheck(undo_count() == 2, "no-move click commits nothing", fail)
+	rcheck(kf_sel.active, "no-move click keeps the selection", fail)
+
+	// Delete: the selected key and its now-empty track drop as one node.
+	kf_select(0, 0, 1, 0)
+	del_ok := delete_selected_keyframe()
+	rcheck(del_ok, "delete_selected_keyframe fires with a keyframe selected", fail)
+	rcheck(undo_count() == 3, "delete adds one node", fail)
+	rcheck(!kf_sel.active, "delete drops the keyframe selection", fail)
+	rcheck(len(clip0.keyframe_tracks) == 1, "track drops with its last key (row goes away)", fail)
+	undo_undo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(
+		len(clip0.keyframe_tracks) == 2 && clip0.keyframe_tracks[1].keys[0].frame_off == 12,
+		"undo restores the deleted key",
+		fail,
+	)
+	undo_redo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(len(clip0.keyframe_tracks) == 1, "redo removes it again", fail)
+	// With no keyframe selected the same key must reach the clip path.
+	rcheck(!delete_selected_keyframe(), "delete with no keyframe selected falls through to the clip path", fail)
 }
 
 // handle_undo_probe runs the probe when VYPER_UNDO_PROBE is set (headless; runs
