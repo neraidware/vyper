@@ -1212,6 +1212,9 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if kp, _ := os.lookup_env_alloc("VYPER_KEYFRAME_PROBE", context.temp_allocator); kp != "" {
 		os.exit(keyframe_probe_run())
 	}
+	if rkp, _ := os.lookup_env_alloc("VYPER_RENDER_KF_PROBE", context.temp_allocator); rkp != "" {
+		os.exit(render_kf_probe_run())
+	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.
