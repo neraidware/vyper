@@ -184,6 +184,62 @@ prewarm_next_clip :: proc() {
 	warm_valid = true
 }
 
+// slot_claim_flush_peer finds the slot a NEWLY-covering video clip should
+// inherit: the in_use slot of a flush same-asset neighbor that just left the
+// playhead this frame. A split produces two halves of one source, adjacent
+// (half_end == other_start) and source-contiguous; when the playhead crosses
+// the cut, the departing half's slot is STILL in_use (swept only at the end of
+// update_preview_slots), so the entering half would otherwise cold-claim a
+// fresh slot -- reset+reopen+keyframe-seek, blanking has_frame for the whole
+// async round-trip: the split flash. Claiming the partner's slot instead makes
+// the reassignment block's same_asset path fire (slot.dec preserved) and lets
+// this slot's async worker -- already open on the same file at the frame just
+// before the cut -- serve the entering half's first frame instantly.
+//
+// Direction-agnostic: covers the playhead moving forward (entering clip starts
+// where the departing clip ends) and reverse (entering clip ends where the
+// departing clip starts), so scrubbing back and forth across a cut inherits
+// the partner's slot every time, never cold-claiming.
+slot_claim_flush_peer :: proc(clip: ^Clip, claimed: [MAX_PREVIEW_SLOTS]bool) -> int {
+	if clip == nil || clip.path == nil || clip.kind != .Video {
+		return -1
+	}
+	for s in 0 ..< MAX_PREVIEW_SLOTS {
+		slot := &preview_slots[s]
+		if !slot.in_use || claimed[s] {
+			continue
+		}
+		if slot.path == nil || slot.path != clip.path {
+			continue
+		}
+		peer := slot_clip_with_id(slot.clip_id)
+		if peer == nil || peer.kind != .Video || peer.is_still || peer.path != clip.path {
+			continue
+		}
+		peer_end := peer.timeline_start_frame + peer.source_length_frames
+		peer_src_end := peer.source_start_frame + peer.source_length_frames
+		clip_end := clip.timeline_start_frame + clip.source_length_frames
+		clip_src_end := clip.source_start_frame + clip.source_length_frames
+		forward :=
+			peer_end == clip.timeline_start_frame &&
+			peer_src_end == clip.source_start_frame
+		reverse :=
+			clip_end == peer.timeline_start_frame &&
+			clip_src_end == peer.source_start_frame
+		if !forward && !reverse {
+			continue
+		}
+		// The peer must be on the OTHER side of the playhead's frame -- if it
+		// still covers the playhead it is a live clip, not a departing half.
+		frame := playhead.frame
+		if frame >= peer.timeline_start_frame && frame < peer_end {
+			continue
+		}
+		return s
+	}
+	return -1
+}
+
 // pick_hash_u32 fingerprints a proxy pick path (a cstring resolving to a
 // segment file, the source, or nil when preview proxy is disabled) so the
 // idle-skip in update_preview_slots can tell "same frame, better file".
@@ -240,9 +296,25 @@ update_preview_slots :: proc() -> bool {
 				}
 			}
 			if slot_idx < 0 {
-				// Fresh clip: claim the lowest free slot. Its decoder is reset by
-				// the reassignment block below; the texture behind that index is
-				// the renderer's shared per-index preview texture.
+				// Fresh clip at a flush same-asset boundary (split halves,
+				// duplicates): claim the departing partner's still-in_use slot
+				// instead of a free slot. The partner half just left the playhead
+				// THIS frame -- it's on the other side of the cut -- so its slot
+				// is still in_use (the sweep runs after the walk, line 724).
+				// Claiming it lets the reassignment block's same_asset path fire:
+				// the decoder stays open and both the RAM cache and this slot's
+				// async worker are positioned one frame back from the cut, so the
+				// entering half advances one frame instead of cold-reopening and
+				// keyframe-seeking (which blanked has_frame -- the split flash).
+				// Without this, both halves cold-claim at EVERY crossing of the
+				// cut: the split flash -- forward pass blanks the entering half,
+				// and scrubbing back across it blanks the OTHER half.
+				slot_idx = slot_claim_flush_peer(clip, claimed)
+			}
+			if slot_idx < 0 {
+				// Genuinely fresh clip: claim the lowest free slot. Its decoder
+				// is reset by the reassignment block below; the texture behind
+				// that index is the renderer's shared per-index preview texture.
 				for s in 0 ..< MAX_PREVIEW_SLOTS {
 					if !preview_slots[s].in_use {
 						slot_idx = s
@@ -318,7 +390,17 @@ update_preview_slots :: proc() -> bool {
 					warm_clip_id = 0
 				}
 				if warm_hit {
-					slot.prime_from_warm = true
+					slot.prime_sync = true
+				} else if same_asset {
+					// Same-asset flush (split halves/duplicates): the preserved
+					// decoder is positioned one frame back from the cut, so the
+					// entering half's first frame is a single forward step. Prime
+					// it synchronously like a warm handoff -- otherwise the async
+					// worker serves its PREVIOUS completed decode (the OUTGOING
+					// half's boundary frame, matched on path alone, rejected by the
+					// window check below) and the slot holds a blank while the
+					// worker re-seeks: the black flash.
+					slot.prime_sync = true
 				}
 				slot.in_use = true
 				slot.clip_id = clip.clip_id
@@ -341,6 +423,11 @@ update_preview_slots :: proc() -> bool {
 					)
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
+				// The reassign zeroed the slot (slot^ = {}), wiping the layer the
+				// walk just assigned; restore it so this update draws the slot at
+				// its real stack depth instead of layer 0 (the transient the
+				// pre-fix recorder logged).
+				slot.layer = layer
 			}
 			// A position/source shift invalidates the slot's decoded buffer; it
 			// is cleared below and the exact playhead frame requested next update
@@ -388,7 +475,7 @@ update_preview_slots :: proc() -> bool {
 					// slot's stale frame when ITS clip moved; skipping it here
 					// is required or a warm decoder handed off by prewarm (for
 					// exactly this clip, keeping its buffer) is wiped by the
-					// 0 != clip.start anchor compare before prime_from_warm can
+					// 0 != clip.start anchor compare before prime_sync can
 					// serve it -- the still flash at a freshly-covering clip.
 				} else {
 					flash_rec_note_kill(slot_idx, "anchor-shift")
@@ -627,15 +714,18 @@ update_preview_slots :: proc() -> bool {
 			}
 			if !scrub_skip || !slot.has_frame {
 				if async_has_worker(slot_idx) {
-					if slot.prime_from_warm {
-						// Transition frame: the decoder handed over by prewarm
-						// already holds this clip's first frames in its RAM cache,
-						// so serve this one synchronously (a pure cache hit) and
+					if slot.prime_sync {
+						// Transition frame: the decoder handed over (warm cache or
+						// same-asset flush) already holds this clip's first frames
+						// adjacent to the decode target, so serve this one
+						// synchronously (a cache hit or single forward step) and
 						// set has_frame immediately. Posting to the worker here
-						// would leave the freshly-reassigned slot dark while its
-						// cold decoder opens+seeks -- the flash. The flag is
+						// would leave the freshly-reassigned slot dark (or — on the
+						// flush boundary, before the worker re-seeks — consuming the
+						// outgoing half's stale same-path result: the wrong-side
+						// flash) while its cold decoder opens+seeks. The flag is
 						// consumed; later frames decode on the worker.
-						slot.prime_from_warm = false
+						slot.prime_sync = false
 						decoder_set_preview(&slot.dec, slot_pick, slot_base)
 						if decode_clip_frame_sync(
 							&slot.dec,
@@ -687,6 +777,42 @@ update_preview_slots :: proc() -> bool {
 						// honest; otherwise the slot advertises a (frame,file)
 						// identity that matches no real decode and the preview
 						// re-decodes/serves the wrong thing across the boundary.
+						//
+						// The worker keys results by SOURCE PATH only, so its
+						// "newest completed" can belong to the PRIOR clip identity
+						// that shared this path -- a flush-boundary crossing keeps
+						// the slot, and the worker's last completed decode is the
+						// OUTGOING half's boundary frame, a frame outside the
+						// entering clip's source window ([source_start,
+						// source_start+len)). Consuming it would paint the wrong
+						// side of the cut (the image flash); the synchronous prime
+						// above covers the claiming update itself, but THIS update
+						// (and any until the worker re-seeks) must reject the stale
+						// result without copying it into slot.buffer -- a copy would
+						// leave wrong pixels that the tex_dirty upload renders
+						// anyway. So peek first, validate the window, then consume
+						// only an in-window result and keep the primed/good frame
+						// while the worker converges.
+						in_window := false
+						p_ok, p_frame, _ := async_peek_result(slot_idx, slot.path)
+						if p_ok {
+							in_window =
+								p_frame >= clip.source_start_frame &&
+								p_frame < clip.source_start_frame + clip.source_length_frames
+						}
+						if !in_window {
+							if vyper_trace {
+								fmt.printf(
+									"[vf] stale-peek=%d clip(src=%d+%d) slot=%d ph=%d\n",
+									p_frame,
+									clip.source_start_frame,
+									clip.source_length_frames,
+									slot_idx,
+									playhead.frame,
+								)
+							}
+							continue
+						}
 						if ok, dyn_frame, served_pick := async_try_consume_latest(
 							slot_idx,
 							slot.path,

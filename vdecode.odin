@@ -331,6 +331,27 @@ async_post_request :: proc(slot_idx: int, path: cstring, preview: cstring, frame
 	sync.mutex_unlock(&ad.worker.mutex)
 }
 
+// async_peek_result reports slot_idx's worker's most recently completed frame
+// WITHOUT copying it or clearing the result. The consumer validates the
+// served (frame, path) against the current clip's source window before calling
+// async_try_consume_latest: transparent-skips when "newest" is actually the
+// PRIOR clip identity's boundary frame (same-path, different source window --
+// split halves), so it is never copied into the slot buffer and the primed
+// correct frame stays on screen while the worker converges. Returns false when
+// no completed result for `path` is present yet.
+async_peek_result :: proc(slot_idx: int, path: cstring) -> (bool, i64, u32) {
+	ad := &async_decoders[slot_idx]
+	if ad.worker.thread == nil {
+		return false, 0, 0
+	}
+	sync.mutex_lock(&ad.worker.mutex)
+	defer sync.mutex_unlock(&ad.worker.mutex)
+	if !ad.res_valid || ad.res_path != path {
+		return false, 0, 0
+	}
+	return true, ad.res_frame, ad.res_pick_hash
+}
+
 // async_try_consume copies slot_idx's worker's decoded frame into `out` if and
 // only if it is the result for EXACTLY (path, clip_frame). Returns false if
 // the worker has not produced that exact frame yet (caller keeps its last

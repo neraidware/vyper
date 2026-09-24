@@ -617,14 +617,18 @@ Preview_Slot :: struct {
 	text_recreate:        bool,
 	tex_dirty:            bool,
 	texture:              ^sdl.GPUTexture,
-	// prime_from_warm is set when this slot's decoder was handed over by the
-	// warm prewarm (its RAM cache already holds the new clip's first frames).
-	// On that frame the front slot decodes synchronously from the warm cache
-	// instead of posting to the async worker (which only owns a cold decoder
-	// and would render the freshly-assigned slot dark until its open+seek
-	// lands -- the transition flash). The flag is consumed by that prime and
-	// never set again; every later frame decodes async as usual.
-	prime_from_warm:      bool,
+	// prime_sync is set when this slot's decoder was handed over ALREADY
+	// POSITIONED for the newly-assigned clip's first frame: either by the warm
+	// prewarm (its RAM cache holds the new clip's opening frames) or by the
+	// same-asset flush boundary (split halves/duplicates -- the preserved
+	// decoder stands one frame back from the cut, so the entering clip's first
+	// frame is one step forward). Either way the first decode for the fresh
+	// identity runs synchronously from the inherited decoder instead of
+	// posting to the async worker (which owns its own cold decoder state and
+	// would render the freshly-assigned slot dark or wrong-side until its
+	// open+seek lands -- the transition flash). The flag is consumed by that
+	// prime and never set again; every later frame decodes async as usual.
+	prime_sync:           bool,
 	// has_frame is false until this slot has decoded a frame for its current
 	// clip identity; draw_preview skips slots without it so a reassigned slot
 	// never flashes the previous clip's image while the new decoder opens.
