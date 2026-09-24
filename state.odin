@@ -279,6 +279,11 @@ Clip :: struct {
 	crop_b:               f32,
 	// Markers embedded in the clip (chapter markers, etc.), source-relative.
 	markers:              [dynamic]Clip_Marker,
+	// keyframe_tracks: the generic keyframe store (keyframes.odin) — opaque,
+	// name-addressed (frame_off, value) series. The system never interprets a
+	// track's name; consumers mint tracks named by their own property path.
+	// Sorted tracks, each sorted by frame_off (clip-relative). nil = no keys.
+	keyframe_tracks:      [dynamic]Kf_Track,
 }
 
 Track :: struct {

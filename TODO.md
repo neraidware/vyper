@@ -221,6 +221,99 @@ Out of scope (future): harfbuzz shaping, color/emoji glyphs, tofu box,
 per-size-bucket baking for >32px UI text, IME preedit UI, exact-advance
 text measurement for layout.
 
+## Active 3 — Generic keyframing system (keyframe timelines, decoupled)
+
+**Why:** animate/automate any scalar clip property (transform, scale, gain,
+crop, ...) from the timeline itself. Unlike a first-feature hack, the model is
+property-agnostic: any closed set of scalar properties can ride it, and the
+automation-lane system later adopts it whole (IDEAs.md:150 blueprints the
+property-id-addressed shape). This slice builds the system alone — no property
+is wired into playback/preview yet; that is a follow-up.
+
+**Model (decoupled, Godot-style) — GENERIC, uncoupled from clip properties:**
+- `Keyframe { frame_off: i32, value: f32 }` — frame **relative to the clip's
+  start** (the keyframe timeline is clip-relative; moving the clip moves its
+  rows). A keyframe deals with exactly **ONE value**; multiple values →
+  multiple keyframe tracks.
+- `Kf_Track { name: string, step: f32, keys: [dynamic]Keyframe }` sorted by
+  `frame_off`. Nothing property-shaped in the store: **the system never
+  interprets `name`** — it is an opaque id + the gutter label, minted by the
+  consumer (e.g. the gain field writes the track named "gain"). The
+  name→property mapping lives in the consumer that wires values, not here, so
+  anything listable can ride it (pixels, dB, scale fractions, a future property
+  `Clip` doesn't even carry yet). A row exists only when its track has >= 1
+  key; a clip with no keys keeps today's layout.
+- `step` is the track's per-frame move-toward amount **in the track's own
+  unit** (a dB step and a pixel step can't share one constant; 0 = the global
+  `KF_DEFAULT_STEP_PER_FRAME`).
+- **No interpolation. "Move toward" behavior only** (per user): evaluation
+  advances the value toward the current keyframe's target by the track's step
+  **per frame** until it arrives, then holds until the next keyframe's target
+  takes over. Starts after the key's own frame; origin = caller `base` before
+  the first key, otherwise the previous key's arrived target. Exact numbers
+  pinned by probe.
+- `kf_sample_for(clip, name, timeline_frame, base)` — generic; callers stay
+  property-unaware.
+- **Ownership:** track names are cloned at creation; every clone site
+  (clone_timeline, duplicate_track/clip) deep-copies them; split/trim remaps and
+  free_timeline free what they replace. Untouched/edit sites keep the shared
+  marker-style convention.
+
+**Timeline UI (the "keyframe timelines"):**
+- Keyframes render in a **dedicated row below their assigned clip**, spanning the
+  clip's extent. "Piano sheet" per-value lines: each keyframed value gets its
+  own line.
+- Tracks gutter: the **property name**, stacked under the track name.
+- A keyframe = a **45°-rotated rectangle (diamond), 1 px border, neutral
+  background, light when selected** (use the rect-rotation path built for the
+  gain-knob needle).
+- Track row height grows to fit the tallest keyframed clip
+  (`CLIP_TILE_HEIGHT + rows x row_h`). A collapse toggle is a later option —
+  **not** this slice.
+- No property consumption this slice: storage + render + selection + editing +
+  eval proc only. Wiring (e.g. Scale into preview, Gain into the live fold) is
+  the follow-up.
+
+**Selection:**
+- **Cannot select a clip and a keyframe at the same time** — mutually exclusive.
+  Selecting a diamond deselects clips (`selected_track = -1`, clear
+  `selected_set`); selecting a clip clears the keyframe selection.
+- A selected keyframe shows its value in the inspector.
+
+**Interaction / editing:**
+- **Add keyframe: Shift+click the property input** in the inspector (for now) →
+  records the field's current value at the playhead, creates the row on first key.
+- Drag a diamond horizontally → moves its `frame_off` (clamped 0..clip length).
+  A no-move click must not reseek/reset anything (the clip-stutter lesson).
+- `Delete` removes the selected keyframe. **Discrete commit per add/move/delete
+  on the undo seam**; `clone_timeline` deep-copies tracks (undo snapshots).
+- Split remap on a keyframed clip — Slice-1 rule (user): left keeps keys `< F`,
+  right half re-relatives (`- F`), values preserved. Implemented with the S1
+  structural paths (every clip-copy/free site must own keyframes, or a shared
+  backing dangles on the next key edit): split_clip, ripple straddle/trims,
+  duplicates, delete paths, clone/free.
+
+**Steps** (each lands + probe + vet before the next):
+- [ ] S1. Data model: `Keyframe` / `Kf_Track` (name-opaque) /
+      `Clip.keyframe_tracks` + store helpers (set/del/sample);
+      `clone_timeline`/`free_timeline`, duplicates, delete paths, and the
+      split/trim remaps all own keyframes; `VYPER_KEYFRAME_PROBE`. Probe:
+      insert/sort/replace, move-toward samples (default + track step), split
+      remap offsets, clone round-trip, zero-value `Clip{}` safe.
+- [ ] S2. Evaluation wiring: `kf_sample_for` into a consumer (step semantics
+      already pinned by probe).
+- [ ] S3. Render: growable track-row height + gutter property labels + diamond
+      draw (45° rect, 1 px border, neutral fill, light when selected).
+- [ ] S4. Selection + inspector: exclusive keyframe/clip selection; keyframe
+      value field.
+- [ ] S5. Interaction: Shift+click property input adds key; drag diamond to move;
+      Delete removes; undo commits. Probes: add/move/delete round-trip, exclusive
+      selection transitions, no-op drag leaves state untouched.
+- [ ] ACCEPT: Shift+click adds a row under the clip showing the diamond; dragging
+      moves it; selection flips between clip and keyframe exclusively; all edits
+      clean on undo/redo; probes + `-vet` green. (No property wired yet — the
+      row itself is the demo.)
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

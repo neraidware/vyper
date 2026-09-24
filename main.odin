@@ -1087,6 +1087,11 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if handle_undo_probe() {
 		return
 	}
+	// Headless keyframe-store probe: the generic store's sorted insert,
+	// move-toward sample, split/trim remaps, and clone/free round-trip.
+	if kp, _ := os.lookup_env_alloc("VYPER_KEYFRAME_PROBE", context.temp_allocator); kp != "" {
+		os.exit(keyframe_probe_run())
+	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.

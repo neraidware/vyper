@@ -100,6 +100,7 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 			} else {
 				c.markers = nil
 			}
+			kf_clone_mut(&c, st.clips[j])
 			nt.clips[j] = c
 		}
 		out.tracks[i] = nt
@@ -113,6 +114,10 @@ free_timeline :: proc(t: ^Timeline) {
 		for &c in tr.clips {
 			if c.markers != nil {
 				delete(c.markers)
+			}
+			if c.keyframe_tracks != nil {
+				kf_free_tracks(c.keyframe_tracks)
+				c.keyframe_tracks = nil
 			}
 			if c.name != "" {
 				delete(c.name)

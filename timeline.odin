@@ -526,6 +526,10 @@ split_clip_at_playhead :: proc() {
 			right_len,
 		)
 		delete(old_markers)
+		// Split remap (slice-1 rule): left keeps keys < left_len, right gets
+		// keys >= left_len re-relativized by -left_len; values preserved. The
+		// old shared backing is freed; each half owns fresh clones.
+		kf_split_parts(c, &right, i32(left_len))
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
 	if vyper_trace {
@@ -728,6 +732,7 @@ delete_selected_clip_raw :: proc() {
 		removed := tt.clips[target.index]
 		ordered_remove(&tt.clips, target.index)
 		delete(removed.markers)
+		kf_free_tracks(removed.keyframe_tracks)
 		if vyper_trace {
 			fmt.printf(
 				"[tl] deleted clip raw src=%s start=%d len=%d\n",
@@ -806,11 +811,16 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			}
 			right.source_length_frames = ce - end
 			right.timeline_start_frame = start
-			right.markers = filter_markers_in_range(
+right.markers = filter_markers_in_range(
 				right.markers[:],
 				right.source_start_frame,
 				right.source_length_frames,
 			)
+			// Keyframe split remap: left keeps keys < (start-cs), right gets
+			// the rest re-relativized by - (start-cs) (slice-1 rule). Frees
+			// the shared backing; each half owns fresh clones.
+			kf_split_parts(&left, &right, i32(start - cs))
+			append(&new_clips, left)
 			append(&new_clips, right)
 			// Original markers array no longer referenced by any copy.
 			delete(c.markers)
@@ -823,6 +833,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 				c.source_start_frame,
 				c.source_length_frames,
 			)
+			kf_trim_tail(&c, i32(start - cs))
 			append(&new_clips, c)
 			delete(old_markers)
 		case ce > end:
@@ -843,11 +854,16 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 				c.source_start_frame,
 				c.source_length_frames,
 			)
+			// Keyframes are clip-relative: head trimmed off means keys <
+			// (start-cs) go with the removed head, survivors re-relativize by
+			// - (start-cs).
+			kf_trim_head(&c, i32(start - cs))
 			append(&new_clips, c)
 			delete(old_markers)
 		case cs >= start && ce <= end:
 			// Otherwise the clip is entirely inside the region: dropped.
 			delete(c.markers)
+			kf_free_tracks(c.keyframe_tracks)
 		}
 	}
 	delete(track.clips)
@@ -1670,6 +1686,9 @@ duplicate_track :: proc(index: int) {
 				c.source_length_frames,
 			)
 		}
+		// Deep-clone keyframe tracks: a later key edit on either copy would
+		// reallocate a shared keys backing and strand the other clip on it.
+		kf_clone_mut(&c, src.clips[i])
 		append(&new_track.clips, c)
 	}
 	append(&timeline.tracks, new_track)
@@ -1721,6 +1740,9 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 			Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)},
 		)
 	}
+	// Independent copy: deep-clone keyframe tracks, never alias src's (same
+	// rule as markers/name above — a shared keys backing strands one copy).
+	kf_clone_mut(&c, src^)
 	place := clip_timeline_end(src^)
 	c.timeline_start_frame = clip_place_in_track(track, index, c.source_length_frames, place)
 	insert_at := index + 1
@@ -1747,6 +1769,7 @@ remove_track :: proc(index: int) {
 	removed := timeline.tracks[index]
 	for &c in removed.clips {
 		delete(c.markers)
+		kf_free_tracks(c.keyframe_tracks)
 	}
 	delete(removed.clips)
 	name_buf: [128]u8
