@@ -47,6 +47,10 @@ HANDLE_FILL :: clay.Color{35, 42, 46, 255} // bg_dim — thumb fill inside the b
 HANDLE_BORDER :: clay.Color{133, 146, 137, 255} // grey1
 TEXT :: clay.Color{211, 198, 170, 255} // fg — warm off-white
 TEXT_INPUT_BG :: clay.Color{35, 42, 46, 255} // bg_dim — recessed input, switch-off track
+// CMDLINE_PLACEHOLDER dims the command line's remembered-text hint relative to
+// the typed text, so an empty prompt reads as "what you last ran" rather than
+// an actual command.
+CMDLINE_PLACEHOLDER :: clay.Color{133, 146, 137, 255} // grey1 — dimmer than TEXT
 
 RULER_HEIGHT :: f32(30)
 RULER_TICK_COLOR :: clay.Color{79, 88, 94, 255} // bg4 — ruler ticks
@@ -513,6 +517,11 @@ Text_Input :: struct {
 	// clip (rather than renaming an existing one): the clip only survives if a
 	// non-empty name is committed. Applies both to renamed (commit) and cancel.
 	is_create:  bool,
+	// swallow_text discards the NEXT text-input event without inserting it.
+	// The ":" shortcut both opens the command line AND (via the same keypress's
+	// TEXT_INPUT) would echo a ":" into the buffer; the prompt must start
+	// empty, so the opener swallows its own keypress's text.
+	swallow_text: bool,
 }
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.
@@ -520,6 +529,13 @@ TI_RENAME :: 1
 // TI_PLAYHEAD is the input_type for the playhead time viewer: the committed
 // text is parsed as a timecode/seconds/frames and the playhead is sought there.
 TI_PLAYHEAD :: 2
+// TI_CMDLINE is the input_type for the vim-style ":" command line. The prompt
+// is display-only for now: no commands execute, Enter records the typed text as
+// last_command (the placeholder shown while the buffer is empty).
+TI_CMDLINE :: 3
+// last_command is the most recently committed ":" command-line text, shown as
+// the prompt's placeholder. Owned (session-heap): replaced on each commit.
+last_command: string
 
 Preview_State :: struct {
 	buffer:  [PREVIEW_W * PREVIEW_H * 4]u8,

@@ -53,6 +53,15 @@ text_input_codepoints_before :: proc(at: int) -> int {
 	return n
 }
 
+// text_input_set_buf replaces the whole buffer with s, caret at the end.
+// Used by the cmdline match list to commit a highlighted file path.
+text_input_set_buf :: proc(s: string) {
+	clear(&ti.buf)
+	append(&ti.buf, ..transmute([]u8)s)
+	ti.cursor = len(ti.buf)
+	ti.anchor = ti.cursor
+}
+
 // text_input_sel returns the selection as (start, end) byte offsets
 // (start == end when nothing is selected).
 text_input_sel :: proc() -> (int, int) {
@@ -70,6 +79,14 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 	ti.input_type = input_type
 	ti.target = target
 	ti.is_create = false
+	// A stale swallow from a previous ":"-opened session must not eat this
+	// session's first typed character. The opener sets it again right after.
+	ti.swallow_text = false
+	// Each ":" session starts with a fresh fuzzy file list (walked lazily on
+	// the first non-empty query) and a clear match highlight.
+	if input_type == TI_CMDLINE {
+		cmdline_match_reset()
+	}
 	ti.active = true
 }
 

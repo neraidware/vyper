@@ -2073,6 +2073,7 @@ HELP_SHORTCUTS :: []Help_Shortcut {
 	{"I / O", "Set render-range start / end at the playhead"},
 	{"S", "Split clip at playhead"},
 	{"Ctrl+R", "Rename selected clip"},
+	{":", "Command line (:open <file>)"},
 	{"U", "Link / unlink selection"},
 	{"Backspace", "Delete (ripple) selected clip or group"},
 	{"Delete", "Delete selected clip (raw)"},
@@ -2184,6 +2185,13 @@ draw_text_input_popup :: proc(width, height: c.int) {
 	if !ti.active {
 		return
 	}
+	// The ":" command line is a separate, flatter prompt than the dialog-style
+	// rename/time fields — delegate it so its pill bar doesn't inherit the
+	// dialog chrome.
+	if ti.input_type == TI_CMDLINE {
+		draw_cmdline_popup(width, height)
+		return
+	}
 	// Responsive: the popup is at most 460px wide but never wider than 80% of
 	// the window, and its height fits its content. Positioned centered
 	// horizontally, roughly a third from the top.
@@ -2244,6 +2252,131 @@ draw_text_input_popup :: proc(width, height: c.int) {
 					text_input_string(),
 					clay.TextElementConfig{textColor = TEXT, fontSize = TEXT_INPUT_FONT},
 				)
+			}
+		}
+	}
+}
+
+// draw_cmdline_popup renders the vim-style ":" prompt: a search-bar-shaped pill
+// centered in the window, half the window's width, one font-height tall plus
+// half a font of vertical padding, with a fully-round accent border. The colon
+// is literal; while the buffer is empty the last committed command shows
+// dimmed as the placeholder. When the buffer is `open <query>`, a fuzzy file
+// match list (cwd-relative paths) drops down below the pill; the highlighted
+// row is set by Tab/Shift+Tab/Up/Down and committed by Enter. Drawn via clay
+// floating so it sits above the preview like the other overlays; the caret
+// rides the same TextInputField id the dialog uses, so draw_text_input_caret
+// just works.
+draw_cmdline_popup :: proc(width, height: c.int) {
+	fh := f32(TEXT_INPUT_FONT)
+	pad_v := fh * CMDLINE_PAD_FRAC
+	placeholder := "last ran command"
+	bw := f32(width) * CMDLINE_WIDTH_FRAC
+	bx := (f32(width) - bw) / 2
+	bh := fh + pad_v * 2
+	// Stable, cache-aware match list; the whole block (pill + rows) is
+	// centered so a tall list doesn't push off the bottom.
+	cmdline_match_refresh()
+	n := min(len(cmdline_matches), CMDLINE_MATCH_MAX)
+	row_h := f32(FONT_NORMAL) + 9
+	list_gap: u16 = 6
+	list_h := f32(n) * row_h
+	block_h := bh + (f32(list_gap) if n > 0 else 0) + list_h
+	by := (f32(height) - block_h) / 2
+	if clay.UI(clay.ID("CmdlineColumn"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFixed(bw), height = clay.SizingFixed(block_h)},
+			layoutDirection = .TopToBottom,
+			childGap = list_gap,
+		},
+		floating = {
+			offset = {bx, by},
+			zIndex = 3000,
+			attachTo = .Root,
+			pointerCaptureMode = .Capture,
+		},
+	},
+	) {
+		if clay.UI(clay.ID("CmdlinePopup"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(bh)},
+				layoutDirection = .LeftToRight,
+				childAlignment = {x = .Left, y = .Center},
+				childGap = CARD_GAP,
+				padding = clay.Padding{left = PANEL_PADDING, right = PANEL_PADDING},
+			},
+			backgroundColor = TEXT_INPUT_BG,
+			border = {color = BUTTON_BORDER_HOVER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(bh / 2),
+		},
+		) {
+			clay.Text(":", clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = TEXT_INPUT_FONT})
+			text := placeholder
+			col := CMDLINE_PLACEHOLDER
+			if len(ti.buf) > 0 {
+				text = text_input_string()
+				col = TEXT
+			}
+			if clay.UI(clay.ID("TextInputField"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+					// CARD_GAP side padding matches draw_text_input_caret's
+					// text_x = box.x + CARD_GAP, so the caret lands on the text.
+					padding = clay.Padding{left = CARD_GAP, right = CARD_GAP},
+					childAlignment = {x = .Left, y = .Center},
+				},
+			},
+			) {
+				clay.Text(text, clay.TextElementConfig{textColor = col, fontSize = TEXT_INPUT_FONT})
+			}
+		}
+		if n > 0 {
+			if clay.UI(clay.ID("CmdlineMatches"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(list_h)},
+					layoutDirection = .TopToBottom,
+					childGap = 2,
+				},
+			},
+			) {
+				for i in 0 ..< n {
+					sel := i == cmdline_sel
+					if clay.UI(clay.ID("CmdlineMatchRow", u32(i)))(
+					{
+						layout = {
+							sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(row_h)},
+							padding = clay.Padding{left = CARD_GAP, right = CARD_GAP},
+							childAlignment = {x = .Left, y = .Center},
+						},
+						backgroundColor = sel ? BUTTON_BORDER_HOVER : BUTTON,
+						border = {color = sel ? BUTTON_BORDER : BUTTON_BORDER, width = clay.BorderOutside(1)},
+						cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+					},
+					) {
+						m := cmdline_matches[i]
+						runs: [CMDLINE_QUERY_MAX][2]int
+						nr := cmdline_match_matched_runs(m.path, runs[:])
+						seg_start := 0
+						for r in 0 ..< nr {
+							seg := runs[r]
+							if seg.x > seg_start {
+								col := sel ? BACKGROUND : TEXT
+								clay.Text(m.path[seg_start:seg.x], clay.TextElementConfig{textColor = col, fontSize = FONT_NORMAL})
+							}
+							col := sel ? BACKGROUND : BUTTON_BORDER_HOVER
+							clay.Text(m.path[seg.x:seg.x + seg.y], clay.TextElementConfig{textColor = col, fontSize = FONT_NORMAL})
+							seg_start = seg.x + seg.y
+						}
+						if seg_start < len(m.path) {
+							col := sel ? BACKGROUND : TEXT
+							clay.Text(m.path[seg_start:], clay.TextElementConfig{textColor = col, fontSize = FONT_NORMAL})
+						}
+					}
+				}
 			}
 		}
 	}

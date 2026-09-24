@@ -24,10 +24,31 @@ handle_sdl_events :: proc(running: ^bool) {
 				mods := sdl.GetModState()
 				shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
 				ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
+				// Cmdline match navigation: Tab/arrows move the highlighted
+				// row; handled here so the generic text field stays generic.
+				if ti.input_type == TI_CMDLINE {
+					switch event.key.key {
+					case sdl.K_TAB:
+						cmdline_match_navigate(shift ? -1 : 1)
+						continue
+					case sdl.K_UP:
+						cmdline_match_navigate(-1)
+						continue
+					case sdl.K_DOWN:
+						cmdline_match_navigate(1)
+						continue
+					}
+				}
 				r := text_input_handle_key(event.key.key, shift, ctrl)
 				if r == .Commit {
 					if ti.input_type == TI_PLAYHEAD {
 						apply_playhead_time()
+					} else if ti.input_type == TI_CMDLINE {
+						// Rewrites the buffer to `open <highlighted>` when a
+						// match row is selected, so the normal command path
+						// opens that file; otherwise leaves typed text alone.
+						cmdline_match_apply_selection()
+						apply_command()
 					} else {
 						apply_rename()
 					}
@@ -52,6 +73,21 @@ handle_sdl_events :: proc(running: ^bool) {
 				escape_dismiss()
 			} else if !event.key.repeat {
 				switch event.key.key {
+				case sdl.K_COLON:
+					// Vim-style ":" opens the command line. The same
+					// keypress also fires TEXT_INPUT(":"), which must not
+					// become the first buffer character (the prompt starts
+					// empty) — swallow it via ti.swallow_text.
+					text_input_begin("", TI_CMDLINE, 0)
+					ti.swallow_text = true
+				case sdl.K_SEMICOLON:
+					// Some layouts report ";" as the base key with Shift held
+					// (rather than the shifted K_COLON keycode). Same opener.
+					mods := sdl.GetModState()
+					if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
+						text_input_begin("", TI_CMDLINE, 0)
+						ti.swallow_text = true
+					}
 				case sdl.K_F1:
 					// Always-available shortcut reference.
 					help_open = !help_open
@@ -129,7 +165,11 @@ handle_sdl_events :: proc(running: ^bool) {
 			}
 		case .TEXT_INPUT:
 			if ti.active {
-				text_input_insert(string(event.text.text))
+				if ti.swallow_text {
+					ti.swallow_text = false
+				} else {
+					text_input_insert(string(event.text.text))
+				}
 			} else if editing_field != .None {
 				for ch in string(event.text.text) {
 					// Only accept printable ASCII that makes sense in a number.
