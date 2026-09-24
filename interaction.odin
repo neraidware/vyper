@@ -3,6 +3,7 @@ package main
 import clay "clay-odin"
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:sync"
 import sdl "vendor:sdl3"
 
@@ -19,7 +20,7 @@ import sdl "vendor:sdl3"
 Mouse_Input :: struct {
 	x, y:                f32,
 	left, right, middle: bool,
-	alt, shift:          bool,
+	alt, shift, ctrl:    bool,
 }
 
 // read_mouse_input snapshots the mouse buttons + modifiers for this frame.
@@ -35,6 +36,7 @@ read_mouse_input :: proc() -> Mouse_Input {
 		middle = sdl.MouseButtonFlag.MIDDLE in buttons,
 		alt = sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods,
 		shift = sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods,
+		ctrl = sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods,
 	}
 }
 
@@ -307,6 +309,28 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		if clay.PointerOver(clay.ID("PropCropB")) {
 			edit_begin(.Crop_B, sel.crop_b * 100)
+			return true
+		}
+		return false
+	},
+	// Gain knob drag + gain value field: the only inspector edit that targets
+	// audio clips (the X/Y/Scale/crop probe above rejects .Audio). The knob
+	// starts a live drag; the field focuses for typing like any other field.
+	proc(inp: Mouse_Input) -> bool {
+		_, cl, ok := selected_clip()
+		if !ok || cl.kind != .Audio {
+			return false
+		}
+		if clay.PointerOver(clay.ID("GainKnob")) {
+			undo_begin()
+			gain_drag_clip = cl
+			gain_drag_start_x = inp.x
+			gain_drag_start_db = cl.gain
+			active_interaction = .Gain_Drag
+			return true
+		}
+		if clay.PointerOver(clay.ID("PropFieldGain")) {
+			edit_begin(.Gain, cl.gain)
 			return true
 		}
 		return false
@@ -705,12 +729,22 @@ interaction_post_build :: proc(
 					undo_push(.Transform, "Move transform")
 				}
 			}
+		case .Gain_Drag:
+			// Gain is applied live during the drag; record one value node on
+			// release. No re-provision here: the per-move geometry commit +
+			// the producer's live gain fold already put the final value on the
+			// output, and the old audio_note_edit() on release reopened every
+			// decoder (~100s of ms) -- the audible stutter after a knob drag.
+			if gain_drag_clip != nil && gain_drag_clip.gain != gain_drag_start_db {
+				undo_push(.Value, "Set clip gain")
+			}
 		}
 		active_interaction = .None
 		dragging_handle = nil
 		handle_kind = .None
 		handle_corner_snapped = false
 		drag_clip = nil
+		gain_drag_clip = nil
 		drag_source_track = -1
 		drag_source_index = -1
 		drag_hover_track = -1
@@ -801,6 +835,25 @@ interaction_post_build :: proc(
 				resize_moved = true
 				audio_note_edit()
 			}
+		case .Gain_Drag:
+			if gain_drag_clip == nil {
+				break
+			}
+			dx := inp.x - gain_drag_start_x
+			db := gain_drag_start_db
+			if inp.ctrl {
+				// Fine: continuous 0.1 dB per pixel.
+				db += dx * GAIN_FINE_DB_PER_PX
+			} else {
+				// Coarse: one 1 dB step per full 10 px of travel since the
+				// gesture began (quantized, monotonic per direction).
+				db += math.floor(dx / GAIN_COARSE_PX_PER_STEP) * GAIN_COARSE_DB_PER_10PX
+			}
+			gain_drag_clip.gain = clamp(db, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
+			// Publish the running value into the audio slab so a provision mid-
+			// gesture (play pressed while the knob is held) hears it; the release
+			// commits nothing because the producer's live fold already applied it.
+			audio_geometry_commit()
 		case .Clip_Move:
 			if drag_clip != nil {
 				clip_x := inp.x - clip_drag_offset
@@ -868,6 +921,12 @@ interaction_post_build :: proc(
 				// its source lane regardless of which lane the pointer flicked
 				// into, so the drag can never detach under fast motion. When a
 				// vertical drop IS staged this previews the X the ghost follows.
+				// Resync audio only when the clip actually slid this frame: a
+				// plain select arms Clip_Move with the button held, so the update
+				// fires for a no-move click too, and note_edit() below would
+				// reseek the producer and reopen every decoder for a gesture
+				// that changed nothing. Same guard Clip_Resize applies.
+				start_before := drag_clip.timeline_start_frame
 				drag_move_in_place(frame)
 				// Stall tracer (VYPER_TRACE): logs the first frame where the
 				// cursor's frame target advanced but the clip's start did not —
@@ -892,7 +951,9 @@ interaction_post_build :: proc(
 					drag_trace_last_target = tf
 					drag_trace_last_start = drag_clip.timeline_start_frame
 				}
-				audio_note_edit()
+				if drag_clip.timeline_start_frame != start_before {
+					audio_note_edit()
+				}
 			}
 		case .Playhead_Scrub:
 			// Scrub the playhead to the pointer's frame along the ruler bar.

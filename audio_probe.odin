@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -235,6 +236,126 @@ audio_probe_run :: proc(v: string) -> int {
 	}
 	fmt.printf("[ap] sim: delivered=%d holes=%d of %d frames\n", delivered, holes, end)
 
+	gain_ok := audio_probe_gain_check()
+	if !gain_ok {
+		fmt.println("[ap] GAIN CHECK FAIL")
+		return 1
+	}
+	fmt.println("[ap] gain check ok")
+
+	fold_ok := audio_probe_live_gain_check()
+	if !fold_ok {
+		fmt.println("[ap] LIVE GAIN FOLD CHECK FAIL")
+		return 1
+	}
+	fmt.println("[ap] live gain fold check ok")
+
 	audio_reset_play()
 	return 0
+}
+
+// audio_probe_mix_peak decodes `frames` timeline frames starting at `start`
+// from the already-provisioned sources (caller provisioned at frame 0) and
+// returns the peak |sample| across the whole window.
+audio_probe_mix_peak :: proc(mix: []f32, start: i64, frames: i64, fps: f64) -> f32 {
+	peak := f32(0)
+	for f in start ..< start + frames {
+		spf := 1
+		b0 := audio_frame_boundary48(f, fps)
+		b1 := audio_frame_boundary48(f + 1, fps)
+		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1-b0)))
+		if audio_mix_frame(mix, f, spf) {
+			for &v in mix[:spf * 2] {
+				peak = max(peak, math.abs(v))
+			}
+		}
+	}
+	return peak
+}
+
+// audio_probe_live_gain_check verifies the producer-side live gain fold (the
+// audio_gain_epoch + audio_gain_fold path the feed loop uses during a knob
+// drag): after the first window is mixed at unity, the clips' gains are edited
+// and committed -- which must bump the epoch -- then folded into the already
+// provisioned segments WITHOUT reset/re-provision. A second window mixed from
+// the same logical position must land at gain*peak (live audible update), not
+// the stale unity value, proving the segment gains were rewritten in place.
+audio_probe_live_gain_check :: proc() -> bool {
+	fps := timeline_fps()
+	gain_frames := i64(120)
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	// Previous checks leave every clip at -20 dB. Restore unity (and commit)
+	// first so the drag below is a real 0 -> -20 transition the commit must
+	// detect; a NO-OP commit is the failure this probe exists to catch.
+	for ti in 0 ..< len(timeline.tracks) {
+		for &c in timeline.tracks[ti].clips {
+			if c.kind == .Audio {
+				c.gain = 0
+			}
+		}
+	}
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_provision(0)
+	peak_unity := audio_probe_mix_peak(mix[:], 0, gain_frames, fps)
+	for ti in 0 ..< len(timeline.tracks) {
+		for &c in timeline.tracks[ti].clips {
+			if c.kind == .Audio {
+				c.gain = -20
+			}
+		}
+	}
+	epoch_before := sync.atomic_load(&audio_gain_epoch)
+	audio_geometry_commit()
+	if sync.atomic_load(&audio_gain_epoch) == epoch_before {
+		fmt.println("[ap] live fold: commit did not bump audio_gain_epoch (gain change missed)")
+		return false
+	}
+	audio_gain_fold(&audio_geom[sync.atomic_load(&audio_geom_idx)])
+	audio_gain_folded_epoch = sync.atomic_load(&audio_gain_epoch)
+	peak_live := audio_probe_mix_peak(mix[:], gain_frames, gain_frames, fps)
+	expected := db_to_linear(-20)
+	ratio := peak_unity > 0 ? peak_live / peak_unity : 0
+	fmt.printf(
+		"[ap] fold: unity_peak=%.5f -20dB_peak=%.5f ratio=%.5f expected=%.5f (no re-provision)\n",
+		peak_unity, peak_live, ratio, expected,
+	)
+	if peak_unity <= 0 || math.abs(ratio - expected) > 0.001 {
+		return false
+	}
+	return true
+}
+
+// audio_probe_gain_check verifies the per-clip gain reaches the mix: a -20 dB
+// value must scale the mixed amplitude by exactly 0.1. Runs the same short
+// window twice (unity then -20 dB), re-provisioning between because the frame
+// sim consumes the source fifos.
+audio_probe_gain_check :: proc() -> bool {
+	fps := timeline_fps()
+	gain_frames := i64(120)
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	audio_reset_play()
+	audio_provision(0)
+	peak_unity := audio_probe_mix_peak(mix[:], 0, gain_frames, fps)
+	for ti in 0 ..< len(timeline.tracks) {
+		for &c in timeline.tracks[ti].clips {
+			if c.kind == .Audio {
+				c.gain = -20
+			}
+		}
+	}
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_provision(0)
+	peak_gain := audio_probe_mix_peak(mix[:], 0, gain_frames, fps)
+	expected := db_to_linear(-20)
+	ratio := peak_unity > 0 ? peak_gain / peak_unity : 0
+	fmt.printf(
+		"[ap] gain: unity_peak=%.5f -20dB_peak=%.5f ratio=%.5f expected=%.5f\n",
+		peak_unity, peak_gain, ratio, expected,
+	)
+	if peak_unity <= 0 || math.abs(ratio - expected) > 0.001 {
+		return false
+	}
+	return true
 }

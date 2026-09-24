@@ -12,9 +12,9 @@ import stb "vendor:stb/truetype"
 // ---------------------------------------------------------------------------
 
 RectVertexUniforms :: struct {
-	bounds: [4]f32,
-	viewport: [2]f32,
-	_padding: [2]f32,
+	bounds:    [4]f32,
+	viewport:  [2]f32,
+	rotation:  [2]f32, // (cos, sin) of quad rotation about its center; {0,0} = identity
 }
 
 RectFragmentUniforms :: struct {

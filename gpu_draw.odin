@@ -3,6 +3,7 @@ package main
 import clay "clay-odin"
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:sync"
 import "core:unicode/utf8"
 import sdl "vendor:sdl3"
@@ -989,10 +990,12 @@ render_sdf_rect :: proc(
 	color: clay.Color,
 	radius, border: f32,
 	corner_mode: f32 = 0,
+	rotation: [2]f32 = {},
 ) {
 	vertex_uniforms := RectVertexUniforms {
 		bounds   = {bounds.x, bounds.y, bounds.width, bounds.height},
 		viewport = renderer.viewport,
+		rotation = rotation,
 	}
 	fragment_uniforms := RectFragmentUniforms {
 		color = {
@@ -1018,6 +1021,81 @@ render_sdf_rect :: proc(
 	)
 	sdl.BindGPUGraphicsPipeline(pass, renderer.pipeline)
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+}
+
+// draw_gain_knob paints the audio gain knob's indicator pointer + hub over the
+// baked clay knob body. The body is a clay circle (drawn in the normal passes);
+// the pointer needs rotation about the knob center, which clay has no concept
+// of, so it draws here as a rotated SDF capsule (see rounded_rect.vert).
+draw_gain_knob :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
+	_, cl, ok := selected_clip()
+	if !ok || cl.kind != .Audio {
+		return
+	}
+	bb := clay.GetElementData(clay.ID("GainKnob")).boundingBox
+	if bb.width <= 0 {
+		return
+	}
+	// Angle: 0 dB sits at 12 o'clock. Negative gain sweeps counterclockwise
+	// to -sweep at the floor (9 o'clock), positive gain clockwise to +sweep
+	// (3 o'clock) -- the pointer never passes the horizontal, so it reads as
+	// rotating only through the top half of the dial.
+	db := clamp(cl.gain, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
+	a := f32(0)
+	if db <= 0 {
+		a = -(db / f32(GAIN_MIN_DB)) * GAIN_KNOB_SWEEP_DEG * math.PI / 180
+	} else {
+		a = (db / f32(GAIN_MAX_DB)) * GAIN_KNOB_SWEEP_DEG * math.PI / 180
+	}
+	// Screen space (y down): a=0 points up, +90 rotates clockwise.
+	dir := [2]f32{f32(math.sin(a)), f32(-math.cos(a))}
+	cx := bb.x + bb.width / 2
+	cy := bb.y + bb.height / 2
+	half_len := KNOB_DIAMETER * GAIN_KNOB_NEEDLE_LEN * 0.5
+	// The pointer is a symmetric capsule (the SDF shader rotates a rect about
+	// ITS own center, so a one-sided ray could not pivot at the knob center);
+	// rotation = (cos, sin) puts the rect's local x-axis along `dir`.
+	needle := clay.BoundingBox {
+		x = cx - half_len,
+		y = cy - GAIN_KNOB_NEEDLE_W / 2,
+		width = half_len * 2,
+		height = GAIN_KNOB_NEEDLE_W,
+	}
+	render_sdf_rect(
+		renderer, command_buffer, pass,
+		needle, SELECT_BORDER, GAIN_KNOB_NEEDLE_W / 2, 0,
+		rotation = dir,
+	)
+	// Mask the capsule's back half (the part behind the pivot) with a
+	// counter-rotated body-colored rect, leaving only the outward pointer.
+	// The mask rotates about its own center, which sits at the midpoint of the
+	// hidden segment, so it stays glued to the back half at every angle.
+	mask_w := f32(GAIN_KNOB_NEEDLE_W) + 4
+	mc := [2]f32{cx - dir.x * half_len * 0.5, cy - dir.y * half_len * 0.5}
+	mask := clay.BoundingBox {
+		x = mc.x - (half_len + 2) / 2,
+		y = mc.y - mask_w / 2,
+		width = half_len + 2,
+		height = mask_w,
+	}
+	render_sdf_rect(
+		renderer, command_buffer, pass,
+		mask, BUTTON, mask_w / 2, 0,
+		rotation = dir,
+	)
+	// Center hub: anchors the pointer and recloses the knob body over the
+	// mask's rounded near end.
+	hub := clay.BoundingBox {
+		x = cx - GAIN_KNOB_HUB_R,
+		y = cy - GAIN_KNOB_HUB_R,
+		width = GAIN_KNOB_HUB_R * 2,
+		height = GAIN_KNOB_HUB_R * 2,
+	}
+	render_sdf_rect(renderer, command_buffer, pass, hub, EDITOR_BG, GAIN_KNOB_HUB_R, 0)
 }
 
 // render_icon draws one rasterized SVG icon through the text pipeline: the

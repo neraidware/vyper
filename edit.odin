@@ -16,6 +16,8 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 	case .X, .Y, .None:
 	case .Scale:
 		prec = 2
+	case .Gain:
+		prec = 1
 	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 		scaled = value * 100
 	}
@@ -47,6 +49,8 @@ edit_field_over :: proc() -> bool {
 		return clay.PointerOver(clay.ID("PropCropT"))
 	case .Crop_B:
 		return clay.PointerOver(clay.ID("PropCropB"))
+	case .Gain:
+		return clay.PointerOver(clay.ID("PropFieldGain"))
 	case .None:
 		return false
 	}
@@ -55,12 +59,15 @@ edit_field_over :: proc() -> bool {
 
 edit_commit :: proc() {
 	defer edit_cancel()
-	sel, ok := transformable_selected()
-	if !ok {
+	val, parsed_ok := strconv.parse_f32(string(edit_chars[:edit_len]))
+	if !parsed_ok {
 		return
 	}
-	value, parsed_ok := strconv.parse_f32(string(edit_chars[:edit_len]))
-	if !parsed_ok {
+	// The gain field is the one edit that targets audio clips, which
+	// transformable_selected() rejects, so the clip resolves here and the
+	// transformable guard applies per-field below.
+	_, cl, ok := selected_clip()
+	if !ok {
 		return
 	}
 	// Resolve the edited field to its storage plus the clamped value and label.
@@ -68,42 +75,80 @@ edit_commit :: proc() {
 	// not add a node, so the compare gates the commit below.
 	field: ^f32
 	label := "Edit clip transform"
+	kind := Undo_Kind.Transform
 	switch editing_field {
 	case .X:
-		field = &sel.transform_x
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.transform_x
 		label = "Set clip X"
 	case .Y:
-		field = &sel.transform_y
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.transform_y
 		label = "Set clip Y"
 	case .Scale:
-		field = &sel.scale
-		value = max(value, 0.01)
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.scale
+		val = max(val, 0.01)
 		label = "Set clip scale"
 	case .Crop_L:
-		field = &sel.crop_l
-		value = clamp(value / 100, 0, 1)
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.crop_l
+		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
 	case .Crop_R:
-		field = &sel.crop_r
-		value = clamp(value / 100, 0, 1)
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.crop_r
+		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
 	case .Crop_T:
-		field = &sel.crop_t
-		value = clamp(value / 100, 0, 1)
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.crop_t
+		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
 	case .Crop_B:
-		field = &sel.crop_b
-		value = clamp(value / 100, 0, 1)
+		if cl.kind == .Audio {
+			return
+		}
+		field = &cl.crop_b
+		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
+	case .Gain:
+		// Clamp to the knob range so the typed value and the knob's angle stay
+		// consistent; the knob is the source of truth for what's reachable.
+		val = clamp(val, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
+		field = &cl.gain
+		label = "Set clip gain"
+		kind = .Value
 	case .None:
 		return
 	}
-	if field^ == value {
+	if field^ == val {
 		return
 	}
+	// Only gain edits touch audio; mirror them into the slab and let the
+	// producer's live fold (audio_gain_epoch) apply them without re-provisioning.
+	// A full note_edit() here re-seeded every decoder mid-playback whenever a
+	// gain commit landed -- and dispatch_click_fallback commits in-flight field
+	// edits on ANY fresh click, so selecting another clip re-opened all decoders.
+	audio_changed := kind == .Value
 	undo_begin()
-	field^ = value
-	undo_push(.Transform, label)
+	field^ = val
+	undo_push(kind, label)
+	if audio_changed {
+		audio_geometry_commit()
+	}
 }
 
 edit_append :: proc(ch: u8) {

@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:strconv"
@@ -495,6 +496,11 @@ Play_Seg :: struct {
 	start_a: i64, // timeline_start_frame
 	start_s: i64, // source_start_frame
 	len_a:   i64, // source_length_frames
+	// gain is the segment's linear amplitude multiplier, derived once at
+	// provision from the clip's dB value. Rides the per-segment snapshot (not
+	// per-source) because a split makes adjacent segments of one source
+	// independently adjustable.
+	gain:    f32,
 }
 
 // Play_Src is one source stream's 48 kHz stereo S16 decoder + content-relative
@@ -634,6 +640,9 @@ Audio_Geom_Chip :: struct {
 	source_start:   i64,
 	source_len:     i64,
 	stream_index:   c.int,
+	// gain_dB is the clip's output level. Stored in dB (a stable, human-
+	// readable value); converted to the linear multiplier once at provision.
+	gain_dB:        f32,
 	path_off:       int, // offset into Audio_Geom_Slot.paths
 	path_len:       int,
 }
@@ -647,6 +656,14 @@ Audio_Geom_Slot :: struct {
 
 audio_geom: [2]Audio_Geom_Slot
 audio_geom_idx: u32 // atomic: active slot
+// audio_gain_epoch counts published gain changes (UI bumps it after a commit
+// whose clips' gains differ from the previous slot). The producer compares
+// against audio_gain_folded_epoch (producer-thread only) and folds the new
+// gains into its provisioned segments in place. A gain knob drag during
+// playback must be audible within the cushion; a seek per knob move would
+// reopen every decoder (~16 ms each) and chop the stream on every nudge.
+audio_gain_epoch: u64            // atomic; UI-side bump, published AFTER audio_geom_idx
+audio_gain_folded_epoch: u64     // producer-side: last audio_gain_epoch folded
 // audio_geom_overflow logs once when the timeline holds more audio clips (or
 // more path bytes) than a fixed slab can carry, so the dropped tail is visible.
 audio_geom_overflow: bool
@@ -687,6 +704,8 @@ audio_geometry_commit :: proc() {
 	slot := &audio_geom[write]
 	slot.n = 0
 	slot.path_used = 0
+	read := int(sync.atomic_load(&audio_geom_idx))
+	gains_moved := false
 	for tr in 0 ..< len(timeline.tracks) {
 		for c in 0 ..< len(timeline.tracks[tr].clips) {
 			clip := &timeline.tracks[tr].clips[c]
@@ -702,11 +721,21 @@ audio_geometry_commit :: proc() {
 				sync.atomic_store(&audio_geom_idx, u32(write))
 				return
 			}
+			// Gain-change detection compares against the same-index chip of the
+			// previously published slot. Both slots are rebuilt every commit by
+			// the same track/clip iteration, so while the clip set is static
+			// (the gain knob drag case) the indexes correspond exactly; when a
+			// structural edit shifts them, the producer's audio_seek re-provision
+			// re-reads gains afresh anyway, so a false missed bump is harmless.
+			if !gains_moved && slot.n < audio_geom[read].n && audio_geom[read].chip[slot.n].gain_dB != clip.gain {
+				gains_moved = true
+			}
 			chip := &slot.chip[slot.n]
 			chip.timeline_start = clip.timeline_start_frame
 			chip.source_start = clip.source_start_frame
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
+			chip.gain_dB = clip.gain
 			chip.path_off = slot.path_used
 			chip.path_len = len(path)
 			mem.copy(raw_data(slot.paths[slot.path_used:]), raw_data(path), len(path))
@@ -715,6 +744,40 @@ audio_geometry_commit :: proc() {
 		}
 	}
 	sync.atomic_store(&audio_geom_idx, u32(write))
+	// Publish the epoch only after the slot index, so the producer never folds
+	// new-gains metadata against the old slot it might still read.
+	if gains_moved {
+		sync.atomic_store(&audio_gain_epoch, sync.atomic_load(&audio_gain_epoch) + 1)
+	}
+}
+
+// audio_gain_fold copies the published clip gains into the provisioned
+// segments in place, matching each chip to its segment by path/stream and the
+// timeline-span key the chip was provisioned with (audio_provision's
+// Play_Seg{start_a, start_s, len_a} == {timeline_start, source_start,
+// source_len}). Producer-thread only; neither decoders nor the playhead move,
+// so a live gain drag is audible within the cushion with no reopen storm.
+// Segments whose key no chip matches (rare: a provision from a stale slot
+// right after a structural edit) keep the earlier gain; the governing audio_seek
+// re-provisions them.
+audio_gain_fold :: proc(slot: ^Audio_Geom_Slot) {
+	for ci in 0 ..< slot.n {
+		chip := &slot.chip[ci]
+		path := audio_chip_path(slot, chip)
+		for k in 0 ..< play_src_count {
+			s := &play_srcs[k]
+			if s.seg_count == 0 || s.stream_index != chip.stream_index || string(s.path) != path {
+				continue
+			}
+			for si in 0 ..< s.seg_count {
+				seg := &s.seg[si]
+				if seg.start_a == chip.timeline_start && seg.start_s == chip.source_start && seg.len_a == chip.source_len {
+					seg.gain = db_to_linear(chip.gain_dB)
+					break
+				}
+			}
+		}
+	}
 }
 
 // audio_note_edit tells the producer the clip set or playhead changed out of
@@ -822,6 +885,7 @@ audio_provision :: proc(play_frame: i64) {
 			start_a = chip.timeline_start,
 			start_s = chip.source_start,
 			len_a   = chip.source_len,
+			gain    = db_to_linear(chip.gain_dB),
 		}
 		g.seg_count += 1
 	}
@@ -931,6 +995,13 @@ audio_src_seek_anchor :: proc(s: ^Play_Src, content_sec: f64) -> bool {
 	return true
 }
 
+// db_to_linear converts a decibel level to an amplitude multiplier: +6 dB
+// doubles the amplitude, -20 dB is 1/10. Odin's math.pow overloads f32
+// (pow_f32), keeping this an f32-only call.
+db_to_linear :: proc(db: f32) -> f32 {
+	return math.pow(10, db / 20)
+}
+
 // audio_frame_boundary48 returns the exact (fractional, floor-truncated) 48kHz
 // sample index at which timeline frame `frame` begins, relative to the start
 // of the timeline (frame 0). Used to derive the true per-frame sample count
@@ -985,10 +1056,14 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 			continue
 		}
 		base := int(start48 - s.first48)
+		// Per-segment constant gain folded in as one multiply per sample; the
+		// ring already covers this frame (checked above), so gain is the only
+		// new term here.
+		g := seg.gain
 		for f in 0 ..< spf {
 			l, r := ring_at(&s.fifo, base + f)
-			mix[f * 2 + 0] += l
-			mix[f * 2 + 1] += r
+			mix[f * 2 + 0] += l * g
+			mix[f * 2 + 1] += r * g
 		}
 		delivered = true
 		if audio_trace {
@@ -1209,6 +1284,14 @@ audio_producer_feed :: proc() {
 	queued_frames := i64(f64(sdl.GetAudioStreamQueued(audio_stream)) * rate_sc / f64(spf * 2 * 2))
 	dev_pos := audio_play_frame - queued_frames
 	sync.atomic_store(&audio_dev_frame, dev_pos)
+	// Fold live gain edits (knob drag) into provisioned segments before mixing.
+	// The epoch check is cheap; folding only runs when the UI published a gain
+	// change since the last fold. No seek, so the drag is audible within the
+	// cushion instead of reopening every decoder per knob move.
+	if sync.atomic_load(&audio_gain_epoch) != audio_gain_folded_epoch {
+		audio_gain_fold(&audio_geom[sync.atomic_load(&audio_geom_idx)])
+		audio_gain_folded_epoch = sync.atomic_load(&audio_gain_epoch)
+	}
 	// Pin the queue to the playhead, extrapolated from the UI's published clock
 	// snapshot across any UI update gap (the render loop can block for a second
 	// on the swapchain acquire while the device keeps consuming). Freezing at

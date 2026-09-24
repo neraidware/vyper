@@ -21,6 +21,15 @@ BUTTON_H_PAD :: 10         // Padding{left/right} inside small buttons/fields.
 SWITCH_W :: f32(40)        // Binary toggle (switch_toggle) track width.
 SWITCH_H :: f32(22)        // Binary toggle (switch_toggle) track height.
 SWITCH_KNOB :: f32(16)     // Binary toggle (switch_toggle) knob diameter.
+// Gain knob: circular dial sized to sit beside its dB value field in the
+// clip card; the shader's exact circle needs cornerRadius = half the size.
+KNOB_DIAMETER :: f32(30)
+KNOB_VALUE_W :: 84         // gain value field width (keeps the knob row one line).
+GAIN_KNOB_SWEEP_DEG :: 90.0    // pointer half-sweep from 12 o'clock (deg): -90 at min
+                               // (9 o'clock) .. +90 at max (3 o'clock); 0 dB = straight up.
+GAIN_KNOB_NEEDLE_LEN :: 0.75   // needle total length as a fraction of the diameter.
+GAIN_KNOB_NEEDLE_W :: 2.5      // capsule thickness (px).
+GAIN_KNOB_HUB_R :: 3.0         // center hub radius (px), anchors the needle.
 TAB_H :: f32(24)           // Bottom-of-panel view-separator tab height.
 
 // Corner radii (visual hierarchy: container > panel > widget > button).

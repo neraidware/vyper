@@ -37,6 +37,7 @@ UI_TEXT_TRACK:       [256]u8
 UI_TEXT_FILE:        [256]u8
 UI_TEXT_DUR:         [128]u8
 UI_TEXT_IO:          [128]u8
+UI_TEXT_GAIN:        [64]u8
 UI_TEXT_X:           [64]u8
 UI_TEXT_Y:           [64]u8
 UI_TEXT_S:           [64]u8
@@ -1188,6 +1189,66 @@ clip_card :: proc() {
 			) {
 				prop_field("PropCropT", "T", t_val, editing_field == .Crop_T)
 				prop_field("PropCropB", "B", b_val, editing_field == .Crop_B)
+			}
+		} else {
+			// Audio clips get the gain row: a drag-to-set knob (the GainKnob
+			// element the interaction probe hit-tests) plus the dB value field.
+			// The needle is drawn over the knob after layout (draw_gain_knob).
+			if clay.UI(clay.ID("GainRow"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+					layoutDirection = .LeftToRight,
+					childGap = BUTTON_ROW_GAP,
+					childAlignment = {x = .Left, y = .Center},
+				},
+			},
+			) {
+				knob_active := active_interaction == .Gain_Drag
+				if clay.UI(clay.ID("GainKnob"))(
+				{
+					layout = {
+						sizing = {width = clay.SizingFixed(KNOB_DIAMETER), height = clay.SizingFixed(KNOB_DIAMETER)},
+					},
+					backgroundColor = BUTTON,
+					border = {
+						color = clay.Hovered() || knob_active ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+						width = clay.BorderOutside(1),
+					},
+					// cornerRadius = half the side collapses the SDF to an
+					// exact circle (matches rounded_rect.frag's clamp).
+					cornerRadius = clay.CornerRadiusAll(KNOB_DIAMETER / 2),
+				},
+				) {}
+				clay.Text(
+					"Gain",
+					clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+				)
+				g_buf := UI_TEXT_GAIN[:]
+				g_val := fmt.bprintf(g_buf[:], "%.1f dB", cl.gain)
+				if editing_field == .Gain {
+					g_val = string(edit_chars[:edit_len])
+				}
+				if clay.UI(clay.ID("PropFieldGain"))(
+				{
+					layout = {
+						sizing = {width = clay.SizingFixed(KNOB_VALUE_W), height = clay.SizingFixed(FIELD_H)},
+						childAlignment = {x = .Left, y = .Center},
+						padding = clay.PaddingAll(6),
+					},
+					backgroundColor = editing_field == .Gain ? BUTTON_HOVER : BUTTON,
+					border = {
+						color = editing_field == .Gain ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+						width = clay.BorderOutside(editing_field == .Gain ? 2 : 1),
+					},
+					cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+				},
+				) {
+					clay.Text(
+						g_val,
+						clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
+					)
+				}
 			}
 		}
 	}

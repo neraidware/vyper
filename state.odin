@@ -250,6 +250,10 @@ Clip :: struct {
 	// the clip's lifetime without any ownership/freeing on the clip.
 	srt_id:               int,
 	stream_index:         c.int,
+	// gain: output level of the clip's audio, in decibels (0.0 = unity). Rides
+	// the per-clip audio snapshot through the mix; applies to any media kind,
+	// only audible for Audio clips.
+	gain:                 f32,
 	source_start_frame:   i64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
@@ -496,6 +500,7 @@ Edit_Field :: enum {
 	Crop_R,
 	Crop_T,
 	Crop_B,
+	Gain,
 }
 
 editing_field: Edit_Field
@@ -759,7 +764,26 @@ Interaction :: enum {
 	Media_Bin_Drag,
 	Handle_Drag,   // dragging a preview resize/crop handle
 	Track_Drag,    // dragging a whole track onto an insert gap (reorder)
+	Gain_Drag,     // dragging an audio clip's gain knob in the inspector
 }
+
+// Gain knob constants. Gain is edited in decibels; the knob sweeps the
+// REAPER-ish item-volume range and the text field clamps to it on commit.
+GAIN_MIN_DB :: -48.0
+GAIN_MAX_DB :: 48.0
+// Gain knob pointer delta: ctrl held gives fine 0.1 dB per pixel; the default
+// drag is coarse, one 1 dB step per 10 px of horizontal travel from the
+// gesture's start (threshold-quantized).
+GAIN_FINE_DB_PER_PX :: 0.1
+GAIN_COARSE_DB_PER_10PX :: 1.0
+GAIN_COARSE_PX_PER_STEP :: 10
+
+// gain_drag_* capture the state of a live gain-knob drag. The resolved clip
+// pointer stays valid because the drag grabs the mouse (selection can't
+// change mid-drag) and clip arrays don't grow while dragging.
+gain_drag_clip: ^Clip
+gain_drag_start_x: f32
+gain_drag_start_db: f32
 dragging_handle: Maybe(Handle)
 handle_kind: Handle_Kind = .None
 handle_start_mx: f32
