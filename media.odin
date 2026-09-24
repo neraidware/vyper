@@ -603,6 +603,36 @@ import_media :: proc(path: cstring) {
 	}
 }
 
+// open_file_at opens a media/subtitle file through the Open-File flow: subtitle
+// files load into the bin only (the user drags them onto a track), decodable
+// media imports to the bin AND is placed on the timeline (appended at the end).
+// Non-decodable files (and, for the ":" command line, a nonexistent path) show
+// a notice and change nothing. Returns (opened, retained): `retained` is true
+// when a NEW asset stored `path`, so the caller must keep it alive; on the
+// dedup path (file already in the bin) opened=true but retained=false and the
+// caller may free `path` — the existing asset's copy is what stays alive.
+open_file_at :: proc(path: cstring) -> (opened, retained: bool) {
+	if is_srt_pick(path) {
+		before := len(media_assets)
+		opened = import_srt_to_bin(path) != 0
+		return opened, len(media_assets) > before
+	}
+	probe := probe_streams(path)
+	if !probe.has_video && !probe.has_audio && !media_is_image(path) {
+		show_ui_notice(
+			fmt.aprintf("Could not open '%s': not decodable media", path_basename(path)),
+			4000,
+		)
+		return false, false
+	}
+	before := len(media_assets)
+	if asset_id := import_media_to_bin(path); asset_id != 0 {
+		add_asset_to_timeline(asset_id, 0, timeline_duration())
+		return true, len(media_assets) > before
+	}
+	return false, false
+}
+
 open_file_picker :: proc() -> cstring {
 	when ODIN_OS == .Windows {
 		return win32_open_file_picker()

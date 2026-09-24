@@ -377,6 +377,45 @@ apply_rename :: proc() {
 	}
 }
 
+// apply_command handles a committed command line: it records the text as
+// last_command (the prompt's placeholder) and, when the command is known,
+// executes it. Supported:
+//   open <file>  — open a media/subtitle file through the same flow as the
+//                  Open File button (decodable only: no silent junk imports).
+apply_command :: proc() {
+	cmd := text_input_string()
+	if len(last_command) > 0 {
+		delete(last_command)
+	}
+	last_command = strings.clone(cmd)
+
+	trimmed := strings.trim_space(cmd)
+	sp := 0
+	for sp < len(trimmed) && trimmed[sp] != ' ' && trimmed[sp] != '\t' {
+		sp += 1
+	}
+	if sp == len(trimmed) || trimmed[:sp] != "open" {
+		return
+	}
+	path := strings.trim_space(trimmed[sp:])
+	if len(path) == 0 {
+		show_ui_notice("Usage: open <file>", 3000)
+		return
+	}
+	if !os.exists(path) {
+		show_ui_notice(fmt.aprintf("No such file '%s'", path), 4000)
+		return
+	}
+	// The asset retains this cstring (like the picker's glib-owned buffer), so
+	// it must outlive the command input buffer: clone to session heap and only
+	// free when open_file_at says nothing new stored it.
+	cpath := strings.clone_to_cstring(path)
+	_, retained := open_file_at(cpath)
+	if !retained {
+		delete(cpath)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Playhead time viewer: numeric timeline navigation. The timeline toolbar's
 // time badge (PlayheadTime) opens the generic text input pre-filled with the
@@ -926,6 +965,7 @@ main :: proc() {
 		win_ffmpeg_versions_diag()
 	}
 	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
+	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
 	// the audio producer reads playback_rate for its atempo graph and cushion.
 	if v := os.get_env_alloc("VYPER_RATE", context.temp_allocator); v != "" {
@@ -1026,6 +1066,13 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		async_dec_init()
 		defer async_dec_shutdown()
 		duplicate_probe_run(dp)
+		return
+	}
+	if fp, _ := os.lookup_env_alloc("VYPER_FLASH_PROBE", context.temp_allocator); fp != "" {
+		async_live_mode = false
+		async_dec_init()
+		defer async_dec_shutdown()
+		flash_probe_run(fp)
 		return
 	}
 	if atp, _ := os.lookup_env_alloc("VYPER_ATEMPO_PROBE", context.temp_allocator); atp != "" {
