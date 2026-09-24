@@ -168,19 +168,7 @@ click_cases := []Click_Case{
 	} },
 	{ id = "OpenFileButton", action = proc(_: Mouse_Input) {
 		if path := open_file_picker(); path != nil {
-			if is_srt_pick(path) {
-				// Subtitle pick: into the bin as an asset, placed on the
-				// timeline only when the user drags it to a track (can't
-				// probe a text file as media).
-				import_srt_to_bin(path)
-			} else {
-				// Classic Open File flow: probe the file and drop it straight
-				// onto the timeline (appended at the end), keeping its bin
-				// entry.
-				if asset_id := import_media_to_bin(path); asset_id != 0 {
-					add_asset_to_timeline(asset_id, 0, timeline_duration())
-				}
-			}
+			open_file_at(path)
 		}
 	} },
 	{ id = "Res720", action = proc(_: Mouse_Input) { set_project_resolution_preset(1280, 720) } },
