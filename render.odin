@@ -242,6 +242,61 @@ render_output_name :: proc() -> string {
 // worker never touches live timeline state.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Keyed geometry in the render worker (S6).
+//
+// A video/image clip whose transform/scale/crop properties carry keyframes is
+// EXPORTED ANIMATED: the worker decodes at a stage sized to the range's max
+// scale once, then per frame samples the seven properties at the timeline
+// frame and region-copies the matching sub-rect of the stage (the mapping is
+// 1:1 — the box scales linearly with `scale`, so the animated box is a
+// centered crop of the max-scale stage with no resampling). Clips with no
+// geometry keys keep the old baked path untouched.
+// ---------------------------------------------------------------------------
+
+KF_RENDER_MAX_KEYS :: 64
+
+Render_Geom_Prop :: enum u8 {
+	Trans_X,
+	Trans_Y,
+	Scale,
+	Crop_L,
+	Crop_R,
+	Crop_T,
+	Crop_B,
+	_COUNT,
+}
+
+render_geom_name :: proc(p: Render_Geom_Prop) -> string {
+	switch p {
+	case .Trans_X:
+		return "transform.x"
+	case .Trans_Y:
+		return "transform.y"
+	case .Scale:
+		return "scale"
+	case .Crop_L:
+		return "crop.l"
+	case .Crop_R:
+		return "crop.r"
+	case .Crop_T:
+		return "crop.t"
+	case .Crop_B:
+		return "crop.b"
+	case ._COUNT:
+		unreachable()
+	}
+	return ""
+}
+
+// Render_Kf_Flat is one geometry property's key track copied FLAT onto a
+// Render_Video_Src. Filled on the UI thread at render_start; the worker owns
+// it for the job and never touches the live timeline (kf_fill_snapshot).
+Render_Kf_Flat :: struct {
+	keys: [KF_RENDER_MAX_KEYS]Keyframe,
+	n:    int,
+}
+
 Render_Video_Src :: struct {
 	path:                 cstring, // owned copy, freed by the worker
 	stream_index:         c.int,
@@ -260,6 +315,17 @@ Render_Video_Src :: struct {
 	crop_b:               f32,
 	source_w:             c.int,
 	source_h:             c.int,
+	// Keyed geometry (S6): when any of the 7 geometry properties is keyed,
+	// geom_keyed routes the worker through per-frame evaluation and stage
+	// sub-rect blitting. kf_geom is the UI-thread snapshot; keys ride with the
+	// job (fixed arrays, no extra ownership). blit_sx/sy are the per-frame src
+	// origin into the stage slot, recomputed by render_eval_keyed_geom each
+	// composite frame (worker-owned; the producer ignores them).
+	geom_keyed:          bool,
+	scale_keyed:         bool,
+	stage_scale:         f32,
+	kf_geom:             [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
+	kres_scratch:        []u8,
 	// Compositing state (computed once at open).
 	dec:                  Clip_Decoder,
 	rw, rh:               c.int, // display (cropped box) rect size in output pixels
@@ -506,6 +572,50 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	r = src.transform_x + cw / 2 - src.crop_r * cw
 	t = src.transform_y - ch / 2 + src.crop_t * ch
 	b = src.transform_y + ch / 2 - src.crop_b * ch
+	return
+}
+
+// render_kf_geom_rect evaluates a keyed clip's animation at clip offset `off`
+// and derives the display rect plus the stage sub-rect. Pure pixel math —
+// pinned by VYPER_RENDER_KF_PROBE. stage_w/h is the max-scale decode stage
+// (the whole frame); the animated box is a centered fraction of it (both are
+// uniform resamples of the same source, and the box width is linear in
+// `scale`), and crop insets carve fractions of that. With a fixed scale the
+// src sub-rect pixels equal the display pixels — a lossless region copy; with
+// animated scale the same sub-rect feeds one sws resample per frame.
+render_kf_geom_rect :: proc(
+	geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
+	off: i32,
+	base_tx, base_ty, base_s, base_cl, base_cr, base_ct, base_cb: f32,
+	draw_w, draw_h: c.int,
+	source_w, source_h, stage_w, stage_h: c.int,
+) -> (
+	tx, ty, s, cl, cr, ct, cb: f32,
+	ox, oy, rw, rh, srcx, srcy, srcw, srch: c.int,
+) {
+	tx, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_X)].keys[:geom[int(Render_Geom_Prop.Trans_X)].n], off, base_tx)
+	ty, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_Y)].keys[:geom[int(Render_Geom_Prop.Trans_Y)].n], off, base_ty)
+	s, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Scale)].keys[:geom[int(Render_Geom_Prop.Scale)].n], off, base_s)
+	cl, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_L)].keys[:geom[int(Render_Geom_Prop.Crop_L)].n], off, base_cl)
+	cr, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_R)].keys[:geom[int(Render_Geom_Prop.Crop_R)].n], off, base_cr)
+	ct, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_T)].keys[:geom[int(Render_Geom_Prop.Crop_T)].n], off, base_ct)
+	cb, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_B)].keys[:geom[int(Render_Geom_Prop.Crop_B)].n], off, base_cb)
+	cw, ch := render_full_box_dims(source_w, source_h, f32(draw_w) * s, f32(draw_h) * s)
+	l := tx - cw / 2 + cl * cw
+	r := tx + cw / 2 - cr * cw
+	t := ty - ch / 2 + ct * ch
+	b := ty + ch / 2 - cb * ch
+	ox = c.int(math.round(l))
+	oy = c.int(math.round(t))
+	rw = max(1, c.int(r - l + 0.5))
+	rh = max(1, c.int(b - t + 0.5))
+	srcx = clamp(c.int(cl * f32(stage_w) + 0.5), 0, stage_w - 1)
+	srcy = clamp(c.int(ct * f32(stage_h) + 0.5), 0, stage_h - 1)
+	srcw = clamp(c.int(f32(stage_w) * (1.0 - cl - cr) + 0.5), 1, stage_w - srcx)
+	srch = clamp(c.int(f32(stage_h) * (1.0 - ct - cb) + 0.5), 1, stage_h - srcy)
+	// Never copy past the stage bounds.
+	rw = min(rw, stage_w - srcx)
+	rh = min(rh, stage_h - srcy)
 	return
 }
 
@@ -1600,6 +1710,52 @@ render_worker_run :: proc() {
 	// Prepare compositing state for each video source.
 	for i in 0 ..< len(render_job_videos) {
 		v := &render_job_videos[i]
+		if v.geom_keyed {
+			// S6 animated path: decode ONCE at a stage sized to the max scale
+			// this clip reaches (resting or keyed), then per frame the
+			// composite samples the seven properties and region-copies the
+			// matching sub-rect of the stage (linear in `scale`, so the box is
+			// a centered crop of the stage — lossless, no per-frame decode).
+			// A keyed clip can move anywhere on the canvas, so it is never
+			// fw-zeroed, and neither the visibility crop (the WHOLE stage must
+			// be present every frame) nor the static crop resampler is built.
+			stage_scale := v.scale
+			for k in v.kf_geom[int(Render_Geom_Prop.Scale)].keys[:v.kf_geom[int(Render_Geom_Prop.Scale)].n] {
+				if k.value > stage_scale {
+					stage_scale = k.value
+				}
+			}
+			v.stage_scale = max(stage_scale, 0.0001)
+			scw, sch := render_full_box_dims(
+				v.source_w,
+				v.source_h,
+				f32(render_job_width) * v.stage_scale,
+				f32(render_job_height) * v.stage_scale,
+			)
+			v.fw = max(1, c.int(scw + 0.5))
+			v.fh = max(1, c.int(sch + 0.5))
+			// Seed the display rect with the resting pose; the composite
+			// recomputes it per frame before every blit.
+			l, t, r, b := render_display_rect(v, render_job_width, render_job_height)
+			v.rw = max(1, c.int(r - l + 0.5))
+			v.rh = max(1, c.int(b - t + 0.5))
+			v.ox = c.int(l + 0.5)
+			v.oy = c.int(t + 0.5)
+			for &slot in &v.blit_slots {
+				slot.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
+			}
+			if v.scale_keyed {
+				// Per-frame resample scratch: the animated box is at most the
+				// full stage, so one stage-sized buffer covers every frame.
+				v.kres_scratch = make([]u8, int(v.fw) * int(v.fh) * 4)
+			}
+			if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
+				err_msg = "failed to open video source"
+				fail = true
+				return
+			}
+			continue
+		}
 		l, t, r, b := render_display_rect(v, render_job_width, render_job_height)
 		v.rw = max(1, c.int(r - l + 0.5))
 		v.rh = max(1, c.int(b - t + 0.5))
@@ -1691,14 +1847,26 @@ render_worker_run :: proc() {
 	// overwritten by an opaque blit on every frame, so mem.zero in the frame
 	// loop is dead work. Only clips whose range encloses the whole render
 	// range are counted — a clip absent on some frame leaves stale pixels
-	// behind, which is exactly why the zero exists.
-	skip_canvas_zero := len(render_job_videos) > 0 && render_span_cover_canvas(
-		render_job_videos,
-		render_job_start,
-		render_job_nframes,
-		render_job_width,
-		render_job_height,
-	)
+	// behind, which is exactly why the zero exists. A geometry-keyed clip
+	// ALSO defeats it: its rect moves every frame, so a stale pose could
+	// leak where it was.
+	any_keyed := false
+	for &v in render_job_videos {
+		if v.geom_keyed {
+			any_keyed = true
+			break
+		}
+	}
+	skip_canvas_zero :=
+		len(render_job_videos) > 0 &&
+		!any_keyed &&
+		render_span_cover_canvas(
+			render_job_videos,
+			render_job_start,
+			render_job_nframes,
+			render_job_width,
+			render_job_height,
+		)
 
 	// Start the P5 decode-ahead producer once every decoder is open and its
 	// blit slots are allocated. The producer owns all decoders from here on;
@@ -1878,7 +2046,11 @@ render_worker_run :: proc() {
 			if !slot.ok {
 				continue
 			}
-			render_blit(eslot.canvas, render_job_width, render_job_height, v, slot)
+			if v.geom_keyed {
+				render_eval_keyed_geom(v, timeline_frame, slot, eslot.canvas)
+			} else {
+				render_blit(eslot.canvas, render_job_width, render_job_height, v, slot)
+			}
 		}
 		// Composite all text clips covering this frame (after the decodable
 		// clips, alpha-blended on top, matching the preview layering).
@@ -2132,6 +2304,92 @@ render_span_cover_canvas :: proc(
 	return true
 }
 
+// render_blit_region copies a w x h sub-rect from a flat RGBA framebuffer
+// (src_stride = row pixel width) into the canvas at (ox, oy), clipping both
+// sides. Pure memcpy rows — used by the keyed geometry path.
+render_blit_region :: proc(canvas: []u8, draw_w, draw_h: c.int, src_buf: []u8, src_stride, srcx, srcy, ox, oy, rw, rh: c.int) {
+	top := max(oy, 0)
+	bottom := min(oy + rh, draw_h)
+	left := max(ox, 0)
+	right := min(ox + rw, draw_w)
+	if bottom <= top || right <= left {
+		return
+	}
+	rows := bottom - top
+	cols := right - left
+	srow := srcy + (top - oy)
+	scol := srcx + (left - ox)
+	for row in 0 ..< rows {
+		src := src_buf[uint(srow + row) * uint(src_stride) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
+		copy(dst, src)
+	}
+}
+
+// render_eval_keyed_geom samples a keyed clip's animated geometry at
+// `timeline_frame`, updates its blit rect fields, and composites it from the
+// max-scale stage slot. Returns true when the clip occupied (or attempted)
+// this frame; false means it was fully off-canvas and the composite skips it.
+// Worker thread: v.rw/rh/ox/oy are worker-owned and rewritten every frame.
+render_eval_keyed_geom :: proc(
+	v: ^Render_Video_Src,
+	timeline_frame: i64,
+	slot: ^Render_Blit_Slot,
+	canvas: []u8,
+) -> bool {
+	off := i32(timeline_frame - v.timeline_start_frame)
+	_, _, _, _, _, _, _, ox, oy, rw, rh, srcx, srcy, srcw, srch :=
+		render_kf_geom_rect(
+			&v.kf_geom,
+			off,
+			v.transform_x, v.transform_y, v.scale,
+			v.crop_l, v.crop_r, v.crop_t, v.crop_b,
+			render_job_width, render_job_height,
+			v.source_w, v.source_h, v.fw, v.fh,
+		)
+	v.rw, v.rh, v.ox, v.oy = rw, rh, ox, oy
+	if ox >= render_job_width || oy >= render_job_height ||
+	   ox + rw <= 0 || oy + rh <= 0 {
+		return false
+	}
+	if v.scale_keyed {
+		// Animated scale: the box is a resample of the whole frame (the stage
+		// was decoded at max scale), so resample the crop sub-rect of the
+		// stage down to the display rect.
+		ctx := sws.getContext(
+			srcw, srch, avutil.PixelFormat.RGBA,
+			rw, rh, avutil.PixelFormat.RGBA,
+			sws.Flags{.Bilinear}, nil, nil, nil,
+		)
+		if ctx == nil {
+			return true
+		}
+		defer sws.freeContext(ctx)
+		src_ptr := cast([^]u8)(uintptr(raw_data(slot.blit)) + uintptr((int(srcy) * int(v.fw) + int(srcx)) * 4))
+		dst_ptr := raw_data(v.kres_scratch)
+		sln: [1][^]u8 = {src_ptr}
+		ls:  [4]c.int = {c.int(v.fw) * 4, 0, 0, 0}
+		dln: [4]c.int = {c.int(rw) * 4, 0, 0, 0}
+		dsln: [1][^]u8 = {dst_ptr}
+		if sws.scale(
+			ctx,
+			cast([^][^]u8)&sln[0],
+			cast([^]c.int)&ls[0],
+			0, srch,
+			cast([^][^]u8)&dsln[0],
+			cast([^]c.int)&dln[0],
+		) < 0 {
+			return true
+		}
+		render_blit_region(canvas, render_job_width, render_job_height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
+		return true
+	}
+	// Scale fixed: the stage is already the box, so the crop sub-rect pixels
+	// equal the display pixels — one lossless region copy.
+	render_blit_region(canvas, render_job_width, render_job_height, slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh)
+	return true
+}
+
 // render_blit copies the clip's scaled frame onto the canvas, clipped to bounds.
 // The slot holds the full (pre-crop) frame plus the crop geometry the producer
 // resolved; crop insets select the visible
@@ -2184,7 +2442,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 	}
 	src_ptr := cast([^]u8)(uintptr(raw_data(slot.blit)) +
 		uintptr((int(v.crop_sy) * int(v.fw) + int(v.crop_sx)) * 4))
-	dst_ptr := cast([^]u8)raw_data(v.crop_scratch)
+	dst_ptr := raw_data(v.crop_scratch)
 	sln: [1][^]u8 = {src_ptr}
 	ls:  [4]c.int = {c.int(v.fw) * 4, 0, 0, 0}
 	dln: [4]c.int = {c.int(v.rw) * 4, 0, 0, 0}
@@ -2395,6 +2653,21 @@ render_start :: proc() {
 						source_h = clip.source_h,
 					},
 				)
+				// S6: snapshot the seven geometry key tracks flat so the
+				// worker can evaluate them per frame (UI thread, safe to read
+				// the live clip). geom_keyed routes through the animated path.
+				src := &cls[len(cls) - 1]
+				for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+					p := Render_Geom_Prop(pi)
+					slot := &src.kf_geom[int(p)]
+					slot.n, _ = kf_fill_snapshot(clip, render_geom_name(p), slot.keys[:])
+					if slot.n > 0 {
+						src.geom_keyed = true
+						if p == Render_Geom_Prop.Scale {
+							src.scale_keyed = true
+						}
+					}
+				}
 			case .Audio:
 				append(
 					&auds,

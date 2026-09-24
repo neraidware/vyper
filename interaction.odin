@@ -278,80 +278,86 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		return false
 	},
-	// Clicking an X/Y/Scale/crop property field focuses it for typing;
-	// Shift+click instead adds a keyframe for that property at the playhead.
-	// The track name is minted HERE (the consumer owns the property→name
-	// mapping; the store never interprets it) — see kf_add_prop.
+	// Clicking an X/Y/Scale/crop property field focuses it for typing; the
+	// diamond button beside it (KfAdd*) adds a keyframe for that property at
+	// the playhead. The track name is minted HERE (the consumer owns the
+	// property→name mapping; the store never interprets it) — see kf_add_prop.
 	proc(inp: Mouse_Input) -> bool {
 		sel, ok := transformable_selected()
 		if !ok {
 			return false
 		}
+		if clay.PointerOver(clay.ID("KfAddX")) {
+			kf_add_prop(sel, "transform.x", sel.transform_x)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddY")) {
+			kf_add_prop(sel, "transform.y", sel.transform_y)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddS")) {
+			kf_add_prop(sel, "scale", sel.scale)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddCropL")) {
+			kf_add_prop(sel, "crop.l", sel.crop_l)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddCropR")) {
+			kf_add_prop(sel, "crop.r", sel.crop_r)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddCropT")) {
+			kf_add_prop(sel, "crop.t", sel.crop_t)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddCropB")) {
+			kf_add_prop(sel, "crop.b", sel.crop_b)
+			return true
+		}
 		if clay.PointerOver(clay.ID("PropFieldX")) {
-			if inp.shift {
-				kf_add_prop(sel, "transform.x", sel.transform_x)
-			} else {
-				edit_begin(.X, sel.transform_x)
-			}
+			edit_begin(.X, sel.transform_x)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldY")) {
-			if inp.shift {
-				kf_add_prop(sel, "transform.y", sel.transform_y)
-			} else {
-				edit_begin(.Y, sel.transform_y)
-			}
+			edit_begin(.Y, sel.transform_y)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldS")) {
-			if inp.shift {
-				kf_add_prop(sel, "scale", sel.scale)
-			} else {
-				edit_begin(.Scale, sel.scale)
-			}
+			edit_begin(.Scale, sel.scale)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropL")) {
-			if inp.shift {
-				kf_add_prop(sel, "crop.l", sel.crop_l)
-			} else {
-				edit_begin(.Crop_L, sel.crop_l * 100)
-			}
+			edit_begin(.Crop_L, sel.crop_l * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropR")) {
-			if inp.shift {
-				kf_add_prop(sel, "crop.r", sel.crop_r)
-			} else {
-				edit_begin(.Crop_R, sel.crop_r * 100)
-			}
+			edit_begin(.Crop_R, sel.crop_r * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropT")) {
-			if inp.shift {
-				kf_add_prop(sel, "crop.t", sel.crop_t)
-			} else {
-				edit_begin(.Crop_T, sel.crop_t * 100)
-			}
+			edit_begin(.Crop_T, sel.crop_t * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropB")) {
-			if inp.shift {
-				kf_add_prop(sel, "crop.b", sel.crop_b)
-			} else {
-				edit_begin(.Crop_B, sel.crop_b * 100)
-			}
+			edit_begin(.Crop_B, sel.crop_b * 100)
 			return true
 		}
 		return false
 	},
-	// Gain knob drag + gain value field: the only inspector edit that targets
-	// audio clips (the X/Y/Scale/crop probe above rejects .Audio). The knob
-	// starts a live drag; the field focuses for typing like any other field.
+	// Gain knob drag + gain value field + gain keyframe diamond: the only
+	// inspector edit that targets audio clips (the X/Y/Scale/crop probe above
+	// rejects .Audio). The knob starts a live drag; the field focuses for
+	// typing like any other field; the KfAddGain diamond keys gain at the
+	// playhead.
 	proc(inp: Mouse_Input) -> bool {
 		_, cl, ok := selected_clip()
 		if !ok || cl.kind != .Audio {
 			return false
+		}
+		if clay.PointerOver(clay.ID("KfAddGain")) {
+			kf_add_prop(cl, "gain", cl.gain)
+			return true
 		}
 		if clay.PointerOver(clay.ID("GainKnob")) {
 			undo_begin()
@@ -362,11 +368,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldGain")) {
-			if inp.shift {
-				kf_add_prop(cl, "gain", cl.gain)
-			} else {
-				edit_begin(.Gain, cl.gain)
-			}
+			edit_begin(.Gain, cl.gain)
 			return true
 		}
 		return false

@@ -3,13 +3,23 @@ package main
 import "core:fmt"
 
 // Keyframe probe (VYPER_KEYFRAME_PROBE): headless regression checks for the
-// generic keyframe store — sorted insert/replace, the move-toward sample
-// (default + track step, hold on arrival, segment handoff), the split/trim
-// remaps, the deep-clone round-trip through clone_timeline, empty-track
-// deletion, and zero-value Clip{} safety. Builds its own Clip structs; no
-// decode, no SDL, no timeline globals.
+// generic keyframe store — sorted insert/replace, the linear sample (a key
+// applies on its own frame; between keys the value interpolates and reaches
+// the next key's value exactly on its frame; before the first key and past
+// the last key the property is inactive and the base/resting value rules), the
+// split/trim remaps, the deep-clone round-trip through clone_timeline,
+// empty-track deletion, and zero-value Clip{} safety. Builds its own Clip
+// structs; no decode, no SDL, no timeline globals.
 
 kf_probe_fail := false
+
+kf_approx :: proc(a, b: f32) -> bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d < 0.0001
+}
 
 kf_probe_check :: proc(cond: bool, msg: string, args: ..any) {
 	if !cond {
@@ -44,12 +54,14 @@ keyframe_probe_run :: proc() -> int {
 	// --- lookup: missing name ---------------------------------------------
 	kf_probe_check(kf_track_index(c, "scale") < 0, "unknown name must miss")
 
-	// --- move-toward sample, default step, base before first key ----------
-	// Dedicated two-key clip so the hold/approach scenario is unambiguous
-	// (the insert clip above carries a third key at 30).
+	// --- linear sample: a key applies on its own frame; between keys the ----
+	// value interpolates and reaches the NEXT key's value exactly on its
+	// frame. Before the first key and past the last key the caller's base
+	// rules (direct edits apply there).
 	smp := Clip {}
 	kf_set_key(&smp, "gain", 10, 5.0)
 	kf_set_key(&smp, "gain", 20, 2.0)
+	kf_set_key(&smp, "gain", 30, 8.0)
 	gt := kf_track_index(smp, "gain")
 	gain: ^Kf_Track
 	if gt >= 0 {
@@ -59,32 +71,33 @@ keyframe_probe_run :: proc() -> int {
 	kf_probe_check(!ok && v == 7.0, "before first key: inactive, base kept (v=%v ok=%v)", v, ok)
 	v, ok = kf_sample(gain, 9, 7.0)
 	kf_probe_check(!ok && v == 7.0, "still before first key at off 9: base kept")
-	// first key at 10 target 5, base 0, default step 1.
-	v, ok = kf_sample(gain, 10, 0.0)
-	kf_probe_check(ok && v == 0.0, "key holds its origin on its own frame (got %v)", v)
-	v, _ = kf_sample(gain, 11, 0.0)
-	kf_probe_check(v == 1.0, "steps up 1/frame after the key frame (got %v)", v)
-	v, _ = kf_sample(gain, 14, 0.0)
-	kf_probe_check(v == 4.0, "mid-approach (got %v)", v)
-	v, _ = kf_sample(gain, 15, 0.0)
-	kf_probe_check(v == 5.0, "arrives exactly at target (got %v)", v)
-	v, _ = kf_sample(gain, 16, 0.0)
-	kf_probe_check(v == 5.0, "holds after arrival inside the segment (got %v)", v)
-	v, _ = kf_sample(gain, 100, 0.0)
-	kf_probe_check(v == 2.0, "holds the LAST key's target at end of track (got %v)", v)
+	// first key at 10 target 5.
+	v, ok = kf_sample(gain, 10, 7.0)
+	kf_probe_check(ok && v == 5.0, "a key applies ITS value on its own frame (got %v)", v)
+	v, _ = kf_sample(gain, 11, 7.0)
+	kf_probe_check(kf_approx(v, 4.7), "interpolates toward the next key's value (got %v)", v)
+	v, _ = kf_sample(gain, 14, 7.0)
+	kf_probe_check(kf_approx(v, 3.8), "linear across the segment (got %v)", v)
+	v, _ = kf_sample(gain, 15, 7.0)
+	kf_probe_check(kf_approx(v, 3.5), "midpoint is halfway (got %v)", v)
+	v, _ = kf_sample(gain, 19, 7.0)
+	kf_probe_check(kf_approx(v, 2.3), "near the next key (got %v)", v)
+	v, _ = kf_sample(gain, 20, 7.0)
+	kf_probe_check(v == 2.0, "arrives at exactly the next key's value on its frame (got %v)", v)
+	// second segment 20->30: 2 -> 8.
+	v, _ = kf_sample(gain, 25, 7.0)
+	kf_probe_check(v == 5.0, "second segment midpoint (got %v)", v)
+	v, _ = kf_sample(gain, 30, 7.0)
+	kf_probe_check(v == 8.0, "third key applies its value on its frame (got %v)", v)
+	// past the last key: inactive again, resting base wins (direct edits apply).
+	v, ok = kf_sample(gain, 31, 7.0)
+	kf_probe_check(!ok && v == 7.0, "past the last key: inactive, base restored (v=%v ok=%v)", v, ok)
+	v, _ = kf_sample(gain, 100, 7.0)
+	kf_probe_check(!ok && v == 7.0, "far past the last key: base holds (got %v)", v)
 
-	// --- segment handoff: next key starts from the previous arrival --------
-	// second key at 20 target 2, origin = 5 (already arrived).
-	v, _ = kf_sample(gain, 20, 0.0)
-	kf_probe_check(v == 5.0, "new key holds the previous arrival on its own frame")
-	v, _ = kf_sample(gain, 21, 0.0)
-	kf_probe_check(v == 4.0, "steps down toward the new target (got %v)", v)
-	v, _ = kf_sample(gain, 23, 0.0)
-	kf_probe_check(v == 2.0, "arrives at second target (got %v)", v)
-	v, _ = kf_sample(gain, 50, 0.0)
-	kf_probe_check(v == 2.0, "holds second target (got %v)", v)
-
-	// --- descending approach from base -------------------------------------
+	// --- lone key / no later target -----------------------------------------
+	// A single key pins its frame only; everywhere else the resting base
+	// rules, so direct edits show up even though a key exists.
 	d := Clip {}
 	kf_set_key(&d, "x", 5, 0.0)
 	dt := kf_track_index(d, "x")
@@ -92,33 +105,40 @@ keyframe_probe_run :: proc() -> int {
 	if dt >= 0 {
 		dx = &d.keyframe_tracks[dt]
 	}
-	v, _ = kf_sample(dx, 5, 10.0)
-	kf_probe_check(v == 10.0, "descending key holds base on its frame")
-	v, _ = kf_sample(dx, 6, 10.0)
-	kf_probe_check(v == 9.0, "descends 1/frame (got %v)", v)
+	v, ok = kf_sample(dx, 5, 10.0)
+	kf_probe_check(ok && v == 0.0, "lone key pins its frame (got %v)", v)
+	v, ok = kf_sample(dx, 6, 10.0)
+	kf_probe_check(!ok && v == 10.0, "a frame after the lone key: base restored (v=%v ok=%v)", v, ok)
 	v, _ = kf_sample(dx, 15, 10.0)
-	kf_probe_check(v == 0.0, "arrives at 0 from a descending approach (got %v)", v)
+	kf_probe_check(!ok && v == 10.0, "lone key does not hold to the end (got %v)", v)
 
-	// --- track step overrides the default ----------------------------------
+	// --- linear segment: exact arrival + deactivation ------------------------
 	s := Clip {}
-	kf_set_key(&s, "scale", 3, 10.0, step = 2.0)
+	kf_set_key(&s, "scale", 3, 10.0)
+	kf_set_key(&s, "scale", 8, 0.0)
 	st := kf_track_index(s, "scale")
 	sx: ^Kf_Track
 	if st >= 0 {
 		sx = &s.keyframe_tracks[st]
 	}
-	v, _ = kf_sample(sx, 4, 0.0)
-	kf_probe_check(v == 2.0, "track step 2 (got %v)", v)
-	v, _ = kf_sample(sx, 8, 0.0)
-	kf_probe_check(v == 10.0, "arrives with the track's step (got %v)", v)
+	v, ok = kf_sample(sx, 3, 1.0)
+	kf_probe_check(ok && v == 10.0, "first key applies at its frame (got %v)", v)
+	v, _ = kf_sample(sx, 6, 1.0)
+	kf_probe_check(v == 4.0, "linear at 3/5 of the segment (got %v)", v)
+	v, _ = kf_sample(sx, 8, 1.0)
+	kf_probe_check(v == 0.0, "reaches the next key's value exactly on its frame (got %v)", v)
+	v, ok = kf_sample(sx, 9, 1.0)
+	kf_probe_check(!ok && v == 1.0, "past the last key: inactive again (v=%v ok=%v)", v, ok)
+	v, _ = kf_sample(sx, 10, 1.0)
+	kf_probe_check(!ok && v == 1.0, "still base after the last key (got %v)", v)
 
 	// --- kf_sample_for at a timeline frame, clip-relative -------------------
 	sf := Clip {timeline_start_frame = 100}
 	kf_set_key(&sf, "gain", 0, 4.0)
-	v, _ = kf_sample_for(&sf, "gain", 100, 9.0)
-	kf_probe_check(v == 9.0, "frame 100 == clip-relative off 0: origin held (got %v)", v)
-	v, _ = kf_sample_for(&sf, "gain", 101, 9.0)
-	kf_probe_check(v == 8.0, "frame 101 == off 1: descends toward 4 (got %v)", v)
+	v, ok = kf_sample_for(&sf, "gain", 100, 9.0)
+	kf_probe_check(ok && v == 4.0, "frame 100 == clip-relative off 0: the key's value applies (got %v)", v)
+	v, ok = kf_sample_for(&sf, "gain", 101, 9.0)
+	kf_probe_check(!ok && v == 9.0, "frame 101 == off 1: lone key past, base applies (got %v)", v)
 	v, ok = kf_sample_for(&sf, "scale", 100, 9.0)
 	kf_probe_check(!ok && v == 9.0, "unknown property: base kept, inactive")
 
@@ -147,9 +167,9 @@ keyframe_probe_run :: proc() -> int {
 	kf_probe_check(right_ok, "right re-relatives keys >= cut by -cut")
 	if right_ok {
 		v, _ = kf_sample(&sp_right.keyframe_tracks[0], 0, 0.0)
-		kf_probe_check(v == 0.0, "right off 0 == old frame 40: origin held")
+		kf_probe_check(v == 2.0, "right off 0 == old frame 40: the key's own value applies")
 		v, _ = kf_sample(&sp_right.keyframe_tracks[0], 5, 0.0)
-		kf_probe_check(v == 2.0, "right off 5 == old frame 45: arrives at the key value")
+		kf_probe_check(v == 3.0, "right off 5 == old frame 45: key value applies at its frame")
 	}
 
 	// --- trim head / trim tail ---------------------------------------------
@@ -176,9 +196,45 @@ keyframe_probe_run :: proc() -> int {
 	}
 	kf_probe_check(trim2_ok, "trim_tail drops keys beyond the new length")
 
+	// --- flat-copy evaluator (the audio producer's sampler) mirrors kf_sample --
+	// The audio producer re-evaluates keyed gain each frame from its OWN flat
+	// snapshot (kf_sample_keys), never the live track. It must agree with
+	// kf_sample on the same keys at every offset.
+	fc := Clip {timeline_start_frame = 200}
+	kf_set_key(&fc, "gain", 10, 8.0)
+	kf_set_key(&fc, "gain", 20, 2.0)
+	fc_ti := kf_track_index(fc, "gain")
+	fc_same := false
+	if fc_ti >= 0 {
+		tk := &fc.keyframe_tracks[fc_ti]
+		fc_same = true
+		for off := i32(0); off <= 40; off += 1 {
+			tv, tok := kf_sample(tk, off, 4.0)
+			fv, fok := kf_sample_keys(tk.keys[:], off, 4.0)
+			if tv != fv || tok != fok {
+				fc_same = false
+				break
+			}
+		}
+		// Segment-relative addressing is frame - seg.start_a; the key at
+		// clip-relative 10 applies its own value at 210, then interpolates
+		// toward the next key's 2: 211 -> 7.4, 219 -> 2.6, and past the last
+		// key (225) the resting base 4 rules.
+		f10, _ := kf_sample_keys(tk.keys[:], i32(210 - 200), 4.0)
+		f11, _ := kf_sample_keys(tk.keys[:], i32(211 - 200), 4.0)
+		f19, _ := kf_sample_keys(tk.keys[:], i32(219 - 200), 4.0)
+		f25, fok := kf_sample_keys(tk.keys[:], i32(225 - 200), 4.0)
+		kf_probe_check(
+			f10 == 8.0 && kf_approx(f11, 7.4) && kf_approx(f19, 2.6) && !fok && f25 == 4.0,
+			"flat sampler is clip-relative on timeline addresses (210->%v 211->%v 219->%v 225->%v ok=%v)",
+			f10, f11, f19, f25, fok,
+		)
+	}
+	kf_probe_check(fc_same, "kf_sample_keys agrees with kf_sample on a copied track")
+
 	// --- deep clone through clone_timeline: mutate clone, original untouched -
 	base := Clip {timeline_start_frame = 50}
-	kf_set_key(&base, "gain", 10, 1.5, step = 3.0)
+	kf_set_key(&base, "gain", 10, 1.5)
 	kf_set_key(&base, "gain", 20, 2.5)
 	kf_set_key(&base, "scale", 0, 9.0)
 	src := Timeline {}
@@ -232,8 +288,8 @@ keyframe_probe_run :: proc() -> int {
 		clone_ok = no30 && len(keys) == 1
 	}
 	kf_probe_check(clone_ok, "clone is unaffected by the original's new key 30 (deep copy)")
-	sv, _ := kf_sample_for(&base, "scale", 59, 0.0) // off 9, far past arrival
-	kf_probe_check(sv == 9.0, "original scale untouched by the clone's poke (got %v)", sv)
+	sv, _ := kf_sample_for(&base, "scale", 59, 0.0) // off 9, past the lone key
+	kf_probe_check(sv == 0.0, "original scale untouched by the clone's poke; resting base rules past the key (got %v)", sv)
 	// teardown both timelanes
 	free_timeline(&cloned)
 	free_timeline(&src)

@@ -23,10 +23,6 @@ import "core:strings"
 // (drag, slide) keeps its track arrays shared, the marker-style convention.
 // ---------------------------------------------------------------------------
 
-// KF_DEFAULT_STEP_PER_FRAME is the fallback per-frame move-toward amount for
-// tracks whose consumer never set a unit-specific step.
-KF_DEFAULT_STEP_PER_FRAME :: 1.0
-
 // KF_MAX_OFFSET bounds "no upper limit" remap filters; 2^28 frames at 60fps is
 // ~50 days, far past any real clip.
 KF_MAX_OFFSET :: 268435456
@@ -40,15 +36,13 @@ Keyframe :: struct {
 Kf_Track :: struct {
 	// name: opaque id + gutter label. Consumer-defined; the store only matches.
 	name: string,
-	// step: per-frame move-toward amount in this track's own unit. 0 =>
-	// KF_DEFAULT_STEP_PER_FRAME.
-	step: f32,
 	// keys: sorted ascending by frame_off.
 	keys: [dynamic]Keyframe,
 }
 
 // --- lookups --------------------------------------------------------------
 
+// kf_track_index returns the index of `name`'s track, or -1.
 kf_track_index :: proc(clip: Clip, name: string) -> int {
 	for i in 0 ..< len(clip.keyframe_tracks) {
 		if clip.keyframe_tracks[i].name == name {
@@ -56,6 +50,26 @@ kf_track_index :: proc(clip: Clip, name: string) -> int {
 		}
 	}
 	return -1
+}
+
+// kf_fill_snapshot copies `name`'s track into `dst` (a flat fixed array) up to
+// its cap, returning (copied, total). This is how a cross-thread consumer
+// (audio producer, render worker) gets an OWN copy of a track it samples per
+// frame without ever touching the live timeline. n == 0 means "not keyed".
+// The consumer that races the UI thread must memset-free nothing: dst is its
+// own storage (a struct field), the copy is plain bytes.
+kf_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, total: int) {
+	ti := kf_track_index(clip^, name)
+	if ti < 0 {
+		return 0, 0
+	}
+	tk := &clip.keyframe_tracks[ti]
+	total = len(tk.keys)
+	n = min(total, len(dst))
+	if n > 0 {
+		mem.copy(raw_data(dst[:n]), raw_data(tk.keys[:n]), n * size_of(Keyframe))
+	}
+	return
 }
 
 // --- discrete edits (undo-seam callers) -------------------------------------
@@ -75,14 +89,12 @@ kf_bump_structure :: proc() {
 	}
 }
 
-kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32, step: f32 = KF_DEFAULT_STEP_PER_FRAME) {
+kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
 	kf_bump_structure()
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
-		append(&clip.keyframe_tracks, Kf_Track {name = strings.clone(name), step = step})
+		append(&clip.keyframe_tracks, Kf_Track {name = strings.clone(name)})
 		ti = len(clip.keyframe_tracks) - 1
-	} else if clip.keyframe_tracks[ti].step <= 0 {
-		clip.keyframe_tracks[ti].step = step
 	}
 	track := &clip.keyframe_tracks[ti]
 	// Insertion point: last key at-or-before frame_off.
@@ -135,56 +147,55 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 	}
 }
 
-// --- evaluation (move-toward, step per frame) -------------------------------
+// --- evaluation (linear between keys, base outside them) ----------------
 
-// kf_sample evaluates the move-toward value for clip-relative frame_off.
-//
-// The active segment is the LAST key at-or-before frame_off. When a key goes
-// active the value starts at `base` until the first key (the caller's resting
-// value), then at the previous key's target (the value it was already holding).
-// From there it approaches the active key's value by `track.step` per frame,
-// clamping on arrival and holding; the approach begins AFTER the key's own
-// frame (a key holds its origin on the frame it sits on). Before any key the
-// track is inactive and the caller keeps its own value.
-kf_sample :: proc(track: ^Kf_Track, frame_off: i32, base: f32) -> (f32, bool) {
-	if track == nil || len(track.keys) == 0 {
+// kf_sample_keys is the keyed evaluation over a flat key slice — the same
+// algorithm kf_sample runs over a track, exposed separately so the audio
+// producer can sample a SNAPSHOT of a clip's gain track it owns (it may never
+// touch the live timeline). A key applies ITS value on its own frame; between
+// two adjacent keys the value interpolates linearly so it reaches the NEXT
+// key's value exactly on that key's frame. Before the first key and after the
+// last key the property is INACTIVE: the caller keeps its own (base/resting)
+// value, so direct edits and drags apply there.
+kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, bool) {
+	if len(keys) == 0 {
 		return base, false
 	}
-	active := len(track.keys) - 1
-	for active >= 0 && track.keys[active].frame_off > frame_off {
+	active := len(keys) - 1
+	for active >= 0 && keys[active].frame_off > frame_off {
 		active -= 1
 	}
 	if active < 0 {
 		return base, false
 	}
-	active_key := track.keys[active]
-	origin := base
-	if active > 0 {
-		origin = track.keys[active - 1].value
+	active_key := keys[active]
+	if frame_off == active_key.frame_off {
+		return active_key.value, true
 	}
-	target := active_key.value
-	step := track.step
-	if step <= 0 {
-		step = KF_DEFAULT_STEP_PER_FRAME
+	// A later key starts a segment from this key's frame; interpolate toward
+	// it so the next key's value lands exactly on its own frame.
+	if active + 1 < len(keys) {
+		next_key := keys[active + 1]
+		span := next_key.frame_off - active_key.frame_off
+		t := f32(frame_off - active_key.frame_off) / f32(span)
+		return active_key.value + (next_key.value - active_key.value) * t, true
 	}
-	if step <= 0 || origin == target {
-		return target, true
+	// Past the last key the property is under direct control again.
+	return base, false
+}
+
+// kf_sample evaluates the keyed value for clip-relative frame_off.
+//
+// A key applies ITS value on its own frame (creating or editing a keyframe is
+// visible immediately); between two adjacent keys the value interpolates
+// linearly and arrives at the NEXT key's value exactly on that key's frame.
+// Before the first key and after the last key the property is inactive and
+// the caller keeps its own value — direct edits and drags apply there.
+kf_sample :: proc(track: ^Kf_Track, frame_off: i32, base: f32) -> (f32, bool) {
+	if track == nil || len(track.keys) == 0 {
+		return base, false
 	}
-	during := frame_off - active_key.frame_off
-	if during <= 0 {
-		return origin, true
-	}
-	direction := f32(1.0)
-	if target < origin {
-		direction = -1.0
-	}
-	value := origin + direction * step * f32(during)
-	if target > origin {
-		value = min(value, target)
-	} else {
-		value = max(value, target)
-	}
-	return value, true
+	return kf_sample_keys(track.keys[:], frame_off, base)
 }
 
 // kf_sample_for resolves `name` against the clip and samples at a TIMELINE
@@ -212,7 +223,7 @@ kf_clone_mut :: proc(dst: ^Clip, src: Clip) {
 	dst.keyframe_tracks = make([dynamic]Kf_Track, len(src.keyframe_tracks))
 	for i in 0 ..< len(src.keyframe_tracks) {
 		st := src.keyframe_tracks[i]
-		nt := Kf_Track {name = strings.clone(st.name), step = st.step}
+		nt := Kf_Track {name = strings.clone(st.name)}
 		if len(st.keys) > 0 {
 			nt.keys = make([dynamic]Keyframe, len(st.keys))
 			copy(nt.keys[:], st.keys[:])
@@ -251,7 +262,7 @@ kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Tr
 			}
 		}
 		if len(keys) > 0 {
-			append(&out, Kf_Track {name = strings.clone(st.name), step = st.step, keys = keys})
+			append(&out, Kf_Track {name = strings.clone(st.name), keys = keys})
 		} else {
 			delete(keys)
 		}

@@ -227,15 +227,15 @@ text measurement for layout.
 crop, ...) from the timeline itself. Unlike a first-feature hack, the model is
 property-agnostic: any closed set of scalar properties can ride it, and the
 automation-lane system later adopts it whole (IDEAs.md:150 blueprints the
-property-id-addressed shape). This slice builds the system alone — no property
-is wired into playback/preview yet; that is a follow-up.
+property-id-addressed shape). S1–S4 build the system alone; S5 (below) wires it
+into playback/preview.
 
 **Model (decoupled, Godot-style) — GENERIC, uncoupled from clip properties:**
 - `Keyframe { frame_off: i32, value: f32 }` — frame **relative to the clip's
   start** (the keyframe timeline is clip-relative; moving the clip moves its
   rows). A keyframe deals with exactly **ONE value**; multiple values →
   multiple keyframe tracks.
-- `Kf_Track { name: string, step: f32, keys: [dynamic]Keyframe }` sorted by
+- `Kf_Track { name: string, keys: [dynamic]Keyframe }` sorted by
   `frame_off`. Nothing property-shaped in the store: **the system never
   interprets `name`** — it is an opaque id + the gutter label, minted by the
   consumer (e.g. the gain field writes the track named "gain"). The
@@ -243,15 +243,14 @@ is wired into playback/preview yet; that is a follow-up.
   anything listable can ride it (pixels, dB, scale fractions, a future property
   `Clip` doesn't even carry yet). A row exists only when its track has >= 1
   key; a clip with no keys keeps today's layout.
-- `step` is the track's per-frame move-toward amount **in the track's own
-  unit** (a dB step and a pixel step can't share one constant; 0 = the global
-  `KF_DEFAULT_STEP_PER_FRAME`).
-- **No interpolation. "Move toward" behavior only** (per user): evaluation
-  advances the value toward the current keyframe's target by the track's step
-  **per frame** until it arrives, then holds until the next keyframe's target
-  takes over. Starts after the key's own frame; origin = caller `base` before
-  the first key, otherwise the previous key's arrived target. Exact numbers
-  pinned by probe.
+- **Linear between keys; direct control outside them** (per user): a key
+  applies ITS value on its own frame (creating/editing a keyframe is visible
+  immediately); between two adjacent keys the value interpolates linearly and
+  reaches the NEXT key's value **exactly on that key's frame**. Before the
+  first key and past the last key the property is INACTIVE — the caller keeps
+  its own `base`/resting value, so direct field edits and canvas drags apply
+  there (editing a transform after the last key works even though a key
+  exists). Exact numbers pinned by probe.
 - `kf_sample_for(clip, name, timeline_frame, base)` — generic; callers stay
   property-unaware.
 - **Ownership:** track names are cloned at creation; every clone site
@@ -280,9 +279,9 @@ is wired into playback/preview yet; that is a follow-up.
 - Track row height grows to fit the tallest keyframed clip
   (`CLIP_TILE_HEIGHT + rows x row_h`). A collapse toggle is a later option —
   **not** this slice.
-- No property consumption this slice: storage + render + selection + editing +
-  eval proc only. Wiring (e.g. Scale into preview, Gain into the live fold) is
-  the follow-up.
+- No property consumption in S1–S4: storage + render + selection + editing +
+  eval proc only. Wiring (Scale into preview, Gain into the live fold) landed in
+  S5 below.
 
 **Selection:**
 - **Cannot select a clip and a keyframe at the same time** — mutually exclusive.
@@ -291,8 +290,10 @@ is wired into playback/preview yet; that is a follow-up.
 - A selected keyframe shows its value in the inspector.
 
 **Interaction / editing:**
-- **Add keyframe: Shift+click the property input** in the inspector (for now) →
-  records the field's current value at the playhead, creates the row on first key.
+- **Add keyframe: click the diamond button next to the property field** in the
+  inspector → records the field's current value at the playhead, creates the
+  row on first key. The buttons paint as keyframe diamonds (`draw_kf_add_buttons`,
+  the exact KF_DIAMOND_* look scaled via KF_BTN_R); Shift+click was retired.
 - Drag a diamond horizontally → moves its `frame_off` (clamped 0..clip length).
   A no-move click must not reseek/reset anything (the clip-stutter lesson).
 - `Delete` removes the selected keyframe. **Discrete commit per add/move/delete
@@ -305,8 +306,8 @@ is wired into playback/preview yet; that is a follow-up.
 
 **Steps** (each lands + probe + vet before the next):
 - [x] S1. Data model: `Keyframe` / `Kf_Track` (name-opaque) /
-      `Clip.keyframe_tracks` + store helpers, incl. the move-toward eval
-      (`kf_sample` / `kf_sample_for`) with step semantics pinned by probe;
+      `Clip.keyframe_tracks` + store helpers, incl. the linear eval
+      (`kf_sample` / `kf_sample_for`) pinned by probe;
       `clone_timeline`/`free_timeline`, duplicates, delete paths, and the
       split/trim remaps all own keyframes; `VYPER_KEYFRAME_PROBE` green.
       (No property wired into playback/preview anywhere — decision #3 holds
@@ -334,15 +335,18 @@ is wired into playback/preview yet; that is a follow-up.
       survive a wholesale tree swap). Verified by `VYPER_UNDO_PROBE` (S3
       section: exclusivity both ways, value-edit add/undo/redo, gen
       invalidation) — probes + `-vet` green.
-- [x] S4. Interaction: Shift+click property input adds key; drag diamond to move;
-      Delete removes; undo commits. Add = `kf_add_prop` (main.odin): minting the
-      track name is the CONSUMER's job — the X/Y/Scale/crop/gain field handlers
-      Shift+click into `kf_add_prop(sel, "transform.x"..., value)` and it records
-      the field's current value at the playhead (clip-relative, clamped), as one
-      `.Value` node. Diamond drag = new `Interaction.Keyframe_Move`: the same
-      press that selects (S3) arms it, `update_keyframe_drag` slides the key with
-      the pointer (frame derived straight from the wrap box — the exact inverse
-      of `kf_key_center`'s cx mapping, so the diamond never detaches), and
+- [x] S4. Interaction: diamond "add keyframe" button beside each property field
+      adds a key; drag diamond to move; Delete removes; undo commits. Add = the
+      KfAdd* buttons (ui.odin, `kf_add_button`, hit by `interaction.odin`), each
+      calling `kf_add_prop` (main.odin): minting the track name is the CONSUMER's
+      job — the X/Y/Scale/crop/gain buttons call `kf_add_prop(sel, "transform.x"..., value)`
+      and it records the field's current value at the playhead (clip-relative,
+      clamped), as one `.Value` node. The buttons paint as the exact keyframe
+      diamond (gpu_draw.odin `draw_kf_add_buttons`, KF_DIAMOND_* look via
+      KF_BTN_R, hover lifts the fill). Diamond drag = new `Interaction.Keyframe_Move`:
+      the same press that selects (S3) arms it, `update_keyframe_drag` slides the
+      key with the pointer (frame derived straight from the wrap box — the exact
+      inverse of `kf_key_center`'s cx mapping, so the diamond never detaches), and
       `commit_keyframe_drag` on release commits only when the frame actually
       moved — normalized as a pure store pair del(old)+set(new) so the track
       stays sorted and unique from wherever the drag landed (the no-move click
@@ -351,9 +355,29 @@ is wired into playback/preview yet; that is a follow-up.
       fall through to the clip delete. Verified by `VYPER_UNDO_PROBE` (S4
       section: add/move/delete round-trips, move-is-a-move not a copy, no-op
       drag off the undo trail, delete fallthrough) — probes + `-vet` green.
-- [x] ACCEPT: Shift+click adds a row under the clip showing the diamond; dragging
+- [x] ACCEPT: the diamond button adds a row under the clip showing the diamond; dragging
       moves it; selection flips between clip and keyframe exclusively; all edits
       clean on undo/redo; probes + `-vet` green.
+- [x] S5. Functional wiring (the Active-3 "follow-up"); keyframes are now
+      CONSUMED. Preview: `update_preview_slots` samples `transform.x/y`, `scale`,
+      `crop.l/r/t/b` at the playhead into the slot (`kf_sample_for`), so keyed
+      clips animate live on the canvas while the clip's fields keep their
+      resting base; un-keyed properties sample base exactly — the render is
+      unchanged for every existing project. Audio: `audio_geometry_commit`
+      snapshots the clip's `gain` track FLAT into each chip
+      (`GAIN_KF_MAX_KEYS`, overflow truncated + logged once), provision copies
+      it into the `Play_Seg`, and `audio_mix_frame` re-evaluates the keyed gain
+      per mixed timeline frame via `kf_sample_keys(seg.kf_keys, frame -
+      seg.start_a, ...)` — the producer never reads the live timeline, it
+      samples its own copy. `kf_sample`/`kf_sample_keys` share one algorithm
+      (linear between keys, resting base outside them — since the S5 sanity
+      fix, the `step` move-toward model was dropped for linear, and the
+      after-last-key region rules resting so direct edits apply);
+      probe pins their agreement + clip-relative addressing. EXPORT NOT wired:
+      render.odin snapshots each clip's transform once at render start (decode
+      boxes are baked at open), so an export renders the resting transform —
+      keyed motion is preview-only until the export compositor evaluates per
+      frame (its own follow-up).
 
 ## Queued — Performance / Cleanup
 

@@ -690,11 +690,14 @@ kf_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32,
 
 // diamond_at paints one keyframe diamond centered on (cx, cy); selected uses
 // the light fill so the keyframe cursor reads against the neutral rest state.
+// half is the diamond's bounding half-width: KF_DIAMOND_R in the timeline,
+// KF_BTN_R for the inspector's add-keyframe buttons.
 diamond_at :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 	cx, cy: f32,
+	half: f32,
 	fill: clay.Color,
 ) {
 	render_sdf_rect(
@@ -702,10 +705,10 @@ diamond_at :: proc(
 		command_buffer,
 		pass,
 		clay.BoundingBox {
-			x = cx - KF_DIAMOND_R,
-			y = cy - KF_DIAMOND_R,
-			width = KF_DIAMOND_R * 2,
-			height = KF_DIAMOND_R * 2,
+			x = cx - half,
+			y = cy - half,
+			width = half * 2,
+			height = half * 2,
 		},
 		fill,
 		KF_DIAMOND_CORNER,
@@ -759,7 +762,7 @@ draw_keyframes :: proc(
 					   kf_sel.key == k_idx {
 						fill = KF_DIAMOND_FILL_SELECTED
 					}
-					diamond_at(renderer, command_buffer, pass, cx, cy, fill)
+					diamond_at(renderer, command_buffer, pass, cx, cy, KF_DIAMOND_R, fill)
 				}
 			}
 		}
@@ -1195,6 +1198,30 @@ draw_gain_knob :: proc(
 		height = GAIN_KNOB_HUB_R * 2,
 	}
 	render_sdf_rect(renderer, command_buffer, pass, hub, EDITOR_BG, GAIN_KNOB_HUB_R, 0)
+}
+
+// draw_kf_add_buttons paints the inspector's add-keyframe buttons as keyframe
+// diamonds (same KF_DIAMOND_* look as the timeline, scaled up via KF_BTN_R),
+// centered on each button's clay box. Hover lifts the fill like a selected key
+// would, a button affordance on top of the exact keyframe glyph. Empty boxes
+// (a video clip has no KfAddGain element) paint nothing.
+draw_kf_add_buttons :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
+	for id in KF_ADD_BTN_IDS {
+		bb := clay.GetElementData(clay.ID(id)).boundingBox
+		if bb.width <= 0 || bb.height <= 0 {
+			continue
+		}
+		fill := clay.PointerOver(clay.ID(id)) ? KF_DIAMOND_FILL_SELECTED : KF_DIAMOND_FILL
+		diamond_at(
+			renderer, command_buffer, pass,
+			bb.x + bb.width / 2, bb.y + bb.height / 2,
+			KF_BTN_R, fill,
+		)
+	}
 }
 
 // render_icon draws one rasterized SVG icon through the text pipeline: the

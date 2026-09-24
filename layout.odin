@@ -69,6 +69,20 @@ KF_DIAMOND_ROT :: [2]f32{0.70710678, 0.70710678} // cos/sin of 45°: squares up 
 KF_DIAMOND_CORNER :: 2     // Diamond corner rounding, keeps a point on each axis.
 KF_DIAMOND_BORDER :: 1     // 1px border, drawn inside the diamond.
 KF_HIT_MARGIN :: f32(6)    // Diamond pick radius: pointer within this of a key's center selects it.
+// Inspector "add keyframe" button: the same 45°-rotated-square keyframe look
+// (KF_DIAMOND_* above), scaled to sit beside a property field. The painted
+// diamond is the button's only graphics; the clay box beneath carries the id
+// for hit-testing and adds a little click padding around the glyph.
+KF_BTN_R :: f32(7)          // Half of the add-keyframe button diamond (14px across).
+KF_BTN_PAD :: f32(3)        // Transparent click padding around the button diamond.
+// Inspector add-keyframe buttons, one per keyable property in row order: the
+// element ids are hit-tested in interaction.odin and painted as diamonds in
+// gpu_draw.odin, so they live here as the single source of truth.
+KF_ADD_BTN_IDS :: [8]string{
+	"KfAddX", "KfAddY", "KfAddS",
+	"KfAddCropL", "KfAddCropR", "KfAddCropT", "KfAddCropB",
+	"KfAddGain",
+}
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 TSCROLLBAR_W :: f32(10)    // Width of the timeline's vertical scrollbar strip.
 TSCROLLBAR_MIN_H :: f32(28) // Smallest rendered scrollbar thumb.

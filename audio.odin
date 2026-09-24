@@ -472,12 +472,12 @@ ring_drop :: proc(r: ^Audio_Ring, n: int) {
 	if n <= 0 {
 		return
 	}
-	n := min(n, r.count)
+	drop := min(n, r.count)
 	cap_now := ring_cap(r)
 	if cap_now > 0 {
-		r.head = (r.head + n) % cap_now
+		r.head = (r.head + drop) % cap_now
 	}
-	r.count -= n
+	r.count -= drop
 }
 
 // ring_destroy frees the backing buffer and zeroes the ring.
@@ -501,6 +501,11 @@ Play_Seg :: struct {
 	// per-source) because a split makes adjacent segments of one source
 	// independently adjustable.
 	gain:    f32,
+	// kf_* is the segment's copied "gain" keyframe track (kf_n = 0 = static);
+	// the mix re-evaluates the keyed gain per timeline frame so automation
+	// animates live. Copied at provision from the chip (see GAIN_KF_MAX_KEYS).
+	kf_keys: [GAIN_KF_MAX_KEYS]Keyframe,
+	kf_n:    int,
 }
 
 // Play_Src is one source stream's 48 kHz stereo S16 decoder + content-relative
@@ -630,10 +635,16 @@ audio_dbg_budget: int
 // slots are fixed arrays with permanent addresses, so a swap is a single atomic
 // index store and the publisher never frees memory the producer may still be
 // reading. Paths are packed into a per-slot byte arena instead of inlined in
-// each chip: a chip stays ~50 bytes, so the bound is memory-proportional rather
-// than 4 KB per clip, and it sits far above any real project.
+// each chip (a chip here is ~50 bytes of metadata plus the flat gain keyframe
+// snapshot, so the bound is memory-proportional rather than KBs per clip), and
+// it sits far above any real project.
 AUDIO_GEOM_MAX_CLIPS :: 4096
 AUDIO_GEOM_PATH_ARENA :: 1 << 20 // bytes of packed path data per slot
+// GAIN_KF_MAX_KEYS caps a chip/segment's copied gain keyframe track. The audio
+// producer owns its snapshot (it must never read the live timeline), so a
+// keyed gain track is copied here flat. A track past the cap keeps its first
+// keys and logs once — truncation is silent data loss otherwise.
+GAIN_KF_MAX_KEYS :: 64
 
 Audio_Geom_Chip :: struct {
 	timeline_start: i64,
@@ -645,6 +656,11 @@ Audio_Geom_Chip :: struct {
 	gain_dB:        f32,
 	path_off:       int, // offset into Audio_Geom_Slot.paths
 	path_len:       int,
+	// kf_* is the clip's "gain" keyframe track snapshot (kf_n = 0 = static),
+	// copied flat so the producer can re-evaluate the keyed gain per timeline
+	// frame without touching live state.
+	kf_keys:       [GAIN_KF_MAX_KEYS]Keyframe,
+	kf_n:          int,
 }
 
 Audio_Geom_Slot :: struct {
@@ -667,6 +683,8 @@ audio_gain_folded_epoch: u64     // producer-side: last audio_gain_epoch folded
 // audio_geom_overflow logs once when the timeline holds more audio clips (or
 // more path bytes) than a fixed slab can carry, so the dropped tail is visible.
 audio_geom_overflow: bool
+// audio_kf_trunc_logged logs once when a gain keyframe track is capped.
+audio_kf_trunc_logged: bool
 
 // audio_chip_path resolves a chip's path from its slot's packed arena.
 audio_chip_path :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chip) -> string {
@@ -736,6 +754,18 @@ audio_geometry_commit :: proc() {
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
 			chip.gain_dB = clip.gain
+			// Snapshot the clip's "gain" keyframe track flat so the producer can
+			// evaluate keyed gain per frame. kf_fill_snapshot renders the name;
+			// the geometry commit is UI-thread so reading the live clip is safe.
+			if n, total := kf_fill_snapshot(clip, "gain", chip.kf_keys[:]); n > 0 {
+				chip.kf_n = n
+				if total > GAIN_KF_MAX_KEYS {
+					if !audio_kf_trunc_logged {
+						fmt.printf("[audio] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, n)
+						audio_kf_trunc_logged = true
+					}
+				}
+			}
 			chip.path_off = slot.path_used
 			chip.path_len = len(path)
 			mem.copy(raw_data(slot.paths[slot.path_used:]), raw_data(path), len(path))
@@ -886,6 +916,14 @@ audio_provision :: proc(play_frame: i64) {
 			start_s = chip.source_start,
 			len_a   = chip.source_len,
 			gain    = db_to_linear(chip.gain_dB),
+		}
+		if chip.kf_n > 0 {
+			g.seg[g.seg_count].kf_n = chip.kf_n
+			mem.copy(
+				raw_data(g.seg[g.seg_count].kf_keys[:]),
+				raw_data(chip.kf_keys[:]),
+				chip.kf_n * size_of(Keyframe),
+			)
 		}
 		g.seg_count += 1
 	}
@@ -1058,8 +1096,14 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		base := int(start48 - s.first48)
 		// Per-segment constant gain folded in as one multiply per sample; the
 		// ring already covers this frame (checked above), so gain is the only
-		// new term here.
+		// new term here. A segment carrying a gain keyframe track instead
+		// re-evaluates the keyed gain at its frame-relative position each
+		// frame (kf_sample_keys on the segment's own snapshot — the producer
+		// never reads the live timeline), so automation animates audibly.
 		g := seg.gain
+		if seg.kf_n > 0 {
+			g, _ = kf_sample_keys(seg.kf_keys[:seg.kf_n], i32(frame - seg.start_a), seg.gain)
+		}
 		for f in 0 ..< spf {
 			l, r := ring_at(&s.fifo, base + f)
 			mix[f * 2 + 0] += l * g

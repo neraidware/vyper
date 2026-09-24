@@ -1048,6 +1048,43 @@ prop_field :: proc(id_name: string, label, value: string, focused: bool) {
 	}
 }
 
+// kf_add_button is the inspector's "key this property at the playhead"
+// control: a transparent click pad sized to the diamond glyph (KF_BTN_R*2
+// plus KF_BTN_PAD). The diamond itself is painted over it in the overlay pass
+// (draw_kf_add_buttons) so the button looks exactly like a keyframe.
+kf_add_button :: proc(id_name: string) {
+	pad := KF_BTN_R * 2 + KF_BTN_PAD * 2
+	if clay.UI(clay.ID(id_name))(
+	{
+		layout = {
+			sizing = {
+				width = clay.SizingFixed(pad),
+				height = clay.SizingFixed(pad),
+			},
+			childAlignment = {x = .Left, y = .Center},
+		},
+	},
+	) {}
+}
+
+// prop_field_row lays one property field out with its add-keyframe button: the
+// field grows, the fixed diamond button sits right of it.
+prop_field_row :: proc(id_name, field_id, label, value: string, focused: bool, btn_id: string) {
+	if clay.UI(clay.ID(id_name))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+			layoutDirection = .LeftToRight,
+			childGap = 6,
+			childAlignment = {x = .Left, y = .Center},
+		},
+	},
+	) {
+		prop_field(field_id, label, value, focused)
+		kf_add_button(btn_id)
+	}
+}
+
 // project_card is the "Project" inspector card: canvas resolution presets,
 // orientation, frame rate, and the render range. These controls are always
 // reachable (not gated behind an empty timeline).
@@ -1246,19 +1283,19 @@ clip_card :: proc() {
 			if editing_field == .X {
 				x_val = string(edit_chars[:edit_len])
 			}
-			prop_field("PropFieldX", "X", x_val, editing_field == .X)
+			prop_field_row("PropRowX", "PropFieldX", "X", x_val, editing_field == .X, "KfAddX")
 			y_buf := UI_TEXT_Y[:]
 			y_val := fmt.bprintf(y_buf[:], "%.0f", cl.transform_y)
 			if editing_field == .Y {
 				y_val = string(edit_chars[:edit_len])
 			}
-			prop_field("PropFieldY", "Y", y_val, editing_field == .Y)
+			prop_field_row("PropRowY", "PropFieldY", "Y", y_val, editing_field == .Y, "KfAddY")
 			s_buf := UI_TEXT_S[:]
 			scl_val := fmt.bprintf(s_buf[:], "%.2f", cl.scale)
 			if editing_field == .Scale {
 				scl_val = string(edit_chars[:edit_len])
 			}
-			prop_field("PropFieldS", "Scale", scl_val, editing_field == .Scale)
+			prop_field_row("PropRowS", "PropFieldS", "Scale", scl_val, editing_field == .Scale, "KfAddS")
 			// Canvas-center snap belongs with the transform settings it governs.
 			if clay.UI(clay.ID("SnapRow"))(
 			{
@@ -1303,7 +1340,9 @@ clip_card :: proc() {
 			},
 			) {
 				prop_field("PropCropL", "L", l_val, editing_field == .Crop_L)
+				kf_add_button("KfAddCropL")
 				prop_field("PropCropR", "R", r_val, editing_field == .Crop_R)
+				kf_add_button("KfAddCropR")
 			}
 			if clay.UI(clay.ID("CropRowBot"))(
 			{
@@ -1315,7 +1354,9 @@ clip_card :: proc() {
 			},
 			) {
 				prop_field("PropCropT", "T", t_val, editing_field == .Crop_T)
+				kf_add_button("KfAddCropT")
 				prop_field("PropCropB", "B", b_val, editing_field == .Crop_B)
+				kf_add_button("KfAddCropB")
 			}
 		} else {
 			// Audio clips get the gain row: a drag-to-set knob (the GainKnob
@@ -1376,6 +1417,7 @@ clip_card :: proc() {
 						clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 					)
 				}
+				kf_add_button("KfAddGain")
 			}
 		}
 	}

@@ -1208,7 +1208,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		return
 	}
 	// Headless keyframe-store probe: the generic store's sorted insert,
-	// move-toward sample, split/trim remaps, and clone/free round-trip.
+	// linear sample, split/trim remaps, and clone/free round-trip.
 	if kp, _ := os.lookup_env_alloc("VYPER_KEYFRAME_PROBE", context.temp_allocator); kp != "" {
 		os.exit(keyframe_probe_run())
 	}

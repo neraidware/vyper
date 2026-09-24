@@ -143,6 +143,7 @@ render_ui_frame :: proc(
 		draw_media_bin_thumbnails(renderer, command_buffer, pass)
 		draw_ui_icons(renderer, command_buffer, pass)
 		draw_gain_knob(renderer, command_buffer, pass)
+		draw_kf_add_buttons(renderer, command_buffer, pass)
 		draw_media_drag_ghost(renderer, command_buffer, pass)
 		if len(timeline.tracks) > 0 {
 			draw_timeline_ruler(renderer, command_buffer, pass)
