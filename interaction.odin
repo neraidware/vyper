@@ -490,6 +490,10 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			snap_playhead_to_clips = !snap_playhead_to_clips
 			return true
 		}
+		if clay.PointerOver(clay.ID("AutoKf")) {
+			auto_keyframe = !auto_keyframe
+			return true
+		}
 		if clay.PointerOver(clay.ID("PlayheadTime")) {
 			// Clicking the playhead time badge opens numeric navigation (the
 			// typed value is parsed and the playhead sought on commit).
@@ -1034,6 +1038,18 @@ interaction_post_build :: proc(
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
 				canvas := preview_canvas(pb)
 				update_handle_drag(sel, canvas, inp.x, inp.y, inp.shift)
+				// Auto-keyframe every property this gesture actually moved (the
+				// crop handles reach one or two edges, no more — keying all four
+				// would stamp keys the user never touched).
+				autokey_gesture(sel, handle_start_scale, sel.scale, "scale")
+				autokey_gesture(sel, handle_start_tx, sel.transform_x, "transform.x")
+				autokey_gesture(sel, handle_start_ty, sel.transform_y, "transform.y")
+				if handle_kind == .Crop {
+					autokey_gesture(sel, handle_start_crop_l, sel.crop_l, "crop.l")
+					autokey_gesture(sel, handle_start_crop_r, sel.crop_r, "crop.r")
+					autokey_gesture(sel, handle_start_crop_t, sel.crop_t, "crop.t")
+					autokey_gesture(sel, handle_start_crop_b, sel.crop_b, "crop.b")
+				}
 			}
 		case .Panel_Resize:
 			// The divider sits in the root column below the app bar, so the
@@ -1066,6 +1082,14 @@ interaction_post_build :: proc(
 					// snap runs regardless, so a centered clip still snaps).
 					snap_center(sel, snap_margin(canvas, SNAP_MARGIN_PX))
 					snap_transform(sel, snap_margin(canvas, SNAP_MARGIN_PX))
+					// Auto-keyframe: a moved axis keys at the playhead (new key,
+					// or update of a key already sitting there) so the motion is
+					// recorded on the timeline, not just the resting transform.
+					// A drag's live write rides the key AND the resting value:
+					// the preview samples keyed regions from the track, so the
+					// on-screen moose must follow the key while it moves.
+					autokey_gesture(sel, handle_start_tx, sel.transform_x, "transform.x")
+					autokey_gesture(sel, handle_start_ty, sel.transform_y, "transform.y")
 				}
 			}
 		case .Clip_Resize:
@@ -1118,6 +1142,9 @@ interaction_post_build :: proc(
 				db += math.floor(dx / GAIN_COARSE_PX_PER_STEP) * GAIN_COARSE_DB_PER_10PX
 			}
 			gain_drag_clip.gain = clamp(db, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
+			// Auto-keyframe the running gain at the playhead so the move records
+			// onto a keyed timeline as it happens.
+			autokey_gesture(gain_drag_clip, gain_drag_start_db, gain_drag_clip.gain, "gain")
 			// Publish the running value into the audio slab so a provision mid-
 			// gesture (play pressed while the knob is held) hears it; the release
 			// commits nothing because the producer's live fold already applied it.
@@ -1298,6 +1325,48 @@ interaction_post_build :: proc(
 			}
 		} else if render_encoder_menu_open {
 			render_encoder_menu_open = false
+		}
+	}
+	// Keyframe-interpolation dropdown: same toggle/select/dismiss shape, gated on
+	// a live keyframe selection (S3). Choosing a mode commits it on the selected
+	// key — the segment arriving at that key eases (we ease INTO a breakpoint) —
+	// as one undoable edit; an unchanged re-click only closes the menu.
+	if was_click && kf_sel.active {
+		if clay.PointerOver(clay.ID("KfInterpButton")) {
+			if _, _, _, ok := kf_selected(); ok {
+				kf_interp_menu_open = !kf_interp_menu_open
+			}
+		} else if kf_interp_menu_open && clay.PointerOver(clay.ID("KfInterpMenu")) {
+			_, _, k, ok := kf_selected()
+			choice: Kf_Interp
+			hit := true
+			if clay.PointerOver(clay.ID("KfInterpLinear")) {
+				choice = .Linear
+			} else if clay.PointerOver(clay.ID("KfInterpCubic")) {
+				choice = .Cubic
+			} else if clay.PointerOver(clay.ID("KfInterpEaseIn")) {
+				choice = .Ease_In
+			} else if clay.PointerOver(clay.ID("KfInterpEaseOut")) {
+				choice = .Ease_Out
+			} else if clay.PointerOver(clay.ID("KfInterpEaseInOut")) {
+				choice = .Ease_In_Out
+			} else if clay.PointerOver(clay.ID("KfInterpElastic")) {
+				choice = .Elastic
+			} else {
+				hit = false
+			}
+			if hit {
+				if ok {
+					if k.interp != choice {
+						undo_begin()
+						k.interp = choice
+						undo_push(.Value, "Set keyframe interpolation")
+					}
+				}
+				kf_interp_menu_open = false
+			}
+		} else if kf_interp_menu_open {
+			kf_interp_menu_open = false
 		}
 	}
 	// Help overlay: the "?" button toggles it; any other click outside the

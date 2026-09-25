@@ -925,6 +925,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					) {
 						settings_icon_button("SnapClipToPh", snap_clips_to_playhead)
 						settings_icon_button("SnapPhToClip", snap_playhead_to_clips)
+						settings_icon_button("AutoKf", auto_keyframe)
 						// Grow spacer pushes the zoom group to the right edge,
 						// keeping the snap toggles pinned left.
 						if clay.UI(clay.ID("TimelineBottomSpacer"))(
@@ -1510,6 +1511,128 @@ keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 			clay.Text(
 				v_str,
 				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
+			)
+		}
+	}
+	if clay.UI(clay.ID("KfInterpRow"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+			layoutDirection = .LeftToRight,
+			childGap = BUTTON_ROW_GAP,
+			childAlignment = {x = .Left, y = .Center},
+		},
+	},
+	) {
+		clay.Text(
+			"Interp",
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+		)
+		kf_interp_dropdown(kf)
+	}
+}
+
+// kf_interp_label is the keyframe interpolation dropdown's display text.
+kf_interp_label :: proc(interp: Kf_Interp) -> string {
+	switch interp {
+	case .Linear:
+		return "Linear"
+	case .Cubic:
+		return "Cubic"
+	case .Ease_In:
+		return "Ease in"
+	case .Ease_Out:
+		return "Ease out"
+	case .Ease_In_Out:
+		return "Ease in/out"
+	case .Elastic:
+		return "Elastic"
+	}
+	return "Linear"
+}
+
+// kf_interp_dropdown renders the selected keyframe's interpolation selector as
+// a collapsed button toggling a floating menu, the same toggle/select/dismiss
+// shape as the export-encoder dropdown. Picking a mode sets how the segment
+// ARRIVING at the key eases (we ease into a breakpoint, so the key you're
+// heading to owns the curve); an undoable edit, like the value field.
+kf_interp_dropdown :: proc(kf: ^Keyframe) {
+	if clay.UI(clay.ID("KfInterpButton"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFixed(120), height = clay.SizingFixed(BUTTON_HEIGHT)},
+			padding = clay.Padding{left = 8, right = 8},
+			childAlignment = {x = .Left, y = .Center},
+		},
+		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
+		border = {
+			color = kf_interp_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			width = clay.BorderOutside(1),
+		},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	},
+	) {
+		clay.Text(
+			kf_interp_label(kf.interp),
+			clay.TextElementConfig {
+				textColor = kf_interp_menu_open ? BUTTON_BORDER_HOVER : TEXT,
+				fontSize = FONT_SMALL,
+			},
+		)
+	}
+	if kf_interp_menu_open {
+		if clay.UI(clay.ID("KfInterpMenu"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingFixed(120), height = clay.SizingFit({})},
+				layoutDirection = .TopToBottom,
+				childGap = 2,
+				padding = clay.PaddingAll(4),
+			},
+			backgroundColor = BUTTON,
+			border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(4),
+			floating = {
+				offset = {0, 4},
+				parentId = clay.ID("KfInterpButton").id,
+				zIndex = 1000,
+				attachment = {element = .LeftTop, parent = .LeftBottom},
+				attachTo = .ElementWithId,
+				pointerCaptureMode = .Capture,
+				clipTo = .None,
+			},
+		},
+		) {
+			settings_button("KfInterpLinear", kf_interp_label(.Linear), kf.interp == .Linear, fill_width = true)
+			settings_button(
+				"KfInterpCubic",
+				kf_interp_label(.Cubic),
+				kf.interp == .Cubic,
+				fill_width = true,
+			)
+			settings_button(
+				"KfInterpEaseIn",
+				kf_interp_label(.Ease_In),
+				kf.interp == .Ease_In,
+				fill_width = true,
+			)
+			settings_button(
+				"KfInterpEaseOut",
+				kf_interp_label(.Ease_Out),
+				kf.interp == .Ease_Out,
+				fill_width = true,
+			)
+			settings_button(
+				"KfInterpEaseInOut",
+				kf_interp_label(.Ease_In_Out),
+				kf.interp == .Ease_In_Out,
+				fill_width = true,
+			)
+			settings_button(
+				"KfInterpElastic",
+				kf_interp_label(.Elastic),
+				kf.interp == .Elastic,
+				fill_width = true,
 			)
 		}
 	}

@@ -81,12 +81,12 @@ keyframe_probe_run :: proc() -> int {
 		keys := c.keyframe_tracks[ti].keys
 		kf_probe_check(len(keys) == 3, "3 distinct frames => 3 keys, got %d", len(keys))
 		kf_probe_check(
-			keys[0] == Keyframe {10, 0, 5.0},
+			keys[0] == Keyframe {frame_off = 10, value = 5.0},
 			"inserts must stay sorted and the repeated frame replaced: keys[0]=%v",
 			keys[0],
 		)
-		kf_probe_check(keys[1] == Keyframe {20, 0, 2.0}, "keys[1]=%v", keys[1])
-		kf_probe_check(keys[2] == Keyframe {30, 0, 3.0}, "keys[2]=%v", keys[2])
+kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", keys[1])
+	kf_probe_check(keys[2] == Keyframe {frame_off = 30, value = 3.0}, "keys[2]=%v", keys[2])
 	}
 
 	// --- lookup: missing name ---------------------------------------------
@@ -100,6 +100,19 @@ keyframe_probe_run :: proc() -> int {
 	kf_set_key(&smp, "gain", 10, 5.0)
 	kf_set_key(&smp, "gain", 20, 2.0)
 	kf_set_key(&smp, "gain", 30, 8.0)
+
+	kf_set_lane_interp :: proc(clip: ^Clip, name: string, interp: Kf_Interp) {
+		if ti := kf_track_index(clip^, name); ti >= 0 {
+			for k in 0 ..< len(clip.keyframe_tracks[ti].keys) {
+				clip.keyframe_tracks[ti].keys[k].interp = interp
+			}
+		}
+	}
+
+	// New keys default to .Cubic (the zero value); this section exercises the
+	// LINEAR sampler, so pin the mode explicitly rather than relying on a
+	// default that the spline feature changed.
+	kf_set_lane_interp(&smp, "gain", .Linear)
 	gt := kf_track_index(smp, "gain")
 	gain: ^Kf_Track
 	if gt >= 0 {
@@ -191,16 +204,16 @@ keyframe_probe_run :: proc() -> int {
 	left_ok := false
 	if len(sp.keyframe_tracks) == 1 {
 		lk := sp.keyframe_tracks[0].keys
-		left_ok = len(lk) == 1 && lk[0] == Keyframe {10, 0, 1.0}
+		left_ok = len(lk) == 1 && lk[0] == Keyframe {frame_off = 10, value = 1.0}
 	}
 	kf_probe_check(left_ok, "left keeps only keys < cut, values preserved")
 	right_ok := false
 	if len(sp_right.keyframe_tracks) == 1 {
 		rk := sp_right.keyframe_tracks[0].keys
 		right_ok = len(rk) == 3 &&
-		rk[0] == Keyframe {0, 0, 2.0} &&
-		rk[1] == Keyframe {5, 0, 3.0} &&
-		rk[2] == Keyframe {59, 0, 4.0}
+		rk[0] == Keyframe {frame_off = 0, value = 2.0} &&
+		rk[1] == Keyframe {frame_off = 5, value = 3.0} &&
+		rk[2] == Keyframe {frame_off = 59, value = 4.0}
 	}
 	kf_probe_check(right_ok, "right re-relatives keys >= cut by -cut")
 	if right_ok {
@@ -219,7 +232,7 @@ keyframe_probe_run :: proc() -> int {
 	trim_ok := false
 	if len(tr.keyframe_tracks) == 1 {
 		tk := tr.keyframe_tracks[0].keys
-		trim_ok = len(tk) == 2 && tk[0] == Keyframe {0, 0, 2.0} && tk[1] == Keyframe {5, 0, 3.0}
+		trim_ok = len(tk) == 2 && tk[0] == Keyframe {frame_off = 0, value = 2.0} && tk[1] == Keyframe {frame_off = 5, value = 3.0}
 	}
 	kf_probe_check(trim_ok, "trim_head drops head keys and re-relatives survivors")
 	tr2 := Clip {}
@@ -230,9 +243,33 @@ keyframe_probe_run :: proc() -> int {
 	trim2_ok := false
 	if len(tr2.keyframe_tracks) == 1 {
 		tk := tr2.keyframe_tracks[0].keys
-		trim2_ok = len(tk) == 2 && tk[0] == Keyframe {5, 0, 1.0} && tk[1] == Keyframe {40, 0, 2.0}
+		trim2_ok = len(tk) == 2 && tk[0] == Keyframe {frame_off = 5, value = 1.0} && tk[1] == Keyframe {frame_off = 40, value = 2.0}
 	}
 	kf_probe_check(trim2_ok, "trim_tail drops keys beyond the new length")
+
+	// Split/trim remaps keys through kf_rebuild_tracks; the interpolation mode
+	// must survive the rebuild (each half/full key is a NEW Keyframe there).
+	spt := Clip {}
+	kf_set_key(&spt, "gain", 10, 1.0)
+	kf_set_key(&spt, "gain", 40, 2.0)
+	spt.keyframe_tracks[0].keys[1].interp = .Cubic
+	spt_right := spt
+	kf_split_parts(&spt, &spt_right, 30)
+	split_mode_ok :=
+		len(spt_right.keyframe_tracks) == 1 &&
+		len(spt_right.keyframe_tracks[0].keys) == 1 &&
+		spt_right.keyframe_tracks[0].keys[0] == Keyframe {frame_off = 10, value = 2.0, interp = .Cubic}
+	kf_probe_check(split_mode_ok, "split rebuild preserves the key's interpolation mode")
+	tmt := Clip {}
+	kf_set_key(&tmt, "gain", 5, 1.0)
+	kf_set_key(&tmt, "gain", 40, 2.0)
+	tmt.keyframe_tracks[0].keys[1].interp = .Ease_In_Out
+	kf_trim_head(&tmt, 20)
+	trim_mode_ok :=
+		len(tmt.keyframe_tracks) == 1 &&
+		len(tmt.keyframe_tracks[0].keys) == 1 &&
+		tmt.keyframe_tracks[0].keys[0] == Keyframe {frame_off = 20, value = 2.0, interp = .Ease_In_Out}
+	kf_probe_check(trim_mode_ok, "trim rebuild preserves the key's interpolation mode")
 
 	// --- flat-copy evaluator (the audio producer's sampler) mirrors kf_sample --
 	// The audio producer re-evaluates keyed gain each frame from its OWN flat
@@ -269,6 +306,170 @@ keyframe_probe_run :: proc() -> int {
 		)
 	}
 	kf_probe_check(fc_same, "kf_sample_keys agrees with kf_sample on a copied track")
+
+	// --- interpolation modes: closed-form curves, spline, packed parity ------
+	// kf_ease signature values at t = 1/2, hand-derived: cubic-in = 1/8,
+	// cubic-out = 7/8, in-out = 1/2 at the midpoint by construction.
+	ease_mid := kf_ease(.Elastic, 0.5)
+	ease_ok :=
+		kf_approx(kf_ease(.Linear, 0.5), 0.5) &&
+		kf_approx(kf_ease(.Ease_In, 0.5), 0.125) &&
+		kf_approx(kf_ease(.Ease_Out, 0.5), 0.875) &&
+		kf_approx(kf_ease(.Ease_In_Out, 0.5), 0.5) &&
+		kf_ease(.Elastic, 0) == 0 && kf_ease(.Elastic, 1) == 1 && ease_mid > 1.0
+	kf_probe_check(
+		ease_ok,
+		"kf_ease signatures (in=%v out=%v inout=%v elastic-mid=%v)",
+		kf_ease(.Ease_In, 0.5),
+		kf_ease(.Ease_Out, 0.5),
+		kf_ease(.Ease_In_Out, 0.5),
+		ease_mid,
+	)
+
+	// A TWO-key track with .Cubic is exactly Linear: both spline tangents
+	// default to the chord slope (no outside neighbor on either end — the
+	// natural edge condition), and a Hermite whose endpoint tangents equal the
+	// chord IS the straight line. Pinned so "Cubic did nothing" is known-intent
+	// (the curve needs a third key to have anywhere to deviate).
+	twok := Clip {}
+	kf_set_key(&twok, "gain", 0, 0.0)
+	kf_set_key(&twok, "gain", 10, 100.0)
+	cubic_ok := true
+	if sti := kf_track_index(twok, "gain"); sti >= 0 {
+		sk2 := &twok.keyframe_tracks[sti]
+		sk2.keys[1].interp = .Cubic
+		for off in i32(0) ..= 10 {
+			vc, _ := kf_sample(sk2, off, 0.0)
+			if !kf_approx(vc, f32(off) * 10.0) {
+				cubic_ok = false
+				break
+			}
+		}
+	}
+	kf_probe_check(cubic_ok, "two-key Cubic collapses to Linear (chord tangents)")
+
+	// The sampler eases INTO the next key, so the segment's mode is the
+	// ARRIVING key's, not the departing key's; both endpoints still snap
+	// exactly (on-frame returns the key's own value).
+	sc := Clip {}
+	kf_set_key(&sc, "gain", 0, 0.0)
+	kf_set_key(&sc, "gain", 10, 100.0)
+	if sti := kf_track_index(sc, "gain"); sti >= 0 {
+		sk := &sc.keyframe_tracks[sti]
+		sk.keys[1].interp = .Ease_In
+		ki0, _ := kf_sample(sk, 0, 0.0)
+		kim, _ := kf_sample(sk, 5, 0.0)
+		ki1, _ := kf_sample(sk, 10, 0.0)
+		sk.keys[1].interp = .Ease_Out
+		kom, _ := kf_sample(sk, 5, 0.0)
+		sk.keys[1].interp = .Ease_In_Out
+		kio_m, _ := kf_sample(sk, 5, 0.0)
+		sk.keys[1].interp = .Elastic
+		kel_m, _ := kf_sample(sk, 5, 0.0)
+		// Ownership pin: setting the FIRST (departing) key's mode must not
+		// reshape the segment — nothing arrives at the first key, its mode is
+		// inert. Rearm the arriving key to Linear and bounce the first one.
+		sk.keys[1].interp = .Linear
+		sk.keys[0].interp = .Elastic
+		kfirst, _ := kf_sample(sk, 5, 0.0)
+		kf_probe_check(
+			ki0 == 0.0 && kf_approx(kim, 12.5) && ki1 == 100.0 &&
+				kf_approx(kom, 87.5) && kio_m == 50.0 && kel_m > 100.0 &&
+				kf_approx(kfirst, 50.0),
+			"sampler eases into the arriving key's mode (in=%v out=%v inout=%v elastic=%v first-key-inert=%v)",
+			kim, kom, kio_m, kel_m, kfirst,
+		)
+	}
+
+	// Cubic is a Hermite spline, not an ease curve. Two properties pin it down:
+	// a tangent-symmetric segment's midpoint sits exactly on the linear midpoint,
+	// and an asymmetric one pulls off the chord (proving it actually curves).
+	spc := Clip {}
+	kf_set_key(&spc, "gain", 0, 0.0)
+	kf_set_key(&spc, "gain", 10, 100.0)
+	kf_set_key(&spc, "gain", 20, 250.0)
+	kf_set_key(&spc, "gain", 30, 350.0)
+	if sti := kf_track_index(spc, "gain"); sti >= 0 {
+		spk := &spc.keyframe_tracks[sti]
+		spk.keys[0].interp = .Cubic
+		spk.keys[1].interp = .Cubic
+		spk.keys[2].interp = .Cubic
+		// segment 10->20: tangents (250-0)/20 == (350-100)/20 == 12.5 each =>
+		// Hermite midpoint == (100+250)/2 == 175.
+		sm_mid, _ := kf_sample(spk, 15, 0.0)
+		// segment 0->10: m0 chord = 10, m1 = (250-0)/20 = 12.5 => 46.875 at 5.
+		sma_mid, _ := kf_sample(spk, 5, 0.0)
+		kf_probe_check(
+			kf_approx(sm_mid, 175.0) && kf_approx(sma_mid, 46.875),
+			"spline curves through keys (sym-mid=%v asym-mid=%v)",
+			sm_mid, sma_mid,
+		)
+	}
+
+	// Packed section lanes ease identically to the scalar path and carry
+	// per-knot interp through the fold.
+	peck := Clip {}
+	lanes0 := [KF_PACK_MAX]f32{}
+	lanes1 := [KF_PACK_MAX]f32{}
+	lanes0[0] = 0.0
+	lanes1[0] = 100.0
+	kf_set_packed_key(&peck, "sec", 0, lanes0, 1)
+	kf_set_packed_key(&peck, "sec", 10, lanes1, 1)
+	if pti := kf_track_index(peck, "sec"); pti >= 0 {
+		pk := &peck.keyframe_tracks[pti]
+		pk.keys[1].interp = .Ease_Out
+		pv_m, pok := kf_sample_packed_lane(pk, 5, 0, 0.0)
+		pek := Clip {}
+		kf_set_key(&pek, "sec", 0, 0.0)
+		kf_set_key(&pek, "sec", 10, 100.0)
+		peks := &pek.keyframe_tracks[kf_track_index(pek, "sec")]
+		peks.keys[1].interp = .Ease_Out
+		sv_m, _ := kf_sample(peks, 5, 0.0)
+		kf_probe_check(
+			pok && kf_approx(pv_m, 87.5) && pv_m == sv_m,
+			"packed lane and scalar track ease identically (%v vs %v)",
+			pv_m, sv_m,
+		)
+	}
+
+	// Spline parity: the packed lane's two-neighbor tangent capture (prev2/next2)
+	// must reproduce the scalar Hermite across the whole run of knots.
+	pecs := Clip {}
+	l0 := [KF_PACK_MAX]f32{}
+	l1 := [KF_PACK_MAX]f32{}
+	l2 := [KF_PACK_MAX]f32{}
+	l3 := [KF_PACK_MAX]f32{}
+	l0[0] = 0.0
+	l1[0] = 100.0
+	l2[0] = 250.0
+	l3[0] = 350.0
+	kf_set_packed_key(&pecs, "sec", 0, l0, 1)
+	kf_set_packed_key(&pecs, "sec", 10, l1, 1)
+	kf_set_packed_key(&pecs, "sec", 20, l2, 1)
+	kf_set_packed_key(&pecs, "sec", 30, l3, 1)
+	seck := &pecs.keyframe_tracks[kf_track_index(pecs, "sec")]
+	for i in 0 ..= 2 {
+		seck.keys[i].interp = .Cubic
+	}
+	sc2 := Clip {}
+	kf_set_key(&sc2, "sec", 0, 0.0)
+	kf_set_key(&sc2, "sec", 10, 100.0)
+	kf_set_key(&sc2, "sec", 20, 250.0)
+	kf_set_key(&sc2, "sec", 30, 350.0)
+	sc2k := &sc2.keyframe_tracks[kf_track_index(sc2, "sec")]
+	sc2k.keys[0].interp = .Cubic
+	sc2k.keys[1].interp = .Cubic
+	sc2k.keys[2].interp = .Cubic
+	spline_parity := true
+	for off := i32(0); off <= 30; off += 1 {
+		pv, _ := kf_sample_packed_lane(seck, off, 0, 0.0)
+		sv, _ := kf_sample_keys(sc2k.keys[:], off, 0.0)
+		if !kf_approx(pv, sv) {
+			spline_parity = false
+			break
+		}
+	}
+	kf_probe_check(spline_parity, "packed spline agrees with the scalar spline on every frame")
 
 	// --- deep clone through clone_timeline: mutate clone, original untouched -
 	base := Clip {timeline_start_frame = 50}
@@ -414,7 +615,7 @@ keyframe_probe_run :: proc() -> int {
 	kf_probe_check(sn == 2 && stotal == 2, "snapshot: packed section expands to 2 scalar keys, got %d/%d", sn, stotal)
 	snap_ok := sn == 2
 	if snap_ok {
-		snap_ok = snap_dst[0] == Keyframe {10, 0, 4.0} && snap_dst[1] == Keyframe {24, 0, 9.0}
+		snap_ok = snap_dst[0] == Keyframe {frame_off = 10, value = 4.0} && snap_dst[1] == Keyframe {frame_off = 24, value = 9.0}
 	}
 	kf_probe_check(snap_ok, "snapshot: expanded keys match the packed lane values (got %v %v)", snap_dst[0], snap_dst[1])
 	for off := i32(0); off <= 30; off += 1 {
@@ -430,7 +631,7 @@ keyframe_probe_run :: proc() -> int {
 	gain_clip := Clip {}
 	kf_set_key(&gain_clip, "gain", 5, 7.0)
 	gn, gtotal := kf_geom_fill_snapshot(&gain_clip, "gain", snap_dst[:])
-	kf_probe_check(gn == 1 && gtotal == 1 && snap_dst[0] == Keyframe {5, 0, 7.0}, "snapshot: scalar track copies unchanged")
+	kf_probe_check(gn == 1 && gtotal == 1 && snap_dst[0] == Keyframe {frame_off = 5, value = 7.0}, "snapshot: scalar track copies unchanged")
 
 	// --- unwrap: keying an individual lane makes the group give way ---------
 	uv := Clip {}
@@ -597,6 +798,65 @@ keyframe_probe_run :: proc() -> int {
 	kf_probe_check(cp_ok, "clone_timeline carries a packed section with its n and values")
 	free_timeline(&cp_cloned)
 	free_timeline(&cpt)
+
+	// --- auto-keyframing (kf_auto_key) -------------------------------------
+	// With the toggle on, a change to an ALREADY-keyed property writes a key at
+	// the playhead; a key already on the frame is updated in place (its interp
+	// survives); an unkeyed property or a playhead outside the clip declines.
+	ak_saved_toggle := auto_keyframe
+	ak_saved_ph := playhead.frame
+	defer {
+		auto_keyframe = ak_saved_toggle
+		playhead.frame = ak_saved_ph
+	}
+	auto_keyframe = true
+	ak := Clip {timeline_start_frame = 10, source_length_frames = 40}
+	kf_set_key(&ak, "gain", 5, 1.0)
+	kf_set_key(&ak, "gain", 30, 2.0)
+	ak.keyframe_tracks[0].keys[1].interp = .Ease_In_Out
+	ak_ti := &ak.keyframe_tracks[0]
+
+	// Playhead INSIDE the clip, mid-segment, no key on the frame: insert.
+	// (playhead 20 -> clip-relative off 10, between the keys at 5 and 30.)
+	playhead.frame = 20
+	got_track_before := len(ak.keyframe_tracks[0].keys)
+	created := kf_auto_key(&ak, "gain", 3.0)
+	ak_ok := created && len(ak_ti.keys) == got_track_before + 1
+	if ak_ok {
+		akv, _ := kf_sample(ak_ti, 10, 0.0)
+		ak_ok = akv == 3.0
+	}
+	kf_probe_check(ak_ok, "auto-key inserts a new key at the playhead mid-segment")
+
+	// Playhead ON an existing key, same property: update in place, count
+	// unchanged, and the key keeps its interpolation mode. The original key
+	// sits at clip-relative off 30 (timeline frame 40).
+	playhead.frame = 40
+	mode_before := ak_ti.keys[2].interp
+	updated := kf_auto_key(&ak, "gain", 9.0)
+	ak_ok = updated && len(ak_ti.keys) == got_track_before + 1
+	if ak_ok {
+		akv, _ := kf_sample(ak_ti, 30, 0.0)
+		ak_ok = akv == 9.0 && ak_ti.keys[2].interp == mode_before
+	}
+	kf_probe_check(ak_ok, "auto-key on an existing key updates it in place, preserving its mode")
+
+	// Unkeyed property: declined, no new track minted.
+	playhead.frame = 20
+	ak_ok = !kf_auto_key(&ak, "scale", 1.5)
+	ak_ok = ak_ok && kf_track_index(ak, "scale") < 0
+	kf_probe_check(ak_ok, "auto-key declines an unkeyed property and mints no track")
+
+	// Playhead outside the clip: declined even though the property is keyed.
+	playhead.frame = 60
+	ak_ok = !kf_auto_key(&ak, "gain", 4.0)
+	kf_probe_check(ak_ok, "auto-key declines when the playhead sits outside the clip")
+
+	// Toggle off: declined entirely.
+	auto_keyframe = false
+	playhead.frame = 20
+	ak_ok = !kf_auto_key(&ak, "gain", 4.0)
+	kf_probe_check(ak_ok, "auto-key declines when the toggle is off")
 
 	if kf_probe_fail {
 		fmt.println("[kf-probe] summary: FAIL")

@@ -653,6 +653,58 @@ kf_add_group_prop :: proc(clip: ^Clip, sec: string, lanes: [KF_PACK_MAX]f32) {
 	undo_push(.Value, "Add group keyframe")
 }
 
+// kf_geom_prop_keyed reports whether `name` holds ANY keyframes right now:
+// either its own scalar track exists, or (for a lane name) the section that
+// groups it is packed and therefore owns keys.
+kf_geom_prop_keyed :: proc(clip: ^Clip, name: string) -> bool {
+	if kf_track_index(clip^, name) >= 0 {
+		return true
+	}
+	if sec_index, _, is_lane := kf_geom_section_for_lane(name); is_lane {
+		defs := kf_geom_sections
+		return kf_track_index(clip^, defs[sec_index].name) >= 0
+	}
+	return false
+}
+
+// kf_auto_key writes `value` onto `name`'s track AT THE PLAYHEAD — the
+// auto-keyframing entry point every property edit funnels through. It only
+// fires when the toggle is on, the playhead sits inside the clip, and the
+// property already has keyframes (a property nobody has keyed yet keeps its
+// resting-edit behavior: auto-keying writes into existing tracks, it never
+// mints them). A key already on the playhead frame is updated in place — its
+// interpolation mode survives (kf_set_key's same-frame replace only touches
+// the value) — otherwise a new key is inserted. Returns whether a key was
+// written, so callers can keep their resting write when this declines.
+kf_auto_key :: proc(clip: ^Clip, name: string, value: f32) -> bool {
+	if !auto_keyframe {
+		return false
+	}
+	if playhead.frame < clip.timeline_start_frame ||
+	   playhead.frame > clip.timeline_start_frame + i64(clip.source_length_frames) {
+		return false
+	}
+	if !kf_geom_prop_keyed(clip, name) {
+		return false
+	}
+	off := i32(playhead.frame - clip.timeline_start_frame)
+	kf_geom_set_lane_key(clip, name, off, value)
+	return true
+}
+
+// autokey_gesture feeds one live drag-move value into auto-keyframing: a
+// property that DEPARTED from its gesture-start value writes the playhead key
+// (updating a key already there, else inserting one) so a drag records onto
+// the timeline while it happens. No undo handling here — the gesture began
+// with undo_begin() and the release-time push captures the whole drag,
+// including any key it inserted.
+autokey_gesture :: proc(clip: ^Clip, start, current: f32, name: string) -> bool {
+	if current == start {
+		return false
+	}
+	return kf_auto_key(clip, name, current)
+}
+
 // delete_selected_keyframe removes the selected keyframe as one undoable
 // discrete edit; returns false when no keyframe is selected so callers fall
 // through to their clip-delete path. A stale selection (structure gen drifted)

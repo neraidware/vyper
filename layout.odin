@@ -79,9 +79,11 @@ KF_DBL_CLICK_NS :: i64(400_000_000)
 // Inspector "add keyframe" button: the same 45°-rotated-square keyframe look
 // (KF_DIAMOND_* above), scaled to sit beside a property field. The painted
 // diamond is the button's only graphics; the clay box beneath carries the id
-// for hit-testing and adds a little click padding around the glyph.
-KF_BTN_R :: f32(7)          // Half of the add-keyframe button diamond (14px across).
-KF_BTN_PAD :: f32(3)        // Transparent click padding around the button diamond.
+// for hit-testing and adds a little click padding around the glyph. Sized to
+// the timeline keyframe diamond so a created key reads exactly like its row
+// did on the timeline.
+KF_BTN_R :: KF_DIAMOND_R   // Half of the add-keyframe button diamond (8px across).
+KF_BTN_PAD :: f32(3)       // Transparent click padding around the button diamond.
 // Inspector add-keyframe buttons, one per keyable property in row order: the
 // element ids are hit-tested in interaction.odin and painted as diamonds in
 // gpu_draw.odin, so they live here as the single source of truth.

@@ -691,7 +691,9 @@ kf_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32,
 // diamond_at paints one keyframe diamond centered on (cx, cy); selected uses
 // the light fill so the keyframe cursor reads against the neutral rest state.
 // half is the diamond's bounding half-width: KF_DIAMOND_R in the timeline,
-// KF_BTN_R for the inspector's add-keyframe buttons.
+// KF_BTN_R for the inspector's add-keyframe buttons. filled draws the diamond
+// solid (border 0 in the SDF); otherwise the SDF renders a 1px ring with a
+// transparent interior (the button affordance look).
 diamond_at :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -699,6 +701,7 @@ diamond_at :: proc(
 	cx, cy: f32,
 	half: f32,
 	fill: clay.Color,
+	filled: bool,
 ) {
 	render_sdf_rect(
 		renderer,
@@ -712,7 +715,7 @@ diamond_at :: proc(
 		},
 		fill,
 		KF_DIAMOND_CORNER,
-		KF_DIAMOND_BORDER,
+		filled ? 0.0 : KF_DIAMOND_BORDER,
 		rotation = KF_DIAMOND_ROT,
 	)
 }
@@ -762,7 +765,11 @@ draw_keyframes :: proc(
 					   kf_sel.key == k_idx {
 						fill = KF_DIAMOND_FILL_SELECTED
 					}
-					diamond_at(renderer, command_buffer, pass, cx, cy, KF_DIAMOND_R, fill)
+					// Two-layer diamond: a full-size accent ring under a fill
+					// inset by the border width, so every key gets a thin
+					// colored outline against the row background.
+					diamond_at(renderer, command_buffer, pass, cx, cy, KF_DIAMOND_R, KF_DIAMOND_BORDER_COLOR, true)
+					diamond_at(renderer, command_buffer, pass, cx, cy, KF_DIAMOND_R - f32(KF_DIAMOND_BORDER), fill, true)
 				}
 			}
 		}
@@ -1201,15 +1208,22 @@ draw_gain_knob :: proc(
 }
 
 // draw_kf_add_buttons paints the inspector's add-keyframe buttons as keyframe
-// diamonds (same KF_DIAMOND_* look as the timeline, scaled up via KF_BTN_R),
+// diamonds (same KF_DIAMOND_* look as the timeline, scaled via KF_BTN_R),
 // centered on each button's clay box. Hover lifts the fill like a selected key
 // would, a button affordance on top of the exact keyframe glyph. Empty boxes
-// (a video clip has no KfAddGain element) paint nothing.
+// (a video clip has no KfAddGain element) paint nothing. Scissored to the
+// whole inspector column so a glyph sitting flush at a row edge can never
+// overpaint the scrollbar gutter or the column's rounded corner.
 draw_kf_add_buttons :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 ) {
+	ins := clay.GetElementData(clay.ID("Inspector")).boundingBox
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{c.int(ins.x), c.int(ins.y), c.int(ins.width), c.int(ins.height)},
+	)
 	for id in KF_ADD_BTN_IDS {
 		bb := clay.GetElementData(clay.ID(id)).boundingBox
 		if bb.width <= 0 || bb.height <= 0 {
@@ -1221,20 +1235,24 @@ draw_kf_add_buttons :: proc(
 			// against the single per-lane diamond beside the value field.
 			cx := bb.x + bb.width / 2
 			cy := bb.y + bb.height / 2
-			gap := KF_BTN_R * 0.5
-			r := KF_BTN_R * 0.45
-			diamond_at(renderer, command_buffer, pass, cx - gap, cy - gap, r, fill)
-			diamond_at(renderer, command_buffer, pass, cx + gap, cy - gap, r, fill)
-			diamond_at(renderer, command_buffer, pass, cx - gap, cy + gap, r, fill)
-			diamond_at(renderer, command_buffer, pass, cx + gap, cy + gap, r, fill)
+			gap := KF_BTN_R * 0.6
+			r := KF_BTN_R * 0.5
+			diamond_at(renderer, command_buffer, pass, cx - gap, cy - gap, r, fill, false)
+			diamond_at(renderer, command_buffer, pass, cx + gap, cy - gap, r, fill, false)
+			diamond_at(renderer, command_buffer, pass, cx - gap, cy + gap, r, fill, false)
+			diamond_at(renderer, command_buffer, pass, cx + gap, cy + gap, r, fill, false)
 			continue
 		}
 		diamond_at(
 			renderer, command_buffer, pass,
 			bb.x + bb.width / 2, bb.y + bb.height / 2,
-			KF_BTN_R, fill,
+			KF_BTN_R, fill, false,
 		)
 	}
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
+	)
 }
 
 // is_group_kf_btn reports whether an add-keyframe button id keys a whole
@@ -1347,6 +1365,15 @@ draw_ui_icons :: proc(
 		"SnapPhToClip",
 		.SnapPlayheadToClip,
 		snap_playhead_to_clips,
+		16,
+	)
+	draw_icon_in_element(
+		renderer,
+		command_buffer,
+		pass,
+		"AutoKf",
+		.AutoKeyframe,
+		auto_keyframe,
 		16,
 	)
 	draw_icon_in_element(

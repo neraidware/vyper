@@ -103,10 +103,13 @@ edit_commit :: proc() {
 	}
 	// Resolve the edited field to its storage plus the clamped value and label.
 	// A parse that changes nothing (click in, click out) is not an edit and must
-	// not add a node, so the compare gates the commit below.
+	// not add a node, so the compare gates the commit below. `name` is the
+	// keyframe-track name for the property, so an auto-keyframe commit can write
+	// the same track the inspector's diamond buttons key.
 	field: ^f32
 	label := "Edit clip transform"
 	kind := Undo_Kind.Transform
+	name := ""
 	switch editing_field {
 	case .X:
 		if cl.kind == .Audio {
@@ -114,12 +117,14 @@ edit_commit :: proc() {
 		}
 		field = &cl.transform_x
 		label = "Set clip X"
+		name = "transform.x"
 	case .Y:
 		if cl.kind == .Audio {
 			return
 		}
 		field = &cl.transform_y
 		label = "Set clip Y"
+		name = "transform.y"
 	case .Scale:
 		if cl.kind == .Audio {
 			return
@@ -127,6 +132,7 @@ edit_commit :: proc() {
 		field = &cl.scale
 		val = max(val, 0.01)
 		label = "Set clip scale"
+		name = "scale"
 	case .Crop_L:
 		if cl.kind == .Audio {
 			return
@@ -134,6 +140,7 @@ edit_commit :: proc() {
 		field = &cl.crop_l
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
+		name = "crop.l"
 	case .Crop_R:
 		if cl.kind == .Audio {
 			return
@@ -141,6 +148,7 @@ edit_commit :: proc() {
 		field = &cl.crop_r
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
+		name = "crop.r"
 	case .Crop_T:
 		if cl.kind == .Audio {
 			return
@@ -148,6 +156,7 @@ edit_commit :: proc() {
 		field = &cl.crop_t
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
+		name = "crop.t"
 	case .Crop_B:
 		if cl.kind == .Audio {
 			return
@@ -155,6 +164,7 @@ edit_commit :: proc() {
 		field = &cl.crop_b
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
+		name = "crop.b"
 	case .Gain:
 		// Clamp to the knob range so the typed value and the knob's angle stay
 		// consistent; the knob is the source of truth for what's reachable.
@@ -162,6 +172,7 @@ edit_commit :: proc() {
 		field = &cl.gain
 		label = "Set clip gain"
 		kind = .Value
+		name = "gain"
 	// Keyframe value edits are committed by the early return above, so this
 	// case is unreachable — but the switch must stay exhaustive over the enum.
 	case .Kf_Value, .None:
@@ -178,6 +189,12 @@ edit_commit :: proc() {
 	audio_changed := kind == .Value
 	undo_begin()
 	field^ = val
+	// Auto-keyframing: with the toggle on and a keyed property, the commit
+	// writes the playhead key as well, so the typed value lands on the timeline
+	// (a key already on the frame is updated in place; otherwise a new key
+	// appears). Same undo node as the resting write — the whole field edit is
+	// one step.
+	kf_auto_key(cl, name, val)
 	undo_push(kind, label)
 	if audio_changed {
 		audio_geometry_commit()

@@ -41,9 +41,13 @@ AUDIO_CLIP :: clay.Color{84, 58, 72, 255} // bg_visual — muted purple clip fil
 SELECT_BORDER :: clay.Color{127, 187, 179, 255} // blue — selection
 MARKER_COLOR :: clay.Color{219, 188, 127, 255} // yellow — clip markers
 // Keyframe diamond fills: neutral by default, light (fg) when selected. The
-// selected state lands with the keyframe selection slice.
+// selected state lands with the keyframe selection slice. Timeline diamonds
+// paint a thin accent ring under the fill (KF_DIAMOND_BORDER_COLOR) so a key
+// reads against the row background; the inspector's add-keyframe buttons use
+// the plain hollow ring instead.
 KF_DIAMOND_FILL :: clay.Color{79, 88, 94, 255} // bg4 — neutral keyframe diamond fill
 KF_DIAMOND_FILL_SELECTED :: clay.Color{211, 198, 170, 255} // fg — light when selected
+KF_DIAMOND_BORDER_COLOR :: clay.Color{167, 192, 128, 255} // green — active accent ring (same as hover)
 TOOLTIP_BG :: clay.Color{61, 72, 77, 255} // bg2 — popup/tooltip surface
 TOOLTIP_TEXT :: clay.Color{211, 198, 170, 255} // fg
 RANGE_COLOR :: clay.Color{167, 192, 128, 255} // green — active range chevrons
@@ -71,6 +75,13 @@ timeline_view_top: f32 = 0
 // snaps it to the edge. Both default on.
 snap_clips_to_playhead: bool = true
 snap_playhead_to_clips: bool = true
+// Auto-keyframing toggle for the timeline bottom bar. When on, editing a
+// property that ALREADY has keyframes writes a key at the playhead instead of
+// (or in addition to) the resting value: a key already on the playhead frame
+// is updated, otherwise a new key is inserted. Properties nobody has keyed
+// yet keep their resting-edit behavior — auto-keying writes into tracks, it
+// never mints them.
+auto_keyframe: bool = true
 // snap_center_to_canvas makes a clip dragged/scaled in the preview snap to the
 // project canvas center when its visible center comes within the snap margin.
 // Defaults on, like the other snap toggles; driven by the "Center" toggle in the
@@ -510,6 +521,11 @@ Keyframe_Selection :: struct {
 	gen:        u32, // kf_structure_gen when the selection was made
 }
 kf_sel: Keyframe_Selection // zero value = nothing selected
+
+// kf_interp_menu_open: the keyframe readout's interpolation dropdown. One flag
+// (a single key is selected at a time), same toggle/select/dismiss shape as
+// the export-encoder dropdown.
+kf_interp_menu_open: bool
 
 // kf_structure_gen increments whenever a keyframe SEQUENCE can shift: a key
 // inserted or deleted (kf_set_key/kf_del_key) or a lane remapped (split/trim).

@@ -411,7 +411,7 @@ kf_geom_unwrap_section :: proc(clip: ^Clip, sec: string) {
 		lane.keys = make([dynamic]Keyframe, 0, len(src_keys))
 		for k in src_keys {
 			if v, covered := kf_lane_value(k, li); covered {
-				append(&lane.keys, Keyframe {frame_off = k.frame_off, value = v})
+				append(&lane.keys, Keyframe {frame_off = k.frame_off, value = v, interp = k.interp})
 			}
 		}
 		li += 1
@@ -609,7 +609,7 @@ kf_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n,
 			for k in clip.keyframe_tracks[si].keys {
 				if v, covered := kf_lane_value(k, li); covered {
 					if di < n {
-						dst[di] = Keyframe {frame_off = k.frame_off, value = v}
+						dst[di] = Keyframe {frame_off = k.frame_off, value = v, interp = k.interp}
 						di += 1
 					}
 				}

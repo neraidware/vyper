@@ -1,5 +1,6 @@
 package main
 
+import "core:math"
 import "core:mem"
 import "core:strings"
 
@@ -35,6 +36,32 @@ KF_MAX_OFFSET :: 268435456
 // there.
 KF_PACK_MAX :: 7
 
+// Kf_Interp is the easing a key applies to the segment ARRIVING at it from the
+// previous key — we ease INTO a breakpoint, so the key you're heading to owns
+// the curve. .Cubic is the zero value — a fresh key defaults to the spline
+// (cubic Hermite over neighbor-estimated tangents); .Linear and the rest are
+// closed-form curves evaluated in kf_ease. Samplers use kf_apply_interp so
+// scalar and packed lanes share one curve. The very first key has nothing
+// arriving at it, so its mode is inert.
+Kf_Interp :: enum u8 {
+	Cubic,
+	Linear,
+	Ease_In,
+	Ease_Out,
+	Ease_In_Out,
+	Elastic,
+}
+
+// Elastic is the Penner easeOutElastic over one segment: an amplitude envelope
+// 2^(-ELASTIC_DECAY·t) over ELASTIC_FREQ_CYCLES sine cycles, re-centred to land
+// (+ a hair past) the next key's value at t=1. It overshoots on purpose — that
+// is the bounce the name promises, so sampled values may leave [l, r].
+ELASTIC_DECAY :: 10 // 2^(-10·t): drops to ~1/1000 of its start by t=1.
+ELASTIC_FREQ_CYCLES :: 3 // complete sine swings per segment.
+// ELASTIC_PHASE shifts the sine so t=0 opens at the trough (sin(-π/2) ≈ -1):
+// value stays 0 at the key, then bounces forward of the target.
+ELASTIC_PHASE :: 0.75
+
 Keyframe :: struct {
 	// frame_off: clip-relative frame this key sits on. Sorted ascending.
 	frame_off: i32,
@@ -44,6 +71,10 @@ Keyframe :: struct {
 	// key (value carries .f32); mask != 0 means a packed key (value carries a
 	// [KF_PACK_MAX]f32 indexed by LANE, meaningful where the mask bit is set).
 	mask: u8,
+	// interp: easing for the segment arriving at this key from the previous
+	// one. Scalar and packed keys both carry it; a packed knot's mode applies
+	// to every lane it covers.
+	interp: Kf_Interp,
 	value: union {
 		f32,
 		[KF_PACK_MAX]f32,
@@ -232,16 +263,90 @@ kf_set_packed_key :: proc(clip: ^Clip, name: string, frame_off: i32, lanes: [KF_
 	track.keys[ip] = Keyframe {frame_off = frame_off, mask = mask, value = lanes}
 }
 
-// --- evaluation (linear between keys, base outside them) ----------------
+// --- curve math (easing + spline evaluators) -----------------------------
+
+// kf_ease maps normalized segment time t∈[0,1] for the closed-form easing
+// modes (.Cubic is a spline and is never routed here — kf_apply_interp
+// resolves it). Elastic may push past [0,1]: that overshoot is the point.
+kf_ease :: proc(interp: Kf_Interp, t: f32) -> f32 {
+	switch interp {
+	case .Cubic:
+		// Hermite basis handles spline segments in kf_apply_interp.
+		return t
+	case .Linear:
+		return t
+	case .Ease_In:
+		return t * t * t
+	case .Ease_Out:
+		u := 1 - t
+		return 1 - u * u * u
+	case .Ease_In_Out:
+		if t < 0.5 {
+			return 4 * t * t * t
+		}
+		u := -2 * t + 2
+		return 1 - u * u * u / 2
+	case .Elastic:
+		if t == 0 {
+			return 0
+		}
+		if t == 1 {
+			return 1
+		}
+		return (
+			math.pow(2, -ELASTIC_DECAY * t) *
+			math.sin((t * ELASTIC_DECAY - ELASTIC_PHASE) * ((2 * math.PI) / f32(ELASTIC_FREQ_CYCLES))) +
+			1
+		)
+	}
+	return t
+}
+
+// kf_chord_slope is the per-frame value slope of the straight line `a`→`b`
+// (value/frame). It is the natural end condition for the spline: a missing
+// neighbor defaults the tangent to the chord slope, which reduces cubic Hermite
+// to plain linear interpolation on that end.
+kf_chord_slope :: proc(a, b: Keyframe) -> f32 {
+	return (b.value.(f32) - a.value.(f32)) / f32(b.frame_off - a.frame_off)
+}
+
+// kf_apply_interp evaluates one segment at normalized t∈[0,1], shaped by the
+// arriving key's mode (the segment between l and r ends at r, so r owns the
+// curve — the mode the keyframe readout selects). For .Cubic, m0/m1 are the
+// per-frame tangent slopes at the endpoints, estimated by the caller from the
+// neighbor keys and scaled to the segment by `span`; the Hermite basis then
+// interpolates l→r with those tangents. Every other mode is l + (r−l)·kf_ease.
+// `span` is in frames and always > 0 (adjacent keys are strictly sorted and
+// distinct).
+kf_apply_interp :: proc(l, r: f32, t: f32, interp: Kf_Interp, m0, m1: f32, span: f32) -> f32 {
+	assert(span > 0)
+	switch interp {
+	case .Cubic:
+		t2 := t * t
+		t3 := t2 * t
+		h00 := 2 * t3 - 3 * t2 + 1
+		h10 := t3 - 2 * t2 + t
+		h01 := -(2 * t3) + 3 * t2
+		h11 := t3 - t2
+		return h00 * l + h10 * (m0 * span) + h01 * r + h11 * (m1 * span)
+	case .Linear, .Ease_In, .Ease_Out, .Ease_In_Out, .Elastic:
+		return l + (r - l) * kf_ease(interp, t)
+	}
+	return l
+}
+
+// --- evaluation (interpolated between keys, base outside them) -----------
 
 // kf_sample_keys is the keyed evaluation over a flat key slice — the same
 // algorithm kf_sample runs over a track, exposed separately so the audio
-// producer can sample a SNAPSHOT of a clip's gain track it owns (it may never
-// touch the live timeline). A key applies ITS value on its own frame; between
-// two adjacent keys the value interpolates linearly so it reaches the NEXT
-// key's value exactly on that key's frame. Before the first key and after the
-// last key the property is INACTIVE: the caller keeps its own (base/resting)
-// value, so direct edits and drags apply there.
+// producer re-evaluates keyed gain from its own snapshot (kf_fill_snapshot)
+// without touching the live timeline. A key applies ITS value on its own
+// frame; between two adjacent keys the value follows the NEXT key's
+// interpolation mode (we ease INTO it) so it reaches that key's value exactly
+// on its own frame. Before the first key and after the last key the property
+// is INACTIVE:
+// the caller keeps its own (base/resting) value, so direct edits and drags
+// apply there.
 kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, bool) {
 	if len(keys) == 0 {
 		return base, false
@@ -257,13 +362,27 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 	if frame_off == active_key.frame_off {
 		return active_key.value.(f32), true
 	}
-	// A later key starts a segment from this key's frame; interpolate toward
-	// it so the next key's value lands exactly on its own frame.
+	// A later key starts a segment from this key's frame; the ARRIVING key's
+	// mode shapes the curve into it, and the next key's value still lands
+	// exactly on its own frame.
 	if active + 1 < len(keys) {
 		next_key := keys[active + 1]
-		span := next_key.frame_off - active_key.frame_off
-		t := f32(frame_off - active_key.frame_off) / f32(span)
-		return active_key.value.(f32) + (next_key.value.(f32) - active_key.value.(f32)) * t, true
+		span := f32(next_key.frame_off - active_key.frame_off)
+		t := f32(frame_off - active_key.frame_off) / span
+		// Spline tangents (value/frame) at each endpoint, estimated from the
+		// outside neighbor keys. A missing neighbor defaults to the chord slope
+		// (linear at that end — natural edge condition).
+		m0 := kf_chord_slope(active_key, next_key)
+		if active >= 1 {
+			prev_key := keys[active - 1]
+			m0 = (next_key.value.(f32) - prev_key.value.(f32)) / f32(next_key.frame_off - prev_key.frame_off)
+		}
+		m1 := kf_chord_slope(active_key, next_key)
+		if active + 2 < len(keys) {
+			later_key := keys[active + 2]
+			m1 = (later_key.value.(f32) - active_key.value.(f32)) / f32(later_key.frame_off - active_key.frame_off)
+		}
+		return kf_apply_interp(active_key.value.(f32), next_key.value.(f32), t, next_key.interp, m0, m1, span), true
 	}
 	// Past the last key the property is under direct control again.
 	return base, false
@@ -273,57 +392,96 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 // (the packed twin of kf_sample, from the section track's own keys). A lane's
 // curve is defined by the knots whose mask covers it: each such knot applies
 // its lane value on its own frame, and between two adjacent covering knots the
-// lane interpolates linearly toward the next covering knot's value. Knots that
-// don't mask the lane are no breakpoint for it — the lane's curve runs
-// straight through them, so a partial fold keeps every lane's own keyframe
-// set intact. Before the lane's first covering knot and after its last, the
-// lane is inactive and `base` rules.
+// lane arrives following the NEXT covering knot's interpolation mode (easing
+// into it, like the scalar path). Knots that don't mask the lane are no
+// breakpoint for it — the lane's curve runs straight through them, so a partial
+// fold keeps every lane's own keyframe set intact. Before the lane's first
+// covering knot and after its last, the lane is inactive and `base` rules.
 kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: f32) -> (f32, bool) {
 	if track == nil || len(track.keys) == 0 {
 		return base, false
 	}
-	prev_frame: i32
-	prev_val: f32
-	found := false
+	// Backward scan: the last covering knot at or before the frame (prev) and
+	// the covering knot before it (prev2), which anchors the spline's left
+	// tangent when it exists.
+	prev: Keyframe
+	prev2: Keyframe
+	have_prev := false
+	have_prev2 := false
 	for i := len(track.keys) - 1; i >= 0; i -= 1 {
 		k := track.keys[i]
 		if k.frame_off > frame_off {
 			continue
 		}
-		if v, cov := kf_lane_value(k, idx); cov {
-			if k.frame_off == frame_off {
-				return v, true // the knot applies ITS value on its own frame
+		if _, covered := kf_lane_value(k, idx); covered {
+			if have_prev {
+				prev2 = k
+				have_prev2 = true
+				break
 			}
-			prev_frame = k.frame_off
-			prev_val = v
-			found = true
-			break
+			prev = k
+			have_prev = true
 		}
 	}
-	if !found {
+	if !have_prev {
 		return base, false
 	}
+	if v, _ := kf_lane_value(prev, idx); prev.frame_off == frame_off {
+		return v, true // the knot applies ITS value on its own frame
+	}
+	// Forward scan: the first covering knot after the frame (next) and the one
+	// after it (next2) for the spline's right tangent.
+	next: Keyframe
+	next2: Keyframe
+	have_next := false
+	have_next2 := false
 	for i := 0; i < len(track.keys); i += 1 {
 		k := track.keys[i]
 		if k.frame_off <= frame_off {
 			continue
 		}
-		if nv, cov := kf_lane_value(k, idx); cov {
-			span := k.frame_off - prev_frame
-			t := f32(frame_off - prev_frame) / f32(span)
-			return prev_val + (nv - prev_val) * t, true
+		if _, covered := kf_lane_value(k, idx); covered {
+			if have_next {
+				next2 = k
+				have_next2 = true
+				break
+			}
+			next = k
+			have_next = true
 		}
 	}
-	return base, false
+	if !have_next {
+		return base, false
+	}
+	span := f32(next.frame_off - prev.frame_off)
+	t := f32(frame_off - prev.frame_off) / span
+	lv, _ := kf_lane_value(prev, idx)
+	rv, _ := kf_lane_value(next, idx)
+	// The segment's mode is next's (the knot the segment eases INTO — we arrive
+	// at it, so it owns the curve). Tangent slopes default to the chord when a
+	// covering neighbor is missing, so partial folds and track edges stay
+	// linear.
+	m0 := (rv - lv) / span
+	if have_prev2 {
+		p2v, _ := kf_lane_value(prev2, idx)
+		m0 = (rv - p2v) / f32(next.frame_off - prev2.frame_off)
+	}
+	m1 := (rv - lv) / span
+	if have_next2 {
+		n2v, _ := kf_lane_value(next2, idx)
+		m1 = (n2v - lv) / f32(next2.frame_off - prev.frame_off)
+	}
+	return kf_apply_interp(lv, rv, t, next.interp, m0, m1, span), true
 }
 
 // kf_sample evaluates the keyed value for clip-relative frame_off.
 //
 // A key applies ITS value on its own frame (creating or editing a keyframe is
-// visible immediately); between two adjacent keys the value interpolates
-// linearly and arrives at the NEXT key's value exactly on that key's frame.
-// Before the first key and after the last key the property is inactive and
-// the caller keeps its own value — direct edits and drags apply there.
+// visible immediately); between two adjacent keys the value follows the NEXT
+// key's interpolation mode (we ease INTO it) and arrives at that key's value
+// exactly on its own frame. Before the first key and after the last key the
+// property is inactive and the caller keeps its own value — direct edits and
+// drags apply there.
 kf_sample :: proc(track: ^Kf_Track, frame_off: i32, base: f32) -> (f32, bool) {
 	if track == nil || len(track.keys) == 0 {
 		return base, false
@@ -393,9 +551,12 @@ kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Tr
 		keys := make([dynamic]Keyframe, 0, len(st.keys))
 		for k in st.keys {
 			if k.frame_off >= lo && k.frame_off < hi {
-				// Preserve mask + union payload: a packed (section) key rides the
-				// split/trim remap intact, mask=0 -> scalar comes along for free.
-				append(&keys, Keyframe {frame_off = k.frame_off - lo, mask = k.mask, value = k.value})
+// Preserve mask + union payload + interpolation mode: a packed
+			// (section) key rides the split/trim remap intact with its own
+			// curve, mask=0 -> scalar comes along for free. Dropping interp
+			// here (as each half is a NEW key) would silently reset every
+			// eased/spline mode to Linear on split or trim.
+			append(&keys, Keyframe {frame_off = k.frame_off - lo, mask = k.mask, value = k.value, interp = k.interp})
 			}
 		}
 		if len(keys) > 0 {

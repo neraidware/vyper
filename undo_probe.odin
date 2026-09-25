@@ -267,6 +267,35 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 		fail,
 	)
 
+	// The interpolation mode is per-key data like the value, so it must ride the
+	// same snapshot round trip. A MID key (keys[1]) is used so the edited mode
+	// also has a real arriving segment. New keys default to .Cubic (the enum's
+	// zero value) — editing TO a non-default mode makes the round trip verify
+	// a real transition in both directions.
+	undo_begin()
+	clip0.keyframe_tracks[0].keys[1].interp = .Ease_In_Out
+	undo_push(.Value, "Set keyframe interpolation")
+	rcheck(undo_count() == 2, "interpolation edit adds one undo node", fail)
+	rcheck(
+		clip0.keyframe_tracks[0].keys[1].interp == .Ease_In_Out,
+		"interpolation edit applied",
+		fail,
+	)
+	undo_undo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(
+		clip0.keyframe_tracks[0].keys[1].interp == .Cubic,
+		"undo restores the mode the key had before the edit (default .Cubic)",
+		fail,
+	)
+	undo_redo()
+	clip0 = &timeline.tracks[0].clips[0]
+	rcheck(
+		clip0.keyframe_tracks[0].keys[1].interp == .Ease_In_Out,
+		"redo restores edited interpolation mode",
+		fail,
+	)
+
 	// A store edit that slides keys must invalidate the selection: inserting a
 	// key before the picked one moves the picked key's slot, so resolving the
 	// OLD indices would alias the newly inserted key.

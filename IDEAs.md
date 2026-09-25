@@ -276,3 +276,30 @@ is sketched.
   — the map comes after the closed set is known, not before.
 
 ## (Add new ideas below, newest first.)
+
+## Idea: symmetrical (ghost) keyframes
+
+**Desire:** drop a key anywhere in a clip and have an opposite ghost key
+auto-mirrored to the other side of the clip. Real use case: a soft overlay —
+image fades smoothly in and out — where the fade-out is the fade-in mirrored
+across the clip's center, hand-tuned once instead of matched twice.
+
+**Shape (unresolved — this is a marker note, not a blueprints):**
+- Rides the generic keyframe store (TODO.md: Active 3): a per-key flag
+  (`mirrored: bool`? or a mode on the track) that makes the sampler fold its
+  value across the clip's center: key at offset `o` implies a virtual boundary
+  key at `len(o) = clip_len - o`.
+- Open questions for later:
+  - Does the ghost mirror the VALUE (v / max−v), the slot only, or both? The
+    overlay fade wants value-mirroring (0 at both ends, peak at center) —
+    but a position-mirror (same value, walked across = M/W-ish motion) is a
+    different, also-plausible reading. Probably two flags, or one flag + rule.
+  - Tied to what: clip length at edit time, or a live mirror still faithful
+    when the clip is trimmed? Trim/split remapping (kf) currently rewrites
+    frames — a mirrored key must survive that or recompute from its sibling.
+  - Does the ghost key render as a distinct diamond in the gutter, editable
+    in its own right, or is it read-only until the real key moves?
+  - Interaction with interpolation modes (interp is per-key, left key owns the
+    segment): a mirrored pair shares the reflected mode/curve or not?
+- Parked until the mirror semantics (value vs slot) and the trim behavior are
+  decided.

@@ -83,6 +83,83 @@ render_kf_probe_run :: proc() -> int {
 	render_kf_probe_check(oxB == -25 && rwB == 75,
 		"B src sub-rect + box trim left: got ox=%d rw=%d want -25 75", oxB, rwB)
 
+	// Case C — the eased mode flows through the WORKER seam end to end. The
+	// seam copies the track into the flat worker copy (kf_geom_fill_snapshot)
+	// and the rect's sampler (kf_sample_keys) then eases with it. Keys tx
+	// 0@1 -> 100@21, arriving key .Ease_In: at off=11 (t=1/2) the t^3 curve
+	// gives 12.5, box 100 wide -> l=-37.5, ox=-38. A linear path would give
+	// 50 / ox 0, so a dropped interp trips this hard.
+	clipC := Clip{}
+	kf_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+	kf_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
+	clipC.keyframe_tracks[0].keys[0].interp = .Ease_Out
+	clipC.keyframe_tracks[0].keys[1].interp = .Ease_In
+	geomC: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		p := Render_Geom_Prop(pi)
+		geomC[int(p)] = render_kf_fill_flat(&clipC, p)
+	}
+	// Both modes are non-default so the seam genuinely has to carry per-key
+	// interp; a dropped/zeroed mode would fail here (`.Cubic`, the zero
+	// value, would only be caught by the eased sample below).
+	render_kf_probe_check(
+		geomC[int(Render_Geom_Prop.Trans_X)].keys[0].interp == .Ease_Out &&
+			geomC[int(Render_Geom_Prop.Trans_X)].keys[1].interp == .Ease_In,
+		"worker seam copy carries each key's interpolation mode",
+	)
+	txC, _, _, _, _, _, _, oxC, _, rwC, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomC, 11, 0, 0, 1, 0, 0, 0, 0,
+			100, 100, 100, 100, 100, 100)
+	render_kf_probe_check_near(txC, 12.5, 0.001, "C eased tx: tx=%f want 12.5")
+	render_kf_probe_check(oxC == -38 && rwC == 100,
+		"C eased box: got ox=%d rw=%d want -38 100", oxC, rwC)
+
+	// Case D — the spline mode through the same worker rect. Keys tx
+	// 0@1 100@11 250@21 350@31, all .Cubic: segment 11->21 has symmetric
+	// tangents (12.5 both edges), so its midpoint is exactly 175 -> ox 125.
+	clipD := Clip{}
+	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 11, 100)
+	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 21, 250)
+	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 31, 350)
+	dtk := &clipD.keyframe_tracks[0]
+	dtk.keys[1].interp = .Cubic
+	dtk.keys[2].interp = .Cubic
+	dtk.keys[3].interp = .Cubic
+	geomD: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		p := Render_Geom_Prop(pi)
+		geomD[int(p)] = render_kf_fill_flat(&clipD, p)
+	}
+	txD, _, _, _, _, _, _, oxD, _, rwD, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomD, 16, 0, 0, 1, 0, 0, 0, 0,
+			100, 100, 100, 100, 100, 100)
+	render_kf_probe_check_near(txD, 175.0, 0.001, "D spline tx: tx=%f want 175")
+	render_kf_probe_check(oxD == 125 && rwD == 100,
+		"D spline box: got ox=%d rw=%d want 125 100", oxD, rwD)
+
+	// Case E — the PREVIEW (GPU) seam, kf_geom_sample_lane, the exact call the
+	// per-frame preview_state sampling makes before handing floats to the GPU.
+	// E1: scalar eased track. E2: a PACKED "transform" section (the grouped
+	// form) whose lane is sampled; both must ride the arriving key's mode.
+	clipE1 := Clip{}
+	kf_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+	kf_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
+	clipE1.keyframe_tracks[0].keys[1].interp = .Ease_In
+	pe1, _ := kf_geom_sample_lane(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
+	render_kf_probe_check_near(pe1, 12.5, 0.001, "E1 preview scalar eased: got %f want 12.5")
+
+	clipE2 := Clip{}
+	lanesL := [KF_PACK_MAX]f32{}
+	lanesH := [KF_PACK_MAX]f32{}
+	lanesL[0] = 0
+	lanesH[0] = 100
+	kf_geom_set_packed(&clipE2, "transform", 1, lanesL, 1)
+	kf_geom_set_packed(&clipE2, "transform", 21, lanesH, 1)
+	clipE2.keyframe_tracks[0].keys[1].interp = .Ease_In
+	pe2, _ := kf_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
+	render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview packed lane eased: got %f want 12.5")
+
 	if render_kf_probe_fail {
 		fmt.println("[render-kf-probe] failed")
 		return 1
