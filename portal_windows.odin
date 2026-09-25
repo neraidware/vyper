@@ -13,13 +13,13 @@ import "core:strings"
 // by `media.open_file_picker` on `.Windows`, backed by the Win32 common dialog
 // (`GetOpenFileNameW`).
 //
-// The returned value is a cstring into a package-level buffer, kept alive for
-// the duration of the program (mirrors the persistent `g_filename_from_uri`
-// result the Linux portal returns). Reusing the buffer each call is fine: the
-// previous import has already been consumed.
+// The returned value is a cstring cloned to the session allocator, owned for
+// the rest of the program. Assets and clips store their path by reference
+// (`Media_Asset.path = path`), so each call must mint its own buffer: a shared
+// one would be overwritten by the next import, silently retargeting earlier
+// assets and clips to the latest file. This mirrors the per-call
+// `g_filename_from_uri` results the Linux portal returns.
 // ---------------------------------------------------------------------------
-
-win32_picked_path: [1024]byte
 
 win32_open_file_picker :: proc() -> cstring {
 	filters := strings.concatenate({
@@ -53,11 +53,7 @@ win32_open_file_picker :: proc() -> cstring {
 	if err != nil {
 		return nil
 	}
-	path_utf8 = strings.trim_right_null(path_utf8)
-	// Copy into the persistent global so the cstring survives frame-to-frame.
-	n := copy(win32_picked_path[:], path_utf8)
-	win32_picked_path[n] = 0
-	return cstring(&win32_picked_path[0])
+	return strings.clone_to_cstring(path_utf8)
 }
 
 // win32_open_srt_picker is the subtitle variant of win32_open_file_picker,
@@ -94,13 +90,8 @@ win32_open_srt_picker :: proc() -> cstring {
 	if err != nil {
 		return nil
 	}
-	path_utf8 = strings.trim_right_null(path_utf8)
-	n := copy(win32_picked_path[:], path_utf8)
-	win32_picked_path[n] = 0
-	return cstring(&win32_picked_path[0])
+	return strings.clone_to_cstring(path_utf8)
 }
-
-win32_save_picked_path: [1024]byte
 
 // win32_save_file_picker opens the Win32 common Save-As dialog for the render
 // output path, pre-filtered to .mp4 with an overwrite prompt. Mirror of
@@ -120,16 +111,11 @@ win32_save_file_picker :: proc() -> cstring {
 	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
 	defer delete(file_buf)
 	if render_out_path_len > 0 {
-		n := 0
-		for n < len(file_buf)-1 && n < render_out_path_len {
-			c := u8(render_out_path_buf[n])
-			if c == 0 {
-				break
-			}
-			file_buf[n] = u16(c)
-			n += 1
-		}
-		file_buf[n] = 0
+		// Pre-fill the dialog filename with the last render path. The render
+		// path is UTF-8 and the dialog wants UTF-16; a byte-for-byte copy would
+		// print every non-ASCII name wrong. A too-long/invalid name just opens
+		// the dialog empty -- cosmetic, so a failed conversion is dropped.
+		_ = win32.utf8_to_utf16_buf(file_buf[:], string(render_out_path_buf[:render_out_path_len]))
 	}
 
 	ofn := win32.OPENFILENAMEW{
@@ -150,8 +136,5 @@ win32_save_file_picker :: proc() -> cstring {
 	if err != nil {
 		return nil
 	}
-	path_utf8 = strings.trim_right_null(path_utf8)
-	n := copy(win32_save_picked_path[:], path_utf8)
-	win32_save_picked_path[n] = 0
-	return cstring(&win32_save_picked_path[0])
+	return strings.clone_to_cstring(path_utf8)
 }

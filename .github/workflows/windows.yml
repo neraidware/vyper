@@ -43,7 +43,7 @@ jobs:
 
       # Prebuilt shared ffmpeg (BtbN auto-build). Provides the import libs
       # (avformat.lib, avcodec.lib, ...) Odin's binding links, plus the runtime
-      # dlls and the ffmpeg.exe / ffprobe.exe nered shells out to.
+      # dlls and the ffmpeg.exe / ffprobe.exe vyper shells out to.
       # NOTE: vendor:ffmpeg declares its Windows import as a bare relative name
       # `foreign import "<lib>.lib"`, which Odin resolves *relative to the source
       # file dir* (vendor/ffmpeg/<lib>/<lib>.lib), then passes as an absolute file
@@ -102,14 +102,14 @@ jobs:
           New-Item -ItemType Directory -Force clay-odin\windows | Out-Null
           lib /nologo /OUT:clay-odin\windows\clay.lib vendor\clay.obj
 
-      - name: Build nered
+      - name: Build vyper
         shell: pwsh
         run: |
           # Odin's vendored SDL3 / ffmpeg bindings reference the .lib import libs
           # Run odin. SDL3 is imported via the `{ "SDL3.lib" }` form, which is passed to
           # link.exe as a name and resolved via /LIBPATH -> deps\lib. ffmpeg import
           # libs were dropped into vendor/ffmpeg/<lib>/ by the previous step.
-          odin build . -out:nered.exe `
+          odin build . -out:vyper.exe `
             -define:FFMPEG_LINK=system `
             -extra-linker-flags:"/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup" `
             -show-timings
@@ -118,8 +118,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item nered.exe dist\nered.exe -Force
-          # SDL3 + ffmpeg runtime dlls, plus ffmpeg.exe/ffprobe.exe that nered
+          Copy-Item vyper.exe dist\vyper.exe -Force
+          # SDL3 + ffmpeg runtime dlls, plus ffmpeg.exe/ffprobe.exe that vyper
           # shells out to, must sit beside the exe.
           Get-ChildItem deps\*.dll | Copy-Item -Destination dist -Force
           Copy-Item -Path deps\ffmpeg.exe, deps\ffprobe.exe -Destination dist -Force
@@ -129,14 +129,14 @@ jobs:
       # frame range through the vendored ffmpeg DLLs (NERED_FRAME_PROBE), then
       # build a proxy with the bundled ffmpeg.exe and verify proxy/source
       # parity (NERED_PROXY_PROBE). A dist whose DLL set or decode path is
-      # broken dies HERE with a non-zero exit -- and nered_crash.log next to
+      # broken dies HERE with a non-zero exit -- and vyper_crash.log next to
       # the exe is captured into the log so the fault is diagnosable without
       # a Windows box. This is what would have caught "crashes as soon as I
       # open a video" upstream of the artifact.
       - name: Smoke test (decode + proxy)
         shell: pwsh
         run: |
-          # nered.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
+          # vyper.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
           # redirected, so every run writes a log that we dump on failure/success.
           $env:PATH = "$PWD\dist;$env:PATH"
           & .\dist\ffmpeg.exe -y -loglevel error -f lavfi -i testsrc2=duration=8:size=320x180:rate=30 -frames:v 240 -pix_fmt yuv420p sample.mp4
@@ -144,26 +144,26 @@ jobs:
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_frame.log
           $env:NERED_FRAME_PROBE = "sample.mp4|0-239|30"
-          & .\dist\nered.exe > .\smoke_frame.log 2>&1
+          & .\dist\vyper.exe > .\smoke_frame.log 2>&1
           if ($LASTEXITCODE -ne 0) {
             Get-Content .\smoke_frame.log
-            if (Test-Path .\dist\nered_crash.log) { Get-Content .\dist\nered_crash.log }
+            if (Test-Path .\dist\vyper_crash.log) { Get-Content .\dist\vyper_crash.log }
             throw "frame-probe failed (exit $LASTEXITCODE)"
           }
           Remove-Item Env:NERED_FRAME_PROBE
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_proxy.log
           $env:NERED_PROXY_PROBE = "sample.mp4"
-          & .\dist\nered.exe > .\smoke_proxy.log 2>&1
+          & .\dist\vyper.exe > .\smoke_proxy.log 2>&1
           if ($LASTEXITCODE -ne 0) {
             Get-Content .\smoke_proxy.log
-            if (Test-Path .\dist\nered_crash.log) { Get-Content .\dist\nered_crash.log }
+            if (Test-Path .\dist\vyper_crash.log) { Get-Content .\dist\vyper_crash.log }
             throw "proxy-probe failed (exit $LASTEXITCODE)"
           }
 
-          if (Test-Path .\dist\nered_crash.log) {
-            Get-Content .\dist\nered_crash.log
-            throw "nered_crash.log present after smoke test"
+          if (Test-Path .\dist\vyper_crash.log) {
+            Get-Content .\dist\vyper_crash.log
+            throw "vyper_crash.log present after smoke test"
           }
           Get-Content .\smoke_frame.log
           Get-Content .\smoke_proxy.log
@@ -171,7 +171,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: nered-windows
+          name: vyper-windows
           path: dist/
           if-no-files-found: error
           retention-days: 7
