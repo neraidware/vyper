@@ -1425,6 +1425,20 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 	}
 
+	// Media file arguments: `vyper media.mp4 ...` opens each listed file through
+	// the normal Open-File flow (probe -> bin + timeline append; a bad path
+	// shows the notice and is skipped). This is what the desktop entry's
+	// "Open with vyper" hands over. os.args strings live for the whole process,
+	// so assets may reference the argv bytes directly — no clone needed (unlike
+	// the env-var autoplay below, whose string is temp-arena memory).
+	for arg_i := 1; arg_i < len(os.args); arg_i += 1 {
+		path := cstring(raw_data(os.args[arg_i]))
+		if vyper_trace {
+			fmt.printf("[args] open \"%s\"\n", os.args[arg_i])
+		}
+		open_file_at(path)
+	}
+
 	// DIAG: env-var autoplay for headless-ish diagnostics — autoloads a file and
 	// starts playback after a couple of seconds. Refuses silently-failed imports
 	// (bad path, unreadable file, probe failure) instead of opening an empty

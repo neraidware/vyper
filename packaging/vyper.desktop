@@ -2,8 +2,10 @@
 Type=Application
 Name=vyper
 Comment=Live clip editor
-Exec=vyper
+Exec=vyper %F
 Icon=vyper
 Terminal=false
 Categories=AudioVideo;VideoEditor;
+MimeType=video/mp4;video/x-m4v;video/x-matroska;video/webm;video/quicktime;video/x-msvideo;video/mpeg;video/mp2t;video/x-ms-wmv;video/x-flv;video/3gpp;video/ogg;video/mxf;audio/mp4;audio/mpeg;audio/flac;audio/ogg;audio/wav;audio/x-wav;audio/x-ms-wma;audio/opus;audio/webm;audio/aac;audio/x-m4a;application/x-subrip;
 StartupNotify=false
+StartupWMClass=vyper
