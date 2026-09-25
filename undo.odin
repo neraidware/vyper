@@ -181,6 +181,18 @@ undo_begin :: proc() {
 	undo_hist.pending_valid = true
 }
 
+// undo_cancel drops a pending capture started by undo_begin when the gesture or
+// edit ended up making no change. A stale pending must never leak into a later
+// undo_push: that fold treats it as an "untracked edit since the cursor's
+// action", adopting a snapshot nothing actually produced.
+undo_cancel :: proc() {
+	if undo_hist.pending_valid {
+		free_timeline(&undo_hist.pending)
+		undo_hist.pending = {}
+		undo_hist.pending_valid = false
+	}
+}
+
 // undo_push records a committed edit as the next action and moves the cursor to
 // it. When the cursor already has children this FORKS a new branch (the edit
 // was made after an undo); when it is the newest tip it extends the line.

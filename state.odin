@@ -871,6 +871,20 @@ handle_start_ty: f32
 // merely STARTS flush (e.g. a full-canvas clip whose corner sits on the canvas
 // corner) can still be dragged outward to scale freely.
 handle_corner_snapped: bool
+// crop_pan_* drive the Alt+Middle crop-pan gesture (crop_viewport_pan): the
+// source window slides inside a stationary visible box. *_start_* is the
+// pre-gesture state the release step compares against to decide between
+// committing a "Pan clip" node and discarding a no-move press (undo_cancel).
+crop_pan_active: bool
+crop_pan_last_x: f32
+crop_pan_last_y: f32
+crop_pan_start_scale: f32
+crop_pan_start_x: f32
+crop_pan_start_y: f32
+crop_pan_start_l: f32
+crop_pan_start_r: f32
+crop_pan_start_t: f32
+crop_pan_start_b: f32
 
 Timeline_Frame :: struct {
 	active_clip: ^Clip,

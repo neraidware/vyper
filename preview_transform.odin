@@ -453,6 +453,146 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
 }
 
+// CROP_MIN_VISIBLE_FRAC is the smallest crop window (as a fraction of the full
+// box) the wheel/pan gestures allow; below it the visible box has no extent and
+// the render math divides by zero.
+CROP_MIN_VISIBLE_FRAC :: 0.05
+
+// crop_viewport_zoom magnifies or reduces the selected clip's source window
+// about its box center while the visible (cropped) box keeps its exact position
+// and size: the clip's uniform scale absorbs the box-size change the crop
+// insets would otherwise cause, and the transform re-anchors the crop-symmetric
+// center offset. zoom > 1 magnifies content; zoom < 1 reveals more. With
+// apply=false it only reports whether the edit would change anything (the
+// wheel-at-floor no-op guard), so the caller can capture the pre-edit state
+// before mutating.
+crop_viewport_zoom :: proc(clip: ^Clip, zoom: f32, apply: bool) -> bool {
+	if clip.kind == .Text || clip.source_w <= 0 {
+		return false
+	}
+	fx := 1 - clip.crop_l - clip.crop_r
+	fy := 1 - clip.crop_t - clip.crop_b
+	if fx <= 0 || fy <= 0 {
+		return false
+	}
+	// The window may grow until it fills the source entirely (never beyond: an
+	// edge coming out of the frame would clamp and the real window would
+	// diverge from the ratio the scale compensation assumes). Both axes share
+	// one k per step, so box width and height are scaled by the same factor and
+	// the box keeps its size. Zoom-in is floored so the window never collapses
+	// below CROP_MIN_VISIBLE_FRAC.
+	k := min(1 / zoom, 1 / fx, 1 / fy)
+	k = max(k, CROP_MIN_VISIBLE_FRAC / max(fx, fy))
+	if k == 1 {
+		return false
+	}
+	if !apply {
+		return true
+	}
+	cw0, ch0 := clip_full_box_dims(clip, clip.scale)
+	wx := fx * k
+	wy := fy * k
+	// Place each axis' new window at the current center when an edge still has
+	// room; when the growth step would cross a source border the window slides
+	// off-center instead, so zooming out past a panned pin keeps revealing
+	// (toward the full frame) rather than stopping.
+	hs := clamp((clip.crop_l + 1 - clip.crop_r) * 0.5 - wx * 0.5, 0, 1 - wx)
+	vs := clamp((clip.crop_t + 1 - clip.crop_b) * 0.5 - wy * 0.5, 0, 1 - wy)
+	sl := clip.crop_l - clip.crop_r
+	st := clip.crop_t - clip.crop_b
+	vis_cx := clip.transform_x + sl * cw0 / 2
+	vis_cy := clip.transform_y + st * ch0 / 2
+	clip.crop_l = hs
+	clip.crop_r = 1 - hs - wx
+	clip.crop_t = vs
+	clip.crop_b = 1 - vs - wy
+	clip.scale = clamp(clip.scale / k, 0.05, 100.0)
+	cw1, ch1 := clip_full_box_dims(clip, clip.scale)
+	clip.transform_x = vis_cx - (clip.crop_l - clip.crop_r) * cw1 / 2
+	clip.transform_y = vis_cy - (clip.crop_t - clip.crop_b) * ch1 / 2
+	return true
+}
+
+// crop_viewport_pan slides the source window inside the clip while the visible
+// box stays exactly where it is on the canvas. dx/dy are project-space deltas
+// in the grab-the-content direction (drag right -> content shifts right), so
+// the window edges move opposite the pointer. The window is clamped as a whole
+// (length invariant): once either edge reaches the source border, further pan
+// pins the window there instead of cropping the region smaller.
+crop_viewport_pan :: proc(clip: ^Clip, dx, dy: f32) {
+	if clip.kind == .Text || clip.source_w <= 0 || (dx == 0 && dy == 0) {
+		return
+	}
+	cw, ch := clip_full_box_dims(clip, clip.scale)
+	dxn := dx / max(cw, 0.0001)
+	dyn := dy / max(ch, 0.0001)
+	// In normalized source coords the window is [wl, wr] = [l, 1 - r] (and
+	// [wt, wb] = [t, 1 - b]): its length is invariant under translation, so
+	// clamping the leading edge to [0, 1-window] keeps both edges on-frame.
+	wl := clip.crop_l - dxn
+	wr := 1 - clip.crop_r - dxn
+	w := wr - wl
+	wl = clamp(wl, 0, 1 - w)
+	wr = wl + w
+	wt := clip.crop_t - dyn
+	wb := 1 - clip.crop_b - dyn
+	h := wb - wt
+	wt = clamp(wt, 0, 1 - h)
+	wb = wt + h
+
+	// The visible box is anchored: the transform re-centers under the new crop
+	// asymmetry so the box nobody is dragging never moves.
+	sl := clip.crop_l - clip.crop_r
+	st := clip.crop_t - clip.crop_b
+	vis_cx := clip.transform_x + sl * cw / 2
+	vis_cy := clip.transform_y + st * ch / 2
+	clip.crop_l = wl
+	clip.crop_r = 1 - wr
+	clip.crop_t = wt
+	clip.crop_b = 1 - wb
+	clip.transform_x = vis_cx - (clip.crop_l - clip.crop_r) * cw / 2
+	clip.transform_y = vis_cy - (clip.crop_t - clip.crop_b) * ch / 2
+}
+
+// crop_pan_begin captures the pre-pan transform/crop and opens the undo node
+// for the Alt+Middle crop-pan gesture; the box is anchored so the release step
+// can tell a no-move press from a real pan.
+crop_pan_begin :: proc(clip: ^Clip, x, y: f32) {
+	crop_pan_active = true
+	crop_pan_last_x = x
+	crop_pan_last_y = y
+	crop_pan_start_scale = clip.scale
+	crop_pan_start_x = clip.transform_x
+	crop_pan_start_y = clip.transform_y
+	crop_pan_start_l = clip.crop_l
+	crop_pan_start_r = clip.crop_r
+	crop_pan_start_t = clip.crop_t
+	crop_pan_start_b = clip.crop_b
+	undo_begin()
+}
+
+// crop_pan_end commits the crop pan as one transform node when it moved
+// anything, or discards the pending capture for a no-move press.
+crop_pan_end :: proc() {
+	if !crop_pan_active {
+		return
+	}
+	crop_pan_active = false
+	if sel, ok := transformable_selected(); ok && sel.kind != .Text {
+		if sel.scale != crop_pan_start_scale ||
+		   sel.transform_x != crop_pan_start_x ||
+		   sel.transform_y != crop_pan_start_y ||
+		   sel.crop_l != crop_pan_start_l ||
+		   sel.crop_r != crop_pan_start_r ||
+		   sel.crop_t != crop_pan_start_t ||
+		   sel.crop_b != crop_pan_start_b {
+			undo_push(.Transform, "Pan clip")
+			return
+		}
+	}
+	undo_cancel()
+}
+
 // transformable_clip reports whether the clip currently selected is one with a
 // (video/image) transform that can be previewed/moved.
 transformable_selected :: proc() -> (^Clip, bool) {

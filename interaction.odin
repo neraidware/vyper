@@ -46,10 +46,31 @@ read_mouse_input :: proc() -> Mouse_Input {
 // drag work on last frame's geometry. Also feeds clay the pointer state, which
 // must happen before build_page so PointerOver reflects this frame's layout.
 interaction_pre_build :: proc(inp: Mouse_Input) {
-	// NOTE: Middle-button drag over the preview pans the camera (image-viewer bound:
-	// canvas edge may reach the panel edge, never cross it -- see
-	// clamp_preview_camera).
-	if inp.middle && clay.PointerOver(clay.ID("Preview")) {
+	// NOTE: Alt+Middle over the preview pans the selected clip's crop viewport
+	// (the source window slides inside a stationary visible box) instead of the
+	// camera; the gesture commits one "Pan clip" node on release. Any other
+	// Middle-drag over the preview pans the camera (image-viewer bound: canvas
+	// edge may reach the panel edge, never cross it -- see clamp_preview_camera).
+	crop_pan_allowed := inp.middle && inp.alt && clay.PointerOver(clay.ID("Preview"))
+	if crop_pan_allowed {
+		if sel, ok := transformable_selected(); ok && sel.kind != .Text {
+			if !crop_pan_active {
+				crop_pan_begin(sel, inp.x, inp.y)
+			}
+			pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+			canvas := preview_canvas(pb)
+			lcx, lcy := pixel_to_project_unclamped(canvas, crop_pan_last_x, crop_pan_last_y)
+			ccx, ccy := pixel_to_project_unclamped(canvas, inp.x, inp.y)
+			crop_viewport_pan(sel, ccx - lcx, ccy - lcy)
+			crop_pan_last_x = inp.x
+			crop_pan_last_y = inp.y
+		} else {
+			crop_pan_allowed = false
+		}
+	} else if crop_pan_active {
+		crop_pan_end()
+	}
+	if inp.middle && !crop_pan_allowed && clay.PointerOver(clay.ID("Preview")) {
 		if panning_preview {
 			dx := inp.x - pan_last_x
 			dy := inp.y - pan_last_y

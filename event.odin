@@ -239,12 +239,27 @@ case sdl.K_BACKSPACE:
 				}
 				break
 			}
-			// Scroll over the preview zooms the camera, keeping the point under
-			// the cursor fixed.
+			// Alt+Scroll over the preview crop-zooms the selected clip: the clip's
+			// source window magnifies about the box center while the visible box
+			// stays put, committed as one "Zoom clip" undo node per wheel event.
 			pb := clay.GetElementData(clay.ID("Preview")).boundingBox
 			if event.wheel.mouse_x >= pb.x && event.wheel.mouse_x <= pb.x + pb.width &&
 				event.wheel.mouse_y >= pb.y && event.wheel.mouse_y <= pb.y + pb.height {
 				if event.wheel.y != 0 {
+					mods := sdl.GetModState()
+					if sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods {
+						if sel, ok := transformable_selected(); ok && sel.kind != .Text {
+							factor := 1 + 0.1 * event.wheel.y
+							if crop_viewport_zoom(sel, factor, false) {
+								undo_begin()
+								crop_viewport_zoom(sel, factor, true)
+								undo_push(.Transform, "Zoom clip")
+							}
+							break
+						}
+					}
+					// Scroll over the preview zooms the camera, keeping the point under
+					// the cursor fixed.
 					canvas := preview_canvas(pb)
 					mx_c := event.wheel.mouse_x - (canvas.x + canvas.width / 2)
 					my_c := event.wheel.mouse_y - (canvas.y + canvas.height / 2)

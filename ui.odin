@@ -2410,6 +2410,8 @@ HELP_SHORTCUTS :: []Help_Shortcut {
 	{"Drag timeline scrollbar", "Scroll the track list"},
 	{"Middle-drag timeline", "Pan"},
 	{"Alt+drag a handle", "Crop the selected box"},
+	{"Alt+Wheel over preview", "Crop-zoom the selected clip (box stays put)"},
+	{"Alt+Middle-drag preview", "Crop-pan the selected clip (box stays put)"},
 	{"Shift+drag a handle", "Scale from center"},
 }
 
