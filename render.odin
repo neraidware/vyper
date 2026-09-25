@@ -547,16 +547,14 @@ render_job_end: i64 // inclusive
 render_job_nframes: i64
 
 // clip_full_box_dims works on ^Clip; mirrored here for snapshot structs.
-render_full_box_dims :: proc(sw0, sh0: c.int, out_w, out_h: f32) -> (f32, f32) {
+// Source-relative: scale 1 is the clip's native pixel size in output pixels;
+// a clip with a known source size never stretches (uniform both axes). With an
+// unknown source size it falls back to the canvas box (stretch-to-fill).
+render_full_box_dims :: proc(sw0, sh0: c.int, scale, pw, ph: f32) -> (f32, f32) {
 	if sw0 > 0 && sh0 > 0 {
-		src_ar := f32(sw0) / f32(sh0)
-		box_ar := out_w / out_h
-		if src_ar > box_ar {
-			return out_w, out_w / src_ar
-		}
-		return out_h * src_ar, out_h
+		return f32(sw0) * scale, f32(sh0) * scale
 	}
-	return out_w, out_h
+	return pw * scale, ph * scale
 }
 
 // render_display_rect returns the clip's visible rect in project (output)
@@ -565,8 +563,9 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	cw, ch := render_full_box_dims(
 		src.source_w,
 		src.source_h,
-		f32(PW) * src.scale,
-		f32(PH) * src.scale,
+		src.scale,
+		f32(PW),
+		f32(PH),
 	)
 	l = src.transform_x - cw / 2 + src.crop_l * cw
 	r = src.transform_x + cw / 2 - src.crop_r * cw
@@ -600,7 +599,7 @@ render_kf_geom_rect :: proc(
 	cr, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_R)].keys[:geom[int(Render_Geom_Prop.Crop_R)].n], off, base_cr)
 	ct, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_T)].keys[:geom[int(Render_Geom_Prop.Crop_T)].n], off, base_ct)
 	cb, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_B)].keys[:geom[int(Render_Geom_Prop.Crop_B)].n], off, base_cb)
-	cw, ch := render_full_box_dims(source_w, source_h, f32(draw_w) * s, f32(draw_h) * s)
+	cw, ch := render_full_box_dims(source_w, source_h, s, f32(draw_w), f32(draw_h))
 	l := tx - cw / 2 + cl * cw
 	r := tx + cw / 2 - cr * cw
 	t := ty - ch / 2 + ct * ch
@@ -1729,8 +1728,9 @@ render_worker_run :: proc() {
 			scw, sch := render_full_box_dims(
 				v.source_w,
 				v.source_h,
-				f32(render_job_width) * v.stage_scale,
-				f32(render_job_height) * v.stage_scale,
+				v.stage_scale,
+				f32(render_job_width),
+				f32(render_job_height),
 			)
 			v.fw = max(1, c.int(scw + 0.5))
 			v.fh = max(1, c.int(sch + 0.5))
@@ -1766,8 +1766,9 @@ render_worker_run :: proc() {
 		cw, ch := render_full_box_dims(
 			v.source_w,
 			v.source_h,
-			f32(render_job_width) * v.scale,
-			f32(render_job_height) * v.scale,
+			v.scale,
+			f32(render_job_width),
+			f32(render_job_height),
 		)
 		v.fw = max(1, c.int(cw + 0.5))
 		v.fh = max(1, c.int(ch + 0.5))

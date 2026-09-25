@@ -23,13 +23,15 @@ import "core:os"
 import clay "clay-odin"
 
 mk_probe_clip :: proc() -> (c: Clip) {
-	c.kind = .Video
-	c.generator = .None
-	c.source_w = 16
-	c.source_h = 9
+	// Video import now lands source-relative: scale 1 = the clip's own native
+	// box, so to probe a FULL-CANVAS 16:9 box the fixture's source must BE the
+	// canvas itself (1920x1080). All the flush-on-border cases below then keep
+	// measuring a box that is exactly the canvas at scale 1, as before.
+	c.source_w = project.width
+	c.source_h = project.height
 	c.transform_x = f32(project.width) / 2
 	c.transform_y = f32(project.height) / 2
-	c.scale = 1.0
+	c.scale = 1
 	return
 }
 
@@ -43,9 +45,11 @@ probe_canvas :: proc() -> clay.BoundingBox {
 }
 
 probe_visible_edges :: proc(c: ^Clip) -> (l, r, t, b: f32) {
-	PW := f32(project.width)
-	PH := f32(project.height)
-	cw2, ch2 := clip_full_box_dims(c, PW * c.scale, PH * c.scale)
+	// The probe's mk_probe_clip sets source_w/h = project dims, so scale 1 is
+	// still EXACTLY the full canvas (both models agree there) and the geometry
+	// this labels "full-canvas box" is unchanged. Under the new source-relative
+	// model scale is the only box argument.
+	cw2, ch2 := clip_full_box_dims(c, c.scale)
 	dl := (0.5 - c.crop_l) * cw2
 	dr := (0.5 - c.crop_r) * cw2
 	dt := (0.5 - c.crop_t) * ch2

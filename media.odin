@@ -511,17 +511,14 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 		}
 		if is_video {
 			// Import at native size: 1 source pixel maps to 1 project-canvas
-			// pixel, so a clip bigger than the canvas arrives oversized (here,
-			// wider than the project) and the user transforms it themselves.
+			// pixel (scale is source-relative, so 1 means native), so a clip
+			// bigger than the canvas arrives oversized and the user transforms
+			// it themselves.
 			clip.source_w = asset.src_w
 			clip.source_h = asset.src_h
 			clip.transform_x = f32(project.width) / 2
 			clip.transform_y = f32(project.height) / 2
-			native_scale: f32 = 1
-			if asset.src_w > 0 && f32(project.width) > 0 {
-				native_scale = f32(asset.src_w) / f32(project.width)
-			}
-			clip.scale = native_scale
+			clip.scale = 1
 			// OBS hybrid MP4 recordings embed chapter markers as a text stream;
 			// surface them on the video clip as embedded clip markers.
 			clip.markers = import_obs_chapters(asset.path)

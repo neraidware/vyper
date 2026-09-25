@@ -123,25 +123,21 @@ snap_margin :: proc(canvas: clay.BoundingBox, preview_px: f32) -> f32 {
 }
 
 // clip_full_box_dims returns the uncropped full-image size (project units) for
-// a clip whose canvas scale box is out_w x out_h, constrained to the source's
-// own aspect (contain-fit, letterboxed). With an unknown source size (0) it is
-// the plain canvas box, preserving the old stretch-to-fill behavior.
-clip_full_box_dims :: proc(clip: ^Clip, out_w, out_h: f32) -> (f32, f32) {
+// a clip at the given scale, measured from the SOURCE's own pixels: scale 1 is
+// the clip at native size (1 source pixel = 1 project-canvas pixel), uniform
+// in both axes so the clip never distorts. With an unknown source size (0) it
+// is the plain canvas box, preserving the old stretch-to-fill behavior.
+clip_full_box_dims :: proc(clip: ^Clip, scale: f32) -> (f32, f32) {
 	if clip.source_w > 0 && clip.source_h > 0 {
-		src_ar := f32(clip.source_w) / f32(clip.source_h)
-		box_ar := out_w / out_h
-		if src_ar > box_ar {
-			return out_w, out_w / src_ar
-		}
-		return out_h * src_ar, out_h
+		return f32(clip.source_w) * scale, f32(clip.source_h) * scale
 	}
-	return out_w, out_h
+	return f32(project.width) * scale, f32(project.height) * scale
 }
 
 // snap_transform snaps the clip's visible (cropped) box edges to the project
 // canvas borders when they come within the given margin (project units). Force
 // insets are normalized, so the visible half-extent from the center is
-// (0.5 - crop) * (project axis) * scale. The full box honors the source aspect
+// (0.5 - crop) * (source axis) * scale. The full box is the source-sized box
 // (see clip_full_box_dims), so snapping matches the box the user actually sees.
 snap_transform :: proc(clip: ^Clip, margin: f32) {
 	PW := f32(project.width)
@@ -171,7 +167,7 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 		}
 		return
 	}
-	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+	cw, ch := clip_full_box_dims(clip, clip.scale)
 	d_l := (0.5 - clip.crop_l) * cw
 	d_r := (0.5 - clip.crop_r) * cw
 	left := clip.transform_x - d_l
@@ -224,7 +220,7 @@ snap_center :: proc(clip: ^Clip, margin: f32) -> bool {
 		}
 		return snapped
 	}
-	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+	cw, ch := clip_full_box_dims(clip, clip.scale)
 	cx := clip.transform_x + (clip.crop_l - clip.crop_r) * cw / 2
 	cy := clip.transform_y + (clip.crop_t - clip.crop_b) * ch / 2
 	snapped := false
@@ -358,7 +354,7 @@ corner_snap_scale :: proc(
 	}
 	s_out = s * k
 	// Reanchor the transform on the pinned corner at the new scale.
-	cw2, ch2 := clip_full_box_dims(clip, pw * s_out, ph * s_out)
+	cw2, ch2 := clip_full_box_dims(clip, s_out)
 	dl2 := (0.5 - clip.crop_l) * cw2
 	dr2 := (0.5 - clip.crop_r) * cw2
 	dt2 := (0.5 - clip.crop_t) * ch2
@@ -439,11 +435,19 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 		return {x = tx, y = ty, width = w, height = h}
 	}
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
-	// Preserve the source's own aspect inside the (canvas-shaped) scale box,
-	// letterboxing the excess instead of stretching, so a clip doesn't get
-	// squished when its aspect differs from the project canvas. With an
-	// unknown source size (0) behavior is unchanged (fill the box).
-	sw, sh := clip_full_box_dims(clip, v.width * clip.scale, v.height * clip.scale)
+	// The source-sized box is in PROJECT units (scale relative to the source's
+	// own pixels: scale 1 = native size); scale it onto the screen by the
+	// view's pixels-per-project-unit so the drawn quad matches the box the
+	// handle math sees. With an unknown source size (0) the box falls back to
+	// the canvas.
+	cu_w, cu_h := clip_full_box_dims(clip, clip.scale)
+	pu := f32(project.width)
+	if pu <= 0 {
+		pu = f32(PREVIEW_W)
+	}
+	k := v.width / pu
+	sw := cu_w * k
+	sh := cu_h * k
 	x := cx - sw / 2 + clip.crop_l * sw
 	y := cy - sh / 2 + clip.crop_t * sh
 	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
@@ -578,7 +582,7 @@ clip_visible_box_project :: proc(clip: ^Clip) -> (l, r, t, b: f32) {
 		h := f32(clip.source_h) * f
 		return clip.transform_x, clip.transform_x + w, clip.transform_y, clip.transform_y + h
 	}
-	cw, ch := clip_full_box_dims(clip, PW * clip.scale, PH * clip.scale)
+	cw, ch := clip_full_box_dims(clip, clip.scale)
 	dl := (0.5 - clip.crop_l) * cw
 	dr := (0.5 - clip.crop_r) * cw
 	dt := (0.5 - clip.crop_t) * ch
@@ -631,13 +635,13 @@ snap_driven_handle :: proc(
 		if from_center {
 			cy: f32 = ty + (dt - db) / 2
 			s_out = s * cy / (cy - t)
-			_, ch2 := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			_, ch2 := clip_full_box_dims(clip, s_out)
 			dt = (0.5 - ct) * ch2
 			db = (0.5 - cb) * ch2
 			ty_out = cy + (dt - db) / 2
 		} else {
 			s_out = s * b / (b - t)
-			_, ch2 := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			_, ch2 := clip_full_box_dims(clip, s_out)
 			dt = (0.5 - ct) * ch2
 			db = (0.5 - cb) * ch2
 			ty_out = b - db
@@ -649,13 +653,13 @@ snap_driven_handle :: proc(
 		if from_center {
 			cy: f32 = ty + (dt - db) / 2
 			s_out = s * (PH - cy) / (b - cy)
-			_, ch2 := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			_, ch2 := clip_full_box_dims(clip, s_out)
 			dt = (0.5 - ct) * ch2
 			db = (0.5 - cb) * ch2
 			ty_out = cy + (dt - db) / 2
 		} else {
 			s_out = s * (PH - t) / (b - t)
-			_, ch2 := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			_, ch2 := clip_full_box_dims(clip, s_out)
 			dt = (0.5 - ct) * ch2
 			db = (0.5 - cb) * ch2
 			ty_out = t + dt
@@ -667,13 +671,13 @@ snap_driven_handle :: proc(
 		if from_center {
 			cx: f32 = tx + (dl - dr) / 2
 			s_out = s * cx / (cx - l)
-			cw2, _ := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			cw2, _ := clip_full_box_dims(clip, s_out)
 			dl = (0.5 - cl) * cw2
 			dr = (0.5 - cr) * cw2
 			tx_out = cx + (dl - dr) / 2
 		} else {
 			s_out = s * r / (r - l)
-			cw2, _ := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			cw2, _ := clip_full_box_dims(clip, s_out)
 			dl = (0.5 - cl) * cw2
 			dr = (0.5 - cr) * cw2
 			tx_out = r - dr
@@ -685,13 +689,13 @@ snap_driven_handle :: proc(
 		if from_center {
 			cx: f32 = tx + (dl - dr) / 2
 			s_out = s * (PW - cx) / (r - cx)
-			cw2, _ := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			cw2, _ := clip_full_box_dims(clip, s_out)
 			dl = (0.5 - cl) * cw2
 			dr = (0.5 - cr) * cw2
 			tx_out = cx + (dl - dr) / 2
 		} else {
 			s_out = s * (PW - l) / (r - l)
-			cw2, _ := clip_full_box_dims(clip, PW * s_out, PH * s_out)
+			cw2, _ := clip_full_box_dims(clip, s_out)
 			dl = (0.5 - cl) * cw2
 			dr = (0.5 - cr) * cw2
 			tx_out = l + dl
@@ -910,7 +914,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		cr := handle_start_crop_r
 		ct := handle_start_crop_t
 		cb := handle_start_crop_b
-		cw0, ch0 := clip_full_box_dims(clip, PW * scale0, PH * scale0)
+		cw0, ch0 := clip_full_box_dims(clip, scale0)
 		dl0 := (0.5 - cl) * cw0
 		dr0 := (0.5 - cr) * cw0
 		dt0 := (0.5 - ct) * ch0
@@ -944,7 +948,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			pivot_cy := handle_start_ty + (dt0 - db0) / 2
 			k := max(handle_center_pivot_scale(h, pivot_cx, pivot_cy, pmx, pmy, w0, h0), 0.01)
 			s := scale0 * k
-			cw, ch := clip_full_box_dims(clip, PW * s, PH * s)
+			cw, ch := clip_full_box_dims(clip, s)
 			dl := (0.5 - cl) * cw
 			dr := (0.5 - cr) * cw
 			dt := (0.5 - ct) * ch
@@ -1011,7 +1015,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 
 		k = max(k, 0.01)
 		s := scale0 * k
-		cw, ch := clip_full_box_dims(clip, PW * s, PH * s)
+		cw, ch := clip_full_box_dims(clip, s)
 		dl := (0.5 - cl) * cw
 		dr := (0.5 - cr) * cw
 		dt := (0.5 - ct) * ch
@@ -1055,7 +1059,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		PW := f32(project.width)
 		PH := f32(project.height)
 		scale0 := handle_start_scale
-		out_w, out_h := clip_full_box_dims(clip, PW * scale0, PH * scale0)
+		out_w, out_h := clip_full_box_dims(clip, scale0)
 		OX_L := handle_start_tx - out_w / 2
 		OX_R := handle_start_tx + out_w / 2
 		OX_T := handle_start_ty - out_h / 2
