@@ -1721,8 +1721,8 @@ render_worker_run :: proc() {
 			// be present every frame) nor the static crop resampler is built.
 			stage_scale := v.scale
 			for k in v.kf_geom[int(Render_Geom_Prop.Scale)].keys[:v.kf_geom[int(Render_Geom_Prop.Scale)].n] {
-				if k.value > stage_scale {
-					stage_scale = k.value
+				if k.value.(f32) > stage_scale {
+					stage_scale = k.value.(f32)
 				}
 			}
 			v.stage_scale = max(stage_scale, 0.0001)

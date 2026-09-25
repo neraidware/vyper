@@ -43,12 +43,12 @@ keyframe_probe_run :: proc() -> int {
 		keys := c.keyframe_tracks[ti].keys
 		kf_probe_check(len(keys) == 3, "3 distinct frames => 3 keys, got %d", len(keys))
 		kf_probe_check(
-			keys[0] == Keyframe {10, 5.0},
+			keys[0] == Keyframe {10, 0, 5.0},
 			"inserts must stay sorted and the repeated frame replaced: keys[0]=%v",
 			keys[0],
 		)
-		kf_probe_check(keys[1] == Keyframe {20, 2.0}, "keys[1]=%v", keys[1])
-		kf_probe_check(keys[2] == Keyframe {30, 3.0}, "keys[2]=%v", keys[2])
+		kf_probe_check(keys[1] == Keyframe {20, 0, 2.0}, "keys[1]=%v", keys[1])
+		kf_probe_check(keys[2] == Keyframe {30, 0, 3.0}, "keys[2]=%v", keys[2])
 	}
 
 	// --- lookup: missing name ---------------------------------------------
@@ -153,16 +153,16 @@ keyframe_probe_run :: proc() -> int {
 	left_ok := false
 	if len(sp.keyframe_tracks) == 1 {
 		lk := sp.keyframe_tracks[0].keys
-		left_ok = len(lk) == 1 && lk[0] == Keyframe {10, 1.0}
+		left_ok = len(lk) == 1 && lk[0] == Keyframe {10, 0, 1.0}
 	}
 	kf_probe_check(left_ok, "left keeps only keys < cut, values preserved")
 	right_ok := false
 	if len(sp_right.keyframe_tracks) == 1 {
 		rk := sp_right.keyframe_tracks[0].keys
 		right_ok = len(rk) == 3 &&
-			rk[0] == Keyframe {0, 2.0} &&
-			rk[1] == Keyframe {5, 3.0} &&
-			rk[2] == Keyframe {59, 4.0}
+		rk[0] == Keyframe {0, 0, 2.0} &&
+		rk[1] == Keyframe {5, 0, 3.0} &&
+		rk[2] == Keyframe {59, 0, 4.0}
 	}
 	kf_probe_check(right_ok, "right re-relatives keys >= cut by -cut")
 	if right_ok {
@@ -181,7 +181,7 @@ keyframe_probe_run :: proc() -> int {
 	trim_ok := false
 	if len(tr.keyframe_tracks) == 1 {
 		tk := tr.keyframe_tracks[0].keys
-		trim_ok = len(tk) == 2 && tk[0] == Keyframe {0, 2.0} && tk[1] == Keyframe {5, 3.0}
+		trim_ok = len(tk) == 2 && tk[0] == Keyframe {0, 0, 2.0} && tk[1] == Keyframe {5, 0, 3.0}
 	}
 	kf_probe_check(trim_ok, "trim_head drops head keys and re-relatives survivors")
 	tr2 := Clip {}
@@ -192,7 +192,7 @@ keyframe_probe_run :: proc() -> int {
 	trim2_ok := false
 	if len(tr2.keyframe_tracks) == 1 {
 		tk := tr2.keyframe_tracks[0].keys
-		trim2_ok = len(tk) == 2 && tk[0] == Keyframe {5, 1.0} && tk[1] == Keyframe {40, 2.0}
+		trim2_ok = len(tk) == 2 && tk[0] == Keyframe {5, 0, 1.0} && tk[1] == Keyframe {40, 0, 2.0}
 	}
 	kf_probe_check(trim2_ok, "trim_tail drops keys beyond the new length")
 

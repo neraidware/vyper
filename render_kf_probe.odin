@@ -12,7 +12,7 @@ import "core:math"
 // mismatch between the worker's fill and the pure rect's expectations trips
 // the build, not a silent wrong composite.
 
-import "core:intrinsics"
+import "base:intrinsics"
 
 render_kf_probe_fail := false
 

@@ -27,10 +27,28 @@ import "core:strings"
 // ~50 days, far past any real clip.
 KF_MAX_OFFSET :: 268435456
 
+// KF_PACK_MAX: widest packed key the store will hold. A section key fans its
+// inner-scalar lanes into one Keyframe tuple; the widest real section is Crop
+// (4 lanes: L/R/T/B) and Transform (2), so 7 leaves headroom without ever
+// letting a consumer m,n grow past the fixed array that crosses the worker
+// seam. Fixed array, never a slice -- a packed key rides the same raw byte
+// copy (kf_sample_snapshot) the scalar path does, and a slice header would
+// dangle there.
+KF_PACK_MAX :: 7
+
 Keyframe :: struct {
 	// frame_off: clip-relative frame this key sits on. Sorted ascending.
 	frame_off: i32,
-	value:     f32,
+	// n: number of packed lanes this key applies. n == 0 means a scalar key
+	// (value carries .f32); n > 0 means a section key (value carries the
+	// first n lanes of a [KF_PACK_MAX]f32) and the other lanes read as
+	// inactive/resting -- the consumer unpacks section keys BEFORE sampling
+	// so its per-scalar reader never sees a partial lane.
+	n: u8,
+	value: union {
+		f32,
+		[KF_PACK_MAX]f32,
+	},
 }
 
 Kf_Track :: struct {
@@ -106,6 +124,9 @@ kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
 		track.keys[ip-1].value = value
 		return
 	}
+	// Grow the dynamic array by one (sentinel slot) before the slide, so both
+	// the fresh-track first key (ip == 0, empty keys) and an end-append
+	// (ip == len(old keys)) have a valid slot to land in.
 	append(&track.keys, Keyframe {})
 	if ip < len(track.keys) - 1 {
 		// Slide the tail right to make room, keeping the array sorted.
@@ -170,7 +191,7 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 	}
 	active_key := keys[active]
 	if frame_off == active_key.frame_off {
-		return active_key.value, true
+		return active_key.value.(f32), true
 	}
 	// A later key starts a segment from this key's frame; interpolate toward
 	// it so the next key's value lands exactly on its own frame.
@@ -178,7 +199,7 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 		next_key := keys[active + 1]
 		span := next_key.frame_off - active_key.frame_off
 		t := f32(frame_off - active_key.frame_off) / f32(span)
-		return active_key.value + (next_key.value - active_key.value) * t, true
+		return active_key.value.(f32) + (next_key.value.(f32) - active_key.value.(f32)) * t, true
 	}
 	// Past the last key the property is under direct control again.
 	return base, false

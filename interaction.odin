@@ -383,7 +383,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		if clay.PointerOver(clay.ID("PropFieldKf")) {
 			if _, _, k, ok := kf_selected(); ok {
-				edit_begin(.Kf_Value, k.value)
+				edit_begin(.Kf_Value, k.value.(f32))
 				return true
 			}
 		}
@@ -754,7 +754,7 @@ commit_keyframe_drag :: proc() {
 	defer delete(name)
 	start_off := kf_drag_start_frame
 	final_off := k.frame_off
-	value := k.value
+	value := k.value.(f32)
 	kf_del_key(cl, name, start_off)
 	kf_set_key(cl, name, final_off, value)
 	// Re-select the moved key by name + landed frame (the lane index may have
