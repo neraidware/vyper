@@ -373,11 +373,72 @@ into playback/preview.
       (linear between keys, resting base outside them — since the S5 sanity
       fix, the `step` move-toward model was dropped for linear, and the
       after-last-key region rules resting so direct edits apply);
-      probe pins their agreement + clip-relative addressing. EXPORT NOT wired:
-      render.odin snapshots each clip's transform once at render start (decode
-      boxes are baked at open), so an export renders the resting transform —
-      keyed motion is preview-only until the export compositor evaluates per
-      frame (its own follow-up).
+      probe pins their agreement + clip-relative addressing. Export now evaluates
+      keyed geometry per frame through `render_eval_keyed_geom`; its current
+      max-scale/full-box resampling path needs the performance follow-up in
+      Active 4.
+
+## Active 4 — Export keyframe compositor performance
+
+**Status:** measured 2026-09-25. Export scale keyframes are functional but
+pathologically expensive; transform- and crop-only keyframes do not reproduce
+the regression. Scope is export rendering. Preview behavior is unchanged.
+
+**Measured baseline (60 frames, CPU encoder, deterministic fixtures):**
+- 1280x720: no-key export ~0.45 s wall; scale `1 -> 3` ~3.51 s. Keyed `sws`
+  ~52.9 ms/frame; stage grows to 3840x2160.
+- 1920x1080: no-key export ~0.81 s wall; scale `1 -> 3` ~7.78 s. Keyed `sws`
+  ~119.3 ms/frame; stage grows to 5760x3240.
+- Static scale `3` stays near baseline because the static path applies a
+  visibility crop. Keyed clips currently skip that crop and resample the full
+  max-scale stage before canvas clipping.
+
+**Root cause:** keyed setup in `render_worker_run` sizes stages from the maximum
+keyed scale (`render.odin:2043-2083`). `render_eval_keyed_geom` then runs
+`sws.scale` over the full stage/current box every frame
+(`render.odin:2687-2717`), while `render_blit_region` clips only afterward.
+The producer timing labelled `codec` includes `scale_decoded_frame`; its jump
+is stage scaling, not primarily decoder seeking. Off-canvas pixels and a
+one-frame maximum key therefore inflate both producer and compositor work.
+
+**Implementation order (each step lands with probe + vet before next):**
+- [ ] S1. Add an opt-in headless export benchmark fixture for scale `1 -> 2`,
+      `1 -> 3`, constant scale, transform-only, crop-only, reversed scale, and
+      off-canvas motion. Record wall time, producer time, keyed `sws`, stage
+      dimensions, output frame count, and a reference-frame hash/PSNR.
+- [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
+      visible destination rectangle back to the stage source rectangle, clamp
+      rounding at stage bounds, and blit only the visible result. Preserve
+      transform, crop, reversed interpolation, and partial off-canvas cases.
+      This is the lowest-risk first fix; probe showed ~3.5 s -> ~1.1 s at 720p
+      and ~7.8 s -> ~2.4 s at 1080p.
+- [ ] S3. Compute one visibility envelope per keyed clip at render start: union
+      of all on-canvas source regions over the clip's sampled poses, including
+      crop insets. Use that envelope to configure the decoder crop/stage once;
+      never recompute allocations or decoder geometry per frame. Fall back to
+      the full stage when the envelope is not safely bounded.
+- [ ] S4. Size keyed decode stages from the visibility envelope rather than the
+      maximum key scale. Keep enough resolution for the largest visible output,
+      size double buffers and `kres_scratch` from actual maximum destination
+      dimensions, and preserve source aspect/crop semantics. Compare output
+      against the current path before accepting native-stage fallback.
+- [ ] S5. Treat a scale track with no actual value variation as fixed scale;
+      route it through the static visibility-crop path. Do not apply this to
+      genuinely moving clips. Keep transform/crop-only keyed clips on a bounded
+      stage path rather than max-scale full-frame decode.
+- [ ] S6. Reuse or cache `SwsContext` only after S2-S5; profile first. Context
+      creation measured ~0.2-0.5 ms/frame, so it is secondary to eliminating
+      wasted pixels.
+- [ ] ACCEPT: 720p and 1080p scale `1 -> 3` exports stay within 2x of their
+      no-key baselines; no off-canvas full-box resampling; no per-frame
+      allocations; output frame count/duration and reference pixels remain
+      correct. `VYPER_KEYFRAME_PROBE`, `VYPER_RENDER_KF_PROBE`,
+      `VYPER_UNDO_PROBE`, `VYPER_DRAG_PROBE`, `VYPER_TL_PROBE`,
+      `VYPER_UI_PROBE`, `VYPER_TRANSFORM_PROBE`, `odin check`, and a fresh
+      compositor spall trace all pass.
+
+**Out of scope:** preview keyframe sampling, encoder changes, and GPU compositor
+rewrite. Fix export geometry work first.
 
 ## Queued — Performance / Cleanup
 
