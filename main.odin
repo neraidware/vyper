@@ -628,26 +628,28 @@ kf_clear :: proc() {
 // resting value. Discrete edit on the undo seam. Minting the track name is the
 // CONSUMER's job — the store never interprets what `name` means, so the caller
 // chooses it because it owns the property→name mapping (interaction.odin's
-// field handlers).
+// field handlers). The write goes through kf_geom_set_lane_key so a name that
+// is one lane of a packed group unwraps that group first; a name that groups
+// with nothing (gain, scale) lands as an ordinary scalar key.
 kf_add_prop :: proc(clip: ^Clip, name: string, value: f32) {
 	off := clamp(i32(playhead.frame - clip.timeline_start_frame), 0, i32(clip.source_length_frames))
 	undo_begin()
-	kf_set_key(clip, name, off, value)
+	kf_geom_set_lane_key(clip, name, off, value)
 	undo_push(.Value, "Add keyframe")
 }
 
 // kf_add_group_prop records a whole-SECTION key at the playhead (both translate
 // axes, or all four crop edges) with the clip's current values — the group
-// twin of kf_add_prop. It goes through kf_set_key_packed, the packed producer:
+// twin of kf_add_prop. It goes through kf_geom_set_packed, the packed producer:
 // an already-packed section just lands another full knot; a section whose
 // sub-properties own scalar keys FOLDS them into one packed track (each lane
 // key survives as a partial knot, the new frame keys the whole group). A group
 // key never unwraps the section — unwrap only happens when an individual
-// sub-property is keyed afterwards (kf_set_key on a lane, see S4).
+// sub-property is keyed afterwards (kf_geom_set_lane_key, see S4).
 kf_add_group_prop :: proc(clip: ^Clip, sec: string, lanes: [KF_PACK_MAX]f32) {
 	off := clamp(i32(playhead.frame - clip.timeline_start_frame), 0, i32(clip.source_length_frames))
 	undo_begin()
-	kf_set_key_packed(clip, sec, off, lanes, kf_section_full_mask(sec))
+	kf_geom_set_packed(clip, sec, off, lanes, kf_geom_full_mask(sec))
 	undo_push(.Value, "Add group keyframe")
 }
 

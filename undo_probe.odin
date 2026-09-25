@@ -207,8 +207,8 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// above because it ends with the keyframe selected (the two never coexist).
 	undo_init()
 	clip0 := &timeline.tracks[0].clips[0]
-	kf_set_key(clip0, "transform.x", 5, 100.0)
-	kf_set_key(clip0, "transform.x", 20, 50.0)
+	kf_geom_set_lane_key(clip0, "transform.x", 5, 100.0)
+	kf_geom_set_lane_key(clip0, "transform.x", 20, 50.0)
 	selected_track = 0
 	selected_index = 0
 	kf_select(0, 0, 0, 0)
@@ -271,7 +271,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// key before the picked one moves the picked key's slot, so resolving the
 	// OLD indices would alias the newly inserted key.
 	kf_select(0, 0, 0, 0)
-	kf_set_key(clip0, "transform.x", 1, 60.0)
+	kf_geom_set_lane_key(clip0, "transform.x", 1, 60.0)
 	_, _, _, stale_ok := kf_selected()
 	rcheck(!stale_ok, "insert before the selected key kills the selection (structure gen)", fail)
 

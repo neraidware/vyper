@@ -484,20 +484,21 @@ update_preview_slots :: proc() -> bool {
 					mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 				}
 			}
-			// Keyframe wiring (Active 3 follow-up): a clip's keyed properties are
-			// evaluated at the playhead and taken into the slot in place of the
-			// clip's resting transform, so animating rows move on the canvas
-			// live (and the clip's own fields keep their resting base value).
-			// kf_sample_for returns the caller base when the property has no
-			// track (or the playhead sits before its first key), so un-keyed
-			// clips render their exact current values.
-			slot.transform_x, _ = kf_sample_for(clip, "transform.x", frame, clip.transform_x)
-			slot.transform_y, _ = kf_sample_for(clip, "transform.y", frame, clip.transform_y)
-			slot.scale, _ = kf_sample_for(clip, "scale", frame, clip.scale)
-			slot.crop_l, _ = kf_sample_for(clip, "crop.l", frame, clip.crop_l)
-			slot.crop_r, _ = kf_sample_for(clip, "crop.r", frame, clip.crop_r)
-			slot.crop_t, _ = kf_sample_for(clip, "crop.t", frame, clip.crop_t)
-			slot.crop_b, _ = kf_sample_for(clip, "crop.b", frame, clip.crop_b)
+		// Keyframe wiring (Active 3 follow-up): a clip's keyed properties are
+		// evaluated at the playhead and taken into the slot in place of the
+		// clip's resting transform, so animating rows move on the canvas
+		// live (and the clip's own fields keep their resting base value).
+		// kf_geom_sample_lane returns the caller base when the property has no
+		// track (or the playhead sits before its first key), so un-keyed
+		// clips render their exact current values; it also resolves a lane
+		// whose section currently lives in packed form.
+		slot.transform_x, _ = kf_geom_sample_lane(clip, "transform.x", frame, clip.transform_x)
+		slot.transform_y, _ = kf_geom_sample_lane(clip, "transform.y", frame, clip.transform_y)
+		slot.scale, _ = kf_geom_sample_lane(clip, "scale", frame, clip.scale)
+		slot.crop_l, _ = kf_geom_sample_lane(clip, "crop.l", frame, clip.crop_l)
+		slot.crop_r, _ = kf_geom_sample_lane(clip, "crop.r", frame, clip.crop_r)
+		slot.crop_t, _ = kf_geom_sample_lane(clip, "crop.t", frame, clip.crop_t)
+		slot.crop_b, _ = kf_geom_sample_lane(clip, "crop.b", frame, clip.crop_b)
 			slot.source_w = clip.source_w
 			slot.source_h = clip.source_h
 			// Text clips have no decoder or source frame: the buffer is the

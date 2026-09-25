@@ -44,7 +44,7 @@ Kf_Lane_Profile :: struct {
 kf_probe_lane_profile :: proc(clip: ^Clip, lane: string, f0, f1: i32, base: f32) -> Kf_Lane_Profile {
 	p: Kf_Lane_Profile
 	for f in f0 ..= f1 {
-		v, ok := kf_sample_for(clip, lane, i64(f), base)
+		v, ok := kf_geom_sample_lane(clip, lane, i64(f), base)
 		p.values[p.count] = v
 		p.active[p.count] = ok
 		p.count += 1
@@ -173,11 +173,11 @@ keyframe_probe_run :: proc() -> int {
 	// --- kf_sample_for at a timeline frame, clip-relative -------------------
 	sf := Clip {timeline_start_frame = 100}
 	kf_set_key(&sf, "gain", 0, 4.0)
-	v, ok = kf_sample_for(&sf, "gain", 100, 9.0)
+	v, ok = kf_geom_sample_lane(&sf, "gain", 100, 9.0)
 	kf_probe_check(ok && v == 4.0, "frame 100 == clip-relative off 0: the key's value applies (got %v)", v)
-	v, ok = kf_sample_for(&sf, "gain", 101, 9.0)
+	v, ok = kf_geom_sample_lane(&sf, "gain", 101, 9.0)
 	kf_probe_check(!ok && v == 9.0, "frame 101 == off 1: lone key past, base applies (got %v)", v)
-	v, ok = kf_sample_for(&sf, "scale", 100, 9.0)
+	v, ok = kf_geom_sample_lane(&sf, "scale", 100, 9.0)
 	kf_probe_check(!ok && v == 9.0, "unknown property: base kept, inactive")
 
 	// --- split remap (slice-1 rule) -----------------------------------------
@@ -326,7 +326,7 @@ keyframe_probe_run :: proc() -> int {
 		clone_ok = no30 && len(keys) == 1
 	}
 	kf_probe_check(clone_ok, "clone is unaffected by the original's new key 30 (deep copy)")
-	sv, _ := kf_sample_for(&base, "scale", 59, 0.0) // off 9, past the lone key
+	sv, _ := kf_geom_sample_lane(&base, "scale", 59, 0.0) // off 9, past the lone key
 	kf_probe_check(sv == 0.0, "original scale untouched by the clone's poke; resting base rules past the key (got %v)", sv)
 	// teardown both timelanes
 	free_timeline(&cloned)
@@ -339,12 +339,12 @@ keyframe_probe_run :: proc() -> int {
 	kf_probe_check(ti_d >= 0, "delete setup: track exists")
 	kf_del_key(&del, "gain", 7)
 	kf_probe_check(len(del.keyframe_tracks) == 0, "track dropped once its only key is deleted")
-	v, ok = kf_sample_for(&del, "gain", 7, 2.0)
+	v, ok = kf_geom_sample_lane(&del, "gain", 7, 2.0)
 	kf_probe_check(!ok && v == 2.0, "deleted track is inactive")
 
 	// --- zero-value Clip{} stays safe --------------------------------------
 	z := Clip {}
-	v, ok = kf_sample_for(&z, "gain", 7, 3.5)
+	v, ok = kf_geom_sample_lane(&z, "gain", 7, 3.5)
 	kf_probe_check(!ok && v == 3.5, "zero-value clip: inactive, base kept")
 	kf_probe_check(kf_track_index(z, "gain") < 0, "zero-value clip: no tracks")
 	kf_del_key(&z, "gain", 0)
@@ -358,14 +358,14 @@ keyframe_probe_run :: proc() -> int {
 	// lane tracks never coexist. Full pack first: sorted insert + same-frame
 	// replace, lane readout, lane-absent invariant.
 	crop := Clip {}
-	kf_set_key_packed(&crop, "crop", 10, {10.0, 14.0, 4.0, 6.0, 0, 0, 0}, 0b1111)
-	kf_set_key_packed(&crop, "crop", 30, {20.0, 8.0, 1.0, 9.0, 0, 0, 0}, 0b1111)
-	kf_set_key_packed(&crop, "crop", 10, {11.0, 13.0, 3.0, 7.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&crop, "crop", 10, {10.0, 14.0, 4.0, 6.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&crop, "crop", 30, {20.0, 8.0, 1.0, 9.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&crop, "crop", 10, {11.0, 13.0, 3.0, 7.0, 0, 0, 0}, 0b1111)
 	cti := kf_track_index(crop, "crop")
 	kf_probe_check(cti >= 0, "packed: section track exists")
 	kf_probe_check(len(crop.keyframe_tracks) == 1, "packed: one section track, got %d", len(crop.keyframe_tracks))
 	kf_probe_check(
-		kf_section_full_mask("crop") == 0b1111 && kf_section_full_mask("transform") == 0b11,
+		kf_geom_full_mask("crop") == 0b1111 && kf_geom_full_mask("transform") == 0b11,
 		"group masks: whole crop = all 4 edges, whole transform = both axes",
 	)
 	kf_probe_check(kf_track_index(crop, "crop.l") < 0, "packed: lane track absent while the section is packed")
@@ -384,33 +384,33 @@ keyframe_probe_run :: proc() -> int {
 	}
 
 	// --- packed sampling: key on its frame, interpolation between ----------
-	v, ok = kf_sample_for(&crop, "crop.l", 10, 0.0)
+	v, ok = kf_geom_sample_lane(&crop, "crop.l", 10, 0.0)
 	kf_probe_check(ok && v == 11.0, "packed: lane 0 key applies on its frame (got %v)", v)
-	v, _ = kf_sample_for(&crop, "crop.r", 20, 0.0)
+	v, _ = kf_geom_sample_lane(&crop, "crop.r", 20, 0.0)
 	kf_probe_check(kf_approx(v, 10.5), "packed: lane 1 interpolates 13->8 at the midpoint (got %v)", v)
-	v, _ = kf_sample_for(&crop, "crop.t", 30, 0.0)
+	v, _ = kf_geom_sample_lane(&crop, "crop.t", 30, 0.0)
 	kf_probe_check(v == 1.0, "packed: lane 2 arrives at the next key's value (got %v)", v)
-	v, ok = kf_sample_for(&crop, "crop.b", 35, 0.0)
+	v, ok = kf_geom_sample_lane(&crop, "crop.b", 35, 0.0)
 	kf_probe_check(!ok && v == 0.0, "packed: past the last key a lane rests, base kept (v=%v ok=%v)", v, ok)
-	v, ok = kf_sample_for(&crop, "crop.l", 5, 0.0)
+	v, ok = kf_geom_sample_lane(&crop, "crop.l", 5, 0.0)
 	kf_probe_check(!ok && v == 0.0, "packed: before the first key, base (v=%v ok=%v)", v, ok)
 
 	// --- partial pack: n < section width leaves uncovered lanes resting -----
 	pp := Clip {}
-	kf_set_key_packed(&pp, "crop", 10, {5.0, 6.0, 0, 0, 0, 0, 0}, 0b11)
-	unv, unok := kf_sample_for(&pp, "crop.t", 10, 9.0)
+	kf_geom_set_packed(&pp, "crop", 10, {5.0, 6.0, 0, 0, 0, 0, 0}, 0b11)
+	unv, unok := kf_geom_sample_lane(&pp, "crop.t", 10, 9.0)
 	kf_probe_check(!unok && unv == 9.0, "partial pack: an uncovered lane rests (got %v)", unv)
-	unv, unok = kf_sample_for(&pp, "crop.b", 7, 9.0)
+	unv, unok = kf_geom_sample_lane(&pp, "crop.b", 7, 9.0)
 	kf_probe_check(!unok && unv == 9.0, "partial pack: rest before, during, and after, base holds (got %v)", unv)
-	lv, lok := kf_sample_for(&pp, "crop.l", 10, 9.0)
+	lv, lok := kf_geom_sample_lane(&pp, "crop.l", 10, 9.0)
 	kf_probe_check(lok && lv == 5.0, "partial pack: covered lane still applies (got %v)", lv)
 
 	// --- packed snapshot (worker seam): section expands to per-lane scalars --
 	sl := Clip {}
-	kf_set_key_packed(&sl, "transform", 10, {4.0, 8.0, 0, 0, 0, 0, 0}, 0b11)
-	kf_set_key_packed(&sl, "transform", 24, {9.0, 1.0, 0, 0, 0, 0, 0}, 0b11)
+	kf_geom_set_packed(&sl, "transform", 10, {4.0, 8.0, 0, 0, 0, 0, 0}, 0b11)
+	kf_geom_set_packed(&sl, "transform", 24, {9.0, 1.0, 0, 0, 0, 0, 0}, 0b11)
 	snap_dst: [32]Keyframe
-	sn, stotal := kf_fill_snapshot(&sl, "transform.x", snap_dst[:])
+	sn, stotal := kf_geom_fill_snapshot(&sl, "transform.x", snap_dst[:])
 	kf_probe_check(sn == 2 && stotal == 2, "snapshot: packed section expands to 2 scalar keys, got %d/%d", sn, stotal)
 	snap_ok := sn == 2
 	if snap_ok {
@@ -418,7 +418,7 @@ keyframe_probe_run :: proc() -> int {
 	}
 	kf_probe_check(snap_ok, "snapshot: expanded keys match the packed lane values (got %v %v)", snap_dst[0], snap_dst[1])
 	for off := i32(0); off <= 30; off += 1 {
-		sv2, sok := kf_sample_for(&sl, "transform.x", i64(off), 0.0)
+		sv2, sok := kf_geom_sample_lane(&sl, "transform.x", i64(off), 0.0)
 		fv, fok := kf_sample_keys(snap_dst[:sn], off, 0.0)
 		if !sok && fok || sok && !fok || (sok && fok && !kf_approx(sv2, fv)) {
 			snap_ok = false
@@ -429,14 +429,14 @@ keyframe_probe_run :: proc() -> int {
 	// A scalar property still snapshots straight-through.
 	gain_clip := Clip {}
 	kf_set_key(&gain_clip, "gain", 5, 7.0)
-	gn, gtotal := kf_fill_snapshot(&gain_clip, "gain", snap_dst[:])
+	gn, gtotal := kf_geom_fill_snapshot(&gain_clip, "gain", snap_dst[:])
 	kf_probe_check(gn == 1 && gtotal == 1 && snap_dst[0] == Keyframe {5, 0, 7.0}, "snapshot: scalar track copies unchanged")
 
 	// --- unwrap: keying an individual lane makes the group give way ---------
 	uv := Clip {}
-	kf_set_key_packed(&uv, "transform", 10, {4.0, 8.0, 0, 0, 0, 0, 0}, 0b11)
-	kf_set_key_packed(&uv, "transform", 24, {9.0, 1.0, 0, 0, 0, 0, 0}, 0b11)
-	kf_set_key(&uv, "transform.y", 18, 5.0) // the unwrap trigger
+	kf_geom_set_packed(&uv, "transform", 10, {4.0, 8.0, 0, 0, 0, 0, 0}, 0b11)
+	kf_geom_set_packed(&uv, "transform", 24, {9.0, 1.0, 0, 0, 0, 0, 0}, 0b11)
+	kf_geom_set_lane_key(&uv, "transform.y", 18, 5.0) // the unwrap trigger
 	kf_probe_check(kf_track_index(uv, "transform") < 0, "unwrap: section track gone after a lane key")
 	kf_probe_check(kf_track_index(uv, "transform.x") >= 0, "unwrap: sibling lane track exists")
 	kf_probe_check(kf_track_index(uv, "transform.y") >= 0, "unwrap: keyed lane track exists")
@@ -446,11 +446,11 @@ keyframe_probe_run :: proc() -> int {
 	// the 10→24 segment, so comparing against the PRE-unwrap packed curve
 	// (skip-the-new-key) is the wrong oracle.
 	uo := Clip {}
-	kf_set_key(&uo, "transform.x", 10, 4.0)
-	kf_set_key(&uo, "transform.x", 24, 9.0)
-	kf_set_key(&uo, "transform.y", 10, 8.0)
-	kf_set_key(&uo, "transform.y", 18, 5.0)
-	kf_set_key(&uo, "transform.y", 24, 1.0)
+	kf_geom_set_lane_key(&uo, "transform.x", 10, 4.0)
+	kf_geom_set_lane_key(&uo, "transform.x", 24, 9.0)
+	kf_geom_set_lane_key(&uo, "transform.y", 10, 8.0)
+	kf_geom_set_lane_key(&uo, "transform.y", 18, 5.0)
+	kf_geom_set_lane_key(&uo, "transform.y", 24, 1.0)
 	q0 := kf_probe_lane_profile(&uv, "transform.x", 0, 30, 0.0)
 	q1 := kf_probe_lane_profile(&uv, "transform.y", 0, 30, 0.0)
 	o0 := kf_probe_lane_profile(&uo, "transform.x", 0, 30, 0.0)
@@ -462,41 +462,41 @@ keyframe_probe_run :: proc() -> int {
 
 	// --- kf_set_value on a packed section: unwraps, edits lane 0 -------------
 	sv_clip := Clip {}
-	kf_set_key_packed(&sv_clip, "transform", 10, {4.0, 8.0, 0, 0, 0, 0, 0}, 0b11)
-	kf_set_key_packed(&sv_clip, "transform", 24, {9.0, 1.0, 0, 0, 0, 0, 0}, 0b11)
-	kf_set_value(&sv_clip, "transform", 10, 6.5)
+	kf_geom_set_packed(&sv_clip, "transform", 10, {4.0, 8.0, 0, 0, 0, 0, 0}, 0b11)
+	kf_geom_set_packed(&sv_clip, "transform", 24, {9.0, 1.0, 0, 0, 0, 0, 0}, 0b11)
+	kf_geom_set_value(&sv_clip, "transform", 10, 6.5)
 	kf_probe_check(kf_track_index(sv_clip, "transform") < 0, "kf_set_value: section unwrapped")
-	ev, eok := kf_sample_for(&sv_clip, "transform.x", 10, 0.0)
+	ev, eok := kf_geom_sample_lane(&sv_clip, "transform.x", 10, 0.0)
 	kf_probe_check(eok && ev == 6.5, "kf_set_value: lane 0 holds the edited value (got %v)", ev)
-	ey, _ := kf_sample_for(&sv_clip, "transform.y", 10, 0.0)
+	ey, _ := kf_geom_sample_lane(&sv_clip, "transform.y", 10, 0.0)
 	kf_probe_check(ey == 8.0, "kf_set_value: the untouched sibling lane keeps its value (got %v)", ey)
 
 	// --- fold: keying the whole section over keyed lanes --------------------
 	fv := Clip {}
-	kf_set_key(&fv, "crop.l", 10, 1.0)
-	kf_set_key(&fv, "crop.r", 10, 2.0)
-	kf_set_key(&fv, "crop.l", 22, 5.0)
-	kf_set_key(&fv, "crop.r", 30, 6.0)
-	kf_set_key(&fv, "crop.t", 10, 3.0)
-	kf_set_key(&fv, "crop.t", 30, 4.0)
-	kf_set_key(&fv, "crop.b", 10, 7.0)
-	kf_set_key(&fv, "crop.b", 30, 8.0)
+	kf_geom_set_lane_key(&fv, "crop.l", 10, 1.0)
+	kf_geom_set_lane_key(&fv, "crop.r", 10, 2.0)
+	kf_geom_set_lane_key(&fv, "crop.l", 22, 5.0)
+	kf_geom_set_lane_key(&fv, "crop.r", 30, 6.0)
+	kf_geom_set_lane_key(&fv, "crop.t", 10, 3.0)
+	kf_geom_set_lane_key(&fv, "crop.t", 30, 4.0)
+	kf_geom_set_lane_key(&fv, "crop.b", 10, 7.0)
+	kf_geom_set_lane_key(&fv, "crop.b", 30, 8.0)
 	// Oracle: the pre-fold lanes plus the same group edit applied per-lane.
 	oracle := Clip {}
-	kf_set_key(&oracle, "crop.l", 10, 1.0)
-	kf_set_key(&oracle, "crop.r", 10, 2.0)
-	kf_set_key(&oracle, "crop.l", 22, 5.0)
-	kf_set_key(&oracle, "crop.r", 30, 6.0)
-	kf_set_key(&oracle, "crop.t", 10, 3.0)
-	kf_set_key(&oracle, "crop.t", 30, 4.0)
-	kf_set_key(&oracle, "crop.b", 10, 7.0)
-	kf_set_key(&oracle, "crop.b", 30, 8.0)
-	kf_set_key(&oracle, "crop.l", 16, 2.5)
-	kf_set_key(&oracle, "crop.r", 16, 3.5)
-	kf_set_key(&oracle, "crop.t", 16, 3.25)
-	kf_set_key(&oracle, "crop.b", 16, 7.25)
+	kf_geom_set_lane_key(&oracle, "crop.l", 10, 1.0)
+	kf_geom_set_lane_key(&oracle, "crop.r", 10, 2.0)
+	kf_geom_set_lane_key(&oracle, "crop.l", 22, 5.0)
+	kf_geom_set_lane_key(&oracle, "crop.r", 30, 6.0)
+	kf_geom_set_lane_key(&oracle, "crop.t", 10, 3.0)
+	kf_geom_set_lane_key(&oracle, "crop.t", 30, 4.0)
+	kf_geom_set_lane_key(&oracle, "crop.b", 10, 7.0)
+	kf_geom_set_lane_key(&oracle, "crop.b", 30, 8.0)
+	kf_geom_set_lane_key(&oracle, "crop.l", 16, 2.5)
+	kf_geom_set_lane_key(&oracle, "crop.r", 16, 3.5)
+	kf_geom_set_lane_key(&oracle, "crop.t", 16, 3.25)
+	kf_geom_set_lane_key(&oracle, "crop.b", 16, 7.25)
 	// The fold trigger: a whole-crop key on frame 16 with the group edit values.
-	kf_set_key_packed(&fv, "crop", 16, {2.5, 3.5, 3.25, 7.25, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&fv, "crop", 16, {2.5, 3.5, 3.25, 7.25, 0, 0, 0}, 0b1111)
 	kf_probe_check(kf_track_index(fv, "crop") >= 0, "fold: section track exists after the group key")
 	kf_probe_check(kf_track_index(fv, "crop.l") < 0, "fold: lane tracks folded away")
 	kf_probe_check(kf_track_index(fv, "crop.r") < 0, "fold: lane tracks folded away (r)")
@@ -520,18 +520,18 @@ keyframe_probe_run :: proc() -> int {
 	// Rest-before-first-key: a lane whose first key is late keeps its resting
 	// base at early union frames — the fold must not lift it to the set value.
 	rb := Clip {}
-	kf_set_key(&rb, "crop.l", 10, 2.0)
-	kf_set_key(&rb, "crop.r", 40, 9.0) // first key LATER than frame 10's union knot
-	br, brok := kf_sample_for(&rb, "crop.r", 12, 1.0)
+	kf_geom_set_lane_key(&rb, "crop.l", 10, 2.0)
+	kf_geom_set_lane_key(&rb, "crop.r", 40, 9.0) // first key LATER than frame 10's union knot
+	br, brok := kf_geom_sample_lane(&rb, "crop.r", 12, 1.0)
 	kf_probe_check(!brok && br == 1.0, "fold setup: crop.r rests pre-edit, base 1 (got %v)", br)
-	kf_set_key_packed(&rb, "crop", 20, {3.0, 4.0, 0, 0, 0, 0, 0}, 0b11)
-	rr, rrok := kf_sample_for(&rb, "crop.r", 12, 1.0)
+	kf_geom_set_packed(&rb, "crop", 20, {3.0, 4.0, 0, 0, 0, 0, 0}, 0b11)
+	rr, rrok := kf_geom_sample_lane(&rb, "crop.r", 12, 1.0)
 	kf_probe_check(!rrok && rr == 1.0, "fold: crop.r keeps resting base 1 before its first key (got %v)", rr)
 
 	// --- del / trim / split on a packed section (n survives remaps) ----------
 	pc := Clip {}
-	kf_set_key_packed(&pc, "crop", 5, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
-	kf_set_key_packed(&pc, "crop", 40, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&pc, "crop", 5, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&pc, "crop", 40, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
 	kf_del_key(&pc, "crop", 5)
 	pk := kf_track_index(pc, "crop")
 	del_ok := false
@@ -541,8 +541,8 @@ keyframe_probe_run :: proc() -> int {
 	}
 	kf_probe_check(del_ok, "del on a packed section drops only the frame, n survives")
 	th := Clip {}
-	kf_set_key_packed(&th, "crop", 5, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
-	kf_set_key_packed(&th, "crop", 40, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&th, "crop", 5, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&th, "crop", 40, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
 	kf_trim_head(&th, 40)
 	th_ok := false
 	if ti := kf_track_index(th, "crop"); ti >= 0 {
@@ -555,9 +555,9 @@ keyframe_probe_run :: proc() -> int {
 	}
 	kf_probe_check(th_ok, "trim_head re-relatives a packed key, preserving n and value")
 	sp2 := Clip {}
-	kf_set_key_packed(&sp2, "crop", 10, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
-	kf_set_key_packed(&sp2, "crop", 30, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
-	kf_set_key_packed(&sp2, "crop", 50, {3.0, 6.0, 9.0, 12.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&sp2, "crop", 10, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&sp2, "crop", 30, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&sp2, "crop", 50, {3.0, 6.0, 9.0, 12.0, 0, 0, 0}, 0b1111)
 	sp2r := sp2
 	kf_split_parts(&sp2, &sp2r, 30)
 	sp_ok := false
@@ -577,7 +577,7 @@ keyframe_probe_run :: proc() -> int {
 
 	// --- deep clone carries packed sections intact ---------------------------
 	cp := Clip {}
-	kf_set_key_packed(&cp, "crop", 10, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
+	kf_geom_set_packed(&cp, "crop", 10, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
 	cpt := Timeline {}
 	cpt.track_order = make([dynamic]int, 1)
 	cpt.tracks = make([dynamic]Track, 1)

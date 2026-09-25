@@ -836,15 +836,18 @@ commit_keyframe_drag :: proc() {
 		// source was a packed section key, so `name` must BE a section and no
 		// lane of it may exist (the mutual-exclusion invariant, asserted both
 		// ends to catch a drifted store).
-		sdefs := kf_section_defs
-		sec_idx, is_sec := kf_section_index(name)
+		sec_idx, is_sec := kf_geom_section_index(name)
 		assert(is_sec, "a packed section key drag must source a section track name")
-		for lname in sdefs[sec_idx].lanes {
-			assert(kf_track_index(cl^, lname) < 0, "a packed section and its lanes may not coexist during a drag re-land")
+		sdefs := kf_geom_sections
+		for lane_prop in sdefs[sec_idx].lanes {
+			assert(
+				kf_track_index(cl^, kf_lane_name(lane_prop)) < 0,
+				"a packed section and its lanes may not coexist during a drag re-land",
+			)
 		}
 		kf_set_packed_key(cl, name, final_off, packed, mask)
 	} else {
-		kf_set_key(cl, name, final_off, scalar)
+		kf_geom_set_lane_key(cl, name, final_off, scalar)
 	}
 	// Re-select the moved key by name + landed frame (the lane index may have
 	// shifted if the track emptied and re-minted), under the fresh gen.

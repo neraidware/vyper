@@ -28,7 +28,7 @@ render_kf_probe_check_near :: proc(got, want, eps: f32, msg: string) {
 }
 
 render_kf_fill_flat :: proc(clip: ^Clip, p: Render_Geom_Prop) -> (flat: Render_Kf_Flat) {
-	flat.n, _ = kf_fill_snapshot(clip, render_geom_name(p), flat.keys[:])
+	flat.n, _ = kf_geom_fill_snapshot(clip, render_geom_name(p), flat.keys[:])
 	return
 }
 
@@ -36,8 +36,8 @@ render_kf_probe_run :: proc() -> int {
 	// Case A — transform.x keyed 0 @1 -> 100 @30; everything else rests at
 	// its base (tx/ty baseline 0, scale 1, no crops). Box == full stage.
 	clipA := Clip{}
-	kf_set_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
-	kf_set_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 7, 100)
+	kf_geom_set_lane_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+	kf_geom_set_lane_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 7, 100)
 	geomA: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 	geomA[int(Render_Geom_Prop.Trans_X)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Trans_X)
 	geomA[int(Render_Geom_Prop.Trans_Y)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Trans_Y)
@@ -70,8 +70,8 @@ render_kf_probe_run :: proc() -> int {
 	// left, src sub-rect cuts into the stage, ox/rw follow the visible rect.
 	geomB: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 	clipB := Clip{}
-	kf_set_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 1, 0.25)
-	kf_set_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 2, 0.25)
+	kf_geom_set_lane_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 1, 0.25)
+	kf_geom_set_lane_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 2, 0.25)
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		p := Render_Geom_Prop(pi)
 		geomB[int(p)] = render_kf_fill_flat(&clipB, p)
