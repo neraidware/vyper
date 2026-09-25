@@ -4,7 +4,9 @@
 
 A GitHub Actions workflow (`/.github/workflows/windows.yml`) builds a Windows
 executable on every push. The runner is `windows-latest` (VS 2022 + MSVC).
-The artifact `vyper-windows` contains the exe + all required DLLs + ffmpeg/ffprobe.
+The artifact `vyper-windows` contains the exe + all required DLLs. No
+`ffmpeg.exe`/`ffprobe.exe` is shipped: every probe and transcode is in-process
+(vendored FFmpeg DLLs), so the CLIs would be ~180 MB of dead weight.
 
 Download: https://github.com/neraidware/vyper/actions → latest successful `windows` run → `vyper-windows` artifact.
 
@@ -14,7 +16,7 @@ Download: https://github.com/neraidware/vyper/actions → latest successful `win
 |-----|--------|--------|
 | Odin `dev-2026-07a` | [laytan/setup-odin](https://github.com/laytan/setup-odin) or [releases](https://github.com/odin-lang/Odin/releases) | System-wide |
 | SDL3 3.4.14 | `SDL3-devel-3.4.14-VC.zip` from [SDL3 releases](https://github.com/libsdl-org/SDL/releases) | `lib/x64/SDL3.lib` + `lib/x64/SDL3.dll` |
-| ffmpeg (shared, BtbN) | [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/latest) | `lib/*.lib` (import) + `bin/*.dll` + `bin/ffmpeg.exe` + `bin/ffprobe.exe` |
+| ffmpeg (shared, BtbN) | [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/latest) | `lib/*.lib` (import; copied into `vendor/ffmpeg/<lib>/`) + `bin/*.dll` (runtime, shipped). `ffmpeg.exe` used by CI for smoke sample gen only — not shipped |
 
 ## Build command
 
@@ -51,8 +53,6 @@ All files must be co-located (`dist/`):
 ```
 vyper.exe
 SDL3.dll
-ffmpeg.exe        ← vyper shells out to this for transcoding
-ffprobe.exe       ← vyper shells out to this for probing
 avcodec-63.dll    ← ffmpeg runtime DLLs (version numbers vary by BtbN build)
 avfilter-N.dll
 avformat-63.dll
@@ -61,9 +61,10 @@ swresample-7.dll
 swscale-10.dll
 ```
 
-`ffmpeg.exe`/`ffprobe.exe` must live next to `vyper.exe` — vyper resolves them
-by exe directory, not `PATH`. On a crash, vyper writes `vyper_crash.log`
-(exception code + fault address) in this same directory.
+No `ffmpeg.exe`/`ffprobe.exe` in dist — all probing and transcoding is in-process
+through the vendored FFmpeg DLLs; CI stages the CLI only to synthesize the smoke
+sample. On a crash, vyper writes `vyper_crash.log` (exception code + fault
+address) in this same directory.
 
 Preview proxies (low-res all-intra cache of edited clips) are stored under
 `%LOCALAPPDATA%\vyper\` — `<base>-<hash>.vyperproxy.mp4`, per-segment
@@ -76,11 +77,12 @@ The `windows` workflow runs headless probes against the staged `dist/` before
 uploading the artifact, so a build whose FFmpeg DLL set or decode path is broken
 fails the run instead of shipping a binary that crashes on open:
 
-- generates `sample.mp4` with the bundled `ffmpeg.exe`; then
+- generates `sample.mp4` with the `ffmpeg.exe` staged in `deps\` (smoke-only,
+  not shipped); then
 - `VYPER_FRAME_PROBE="sample.mp4|0-240|30"` decodes a frame range through the
   vendored FFmpeg DLLs; and
-- `VYPER_PROXY_PROBE="sample.mp4"` builds a proxy with `ffmpeg.exe` and verifies
-  proxy/source parity.
+- `VYPER_PROXY_PROBE="sample.mp4"` builds a proxy in-process (libx264 via the
+  vendored DLLs) and verifies proxy/source parity.
 - Any non-zero exit, or `vyper_crash.log` next to the exe, fails the job.
 
 `vyper.exe` also prints the linked FFmpeg majors first thing on startup:

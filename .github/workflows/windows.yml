@@ -43,7 +43,11 @@ jobs:
 
       # Prebuilt shared ffmpeg (BtbN auto-build). Provides the import libs
       # (avformat.lib, avcodec.lib, ...) Odin's binding links, plus the runtime
-      # dlls and the ffmpeg.exe / ffprobe.exe vyper shells out to.
+      # dlls vyper loads in-process. The ffmpeg.exe / ffprobe.exe CLIs are kept
+      # in deps\ ONLY to generate the smoke-test sample video -- the app no
+      # longer shells out for media (all probe/transcode is in-process), so they
+      # must not be shipped in dist. Shipping them is ~180 MB of dead weight
+      # that filled the artifact quota.
       # NOTE: vendor:ffmpeg declares its Windows import as a bare relative name
       # `foreign import "<lib>.lib"`, which Odin resolves *relative to the source
       # file dir* (vendor/ffmpeg/<lib>/<lib>.lib), then passes as an absolute file
@@ -119,10 +123,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item vyper.exe dist\vyper.exe -Force
-          # SDL3 + ffmpeg runtime dlls, plus ffmpeg.exe/ffprobe.exe that vyper
-          # shells out to, must sit beside the exe.
+          # SDL3 + ffmpeg runtime dlls must sit beside the exe; the ffmpeg/ffprobe
+          # CLIs stay behind in deps\ (smoke-only, not shipped).
           Get-ChildItem deps\*.dll | Copy-Item -Destination dist -Force
-          Copy-Item -Path deps\ffmpeg.exe, deps\ffprobe.exe -Destination dist -Force
           Get-ChildItem dist | Select-Object Name,Length
 
       # Smoke test the shipped dist headlessly: generate a sample, decode a
@@ -139,7 +142,7 @@ jobs:
           # vyper.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
           # redirected, so every run writes a log that we dump on failure/success.
           $env:PATH = "$PWD\dist;$env:PATH"
-          & .\dist\ffmpeg.exe -y -loglevel error -f lavfi -i testsrc2=duration=8:size=320x180:rate=30 -frames:v 240 -pix_fmt yuv420p sample.mp4
+          & .\deps\ffmpeg.exe -y -loglevel error -f lavfi -i testsrc2=duration=8:size=320x180:rate=30 -frames:v 240 -pix_fmt yuv420p sample.mp4
           if ($LASTEXITCODE -ne 0) { throw "sample generation failed (exit $LASTEXITCODE)" }
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_frame.log
@@ -169,6 +172,11 @@ jobs:
           Get-Content .\smoke_proxy.log
 
       - name: Upload artifact
+        # Best-effort: a quota hiccup on the account must not red a build whose
+        # compile and smoke both passed. Artifact storage is account-wide and
+        # GitHub only recalculates usage every 6-12h after deletions, so this
+        # step can fail while there is genuinely nothing wrong with the build.
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: vyper-windows
