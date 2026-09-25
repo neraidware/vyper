@@ -1085,6 +1085,30 @@ prop_field_row :: proc(id_name, field_id, label, value: string, focused: bool, b
 	}
 }
 
+// group_caption_row is a property-section header (Transform, Crop) with the
+// whole-group keyframe button on the right: one click keys every lane of the
+// section at the playhead. The group button uses the same kf_add_button pad,
+// so the diamond cluster painted over it in gpu_draw.odin (KF_GROUP_BTN_IDS)
+// is hit-tested exactly like a single-lane button.
+group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
+	if clay.UI(clay.ID(caption_id))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+			layoutDirection = .LeftToRight,
+			childGap = BUTTON_ROW_GAP,
+			childAlignment = {x = .Left, y = .Center},
+		},
+	},
+	) {
+		clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+		if clay.UI(clay.ID(spacer_id))( // stretch: pushes the button to the right
+			{layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}}},
+		) {}
+		kf_add_button(btn_id)
+	}
+}
+
 // project_card is the "Project" inspector card: canvas resolution presets,
 // orientation, frame rate, and the render range. These controls are always
 // reachable (not gated behind an empty timeline).
@@ -1283,6 +1307,7 @@ clip_card :: proc() {
 			if editing_field == .X {
 				x_val = string(edit_chars[:edit_len])
 			}
+			group_caption_row("TransCaption", "TransCaptionSpacer", "Transform", "KfAddTrans")
 			prop_field_row("PropRowX", "PropFieldX", "X", x_val, editing_field == .X, "KfAddX")
 			y_buf := UI_TEXT_Y[:]
 			y_val := fmt.bprintf(y_buf[:], "%.0f", cl.transform_y)
@@ -1309,7 +1334,7 @@ clip_card :: proc() {
 			) {
 				switch_toggle("SnapCenter", "Snap center", snap_center_to_canvas)
 			}
-			panel_caption("Crop (percent of box)")
+			group_caption_row("CropCaption", "CropCaptionSpacer", "Crop (percent of box)", "KfAddCrop")
 			l_buf := UI_TEXT_L[:]
 			l_val := fmt.bprintf(l_buf[:], "%.0f%%", cl.crop_l * 100)
 			if editing_field == .Crop_L {
@@ -1455,7 +1480,15 @@ keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
 		v_buf := UI_TEXT_KF_VAL[:]
-		v_str := fmt.bprintf(v_buf[:], "%.2f", kf.value)
+		// A packed (section) key shows lane 0 — the lane an edit would
+		// unwrap-and-target — so the readout and the commit agree.
+		rval: f32
+		if kf.mask != 0 {
+			rval, _ = kf_lane_value(kf^, 0)
+		} else {
+			rval = kf.value.(f32)
+		}
+		v_str := fmt.bprintf(v_buf[:], "%.2f", rval)
 		if editing_field == .Kf_Value {
 			v_str = string(edit_chars[:edit_len])
 		}

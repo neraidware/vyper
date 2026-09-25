@@ -69,18 +69,28 @@ edit_commit :: proc() {
 	}
 	// Keyframe value edits target the keyframe selection, which is the ONLY
 	// selection while active (S3 exclusivity) — so it can't ride the
-	// selected_clip() resolve the clip fields use. Write through the live key;
-	// undo snapshots the whole timeline, so the replace is a plain commit.
+	// selected_clip() resolve the clip fields use. A packed (section) key's
+	// readout shows lane 0; editing it unwraps the section via kf_set_value,
+	// then lands the scalar on that lane. Undo snapshots the whole timeline,
+	// so the replace is a plain commit.
 	if editing_field == .Kf_Value {
-		_, _, k, ok := kf_selected()
-		if !ok {
+		kcl, klane, k, kok := kf_selected()
+		if !kok {
 			return
 		}
-		if k.value == val {
+		lane_name := kcl.keyframe_tracks[klane].name
+		frame := k.frame_off
+		v0: f32
+		if k.mask != 0 {
+			v0, _ = kf_lane_value(k^, 0)
+		} else {
+			v0 = k.value.(f32)
+		}
+		if v0 == val {
 			return
 		}
 		undo_begin()
-		k.value = val
+		kf_set_value(kcl, lane_name, frame, val)
 		undo_push(.Value, "Set keyframe value")
 		return
 	}

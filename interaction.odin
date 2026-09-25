@@ -291,6 +291,14 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			kf_add_prop(sel, "transform.x", sel.transform_x)
 			return true
 		}
+		if clay.PointerOver(clay.ID("KfAddTrans")) {
+			kf_add_group_prop(sel, "transform", {sel.transform_x, sel.transform_y, 0, 0, 0, 0, 0})
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddCrop")) {
+			kf_add_group_prop(sel, "crop", {sel.crop_l, sel.crop_r, sel.crop_t, sel.crop_b, 0, 0, 0})
+			return true
+		}
 		if clay.PointerOver(clay.ID("KfAddY")) {
 			kf_add_prop(sel, "transform.y", sel.transform_y)
 			return true
@@ -383,7 +391,16 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		if clay.PointerOver(clay.ID("PropFieldKf")) {
 			if _, _, k, ok := kf_selected(); ok {
-				edit_begin(.Kf_Value, k.value.(f32))
+				// A packed (section) key's readout shows lane 0; edit_begin
+				// seeds the field with that lane so the typed value and the
+				// displayed one agree (commit unwraps and edits that lane).
+				v0: f32
+				if k.mask != 0 {
+					v0, _ = kf_lane_value(k^, 0)
+				} else {
+					v0 = k.value.(f32)
+				}
+				edit_begin(.Kf_Value, v0)
 				return true
 			}
 		}
@@ -749,14 +766,38 @@ commit_keyframe_drag :: proc() {
 	// the track can even drop/re-mint, so every pointer or borrowed string held
 	// across the ops would dangle. The name is cloned because del() frees the
 	// track's name string when the last key leaves; set() then re-clones from
-	// our copy instead of freed memory.
+	// our copy instead of freed memory. A packed (section) key moves whole: its
+	// array payload is copied out before the del, then re-landed via the packed
+	// producer so a grouped crop/transform key drags as one unit.
 	name := strings.clone(cl.keyframe_tracks[lane].name)
 	defer delete(name)
 	start_off := kf_drag_start_frame
 	final_off := k.frame_off
-	value := k.value.(f32)
+	mask := k.mask
+	packed: [KF_PACK_MAX]f32
+	scalar: f32
+	if mask != 0 {
+		packed = k.value.([KF_PACK_MAX]f32)
+	} else {
+		scalar = k.value.(f32)
+	}
 	kf_del_key(cl, name, start_off)
-	kf_set_key(cl, name, final_off, value)
+	if mask != 0 {
+		// A packed (section) key drags as one whole crop/transform unit and
+		// lands in the SAME form: form-preserving re-land, never a fold. Its
+		// source was a packed section key, so `name` must BE a section and no
+		// lane of it may exist (the mutual-exclusion invariant, asserted both
+		// ends to catch a drifted store).
+		sdefs := kf_section_defs
+		sec_idx, is_sec := kf_section_index(name)
+		assert(is_sec, "a packed section key drag must source a section track name")
+		for lname in sdefs[sec_idx].lanes {
+			assert(kf_track_index(cl^, lname) < 0, "a packed section and its lanes may not coexist during a drag re-land")
+		}
+		kf_set_packed_key(cl, name, final_off, packed, mask)
+	} else {
+		kf_set_key(cl, name, final_off, scalar)
+	}
 	// Re-select the moved key by name + landed frame (the lane index may have
 	// shifted if the track emptied and re-minted), under the fresh gen.
 	fresh_lane := kf_track_index(cl^, name)

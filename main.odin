@@ -636,6 +636,21 @@ kf_add_prop :: proc(clip: ^Clip, name: string, value: f32) {
 	undo_push(.Value, "Add keyframe")
 }
 
+// kf_add_group_prop records a whole-SECTION key at the playhead (both translate
+// axes, or all four crop edges) with the clip's current values — the group
+// twin of kf_add_prop. It goes through kf_set_key_packed, the packed producer:
+// an already-packed section just lands another full knot; a section whose
+// sub-properties own scalar keys FOLDS them into one packed track (each lane
+// key survives as a partial knot, the new frame keys the whole group). A group
+// key never unwraps the section — unwrap only happens when an individual
+// sub-property is keyed afterwards (kf_set_key on a lane, see S4).
+kf_add_group_prop :: proc(clip: ^Clip, sec: string, lanes: [KF_PACK_MAX]f32) {
+	off := clamp(i32(playhead.frame - clip.timeline_start_frame), 0, i32(clip.source_length_frames))
+	undo_begin()
+	kf_set_key_packed(clip, sec, off, lanes, kf_section_full_mask(sec))
+	undo_push(.Value, "Add group keyframe")
+}
+
 // delete_selected_keyframe removes the selected keyframe as one undoable
 // discrete edit; returns false when no keyframe is selected so callers fall
 // through to their clip-delete path. A stale selection (structure gen drifted)

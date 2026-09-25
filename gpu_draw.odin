@@ -1216,12 +1216,36 @@ draw_kf_add_buttons :: proc(
 			continue
 		}
 		fill := clay.PointerOver(clay.ID(id)) ? KF_DIAMOND_FILL_SELECTED : KF_DIAMOND_FILL
+		if is_group_kf_btn(id) {
+			// Whole-group key button: a 2x2 cluster reads "all lanes at once"
+			// against the single per-lane diamond beside the value field.
+			cx := bb.x + bb.width / 2
+			cy := bb.y + bb.height / 2
+			gap := KF_BTN_R * 0.5
+			r := KF_BTN_R * 0.45
+			diamond_at(renderer, command_buffer, pass, cx - gap, cy - gap, r, fill)
+			diamond_at(renderer, command_buffer, pass, cx + gap, cy - gap, r, fill)
+			diamond_at(renderer, command_buffer, pass, cx - gap, cy + gap, r, fill)
+			diamond_at(renderer, command_buffer, pass, cx + gap, cy + gap, r, fill)
+			continue
+		}
 		diamond_at(
 			renderer, command_buffer, pass,
 			bb.x + bb.width / 2, bb.y + bb.height / 2,
 			KF_BTN_R, fill,
 		)
 	}
+}
+
+// is_group_kf_btn reports whether an add-keyframe button id keys a whole
+// property section (KF_GROUP_BTN_IDS) instead of one lane.
+is_group_kf_btn :: proc(id: string) -> bool {
+	for gid in KF_GROUP_BTN_IDS {
+		if id == gid {
+			return true
+		}
+	}
+	return false
 }
 
 // render_icon draws one rasterized SVG icon through the text pipeline: the
