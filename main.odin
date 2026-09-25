@@ -1270,9 +1270,9 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	}
 	defer sdl.DestroyWindow(window)
 	app_window = window
-	// Enable SDL text input so TEXT_INPUT events (typing) reach the app for the
-	// property/number fields and the generic rename text field.
-	_ = sdl.StartTextInput(window)
+	// SDL text input is instead enabled per edit session: text_input_begin
+	// turns it on, text_input_commit/cancel turn it off, so the IME softens
+	// nothing while no field is open (global hotkeys stay crisp).
 
 	device := sdl.CreateGPUDevice({.SPIRV}, true, "vulkan")
 	if device == nil {

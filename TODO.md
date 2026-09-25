@@ -154,14 +154,11 @@ in-process encode+verify (probe is now a file handle open, decode-200, close).
 
 ## Active 2 — Unicode text + GPU glyph cache (full font coverage)
 
-**Status:** UI text (`render_text`) bakes a fixed 512px atlas of 95 ASCII
-chars at 32px and loops bytes, so `é` (and any non-ASCII) is dropped both by
-the byte-loop clamp and the missing atlas entry. Text clips/subtitles are
-**already Unicode-safe** (`textclip.odin` iterates runes via
-`stb.MakeCodepointBitmap`) — no work there. Input already routes composed
-UTF-8 through `SDL_StartTextInput` + `.TEXT_INPUT` (event.odin:116); `é`
-reaches the buffer, it just never renders. Goal: cache every glyph the font
-provides, GPU-side, on demand.
+**Status:** implemented — dynamic GPU glyph atlas covers the full font face; UI text
+(`render_text`) walks runes and bakes glyphs on demand, non-ASCII (`é`, `Й`, `ω`,
+`日本`) renders and the caret advances by character. Confirmed in code 2026-09-25;
+the TODO's unchecked boxes were stale. S6's lifecycle polish is now also done
+(SDL text input scoped per edit session, `textinput.odin`).
 
 Design decisions (from 2026-09-12 review):
 - **Dynamic growable atlas**, R8, bake-at-32px keeping the current
@@ -186,7 +183,7 @@ Design decisions (from 2026-09-12 review):
   is a later polish item.
 
 Steps (each lands + passes probe + vet before the next):
-- [ ] S1. CPU core in `gpu_renderer.odin`: `Glyph_Atlas` struct (texture/
+- [x] S1. CPU core in `gpu_renderer.odin`: `Glyph_Atlas` struct (texture/
       sampler, cells_x/y, generation, `rune_map`, `slots`, pending/dirty
       lists) + slot allocator + cell-grid placement + `glyph_ensure(rune)`
       doing metrics-only bake (advance/bbox via `stbtt_GetCodepointHMetrics`
@@ -194,25 +191,26 @@ Steps (each lands + passes probe + vet before the next):
       the ASCII-only assertion at ui_probe.odin:69) or add a CPU-only
       `font_probe` covering: slot allocation, cell layout on grid growth,
       rune dedup, rune_map round-trip.
-- [ ] S2. `render_text` (gpu_draw.odin:758) iterates runes via `utf8`
+- [x] S2. `render_text` (gpu_draw.odin:986) iterates runes via `utf8`
       decode over `chars[0:length]`; draws from slot metrics+UV; missing
       glyph → queue pending + skip. Delete the byte clamp and the
       `stb.GetBakedQuad`/`renderer.font.chars[95]` call sites.
-- [ ] S3. `input_advance_up_to` (gpu_draw.odin:387) decodes runes and sums
+- [x] S3. `input_advance_up_to` (gpu_draw.odin:456) decodes runes and sums
       cached advances so caret/selection track non-ASCII text.
-- [ ] S4. Deferred bake + upload in `render_ui_frame`: CPU-bake pending
+- [x] S4. Deferred bake + upload in `render_ui_frame`: CPU-bake pending
       glyphs, assign cells, upload dirty cells via copy pass (no render
       pass open there), grow on capacity. Remove fixed 512 atlas
       (`Font_Atlas` → `Glyph_Atlas`, `upload_font_atlas` → prebake ASCII +
       dynamic path).
-- [ ] S5. `measure_text` (font.odin:58) counts runes, not bytes, for the
+- [x] S5. `measure_text` (font.odin:58) counts runes, not bytes, for the
       0.55/character layout estimate (optional later: exact stbtt advance).
-- [ ] S6. Input verification: probe confirms a composed `é` via
+- [x] S6. Input verification: probe confirms a composed `é` via
       `text_input_insert` renders a non-empty glyph; lifecycle polish —
       `SDL_StartTextInput`/`StopTextInput` scoped to when a field is open
-      (so IME never eats global hotkeys); `.TEXT_EDITING` (IME preedit)
-      optional in a later pass.
-- [ ] ACCEPT: type `é`, `Й`, `ω`, `日本` in the rename popup and each
+      (so IME never eats global hotkeys) — landed 2026-09-25
+      (`text_input_begin` turns text input on, commit/cancel turn it off);
+      `.TEXT_EDITING` (IME preedit) optional in a later pass.
+- [x] ACCEPT: type `é`, `Й`, `ω`, `日本` in the rename popup and each
       renders glyph-true and moves the caret correctly; no per-frame
       allocation (temp allocator only for bake scratch); spall trace shows
       glyph bake+upload outside the hot frame path; probes + `-vet` green.

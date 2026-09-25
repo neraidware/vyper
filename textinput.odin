@@ -72,6 +72,12 @@ text_input_sel :: proc() -> (int, int) {
 // text_input_begin starts a fresh edit session, pre-filled with `initial`.
 // input_type + target are caller discriminators resolved by the commit handler.
 text_input_begin :: proc(initial: string, input_type: int, target: u64) {
+	// Enable SDL text input for the session's lifetime so the IME never eats
+	// global hotkeys while no field is open; text_input_commit/cancel turn it
+	// back off. A re-begin while already editing keeps the current session.
+	if !ti.active {
+		_ = sdl.StartTextInput(app_window)
+	}
 	clear(&ti.buf)
 	append(&ti.buf, ..transmute([]u8)initial)
 	ti.cursor = len(ti.buf)
@@ -91,6 +97,9 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 }
 
 text_input_cancel :: proc() {
+	if ti.active {
+		_ = sdl.StopTextInput(app_window)
+	}
 	ti.active = false
 	clear(&ti.buf)
 	ti.cursor = 0
@@ -100,6 +109,9 @@ text_input_cancel :: proc() {
 // text_input_commit dismisses the field; the caller applies the value (based on
 // input_type) from the buffer before it is cleared.
 text_input_commit :: proc() {
+	if ti.active {
+		_ = sdl.StopTextInput(app_window)
+	}
 	ti.active = false
 	ti.cursor = 0
 	ti.anchor = 0
