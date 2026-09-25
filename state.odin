@@ -832,6 +832,24 @@ gain_drag_start_db: f32
 // no-move click commits nothing — the clip-stutter rule). Meaningful only while
 // active_interaction == .Keyframe_Move.
 kf_drag_start_frame: i32
+// kf_drag_press_x is the pointer x at diamond press. The drag only engages once
+// the cursor travels KF_DRAG_THRESHOLD_PX from it, so a click (no travel) never
+// moves the key. kf_drag_pivot is the frame-space offset between the grabbed key
+// and the cursor at press (key_frame - cursor_frame): the drag TRANSLATES the
+// key by the pointer's own delta, so grabbing a diamond off-center keeps that
+// pivot instead of snapping the key's center to the cursor. Both meaningful
+// only while active_interaction == .Keyframe_Move.
+kf_drag_press_x: f32
+kf_drag_pivot: f32
+// kf_dbl_click_* record the previous diamond press so a second press on the SAME
+// key (same track, clip, lane, and key frame) within KF_DBL_CLICK_NS reads as a
+// double-click: the playhead jumps to that key's frame instead of re-arming a
+// move. kf_dbl_click_ns == 0 means "no previous press".
+kf_dbl_click_ns: i64
+kf_dbl_click_track: int
+kf_dbl_click_clip: int
+kf_dbl_click_lane: int
+kf_dbl_click_frame: i32
 dragging_handle: Maybe(Handle)
 handle_kind: Handle_Kind = .None
 handle_start_mx: f32

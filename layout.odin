@@ -69,6 +69,13 @@ KF_DIAMOND_ROT :: [2]f32{0.70710678, 0.70710678} // cos/sin of 45°: squares up 
 KF_DIAMOND_CORNER :: 2     // Diamond corner rounding, keeps a point on each axis.
 KF_DIAMOND_BORDER :: 1     // 1px border, drawn inside the diamond.
 KF_HIT_MARGIN :: f32(6)    // Diamond pick radius: pointer within this of a key's center selects it.
+// Pointer travel (px) from a diamond press before the gesture counts as a drag.
+// Below this the press is just a click and must never nudge the key, so the key
+// only moves on a deliberate click+drag.
+KF_DRAG_THRESHOLD_PX :: f32(3)
+// Two diamond presses on the SAME key (track, clip, lane, frame) within this
+// window are a double-click: the playhead jumps to that key's frame.
+KF_DBL_CLICK_NS :: i64(400_000_000)
 // Inspector "add keyframe" button: the same 45°-rotated-square keyframe look
 // (KF_DIAMOND_* above), scaled to sit beside a property field. The painted
 // diamond is the button's only graphics; the clay box beneath carries the id

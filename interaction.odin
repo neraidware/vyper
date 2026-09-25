@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:math"
 import "core:strings"
 import "core:sync"
+import "core:time"
 import sdl "vendor:sdl3"
 
 // ---------------------------------------------------------------------------
@@ -554,14 +555,55 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 	proc(inp: Mouse_Input) -> bool {
 		if ti, ci, lane, key, ok := kf_key_at(inp.x, inp.y); ok {
 			kf_select(ti, ci, lane, key)
+			cl, _, k, kok := kf_selected()
+			// A stale hit (the key vanished between the hit-test and the resolve)
+			// must read as a plain click, never as a double-click against a
+			// borrowed frame: park the record so no second press can match it.
+			now := i64(time.now()._nsec)
+			kf_frame := kok ? k.frame_off : -1
+			// A second press on the SAME key inside the double-click window is a
+			// "go to keyframe": move the playhead onto that key's frame (anchoring
+			// audio exactly like the scrub) and swallow the press so it never arms
+			// a move. The first press of the pair already selected the key.
+			if kok &&
+			   kf_dbl_click_ns != 0 &&
+			   now - kf_dbl_click_ns <= KF_DBL_CLICK_NS &&
+			   ti == kf_dbl_click_track &&
+			   ci == kf_dbl_click_clip &&
+			   lane == kf_dbl_click_lane &&
+			   kf_frame == kf_dbl_click_frame {
+				f := clamp(
+					cl.timeline_start_frame + i64(kf_frame),
+					0,
+					max(0, timeline_duration() - 1),
+				)
+				playhead.frame = f
+				audio_seek(f)
+				sync.atomic_store(&audio_ph_src, 1)
+				sync.atomic_store(&audio_ph_catch, 0)
+				kf_dbl_click_ns = now
+				return true
+			}
+			kf_dbl_click_ns = now
+			kf_dbl_click_track = ti
+			kf_dbl_click_clip = ci
+			kf_dbl_click_lane = lane
+			kf_dbl_click_frame = kf_frame
 			// The same press that selects ALSO arms the horizontal move gesture
 			// (S4). A drag is only distinguishable from a click at release, so
 			// arming here with a frame-at-press capture + release-time compare
 			// is the honest shape: a click that never slides commits nothing
 			// (the clip-stutter rule) and the capture doubles as the pre-move
-			// snapshot hook (undo_begin) for the live drag.
-			if _, _, k, kok := kf_selected(); kok {
+			// snapshot hook (undo_begin) for the live drag. The drag translates
+			// the key by the pointer's own delta from the grab point
+			// (kf_drag_pivot), so an off-center grab never snaps the key's
+			// center to the cursor.
+			if kok {
 				kf_drag_start_frame = k.frame_off
+				kf_drag_press_x = inp.x
+				box :=
+					clay.GetElementData(clay.ID("TimelineClipWrap", u32(ti * 1000 + ci))).boundingBox
+				kf_drag_pivot = f32(k.frame_off) - (inp.x - box.x) / timeline_zoom
 			}
 			undo_begin()
 			active_interaction = .Keyframe_Move
@@ -721,10 +763,12 @@ drag_move_in_place :: proc(frame: f32) {
 
 // update_keyframe_drag follows the pointer while a Keyframe_Move drag is in
 // flight (called every mouse-move while down, like the clip/gain updates). The
-// target frame is derived straight from the pointer against the wrap box — the
-// exact inverse of kf_key_center's cx mapping — so the diamond can never
-// detach from the cursor (no per-frame delta drift), and clamped into the
-// clip's extent.
+// key TRANSLATES by the pointer's own frame delta from the grab point
+// (kf_drag_pivot), so the diamond keeps the exact offset the user grabbed it at
+// — it can never jump its center to the cursor, and the pointer can never
+// detach (the mapping is a pure delta, no per-frame accumulation). The move only
+// engages once the cursor travels KF_DRAG_THRESHOLD_PX from the press, so a
+// click (even one landing off-center) never nudges the key.
 update_keyframe_drag :: proc(mx: f32) {
 	if kf_sel.track_idx < 0 || kf_sel.clip_index < 0 {
 		return
@@ -733,12 +777,16 @@ update_keyframe_drag :: proc(mx: f32) {
 	if !ok {
 		return
 	}
+	if abs(mx - kf_drag_press_x) < KF_DRAG_THRESHOLD_PX {
+		return
+	}
 	box :=
 		clay.GetElementData(clay.ID("TimelineClipWrap", u32(kf_sel.track_idx * 1000 + kf_sel.clip_index))).boundingBox
 	if box.width <= 0 {
 		return
 	}
-	k.frame_off = clamp(i32((mx - box.x) / timeline_zoom), 0, i32(cl.source_length_frames))
+	cursor_frame := (mx - box.x) / timeline_zoom
+	k.frame_off = clamp(i32(cursor_frame + kf_drag_pivot), 0, i32(cl.source_length_frames))
 }
 
 // commit_keyframe_drag is the Keyframe_Move release path: the frame was applied
@@ -939,6 +987,8 @@ interaction_post_build :: proc(
 		drag_clip = nil
 		gain_drag_clip = nil
 		kf_drag_start_frame = 0
+		kf_drag_press_x = 0
+		kf_drag_pivot = 0
 		drag_source_track = -1
 		drag_source_index = -1
 		drag_hover_track = -1
