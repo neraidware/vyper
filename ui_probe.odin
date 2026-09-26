@@ -115,6 +115,10 @@ for j := 0; j < len(raw); {
 	if !ui_probe_track_menu_asserts() {
 		os.exit(1)
 	}
+	// The finder must show its listing the moment it opens, with no typing.
+	if !ui_probe_finder_listing_asserts() {
+		os.exit(1)
+	}
 	// The file finder is a dialog-style popup drawn off the text input hook:
 	// open it headless, lay out a page, and check the popup exists, is centered,
 	// and paints one row per visible entry.
@@ -241,6 +245,66 @@ ui_probe_finder_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] finder layout ok (%d rows)\n", FINDER_MAX_ROWS)
+	}
+	return ok
+}
+
+// ui_probe_finder_listing_asserts covers the regression where `:open` showed an
+// EMPTY listing until the user typed something: the refresh memo was keyed on
+// the query alone, but the filter output also depends on the entries list, so a
+// relist under an unchanged query was silently dropped. Uses a real directory
+// (the probe's own cwd) because the whole point is that a real read populates
+// rows.
+ui_probe_finder_listing_asserts :: proc() -> bool {
+	ok := true
+	ti.active = true
+	ti.input_type = TI_FINDER
+	ti.cursor = 0
+	ti.anchor = 0
+	clear(&ti.buf) // empty query: the state right after the finder opens
+
+	// Stand in for finder_open's browse setup without the SDL text-input poke.
+	file_finder.active = true
+	file_finder.mode = .Open
+	file_finder.sel = 0
+	file_finder.scroll = 0
+	cwd := os.get_working_directory(context.temp_allocator) or_else ""
+	if len(cwd) == 0 {
+		fmt.eprintf("[ui-probe] no cwd for the listing check\n")
+		return false
+	}
+	defer {
+		finder_close()
+		ti.active = false
+	}
+	file_finder.cwd = strings.clone(cwd)
+	finder_relist()
+	if len(file_finder.entries) == 0 {
+		fmt.eprintf("[ui-probe] cwd listing came back empty\n")
+		return false
+	}
+	finder_refresh()
+	// This is the reported bug: rows exist, the query is empty, and the list
+	// must be visible without typing.
+	if len(file_finder.filtered) == 0 {
+		fmt.eprintf(
+			"[ui-probe] %d entries but 0 rows shown with an empty query\n",
+			len(file_finder.entries),
+		)
+		return false
+	}
+
+	// The same must hold after a descend, which rebuilds the entries under a
+	// query that did not change.
+	file_finder.filtered_valid = true
+	finder_relist()
+	finder_refresh()
+	if len(file_finder.filtered) == 0 {
+		fmt.eprintf("[ui-probe] relist under an unchanged query emptied the rows\n")
+		ok = false
+	}
+	if ok {
+		fmt.printf("[ui-probe] finder listing ok (%d rows)\n", len(file_finder.filtered))
 	}
 	return ok
 }
@@ -381,10 +445,16 @@ ui_probe_finder_save_asserts :: proc() -> bool {
 // handful of synthetic entries (dirs + files of each kind) so the popup has
 // something to draw without touching the real filesystem.
 finder_populate :: proc(n: int) {
+	// Tear down whatever listing is live first, the way a real browse does.
+	// Assigning `file_finder.entries = make(...)` instead orphans the old
+	// buffer (and its cloned name/fullpath strings) with no pointer left to
+	// free it — Odin's clear keeps capacity, so the seeding below can just
+	// reserve and reuse.
+	finder_clear()
 	file_finder.active = true
 	file_finder.mode = .Open
 	file_finder.cwd = strings.clone("/probe/fixtures")
-	file_finder.entries = make([dynamic]Finder_Entry, 0, n + 3)
+	reserve(&file_finder.entries, n + 3)
 	for i in 0 ..< n {
 		kind := Finder_Kind((i + 1) % len(Finder_Kind))
 		append(
@@ -405,10 +475,9 @@ finder_populate :: proc(n: int) {
 			kind = .Subtitle,
 		},
 	)
-	file_finder.filtered = make([dynamic]int, 0, len(file_finder.entries))
-	for i in 0 ..< len(file_finder.entries) {
-		append(&file_finder.filtered, i)
-	}
+	// Let the real refresh build `filtered` from the query, the way the popup
+	// does. Populating it by hand (or forcing the memo with query_len = -1) hid
+	// the fact that a relist under an unchanged query left it empty.
 	// The finder's text input rides on `ti`, but the real opener pokes SDL text
 	// input (sdl.StartTextInput) which is unavailable headless — reproduce only
 	// the state the popup's draw reads.
@@ -419,7 +488,7 @@ finder_populate :: proc(n: int) {
 	clear(&ti.buf)
 	file_finder.sel = 0
 	file_finder.scroll = 0
-	file_finder.query_len = -1 // force finder_refresh to scan the new list
+	file_finder.filtered_valid = false
 	finder_refresh()
 }
 

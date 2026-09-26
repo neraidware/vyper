@@ -478,6 +478,21 @@ Steps (each lands + probe + vet before the next):
 - [x] S4. Routing: bare `:open` in `apply_command`, OpenFileButton,
       BinImportButton → `finder_open` with a commit proc (open_file_at /
       import_srt_to_bin / import_media_to_bin). Wheel scroll over popup.
+- [x] S5. Fix: `:open` showed an EMPTY listing until the user typed something.
+      `finder_refresh` memoised on the query text alone, but its output is a
+      function of the query AND the entries list — so `finder_relist` (open,
+      descend, go up) rebuilt the entries, cleared `filtered`, and the memo
+      still claimed to be current. With an empty query (exactly the state right
+      after opening) the strings compared equal and the rebuild was skipped, so
+      the popup drew nothing; typing a character changed the query, forced the
+      rebuild, and the list appeared. Added `filtered_valid` so the memo needs
+      both inputs, set false by every relist and true by the rebuild. Note the
+      probe had been papering over this with `query_len = -1` to force a scan;
+      that hack is gone and the probe now builds `filtered` through the real
+      `finder_refresh`. Probe: `ui_probe_finder_listing_asserts` browses a real
+      directory and asserts rows appear with an empty query, both on open and
+      after a relist. Mutation-checked: restoring the query-only memo fails it
+      with the exact reported symptom ("79 entries but 0 rows shown").
 - [ ] ACCEPT: `:open` pops the finder; navigate dirs, follow symlinks, filter
       fuzzily, open a media file and import into bin without touching an OS
       dialog. Probes + `-vet` green. (UI probe extended with a headless

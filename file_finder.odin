@@ -50,6 +50,12 @@ File_Finder :: struct {
 	scroll:    int,                   // first visible row window
 	query_buf: [FINDER_QUERY_MAX + 1]u8, // refresh-compare scratch for the filter
 	query_len: int,
+	// filtered_valid records that `filtered` matches the CURRENT entries and
+	// query. `filtered` is derived from both, so keying the refresh memo on the
+	// query alone went stale whenever finder_relist rebuilt the entries under an
+	// unchanged query — which left the listing blank until the user typed
+	// something that happened to change the query.
+	filtered_valid: bool,
 }
 file_finder: File_Finder
 
@@ -98,6 +104,7 @@ finder_clear :: proc() {
 	}
 	clear(&file_finder.entries)
 	clear(&file_finder.filtered)
+	file_finder.filtered_valid = false
 	delete(file_finder.cwd)
 	file_finder.cwd = ""
 	file_finder.sel = 0
@@ -121,6 +128,9 @@ finder_relist :: proc() {
 	}
 	clear(&file_finder.entries)
 	clear(&file_finder.filtered)
+	// The listing just changed, so the filter output is stale regardless of the
+	// query text. finder_refresh rebuilds it on the next draw.
+	file_finder.filtered_valid = false
 	file_finder.sel = 0
 	file_finder.scroll = 0
 
@@ -170,14 +180,18 @@ finder_relist :: proc() {
 	})
 }
 
-// finder_refresh rebuilds the filtered index list when the filter changed
-// since the last build; a hidden-filter change (descend) or a fresh list calls
-// it with the buffer already cleared. Selection clamps to the new list and the
-// scroll window follows the selected row.
+// finder_refresh rebuilds the filtered index list when EITHER input changed
+// since the last build: the query text, or the entries listing (a descend, go
+// up, or a fresh open — see filtered_valid). Both are needed because the output
+// is a function of both; keying on the query alone left a freshly opened or
+// freshly descended listing blank until the user typed something. Selection
+// clamps to the new list and the scroll window follows the selected row.
 finder_refresh :: proc() {
 	query := text_input_string()
-	if len(query) == file_finder.query_len &&
-		string(file_finder.query_buf[:file_finder.query_len]) == query {
+	query_unchanged :=
+		len(query) == file_finder.query_len &&
+		string(file_finder.query_buf[:file_finder.query_len]) == query
+	if file_finder.filtered_valid && query_unchanged {
 		return
 	}
 	qn := min(len(query), FINDER_QUERY_MAX)
@@ -200,6 +214,7 @@ finder_refresh :: proc() {
 	} else {
 		file_finder.sel = clamp(file_finder.sel, 0, len(file_finder.filtered) - 1)
 	}
+	file_finder.filtered_valid = true
 	finder_clamp_scroll()
 }
 

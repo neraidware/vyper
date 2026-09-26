@@ -697,11 +697,15 @@ Text_Input :: struct {
 	// clip (rather than renaming an existing one): the clip only survives if a
 	// non-empty name is committed. Applies both to renamed (commit) and cancel.
 	is_create:  bool,
-	// swallow_text discards the NEXT text-input event without inserting it.
-	// The ":" shortcut both opens the command line AND (via the same keypress's
-	// TEXT_INPUT) would echo a ":" into the buffer; the prompt must start
-	// empty, so the opener swallows its own keypress's text.
-	swallow_text: bool,
+	// swallow_char is the exact byte to discard from the next text-input event
+	// (0 = nothing pending). The ":" shortcut both opens the command line AND
+	// (via the same keypress's TEXT_INPUT) would echo a ":" into the buffer; the
+	// prompt must start empty, so the opener swallows its own keypress's text.
+	// Matching the CHARACTER rather than blindly dropping the next event is
+	// what makes this safe: a keypress that produces no text event at all
+	// (layout/IME differences) used to leave a pending swallow that ate the
+	// user's next real keystroke.
+	swallow_char: u8,
 }
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.

@@ -85,9 +85,10 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 	ti.input_type = input_type
 	ti.target = target
 	ti.is_create = false
-	// A stale swallow from a previous ":"-opened session must not eat this
-	// session's first typed character. The opener sets it again right after.
-	ti.swallow_text = false
+	// Drop any pending swallow from a previous session. A begin that follows a
+	// keypress which never produced a text event could otherwise carry a stale
+	// one into this session; the opener arms a fresh one right after.
+	ti.swallow_char = 0
 	// Each ":" session starts with a fresh fuzzy file list (walked lazily on
 	// the first non-empty query) and a clear match highlight.
 	if input_type == TI_CMDLINE {

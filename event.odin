@@ -104,16 +104,16 @@ handle_sdl_events :: proc(running: ^bool) {
 					// Vim-style ":" opens the command line. The same
 					// keypress also fires TEXT_INPUT(":"), which must not
 					// become the first buffer character (the prompt starts
-					// empty) — swallow it via ti.swallow_text.
+					// empty) — swallow that one character.
 					text_input_begin("", TI_CMDLINE, 0)
-					ti.swallow_text = true
+					ti.swallow_char = ':'
 				case sdl.K_SEMICOLON:
 					// Some layouts report ";" as the base key with Shift held
 					// (rather than the shifted K_COLON keycode). Same opener.
 					mods := sdl.GetModState()
 					if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
 						text_input_begin("", TI_CMDLINE, 0)
-						ti.swallow_text = true
+						ti.swallow_char = ':'
 					}
 				case sdl.K_F1:
 					// Always-available shortcut reference.
@@ -196,10 +196,15 @@ case sdl.K_BACKSPACE:
 			}
 		case .TEXT_INPUT:
 			if ti.active {
-				if ti.swallow_text {
-					ti.swallow_text = false
-				} else {
-					text_input_insert(string(event.text.text))
+				text := string(event.text.text)
+				// Drop the swallowed CHARACTER, not merely the next event. A
+				// text event always consumes the swallow (one-shot), so a ":"
+				// keypress that produced no text event can't leave a pending
+				// swallow behind to eat the user's next real keystroke.
+				swallow := ti.swallow_char
+				ti.swallow_char = 0
+				if !(swallow != 0 && len(text) > 0 && text[0] == swallow) {
+					text_input_insert(text)
 				}
 			} else if edit_state.field != .None {
 				for ch in string(event.text.text) {
