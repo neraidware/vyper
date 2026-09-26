@@ -100,21 +100,6 @@ handle_sdl_events :: proc(running: ^bool) {
 				escape_dismiss()
 			} else if !event.key.repeat {
 				switch event.key.key {
-				case sdl.K_COLON:
-					// Vim-style ":" opens the command line. The same
-					// keypress also fires TEXT_INPUT(":"), which must not
-					// become the first buffer character (the prompt starts
-					// empty) — swallow that one character.
-					text_input_begin("", TI_CMDLINE, 0)
-					ti.swallow_char = ':'
-				case sdl.K_SEMICOLON:
-					// Some layouts report ";" as the base key with Shift held
-					// (rather than the shifted K_COLON keycode). Same opener.
-					mods := sdl.GetModState()
-					if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
-						text_input_begin("", TI_CMDLINE, 0)
-						ti.swallow_char = ':'
-					}
 				case sdl.K_F1:
 					// Always-available shortcut reference.
 					editor_flags.help_open = !editor_flags.help_open
@@ -195,19 +180,21 @@ case sdl.K_BACKSPACE:
 				}
 			}
 		case .TEXT_INPUT:
-			if ti.active {
-				text := string(event.text.text)
-				// Drop the swallowed CHARACTER, not merely the next event. A
-				// text event always consumes the swallow (one-shot), so a ":"
-				// keypress that produced no text event can't leave a pending
-				// swallow behind to eat the user's next real keystroke.
-				swallow := ti.swallow_char
-				ti.swallow_char = 0
-				if !(swallow != 0 && len(text) > 0 && text[0] == swallow) {
-					text_input_insert(text)
-				}
+			// The vim-style ":" prompt opener lives HERE, on the text event,
+			// not on KEY_DOWN. The text event IS the character, so consuming it
+			// is the entire job: there is no second event to suppress and no
+			// state correlating the two, which is all the old swallow flag ever
+			// did — and what let it eat the user's next keystroke whenever a
+			// keypress produced no text event. Keying off the character instead
+			// of a keycode also drops the K_COLON-vs-";"-with-Shift guessing:
+			// a ":" from any layout, dead key, or IME arrives identically.
+			text := string(event.text.text)
+			if !ti.active && edit_state.field == .None && text == CMDLINE_OPENER {
+				text_input_begin("", TI_CMDLINE, 0)
+			} else if ti.active {
+				text_input_insert(text)
 			} else if edit_state.field != .None {
-				for ch in string(event.text.text) {
+				for ch in text {
 					// Only accept printable ASCII that makes sense in a number.
 					if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
 						edit_append(u8(ch))

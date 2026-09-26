@@ -666,6 +666,55 @@ clip or loading a project fits the divider to at most 5 tracks on screen.
 Out of scope: reordering tracks by drag, a context menu on the clip lane
 (already exists), renaming a track in place.
 
+## Active 8 — Command line opens from the text event, not a keycode
+
+**Why:** the `:` prompt opener was a KEY_DOWN case that had to suppress its own
+keypress's TEXT_INPUT echo, because SDL sends both events for one keypress. The
+suppression was a flag that discarded "the next text event", so a keypress that
+produced no text event (layout/IME differences) left it armed and it ate the
+user's first real character. `text_input_begin` already carried a patch for the
+stale-flag case, which is what a workaround looks like when the flag was the
+wrong shape.
+
+**Scope (per user, 2026-09-26):** delete the swallow mechanism, not patch it.
+
+- [x] S1. The opener moved to the TEXT_INPUT branch and consumes the character
+      that opened it. The text event IS the character, so there is no second
+      event to suppress and no state correlating the two — the whole mechanism
+      is gone, not guarded: `swallow_char` and its per-session reset are deleted,
+      and with them the `K_COLON` case and the `K_SEMICOLON`+Shift case (which
+      existed only because a keycode-driven opener had to guess which keycode
+      produces `:` on a given layout). A `:` from any layout, dead key, or IME
+      now arrives identically, because none of that is inspected any more.
+      `CMDLINE_OPENER` names the character.
+- [x] S2. The character is consumed where it arrives, never filtered from the
+      buffer: `open C:/foo` is a legal command on Windows, and dropping `:` when
+      the buffer is empty is the same bug in a new hat (the opener's echo is
+      dropped, the buffer stays empty, and the next real character is eaten as if
+      it were the echo).
+- [x] Probe: `ui_probe_cmdline_opener_asserts` pushes real SDL_TEXT_INPUT events
+      through `sdl.PushEvent` and drains them with the real `handle_sdl_events`,
+      so the opener is exercised over the same path a keypress takes. Covers the
+      prompt opening on `:` with an empty buffer, the first typed character
+      surviving (the reported bug), a `:` inside an open prompt being data rather
+      than a second opener, and non-opener text not opening the prompt.
+      Mutation-checked against the old swallow semantics, which fails it with the
+      exact reported symptom (`first typed char gave "", want "o"`).
+      Two things this cost, both now commented at their site: the probe path
+      returns from main before `sdl.Init`, so it brings up `INIT_EVENTS` itself
+      (no display needed), and writing a `#raw_union` variant does NOT set the
+      tag — a synthetic event stays `FIRST` and the app's switch never matches
+      unless the tag is set explicitly.
+- [ ] ACCEPT: manual pass — press `:` and the prompt opens EMPTY, the first
+      character typed shows up, `open C:/x` keeps its colon, and F1/undo/redo
+      shortcuts still fire. This is also the one thing the probe cannot settle:
+      it injects events, so it proves the routing but not whether SDL3 delivers
+      TEXT_INPUT while text input is stopped (the state a `:` arrives in, since
+      `text_input_cancel` calls `StopTextInput`). If `:` turns out not to open
+      the prompt on a real keypress, the fix is one line — leave text input
+      started — but it trades away the IME quiescence `text_input_begin` wants,
+      so it is a deliberate call, not a silent one.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

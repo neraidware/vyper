@@ -19,6 +19,7 @@
 package main
 
 import clay "clay-odin"
+import sdl "vendor:sdl3"
 import "core:c"
 import "core:fmt"
 import "core:os"
@@ -117,6 +118,11 @@ for j := 0; j < len(raw); {
 	}
 	// The finder must show its listing the moment it opens, with no typing.
 	if !ui_probe_finder_listing_asserts() {
+		os.exit(1)
+	}
+	// The ":" prompt opener consumes its own text event; the first real
+	// keystroke after it must survive.
+	if !ui_probe_cmdline_opener_asserts() {
 		os.exit(1)
 	}
 	// The file finder is a dialog-style popup drawn off the text input hook:
@@ -245,6 +251,97 @@ ui_probe_finder_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] finder layout ok (%d rows)\n", FINDER_MAX_ROWS)
+	}
+	return ok
+}
+
+// ui_probe_text_buf backs ui_probe_push_text. SDL holds the text pointer until
+// the event is drained, so the bytes need storage that outlives the push; a
+// package var does, and one buffer suffices because every push is drained by the
+// next handle_sdl_events before the next push overwrites it.
+ui_probe_text_buf: [64]u8
+
+// ui_probe_push_text queues a real SDL_TEXT_INPUT event through SDL's own event
+// queue, so the command-line opener is exercised through the same path a
+// keypress takes.
+ui_probe_push_text :: proc(s: string) {
+	n := min(len(s), len(ui_probe_text_buf) - 1)
+	copy(ui_probe_text_buf[:n], s[:n])
+	ui_probe_text_buf[n] = 0
+	// cstring is [^]u8, so transmute the pointer, not the slice. The tag is set
+	// explicitly because writing a raw_union's variant does NOT set it — a union
+	// built this way stays FIRST and the app's switch never matches TEXT_INPUT.
+	raw: [^]u8 = raw_data(ui_probe_text_buf[:])
+	ev: sdl.Event
+	ev.type = .TEXT_INPUT
+	ev.text.text = transmute(cstring)raw
+	if !sdl.PushEvent(&ev) {
+		fmt.eprintf("[ui-probe] SDL_PushEvent failed for %q\n", s)
+	}
+}
+
+// ui_probe_cmdline_opener_asserts drives the command line through real SDL
+// text events. The opener used to be a KEY_DOWN case that then had to suppress
+// its own keypress's TEXT_INPUT echo, and the suppression was a flag eating
+// "the next event" — so a keypress that produced no text event left it armed and
+// it consumed the user's first real character. Opening on the text event
+// removes the second event entirely, and this asserts the behaviour that was
+// reported: the first character typed after ":" must survive.
+ui_probe_cmdline_opener_asserts :: proc() -> bool {
+	ok := true
+	running := true
+
+	// This probe path returns from main before the app's sdl.Init, so there is
+	// no event queue to push into. The event subsystem needs no display, so
+	// bring up just that and tear it down after.
+	if !sdl.Init(sdl.INIT_EVENTS) {
+		fmt.eprintf("[ui-probe] SDL_Init(EVENTS) failed\n")
+		return false
+	}
+	defer sdl.Quit()
+
+	// No field open, prompt closed.
+	text_input_cancel()
+	ti.active = false
+	ui_probe_push_text(CMDLINE_OPENER)
+	handle_sdl_events(&running)
+	if !ti.active || ti.input_type != TI_CMDLINE {
+		fmt.eprintf("[ui-probe] %q did not open the command line\n", CMDLINE_OPENER)
+		return false
+	}
+	// The opener consumes itself: the prompt starts empty, not ":".
+	if got := text_input_string(); len(got) != 0 {
+		fmt.eprintf("[ui-probe] prompt opened with %q, want empty\n", got)
+		ok = false
+	}
+	// The reported bug: the FIRST character typed must land.
+	ui_probe_push_text("o")
+	handle_sdl_events(&running)
+	if got := text_input_string(); got != "o" {
+		fmt.eprintf("[ui-probe] first typed char gave %q, want \"o\"\n", got)
+		ok = false
+	}
+	// A ":" typed into an open prompt IS data (a Windows drive path), so it
+	// must be inserted rather than treated as another opener.
+	ui_probe_push_text("C:/x")
+	handle_sdl_events(&running)
+	if got := text_input_string(); got != "oC:/x" {
+		fmt.eprintf("[ui-probe] drive path gave %q, want \"oC:/x\"\n", got)
+		ok = false
+	}
+	// Multi-byte text must not be mistaken for the opener.
+	text_input_cancel()
+	ti.active = false
+	ui_probe_push_text("é")
+	handle_sdl_events(&running)
+	if ti.active {
+		fmt.eprintf("[ui-probe] non-opener text %q opened the prompt\n", "é")
+		ok = false
+	}
+
+	text_input_cancel()
+	if ok {
+		fmt.printf("[ui-probe] cmdline opener ok\n")
 	}
 	return ok
 }
