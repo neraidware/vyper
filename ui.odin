@@ -29,36 +29,51 @@ import "core:fmt"
 // rendered every dynamic label that fed clay.Text from a local buffer as
 // garbage. Every per-frame label has its own persistent buffer here, one per
 // text element, never shared between two clay.Text calls.
-UI_TEXT_APP_SUMMARY: [512]u8
-UI_TEXT_APP_FPS:     [32]u8
-UI_TEXT_STATE:       [64]u8
-UI_TEXT_RANGE:       [64]u8
-UI_TEXT_TRACK:       [256]u8
-UI_TEXT_FILE:        [256]u8
-UI_TEXT_DUR:         [128]u8
-UI_TEXT_IO:          [128]u8
-UI_TEXT_GAIN:        [64]u8
-UI_TEXT_X:           [64]u8
-UI_TEXT_Y:           [64]u8
-UI_TEXT_S:           [64]u8
-UI_TEXT_L:           [64]u8
-UI_TEXT_R:           [64]u8
-UI_TEXT_T:           [64]u8
-UI_TEXT_B:           [64]u8
-UI_TEXT_OUT:         [128]u8
-UI_TEXT_RATE:        [64]u8
-UI_TEXT_HINT:        [512]u8
-UI_TEXT_KF_NAME:     [128]u8 // keyframe readout: track name
-UI_TEXT_KF_FRAME:    [64]u8 // keyframe readout: absolute timeline frame
-UI_TEXT_KF_VAL:      [64]u8 // keyframe readout: value field text
-
-// One label+name buffer per rate for the playback-rate dropdown items. Each
-// menu row must keep its own buffer alive until draw (clay keeps the slices),
-// and the same buffer can never back two rows -- so sizes match PLAYBACK_RATES.
-UI_TEXT_RATE_MENU: [7]struct {
-	name:  [64]u8,
-	label: [64]u8,
+// UI_Text_Buffers holds every per-frame text scratch used by build_page. Clay
+// does NOT copy the bytes, so each field is one devoted buffer per clay.Text
+// element (one per label, never shared between two calls -- a shared buffer
+// would render both labels with whichever wrote last). Declared here as one
+// process-singleton instance so the whole scratch surface has one owner.
+UI_Text_Buffers :: struct {
+	app_summary: [512]u8,
+	app_fps:     [32]u8,
+	state:       [64]u8,
+	range:       [64]u8,
+	track:       [256]u8,
+	file:        [256]u8,
+	dur:         [128]u8,
+	io:          [128]u8,
+	gain:        [64]u8,
+	x:           [64]u8,
+	y:           [64]u8,
+	s:           [64]u8,
+	l:           [64]u8,
+	r:           [64]u8,
+	t:           [64]u8,
+	b:           [64]u8,
+	out:         [128]u8,
+	rate:        [64]u8,
+	hint:        [512]u8,
+	// keyframe readout scratch: lane name, absolute timeline frame, value text.
+	kf_name:     [128]u8,
+	kf_frame:    [64]u8,
+	kf_val:      [64]u8,
+	// playhead timecode (HH:MM:SS:FF) scratch; clay keeps it until draw, so it
+	// must outlive build_page and back exactly one clay.Text element per frame.
+	timecode:    [32]u8,
+	// One label+name buffer per rate for the playback-rate dropdown items. Each
+	// menu row must keep its own buffer alive until draw (clay keeps the slices),
+	// and the same buffer can never back two rows -- so sizes match PLAYBACK_RATES.
+	rate_menu:   [7]struct {
+		name:  [64]u8,
+		label: [64]u8,
+	},
+	// file-finder scratch: the current-directory header and the symlink suffix.
+	finder_dir: [512]u8,
+	finder_sym: [512]u8,
 }
+
+ui_text: UI_Text_Buffers
 
 build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	clay.SetLayoutDimensions({f32(width), f32(height)})
@@ -74,7 +89,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	}
 	fps_l := "auto"
 	if project.frame_rate > 0 {
-		fps_l = fmt.bprintf(UI_TEXT_APP_FPS[:], "%g", project.frame_rate)
+		fps_l = fmt.bprintf(ui_text.app_fps[:], "%g", project.frame_rate)
 	}
 
 	if clay.UI()(
@@ -109,7 +124,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			)
 			clay.Text(
 				fmt.bprintf(
-					UI_TEXT_APP_SUMMARY[:],
+					ui_text.app_summary[:],
 					"%s · %dx%d @ %sfps",
 					project_label,
 					project.width,
@@ -133,8 +148,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 				},
 				backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
 				border = {
-					color = help_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-					width = clay.BorderOutside(help_open ? 2 : 1),
+					color = editor_flags.help_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+					width = clay.BorderOutside(editor_flags.help_open ? 2 : 1),
 				},
 				cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 			},
@@ -142,7 +157,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 				clay.Text(
 					"?",
 					clay.TextElementConfig {
-						textColor = help_open ? BUTTON_BORDER_HOVER : TEXT,
+						textColor = editor_flags.help_open ? BUTTON_BORDER_HOVER : TEXT,
 						fontSize = FONT_HEADING,
 					},
 				)
@@ -153,7 +168,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			layout = {
 				sizing = {
 					width = clay.SizingGrow({}),
-					height = clay.SizingFixed(upper_area_height),
+					height = clay.SizingFixed(panel_layout.upper_area_height),
 				},
 				padding = clay.PaddingAll(PANEL_PADDING),
 				childAlignment = {x = .Center, y = .Center},
@@ -194,7 +209,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					},
 				},
 				) {
-					switch media_bin_view {
+					switch panel_views.media_bin_view {
 					case .Bin:
 						media_bin_header()
 						media_bin_grid()
@@ -318,7 +333,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					) {
 						clay.Text(
 							fmt.bprintf(
-								UI_TEXT_STATE[:],
+								ui_text.state[:],
 								"%d / %d  ·  %gfps",
 								playhead.frame,
 								max(0, timeline_duration() - 1),
@@ -362,7 +377,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							layoutDirection = .TopToBottom,
 							childGap = 0,
 						},
-						clip = {vertical = true, childOffset = {0, -inspector_scroll}},
+						clip = {vertical = true, childOffset = {0, -scrollbars.inspector.offset}},
 					},
 					) {
 						if clay.UI(clay.ID("InspectorContent"))(
@@ -374,7 +389,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 							},
 						},
 						) {
-							switch inspector_view {
+							switch panel_views.inspector_view {
 							case .Clip:
 								clip_card()
 							case .Project:
@@ -386,7 +401,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 					}
 					v_scrollbar(
 						"InspectorV",
-						inspector_scroll,
+						scrollbars.inspector.offset,
 						inspector_content_height(),
 						inspector_view_height(),
 					)
@@ -559,7 +574,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 								layoutDirection = .TopToBottom,
 								childGap = 0,
 							},
-							clip = {vertical = true, childOffset = {0, -timeline_view_top}},
+							clip = {vertical = true, childOffset = {0, -timeline_view.top}},
 						},
 						) {
 							sync_track_order()
@@ -755,7 +770,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										horizontal = true,
 										vertical = true,
 										childOffset = {
-											-timeline_view_start * timeline_zoom,
+											-timeline_view.start * timeline_view.zoom,
 											0,
 										},
 									},
@@ -765,7 +780,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 									for timeline_clip, index in track.clips {
 										target_x :=
 											f32(timeline_clip.timeline_start_frame) *
-											timeline_zoom
+											timeline_view.zoom
 										if target_x > clips_content_x {
 											spacer_w := target_x - clips_content_x
 											clips_content_x = target_x
@@ -787,7 +802,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										}
 										clip_width :=
 											f32(max(timeline_clip.source_length_frames, 1)) *
-											timeline_zoom
+											timeline_view.zoom
 										clip_color := BUTTON
 										clip_border := BUTTON_BORDER
 										clip_border_w: u16 = 2
@@ -800,8 +815,8 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 										} else if clip_label == "" {
 											clip_label = "Clip"
 										}
-										if ti == selected_track &&
-										   index == selected_index {
+										if ti == selection.track &&
+										   index == selection.index {
 											clip_border = SELECT_BORDER
 											clip_border_w = 3
 										} else if is_clip_selected(ti, index) {
@@ -923,9 +938,9 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 						},
 					},
 					) {
-						settings_icon_button("SnapClipToPh", snap_clips_to_playhead)
-						settings_icon_button("SnapPhToClip", snap_playhead_to_clips)
-						settings_icon_button("AutoKf", auto_keyframe)
+						settings_icon_button("SnapClipToPh", editor_flags.snap_clips_to_playhead)
+						settings_icon_button("SnapPhToClip", editor_flags.snap_playhead_to_clips)
+						settings_icon_button("AutoKf", editor_flags.auto_keyframe)
 						// Grow spacer pushes the zoom group to the right edge,
 						// keeping the snap toggles pinned left.
 						if clay.UI(clay.ID("TimelineBottomSpacer"))(
@@ -1174,7 +1189,7 @@ project_card :: proc() {
 	if project.start_frame >= 0 &&
 	   project.end_frame >= 0 &&
 	   project.end_frame > project.start_frame {
-		range_buf := UI_TEXT_RANGE[:]
+		range_buf := ui_text.range[:]
 		clay.Text(
 			fmt.bprintf(range_buf[:], "%d – %d", project.start_frame, project.end_frame),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
@@ -1277,9 +1292,9 @@ clip_card :: proc() {
 		// text at the call — it keeps the slice until draw — so every element
 		// must own its own buffer: one per line, never a shared buffer rewritten
 		// between clay.Text calls.
-		track_buf := UI_TEXT_TRACK[:]
-		file_buf := UI_TEXT_FILE[:]
-		dur_buf := UI_TEXT_DUR[:]
+		track_buf := ui_text.track[:]
+		file_buf := ui_text.file[:]
+		dur_buf := ui_text.dur[:]
 		clay.Text(
 			fmt.bprintf(track_buf[:], "Track: %s", tr.name),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
@@ -1293,7 +1308,7 @@ clip_card :: proc() {
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 		)
 		if cl.kind != .Audio {
-			io_buf := UI_TEXT_IO[:]
+			io_buf := ui_text.io[:]
 			clay.Text(
 				fmt.bprintf(
 					io_buf[:],
@@ -1303,25 +1318,25 @@ clip_card :: proc() {
 				),
 				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 			)
-			x_buf := UI_TEXT_X[:]
+			x_buf := ui_text.x[:]
 			x_val := fmt.bprintf(x_buf[:], "%.0f", cl.transform_x)
-			if editing_field == .X {
-				x_val = string(edit_chars[:edit_len])
+			if edit_state.field == .X {
+				x_val = string(edit_state.chars[:edit_state.len])
 			}
 			group_caption_row("TransCaption", "TransCaptionSpacer", "Transform", "KfAddTrans")
-			prop_field_row("PropRowX", "PropFieldX", "X", x_val, editing_field == .X, "KfAddX")
-			y_buf := UI_TEXT_Y[:]
+			prop_field_row("PropRowX", "PropFieldX", "X", x_val, edit_state.field == .X, "KfAddX")
+			y_buf := ui_text.y[:]
 			y_val := fmt.bprintf(y_buf[:], "%.0f", cl.transform_y)
-			if editing_field == .Y {
-				y_val = string(edit_chars[:edit_len])
+			if edit_state.field == .Y {
+				y_val = string(edit_state.chars[:edit_state.len])
 			}
-			prop_field_row("PropRowY", "PropFieldY", "Y", y_val, editing_field == .Y, "KfAddY")
-			s_buf := UI_TEXT_S[:]
+			prop_field_row("PropRowY", "PropFieldY", "Y", y_val, edit_state.field == .Y, "KfAddY")
+			s_buf := ui_text.s[:]
 			scl_val := fmt.bprintf(s_buf[:], "%.2f", cl.scale)
-			if editing_field == .Scale {
-				scl_val = string(edit_chars[:edit_len])
+			if edit_state.field == .Scale {
+				scl_val = string(edit_state.chars[:edit_state.len])
 			}
-			prop_field_row("PropRowS", "PropFieldS", "Scale", scl_val, editing_field == .Scale, "KfAddS")
+			prop_field_row("PropRowS", "PropFieldS", "Scale", scl_val, edit_state.field == .Scale, "KfAddS")
 			// Canvas-center snap belongs with the transform settings it governs.
 			if clay.UI(clay.ID("SnapRow"))(
 			{
@@ -1333,28 +1348,28 @@ clip_card :: proc() {
 				},
 			},
 			) {
-				switch_toggle("SnapCenter", "Snap center", snap_center_to_canvas)
+				switch_toggle("SnapCenter", "Snap center", editor_flags.snap_center_to_canvas)
 			}
 			group_caption_row("CropCaption", "CropCaptionSpacer", "Crop (percent of box)", "KfAddCrop")
-			l_buf := UI_TEXT_L[:]
+			l_buf := ui_text.l[:]
 			l_val := fmt.bprintf(l_buf[:], "%.0f%%", cl.crop_l * 100)
-			if editing_field == .Crop_L {
-				l_val = string(edit_chars[:edit_len])
+			if edit_state.field == .Crop_L {
+				l_val = string(edit_state.chars[:edit_state.len])
 			}
-			r_buf := UI_TEXT_R[:]
+			r_buf := ui_text.r[:]
 			r_val := fmt.bprintf(r_buf[:], "%.0f%%", cl.crop_r * 100)
-			if editing_field == .Crop_R {
-				r_val = string(edit_chars[:edit_len])
+			if edit_state.field == .Crop_R {
+				r_val = string(edit_state.chars[:edit_state.len])
 			}
-			t_buf := UI_TEXT_T[:]
+			t_buf := ui_text.t[:]
 			t_val := fmt.bprintf(t_buf[:], "%.0f%%", cl.crop_t * 100)
-			if editing_field == .Crop_T {
-				t_val = string(edit_chars[:edit_len])
+			if edit_state.field == .Crop_T {
+				t_val = string(edit_state.chars[:edit_state.len])
 			}
-			b_buf := UI_TEXT_B[:]
+			b_buf := ui_text.b[:]
 			b_val := fmt.bprintf(b_buf[:], "%.0f%%", cl.crop_b * 100)
-			if editing_field == .Crop_B {
-				b_val = string(edit_chars[:edit_len])
+			if edit_state.field == .Crop_B {
+				b_val = string(edit_state.chars[:edit_state.len])
 			}
 			if clay.UI(clay.ID("CropRowTop"))(
 			{
@@ -1365,9 +1380,9 @@ clip_card :: proc() {
 				},
 			},
 			) {
-				prop_field("PropCropL", "L", l_val, editing_field == .Crop_L)
+				prop_field("PropCropL", "L", l_val, edit_state.field == .Crop_L)
 				kf_add_button("KfAddCropL")
-				prop_field("PropCropR", "R", r_val, editing_field == .Crop_R)
+				prop_field("PropCropR", "R", r_val, edit_state.field == .Crop_R)
 				kf_add_button("KfAddCropR")
 			}
 			if clay.UI(clay.ID("CropRowBot"))(
@@ -1379,9 +1394,9 @@ clip_card :: proc() {
 				},
 			},
 			) {
-				prop_field("PropCropT", "T", t_val, editing_field == .Crop_T)
+				prop_field("PropCropT", "T", t_val, edit_state.field == .Crop_T)
 				kf_add_button("KfAddCropT")
-				prop_field("PropCropB", "B", b_val, editing_field == .Crop_B)
+				prop_field("PropCropB", "B", b_val, edit_state.field == .Crop_B)
 				kf_add_button("KfAddCropB")
 			}
 		} else {
@@ -1418,10 +1433,10 @@ clip_card :: proc() {
 					"Gain",
 					clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 				)
-				g_buf := UI_TEXT_GAIN[:]
+				g_buf := ui_text.gain[:]
 				g_val := fmt.bprintf(g_buf[:], "%.1f dB", cl.gain)
-				if editing_field == .Gain {
-					g_val = string(edit_chars[:edit_len])
+				if edit_state.field == .Gain {
+					g_val = string(edit_state.chars[:edit_state.len])
 				}
 				if clay.UI(clay.ID("PropFieldGain"))(
 				{
@@ -1430,10 +1445,10 @@ clip_card :: proc() {
 						childAlignment = {x = .Left, y = .Center},
 						padding = clay.PaddingAll(6),
 					},
-					backgroundColor = editing_field == .Gain ? BUTTON_HOVER : BUTTON,
+					backgroundColor = edit_state.field == .Gain ? BUTTON_HOVER : BUTTON,
 					border = {
-						color = editing_field == .Gain ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-						width = clay.BorderOutside(editing_field == .Gain ? 2 : 1),
+						color = edit_state.field == .Gain ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+						width = clay.BorderOutside(edit_state.field == .Gain ? 2 : 1),
 					},
 					cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 				},
@@ -1456,12 +1471,12 @@ clip_card :: proc() {
 // edit_commit (S3 already wires the store side; S4 adds drag-move/delete).
 keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 	panel_caption("Keyframe")
-	name_buf := UI_TEXT_KF_NAME[:]
+	name_buf := ui_text.kf_name[:]
 	clay.Text(
 		fmt.bprintf(name_buf[:], "%s", cl.keyframe_tracks[lane].name),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
 	)
-	frame_buf := UI_TEXT_KF_FRAME[:]
+	frame_buf := ui_text.kf_frame[:]
 	clay.Text(
 		fmt.bprintf(frame_buf[:], "frame %d", cl.timeline_start_frame + i64(kf.frame_off)),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
@@ -1480,7 +1495,7 @@ keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 			"Value",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
-		v_buf := UI_TEXT_KF_VAL[:]
+		v_buf := ui_text.kf_val[:]
 		// A packed (section) key shows lane 0 — the lane an edit would
 		// unwrap-and-target — so the readout and the commit agree.
 		rval: f32
@@ -1490,8 +1505,8 @@ keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 			rval = kf.value.(f32)
 		}
 		v_str := fmt.bprintf(v_buf[:], "%.2f", rval)
-		if editing_field == .Kf_Value {
-			v_str = string(edit_chars[:edit_len])
+		if edit_state.field == .Kf_Value {
+			v_str = string(edit_state.chars[:edit_state.len])
 		}
 		if clay.UI(clay.ID("PropFieldKf"))(
 		{
@@ -1500,10 +1515,10 @@ keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 				childAlignment = {x = .Left, y = .Center},
 				padding = clay.PaddingAll(6),
 			},
-			backgroundColor = editing_field == .Kf_Value ? BUTTON_HOVER : BUTTON,
+			backgroundColor = edit_state.field == .Kf_Value ? BUTTON_HOVER : BUTTON,
 			border = {
-				color = editing_field == .Kf_Value ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-				width = clay.BorderOutside(editing_field == .Kf_Value ? 2 : 1),
+				color = edit_state.field == .Kf_Value ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+				width = clay.BorderOutside(edit_state.field == .Kf_Value ? 2 : 1),
 			},
 			cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 		},
@@ -1566,7 +1581,7 @@ kf_interp_dropdown :: proc(kf: ^Keyframe) {
 		},
 		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
 		border = {
-			color = kf_interp_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			color = kf_view.interp_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			width = clay.BorderOutside(1),
 		},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
@@ -1575,12 +1590,12 @@ kf_interp_dropdown :: proc(kf: ^Keyframe) {
 		clay.Text(
 			kf_interp_label(kf.interp),
 			clay.TextElementConfig {
-				textColor = kf_interp_menu_open ? BUTTON_BORDER_HOVER : TEXT,
+				textColor = kf_view.interp_menu_open ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_SMALL,
 			},
 		)
 	}
-	if kf_interp_menu_open {
+	if kf_view.interp_menu_open {
 		if clay.UI(clay.ID("KfInterpMenu"))(
 		{
 			layout = {
@@ -1664,21 +1679,21 @@ render_encoder_dropdown :: proc() {
 		},
 		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
 		border = {
-			color = render_encoder_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			color = render_encoder_ui.menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			width = enc_border,
 		},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	},
 	) {
 		clay.Text(
-			render_encoder_label(render_encoder_choice),
+			render_encoder_label(render_encoder_ui.choice),
 			clay.TextElementConfig {
-				textColor = render_encoder_menu_open ? BUTTON_BORDER_HOVER : TEXT,
+				textColor = render_encoder_ui.menu_open ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_SMALL,
 			},
 		)
 	}
-	if render_encoder_menu_open {
+	if render_encoder_ui.menu_open {
 		if clay.UI(clay.ID("RenderEncoderMenu"))(
 		{
 			layout = {
@@ -1701,8 +1716,8 @@ render_encoder_dropdown :: proc() {
 			},
 		},
 		) {
-			settings_button("EncChoiceCPU", "High quality (CPU)", render_encoder_choice == .CPU, fill_width = true)
-			settings_button("EncChoiceGPU", "Fast (GPU)", render_encoder_choice == .GPU, fill_width = true)
+			settings_button("EncChoiceCPU", "High quality (CPU)", render_encoder_ui.choice == .CPU, fill_width = true)
+			settings_button("EncChoiceGPU", "Fast (GPU)", render_encoder_ui.choice == .GPU, fill_width = true)
 		}
 	}
 }
@@ -1775,12 +1790,12 @@ render_card :: proc() {
 			}
 		}
 	}
-	out_buf := UI_TEXT_OUT[:]
+	out_buf := ui_text.out[:]
 	clay.Text(
 		fmt.bprintf(out_buf[:], "Output: %s", render_output_name()),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words},
 	)
-	switch_toggle("RenderOverwrite", "Overwrite existing output", render_overwrite_out)
+	switch_toggle("RenderOverwrite", "Overwrite existing output", render_output.overwrite)
 	clay.Text(
 		render_status_text(),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL, wrapMode = .Words},
@@ -1911,8 +1926,8 @@ media_bin_tabs :: proc() {
 		border = {color = BUTTON_BORDER, width = clay.BorderWidth{top = 1}},
 	},
 	) {
-		tab_button("MediaTabBin", "Media Bin", media_bin_view == .Bin)
-		tab_button("MediaTabUndo", "Undo Tree", media_bin_view == .Undo)
+		tab_button("MediaTabBin", "Media Bin", panel_views.media_bin_view == .Bin)
+		tab_button("MediaTabUndo", "Undo Tree", panel_views.media_bin_view == .Undo)
 	}
 }
 
@@ -1930,9 +1945,9 @@ inspector_tabs :: proc() {
 		border = {color = BUTTON_BORDER, width = clay.BorderWidth{top = 1}},
 	},
 	) {
-		tab_button("InspTabClip", "Clip", inspector_view == .Clip)
-		tab_button("InspTabProject", "Project", inspector_view == .Project)
-		tab_button("InspTabRender", "Render", inspector_view == .Render)
+		tab_button("InspTabClip", "Clip", panel_views.inspector_view == .Clip)
+		tab_button("InspTabProject", "Project", panel_views.inspector_view == .Project)
+		tab_button("InspTabRender", "Render", panel_views.inspector_view == .Render)
 	}
 }
 
@@ -1978,7 +1993,7 @@ settings_button :: proc(name: string, label: string, active: bool, fill_width :=
 res_preset_button :: proc(name: string, label: string, w, h: c.int) {
 	active :=
 		(project.width == w && project.height == h) || (project.width == h && project.height == w)
-	if !resolution_locked && active {
+	if !project.resolution_locked && active {
 		// A preset shouldn't look held when the canvas just happens to match it
 		// but resolution is still on auto (picked up from the file, not chosen).
 		active = false
@@ -1989,7 +2004,7 @@ res_preset_button :: proc(name: string, label: string, w, h: c.int) {
 // res_auto_button is the "Auto" resolution control. It stays held while the
 // canvas is unlocked (resolution inferred from the next import).
 res_auto_button :: proc() {
-	settings_button("ResAuto", "Auto", !resolution_locked)
+	settings_button("ResAuto", "Auto", !project.resolution_locked)
 }
 
 // switch_toggle is the shared binary control. Only the switch track owns the
@@ -2118,7 +2133,7 @@ playback_rate_name :: proc(rate: f64, buf: []u8) -> string {
 // playback_rate_dropdown renders the rate selector beside the play button. The
 // collapsed control is a button showing the current rate; clicking it toggles a
 // small menu of the available rates that drops below it. Picking one sets
-// playback_rate and closes the menu. Auto (0) is offered but currently behaves
+// playback.rate and closes the menu. Auto (0) is offered but currently behaves
 // as 1x.
 playback_rate_dropdown :: proc() {
 	rate_border := clay.BorderOutside(1)
@@ -2131,22 +2146,22 @@ playback_rate_dropdown :: proc() {
 		},
 		backgroundColor = BUTTON,
 		border = {
-			color = playback_rate_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			color = playback.rate_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			width = rate_border,
 		},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	},
 	) {
-		rate_lbl := UI_TEXT_RATE[:]
+		rate_lbl := ui_text.rate[:]
 		clay.Text(
-			playback_rate_label(playback_rate, rate_lbl[:]),
+			playback_rate_label(playback.rate, rate_lbl[:]),
 			clay.TextElementConfig {
-				textColor = playback_rate_open ? BUTTON_BORDER_HOVER : TEXT,
+				textColor = playback.rate_open ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_NORMAL,
 			},
 		)
 	}
-	if playback_rate_open {
+	if playback.rate_open {
 		// A proper floating dropdown: the menu overlays the UI anchored just
 		// below the rate button instead of expanding the surrounding layout.
 		if clay.UI(clay.ID("PlayRateMenu"))(
@@ -2172,11 +2187,11 @@ playback_rate_dropdown :: proc() {
 		},
 		) {
 			for rate, i in PLAYBACK_RATES {
-				assert(i < len(UI_TEXT_RATE_MENU))
+				assert(i < len(ui_text.rate_menu))
 				settings_button(
-					playback_rate_name(rate, UI_TEXT_RATE_MENU[i].name[:]),
-					playback_rate_label(rate, UI_TEXT_RATE_MENU[i].label[:]),
-					playback_rate == rate,
+					playback_rate_name(rate, ui_text.rate_menu[i].name[:]),
+					playback_rate_label(rate, ui_text.rate_menu[i].label[:]),
+					playback.rate == rate,
 					fill_width = true,
 				)
 			}
@@ -2188,7 +2203,7 @@ playback_rate_dropdown :: proc() {
 // is held (highlighted) while playing in that direction; the label shows the
 // temporary speed boost when active. dir is +1 (forward) or -1 (backward).
 jog_button :: proc(name: string, dir: int) {
-	active := playhead.playing && playback_dir == dir
+	active := playhead.playing && playback.dir == dir
 	if clay.UI(clay.ID(name))(
 	{
 		layout = {
@@ -2212,7 +2227,7 @@ jog_button :: proc(name: string, dir: int) {
 // (preview_fit_reset); panning or zooming releases it (interaction/event), so
 // the held border reads whether the canvas is currently fit to the panel.
 preview_fit_button :: proc() {
-	active := preview_fit_to_window
+	active := preview_cam.fit_to_window
 	if clay.UI(clay.ID("PreviewFitButton"))(
 	{
 		layout = {
@@ -2566,7 +2581,7 @@ help_entry :: proc(shortcut: Help_Shortcut) {
 // floating panel. Dismissed by clicking outside it, by the "?" button, by F1,
 // or by Esc.
 draw_help_overlay :: proc(width, height: c.int) {
-	if !help_open {
+	if !editor_flags.help_open {
 		return
 	}
 	pw := min(f32(560), f32(width) * 0.9)
@@ -2639,6 +2654,10 @@ draw_text_input_popup :: proc(width, height: c.int) {
 		draw_cmdline_popup(width, height)
 		return
 	}
+	if ti.input_type == TI_FINDER {
+		draw_finder_popup(width, height)
+		return
+	}
 	// Responsive: the popup is at most 460px wide but never wider than 80% of
 	// the window, and its height fits its content. Positioned centered
 	// horizontally, roughly a third from the top.
@@ -2671,7 +2690,7 @@ draw_text_input_popup :: proc(width, height: c.int) {
 		},
 	},
 	) {
-		hint_buf := UI_TEXT_HINT[:]
+		hint_buf := ui_text.hint[:]
 		clay.Text(
 			fmt.bprintf(hint_buf[:], "%s — Enter to confirm, Esc to cancel", title),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
@@ -2724,7 +2743,7 @@ draw_cmdline_popup :: proc(width, height: c.int) {
 	// Stable, cache-aware match list; the whole block (pill + rows) is
 	// centered so a tall list doesn't push off the bottom.
 	cmdline_match_refresh()
-	n := min(len(cmdline_matches), CMDLINE_MATCH_MAX)
+	n := min(len(cmdline_match_state.matches), CMDLINE_MATCH_MAX)
 	row_h := f32(FONT_NORMAL) + 9
 	list_gap: u16 = 6
 	list_h := f32(n) * row_h
@@ -2791,7 +2810,7 @@ draw_cmdline_popup :: proc(width, height: c.int) {
 			},
 			) {
 				for i in 0 ..< n {
-					sel := i == cmdline_sel
+					sel := i == cmdline_match_state.sel
 					if clay.UI(clay.ID("CmdlineMatchRow", u32(i)))(
 					{
 						layout = {
@@ -2804,7 +2823,7 @@ draw_cmdline_popup :: proc(width, height: c.int) {
 						cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 					},
 					) {
-						m := cmdline_matches[i]
+						m := cmdline_match_state.matches[i]
 						runs: [CMDLINE_QUERY_MAX][2]int
 						nr := cmdline_match_matched_runs(m.path, runs[:])
 						seg_start := 0
@@ -2821,6 +2840,122 @@ draw_cmdline_popup :: proc(width, height: c.int) {
 						if seg_start < len(m.path) {
 							col := sel ? BACKGROUND : TEXT
 							clay.Text(m.path[seg_start:], clay.TextElementConfig{textColor = col, fontSize = FONT_NORMAL})
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// draw_finder_popup renders the in-app file finder: a wide floating column
+// with the filter field on top (the same TextInputField id the dialog uses,
+// so draw_text_input_caret just works) and the current directory's listing
+// beneath it as icon + name rows. The current directory shows dimmed under the
+// field. Row icons/thumbnails paint in the overdraw pass (draw_finder_rows)
+// because the icon textures are GPU-side; here the rows are only cells with
+// ids the overdraw looks up.
+draw_finder_popup :: proc(width, height: c.int) {
+	finder_refresh()
+	row_h := f32(FONT_NORMAL) + 9
+	finder_width := f32(min(720, int(f32(width) * 0.92)))
+	visible := min(FINDER_MAX_ROWS, len(file_finder.filtered))
+	list_h := f32(visible) * row_h
+	field_h := f32(TEXT_INPUT_FONT) + f32(TEXT_INPUT_FONT) * CMDLINE_PAD_FRAC * 2
+	dir_h := f32(FONT_SMALL) + 4
+	list_gap: u16 = 4
+	block_h := dir_h + field_h + f32(list_gap) * 2 + list_h
+	block_w := finder_width
+	px := (f32(width) - block_w) / 2
+	py := (f32(height) - block_h) / 2
+	if clay.UI(clay.ID("FinderColumn"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFixed(block_w), height = clay.SizingFixed(block_h)},
+			layoutDirection = .TopToBottom,
+			childGap = list_gap,
+			padding = clay.Padding{left = 8, right = 8, top = 8, bottom = 8},
+		},
+		floating = {
+			offset = {px, py},
+			zIndex = 3000,
+			attachTo = .Root,
+			pointerCaptureMode = .Capture,
+		},
+	},
+	) {
+		dir_buf := ui_text.finder_dir[:]
+		clay.Text(
+			fmt.bprintf(dir_buf[:], "▸ %s", file_finder.cwd),
+			clay.TextElementConfig{textColor = BUTTON_BORDER_HOVER, fontSize = FONT_SMALL},
+		)
+		if clay.UI(clay.ID("TextInputField"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(field_h)},
+				// CARD_GAP side padding matches draw_text_input_caret's
+				// text_x = box.x + CARD_GAP, so the caret lands on the text.
+				padding = clay.Padding{left = CARD_GAP, right = CARD_GAP},
+				childAlignment = {x = .Left, y = .Center},
+			},
+			backgroundColor = TEXT_INPUT_BG,
+			border = {color = BUTTON_BORDER_HOVER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+		},
+		) {
+			text := "filter files…"
+			col := CMDLINE_PLACEHOLDER
+			if len(ti.buf) > 0 {
+				text = text_input_string()
+				col = TEXT
+			}
+			clay.Text(text, clay.TextElementConfig{textColor = col, fontSize = TEXT_INPUT_FONT})
+		}
+		if visible > 0 {
+			if clay.UI(clay.ID("FinderRows"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(list_h)},
+					layoutDirection = .TopToBottom,
+					childGap = 2,
+				},
+			},
+			) {
+				for r in 0 ..< visible {
+					ri := file_finder.scroll + r
+					sel := ri == file_finder.sel
+					if clay.UI(clay.ID("FinderRow", u32(ri)))(
+					{
+						layout = {
+							sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(row_h)},
+							layoutDirection = .LeftToRight,
+							childGap = 6,
+							padding = clay.Padding{left = CARD_GAP, right = CARD_GAP},
+							childAlignment = {x = .Left, y = .Center},
+						},
+						backgroundColor = sel ? BUTTON_BORDER_HOVER : BUTTON,
+						border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+						cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+					},
+					) {
+						// The icon/thumbnail cell: the overdraw pass paints the
+						// finder icon (or a media-bin thumbnail) into this box.
+						clay.UI(clay.ID("FinderRowIcon", u32(ri)))(
+						{
+							layout = {
+								sizing = {width = clay.SizingFixed(row_h - 6), height = clay.SizingFixed(row_h - 6)},
+							},
+						},
+						)
+						entry := file_finder.entries[file_finder.filtered[ri]]
+						col := sel ? BACKGROUND : TEXT
+						if entry.is_symlink {
+							clay.Text(
+								fmt.bprintf(ui_text.finder_sym[:], "%s ↪", entry.name),
+								clay.TextElementConfig{textColor = col, fontSize = FONT_NORMAL},
+							)
+						} else {
+							clay.Text(entry.name, clay.TextElementConfig{textColor = col, fontSize = FONT_NORMAL})
 						}
 					}
 				}
@@ -2898,11 +3033,11 @@ media_bin_header :: proc() {
 }
 
 // media_bin_grid lays out the imported assets as a wrapped thumbnail grid
-// inside a manually-scrolled clip (childOffset = -media_bin_scroll, matching
+// inside a manually-scrolled clip (childOffset = -panel_views.media_bin_scroll, matching
 // the TracksSection pattern). Column count derives from the bin width; rows
 // wrap once the cells exceed it.
 media_bin_grid :: proc() {
-	if len(media_assets) == 0 {
+	if len(media_bin.assets) == 0 {
 		clay.Text(
 			"No media imported",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
@@ -2910,7 +3045,7 @@ media_bin_grid :: proc() {
 		return
 	}
 	cols := media_bin_cols()
-	total_rows := (len(media_assets) + cols - 1) / cols
+	total_rows := (len(media_bin.assets) + cols - 1) / cols
 	if clay.UI(clay.ID("MediaBinScroll"))(
 	{
 		layout = {
@@ -2918,7 +3053,7 @@ media_bin_grid :: proc() {
 			layoutDirection = .TopToBottom,
 			childGap = CARD_GAP,
 		},
-		clip = {vertical = true, childOffset = {0, -media_bin_scroll}},
+		clip = {vertical = true, childOffset = {0, -panel_views.media_bin_scroll}},
 	},
 	) {
 		for row in 0 ..< total_rows {
@@ -2935,7 +3070,7 @@ media_bin_grid :: proc() {
 			},
 			) {
 				base := row * cols
-				for i in base ..< min(base + cols, len(media_assets)) {
+				for i in base ..< min(base + cols, len(media_bin.assets)) {
 					media_bin_item(i)
 				}
 			}
@@ -2947,8 +3082,8 @@ media_bin_grid :: proc() {
 // mediabin.odin after layout) plus the asset basename. Selection shows a
 // spring-green border.
 media_bin_item :: proc(index: int) {
-	asset := &media_assets[index]
-	selected := asset.id == selected_asset_id
+	asset := &media_bin.assets[index]
+	selected := asset.id == selection.asset_id
 	if clay.UI(clay.ID("MediaItem", u32(index)))(
 	{
 		layout = {

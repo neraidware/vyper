@@ -27,29 +27,40 @@ CMDLINE_QUERY_MAX :: 127  // query bytes considered for matching/draw
 CMDLINE_PATH_BUF :: 512   // rewritten `open <path>` command buffer
 
 Cmdline_Match :: struct {
-	path:  string, // relative path (slice into cmdline_files)
+	path:  string, // relative path (slice into match_state.files)
 	score: int,
 }
 
-cmdline_files: [dynamic]string
-cmdline_files_dirty: bool = true
-cmdline_matches: [dynamic]Cmdline_Match
-cmdline_sel: int = -1
-cmdline_query_buf: [CMDLINE_QUERY_MAX + 1]u8 // last query matches were built for
-cmdline_query_len: int
+// Cmdline_Match_State is the ":" open-command's file-matcher session: the
+// cwd-walk file list (session-owned, rebuilt per ":" press) with its dirty
+// flag, the scored match list, the selected match (-1 = none), the query the
+// matches were built for, and its length.
+Cmdline_Match_State :: struct {
+	files:     [dynamic]string,
+	files_dirty: bool,
+	matches:   [dynamic]Cmdline_Match,
+	sel:       int,
+	query_buf: [CMDLINE_QUERY_MAX + 1]u8,
+	query_len: int,
+	// last_command is the most recently committed ":" command-line text,
+	// shown as the prompt's placeholder. Owned (session-heap): the old string
+	// is deleted and replaced by the caller on each commit.
+	last_command: string,
+}
+cmdline_match_state: Cmdline_Match_State = {files_dirty = true, sel = -1}
 
 // cmdline_match_reset drops the session-owned file list and match state.
 // Called by text_input_begin when a TI_CMDLINE session starts, so each ":"
 // press walks a fresh tree.
 cmdline_match_reset :: proc() {
-	for path in cmdline_files {
+	for path in cmdline_match_state.files {
 		delete(path)
 	}
-	delete(cmdline_files)
-	clear(&cmdline_matches)
-	cmdline_files_dirty = true
-	cmdline_sel = -1
-	cmdline_query_len = 0
+	delete(cmdline_match_state.files)
+	clear(&cmdline_match_state.matches)
+	cmdline_match_state.files_dirty = true
+	cmdline_match_state.sel = -1
+	cmdline_match_state.query_len = 0
 }
 
 // cmdline_match_build_files walks the process cwd once and caches relative
@@ -57,10 +68,10 @@ cmdline_match_reset :: proc() {
 // this platform, so the cwd prefix is trimmed to make every candidate a
 // cwd-relative path — the same form apply_command feeds os.exists.
 cmdline_match_build_files :: proc() {
-	if !cmdline_files_dirty {
+	if !cmdline_match_state.files_dirty {
 		return
 	}
-	cmdline_files_dirty = false
+	cmdline_match_state.files_dirty = false
 	cwd := os.get_working_directory(context.temp_allocator) or_else ""
 	if len(cwd) == 0 {
 		return
@@ -70,7 +81,7 @@ cmdline_match_build_files :: proc() {
 	os.walker_init_path(&w, ".")
 	defer os.walker_destroy(&w)
 	for info in os.walker_walk(&w) {
-		if len(cmdline_files) >= CMDLINE_FILES_MAX {
+		if len(cmdline_match_state.files) >= CMDLINE_FILES_MAX {
 			break
 		}
 		if len(info.name) > 0 && info.name[0] == '.' {
@@ -86,7 +97,7 @@ cmdline_match_build_files :: proc() {
 			continue
 		}
 		rel := info.fullpath[len(prefix):]
-		append(&cmdline_files, strings.clone(rel))
+		append(&cmdline_match_state.files, strings.clone(rel))
 	}
 }
 
@@ -163,43 +174,43 @@ cmdline_match_refresh :: proc() {
 	query := cmdline_match_query()
 	// Compare against the stored query byte-for-byte; identical text means the
 	// existing match list is still current.
-	if len(query) == cmdline_query_len &&
-		string(cmdline_query_buf[:cmdline_query_len]) == query {
+	if len(query) == cmdline_match_state.query_len &&
+		string(cmdline_match_state.query_buf[:cmdline_match_state.query_len]) == query {
 		return
 	}
 	qn := min(len(query), CMDLINE_QUERY_MAX)
-	copy(cmdline_query_buf[:qn], query[:qn])
-	cmdline_query_len = qn
-	clear(&cmdline_matches)
+	copy(cmdline_match_state.query_buf[:qn], query[:qn])
+	cmdline_match_state.query_len = qn
+	clear(&cmdline_match_state.matches)
 	if qn == 0 {
-		cmdline_sel = -1
+		cmdline_match_state.sel = -1
 		return
 	}
 	cmdline_match_build_files()
-	for path in cmdline_files {
+	for path in cmdline_match_state.files {
 		if sc := cmdline_fuzzy_score(query[:qn], path); sc > 0 {
-			append(&cmdline_matches, Cmdline_Match{path = path, score = sc})
+			append(&cmdline_match_state.matches, Cmdline_Match{path = path, score = sc})
 		}
 	}
-	sort.quick_sort_proc(cmdline_matches[:], proc(a, b: Cmdline_Match) -> int {
+	sort.quick_sort_proc(cmdline_match_state.matches[:], proc(a, b: Cmdline_Match) -> int {
 		if a.score > b.score { return -1 }
 		if a.score < b.score { return 1 }
 		return 0
 	})
 	// Keep only the rows that fit the dropdown so navigation and rendering
 	// agree on the same list (sel wraps over exactly what's shown).
-	if len(cmdline_matches) > CMDLINE_MATCH_MAX {
-		resize(&cmdline_matches, CMDLINE_MATCH_MAX)
+	if len(cmdline_match_state.matches) > CMDLINE_MATCH_MAX {
+		resize(&cmdline_match_state.matches, CMDLINE_MATCH_MAX)
 	}
-	cmdline_sel = 0 if len(cmdline_matches) > 0 else -1
+	cmdline_match_state.sel = 0 if len(cmdline_match_state.matches) > 0 else -1
 }
 
 // cmdline_match_navigate moves the highlight by delta rows, wrapping.
 cmdline_match_navigate :: proc(delta: int) {
-	if len(cmdline_matches) == 0 {
+	if len(cmdline_match_state.matches) == 0 {
 		return
 	}
-	cmdline_sel = (cmdline_sel + delta + len(cmdline_matches)) % len(cmdline_matches)
+	cmdline_match_state.sel = (cmdline_match_state.sel + delta + len(cmdline_match_state.matches)) % len(cmdline_match_state.matches)
 }
 
 // cmdline_match_apply_selection rewrites the buffer to the highlighted
@@ -213,7 +224,7 @@ cmdline_match_apply_selection :: proc() -> bool {
 	query := cmdline_match_query()
 	if len(query) > 0 {
 		cmdline_match_build_files()
-		for path in cmdline_files {
+		for path in cmdline_match_state.files {
 			if path == query {
 				buf: [CMDLINE_PATH_BUF]u8
 				text_input_set_buf(fmt.bprintf(buf[:], "open %s", path))
@@ -221,10 +232,10 @@ cmdline_match_apply_selection :: proc() -> bool {
 			}
 		}
 	}
-	if cmdline_sel < 0 || cmdline_sel >= len(cmdline_matches) {
+	if cmdline_match_state.sel < 0 || cmdline_match_state.sel >= len(cmdline_match_state.matches) {
 		return false
 	}
-	path := cmdline_matches[cmdline_sel].path
+	path := cmdline_match_state.matches[cmdline_match_state.sel].path
 	buf: [CMDLINE_PATH_BUF]u8
 	text_input_set_buf(fmt.bprintf(buf[:], "open %s", path))
 	return true
@@ -234,7 +245,7 @@ cmdline_match_apply_selection :: proc() -> bool {
 // path that match the stored query, for highlight drawing. Returns the number
 // of runs written.
 cmdline_match_matched_runs :: proc(path: string, runs: [][2]int) -> int {
-	q := string(cmdline_query_buf[:cmdline_query_len])
+	q := string(cmdline_match_state.query_buf[:cmdline_match_state.query_len])
 	ql := len(q)
 	if ql == 0 {
 		return 0

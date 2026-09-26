@@ -39,6 +39,28 @@ handle_sdl_events :: proc(running: ^bool) {
 						continue
 					}
 				}
+				// Finder navigation: Tab/Up/Down move the highlight, Enter
+				// descends into the selected directory or opens the selected
+				// file — Enter never commits the field (the finder stays open
+				// across a descend), so it is handled before the generic
+				// commit path. Esc still cancels through the text field.
+				if ti.input_type == TI_FINDER {
+					switch event.key.key {
+					case sdl.K_TAB:
+						finder_navigate(shift ? -1 : 1)
+						continue
+					case sdl.K_UP:
+						finder_navigate(-1)
+						continue
+					case sdl.K_DOWN:
+						finder_navigate(1)
+						continue
+					case sdl.K_RETURN, sdl.K_RETURN2:
+						finder_refresh()
+						finder_enter()
+						continue
+					}
+				}
 				r := text_input_handle_key(event.key.key, shift, ctrl)
 				if r == .Commit {
 					if ti.input_type == TI_PLAYHEAD {
@@ -53,14 +75,17 @@ handle_sdl_events :: proc(running: ^bool) {
 						apply_rename()
 					}
 				} else if r == .Cancel {
-					if ti.is_create {
+					if ti.input_type == TI_FINDER {
+						// Esc dismissed the finder's filter field.
+						finder_close()
+					} else if ti.is_create {
 						// Aborted a clip-create dialog: drop the clip that was
 						// temporarily inserted so no nameless clip remains.
 						delete_selected_clip_raw()
 						ti.is_create = false
 					}
 				}
-			} else if editing_field != .None {
+			} else if edit_state.field != .None {
 				switch event.key.key {
 				case sdl.K_BACKSPACE:
 					edit_backspace()
@@ -90,7 +115,7 @@ handle_sdl_events :: proc(running: ^bool) {
 					}
 				case sdl.K_F1:
 					// Always-available shortcut reference.
-					help_open = !help_open
+					editor_flags.help_open = !editor_flags.help_open
 				case sdl.K_Z:
 					mods := sdl.GetModState()
 					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
@@ -174,7 +199,7 @@ case sdl.K_BACKSPACE:
 				} else {
 					text_input_insert(string(event.text.text))
 				}
-			} else if editing_field != .None {
+			} else if edit_state.field != .None {
 				for ch in string(event.text.text) {
 					// Only accept printable ASCII that makes sense in a number.
 					if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
@@ -183,20 +208,30 @@ case sdl.K_BACKSPACE:
 				}
 			}
 		case .MOUSE_WHEEL:
+			// Wheel over the file finder moves its selection (like the cmdline
+			// match list): up = earlier rows, down = later.
+			fc := clay.GetElementData(clay.ID("FinderColumn")).boundingBox
+			if fc.width > 0 && event.wheel.mouse_x >= fc.x && event.wheel.mouse_x <= fc.x + fc.width &&
+				event.wheel.mouse_y >= fc.y && event.wheel.mouse_y <= fc.y + fc.height {
+				if event.wheel.y != 0 {
+					finder_navigate(-int(event.wheel.y))
+					break
+				}
+			}
 			// Scroll over the media bin scrolls its active view: the thumbnail
 			// grid in the Media Bin view, the undo tree in the Undo Tree view.
 			mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
 			if mb.width > 0 && event.wheel.mouse_x >= mb.x && event.wheel.mouse_x <= mb.x + mb.width &&
 				event.wheel.mouse_y >= mb.y && event.wheel.mouse_y <= mb.y + mb.height {
 				if event.wheel.y != 0 {
-					if media_bin_view == .Undo {
+					if panel_views.media_bin_view == .Undo {
 						undo_hist.view_scroll = clamp(
 							undo_hist.view_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP,
 							0,
 							undo_view_max_scroll(),
 						)
-					} else if len(media_assets) > 0 {
-						media_bin_scroll = clamp(media_bin_scroll - f32(event.wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
+					} else if len(media_bin.assets) > 0 {
+						panel_views.media_bin_scroll = clamp(panel_views.media_bin_scroll - f32(event.wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
 					}
 					break
 				}
@@ -207,7 +242,7 @@ case sdl.K_BACKSPACE:
 			if ic.height > 0 && event.wheel.mouse_x >= ic.x && event.wheel.mouse_x <= ic.x + ic.width &&
 				event.wheel.mouse_y >= ic.y && event.wheel.mouse_y <= ic.y + ic.height {
 				if event.wheel.y != 0 {
-					inspector_scroll = clamp(inspector_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
+					scrollbars.inspector.offset = clamp(scrollbars.inspector.offset - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
 					break
 				}
 			}
@@ -218,7 +253,7 @@ case sdl.K_BACKSPACE:
 			if ta.height > 0 && event.wheel.mouse_x >= ta.x && event.wheel.mouse_x <= ta.x + ta.width &&
 				event.wheel.mouse_y >= ta.y && event.wheel.mouse_y <= ta.y + ta.height {
 				if event.wheel.y != 0 {
-					timeline_view_top = clamp(timeline_view_top - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
+					timeline_view.top = clamp(timeline_view.top - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
 					break
 				}
 			}
@@ -228,13 +263,13 @@ case sdl.K_BACKSPACE:
 				event.wheel.mouse_y >= tlb.y && event.wheel.mouse_y <= tlb.y + tlb.height {
 				if event.wheel.y != 0 {
 					ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
-					anchor := f32(playhead.frame - i64(timeline_view_start)) * timeline_zoom
-					anchor_frame := timeline_view_start + anchor / timeline_zoom
-					new_zoom := clamp(timeline_zoom * (1 + 0.1 * event.wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
-					if new_zoom != timeline_zoom {
-						timeline_view_start = anchor_frame - anchor / new_zoom
-						timeline_view_start = clamp(timeline_view_start, 0, f32(timeline_duration()))
-						timeline_zoom = new_zoom
+					anchor := f32(playhead.frame - i64(timeline_view.start)) * timeline_view.zoom
+					anchor_frame := timeline_view.start + anchor / timeline_view.zoom
+					new_zoom := clamp(timeline_view.zoom * (1 + 0.1 * event.wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+					if new_zoom != timeline_view.zoom {
+						timeline_view.start = anchor_frame - anchor / new_zoom
+						timeline_view.start = clamp(timeline_view.start, 0, f32(timeline_duration()))
+						timeline_view.zoom = new_zoom
 					}
 				}
 				break
@@ -263,17 +298,17 @@ case sdl.K_BACKSPACE:
 					canvas := preview_canvas(pb)
 					mx_c := event.wheel.mouse_x - (canvas.x + canvas.width / 2)
 					my_c := event.wheel.mouse_y - (canvas.y + canvas.height / 2)
-					old_zoom := preview_cam_zoom
+					old_zoom := preview_cam.zoom
 					new_zoom := clamp(old_zoom * (1 + 0.1 * event.wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
 					if new_zoom != old_zoom {
 						// Zooming steers the camera, so the fit toggle releases.
-						preview_fit_to_window = false
+						preview_cam.fit_to_window = false
 						// NOTE: cursor-anchored zoom -- the point under the cursor
-					// stays put, so pan (preview_cam_ox|oy) scales by the zoom
+					// stays put, so pan (preview_cam.ox|oy) scales by the zoom
 					// ratio here and only gets clamped later at render time.
-					preview_cam_ox = mx_c - (mx_c - preview_cam_ox) * (new_zoom / old_zoom)
-						preview_cam_oy = my_c - (my_c - preview_cam_oy) * (new_zoom / old_zoom)
-						preview_cam_zoom = new_zoom
+					preview_cam.ox = mx_c - (mx_c - preview_cam.ox) * (new_zoom / old_zoom)
+						preview_cam.oy = my_c - (my_c - preview_cam.oy) * (new_zoom / old_zoom)
+						preview_cam.zoom = new_zoom
 					}
 				}
 			}

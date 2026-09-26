@@ -69,7 +69,7 @@ enc_probe_render :: proc(
 	}
 	path_buf[n] = 0
 
-	render_encoder_choice = choice
+	render_encoder_ui.choice = choice
 	e: Render_Enc
 	defer enc_cleanup(&e)
 	if !render_open_output(&e, cstring(&path_buf[0]), ENC_PROBE_W, ENC_PROBE_H, false, 30, 1) {

@@ -110,12 +110,12 @@ win32_save_file_picker :: proc() -> cstring {
 
 	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
 	defer delete(file_buf)
-	if render_out_path_len > 0 {
+	if render_output.path_len > 0 {
 		// Pre-fill the dialog filename with the last render path. The render
 		// path is UTF-8 and the dialog wants UTF-16; a byte-for-byte copy would
 		// print every non-ASCII name wrong. A too-long/invalid name just opens
 		// the dialog empty -- cosmetic, so a failed conversion is dropped.
-		_ = win32.utf8_to_utf16_buf(file_buf[:], string(render_out_path_buf[:render_out_path_len]))
+		_ = win32.utf8_to_utf16_buf(file_buf[:], string(render_output.path_buf[:render_output.path_len]))
 	}
 
 	ofn := win32.OPENFILENAMEW{

@@ -3,6 +3,18 @@
 Engineering philosophy for this codebase. Every change should satisfy these,
 in order, or deviate with a comment saying why.
 
+## 0. TODO.md is the project state tracker
+
+- Record in TODO.md **any and every change that affects the final result of
+  the project** — a new feature, a behavioral change, a fix that changes
+  output. Keep one Active section per work-stream, with the same
+  steps-probe-accept structure the rest of the file uses. Update it in the
+  same commit as the code it describes (or right before, when the steps are
+  being checked off mid-work).
+- Not tracked: scratch, probe-only churn that changes nothing shipped, and
+  experiments that were reverted before landing. If it touched the shipped
+  behavior of the app, even temporarily, it goes in the file.
+
 ## 1. Memory model: arenas, generational handles, single-writer ownership
 
 The memory model is the architecture — it decides how every subsystem

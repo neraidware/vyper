@@ -26,9 +26,14 @@ import sws "vendor/ffmpeg/swscale"
 // proc has no Odin context and must not allocate.
 // ---------------------------------------------------------------------------
 
-crash_handler_installed: bool
-
-crash_log_name: [win32.MAX_PATH]u16
+// Crash_State is the crash-handler's once-only setup state: whether the
+// handler is installed and the fixed .mdmp/.txt log path, both written during
+// startup guard, never torn down.
+Crash_State :: struct {
+	handler_installed: bool,
+	log_name:          [win32.MAX_PATH]u16,
+}
+crash_state: Crash_State
 
 // win_ffmpeg_versions_diag prints the running FFmpeg shared-library majors once,
 // first thing at startup. The vendored bindings link these DLLs at import time;
@@ -81,7 +86,7 @@ crash_log_write :: proc "system" (code: u32, addr: uintptr) {
 	crash_log_put_cstr(buf[:], &pos, "\n")
 
 	log_handle := win32.CreateFileW(
-		cast(cstring16)&crash_log_name[0],
+		cast(cstring16)&crash_state.log_name[0],
 		win32.GENERIC_WRITE,
 		win32.FILE_SHARE_READ,
 		nil,
@@ -108,10 +113,10 @@ crash_filter :: proc "system" (ep: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 }
 
 crash_handler_install :: proc() {
-	if !crash_handler_installed {
-		w := win32.utf8_to_utf16_buf(crash_log_name[:], "vyper_crash.log")
-		if w != nil {crash_log_name[len(w)] = 0}
+	if !crash_state.handler_installed {
+		w := win32.utf8_to_utf16_buf(crash_state.log_name[:], "vyper_crash.log")
+		if w != nil {crash_state.log_name[len(w)] = 0}
 		win32.SetUnhandledExceptionFilter(crash_filter)
-		crash_handler_installed = true
+		crash_state.handler_installed = true
 	}
 }

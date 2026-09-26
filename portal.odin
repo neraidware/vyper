@@ -86,8 +86,15 @@ foreign gio {
 // bounded per-dialog leak) rather than risk the double-finalize. Standard
 // gio match-object clustering keeps a nil match from a flood of unrelated
 // portal signals: only one dialog is pending at a time here.
-portal_dialog_pending: bool
-portal_response_data: ^GVariant
+// Portal_State is the single in-flight file-dialog handshake. pending is true
+// while a dialog is open; response_data holds the Response signal's payload
+// until the waiting loop consumes it. Only one dialog is pending at a time
+// (the wait loop + gio match-object clustering guarantee that).
+Portal_State :: struct {
+	dialog_pending: bool,
+	response_data:  ^GVariant,
+}
+portal_state: Portal_State
 
 portal_response :: proc "c" (
 	connection: ^GDBusConnection,
@@ -95,13 +102,13 @@ portal_response :: proc "c" (
 	parameters: ^GVariant,
 	user_data: rawptr,
 ) {
-	if !portal_dialog_pending {
+	if !portal_state.dialog_pending {
 		// A stale Response from a previous dialog: keep the current wait
 		// pending, ignore the emission entirely (no ref, no leak).
 		return
 	}
-	portal_response_data = g_variant_ref(parameters)
-	portal_dialog_pending = false
+	portal_state.response_data = g_variant_ref(parameters)
+	portal_state.dialog_pending = false
 }
 
 // Portal_Filter is a FileChooser filter: a display name plus its glob patterns.
@@ -208,7 +215,7 @@ portal_build_open_params :: proc(title: string, f: Portal_Filter) -> ^GVariant {
 // media and subtitle pickers; the dialog is modal and blocks as the portal's
 // synchronous GDBus plumbing does.
 portal_open_picker :: proc(title: string, filter: Portal_Filter) -> cstring {
-	portal_response_data = nil
+	portal_state.response_data = nil
 	connection := g_bus_get_sync(2, nil, nil) // G_BUS_TYPE_SESSION
 	if connection == nil {
 		fmt.println("Could not connect to session bus")
@@ -296,59 +303,59 @@ portal_wait_response_path :: proc(connection: ^GDBusConnection, request_path: cs
 		fmt.println("Portal: could not subscribe to Request/Response")
 		return nil
 	}
-	portal_dialog_pending = true
+	portal_state.dialog_pending = true
 	// Pump the default main context until the portal emits Response. The old
 	// nested g_main_loop_run + per-dialog unsubscribe double-finalized gio's
 	// internal listener; iterating the existing default context (and leaving
 	// the subscription alive) has nothing to tear down.
 	started := time.now()
-	for portal_dialog_pending {
+	for portal_state.dialog_pending {
 		g_main_context_iteration(nil, false)
 		if time.since(started) > 5 * time.Minute {
 			fmt.println("Portal: dialog timed out")
-			portal_dialog_pending = false
-			portal_response_data = nil
+			portal_state.dialog_pending = false
+			portal_state.response_data = nil
 			return nil
 		}
 		time.sleep(2 * time.Millisecond)
 	}
-	if portal_response_data == nil {
+	if portal_state.response_data == nil {
 		return nil
 	}
-	if g_variant_n_children(portal_response_data) < 2 {
-		g_variant_unref(portal_response_data)
+	if g_variant_n_children(portal_state.response_data) < 2 {
+		g_variant_unref(portal_state.response_data)
 		return nil
 	}
-	code_child := g_variant_get_child_value(portal_response_data, 0)
+	code_child := g_variant_get_child_value(portal_state.response_data, 0)
 	response_code := g_variant_get_uint32(code_child)
 	g_variant_unref(code_child)
 	if response_code != 0 {
-		g_variant_unref(portal_response_data)
+		g_variant_unref(portal_state.response_data)
 		return nil
 	}
-	results := g_variant_get_child_value(portal_response_data, 1)
+	results := g_variant_get_child_value(portal_state.response_data, 1)
 	if results == nil {
-		g_variant_unref(portal_response_data)
+		g_variant_unref(portal_state.response_data)
 		return nil
 	}
 	uris := g_variant_lookup_value(results, "uris", nil)
 	g_variant_unref(results)
 	if uris == nil {
-		g_variant_unref(portal_response_data)
+		g_variant_unref(portal_state.response_data)
 		return nil
 	}
 	// uris is "as" (array of strings); on an empty array child 0 is NULL.
 	first_uri := g_variant_get_child_value(uris, 0)
 	if first_uri == nil {
 		g_variant_unref(uris)
-		g_variant_unref(portal_response_data)
+		g_variant_unref(portal_state.response_data)
 		return nil
 	}
 	uri := g_variant_get_string(first_uri, nil)
 	path := g_filename_from_uri(uri, nil, nil)
 	g_variant_unref(first_uri)
 	g_variant_unref(uris)
-	g_variant_unref(portal_response_data)
+	g_variant_unref(portal_state.response_data)
 	return path
 }
 
@@ -356,7 +363,7 @@ portal_wait_response_path :: proc(connection: ^GDBusConnection, request_path: cs
 // path. Same request/Response plumbing as open, but through the SaveFile method
 // and seeded with the current default output name so the dialog opens on it.
 portal_save_file_picker :: proc() -> cstring {
-	portal_response_data = nil
+	portal_state.response_data = nil
 	connection := g_bus_get_sync(2, nil, nil) // G_BUS_TYPE_SESSION
 	if connection == nil {
 		fmt.println("Could not connect to session bus")
@@ -364,8 +371,8 @@ portal_save_file_picker :: proc() -> cstring {
 	}
 
 	default_name := "out.mp4"
-	if render_out_path_len > 0 {
-		default_name = path_basename(cstring(&render_out_path_buf[0]))
+	if render_output.path_len > 0 {
+		default_name = path_basename(cstring(&render_output.path_buf[0]))
 	}
 	dict_type := g_variant_type_new("a{sv}")
 	dict := g_variant_builder_new(dict_type)
@@ -380,7 +387,7 @@ portal_save_file_picker :: proc() -> cstring {
 	// Open the dialog on the folder that holds the current output path (for
 	// the startup default, ~/Videos) instead of wherever the portal last was.
 	{
-		out := string(render_out_path_buf[:render_out_path_len])
+		out := string(render_output.path_buf[:render_output.path_len])
 		dir_end := 0
 		for i := len(out) - 1; i >= 0; i -= 1 {
 			if out[i] == '/' {

@@ -34,9 +34,9 @@ preview_canvas :: proc(bounds: clay.BoundingBox) -> clay.BoundingBox {
 // panel: zoom 1, no pan. preview_view then renders exactly preview_canvas, so
 // the whole frame is visible. Called when the fit toggle is re-armed.
 preview_fit_reset :: proc() {
-	preview_cam_zoom = 1.0
-	preview_cam_ox = 0
-	preview_cam_oy = 0
+	preview_cam.zoom = 1.0
+	preview_cam.ox = 0
+	preview_cam.oy = 0
 }
 
 // clamp_preview_camera keeps the zoom in range and the pan inside the
@@ -54,10 +54,10 @@ clamp_preview_camera :: proc(canvas: clay.BoundingBox) {
 	// every frame. The pan/zoom handlers clear the flag before touching the
 	// camera, so this enforcement only re-asserts the fit (e.g. after a resize)
 	// -- it never fights a user's pan.
-	if preview_fit_to_window {
+	if preview_cam.fit_to_window {
 		preview_fit_reset()
 	}
-	preview_cam_zoom = clamp(preview_cam_zoom, PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
+	preview_cam.zoom = clamp(preview_cam.zoom, PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
 	panel := clay.GetElementData(clay.ID("Preview")).boundingBox
 	px := panel.width
 	py := panel.height
@@ -67,18 +67,18 @@ clamp_preview_camera :: proc(canvas: clay.BoundingBox) {
 	if py <= 0 {
 		py = canvas.height
 	}
-	preview_cam_ox = clamp(preview_cam_ox, -(canvas.width * preview_cam_zoom + px) / 2, (canvas.width * preview_cam_zoom + px) / 2)
-	preview_cam_oy = clamp(preview_cam_oy, -(canvas.height * preview_cam_zoom + py) / 2, (canvas.height * preview_cam_zoom + py) / 2)
+	preview_cam.ox = clamp(preview_cam.ox, -(canvas.width * preview_cam.zoom + px) / 2, (canvas.width * preview_cam.zoom + px) / 2)
+	preview_cam.oy = clamp(preview_cam.oy, -(canvas.height * preview_cam.zoom + py) / 2, (canvas.height * preview_cam.zoom + py) / 2)
 }
 
 // preview_view applies the camera (pan + zoom, centered on the base canvas) to
 // produce the on-screen canvas rect used for drawing and hit-testing.
 preview_view :: proc(canvas: clay.BoundingBox) -> clay.BoundingBox {
 	clamp_preview_camera(canvas)
-	w := canvas.width * preview_cam_zoom
-	h := canvas.height * preview_cam_zoom
-	cx := canvas.x + canvas.width / 2 + preview_cam_ox
-	cy := canvas.y + canvas.height / 2 + preview_cam_oy
+	w := canvas.width * preview_cam.zoom
+	h := canvas.height * preview_cam.zoom
+	cx := canvas.x + canvas.width / 2 + preview_cam.ox
+	cy := canvas.y + canvas.height / 2 + preview_cam.oy
 	return {x = cx - w / 2, y = cy - h / 2, width = w, height = h}
 }
 
@@ -193,9 +193,9 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 // snap_center snaps a dragged/scaled clip so its visible box center lands on
 // the project canvas center when it comes within the given margin (project
 // units), mirroring the per-axis margin semantics of snap_transform. Active
-// only while snap_center_to_canvas is on; returns whether the clip snapped.
+// only while editor_flags.snap_center_to_canvas is on; returns whether the clip snapped.
 snap_center :: proc(clip: ^Clip, margin: f32) -> bool {
-	if !snap_center_to_canvas {
+	if !editor_flags.snap_center_to_canvas {
 		return false
 	}
 	PW := f32(project.width)
@@ -558,34 +558,34 @@ crop_viewport_pan :: proc(clip: ^Clip, dx, dy: f32) {
 // for the Alt+Middle crop-pan gesture; the box is anchored so the release step
 // can tell a no-move press from a real pan.
 crop_pan_begin :: proc(clip: ^Clip, x, y: f32) {
-	crop_pan_active = true
-	crop_pan_last_x = x
-	crop_pan_last_y = y
-	crop_pan_start_scale = clip.scale
-	crop_pan_start_x = clip.transform_x
-	crop_pan_start_y = clip.transform_y
-	crop_pan_start_l = clip.crop_l
-	crop_pan_start_r = clip.crop_r
-	crop_pan_start_t = clip.crop_t
-	crop_pan_start_b = clip.crop_b
+	crop_pan.active = true
+	crop_pan.last_x = x
+	crop_pan.last_y = y
+	crop_pan.start_scale = clip.scale
+	crop_pan.start_x = clip.transform_x
+	crop_pan.start_y = clip.transform_y
+	crop_pan.start_l = clip.crop_l
+	crop_pan.start_r = clip.crop_r
+	crop_pan.start_t = clip.crop_t
+	crop_pan.start_b = clip.crop_b
 	undo_begin()
 }
 
 // crop_pan_end commits the crop pan as one transform node when it moved
 // anything, or discards the pending capture for a no-move press.
 crop_pan_end :: proc() {
-	if !crop_pan_active {
+	if !crop_pan.active {
 		return
 	}
-	crop_pan_active = false
+	crop_pan.active = false
 	if sel, ok := transformable_selected(); ok && sel.kind != .Text {
-		if sel.scale != crop_pan_start_scale ||
-		   sel.transform_x != crop_pan_start_x ||
-		   sel.transform_y != crop_pan_start_y ||
-		   sel.crop_l != crop_pan_start_l ||
-		   sel.crop_r != crop_pan_start_r ||
-		   sel.crop_t != crop_pan_start_t ||
-		   sel.crop_b != crop_pan_start_b {
+		if sel.scale != crop_pan.start_scale ||
+		   sel.transform_x != crop_pan.start_x ||
+		   sel.transform_y != crop_pan.start_y ||
+		   sel.crop_l != crop_pan.start_l ||
+		   sel.crop_r != crop_pan.start_r ||
+		   sel.crop_t != crop_pan.start_t ||
+		   sel.crop_b != crop_pan.start_b {
 			undo_push(.Transform, "Pan clip")
 			return
 		}
@@ -649,24 +649,24 @@ is_corner :: proc(handle: Handle) -> bool {
 // from a handle drag. crop=true makes the drag adjust the source crop instead
 // of the scale.
 begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: Handle, mx, my: f32, crop: bool) {
-	dragging_handle = handle
-	handle_kind = crop ? .Crop : .Scale
-	handle_corner_snapped = false
-	handle_start_mx = mx
-	handle_start_my = my
-	handle_start_scale = clip.scale
-	handle_start_crop_l = clip.crop_l
-	handle_start_crop_r = clip.crop_r
-	handle_start_crop_t = clip.crop_t
-	handle_start_crop_b = clip.crop_b
+	handle_drag.handle = handle
+	handle_drag.kind = crop ? .Crop : .Scale
+	handle_drag.corner_snapped = false
+	handle_drag.start_mx = mx
+	handle_drag.start_my = my
+	handle_drag.start_scale = clip.scale
+	handle_drag.start_crop_l = clip.crop_l
+	handle_drag.start_crop_r = clip.crop_r
+	handle_drag.start_crop_t = clip.crop_t
+	handle_drag.start_crop_b = clip.crop_b
 	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
-	handle_start_center_x = cx
-	handle_start_center_y = cy
-	handle_start_tx = clip.transform_x
-	handle_start_ty = clip.transform_y
+	handle_drag.start_center_x = cx
+	handle_drag.start_center_y = cy
+	handle_drag.start_tx = clip.transform_x
+	handle_drag.start_ty = clip.transform_y
 	ib := clip_image_bounds(canvas, clip)
-	handle_start_box_w = ib.width
-	handle_start_box_h = ib.height
+	handle_drag.start_box_w = ib.width
+	handle_drag.start_box_h = ib.height
 	// Scale/crop is applied live during the drag; capture the pre-edit document
 	// here so releasing commits the whole gesture as one transform node.
 	undo_begin()
@@ -674,7 +674,7 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: Handle,
 
 // handle_drag_frozen reports whether a corner-handle drag must hold its box
 // instead of resizing. Once the driven corner has snapped flush onto a canvas
-// corner during this drag (handle_corner_snapped latched), moving the cursor
+// corner during this drag (handle_drag.corner_snapped latched), moving the cursor
 // DIAGONALLY beyond that corner (past the snap margin on BOTH axes) would keep
 // rescaling the box about the pinned opposite corner -- the "resizing on the
 // other corner" overflow, the corner-handle version of the old edge bug. The
@@ -689,7 +689,7 @@ handle_drag_frozen :: proc(clip: ^Clip, handle: Handle, pmx, pmy, margin: f32) -
 	if clip == nil {
 		return false
 	}
-	if !handle_corner_snapped {
+	if !handle_drag.corner_snapped {
 		return false
 	}
 	PW := f32(project.width)
@@ -853,7 +853,7 @@ snap_driven_handle :: proc(
 				s_out = ss
 				tx_out = tsx
 				ty_out = tsy
-				handle_corner_snapped = true
+				handle_drag.corner_snapped = true
 			}
 		}
 	}
@@ -867,10 +867,10 @@ snap_driven_handle :: proc(
 // pins the handle opposite the one being dragged: the opposite edge/corner
 // stays fixed while the dragged handle tracks the pointer.
 update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, from_center := false) {
-	if dragging_handle == nil || clip == nil {
+	if handle_drag.handle == nil || clip == nil {
 		return
 	}
-	h := dragging_handle.?
+	h := handle_drag.handle.?
 
 	// Text clips use a different transform model than video: transform_x/y is
 	// the text's TOP-LEFT corner (in project units), not its center, and the box
@@ -878,7 +878,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 	// units). The video math below anchors the transform as the center, so text
 	// scales through its own top-left-anchored math. No cropping for text.
 	if clip.kind == .Text {
-		switch handle_kind {
+		switch handle_drag.kind {
 		case .None, .Crop:
 			return
 		case .Scale:
@@ -897,9 +897,9 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		// and the opposite-handle pivot visibly drifts for non-16:9 projects.
 		bw0 := twpx * PW / f32(PREVIEW_W)
 		bh0 := thpx * PW / f32(PREVIEW_W)
-		scale0 := handle_start_scale
-		tx0 := handle_start_tx
-		ty0 := handle_start_ty
+		scale0 := handle_drag.start_scale
+		tx0 := handle_drag.start_tx
+		ty0 := handle_drag.start_ty
 		left0 := tx0
 		right0 := tx0 + bw0 * scale0
 		top0 := ty0
@@ -975,7 +975,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		}
 		// The k factors divide by the BASE (scale=1) size bw0/bh0, so k is
 		// already the absolute target scale — not a multiplier relative to
-		// handle_start_scale. Applying it as `s := max(k, ...)` makes the
+		// handle_drag.start_scale. Applying it as `s := max(k, ...)` makes the
 		// dragged edge/corner land exactly under the mouse for any starting
 		// scale (scale0* would overshoot by scale0x once the text is pre-scaled).
 		s := max(k, 0.01)
@@ -1036,7 +1036,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		return
 	}
 
-	switch handle_kind {
+	switch handle_drag.kind {
 	case .None:
 		return
 	case .Scale:
@@ -1049,20 +1049,20 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		// honors the source aspect so the math matches the box the user sees.
 		PW := f32(project.width)
 		PH := f32(project.height)
-		scale0 := handle_start_scale
-		cl := handle_start_crop_l
-		cr := handle_start_crop_r
-		ct := handle_start_crop_t
-		cb := handle_start_crop_b
+		scale0 := handle_drag.start_scale
+		cl := handle_drag.start_crop_l
+		cr := handle_drag.start_crop_r
+		ct := handle_drag.start_crop_t
+		cb := handle_drag.start_crop_b
 		cw0, ch0 := clip_full_box_dims(clip, scale0)
 		dl0 := (0.5 - cl) * cw0
 		dr0 := (0.5 - cr) * cw0
 		dt0 := (0.5 - ct) * ch0
 		db0 := (0.5 - cb) * ch0
-		vl0 := handle_start_tx - dl0
-		vr0 := handle_start_tx + dr0
-		vt0 := handle_start_ty - dt0
-		vb0 := handle_start_ty + db0
+		vl0 := handle_drag.start_tx - dl0
+		vr0 := handle_drag.start_tx + dr0
+		vt0 := handle_drag.start_ty - dt0
+		vb0 := handle_drag.start_ty + db0
 		w0 := (1 - cl - cr) * cw0
 		h0 := (1 - ct - cb) * ch0
 		// The k-switch below divides by w0/h0, and every handle's formula uses
@@ -1084,8 +1084,8 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			// the box never drifts. The center is the transform shifted by the
 			// crop asymmetry ((dr-dl)/2), so a cropped clip still resizes about
 			// what the user sees.
-			pivot_cx := handle_start_tx + (dl0 - dr0) / 2
-			pivot_cy := handle_start_ty + (dt0 - db0) / 2
+			pivot_cx := handle_drag.start_tx + (dl0 - dr0) / 2
+			pivot_cy := handle_drag.start_ty + (dt0 - db0) / 2
 			k := max(handle_center_pivot_scale(h, pivot_cx, pivot_cy, pmx, pmy, w0, h0), 0.01)
 			s := scale0 * k
 			cw, ch := clip_full_box_dims(clip, s)
@@ -1160,8 +1160,8 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		dr := (0.5 - cr) * cw
 		dt := (0.5 - ct) * ch
 		db := (0.5 - cb) * ch
-		tx := handle_start_tx
-		ty := handle_start_ty
+		tx := handle_drag.start_tx
+		ty := handle_drag.start_ty
 		switch h {
 		case .T: // top pins bottom
 			ty = vb0 - db
@@ -1198,16 +1198,16 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		// The full box honors the source aspect so edges align with what is seen.
 		PW := f32(project.width)
 		PH := f32(project.height)
-		scale0 := handle_start_scale
+		scale0 := handle_drag.start_scale
 		out_w, out_h := clip_full_box_dims(clip, scale0)
-		OX_L := handle_start_tx - out_w / 2
-		OX_R := handle_start_tx + out_w / 2
-		OX_T := handle_start_ty - out_h / 2
-		OX_B := handle_start_ty + out_h / 2
-		cl := handle_start_crop_l
-		cr := handle_start_crop_r
-		ct := handle_start_crop_t
-		cb := handle_start_crop_b
+		OX_L := handle_drag.start_tx - out_w / 2
+		OX_R := handle_drag.start_tx + out_w / 2
+		OX_T := handle_drag.start_ty - out_h / 2
+		OX_B := handle_drag.start_ty + out_h / 2
+		cl := handle_drag.start_crop_l
+		cr := handle_drag.start_crop_r
+		ct := handle_drag.start_crop_t
+		cb := handle_drag.start_crop_b
 		vl0 := OX_L + cl * out_w
 		vr0 := OX_R - cr * out_w
 		vt0 := OX_T + ct * out_h

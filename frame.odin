@@ -85,7 +85,7 @@ render_ui_frame :: proc(
 	// here where the device is).
 	drain_pending_text_releases(device)
 	// Upload decoded media-bin thumbnails (once per asset, after import).
-	for &a in media_assets {
+	for &a in media_bin.assets {
 		upload_asset_thumbnail(renderer, command_buffer, &a)
 	}
 	// Deferred glyph atlas bake+upload: grows the grid + re-creates the
@@ -141,6 +141,7 @@ render_ui_frame :: proc(
 		draw_drag_ghost(renderer, command_buffer, pass)
 		draw_track_drag_ghost(renderer, command_buffer, pass)
 		draw_media_bin_thumbnails(renderer, command_buffer, pass)
+		draw_finder_rows(renderer, command_buffer, pass)
 		draw_ui_icons(renderer, command_buffer, pass)
 		draw_gain_knob(renderer, command_buffer, pass)
 		draw_kf_add_buttons(renderer, command_buffer, pass)

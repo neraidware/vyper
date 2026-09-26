@@ -120,17 +120,17 @@ proxy_sched_scenario :: proc(v: string) -> bool {
 	file_buf[n] = 0
 	file := cstring(&file_buf[0])
 
-	preview_proxy_enabled = true
-	async_import_mode = true
+	editor_flags.preview_proxy_enabled = true
+	editor_flags.async_import_mode = true
 	// 2s margin -> seg_margin 1: every wanted window is the playhead's segment
 	// plus one, keeping each build cheap and all transitions visible.
-	proxy_sched_margin_seconds = 2
+	proxy_state.sched_margin = 2
 
 	// Full import (bin + timeline) like the GUI. No proxy work happens at
-	// import under async_import_mode; the scheduler below drives everything.
+	// import under editor_flags.async_import_mode; the scheduler below drives everything.
 	import_media(file)
 
-	asset := &media_assets[len(media_assets) - 1]
+	asset := &media_bin.assets[len(media_bin.assets) - 1]
 	if asset == nil || asset.frame_count <= 0 || asset.dur_us <= 0 {
 		fmt.println("[sched-probe] FAIL: imported asset missing duration/frames")
 		return false

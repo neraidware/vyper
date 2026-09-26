@@ -24,9 +24,15 @@ Icon_Id :: enum {
 	Duplicate,
 	RemoveTrack,
 	Import,
+	FinderFolder,
+	FinderVideo,
+	FinderAudio,
+	FinderImage,
+	FinderSubtitle,
+	FinderFile,
 }
 
-ICON_COUNT :: 8
+ICON_COUNT :: 14
 ICON_RASTER :: 96 // rasterized texture size per icon (px).
 
 skip_back_svg := #load("icons/skip_back.svg")
@@ -37,6 +43,12 @@ auto_keyframe_svg := #load("icons/auto_keyframe.svg")
 duplicate_svg := #load("icons/duplicate.svg")
 remove_track_svg := #load("icons/remove_track.svg")
 import_svg := #load("icons/import.svg")
+folder_svg := #load("icons/folder.svg")
+video_svg := #load("icons/video.svg")
+audio_svg := #load("icons/audio.svg")
+image_svg := #load("icons/image.svg")
+subtitle_svg := #load("icons/subtitle.svg")
+file_svg := #load("icons/file.svg")
 
 get_icon_svg :: proc(id: Icon_Id) -> []u8 {
 	switch id {
@@ -56,6 +68,18 @@ get_icon_svg :: proc(id: Icon_Id) -> []u8 {
 		return remove_track_svg
 	case .Import:
 		return import_svg
+	case .FinderFolder:
+		return folder_svg
+	case .FinderVideo:
+		return video_svg
+	case .FinderAudio:
+		return audio_svg
+	case .FinderImage:
+		return image_svg
+	case .FinderSubtitle:
+		return subtitle_svg
+	case .FinderFile:
+		return file_svg
 	case:
 		return nil
 	}

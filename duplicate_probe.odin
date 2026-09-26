@@ -24,7 +24,7 @@ dup_check :: proc(cond: bool, msg: string, args: ..any) {
 // original in the visual stack (track_order), and both clips converge to
 // decoded preview slots while parked in the shared range.
 duplicate_probe_run :: proc(v: string) {
-	async_import_mode = false
+	editor_flags.async_import_mode = false
 	inp: [4096]u8
 	n := 0
 	for n < len(v) && n < len(inp) - 1 {

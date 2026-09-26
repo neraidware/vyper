@@ -16,7 +16,7 @@ import sdl "vendor:sdl3"
 // dispatch, drag-state machine, playback tick), and the per-frame render.
 
 // toggle_playback starts playback from the current playhead (wrapping to
-// frame 0 when already at/past the end) or pauses it. playback_stop_frame is
+// frame 0 when already at/past the end) or pauses it. playback.stop_frame is
 // cleared so a normal run plays the whole timeline.
 toggle_playback :: proc() {
 	if playhead.playing {
@@ -24,19 +24,19 @@ toggle_playback :: proc() {
 		preview.playing = false
 		// A pause drops the jog speed boost so the next play uses the selected
 		// rate again.
-		playback_boost = 0
+		playback.boost = 0
 		if vyper_trace {
 			fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
 		}
 		return
 	}
-	if playback_dir == 1 && playhead.frame >= timeline_duration() {
+	if playback.dir == 1 && playhead.frame >= timeline_duration() {
 		playhead.frame = 0
 	}
-	playback_stop_frame = -1
-	playhead_accumulator = 0
-	last_tick_ns = sdl.GetTicksNS()
-	audio_was_playing = false
+	playback.stop_frame = -1
+	playback.accumulator = 0
+	playback.last_tick_ns = sdl.GetTicksNS()
+	audio_prod.was_playing = false
 	playhead.playing = true
 	preview.playing = true
 	if vyper_trace {
@@ -44,7 +44,7 @@ toggle_playback :: proc() {
 			"[pb] toggle playing=%v ph=%d dir=%d\n",
 			playhead.playing,
 			playhead.frame,
-			playback_dir,
+			playback.dir,
 		)
 	}
 }
@@ -57,16 +57,16 @@ toggle_playback :: proc() {
 // audio_update.
 jog_playback :: proc(dir: int) {
 	if !playhead.playing {
-		playback_dir = dir
-		playback_boost = 0
-		if playback_stop_frame < 0 && dir == -1 && playhead.frame <= 0 {
+		playback.dir = dir
+		playback.boost = 0
+		if playback.stop_frame < 0 && dir == -1 && playhead.frame <= 0 {
 			// Nothing to show backward from frame 0.
 			return
 		}
-		playback_stop_frame = -1
-		playhead_accumulator = 0
-		last_tick_ns = sdl.GetTicksNS()
-		audio_was_playing = false
+		playback.stop_frame = -1
+		playback.accumulator = 0
+		playback.last_tick_ns = sdl.GetTicksNS()
+		audio_prod.was_playing = false
 		playhead.playing = true
 		preview.playing = true
 		if vyper_trace {
@@ -75,19 +75,19 @@ jog_playback :: proc(dir: int) {
 		return
 	}
 	// Already playing.
-	if playback_dir == dir {
-		playback_boost += 1
+	if playback.dir == dir {
+		playback.boost += 1
 		if vyper_trace {
 			fmt.printf(
 				"[pb] jog boost dir=%d boost=%d eff=%.2fx\n",
 				dir,
-				playback_boost,
+				playback.boost,
 				effective_playback_rate(),
 			)
 		}
 	} else {
-		playback_dir = dir
-		playback_boost = 0
+		playback.dir = dir
+		playback.boost = 0
 		if vyper_trace {
 			fmt.printf("[pb] jog flip dir=%d ph=%d\n", dir, playhead.frame)
 		}
@@ -97,7 +97,7 @@ jog_playback :: proc(dir: int) {
 // effective_playback_rate is the rate the playhead actually advances at: the
 // selected rate scaled by the temporary jog boost.
 effective_playback_rate :: proc() -> f64 {
-	return playback_rate * f64(1 + max(0, playback_boost))
+	return playback.rate * f64(1 + max(0, playback.boost))
 }
 
 // timeline_track_hit_test returns the timeline track whose empty (non-clip)
@@ -278,16 +278,16 @@ inspector_max_scroll :: proc() -> f32 {
 // hovering a clip's duration edge, restoring the arrow cursor otherwise.
 update_timeline_cursor :: proc(mx, my: f32) {
 	if !timeline_resize_hover(mx, my) {
-		if _timeline_arrow_cursor == nil {
-			_timeline_arrow_cursor = sdl.CreateSystemCursor(.DEFAULT)
+		if clip_resize.arrow_cursor == nil {
+			clip_resize.arrow_cursor = sdl.CreateSystemCursor(.DEFAULT)
 		}
-		_ = sdl.SetCursor(_timeline_arrow_cursor)
+		_ = sdl.SetCursor(clip_resize.arrow_cursor)
 		return
 	}
-	if _timeline_resize_cursor == nil {
-		_timeline_resize_cursor = sdl.CreateSystemCursor(.EW_RESIZE)
+	if clip_resize.resize_cursor == nil {
+		clip_resize.resize_cursor = sdl.CreateSystemCursor(.EW_RESIZE)
 	}
-	_ = sdl.SetCursor(_timeline_resize_cursor)
+	_ = sdl.SetCursor(clip_resize.resize_cursor)
 }
 
 // open_track_context_menu shows the per-track right-click menu at the pointer,
@@ -312,7 +312,7 @@ open_track_context_menu :: proc(mx, my: f32, track: int) {
 	ctx_menu.target_clip_track = -1
 	ctx_menu.target_clip_index = -1
 	track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-	ctx_menu.frame = i64(max(f32(0), (mx - track_start) / timeline_zoom + timeline_view_start))
+	ctx_menu.frame = i64(max(f32(0), (mx - track_start) / timeline_view.zoom + timeline_view.start))
 }
 
 // close_context_menu dismisses the context menu, if open.
@@ -331,8 +331,8 @@ close_context_menu :: proc() {
 // text field.
 escape_dismiss :: proc() {
 	close_context_menu()
-	playback_rate_open = false
-	help_open = false
+	playback.rate_open = false
+	editor_flags.help_open = false
 }
 
 // begin_clip_rename opens the generic text field to edit the selected clip's
@@ -387,10 +387,10 @@ apply_rename :: proc() {
 //                  Open File button (decodable only: no silent junk imports).
 apply_command :: proc() {
 	cmd := text_input_string()
-	if len(last_command) > 0 {
-		delete(last_command)
+	if len(cmdline_match_state.last_command) > 0 {
+		delete(cmdline_match_state.last_command)
 	}
-	last_command = strings.clone(cmd)
+	cmdline_match_state.last_command = strings.clone(cmd)
 
 	trimmed := strings.trim_space(cmd)
 	sp := 0
@@ -398,11 +398,17 @@ apply_command :: proc() {
 		sp += 1
 	}
 	if sp == len(trimmed) || trimmed[:sp] != "open" {
+		// Bare ":open" (no argument) launches the in-app fuzzy file finder
+		// instead of the OS dialog that the Open File button uses; a typed
+		// path after "open" still goes down the direct-open path below.
+		if trimmed == "open" {
+			finder_open(.Open)
+		}
 		return
 	}
 	path := strings.trim_space(trimmed[sp:])
 	if len(path) == 0 {
-		show_ui_notice("Usage: open <file>", 3000)
+		finder_open(.Open)
 		return
 	}
 	if !os.exists(path) {
@@ -427,11 +433,10 @@ apply_command :: proc() {
 // ---------------------------------------------------------------------------
 
 // playhead_timecode renders the current playhead frame as an HH:MM:SS:FF
-// value. playhead_timecode_buf is persistent (never stack/temp): clay keeps
-// the returned slice until draw, so the buffer must outlive build_page, and
-// it backs exactly one clay.Text element per frame. If more consumers appear,
+// value. Its scratch lives in ui_text.timecode (never stack/temp): clay keeps
+// the returned slice until draw, so the buffer must outlive build_page, and it
+// backs exactly one clay.Text element per frame. If more consumers appear,
 // each needs its own buffer.
-playhead_timecode_buf: [32]u8
 
 // timecode at the timeline's fps.
 playhead_timecode :: proc() -> string {
@@ -445,7 +450,7 @@ playhead_timecode :: proc() -> string {
 	s := total_sec % 60
 	m := (total_sec / 60) % 60
 	h := total_sec / (60 * 60)
-	return fmt.bprintf(playhead_timecode_buf[:], "%02d:%02d:%02d:%02d", h, m, s, ff)
+	return fmt.bprintf(ui_text.timecode[:], "%02d:%02d:%02d:%02d", h, m, s, ff)
 }
 
 // begin_playhead_time_edit opens the text field pre-filled with the current
@@ -538,8 +543,8 @@ apply_playhead_time :: proc() {
 	}
 	playhead.frame = frame
 	audio_seek(frame)
-	sync.atomic_store(&audio_ph_src, 1)
-	sync.atomic_store(&audio_ph_catch, 0)
+	sync.atomic_store(&audio_rpt.ph_src, 1)
+	sync.atomic_store(&audio_rpt.ph_catch, 0)
 }
 
 // handle_ctx_option dispatches a click on a context-menu entry. Selecting
@@ -599,10 +604,10 @@ select_clip :: proc(track_idx, index: int) {
 		return
 	}
 	kf_sel = {}
-	selected_track = track_idx
-	selected_index = index
-	clear(&selected_set)
-	selected_set[timeline.tracks[track_idx].clips[index].clip_id] = true
+	selection.track = track_idx
+	selection.index = index
+	clear(&selection.extra_set)
+	selection.extra_set[timeline.tracks[track_idx].clips[index].clip_id] = true
 }
 
 // kf_select makes (track_idx,clip_index,lane,key) the sole keyframe selection,
@@ -613,10 +618,10 @@ kf_select :: proc(track_idx, clip_index, lane, key: int) {
 	kf_sel.clip_index = clip_index
 	kf_sel.lane = lane
 	kf_sel.key = key
-	kf_sel.gen = kf_structure_gen
-	selected_track = -1
-	selected_index = -1
-	clear(&selected_set)
+	kf_sel.gen = kf_view.structure_gen
+	selection.track = -1
+	selection.index = -1
+	clear(&selection.extra_set)
 }
 
 kf_clear :: proc() {
@@ -677,7 +682,7 @@ kf_geom_prop_keyed :: proc(clip: ^Clip, name: string) -> bool {
 // the value) — otherwise a new key is inserted. Returns whether a key was
 // written, so callers can keep their resting write when this declines.
 kf_auto_key :: proc(clip: ^Clip, name: string, value: f32) -> bool {
-	if !auto_keyframe {
+	if !editor_flags.auto_keyframe {
 		return false
 	}
 	if playhead.frame < clip.timeline_start_frame ||
@@ -735,9 +740,9 @@ kf_selected :: proc() -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
 	if !kf_sel.active {
 		return nil, -1, nil, false
 	}
-	// A keyframe sequence shift (kf_structure_gen bumped by set/del/split/trim)
+	// A keyframe sequence shift (kf_view.structure_gen bumped by set/del/split/trim)
 	// invalidates the whole index selection: slots may have been reused.
-	if kf_sel.gen != kf_structure_gen {
+	if kf_sel.gen != kf_view.structure_gen {
 		return nil, -1, nil, false
 	}
 	if kf_sel.track_idx < 0 || kf_sel.track_idx >= len(timeline.tracks) {
@@ -839,16 +844,16 @@ delete_clip_at :: proc(track_idx, index: int) {
 // timeline_zoom_about_playhead multiplies the timeline zoom by factor, keeping
 // the playhead's visible frame fixed (same math as the ruler wheel handler).
 timeline_zoom_about_playhead :: proc(factor: f32) {
-	anchor := f32(playhead.frame - i64(timeline_view_start)) * timeline_zoom
-	anchor_frame := timeline_view_start + anchor / max(timeline_zoom, 0.0001)
-	new_zoom := clamp(timeline_zoom * factor, TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
-	if new_zoom != timeline_zoom {
-		timeline_view_start = clamp(
+	anchor := f32(playhead.frame - i64(timeline_view.start)) * timeline_view.zoom
+	anchor_frame := timeline_view.start + anchor / max(timeline_view.zoom, 0.0001)
+	new_zoom := clamp(timeline_view.zoom * factor, TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+	if new_zoom != timeline_view.zoom {
+		timeline_view.start = clamp(
 			anchor_frame - anchor / max(new_zoom, 0.0001),
 			0,
 			f32(timeline_duration()),
 		)
-		timeline_zoom = new_zoom
+		timeline_view.zoom = new_zoom
 	}
 }
 
@@ -864,8 +869,8 @@ timeline_zoom_fit :: proc() {
 		TIMELINE_MIN_ZOOM,
 		TIMELINE_MAX_ZOOM,
 	)
-	timeline_zoom = new_zoom
-	timeline_view_start = 0
+	timeline_view.zoom = new_zoom
+	timeline_view.start = 0
 }
 
 // add_text_clip_at inserts a Text generator clip on ctx_menu.target_track at
@@ -881,14 +886,14 @@ add_text_clip_at :: proc() {
 	idx := add_text_generator_clip(&timeline.tracks[ctx_menu.target_track], ctx_menu.frame)
 	audio_note_edit()
 
-	selected_track = ctx_menu.target_track
-	selected_index = idx
+	selection.track = ctx_menu.target_track
+	selection.index = idx
 
 	// A text clip is defined by its title, so creating one requires a name: open
 	// the rename field in "create" mode. If the user commits an empty name (or
 	// cancels) the just-inserted clip is removed (see apply_rename and the cancel
 	// routing), so "Add > Text Clip" never leaves a nameless clip on the track.
-	clip := &timeline.tracks[selected_track].clips[selected_index]
+	clip := &timeline.tracks[selection.track].clips[selection.index]
 	text_input_begin("", TI_RENAME, clip.clip_id)
 	ti.is_create = true
 }
@@ -924,8 +929,8 @@ add_subtitle_clip_at :: proc() {
 	)
 	audio_note_edit()
 
-	selected_track = ctx_menu.target_track
-	selected_index = idx
+	selection.track = ctx_menu.target_track
+	selection.index = idx
 
 	undo_push(.Text, "Add subtitle clip")
 }
@@ -966,22 +971,22 @@ pointer_over_context_menu :: proc(mx, my: f32) -> bool {
 // handle_playback_rate_click resolves a click for the playback-rate dropdown.
 // rate_clicked reports whether the collapsed rate button itself was clicked
 // (toggles the menu). Otherwise, if the menu is open, a click on one of its
-// options sets playback_rate and closes the menu; any other click dismisses the
+// options sets playback.rate and closes the menu; any other click dismisses the
 // menu. Clicks elsewhere in the UI go through the normal input chain and simply
 // close the open menu here.
 handle_playback_rate_click :: proc(rate_clicked: bool) {
 	if rate_clicked {
-		playback_rate_open = !playback_rate_open
+		playback.rate_open = !playback.rate_open
 		return
 	}
-	if !playback_rate_open {
+	if !playback.rate_open {
 		return
 	}
 	if in_playback_rate_menu() {
-		playback_rate = rate_from_element()
-		playback_rate_open = false
+		playback.rate = rate_from_element()
+		playback.rate_open = false
 	} else {
-		playback_rate_open = false
+		playback.rate_open = false
 	}
 }
 
@@ -1007,7 +1012,7 @@ rate_from_element :: proc() -> f64 {
 			return rate
 		}
 	}
-	return playback_rate
+	return playback.rate
 }
 
 // play_project_area starts playback at the render range's start frame and
@@ -1019,16 +1024,16 @@ play_project_area :: proc() {
 		return
 	}
 	playhead.frame = project.start_frame
-	playback_stop_frame = project.end_frame
-	playback_dir = 1
-	playback_boost = 0
-	playhead_accumulator = 0
-	last_tick_ns = sdl.GetTicksNS()
-	audio_was_playing = false
+	playback.stop_frame = project.end_frame
+	playback.dir = 1
+	playback.boost = 0
+	playback.accumulator = 0
+	playback.last_tick_ns = sdl.GetTicksNS()
+	audio_prod.was_playing = false
 	playhead.playing = true
 	preview.playing = true
 	if vyper_trace {
-		fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback_stop_frame)
+		fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback.stop_frame)
 	}
 }
 
@@ -1036,23 +1041,23 @@ play_project_area :: proc() {
 // seqlock: a reader that samples the pair while the UI is mid-publish retries
 // instead of reading a torn frame/time mismatch.
 playback_publish :: proc(frame: i64, now_ns: sdl.Uint64) {
-	sync.atomic_add(&playback_seq, 1)
-	sync.atomic_store(&ui_playhead_frame, frame)
-	sync.atomic_store(&ui_playhead_ns, i64(now_ns))
-	sync.atomic_add(&playback_seq, 1)
+	sync.atomic_add(&playback.seq, 1)
+	sync.atomic_store(&playback.ui_frame, frame)
+	sync.atomic_store(&playback.ui_ns, i64(now_ns))
+	sync.atomic_add(&playback.seq, 1)
 }
 
 // playback_read_snapshot returns the last published (frame, wall-time) pair,
 // retrying until a consistent one is observed.
 playback_read_snapshot :: proc() -> (frame: i64, ns: i64) {
 	for {
-		s0 := sync.atomic_load(&playback_seq)
+		s0 := sync.atomic_load(&playback.seq)
 		if s0 & 1 != 0 {
 			continue
 		}
-		frame = sync.atomic_load(&ui_playhead_frame)
-		ns = sync.atomic_load(&ui_playhead_ns)
-		if sync.atomic_load(&playback_seq) == s0 {
+		frame = sync.atomic_load(&playback.ui_frame)
+		ns = sync.atomic_load(&playback.ui_ns)
+		if sync.atomic_load(&playback.seq) == s0 {
 			return
 		}
 	}
@@ -1075,8 +1080,8 @@ playback_playhead_at :: proc(now_ns: sdl.Uint64, rate: f64) -> i64 {
 }
 
 playback_update :: proc(now_ns: sdl.Uint64) {
-	if last_tick_ns == 0 {
-		last_tick_ns = now_ns
+	if playback.last_tick_ns == 0 {
+		playback.last_tick_ns = now_ns
 	}
 	if playhead.playing {
 		// Playback is real-time: consume the true wall delta, never a clamped
@@ -1085,32 +1090,32 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// audio producer (which extrapolates this same clock). A long stall
 		// therefore jumps the playhead to where it should be, and audio_update's
 		// forward-skip resyncs the producer if it had fallen behind.
-		// DIAG (temporary): PLAYBACK_MAGIC_MS replaces the measured wall
+		// DIAG (temporary): playback.magic_ms replaces the measured wall
 		// delta so the cadence is perfectly jitter-free (or any fixed rate).
 		dt_s :=
-			PLAYBACK_MAGIC_MS > 0 ? PLAYBACK_MAGIC_MS / 1000.0 : f64(now_ns - last_tick_ns) / 1_000_000_000
+			playback.magic_ms > 0 ? playback.magic_ms / 1000.0 : f64(now_ns - playback.last_tick_ns) / 1_000_000_000
 		// The playhead advances +dir frames at effective_playback_rate against
 		// the wall clock (rate * jog boost). Audio pacing at non-1x is the
 		// producer's stream frequency ratio; audio is muted going backward.
-		playhead_accumulator += dt_s * max(0.0, effective_playback_rate())
+		playback.accumulator += dt_s * max(0.0, effective_playback_rate())
 		playback_fps := timeline_fps()
 		catchup := i64(0)
-		for playhead_accumulator >= 1.0 / playback_fps {
-			playhead.frame += i64(playback_dir)
+		for playback.accumulator >= 1.0 / playback_fps {
+			playhead.frame += i64(playback.dir)
 			catchup += 1
-			playhead_accumulator -= 1.0 / playback_fps
+			playback.accumulator -= 1.0 / playback_fps
 		}
 		if catchup > 0 {
-			sync.atomic_store(&audio_ph_src, 2)
-			sync.atomic_store(&audio_ph_catch, catchup)
+			sync.atomic_store(&audio_rpt.ph_src, 2)
+			sync.atomic_store(&audio_rpt.ph_catch, catchup)
 			if catchup > 1 {
 				if vyper_trace {
 					fmt.printf(
 						"[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n",
-						i64(playback_dir) * catchup,
+						i64(playback.dir) * catchup,
 						playhead.frame,
-						f64(now_ns - last_tick_ns) / 1e6,
-						playhead_accumulator,
+						f64(now_ns - playback.last_tick_ns) / 1e6,
+						playback.accumulator,
 					)
 				}
 			}
@@ -1118,23 +1123,23 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// Directional boundary: stop at the run end going forward, at frame 0
 		// going backward. Resetting the boost on auto-stop so a later play
 		// starts from the selected rate.
-		stop_frame := playback_stop_frame
+		stop_frame := playback.stop_frame
 		if stop_frame < 0 {
 			stop_frame = timeline_duration()
 		}
 		at_end :=
-			(playback_dir == 1 && playhead.frame >= stop_frame) ||
-			(playback_dir == -1 && playhead.frame <= 0)
+			(playback.dir == 1 && playhead.frame >= stop_frame) ||
+			(playback.dir == -1 && playhead.frame <= 0)
 		if at_end {
-			playback_stop_frame = -1
-			playback_boost = 0
+			playback.stop_frame = -1
+			playback.boost = 0
 			playhead.frame = clamp(playhead.frame, 0, max(0, stop_frame - 1))
 			playhead.playing = false
 			preview.playing = false
 			if vyper_trace {
 				fmt.printf(
 					"[pb] auto-stop dir=%d ph=%d stop=%d\n",
-					playback_dir,
+					playback.dir,
 					playhead.frame,
 					stop_frame,
 				)
@@ -1143,7 +1148,7 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// Playback is real-time: the playhead (and with it the audio) runs on
 		// the wall clock. Video decode is best-effort on top of that clock.
 	}
-	last_tick_ns = now_ns
+	playback.last_tick_ns = now_ns
 }
 
 // ---------------------------------------------------------------------------
@@ -1156,11 +1161,11 @@ main :: proc() {
 	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
 	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
-	// the audio producer reads playback_rate for its atempo graph and cushion.
+	// the audio producer reads playback.rate for its atempo graph and cushion.
 	if v := os.get_env_alloc("VYPER_RATE", context.temp_allocator); v != "" {
-		playback_rate, _ = strconv.parse_f64(v)
+		playback.rate, _ = strconv.parse_f64(v)
 		if vyper_trace {
-			fmt.printf("[main] VYPER_RATE -> playback_rate=%.2f\n", playback_rate)
+			fmt.printf("[main] VYPER_RATE -> playback.rate=%.2f\n", playback.rate)
 		}
 	}
 	// libav's INFO chatter (libx264 "using cpu capabilities", decoder open
@@ -1395,8 +1400,8 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	import_bg_init()
 	defer import_bg_shutdown()
 	undo_init()
-	defer if warm_valid {
-		clip_decoder_reset(&warm_decoder)
+	defer if warm.valid {
+		clip_decoder_reset(&warm.decoder)
 	}
 	render_init()
 
@@ -1410,17 +1415,17 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 
 	// DIAG (temporary): magic playhead-clock knobs.
 	if v := os.get_env_alloc("VYPER_PLAYBACK_MAGIC_MS", context.temp_allocator); v != "" {
-		PLAYBACK_MAGIC_MS, _ = strconv.parse_f64(v)
+		playback.magic_ms, _ = strconv.parse_f64(v)
 	}
 	if v := os.get_env_alloc("VYPER_PLAYBACK_FPS", context.temp_allocator); v != "" {
-		PLAYBACK_MAGIC_FPS, _ = strconv.parse_f64(v)
+		playback.magic_fps, _ = strconv.parse_f64(v)
 	}
-	if PLAYBACK_MAGIC_MS > 0 || PLAYBACK_MAGIC_FPS > 0 {
+	if playback.magic_ms > 0 || playback.magic_fps > 0 {
 		if vyper_trace {
 			fmt.printf(
 				"[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n",
-				PLAYBACK_MAGIC_MS,
-				PLAYBACK_MAGIC_FPS,
+				playback.magic_ms,
+				playback.magic_fps,
 			)
 		}
 	}
@@ -1473,13 +1478,13 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		playhead.playing = true
 		preview.playing = true
-		playhead_accumulator = 0
-		last_tick_ns = sdl.GetTicksNS()
+		playback.accumulator = 0
+		playback.last_tick_ns = sdl.GetTicksNS()
 		if sec := os.get_env_alloc("VYPER_PLAY_SEC", context.temp_allocator); sec != "" {
 			if v, okf := strconv.parse_f64(sec); okf && v > 0 {
-				playback_stop_frame = i64(v * timeline_fps())
+				playback.stop_frame = i64(v * timeline_fps())
 				if vyper_trace {
-					fmt.printf("[autoplay] VYPER_PLAY_SEC=%.0f -> stop=%d\n", v, playback_stop_frame)
+					fmt.printf("[autoplay] VYPER_PLAY_SEC=%.0f -> stop=%d\n", v, playback.stop_frame)
 				}
 			}
 		}
@@ -1545,10 +1550,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 					f64(ui_frame_count) / elapsed,
 					f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
 					playhead.frame,
-					playhead_accumulator,
-					sync.atomic_load(&audio_ph_src),
-					sync.atomic_load(&audio_ph_catch),
-					sync.atomic_load(&audio_prod_frame),
+					playback.accumulator,
+					sync.atomic_load(&audio_rpt.ph_src),
+					sync.atomic_load(&audio_rpt.ph_catch),
+					sync.atomic_load(&audio_prod.prod_frame),
 				)
 			}
 			ui_report_tick = now_ns

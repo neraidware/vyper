@@ -13,7 +13,7 @@ gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
 // ---------------------------------------------------------------------------
 // VYPER_PROXY_PROBE="<file>": verify the editing-time proxy pipeline end to end.
 //
-// The regular probes run with preview_proxy_enabled=false so they exercise the
+// The regular probes run with editor_flags.preview_proxy_enabled=false so they exercise the
 // ORIGINAL decode path (proxy pixels are lossy by design). This probe flips the
 // flag back on exactly like the live editor, then checks:
 //   1. import_media builds a frame-suffcient proxy on disk;
@@ -25,11 +25,11 @@ gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
 // ---------------------------------------------------------------------------
 
 proxy_probe_run :: proc(v: string) {
-	preview_proxy_enabled = true
+	editor_flags.preview_proxy_enabled = true
 	// The proxy-probe asserts the proxy exists on disk right after import_media
 	// returns, so it needs the historical SYNCHRONOUS build, not the background
 	// worker (which would still be transcoding at that point).
-	async_import_mode = false
+	editor_flags.async_import_mode = false
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
 		fmt.println("proxy-probe: need VYPER_PROXY_PROBE=\"<file>\"")
@@ -211,7 +211,7 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 // VYPER_PROXY_BG_TEST="<file>[|<cancel_pct>]": exercise the BACKGROUND proxy
 // builder (import_bg.odin) without a window.
 //
-// Imports `file` with async_import_mode=true like the live editor, then polls
+// Imports `file` with editor_flags.async_import_mode=true like the live editor, then polls
 // the worker until it either:
 //   - verifies a valid proxy (Done_Ok) -> exit 0; or
 //   - with <cancel_pct> given (e.g. "30"): issues import_bg_cancel once the
@@ -223,8 +223,8 @@ proxy_bg_probe_run :: proc(v: string) {
 	import_bg_init()
 	defer import_bg_shutdown()
 
-	preview_proxy_enabled = true
-	async_import_mode = true
+	editor_flags.preview_proxy_enabled = true
+	editor_flags.async_import_mode = true
 
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
@@ -258,13 +258,13 @@ proxy_bg_probe_run :: proc(v: string) {
 	// would. The probe uses the full-source window [0, seg_total) so the
 	// whole-file verification below still holds.
 	import_media(path)
-	frame_count := media_frame_count(file_info_text)
+	frame_count := media_frame_count(project.info_text)
 
 	// The imported asset carries dur_us/src size (set at import); reuse it so
 	// the request matches what the GUI scheduler would compute.
 	asset: ^Media_Asset
-	if len(media_assets) > 0 {
-		asset = &media_assets[len(media_assets) - 1]
+	if len(media_bin.assets) > 0 {
+		asset = &media_bin.assets[len(media_bin.assets) - 1]
 	}
 
 	deadline := sdl.GetTicksNS() + 300_000_000_000
@@ -391,8 +391,8 @@ proxy_bg_probe_run :: proc(v: string) {
 // if the picker itself flips, the resolver is the bug.
 // ---------------------------------------------------------------------------
 proxy_pick_scan_run :: proc(v: string) {
-	preview_proxy_enabled = true
-	async_import_mode = true
+	editor_flags.preview_proxy_enabled = true
+	editor_flags.async_import_mode = true
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
 		fmt.println("proxy-pick-scan: need VYPER_PROXY_PICK_SCAN=\"<file>\"")
@@ -407,7 +407,7 @@ proxy_pick_scan_run :: proc(v: string) {
 	inp[n] = 0
 	path := cstring(&inp[0])
 	import_media(path)
-	frame_count := media_frame_count(file_info_text)
+	frame_count := media_frame_count(project.info_text)
 
 	last_seg: int = -1
 	buf: [4096]u8
@@ -441,7 +441,7 @@ proxy_pick_scan_run :: proc(v: string) {
 // source and stays there" bug on a real file + a complete on-disk cache.
 //
 // Mirrors preview_probe_run's deterministic playhead walk but with the proxy
-// ENABLED (the preview probe forces preview_proxy_enabled=false, so it only
+// ENABLED (the preview probe forces editor_flags.preview_proxy_enabled=false, so it only
 // ever exercises the source decode path). Each playhead step calls
 // update_preview_slots like the live editor; the probe then reports, for the
 // foreground slot, what proxy_pick_for_frame resolved for that clip frame and
@@ -449,8 +449,8 @@ proxy_pick_scan_run :: proc(v: string) {
 // initial segment serve is the bug reproduced.
 // ---------------------------------------------------------------------------
 proxy_step_probe_run :: proc(v: string) {
-	preview_proxy_enabled = true
-	async_import_mode = true
+	editor_flags.preview_proxy_enabled = true
+	editor_flags.async_import_mode = true
 	parts := strings.split(v, "|")
 	if len(parts) < 1 {
 		fmt.println("proxy-step: need VYPER_PROXY_STEP=\"<file>\"")

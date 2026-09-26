@@ -63,30 +63,17 @@ CMDLINE_PLACEHOLDER :: clay.Color{133, 146, 137, 255} // grey1 — dimmer than T
 RULER_HEIGHT :: f32(30)
 RULER_TICK_COLOR :: clay.Color{79, 88, 94, 255} // bg4 — ruler ticks
 RULER_LABEL_COLOR :: clay.Color{157, 169, 160, 255} // grey2 — ruler labels
-// Timeline navigation: timeline_view_start is the first visible frame (pan),
-// timeline_zoom is horizontal pixels per frame, and timeline_view_top is the
+// Timeline navigation: timeline_view.start is the first visible frame (pan),
+// timeline_view.zoom is horizontal pixels per frame, and timeline_view.top is the
+// Timeline_View is the timeline panel's own scroll/zoom transform: the
+// horizontal scroll offset, the horizontal zoom (frames-per-pixel), and the
 // vertical scroll offset over the track rows (so many tracks stay reachable).
-timeline_view_start: f32 = 0
-timeline_zoom: f32 = 1
-timeline_view_top: f32 = 0
-
-// Snap toggles for the timeline-gutter buttons: dragging a clip onto the
-// playhead snaps it there; scrubbing the playhead onto a clip's start/end
-// snaps it to the edge. Both default on.
-snap_clips_to_playhead: bool = true
-snap_playhead_to_clips: bool = true
-// Auto-keyframing toggle for the timeline bottom bar. When on, editing a
-// property that ALREADY has keyframes writes a key at the playhead instead of
-// (or in addition to) the resting value: a key already on the playhead frame
-// is updated, otherwise a new key is inserted. Properties nobody has keyed
-// yet keep their resting-edit behavior — auto-keying writes into tracks, it
-// never mints them.
-auto_keyframe: bool = true
-// snap_center_to_canvas makes a clip dragged/scaled in the preview snap to the
-// project canvas center when its visible center comes within the snap margin.
-// Defaults on, like the other snap toggles; driven by the "Center" toggle in the
-// project info panel.
-snap_center_to_canvas: bool = true
+Timeline_View :: struct {
+	start: f32,
+	zoom:  f32,
+	top:   f32,
+}
+timeline_view: Timeline_View = {start = 0, zoom = 1, top = 0}
 SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.001)
 TIMELINE_MAX_ZOOM :: f32(16)
@@ -97,8 +84,8 @@ TIMELINE_MAX_ZOOM :: f32(16)
 // canvas must tick at this rate for 1:1 audio/video.
 // Falls back to 60 as a safe default before any media is open.
 timeline_fps :: proc() -> f64 {
-	if PLAYBACK_MAGIC_FPS > 0 {
-		return PLAYBACK_MAGIC_FPS
+	if playback.magic_fps > 0 {
+		return playback.magic_fps
 	}
 	if project.frame_rate > 0 {
 		return project.frame_rate
@@ -117,8 +104,11 @@ timeline_fps :: proc() -> f64 {
 //   VYPER_PLAYBACK_FPS       > 0  override timeline_fps() for the playhead
 //                               advance, the mixer's start48/spf mapping, and
 //                               the audio producer. 0 = use the imported rate.
-PLAYBACK_MAGIC_MS: f64 = 0
-PLAYBACK_MAGIC_FPS: f64 = 0
+// These live in the Playback struct alongside the clock they override. This
+// comment keeps the env-var names in one place the writer (system_main_init)
+// and readers (timeline_fps, the main loop) can share.
+//
+// [playback struct below holds magic_ms/magic_fps]
 
 Project :: struct {
 	name:        string,
@@ -133,6 +123,13 @@ Project :: struct {
 	// project is the render range. Setting both to the same frame clears it.
 	start_frame: i64,
 	end_frame:   i64,
+	// info_text is the media-file info line shown in the project panel.
+	info_text: string,
+	// resolution_locked becomes true the moment the project resolution is set
+	// explicitly (a preset button or the orientation toggle) or inferred from
+	// the first imported file. Once locked, importing more media never resizes
+	// the canvas.
+	resolution_locked: bool,
 }
 project: Project = {
 	name        = "Untitled Project",
@@ -142,13 +139,6 @@ project: Project = {
 	start_frame = -1,
 	end_frame   = -1,
 }
-file_info_text: string
-
-// resolution_locked becomes true the moment the project resolution is set
-// explicitly (a preset button or the orientation toggle) or inferred from the
-// first imported file. Once locked, importing more media never resizes the
-// canvas.
-resolution_locked: bool
 
 Media_Kind :: enum {
 	Video,
@@ -305,7 +295,7 @@ Track :: struct {
 	name:  string,
 	clips: [dynamic]Clip,
 }
-Playback_State :: enum {
+Playback_Mode :: enum {
 	Stopped,
 	Playing,
 	Paused,
@@ -317,95 +307,138 @@ Timeline :: struct {
 	// considers topmost) lives in track_order, a top-to-bottom list of indices
 	// into tracks. Ordering is never inferrable from array position: a track
 	// can be moved/duplicated/reordered without touching tracks, so clip
-	// references (selected_track, drag targets, lane math) key on the STORAGE
+	// references (selection.track, drag targets, lane math) key on the STORAGE
 	// index and are stable across reordering.
 	tracks:         [dynamic]Track,
 	track_order:    [dynamic]int,
 	playhead_frame: i64,
-	playback:       Playback_State,
+	playback:       Playback_Mode,
 	frame_rate:     f64,
 }
-media_assets: [dynamic]Media_Asset
 timeline: Timeline
 Playhead :: struct {
 	frame:   i64,
 	playing: bool,
 }
 playhead: Playhead
-playhead_accumulator: f64
-// playback_rate is the selected playback rate (Nx real time). Defaults to 1x.
-playback_rate: f64 = 1.0
-// playback_rate_open tracks whether the playback-rate dropdown is shown.
-playback_rate_open: bool
-// help_open shows the always-available keyboard-shortcut overlay ("?" button or
-// F1). Closed by ESC / a click outside / toggling it again.
-help_open: bool
+
+// Playback groups the playback-clock machinery that used to be a pile of loose
+// globals: the cadence accumulator, rate/direction/boost selection, the scrub
+// decimator, the DIAG magic-clock overrides, and the UI→producer playhead/device
+// clock snapshot (ui_* + seq, dev_*) with its seqlock. One owner, one home.
+Playback :: struct {
+	// magic_ms / magic_fps: DIAG (temporary) overrides; see the env-var doc at
+	// their former decl site (VYPER_PLAYBACK_MAGIC_MS / VYPER_PLAYBACK_FPS).
+	magic_ms:      f64,
+	magic_fps:     f64,
+	// accumulator: wall-clock fraction of a frame not yet moved into the
+	// playhead (frame cadence at float speed, kept in f64 across ticks).
+	accumulator:   f64,
+	last_tick_ns:  sdl.Uint64,
+	// rate is the selected playback rate (Nx real time). Defaults to 1x.
+	// rate_open tracks whether the playback-rate dropdown is shown.
+	rate:          f64,
+	rate_open:     bool,
+	// dir: playback direction, +1 forward, -1 backward. Set by the forward/
+	// backward jog controls (and h/l keys); playback advances the playhead by
+	// +dir each step.
+	dir:           int,
+	// boost: temporary speed boost accumulated by repeatedly pressing the
+	// forward/backward jog control while already playing in that direction.
+	// Effective rate = rate * (1 + boost). Reset to 0 on pause.
+	boost:         int,
+	// stop_frame is the exclusive end of the active playback run; -1 means the
+	// whole timeline (timeline_duration). Ctrl+Space sets it to the project's
+	// render range end so playback stops there.
+	stop_frame:    i64,
+	// scrub_tick counts update_preview_slots calls during a playhead scrub
+	// (SCRUB_DECIMATION throttling); see the constant's comment.
+	scrub_tick:    i32,
+	// ------------------------------------------------------------------
+	// Playhead clock snapshot published by the UI thread for the audio
+	// producer. The producer must not read playhead.frame directly (cross-thread
+	// data race) and must not treat the last published value as frozen: a
+	// blocking swapchain acquire can hold the render loop for a second while the
+	// sound device keeps consuming, so a frozen frame would starve the producer
+	// and a value that free-runs on the device would lock a permanent offset
+	// after the stall. Publishing (frame, wall-time) together lets the producer
+	// extrapolate the playhead on its own, from the same monotonic clock the UI
+	// uses, across any UI update gap. Guarded by the seqlock seq so the pair is
+	// never read torn; non-explicit Odin atomics are sequentially consistent.
+	ui_frame:      i64, // atomic, guarded by seq
+	ui_ns:         i64, // atomic, sdl.GetTicksNS() when ui_frame was current
+	seq:           u64, // atomic seqlock: odd while publishing
+	// dev_frame is the content frame the sound device has actually consumed
+	// (everything the producer pushed minus what is still queued); published
+	// every feed pass so the preview HUD can show the audio clock next to the
+	// video one. dev_at_ns is the GetTicksNS() that belonged to the same feed
+	// pass, so a reader can extrapolate the device position to its own "now" and
+	// compare against the extrapolated playhead at the same instant -- the
+	// stepped publish alone would show a full frame of phantom skew
+	// (dev != playhead.frame).
+	dev_frame:     i64,
+	dev_at_ns:     i64,
+}
+
+playback: Playback = {
+	rate      = 1.0,
+	dir       = 1,
+	stop_frame = -1,
+}
 // PLAYBACK_RATES are the selectable playback-rate values offered by the rate
 // dropdown, in display order (1x first). Iterating this list is what the
 // dropdown draws and the click handler resolves against.
 PLAYBACK_RATES :: []f64{1, 1.5, 2, 2.5, 3, 3.5, 4}
-// preview_proxy_enabled gates the editing-time proxy: when true (normal
-// editing), the live preview decodes low-res all-intra proxies for fluid
-// scrubbing. Probes set it false so headless ground-truth checks exercise the
-// ORIGINAL decode path (proxy pixels are lossy by design and would show up as
-// spurious diffs).
-preview_proxy_enabled: bool = true
+// Editor_Flags are editor-wide mode toggles that gate whole subsystems.
+Editor_Flags :: struct {
+	// help_open shows the always-available keyboard-shortcut overlay ("?" button
+	// or F1). Closed by ESC / a click outside / toggling it again.
+	help_open: bool,
+	// preview_proxy_enabled gates the editing-time proxy: when true (normal
+	// editing), the live preview decodes low-res all-intra proxies for fluid
+	// scrubbing. Probes set it false so headless ground-truth checks exercise
+	// the ORIGINAL decode path (proxy pixels are lossy by design and would show
+	// up as spurious diffs).
+	preview_proxy_enabled: bool,
+	// async_import_mode gates the background proxy builder (import_bg.odin):
+	// live editing (default) enqueues proxy encodes on a worker with progress +
+	// cancel so importing never blocks; probes switch it off to keep the
+	// synchronous build so the proxy exists on disk the moment import_media
+	// returns (the proxy-probe asserts that exactly).
+	async_import_mode: bool,
+	// Timeline-gutter snap toggles: dragging a clip onto the playhead snaps it
+	// there; scrubbing the playhead onto a clip's start/end snaps it to the
+	// edge. Both default on.
+	snap_clips_to_playhead: bool,
+	snap_playhead_to_clips: bool,
+	// Auto-keyframing for the timeline bottom bar. When on, editing a property
+	// that ALREADY has keyframes writes a key at the playhead instead of (or in
+	// addition to) the resting value; properties nobody has keyed yet keep
+	// their resting-edit behavior.
+	auto_keyframe: bool,
+	// snap_center_to_canvas makes a clip dragged/scaled in the preview snap to
+	// the project canvas center when its center comes within the snap margin.
+	snap_center_to_canvas: bool,
+}
+editor_flags: Editor_Flags = {
+	preview_proxy_enabled = true,
+	async_import_mode     = true,
+	snap_clips_to_playhead = true,
+	snap_playhead_to_clips = true,
+	auto_keyframe          = true,
+	snap_center_to_canvas  = true,
+}
 
-// async_import_mode gates the background proxy builder (import_bg.odin): live
-// editing (default) enqueues proxy encodes on a worker with progress + cancel
-// so importing never blocks; probes switch it off to keep the synchronous build
-// so the proxy exists on disk the moment import_media returns (the proxy-probe
-// asserts that exactly).
-async_import_mode: bool = true
-
-// playback_dir is the playback direction: +1 forward, -1 backward. Set by the
-// forward/backward jog controls (and h/l keys); playback advances the playhead
-// by +dir each step.
-playback_dir: int = 1
-// playback_boost is a temporary speed boost accumulated by repeatedly pressing
-// the forward/backward jog control while already playing in that direction.
-// Effective playback rate = playback_rate * (1 + playback_boost). Reset to 0 on
-// pause so playback returns to the selected rate.
-playback_boost: int = 0
-last_tick_ns: sdl.Uint64
-// playback_stop_frame is the exclusive end of the active playback run; -1
-// means the whole timeline (timeline_duration). Ctrl+Space sets it to the
-// project's render range end so playback stops there.
-playback_stop_frame: i64 = -1
 // active_interaction tracks which pointer gesture is active. Exactly one at a
 // time; .None means idle.  Replaces the old pile of mutually-exclusive booleans
 // so the compiler enforces one-active-at-a-time via the type system.
 active_interaction: Interaction
 // Scrub decimation: while active_interaction == .Playhead_Scrub, exact-frame
-// preview decodes run on every SCRUB_DECIMATION-th update (scrub_tick counts
+// preview decodes run on every SCRUB_DECIMATION-th update (playback.scrub_tick counts
 // update_preview_slots calls during a drag) instead of on every mousemove. The
 // last decoded frame stays on-screen between throttled decodes; releasing the
 // drag lifts the throttle so the final position decodes exactly once.
-scrub_tick: i32
 SCRUB_DECIMATION :: 4
-upper_area_height: f32 = 560
-// resize_edge 0 = left (trim/extend head), 1 = right (trim/extend tail).
-resize_edge: int = -1
-// resize_moved marks that an edge-drag gesture actually resized (set live during
-// the drag, cleared on release) so its one undo node is recorded only on a real
-// trim, not on a handle click without a drag.
-resize_moved: bool = false
-// _timeline_resize_cursor and _timeline_arrow_cursor are lazily-created SDL
-// cursors: the horizontal-resize one is shown while dragging/hovering a clip's
-// duration edge, and the arrow is explicitly restored the rest of the time
-// (SDL doesn't reliably reset to the default pointer from SetCursor(nil)).
-_timeline_resize_cursor: ^sdl.Cursor
-_timeline_arrow_cursor: ^sdl.Cursor
-clip_drag_offset: f32
-drag_clip: ^Clip
-// Track the clip was grabbed from and the track its ghost currently hovers.
-// -1 = none. Vertical drags (hover onto a different track) are staged as a
-// ghost until release; horizontal drags keep live-move behavior on the source
-// track.
-drag_source_track: int = -1
-drag_source_index: int = -1
-drag_hover_track: int = -1
-drag_ghost_start: i64 = 0
 // DRAG_LANE_DWELL_FRAMES is how many consecutive frames the pointer must rest
 // in a different lane than the dragged clip's source before a vertical drop is
 // staged (ghost shown, drop committed on release). A fast horizontal flick
@@ -414,24 +447,79 @@ drag_ghost_start: i64 = 0
 // before it touched its neighbor. The dwell makes a deliberate drop (move + hold)
 // still work while a quick cross-lane wobble reads as part of the same-track drag.
 DRAG_LANE_DWELL_FRAMES :: 4
-drag_lane_dwell: u32 = 0
-// Drag stall tracer: last cursor-target frame and clip start seen by the
-// .Clip_Move handler, used by the VYPER_TRACE stall line to pinpoint the frame
-// where a drag stops following the cursor.
-drag_trace_last_target: i64 = -1
-drag_trace_last_start: i64 = -1
-// Track-reorder drag: dragging a whole track row onto an insert gap (the
-// "New track" button strips between rows) to reorder the stack. drag_track_idx
-// is the STORAGE index grabbed; drag_track_hover_row is the VISUAL gap
-// position (0..=len(track_order)).
-drag_track_idx: int = -1
-drag_track_hover_row: int = -1
-// drag_group_delta is the group's mouse-driven horizontal offset while a LINKED
-// group is staged on another track (delta = hovered pointer frame - anchor's
-// original start). The vertical ghost follows it so the unit keeps sliding with
-// the mouse; on release move_linked_group commits members at m.start + delta.
-drag_group_delta: i64 = 0
-// drag_group_orig snapshots the original (track, start, length) of every clip
+
+// Panel_Layout is the editor's top/bottom panel divider: how tall the UPPER
+// (timeline/canvas) area is, in pixels, before the lower (track list) area
+// starts. Dragging the divider edits it (see .Panel_Resize).
+Panel_Layout :: struct {
+	upper_area_height: f32,
+}
+panel_layout: Panel_Layout = {upper_area_height = 560}
+
+// Clip_Resize_State is the whole clip-duration-edge gesture: which edge is
+// grabbable (edge 0 = left trim/extend head, 1 = right trim/extend tail),
+// whether the gesture actually resized (an edge CLICK with no drag commits no
+// undo node), and the two lazily-created SDL cursors the edge shows (the
+// horizontal-resize one while dragging/hovering an edge; the arrow is
+// explicitly restored the rest of the time -- SDL doesn't reliably reset to the
+// default pointer from SetCursor(nil)).
+Clip_Resize_State :: struct {
+	edge:          int,
+	moved:         bool,
+	resize_cursor: ^sdl.Cursor,
+	arrow_cursor:  ^sdl.Cursor,
+}
+clip_resize: Clip_Resize_State = {edge = -1}
+
+// Clip_Move_State is the whole clip-drag gesture (moving a timeline clip along
+// its track or onto another, plus linked-group drags): the clip being dragged,
+// the (track, index) it was grabbed from and the track its ghost currently
+// hovers (-1 = none; vertical drags are staged as a ghost until release,
+// horizontal drags keep live-move behavior on the source track), the ghost's
+// staged start frame, the lane-dwell staging counter, the stall tracer, and
+// the linked-group snapshot (delta + per-member original geometry).
+Clip_Move_State :: struct {
+	// offset: pointer offset within the clip at grab (the clip's start tracks
+	// the cursor minus this).
+	offset:       f32,
+	clip:         ^Clip,
+	source_track: int,
+	source_index: int,
+	hover_track:  int,
+	ghost_start:  i64,
+	// lane_dwell counts how many consecutive frames the pointer has rested in a
+	// different lane than the dragged clip's source before a vertical drop is
+	// staged (see DRAG_LANE_DWELL_FRAMES).
+	lane_dwell:   u32,
+	// trace_last_*: last cursor-target frame and clip start seen by the
+	// .Clip_Move handler, used by the VYPER_TRACE stall line.
+	trace_last_target: i64,
+	trace_last_start:  i64,
+	// group_delta is the group's mouse-driven horizontal offset while a LINKED
+	// group is staged on another track; group_orig snapshots the original
+	// (track, start, length) of every linked clip (see Drag_Group_Orig).
+	group_delta:  i64,
+	group_orig:   [dynamic]Drag_Group_Orig,
+}
+clip_move: Clip_Move_State = {
+	source_track = -1,
+	source_index = -1,
+	hover_track  = -1,
+	trace_last_target = -1,
+	trace_last_start  = -1,
+}
+
+// Track_Drag_State is the whole track-reorder gesture: dragging a whole track
+// row onto an insert gap (the "New track" button strips between rows). idx is
+// the STORAGE index grabbed; hover_row is the VISUAL gap position
+// (0..=len(track_order)).
+Track_Drag_State :: struct {
+	idx:       int,
+	hover_row: int,
+}
+track_drag: Track_Drag_State = {idx = -1, hover_row = -1}
+
+// clip_move.group_orig snapshots the original (track, start, length) of every clip
 // sharing the dragged/resized clip's link_id, so a linked-group edit applies one
 // shared delta to all members (each clamped to its own lane). Invariant: when
 // non-empty its FIRST entry is the anchor clip (the one the user grabbed).
@@ -441,7 +529,6 @@ Drag_Group_Orig :: struct {
 	start:   i64,
 	length:  i64,
 }
-drag_group_orig: [dynamic]Drag_Group_Orig
 
 // Media-bin drag state: dragging a bin asset onto the timeline, showing a
 // ghost of every lane the media would occupy (one per stream). Distinct from
@@ -464,52 +551,65 @@ Media_Lane :: struct {
 	video_thumb_id:  u64, // asset id whose thumbnail paints the video lane
 	has_video_thumb: bool,
 }
-media_drag_asset_id: u64
-media_drag_asset_index: int = -1
-media_drag_lanes: [dynamic]Media_Lane
-media_drag_target: int = -1
-media_drag_frame: i64
-media_drag_pick_dx: f32
-media_drag_pick_dy: f32
-// Current pointer while a bin drag is in flight (the cursor-following drag
-// tile needs the live position; the draw pass runs after the event handling).
-media_drag_mx: f32
-media_drag_my: f32
-media_drag_trace_once: bool = true // one-shot [md] ghost geometry dump per drag
-
-// Vertical scroll offset of the media-bin grid (manual childOffset scroll, the
-// same pattern TracksSection uses) and its vertical wheel stride.
-media_bin_scroll: f32 = 0
-MEDIA_BIN_SCROLL_STEP :: 44
-TIMELINE_SCROLL_STEP :: 44 // Wheel scroll per notch over the track lanes.
+// Media_Drag is the media-bin-to-timeline drag gesture: dragging a bin asset
+// onto the timeline, showing a ghost of every lane the media would occupy (one
+// per stream). Distinct from clip dragging (timeline clips being moved around).
+Media_Drag :: struct {
+	asset_id:    u64,
+	asset_index: int, // index into media_bin.assets; -1 = none
+	lanes:       [dynamic]Media_Lane,
+	target:      int, // hovered track index; -1 = none
+	frame:       i64,
+	pick_dx:     f32, // pointer offset within the drag tile at grab
+	pick_dy:     f32,
+	// Current pointer while the drag is in flight (the cursor-following drag
+	// tile needs the live position; the draw pass runs after the event
+	// handling).
+	mx:          f32,
+	my:          f32,
+	// trace_once: one-shot [md] ghost geometry dump per drag.
+	trace_once:  bool,
+}
+media_drag: Media_Drag = {asset_index = -1, target = -1, trace_once = true}
 
 // View separators: the bottom-of-panel tab rows pick which sub-view each panel
 // shows. The media bin switches between the thumbnail grid and the undo tree;
 // the inspector switches between its three property cards.
 MediaBin_View :: enum { Bin, Undo }
 Inspector_View :: enum { Clip, Project, Render }
-media_bin_view: MediaBin_View = .Bin
-inspector_view: Inspector_View = .Clip
 
-// selected_asset_id is the media-bin item currently highlighted. 0 = none.
-selected_asset_id: u64 = 0
+// Panel_Views is the per-panel sub-view state: which tab each panel shows and
+// the media-bin grid's vertical scroll offset (manual childOffset scroll, the
+// same pattern TracksSection uses).
+Panel_Views :: struct {
+	media_bin_scroll: f32,
+	media_bin_view:   MediaBin_View,
+	inspector_view:   Inspector_View,
+}
+panel_views: Panel_Views = {media_bin_view = .Bin, inspector_view = .Clip}
+MEDIA_BIN_SCROLL_STEP :: 44
+TIMELINE_SCROLL_STEP :: 44 // Wheel scroll per notch over the track lanes.
 
-// Clip selection (for the clip properties panel). Stored as track/clip indices
-// so it isn't invalidated by dynamic-array reallocation; -1 means nothing
-// selected.
-selected_track: int = -1
-selected_index: int = -1
-
-// selected_set holds extra clip ids added to the selection with Shift+click
-// (the anchor clip stays tracked by selected_track/selected_index). Used to
-// link/unlink a deliberate multi-clip set with U.
-selected_set: map[u64]bool
+// Selection is what the editor is currently focused on: the media-bin item
+// highlighted in the thumbnail grid (asset), and the clip selected in the
+// timeline (track/index into the storage arrays — indices, not pointers, so
+// dynamic-array reallocation can't dangle them; -1 means nothing selected).
+// set holds extra clip ids added with Shift+click (the anchor clip stays
+// tracked by track/index); used to link/unlink a deliberate multi-clip set
+// with U.
+Selection :: struct {
+	asset_id:  u64, // media-bin item; 0 = none
+	track:     int, // -1 = no timeline clip selected
+	index:     int, // -1 = no timeline clip selected
+	extra_set: map[u64]bool,
+}
+selection: Selection
 
 // Keyframe selection (S3): one keyframe on the live timeline, resolved by
 // indices (not pointers) so dynamic-array reallocations can't dangle it. It is
 // MUTUALLY EXCLUSIVE with the clip selection above — selecting a keyframe
-// clears selected_track/selected_index/selected_set, and every clip-selection
-// path clears this. Indices go stale the moment the structure moves, so every
+// clears selection.track/.index/.extra_set, and every clip-selection path
+// clears this. Indices go stale the moment the structure moves, so every
 // resolve re-bounds-checks against the live tree; a stale selection reads as
 // "nothing selected" (kf_selected) rather than aliasing a burned slot.
 Keyframe_Selection :: struct {
@@ -518,31 +618,45 @@ Keyframe_Selection :: struct {
 	clip_index: int, // clip within that track
 	lane:       int, // into the clip's keyframe_tracks
 	key:        int, // into the lane's keys
-	gen:        u32, // kf_structure_gen when the selection was made
+	gen:        u32, // kf_view.structure_gen when the selection was made
 }
 kf_sel: Keyframe_Selection // zero value = nothing selected
 
-// kf_interp_menu_open: the keyframe readout's interpolation dropdown. One flag
-// (a single key is selected at a time), same toggle/select/dismiss shape as
-// the export-encoder dropdown.
-kf_interp_menu_open: bool
+// Kf_View is the keyframe selection's UI companion state: the interpolation
+// dropdown toggle (one flag — a single key is selected at a time, same
+// toggle/select/dismiss shape as the export-encoder dropdown) and the
+// structure generation counter below.
+Kf_View :: struct {
+	interp_menu_open: bool,
+	// structure_gen increments whenever a keyframe SEQUENCE can shift: a key
+	// inserted or deleted (kf_set_key/kf_del_key) or a lane remapped
+	// (split/trim). Index-based keyframe selections record the gen they were
+	// made under and refuse to resolve once it drifts — a deleted key's slot
+	// can silently be reused by the next key, so without the gen a stale
+	// selection would alias a key that slid into the old index (AGENTS: never
+	// let an old handle alias a reused slot). On gen mismatch kf_selected
+	// reports "nothing selected", and the user re-picks the diamond.
+	structure_gen:   u32,
+}
+kf_view: Kf_View
 
-// kf_structure_gen increments whenever a keyframe SEQUENCE can shift: a key
-// inserted or deleted (kf_set_key/kf_del_key) or a lane remapped (split/trim).
-// Index-based keyframe selections record the gen they were made under and
-// refuse to resolve once it drifts — a deleted key's slot can silently be
-// reused by the next key, so without the gen a stale selection would alias a
-// key that slid into the old index (AGENTS: never let an old handle alias a
-// reused slot). On gen mismatch kf_selected reports "nothing selected", and
-// the user re-picks the diamond.
-kf_structure_gen: u32
-
-// Transform dragging: moving the selected clip around within the preview.
-preview_drag_offset_x: f32
-preview_drag_offset_y: f32
+// Preview_Move is the preview-transform drag (dragging the selected clip
+// around within the preview canvas): the pre-gesture offset of the clip's
+// center, so each pointer delta translates from a fixed reference instead of
+// accumulating float error.
+Preview_Move :: struct {
+	// Pointer offset from the drag grab point to the clip's center. The clip's
+	// center follows the cursor minus this, so grabbing a clip off-center keeps
+	// that grip instead of snapping the center to the cursor.
+	start_offset_x: f32,
+	start_offset_y: f32,
+}
+// preview_move acts as the gesture payload for .Preview_Move; the current
+// translation is tracked in the clip's own transform, not here.
+preview_move: Preview_Move
 
 // Edit_Field names which clip property a text-edit session targets. .None
-// means no field is being edited; edit_chars/edit_len hold the buffer typed.
+// means no field is being edited; chars/len below hold the buffer typed.
 Edit_Field :: enum {
 	None,
 	X,
@@ -556,9 +670,16 @@ Edit_Field :: enum {
 	Kf_Value, // selected keyframe's value (Clip inspector keyframe readout)
 }
 
-editing_field: Edit_Field
-edit_chars: [64]u8
-edit_len: int
+// Edit_State is the in-progress property text edit (typing a numeric value
+// into a clip inspector field). field names which property; chars/len hold the
+// typed buffer. Committing parses chars into the field's value; cancelling
+// clears it.
+Edit_State :: struct {
+	field: Edit_Field,
+	chars: [64]u8,
+	len:   int,
+}
+edit_state: Edit_State
 
 // Text_Input is the generic modal string field (used by clip rename, and any
 // future string input). UTF-8 safe: cursor/anchor are byte offsets into buf.
@@ -591,17 +712,21 @@ TI_PLAYHEAD :: 2
 // is display-only for now: no commands execute, Enter records the typed text as
 // last_command (the placeholder shown while the buffer is empty).
 TI_CMDLINE :: 3
-// last_command is the most recently committed ":" command-line text, shown as
-// the prompt's placeholder. Owned (session-heap): replaced on each commit.
-last_command: string
+// TI_FINDER is the input_type for the in-app fuzzy file finder (`:open` with no
+// argument, and the open/import buttons). The field is the finder's filter;
+// Enter descends or opens, Esc closes.
+TI_FINDER :: 4
 
 Preview_State :: struct {
 	buffer:  [PREVIEW_W * PREVIEW_H * 4]u8,
 	playing: bool,
+	// last_decoded/requested_playhead are the -1-reset decode staleness markers:
+	// any timeline edit resets them (alongside the async decoders) so the next
+	// frame decode is judged against "nothing decoded" instead of a stale frame.
+	last_decoded:   i64,
+	last_requested: i64,
 }
 preview: Preview_State
-last_decoded_playhead: i64
-last_requested_playhead: i64
 
 // Multi-clip compositing: one Preview_Slot per video clip covering the
 // playhead. Each slot owns a Clip_Decoder (with its own RAM frame cache), a
@@ -665,7 +790,7 @@ Preview_Slot :: struct {
 	text_tex_w:           c.int,
 	text_tex_h:           c.int,
 	// text_scratch is the per-glyph bitmap scratch for text rasterization,
-	// sized for the current baked font (the shared text_clip_scratch is too
+	// sized for the current baked font (the fixed shared buffers are too
 	// small once clip.scale is baked into a larger font).
 	text_scratch:         []u8,
 	// text_recreate tells the render loop a text slot's texture must be
@@ -709,79 +834,79 @@ Preview_Slot :: struct {
 
 preview_slots: [MAX_PREVIEW_SLOTS]Preview_Slot
 
-// Playback clock snapshot published by the UI thread for the audio producer.
-// The producer must not read playhead.frame directly (cross-thread data race)
-// and must not treat the last published value as frozen: a blocking swapchain
-// acquire can hold the render loop for a second while the sound device keeps
-// consuming, so a frozen frame would starve the producer and a value that
-// free-runs on the device would lock a permanent offset after the stall.
-// Publishing (frame, wall-time) together lets the producer extrapolate the
-// playhead on its own, from the same monotonic clock the UI uses, across any
-// UI update gap. Guarded by a seqlock (playback_seq) so the pair is never read
-// torn; non-explicit Odin atomics are sequentially consistent.
-ui_playhead_frame: i64 // atomic, guarded by playback_seq
-ui_playhead_ns:    i64 // atomic, sdl.GetTicksNS() when ui_playhead_frame was current
-playback_seq:      u64 // atomic seqlock: odd while publishing
-// audio_dev_frame is the content frame the sound device has actually consumed
-// (everything the producer pushed minus what is still queued); published every
-// feed pass so the preview HUD can show the audio clock next to the video one.
-// audio_dev_at_ns is the GetTicksNS() that belonged to the same feed pass, so
-// a reader can extrapolate the device position to its own "now" and compare
-// against the extrapolated playhead at the same instant -- the stepped publish
-// alone would show a full frame of phantom skew (dev != playhead.frame).
-audio_dev_frame: i64
-audio_dev_at_ns: i64
-
 // Preview camera: pan (in preview pixels, relative to the base canvas center)
 // and zoom. Pan is the image-viewer bound -- the canvas edge may reach the
 // panel edge, never cross it -- so the view roams past the canvas into the
 // workspace while the canvas always stays reachable (see clamp_preview_camera).
 PREVIEW_CAM_MIN_ZOOM :: 0.25
 PREVIEW_CAM_MAX_ZOOM :: 8.0
-preview_cam_ox: f32
-preview_cam_oy: f32
-preview_cam_zoom: f32 = 1.0
-// preview_fit_to_window pins the camera to the contain-fit of the canvas in the
-// preview panel (zoom 1, no pan) so the whole frame is always visible, including
-// after a panel resize. Panning or zooming clears it (the user took the camera),
-// and the toolbar toggle re-arms it and snaps the camera back (preview_fit_reset).
-preview_fit_to_window: bool = true
-panning_preview: bool
-pan_last_x: f32
-pan_last_y: f32
-panning_timeline: bool
-timeline_pan_last_x: f32
-timeline_pan_last_y: f32
-// Inspector-card scrollbar drag (same mechanics): the inspector column
-// scrolls when the cards overflow their viewport. The timeline has no
-// vertical scrollbar — it scrolls by wheel/pan instead.
-inspector_scroll: f32
-inspector_scroll_dragging: bool
-inspector_scroll_grab: f32
-// Undo-viewer scrollbar drag (same mechanics as the inspector cards column).
-undo_view_scroll_dragging: bool
-undo_view_scroll_grab: f32
+// Preview_Cam is the preview panel's camera: the canvas pan offset (ox/oy in
+// canvas space), the zoom, and the in-flight pan gesture's scroll-capture.
+// fit_to_window pins the camera to the contain-fit of the canvas in the panel
+// (zoom 1, no pan) so the whole frame is always visible — including after a
+// panel resize. Panning or zooming clears it (the user took the camera), and
+// the toolbar toggle re-arms it and snaps the camera back (preview_fit_reset).
+Preview_Cam :: struct {
+	ox:   f32,
+	oy:   f32,
+	zoom: f32,
+	// fit_to_window being a Bin_Cam_Mode would overconstrain the enum (rescues
+	// and the import flash both read it to decide the drawn transform), so it
+	// stays an explicit bool alongside the numeric camera.
+	fit_to_window: bool,
+	panning:       bool,
+	pan_last_x:    f32,
+	pan_last_y:    f32,
+}
+preview_cam: Preview_Cam = {zoom = 1, fit_to_window = true}
 
-// Transient on-window notice (e.g. "couldn't load subtitles"): text owned by
-// the notice path, shown until ui_notice_until (ms) passes.
-ui_notice_text: string
-ui_notice_until: u64
+// Timeline_Pan is the timeline panel's pan gesture (middle-drag the track
+// lanes): whether panning and the last pointer position for the delta.
+Timeline_Pan :: struct {
+	panning:  bool,
+	last_x:   f32,
+	last_y:   f32,
+}
+timeline_pan: Timeline_Pan
+
+// Scrollbar_Volume is the shared scrollbar-drag state for the side panes that
+// scroll by manual childOffset (inspector cards, undo viewer): the offset, and
+// a drag's starting grab offset while dragging. The timeline has no vertical
+// scrollbar — it scrolls by wheel/pan instead.
+Scrollbar_Volume :: struct {
+	inspector:    Scrollbar,
+	undo_view:    Scrollbar,
+}
+Scrollbar :: struct {
+	offset:   f32,
+	dragging: bool,
+	grab:     f32,
+}
+scrollbars: Scrollbar_Volume
+
+// Ui_Notice is the transient on-window notice (e.g. "couldn't load
+// subtitles"): text owned by the notice path, shown until until (ms) passes.
+Ui_Notice :: struct {
+	text:  string,
+	until: u64,
+}
+ui_notice: Ui_Notice
 
 // show_ui_notice displays a transient message centered on the window for the
 // given duration (ms), replacing any current notice.
 show_ui_notice :: proc(text: string, duration_ms: u64) {
-	if len(ui_notice_text) > 0 {
-		delete(ui_notice_text)
+	if len(ui_notice.text) > 0 {
+		delete(ui_notice.text)
 	}
-	ui_notice_text = strings.clone(text)
-	ui_notice_until = sdl.GetTicks() + duration_ms
+	ui_notice.text = strings.clone(text)
+	ui_notice.until = sdl.GetTicks() + duration_ms
 }
 
 // clear_expired_ui_notice frees the notice string once its time is up.
 clear_expired_ui_notice :: proc() {
-	if len(ui_notice_text) > 0 && sdl.GetTicks() >= ui_notice_until {
-		delete(ui_notice_text)
-		ui_notice_text = ""
+	if len(ui_notice.text) > 0 && sdl.GetTicks() >= ui_notice.until {
+		delete(ui_notice.text)
+		ui_notice.text = ""
 	}
 }
 
@@ -810,7 +935,7 @@ Handle_Kind :: enum {
 // active_interaction discriminates which pointer gesture is running. Exactly
 // one interaction is active at any time; this is the tagged difference from
 // the old boolean soup, which could drift into multiple-"true" states. Payload
-// globals (drag_clip, resize_edge, media_drag_*, ...) belong to whichever
+// globals (clip_move.clip, clip_resize.edge, media_drag_*, ...) belong to whichever
 // variant is active and are reset when it clears.
 Interaction :: enum {
 	None,          // no gesture active (playback-only frame, or track-list scroll)
@@ -837,70 +962,91 @@ GAIN_FINE_DB_PER_PX :: 0.1
 GAIN_COARSE_DB_PER_10PX :: 1.0
 GAIN_COARSE_PX_PER_STEP :: 10
 
-// gain_drag_* capture the state of a live gain-knob drag. The resolved clip
-// pointer stays valid because the drag grabs the mouse (selection can't
-// change mid-drag) and clip arrays don't grow while dragging.
-gain_drag_clip: ^Clip
-gain_drag_start_x: f32
-gain_drag_start_db: f32
-// kf_drag_start_frame captures the selected key's frame_off at diamond press,
-// so the release-time compare decides whether the gesture actually moved it (a
-// no-move click commits nothing — the clip-stutter rule). Meaningful only while
-// active_interaction == .Keyframe_Move.
-kf_drag_start_frame: i32
-// kf_drag_press_x is the pointer x at diamond press. The drag only engages once
-// the cursor travels KF_DRAG_THRESHOLD_PX from it, so a click (no travel) never
-// moves the key. kf_drag_pivot is the frame-space offset between the grabbed key
-// and the cursor at press (key_frame - cursor_frame): the drag TRANSLATES the
-// key by the pointer's own delta, so grabbing a diamond off-center keeps that
-// pivot instead of snapping the key's center to the cursor. Both meaningful
-// only while active_interaction == .Keyframe_Move.
-kf_drag_press_x: f32
-kf_drag_pivot: f32
-// kf_dbl_click_* record the previous diamond press so a second press on the SAME
+// Gain_Drag is the live gain-knob drag. The resolved clip pointer stays valid
+// because the drag grabs the mouse (selection can't change mid-drag) and clip
+// arrays don't grow while dragging.
+Gain_Drag :: struct {
+	clip:     ^Clip,
+	start_x:  f32,
+	start_db: f32,
+}
+gain_drag: Gain_Drag
+
+// Kf_Move is the keyframe-diamond drag. start_frame captures the selected
+// key's frame_off at diamond press, so the release-time compare decides whether
+// the gesture actually moved it (a no-move click commits nothing — the
+// clip-stutter rule). press_x is the pointer x at press (the drag only engages
+// once the cursor travels KF_DRAG_THRESHOLD_PX from it, so a click never moves
+// the key); pivot is the frame-space offset between the grabbed key and the
+// cursor at press (key_frame - cursor_frame), so grabbing a diamond off-center
+// keeps that pivot instead of snapping the key's center to the cursor. All
+// meaningful only while active_interaction == .Keyframe_Move.
+Kf_Move :: struct {
+	start_frame: i32,
+	press_x:     f32,
+	pivot:       f32,
+}
+kf_move: Kf_Move
+
+// Kf_Dbl_Click records the previous diamond press so a second press on the SAME
 // key (same track, clip, lane, and key frame) within KF_DBL_CLICK_NS reads as a
 // double-click: the playhead jumps to that key's frame instead of re-arming a
-// move. kf_dbl_click_ns == 0 means "no previous press".
-kf_dbl_click_ns: i64
-kf_dbl_click_track: int
-kf_dbl_click_clip: int
-kf_dbl_click_lane: int
-kf_dbl_click_frame: i32
-dragging_handle: Maybe(Handle)
-handle_kind: Handle_Kind = .None
-handle_start_mx: f32
-handle_start_my: f32
-handle_start_scale: f32
-handle_start_crop_l: f32
-handle_start_crop_r: f32
-handle_start_crop_t: f32
-handle_start_crop_b: f32
-handle_start_box_w: f32
-handle_start_box_h: f32
-handle_start_center_x: f32
-handle_start_center_y: f32
-handle_start_tx: f32
-handle_start_ty: f32
-// handle_corner_snapped latches when a corner (diagonal) handle has actually
-// snapped flush onto a canvas corner during THIS drag. The freeze gate
-// (handle_drag_frozen) only engages after a snap has happened, so a box that
-// merely STARTS flush (e.g. a full-canvas clip whose corner sits on the canvas
-// corner) can still be dragged outward to scale freely.
-handle_corner_snapped: bool
-// crop_pan_* drive the Alt+Middle crop-pan gesture (crop_viewport_pan): the
-// source window slides inside a stationary visible box. *_start_* is the
-// pre-gesture state the release step compares against to decide between
+// move. ns == 0 means "no previous press".
+Kf_Dbl_Click :: struct {
+	ns:    i64,
+	track: int,
+	clip:  int,
+	lane:  int,
+	frame: i32,
+}
+kf_dbl_click: Kf_Dbl_Click
+
+// Handle_Drag is the preview resize/crop-handle drag. handle is the dragged
+// corner (Maybe(nil) = none); kind is Scale vs Crop. Every handle_start_* field
+// snapshots the pre-gesture box/crop/center so each pointer delta re-derives
+// the box from a fixed reference instead of accumulating float error. tx/ty are
+// the pre-gesture transform. corner_snapped latches when a corner (diagonal)
+// handle has actually snapped flush onto a canvas corner during THIS drag; the
+// freeze gate only engages after a snap has happened, so a box that merely
+// STARTS flush (e.g. a full-canvas clip whose corner sits on the canvas corner)
+// can still be dragged outward to scale freely.
+Handle_Drag :: struct {
+	handle:          Maybe(Handle),
+	kind:            Handle_Kind,
+	start_mx:        f32,
+	start_my:        f32,
+	start_scale:     f32,
+	start_crop_l:    f32,
+	start_crop_r:    f32,
+	start_crop_t:    f32,
+	start_crop_b:    f32,
+	start_box_w:     f32,
+	start_box_h:     f32,
+	start_center_x:  f32,
+	start_center_y:  f32,
+	start_tx:        f32,
+	start_ty:        f32,
+	corner_snapped:  bool,
+}
+handle_drag: Handle_Drag = {kind = .None}
+
+// Crop_Pan drives the Alt+Middle crop-pan gesture (crop_viewport_pan): the
+// source window slides inside a stationary visible box. Every start_* field is
+// the pre-gesture state the release step compares against to decide between
 // committing a "Pan clip" node and discarding a no-move press (undo_cancel).
-crop_pan_active: bool
-crop_pan_last_x: f32
-crop_pan_last_y: f32
-crop_pan_start_scale: f32
-crop_pan_start_x: f32
-crop_pan_start_y: f32
-crop_pan_start_l: f32
-crop_pan_start_r: f32
-crop_pan_start_t: f32
-crop_pan_start_b: f32
+Crop_Pan :: struct {
+	active:       bool,
+	last_x:       f32,
+	last_y:       f32,
+	start_scale:  f32,
+	start_x:      f32,
+	start_y:      f32,
+	start_l:      f32,
+	start_r:      f32,
+	start_t:      f32,
+	start_b:      f32,
+}
+crop_pan: Crop_Pan
 
 Timeline_Frame :: struct {
 	active_clip: ^Clip,

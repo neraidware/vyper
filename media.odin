@@ -21,13 +21,13 @@ import avutil "vendor/ffmpeg/avutil"
 set_project_resolution :: proc(w, h: c.int) {
 	project.width = w
 	project.height = h
-	resolution_locked = true
+	project.resolution_locked = true
 }
 
 // set_project_resolution_auto clears the resolution lock so the next import
 // sets the canvas from the file's own dimensions.
 set_project_resolution_auto :: proc() {
-	resolution_locked = false
+	project.resolution_locked = false
 }
 
 // set_project_fps applies an explicit project frame rate (preset button). The
@@ -44,7 +44,7 @@ set_project_orientation :: proc(vertical: bool) {
 	if vertical && project.height < project.width || !vertical && project.width < project.height {
 		project.width, project.height = project.height, project.width
 	}
-	resolution_locked = true
+	project.resolution_locked = true
 }
 
 // probe_video_size returns the first video stream's pixel dimensions, or
@@ -217,20 +217,29 @@ path_basename :: proc(path: cstring) -> string {
 	return p
 }
 
-_next_asset_id: u64
+// Media_Bin is the project's media-binary registry: the asset list itself plus
+// the id allocator that hands out stable, unique ids for bin entries. The
+// array lives here (not in state.odin) because its growth is the one thing
+// every asset id's validity depends on; keeping the id allocator beside it is
+// what makes `media_bin.assets[idx]` id<->asset lookups safe (see find_asset).
+Media_Bin :: struct {
+	assets: [dynamic]Media_Asset,
+	next_id: u64,
+}
+media_bin: Media_Bin
 
 // next_asset_id hands out a stable, unique id for a media bin entry.
 next_asset_id :: proc() -> u64 {
-	_next_asset_id += 1
-	return _next_asset_id
+	media_bin.next_id += 1
+	return media_bin.next_id
 }
 
 // find_asset returns the media-bin entry with the given id, or nil. The
-// returned pointer is only valid until the next append to media_assets (the
+// returned pointer is only valid until the next append to media_bin.assets (the
 // dynamic array can reallocate); callers that hold it across time must
 // re-resolve by id each frame (the drag code does exactly that).
 find_asset :: proc(asset_id: u64) -> ^Media_Asset {
-	for &a in media_assets {
+	for &a in media_bin.assets {
 		if a.id == asset_id {
 			return &a
 		}
@@ -299,13 +308,13 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	// is a no-op returning the existing asset's id, so re-imports don't stack
 	// duplicate rows (the open-file flow also places the asset on the timeline,
 	// which still happens with the returned id).
-	for &a in media_assets {
+	for &a in media_bin.assets {
 		if strings.compare(string(a.path), string(path)) == 0 {
 			return a.id
 		}
 	}
-	file_info_text = probe_media(path)
-	frame_count := media_frame_count(file_info_text)
+	project.info_text = probe_media(path)
+	frame_count := media_frame_count(project.info_text)
 	probe := probe_streams(path)
 	// A still image probes as a one-frame video stream. It has no duration and
 	// no meaningful frame rate, so place it with the default one-second clip
@@ -335,20 +344,20 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 
 	// If the user hasn't set a resolution/orientation yet, infer the canvas
 	// from this (first) file's own video dimensions.
-	if !resolution_locked && src_w > 0 {
+	if !project.resolution_locked && src_w > 0 {
 		project.width = src_w
 		project.height = src_h
-		resolution_locked = true
+		project.resolution_locked = true
 	}
 
 	asset_id := next_asset_id()
 	append(
-		&media_assets,
+		&media_bin.assets,
 		Media_Asset {
 			id = asset_id,
 			path = path,
 			kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
-			metadata = file_info_text,
+			metadata = project.info_text,
 			frame_count = frame_count,
 			dur_us = i64(probe.duration_sec * 1_000_000),
 			src_w = src_w,
@@ -359,7 +368,7 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 			thumb_tex_dirty = true,
 		},
 	)
-	decode_asset_thumbnail(&media_assets[len(media_assets) - 1])
+	decode_asset_thumbnail(&media_bin.assets[len(media_bin.assets) - 1])
 
 	// Editing-time preview can decode a low-res all-intra proxy of a video for
 	// fluid scrubbing instead of re-decoding whole groups-of-pictures from the
@@ -387,7 +396,7 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 // same subtitle yields the existing asset's id. Returns 0 when the file cannot
 // be parsed as SRT.
 import_srt_to_bin :: proc(path: cstring) -> u64 {
-	for &a in media_assets {
+	for &a in media_bin.assets {
 		if strings.compare(string(a.path), string(path)) == 0 {
 			return a.id
 		}
@@ -404,7 +413,7 @@ import_srt_to_bin :: proc(path: cstring) -> u64 {
 	length := max(one_sec, cue_frame(srt_duration_ms(srt_source(srt_id)), f32(timeline_fps())))
 	asset_id := next_asset_id()
 	append(
-		&media_assets,
+		&media_bin.assets,
 		Media_Asset {
 			id = asset_id,
 			path = path,
@@ -551,22 +560,22 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	timeline.playhead_frame = first_placed
 	playhead.frame = first_placed
 	playhead.playing = false
-	playhead_accumulator = 0
+	playback.accumulator = 0
 	preview.playing = false
-	last_decoded_playhead = -1
-	last_requested_playhead = -1
+	preview.last_decoded = -1
+	preview.last_requested = -1
 	async_dec_reset()
-	if warm_valid {
-		clip_decoder_reset(&warm_decoder)
-		warm_valid = false
-		warm_clip_id = 0
+	if warm.valid {
+		clip_decoder_reset(&warm.decoder)
+		warm.valid = false
+		warm.clip_id = 0
 	}
 	audio_reset_for_load()
 	invalidate_preview_slots()
 	audio_note_edit()
-	clear(&selected_set)
-	selected_track = -1
-	selected_index = -1
+	clear(&selection.extra_set)
+	selection.track = -1
+	selection.index = -1
 	kf_sel = {} // a fresh import replaces the whole tree; no keyframe survives it
 	want_kind := Media_Kind.Video
 	#partial switch asset.kind {
@@ -581,8 +590,8 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			if c.asset_id == asset_id &&
 			   c.kind == want_kind &&
 			   c.timeline_start_frame == anchor_placed {
-				selected_track = ti
-				selected_index = ci
+				selection.track = ti
+				selection.index = ci
 			}
 		}
 	}
@@ -611,9 +620,9 @@ import_media :: proc(path: cstring) {
 // caller may free `path` — the existing asset's copy is what stays alive.
 open_file_at :: proc(path: cstring) -> (opened, retained: bool) {
 	if is_srt_pick(path) {
-		before := len(media_assets)
+		before := len(media_bin.assets)
 		opened = import_srt_to_bin(path) != 0
-		return opened, len(media_assets) > before
+		return opened, len(media_bin.assets) > before
 	}
 	probe := probe_streams(path)
 	if !probe.has_video && !probe.has_audio && !media_is_image(path) {
@@ -623,10 +632,10 @@ open_file_at :: proc(path: cstring) -> (opened, retained: bool) {
 		)
 		return false, false
 	}
-	before := len(media_assets)
+	before := len(media_bin.assets)
 	if asset_id := import_media_to_bin(path); asset_id != 0 {
 		add_asset_to_timeline(asset_id, 0, timeline_duration())
-		return true, len(media_assets) > before
+		return true, len(media_bin.assets) > before
 	}
 	return false, false
 }

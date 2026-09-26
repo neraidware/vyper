@@ -9,7 +9,7 @@ import clay "clay-odin"
 // normalized values but edit in percent-scale text (crop % of the box, Scale
 // ×1), so both format/parse by the same 10^decimals factor.
 edit_begin :: proc(field: Edit_Field, value: f32) {
-	editing_field = field
+	edit_state.field = field
 	prec := 0
 	scaled := value
 	switch field {
@@ -24,19 +24,19 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 		scaled = value * 100
 	}
 	text := fmt.aprintf("%.*f", prec, scaled)
-	edit_len = min(len(text), len(edit_chars))
-	copy(edit_chars[:edit_len], text[:edit_len])
+	edit_state.len = min(len(text), len(edit_state.chars))
+	copy(edit_state.chars[:edit_state.len], text[:edit_state.len])
 }
 
 edit_cancel :: proc() {
-	editing_field = .None
-	edit_len = 0
+	edit_state.field = .None
+	edit_state.len = 0
 }
 
 // edit_field_over reports whether the pointer is still over the property field
 // currently being edited (so a click-away outside it commits).
 edit_field_over :: proc() -> bool {
-	switch editing_field {
+	switch edit_state.field {
 	case .X:
 		return clay.PointerOver(clay.ID("PropFieldX"))
 	case .Y:
@@ -63,7 +63,7 @@ edit_field_over :: proc() -> bool {
 
 edit_commit :: proc() {
 	defer edit_cancel()
-	val, parsed_ok := strconv.parse_f32(string(edit_chars[:edit_len]))
+	val, parsed_ok := strconv.parse_f32(string(edit_state.chars[:edit_state.len]))
 	if !parsed_ok {
 		return
 	}
@@ -73,7 +73,7 @@ edit_commit :: proc() {
 	// readout shows lane 0; editing it unwraps the section via
 	// kf_geom_set_value, then lands the scalar on that lane. Undo snapshots the
 	// whole timeline, so the replace is a plain commit.
-	if editing_field == .Kf_Value {
+	if edit_state.field == .Kf_Value {
 		kcl, klane, k, kok := kf_selected()
 		if !kok {
 			return
@@ -110,7 +110,7 @@ edit_commit :: proc() {
 	label := "Edit clip transform"
 	kind := Undo_Kind.Transform
 	name := ""
-	switch editing_field {
+	switch edit_state.field {
 	case .X:
 		if cl.kind == .Audio {
 			return
@@ -182,7 +182,7 @@ edit_commit :: proc() {
 		return
 	}
 	// Only gain edits touch audio; mirror them into the slab and let the
-	// producer's live fold (audio_gain_epoch) apply them without re-provisioning.
+	// producer's live fold (audio_geom_state.gain_epoch) apply them without re-provisioning.
 	// A full note_edit() here re-seeded every decoder mid-playback whenever a
 	// gain commit landed -- and dispatch_click_fallback commits in-flight field
 	// edits on ANY fresh click, so selecting another clip re-opened all decoders.
@@ -202,14 +202,14 @@ edit_commit :: proc() {
 }
 
 edit_append :: proc(ch: u8) {
-	if edit_len < len(edit_chars) {
-		edit_chars[edit_len] = ch
-		edit_len += 1
+	if edit_state.len < len(edit_state.chars) {
+		edit_state.chars[edit_state.len] = ch
+		edit_state.len += 1
 	}
 }
 
 edit_backspace :: proc() {
-	if edit_len > 0 {
-		edit_len -= 1
+	if edit_state.len > 0 {
+		edit_state.len -= 1
 	}
 }

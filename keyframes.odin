@@ -157,12 +157,12 @@ kf_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, tota
 // crash the delete). Writes a SCALAR key on `name`'s own track; a consumer that
 // groups names into packed tracks unwraps first (kf_geom_set_lane_key).
 // kf_bump_structure flags that a keyframe sequence has shifted, invalidating
-// any live index-based selection (see kf_structure_gen). Wrap to skip 0 so a
+// any live index-based selection (see kf_view.structure_gen). Wrap to skip 0 so a
 // full-cycle wrap can't accidentally match a selection made at gen 0.
 kf_bump_structure :: proc() {
-	kf_structure_gen += 1
-	if kf_structure_gen == 0 {
-		kf_structure_gen = 1
+	kf_view.structure_gen += 1
+	if kf_view.structure_gen == 0 {
+		kf_view.structure_gen = 1
 	}
 }
 

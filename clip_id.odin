@@ -4,10 +4,16 @@ import "core:crypto/sha2"
 import "core:sync"
 import "core:time"
 
-// clip_id_seed is a monotonic counter, guaranteeing uniqueness even if two
-// clips are minted within the same wall-clock nanosecond (fast import/split
-// loops, or a low-resolution clock on some platforms).
-clip_id_seed: u64
+// Clip_Id_State is the process-wide clip-identity generator. `seed` is a
+// monotonic counter, guaranteeing uniqueness even if two clips are minted
+// within the same wall-clock nanosecond (fast import/split loops, or a
+// low-resolution clock on some platforms). Kept as one named state object so
+// the id space has a home; new_clip_id is the only reader/writer.
+Clip_Id_State :: struct {
+	seed: u64,
+}
+
+clip_id: Clip_Id_State
 
 // new_clip_id mints a fresh, stable identity for one clip *instance* -- not
 // its content. Two split halves of the same asset must NOT collide, and a
@@ -22,7 +28,7 @@ clip_id_seed: u64
 // half produced by a split (the half that keeps its old struct/slot keeps
 // its old id -- it's still logically the same clip, just shorter).
 new_clip_id :: proc() -> u64 {
-	seed := sync.atomic_add(&clip_id_seed, 1)
+	seed := sync.atomic_add(&clip_id.seed, 1)
 	now := u64(time.to_unix_nanoseconds(time.now()))
 
 	buf: [16]u8

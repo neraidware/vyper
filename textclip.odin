@@ -11,8 +11,15 @@ import stb "vendor:stb/truetype"
 // transparent background, positioned at the top-left of the preview buffer.
 // ---------------------------------------------------------------------------
 
-text_clip_font: stb.fontinfo
-text_clip_font_init: bool
+// Text_Clip_State is the text-clip rasterizer's shared font state: the baked
+// monospace face and an init flag (stb.InitFont runs once, lazily). Callers pass
+// their own per-glyph bitmap scratch (text_rasterize/line_rasterize take one) so
+// the preview loop and render worker never share a buffer.
+Text_Clip_State :: struct {
+	font:      stb.fontinfo,
+	font_init: bool,
+}
+text_clip_state: Text_Clip_State
 
 TEXT_CLIP_FONT_PIXELS :: 48
 
@@ -42,7 +49,7 @@ text_metrics_px :: proc(
 		epx = TEXT_CLIP_FONT_PIXELS
 	}
 	if !font_init^ {
-		stb.InitFont(font, raw_data(font_data), 0)
+		stb.InitFont(font, raw_data(font_state.data), 0)
 		font_init^ = true
 	}
 	scale := stb.ScaleForPixelHeight(font, epx)
@@ -53,10 +60,11 @@ text_metrics_px :: proc(
 	return a, a + d
 }
 
-// Scratch for one glyph's bitmap; sized for a 48px monospace glyph (a few KB).
-// Preview rendering is single-threaded on the UI loop, so a shared buffer is
-// safe here and avoids a per-codepoint dynamic allocation.
-text_clip_scratch: [8192]u8
+// Callers pass their per-glyph bitmap scratch to text_rasterize / the line
+// rasterizers; sized for a 48px monospace glyph (a few KB), though bounding via
+// text_scratch_size_for. Preview rendering is single-threaded on the UI loop,
+// so each caller's shared buffer is safe and avoids a per-codepoint dynamic
+// allocation.
 
 // text_clip_hash is a cheap FNV-1a over the title, used to detect when a text
 // clip's rendered buffer is stale (its name changed) without storing a string.
@@ -132,7 +140,7 @@ rasterize_title_into_buffer :: proc(
 		px = TEXT_CLIP_FONT_PIXELS
 	}
 	if !font_init^ {
-		stb.InitFont(font, raw_data(font_data), 0)
+		stb.InitFont(font, raw_data(font_state.data), 0)
 		font_init^ = true
 	}
 	scale := stb.ScaleForPixelHeight(font, px)
@@ -284,7 +292,7 @@ rasterize_lines_into_buffer :: proc(
 		px = TEXT_CLIP_FONT_PIXELS
 	}
 	if !font_init^ {
-		stb.InitFont(font, raw_data(font_data), 0)
+		stb.InitFont(font, raw_data(font_state.data), 0)
 		font_init^ = true
 	}
 

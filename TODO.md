@@ -438,6 +438,55 @@ one-frame maximum key therefore inflate both producer and compositor work.
 **Out of scope:** preview keyframe sampling, encoder changes, and GPU compositor
 rewrite. Fix export geometry work first.
 
+## Active 5 — In-app fuzzy file finder (replaces OS picker workflow)
+
+**Why:** `:open` with no argument currently does nothing and file open/import
+routes through OS-native dialog portals (portal on Linux, win32 on Windows) —
+two diverging code paths, untestable cross-OS. An in-app fzf/skim-style finder
+unifies file management across OSes and gives a fast, scriptable open/import
+path.
+
+**Design decisions (2026-09-26):**
+- Modal popup like the cmdline popup, launched from three entry points that
+  today call `open_file_picker()` / do nothing: bare `:open` command, the
+  Open File button, and the Bin Import button. `open_srt_picker` (subtitle
+  generator, `.srt`-only) stays on the OS picker.
+- Filter text input on top reuses the generic `ti` field via a new
+  `TI_FINDER` input type; the filter is cleared when a directory is entered.
+- Column of rows below: generic SVG icon per file kind (folder/video/audio/
+  image/subtitle/file — 6 new `Icon_Id`s, ICON_COUNT 8→14) or the media-bin
+  thumbnail when the path matches an imported asset with one.
+- Keyboard-first like fzf: Up/Down/Tab navigate matches, Enter descends into
+  a directory or opens the selected file (commit mode: open, or import to
+  bin), Esc cancels. Wheel scrolls over the popup.
+- Entries listed from current directory (fzf-style browser, no recursion);
+  hidden dotfiles skipped; symlinks-to-dirs followed. Filter = fuzzy match on
+  basename via `cmdline_fuzzy_score`, dirs first then files.
+
+Steps (each lands + probe + vet before the next):
+- [x] S1. `file_finder.odin`: state (dir, entries, filtered indices, sel,
+      scroll, commit proc), `finder_open/mode`, relist/filter/navigate/enter/
+      close. `TI_FINDER` in state.odin, key routing in event.odin
+      (Tab/Up/Down/Enter before `text_input_handle_key`).
+- [x] S2. Icons: 6 new SVGs under icons/, `Icon_Id` members, `get_icon_svg`
+      cases (rasterizer `#load`s one SVG per enum member at init — a missing
+      case kills startup).
+- [x] S3. Render: `draw_finder_popup` (pill + `TextInputField` caret id
+      + row column) dispatched from `draw_text_input_popup`; row overdraw
+      pass in frame.odin (icons via `render_icon`/`icon_box`, bin thumbs via
+      `draw_tex_quad`).
+- [x] S4. Routing: bare `:open` in `apply_command`, OpenFileButton,
+      BinImportButton → `finder_open` with a commit proc (open_file_at /
+      import_srt_to_bin / import_media_to_bin). Wheel scroll over popup.
+- [ ] ACCEPT: `:open` pops the finder; navigate dirs, follow symlinks, filter
+      fuzzily, open a media file and import into bin without touching an OS
+      dialog. Probes + `-vet` green. (UI probe extended with a headless
+      finder-layout + filter-redraw + dismiss assertion; needs a manual
+      interactive pass for the final sheet.)
+
+Out of scope (future): recursive/bookmark walking, mouse row activation,
+clock-stamped recency sorting, portal/win32 picker deletion.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

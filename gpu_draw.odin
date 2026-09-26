@@ -4,6 +4,7 @@ import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:strings"
 import "core:sync"
 import "core:unicode/utf8"
 import sdl "vendor:sdl3"
@@ -49,19 +50,19 @@ draw_timeline_ruler :: proc(
 	)
 	dur := timeline_duration()
 	// Adapt the tick spacing to the current zoom so labels stay ~70px apart.
-	major := nice_frame_step(timeline_zoom)
+	major := nice_frame_step(timeline_view.zoom)
 	minor := max(major / 5, 1)
 
 	// Tick marks along the bottom edge of the ruler strip.
 	minor_h := ruler.height * 0.35
 	major_h := ruler.height * 0.6
-	start_f := i64(f32(i64(timeline_view_start / f32(minor))) * f32(minor))
+	start_f := i64(f32(i64(timeline_view.start / f32(minor))) * f32(minor))
 	// Ticks span [0, dur): dur is the exclusive end and holds no frame (the
 	// last content frame is dur-1), so a tick/label there reads as a phantom
 	// "one frame above the clip's frame count" -- the playhead's max is
 	// already dur-1, which draws the boundary instead.
 	for f := start_f; f < dur; f += minor {
-		x := ruler.x + (f32(f) - timeline_view_start) * timeline_zoom
+		x := ruler.x + (f32(f) - timeline_view.start) * timeline_view.zoom
 		if x < ruler.x {
 			continue
 		}
@@ -107,7 +108,7 @@ draw_timeline_ruler :: proc(
 
 	// Vertical playhead line spanning the ruler and all track rows, plus a grab
 	// handle sitting on top of the ruler strip.
-	line_x := ruler.x + (f32(playhead.frame) - timeline_view_start) * timeline_zoom
+	line_x := ruler.x + (f32(playhead.frame) - timeline_view.start) * timeline_view.zoom
 	tracks := clay.GetElementData(clay.ID("TracksSection")).boundingBox
 	line_bottom := ruler.y + RULER_HEIGHT + tracks.height
 	render_sdf_rect(
@@ -162,8 +163,8 @@ draw_render_range :: proc(
 	if project.start_frame >= 0 &&
 	   project.end_frame >= 0 &&
 	   project.start_frame < project.end_frame {
-		x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
-		x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
+		x1 := ruler.x + (f32(project.start_frame) - timeline_view.start) * timeline_view.zoom
+		x2 := ruler.x + (f32(project.end_frame) - timeline_view.start) * timeline_view.zoom
 		if x2 > ruler.x && x1 < isect {
 			band_x := max(x1, ruler.x)
 			band_w := min(x2, isect) - band_x
@@ -183,13 +184,13 @@ draw_render_range :: proc(
 	// Edge caps make the range boundaries readable even when the band is thin;
 	// a lone start/end marker is drawn the same way so its placement is visible.
 	if project.start_frame >= 0 {
-		x1 := ruler.x + (f32(project.start_frame) - timeline_view_start) * timeline_zoom
+		x1 := ruler.x + (f32(project.start_frame) - timeline_view.start) * timeline_view.zoom
 		if x1 >= ruler.x && x1 <= isect {
 			render_sdf_rect(renderer, command_buffer, pass, {x1, y, 2, 8}, RANGE_COLOR, 0, 0)
 		}
 	}
 	if project.end_frame >= 0 {
-		x2 := ruler.x + (f32(project.end_frame) - timeline_view_start) * timeline_zoom
+		x2 := ruler.x + (f32(project.end_frame) - timeline_view.start) * timeline_view.zoom
 		if x2 >= ruler.x && x2 <= isect {
 			render_sdf_rect(renderer, command_buffer, pass, {x2 - 2, y, 2, 8}, RANGE_COLOR, 0, 0)
 		}
@@ -491,7 +492,7 @@ draw_timeline_resize_focus :: proc(
 	}
 	edge := -1
 	if active_interaction == .Clip_Resize {
-		edge = resize_edge
+		edge = clip_resize.edge
 	} else {
 		pointer := clay.GetPointerState()
 		mx, my := pointer.position.x, pointer.position.y
@@ -606,13 +607,13 @@ draw_clip_markers :: proc(
 				continue
 			}
 			color := BUTTON_BORDER
-			if selected_track == track_idx && selected_index == index {
+			if selection.track == track_idx && selection.index == index {
 				color = BUTTON_BORDER_HOVER
 			}
 			rows := [3]f32{5, 3, 1}
 			for m in clip.markers {
 				line_x := clamp(
-					box.x + f32(m.source_frame - clip.source_start_frame) * timeline_zoom,
+					box.x + f32(m.source_frame - clip.source_start_frame) * timeline_view.zoom,
 					box.x,
 					box.x + box.width,
 				)
@@ -681,7 +682,7 @@ draw_clip_markers :: proc(
 kf_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32, f32) {
 	cy := box.y + CLIP_TILE_HEIGHT + (f32(lane) + 0.5) * KF_ROW_H
 	cx := clamp(
-		box.x + f32(frame_off) * timeline_zoom,
+		box.x + f32(frame_off) * timeline_view.zoom,
 		box.x + KF_DIAMOND_R,
 		box.x + box.width - KF_DIAMOND_R,
 	)
@@ -783,31 +784,31 @@ draw_keyframes :: proc(
 // draw_drag_ghost paints the translucent drop preview for a clip being dragged
 // onto another track: a ghost tile in the hovered lane at the nearest
 // non-overlapping slot. Same width as the dragged clip, positioned from
-// drag_ghost_start like regular clips (frame * zoom offset by the view).
+// clip_move.ghost_start like regular clips (frame * zoom offset by the view).
 draw_drag_ghost :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 ) {
-	if active_interaction != .Clip_Move || drag_clip == nil {
+	if active_interaction != .Clip_Move || clip_move.clip == nil {
 		return
 	}
-	if drag_hover_track < 0 || drag_hover_track >= len(timeline.tracks) {
+	if clip_move.hover_track < 0 || clip_move.hover_track >= len(timeline.tracks) {
 		return
 	}
-	if drag_hover_track == drag_source_track {
+	if clip_move.hover_track == clip_move.source_track {
 		return
 	}
 	// Linked group: paint a ghost for every member in its destination lane at the
-	// mouse-aligned position (m.start + drag_group_delta), so the whole unit
+	// mouse-aligned position (m.start + clip_move.group_delta), so the whole unit
 	// slides with the drag. If any member can't land at that exact spot on its
 	// destination lane the drop is refused, shown red.
-	if len(drag_group_orig) > 1 {
+	if len(clip_move.group_orig) > 1 {
 		// Visual-row delta through the stack order: storage indices may be
 		// scrambled, but the drop targets the visual row under the pointer.
-		delta_rows := order_row_of(drag_hover_track) - order_row_of(drag_source_track)
-		refused := !group_vertical_feasible(delta_rows, drag_group_delta)
-		for m in drag_group_orig {
+		delta_rows := order_row_of(clip_move.hover_track) - order_row_of(clip_move.source_track)
+		refused := !group_vertical_feasible(delta_rows, clip_move.group_delta)
+		for m in clip_move.group_orig {
 			src_row := order_row_of(m.track)
 			dst := src_row >= 0 ? track_at_row(src_row + delta_rows) : -1
 			if dst < 0 {
@@ -817,9 +818,9 @@ draw_drag_ghost :: proc(
 			if lane.width <= 0 || lane.height <= 0 {
 				continue
 			}
-			start := max(m.start + drag_group_delta, 0)
-			x0 := lane.x + (f32(start) - timeline_view_start) * timeline_zoom
-			w := f32(m.length) * timeline_zoom
+			start := max(m.start + clip_move.group_delta, 0)
+			x0 := lane.x + (f32(start) - timeline_view.start) * timeline_view.zoom
+			w := f32(m.length) * timeline_view.zoom
 			bounds := clay.BoundingBox {
 				x      = x0,
 				y      = lane.y,
@@ -845,7 +846,7 @@ draw_drag_ghost :: proc(
 		)
 		return
 	}
-	clip_len := drag_clip.source_length_frames
+	clip_len := clip_move.clip.source_length_frames
 	if clip_len <= 0 {
 		return
 	}
@@ -853,18 +854,18 @@ draw_drag_ghost :: proc(
 	// mouse during the drag), but the ghost must never hide an overlap it would
 	// cause: clamp once more against the hovered track's live content.
 	placed := clip_place_in_track(
-		&timeline.tracks[drag_hover_track],
+		&timeline.tracks[clip_move.hover_track],
 		-1,
 		clip_len,
-		drag_ghost_start,
+		clip_move.ghost_start,
 	)
-	lane := clay.GetElementData(clay.ID("ClipsSection", u32(drag_hover_track))).boundingBox
+	lane := clay.GetElementData(clay.ID("ClipsSection", u32(clip_move.hover_track))).boundingBox
 	if lane.width <= 0 || lane.height <= 0 {
 		return
 	}
 	// Lane origin is at frame 0 = ruler.x; tiles slide with the view offset.
-	x0 := lane.x + (f32(placed) - timeline_view_start) * timeline_zoom
-	w := f32(clip_len) * timeline_zoom
+	x0 := lane.x + (f32(placed) - timeline_view.start) * timeline_view.zoom
+	w := f32(clip_len) * timeline_view.zoom
 	// Ghost tile height matches real clips (CLIP_TILE_HEIGHT, same as the layout).
 	h := CLIP_TILE_HEIGHT
 	bounds := clay.BoundingBox {
@@ -894,7 +895,7 @@ draw_track_drag_ghost :: proc(
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 ) {
-	if active_interaction != .Track_Drag || drag_track_idx < 0 {
+	if active_interaction != .Track_Drag || track_drag.idx < 0 {
 		return
 	}
 	// The whole tracks body (strip incl. the name column) is the safe clip
@@ -904,7 +905,7 @@ draw_track_drag_ghost :: proc(
 	if body.width <= 0 || body.height <= 0 {
 		return
 	}
-	row_box := clay.GetElementData(clay.ID("TrackRow", u32(drag_track_idx))).boundingBox
+	row_box := clay.GetElementData(clay.ID("TrackRow", u32(track_drag.idx))).boundingBox
 	if row_box.width <= 0 || row_box.height <= 0 {
 		return
 	}
@@ -917,8 +918,8 @@ draw_track_drag_ghost :: proc(
 	// Ghost row in the hovered gap: a full-width translucent tile (gutter +
 	// clips band) centered on the gap strip, plus the gap itself highlighted so
 	// the exact "New track" slot the drop targets is unmistakable.
-	if drag_track_hover_row >= 0 {
-		gap := clay.GetElementData(clay.ID("TrackGap", u32(drag_track_hover_row))).boundingBox
+	if track_drag.hover_row >= 0 {
+		gap := clay.GetElementData(clay.ID("TrackGap", u32(track_drag.hover_row))).boundingBox
 		if gap.width > 0 && gap.height > 0 {
 			highlight := gap
 			highlight.x = row_box.x
@@ -1338,6 +1339,65 @@ icon_box :: proc(element_id: string, size: f32, hash: ..u32) -> (clay.BoundingBo
 		true
 }
 
+// finder_icon_for maps a finder entry kind to the icon that represents it.
+finder_icon_for :: proc(kind: Finder_Kind) -> Icon_Id {
+	switch kind {
+	case .Folder:
+		return .FinderFolder
+	case .Video:
+		return .FinderVideo
+	case .Audio:
+		return .FinderAudio
+	case .Image:
+		return .FinderImage
+	case .Subtitle:
+		return .FinderSubtitle
+	case .File:
+		return .FinderFile
+	case:
+		return .FinderFile
+	}
+}
+
+// draw_finder_rows paints every visible finder row's icon cell over the laid-out
+// popup (gpu_draw.odin's icon textures are GPU-side; the clay step only made
+// cells). A row whose fullpath matches an imported media-bin asset with a
+// decoded thumbnail draws that thumbnail instead of the generic kind icon —
+// the finder reuses real thumbs when it has them, icons otherwise.
+draw_finder_rows :: proc(
+	renderer: ^GPU_Renderer,
+	command_buffer: ^sdl.GPUCommandBuffer,
+	pass: ^sdl.GPURenderPass,
+) {
+	if !file_finder.active {
+		return
+	}
+	visible := min(FINDER_MAX_ROWS, len(file_finder.filtered))
+	for r in 0 ..< visible {
+		ri := file_finder.scroll + r
+		box, ok := icon_box("FinderRowIcon", 16, u32(ri))
+		if !ok {
+			continue
+		}
+		sel := ri == file_finder.sel
+		col := sel ? BACKGROUND : TEXT
+		entry := file_finder.entries[file_finder.filtered[ri]]
+		// Reuse the media-bin thumbnail when this exact path was imported.
+		thumb: ^sdl.GPUTexture
+		for &a in media_bin.assets {
+			if a.has_thumb && a.thumb_tex != nil && strings.compare(string(a.path), entry.fullpath) == 0 {
+				thumb = a.thumb_tex
+				break
+			}
+		}
+		if thumb != nil {
+			draw_tex_quad(renderer, command_buffer, pass, box, thumb, {0, 0, 1, 1})
+		} else {
+			render_icon(renderer, command_buffer, pass, box, finder_icon_for(entry.kind), col)
+		}
+	}
+}
+
 // draw_ui_icons overlays the vector icons for the duplicate/remove-track and
 // jog buttons plus the snap playhead/clip toggle buttons (settings_icon_button).
 // The clay elements are hit-test targets (main.odin) with ids unchanged; only
@@ -1355,7 +1415,7 @@ draw_ui_icons :: proc(
 		pass,
 		"SnapClipToPh",
 		.SnapClipToPlayhead,
-		snap_clips_to_playhead,
+		editor_flags.snap_clips_to_playhead,
 		16,
 	)
 	draw_icon_in_element(
@@ -1364,7 +1424,7 @@ draw_ui_icons :: proc(
 		pass,
 		"SnapPhToClip",
 		.SnapPlayheadToClip,
-		snap_playhead_to_clips,
+		editor_flags.snap_playhead_to_clips,
 		16,
 	)
 	draw_icon_in_element(
@@ -1373,7 +1433,7 @@ draw_ui_icons :: proc(
 		pass,
 		"AutoKf",
 		.AutoKeyframe,
-		auto_keyframe,
+		editor_flags.auto_keyframe,
 		16,
 	)
 	draw_icon_in_element(
@@ -1382,7 +1442,7 @@ draw_ui_icons :: proc(
 		pass,
 		"PlayBack",
 		.SkipBack,
-		playhead.playing && playback_dir == -1,
+		playhead.playing && playback.dir == -1,
 		15,
 	)
 	draw_icon_in_element(
@@ -1391,7 +1451,7 @@ draw_ui_icons :: proc(
 		pass,
 		"PlayFwd",
 		.SkipForward,
-		playhead.playing && playback_dir == 1,
+		playhead.playing && playback.dir == 1,
 		15,
 	)
 	// NOTE: The Duplicate/Remove icons sit in the scrolled track-name gutters,
@@ -1482,13 +1542,19 @@ draw_icon_in_element_color :: proc(
 // jog boost that only the video side honors).
 AUDIO_DESYNC_ALERT_SEC :: 0.4
 
-audio_skew_diag_tick: u64
-audio_skew_diag_prev_rsync: i64
-audio_skew_diag_prev_holes: i64
-audio_skew_diag_prev_ncov: u64
-audio_skew_diag_prev_full: u64
-audio_skew_diag_prev_wedge: u64
-audio_skew_diag_prev_rebuilt: u64
+// Audio_Skew_Diag is the audio-desync alert's rate limiter: the last tick the
+// alert fired (at most once per second) and the previous report's counters, so
+// the alert can show how each counter moved since the last line.
+Audio_Skew_Diag :: struct {
+	tick:       u64,
+	prev_rsync: i64,
+	prev_holes: i64,
+	prev_ncov:  u64,
+	prev_full:  u64,
+	prev_wedge: u64,
+	prev_rebuilt: u64,
+}
+audio_skew_diag: Audio_Skew_Diag
 
 draw_preview_hud :: proc(
 	renderer: ^GPU_Renderer,
@@ -1496,7 +1562,7 @@ draw_preview_hud :: proc(
 	pass: ^sdl.GPURenderPass,
 	preview: clay.BoundingBox,
 ) {
-	if !sync.atomic_load(&audio_run_flag) {
+	if !sync.atomic_load(&audio_prod.run) {
 		return
 	}
 	fps := timeline_fps()
@@ -1510,9 +1576,9 @@ draw_preview_hud :: proc(
 	// clock (the way the producer pins its queue target) — the residual is the
 	// true device-vs-playhead offset, a few ms at most.
 	now := sdl.GetTicksNS()
-	dev_at := sync.atomic_load(&audio_dev_at_ns)
-	dev_raw := sync.atomic_load(&audio_dev_frame)
-	rate_sc := max(1.0, playback_rate)
+	dev_at := sync.atomic_load(&playback.dev_at_ns)
+	dev_raw := sync.atomic_load(&playback.dev_frame)
+	rate_sc := max(1.0, playback.rate)
 	dev_now := dev_raw + (dev_at > 0 ? i64(f64(now - u64(dev_at)) / 1e9 * rate_sc * f64(fps)) : 0)
 	// playhead.frame is the last UI-frame publish; extrapolate it to now like
 	// the producer does (audio.odin .feed) so both ends share the same clock.
@@ -1527,33 +1593,33 @@ draw_preview_hud :: proc(
 		f64(ph) / fps,
 		f64(dev - ph) / fps,
 	)
-	if now := sdl.GetTicksNS(); dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag_tick >= u64(1_000_000_000) {
-		rsync := sync.atomic_load(&audio_resync_evt)
-		prod := sync.atomic_load(&audio_prod_frame)
-		holes := sync.atomic_load(&audio_silence_holes)
-		anchor := sync.atomic_load(&audio_anchor_frame)
+	if now := sdl.GetTicksNS(); dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
+		rsync := sync.atomic_load(&audio_prod.resync)
+		prod := sync.atomic_load(&audio_prod.prod_frame)
+		holes := sync.atomic_load(&audio_rpt.silence_holes)
+		anchor := sync.atomic_load(&audio_prod.anchor_frame)
 		fmt.printf(
 			"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
 			f64(dev-ph)/fps,
 			f64(prod)/fps,
 			f64(prod-dev)/fps,
 			f64(anchor)/fps,
-			rsync, rsync-audio_skew_diag_prev_rsync,
-			sync.atomic_load(&audio_provisioning) ? 1 : 0,
-			holes, holes-audio_skew_diag_prev_holes,
-			audio_rpt_skip_nocov, audio_rpt_skip_nocov-audio_skew_diag_prev_ncov,
-			audio_rpt_skip_full, audio_rpt_skip_full-audio_skew_diag_prev_full,
-			audio_wedge_heal, audio_wedge_heal-audio_skew_diag_prev_wedge,
-			audio_rate_rebuilt, audio_rate_rebuilt-audio_skew_diag_prev_rebuilt,
-			playback_rate, playback_boost,
+			rsync, rsync-audio_skew_diag.prev_rsync,
+			sync.atomic_load(&audio_prod.provisioning) ? 1 : 0,
+			holes, holes-audio_skew_diag.prev_holes,
+			audio_rpt.skip_nocov, audio_rpt.skip_nocov-audio_skew_diag.prev_ncov,
+			audio_rpt.skip_full, audio_rpt.skip_full-audio_skew_diag.prev_full,
+			audio_rpt.wedge_heal, audio_rpt.wedge_heal-audio_skew_diag.prev_wedge,
+			audio_rpt.rate_rebuilt, audio_rpt.rate_rebuilt-audio_skew_diag.prev_rebuilt,
+			playback.rate, playback.boost,
 		)
-		audio_skew_diag_tick = now
-		audio_skew_diag_prev_rsync = rsync
-		audio_skew_diag_prev_holes = holes
-		audio_skew_diag_prev_ncov = audio_rpt_skip_nocov
-		audio_skew_diag_prev_full = audio_rpt_skip_full
-		audio_skew_diag_prev_wedge = audio_wedge_heal
-		audio_skew_diag_prev_rebuilt = audio_rate_rebuilt
+		audio_skew_diag.tick = now
+		audio_skew_diag.prev_rsync = rsync
+		audio_skew_diag.prev_holes = holes
+		audio_skew_diag.prev_ncov = audio_rpt.skip_nocov
+		audio_skew_diag.prev_full = audio_rpt.skip_full
+		audio_skew_diag.prev_wedge = audio_rpt.wedge_heal
+		audio_skew_diag.prev_rebuilt = audio_rpt.rate_rebuilt
 	}
 	fs: u16 = FONT_SMALL
 	text_w := f32(len(label)) * f32(fs) * 0.6
@@ -1582,12 +1648,11 @@ draw_preview_hud :: proc(
 	)
 }
 
-// import_cancel_box is the corner badge's Cancel button hit-box, set by
+// import_ui.cancel_box is the corner badge's Cancel button hit-box, set by
 // draw_import_progress each frame while the badge is visible (interaction.odin
 // uses it for manual click dispatch).
-import_cancel_box: clay.BoundingBox
 
-// draw_ui_notice paints the transient on-window notice (ui_notice_text) as a
+// draw_ui_notice paints the transient on-window notice (ui_notice.text) as a
 // small dimmed panel centered on the window, shown until its deadline passes.
 // main.odin calls clear_expired_ui_notice each frame so the string is freed the
 // moment the notice expires.
@@ -1597,7 +1662,7 @@ draw_ui_notice :: proc(
 	pass: ^sdl.GPURenderPass,
 	win_w, win_h: f32,
 ) {
-	if len(ui_notice_text) == 0 || sdl.GetTicks() >= ui_notice_until {
+	if len(ui_notice.text) == 0 || sdl.GetTicks() >= ui_notice.until {
 		return
 	}
 	render_sdf_rect(renderer, command_buffer, pass, {0, 0, win_w, win_h}, {6, 7, 10, 205}, 0, 0)
@@ -1621,7 +1686,7 @@ draw_ui_notice :: proc(
 		0,
 	)
 
-	msg := string(ui_notice_text)
+	msg := string(ui_notice.text)
 	msg_len := min(len(msg), 120)
 	render_text(
 		renderer,
@@ -1660,7 +1725,7 @@ draw_import_progress :: proc(
 ) {
 	active, frac, phase, src := import_bg_status()
 	if !active {
-		import_cancel_box = {}
+		import_ui.cancel_box = {}
 		return
 	}
 
@@ -1801,7 +1866,7 @@ draw_import_progress :: proc(
 	}
 	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON, 6, 0)
 	render_sdf_rect(renderer, command_buffer, pass, cancel, BUTTON_BORDER, 6, 1)
-	import_cancel_box = cancel
+	import_ui.cancel_box = cancel
 	cancel_label := "Cancel"
 	render_text(
 		renderer,
@@ -2016,22 +2081,23 @@ release_slot_owned_textures :: proc(device: ^sdl.GPUDevice) {
 // Owned text-texture lifecycle. A text slot owns its tight texture (video
 // slots instead point at the shared renderer.preview_textures). When the
 // preview state reassigns a slot (it has no GPU device), it stashes the old
-// owned texture here; the render loop drains the queue each frame with the
-// device in hand, so a texture never leaks across a slot reassignment.
+// owned texture in text_texture_releases; the render loop drains the queue
+// each frame with the device in hand, so a texture never leaks across a slot
+// reassignment.
 // ---------------------------------------------------------------------------
-pending_text_release: [dynamic]^sdl.GPUTexture
+text_texture_releases: [dynamic]^sdl.GPUTexture
 
 queue_text_texture_release :: proc(tex: ^sdl.GPUTexture) {
 	if tex != nil {
-		append(&pending_text_release, tex)
+		append(&text_texture_releases, tex)
 	}
 }
 
 drain_pending_text_releases :: proc(device: ^sdl.GPUDevice) {
-	for t in pending_text_release {
+	for t in text_texture_releases {
 		sdl.ReleaseGPUTexture(device, t)
 	}
-	clear(&pending_text_release)
+	clear(&text_texture_releases)
 }
 
 

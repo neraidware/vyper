@@ -37,15 +37,15 @@ media_bin_row_height :: proc() -> f32 {
 }
 
 // media_bin_max_scroll is the largest usable vertical scroll offset for the
-// bin's manual clip scroll, so media_bin_scroll never lets the grid drift
+// bin's manual clip scroll, so panel_views.media_bin_scroll never lets the grid drift
 // above its first cell or below its last. 0 when the grid fits (or empty).
 media_bin_max_scroll :: proc() -> f32 {
 	mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
-	if mb.width <= 0 || len(media_assets) == 0 {
+	if mb.width <= 0 || len(media_bin.assets) == 0 {
 		return 0
 	}
 	cols := media_bin_cols()
-	rows := (len(media_assets) + cols - 1) / cols
+	rows := (len(media_bin.assets) + cols - 1) / cols
 	content := f32(rows) * media_bin_row_height()
 	// Approximate the header ("Media Bin" label + Import button row) so the
 	// viewport height the grid scrolls within is roughly the panel's body.
@@ -56,7 +56,7 @@ media_bin_max_scroll :: proc() -> f32 {
 
 // media_bin_item_at returns the index of the bin cell under the pointer, or -1.
 media_bin_item_at :: proc(mx, my: f32) -> int {
-	for i in 0 ..< len(media_assets) {
+	for i in 0 ..< len(media_bin.assets) {
 		if clay.PointerOver(clay.ID("MediaItem", u32(i))) {
 			return i
 		}
@@ -173,7 +173,7 @@ timeline_frame_from_x :: proc(mx: f32) -> i64 {
 	if len(timeline.tracks) > 0 {
 		start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 		if start > 0 {
-			return max(0, i64((mx - start) / timeline_zoom + timeline_view_start))
+			return max(0, i64((mx - start) / timeline_view.zoom + timeline_view.start))
 		}
 	}
 	empty := clay.GetElementData(clay.ID("EmptyTimeline")).boundingBox
@@ -184,7 +184,7 @@ timeline_frame_from_x :: proc(mx: f32) -> i64 {
 		// unshifted origin puts both the ghost tile and the committed clip
 		// ~GUTTER_WIDTH + SECTION_GAP pixels right of the cursor.
 		origin := empty.x + f32(TIMELINE_PADDING) + GUTTER_WIDTH + SECTION_GAP
-		return max(0, i64((mx - origin) / timeline_zoom + timeline_view_start))
+		return max(0, i64((mx - origin) / timeline_view.zoom + timeline_view.start))
 	}
 	return 0
 }
@@ -232,20 +232,20 @@ lane_box_for :: proc(lane: Media_Lane) -> clay.BoundingBox {
 // begin_media_drag arms a bin-item drag: selects the asset and, from the
 // current pointer position, computes the lanes + ghost.
 begin_media_drag :: proc(asset_index: int, mx, my: f32) {
-	if asset_index < 0 || asset_index >= len(media_assets) {
+	if asset_index < 0 || asset_index >= len(media_bin.assets) {
 		return
 	}
-	asset := &media_assets[asset_index]
-	selected_asset_id = asset.id
+	asset := &media_bin.assets[asset_index]
+	selection.asset_id = asset.id
 	active_interaction = .Media_Bin_Drag
-	media_drag_asset_id = asset.id
-	media_drag_trace_once = true
-	media_drag_asset_index = asset_index
+	media_drag.asset_id = asset.id
+	media_drag.trace_once = true
+	media_drag.asset_index = asset_index
 	item := clay.GetElementData(clay.ID("MediaItem", u32(asset_index))).boundingBox
-	media_drag_pick_dx = mx - item.x
-	media_drag_pick_dy = my - item.y
-	media_drag_mx = mx
-	media_drag_my = my
+	media_drag.pick_dx = mx - item.x
+	media_drag.pick_dy = my - item.y
+	media_drag.mx = mx
+	media_drag.my = my
 	update_media_drag_lanes(mx, my)
 }
 
@@ -255,21 +255,21 @@ update_media_drag_lanes :: proc(mx, my: f32) {
 	if active_interaction != .Media_Bin_Drag {
 		return
 	}
-	media_drag_mx = mx
-	media_drag_my = my
+	media_drag.mx = mx
+	media_drag.my = my
 	target := timeline_drop_target(mx, my)
-	media_drag_target = target
+	media_drag.target = target
 	if target < 0 {
-		clear(&media_drag_lanes)
+		clear(&media_drag.lanes)
 		return
 	}
-	asset := find_asset(media_drag_asset_id)
+	asset := find_asset(media_drag.asset_id)
 	if asset == nil {
-		clear(&media_drag_lanes)
+		clear(&media_drag.lanes)
 		return
 	}
-	media_drag_frame = timeline_frame_from_x(mx)
-	compute_media_drop_lanes(asset, target, media_drag_frame, &media_drag_lanes)
+	media_drag.frame = timeline_frame_from_x(mx)
+	compute_media_drop_lanes(asset, target, media_drag.frame, &media_drag.lanes)
 }
 
 // end_media_drag finishes a bin drag: when released over a valid lane, adds
@@ -278,13 +278,13 @@ update_media_drag_lanes :: proc(mx, my: f32) {
 end_media_drag :: proc(mx, my: f32) {
 	target := timeline_drop_target(mx, my)
 	if target >= 0 {
-		add_asset_to_timeline(media_drag_asset_id, target, timeline_frame_from_x(mx))
+		add_asset_to_timeline(media_drag.asset_id, target, timeline_frame_from_x(mx))
 	}
 	active_interaction = .None
-	media_drag_asset_id = 0
-	media_drag_asset_index = -1
-	media_drag_target = -1
-	clear(&media_drag_lanes)
+	media_drag.asset_id = 0
+	media_drag.asset_index = -1
+	media_drag.target = -1
+	clear(&media_drag.lanes)
 }
 
 // media_kind_color is the placeholder fill for a bin cell with no thumbnail
@@ -331,8 +331,8 @@ thumb_box_for :: proc(asset_index: int) -> clay.BoundingBox {
 // laid-out grid: the asset's texture for files with a decoded thumb, else a
 // kind-colored placeholder.
 draw_media_bin_thumbnails :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer, pass: ^sdl.GPURenderPass) {
-	for i in 0 ..< len(media_assets) {
-		asset := &media_assets[i]
+	for i in 0 ..< len(media_bin.assets) {
+		asset := &media_bin.assets[i]
 		box := thumb_box_for(i)
 		if box.width <= 0 || box.height <= 0 {
 			continue
@@ -358,12 +358,12 @@ draw_media_drag_ghost :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 	if active_interaction != .Media_Bin_Drag {
 		return
 	}
-	asset := find_asset(media_drag_asset_id)
+	asset := find_asset(media_drag.asset_id)
 	if asset == nil {
 		return
 	}
-	if media_drag_target >= 0 && len(media_drag_lanes) > 0 {
-		for lane in media_drag_lanes {
+	if media_drag.target >= 0 && len(media_drag.lanes) > 0 {
+		for lane in media_drag.lanes {
 			lane_box := lane_box_for(lane)
 			if lane_box.width <= 0 || lane_box.height <= 0 {
 				continue
@@ -397,15 +397,15 @@ render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179
 				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179, 255}, 0, 2)
 				}
 			}
-			if media_drag_trace_once {
+			if media_drag.trace_once {
 				rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
 				fmt.printf("[md] lane=%d created=%v gx=%.1f rg=%v row=%v lane_box=%v\n", lane.track_idx, lane.created, gx, rg, row, lane_box)
-				media_drag_trace_once = false
+				media_drag.trace_once = false
 			}
 			b := clay.BoundingBox{
-				x = lane_box.x + (f32(lane.placed) - timeline_view_start) * timeline_zoom,
+				x = lane_box.x + (f32(lane.placed) - timeline_view.start) * timeline_view.zoom,
 				y = lane_box.y,
-				width = f32(lane.clip_len) * timeline_zoom,
+				width = f32(lane.clip_len) * timeline_view.zoom,
 				height = lane_box.height,
 			}
 			sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane_box.x), c.int(lane_box.y), c.int(lane_box.width), c.int(lane_box.height)})
@@ -470,7 +470,7 @@ draw_media_drag_float :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUC
 			tw = th * aspect
 		}
 	}
-	tile := clay.BoundingBox{x = media_drag_mx + 12, y = media_drag_my + 16, width = tw, height = th}
+	tile := clay.BoundingBox{x = media_drag.mx + 12, y = media_drag.my + 16, width = tw, height = th}
 	if asset.has_thumb && asset.thumb_tex != nil {
 		draw_tex_quad(renderer, command_buffer, pass, tile, asset.thumb_tex, {0, 0, 1, 1})
 	} else {
@@ -533,7 +533,7 @@ upload_asset_thumbnail :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPU
 // release_media_asset_textures frees every asset's owned thumbnail texture at
 // shutdown.
 release_media_asset_textures :: proc(device: ^sdl.GPUDevice) {
-	for &a in media_assets {
+	for &a in media_bin.assets {
 		if a.thumb_tex != nil {
 			sdl.ReleaseGPUTexture(device, a.thumb_tex)
 			a.thumb_tex = nil

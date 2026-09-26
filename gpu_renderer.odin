@@ -210,7 +210,7 @@ glyph_ensure :: proc(a: ^Glyph_Atlas, r: rune) -> (slot: u32, ok: bool, is_new: 
 	}
 	assert(a.slot_count < MAX_GLYPH_SLOTS, "glyph atlas: slot table full")
 	if !a.font_ready {
-		stb.InitFont(&a.font, raw_data(font_data), 0)
+		stb.InitFont(&a.font, raw_data(font_state.data), 0)
 		glyph_atlas_read_metrics(a)
 		a.font_ready = true
 	}
@@ -451,7 +451,7 @@ glyph_atlas_ensure_ascii :: proc(a: ^Glyph_Atlas) {
 // the grid is zeroed (never a second mirror to keep in sync).
 glyph_atlas_bake_pending_ink :: proc(a: ^Glyph_Atlas) {
 	if !a.font_ready {
-		stb.InitFont(&a.font, raw_data(font_data), 0)
+		stb.InitFont(&a.font, raw_data(font_state.data), 0)
 		glyph_atlas_read_metrics(a)
 		a.font_ready = true
 	}

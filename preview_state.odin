@@ -15,18 +15,23 @@ import "core:strings"
 // the prewarm kicks in (in timeline frames). At 60fps, 120 frames = 2s.
 WARM_LOOKAHEAD :: 120
 
-// warm_decoder pre-opens the clip that will play next (the one starting flush
-// at -- or first after -- the current front video clip's end) and pre-decodes
-// its first few frames while the current clip is still playing. When the
-// playhead crosses the boundary, update_preview_slots hands this warm decoder
-// to the slot so the transition is a cache hit instead of a cold
-// reopen + keyframe-to-target seek that stalls the render loop exactly at the
-// cut. The cold seek itself is absorbed earlier, during the tail of the
-// current clip, where the dropped-frame preview tolerates a skip.
-warm_decoder: Clip_Decoder
-warm_buf: [PREVIEW_W * PREVIEW_H * 4]u8
-warm_clip_id: u64
-warm_valid: bool
+// Warm_State is the preview prewarm cache: the decoder that pre-opens the clip
+// which will play next (the one starting flush at -- or first after -- the
+// current front video clip's end) and pre-decodes its first few frames while
+// the current clip is still playing. When the playhead crosses the boundary,
+// update_preview_slots hands this warm decoder to the slot so the transition is
+// a cache hit instead of a cold reopen + keyframe-to-target seek that stalls
+// the render loop exactly at the cut. The cold seek itself is absorbed earlier,
+// during the tail of the current clip, where the dropped-frame preview
+// tolerates a skip.
+Warm_State :: struct {
+	decoder: Clip_Decoder,
+	buf:     [PREVIEW_W * PREVIEW_H * 4]u8,
+	// clip_id is the clip the decoder/buf were warmed for; 0 = none.
+	clip_id: u64,
+	valid:   bool,
+}
+warm: Warm_State
 
 // next_clip_on_track returns the next VIDEO clip on `track` starting at
 // `start_idx` whose timeline kickoff is at/after `at_or_after` (the earliest
@@ -57,7 +62,7 @@ next_clip_on_track :: proc(track: ^Track, start_idx: int, at_or_after: i64) -> ^
 // WARM_LOOKAHEAD frames of the boundary. No-op while paused/scrubbing (no
 // wasted seeks) and when no upcoming clip exists.
 prewarm_next_clip :: proc() {
-	if !playhead.playing || playback_dir != 1 {
+	if !playhead.playing || playback.dir != 1 {
 		return
 	}
 	// The single handoff decoder can warm only ONE upcoming clip per call.
@@ -123,13 +128,13 @@ prewarm_next_clip :: proc() {
 	if best == nil {
 		return
 	}
-	if warm_valid && warm_clip_id == best.clip_id {
+	if warm.valid && warm.clip_id == best.clip_id {
 		// Target unchanged; nothing new to decode (cached frames persist).
 		return
 	}
-	if warm_valid {
-		clip_decoder_reset(&warm_decoder)
-		warm_valid = false
+	if warm.valid {
+		clip_decoder_reset(&warm.decoder)
+		warm.valid = false
 	}
 	warm_proxy_buf: [4096]u8
 	// Resolve the preview target PER FRAME (segmented proxies grow as the
@@ -149,12 +154,12 @@ prewarm_next_clip :: proc() {
 		warm_proxy_buf[:],
 		warm_asset != nil && asset_source_hw(warm_asset),
 	)
-	decoder_set_preview(&warm_decoder, warm_pick, warm_base)
+	decoder_set_preview(&warm.decoder, warm_pick, warm_base)
 	if !decode_clip_frame_sync(
-		&warm_decoder,
+		&warm.decoder,
 		best.path,
 		best.source_start_frame,
-		warm_buf[:],
+		warm.buf[:],
 	) {
 		return
 	}
@@ -162,8 +167,8 @@ prewarm_next_clip :: proc() {
 	// still image has no following frames to decode -- its single frame was
 	// just decoded, and that one frame is the whole clip.
 	if best.is_still {
-		warm_clip_id = best.clip_id
-		warm_valid = true
+		warm.clip_id = best.clip_id
+		warm.valid = true
 		return
 	}
 	for kf in i64(1) ..< 4 {
@@ -175,13 +180,13 @@ prewarm_next_clip :: proc() {
 			warm_proxy_buf[:],
 			warm_asset != nil && asset_source_hw(warm_asset),
 		)
-		decoder_set_preview(&warm_decoder, warm_pick, warm_base)
-		if !decode_clip_frame_sync(&warm_decoder, best.path, wf, warm_buf[:]) {
+		decoder_set_preview(&warm.decoder, warm_pick, warm_base)
+		if !decode_clip_frame_sync(&warm.decoder, best.path, wf, warm.buf[:]) {
 			break
 		}
 	}
-	warm_clip_id = best.clip_id
-	warm_valid = true
+	warm.clip_id = best.clip_id
+	warm.valid = true
 }
 
 // slot_claim_flush_peer finds the slot a NEWLY-covering video clip should
@@ -269,7 +274,7 @@ update_preview_slots :: proc() -> bool {
 	claimed: [MAX_PREVIEW_SLOTS]bool
 	layer: u8
 	if active_interaction == .Playhead_Scrub {
-		scrub_tick += 1
+		playback.scrub_tick += 1
 	}
 	// Warm the upcoming clip's decoder before the playhead crosses the
 	// boundary, so the transition hands over a warm decoder (no cut stall).
@@ -355,7 +360,7 @@ update_preview_slots :: proc() -> bool {
 				// takes precedence -- it already holds this clip's first frames
 				// decoded (instant boundary), whereas the preserved decoder would
 				// still have to seek across a source gap.
-				warm_hit := warm_valid && warm_clip_id == clip.clip_id
+				warm_hit := warm.valid && warm.clip_id == clip.clip_id
 				same_asset := slot.in_use && !warm_hit && slot.path == clip.path
 				saved_dec := slot.dec
 				if slot.in_use && !same_asset {
@@ -384,10 +389,10 @@ update_preview_slots :: proc() -> bool {
 				if same_asset {
 					slot.dec = saved_dec
 				} else if warm_hit {
-					slot.dec = warm_decoder
-					warm_decoder = {}
-					warm_valid = false
-					warm_clip_id = 0
+					slot.dec = warm.decoder
+					warm.decoder = {}
+					warm.valid = false
+					warm.clip_id = 0
 				}
 				if warm_hit {
 					slot.prime_sync = true
@@ -419,7 +424,7 @@ update_preview_slots :: proc() -> bool {
 						same_asset,
 						warm_hit,
 						clip.clip_id,
-						warm_clip_id,
+						warm.clip_id,
 					)
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
@@ -465,7 +470,7 @@ update_preview_slots :: proc() -> bool {
 				// face on screen through the drag; the decode below chases the
 				// clip's new position (the idle-skip misses because the
 				// requested clip_frame changed).
-				if drag_clip == clip || active_interaction == .Clip_Resize {
+				if clip_move.clip == clip || active_interaction == .Clip_Resize {
 					// Leave has_frame as-is: paint the stale face through the
 					// drag (the decode below chases the clip's new position).
 				} else if fresh_claim {
@@ -546,8 +551,8 @@ update_preview_slots :: proc() -> bool {
 				// old tight-ink height did).
 				base_bw, base_bh := text_buf_size_for(
 					clip.name,
-					&text_clip_font,
-					&text_clip_font_init,
+					&text_clip_state.font,
+					&text_clip_state.font_init,
 					TEXT_CLIP_FONT_PIXELS,
 				)
 				if base_changed {
@@ -569,8 +574,8 @@ update_preview_slots :: proc() -> bool {
 						slot.text_base_buf,
 						base_bw,
 						base_bh,
-						&text_clip_font,
-						&text_clip_font_init,
+						&text_clip_state.font,
+						&text_clip_state.font_init,
 						slot.text_scratch,
 						TEXT_CLIP_FONT_PIXELS,
 					)
@@ -601,8 +606,8 @@ update_preview_slots :: proc() -> bool {
 					}
 					bw, bh := text_buf_size_for(
 						clip.name,
-						&text_clip_font,
-						&text_clip_font_init,
+						&text_clip_state.font,
+						&text_clip_state.font_init,
 						font_px,
 					)
 					need := bw * bh * 4
@@ -615,8 +620,8 @@ update_preview_slots :: proc() -> bool {
 						slot.text_buf,
 						bw,
 						bh,
-						&text_clip_font,
-						&text_clip_font_init,
+						&text_clip_state.font,
+						&text_clip_state.font_init,
 						slot.text_scratch,
 						font_px,
 					)
@@ -664,7 +669,7 @@ update_preview_slots :: proc() -> bool {
 			// mid-drag shows immediately.
 			scrub_skip :=
 				active_interaction == .Playhead_Scrub &&
-				scrub_tick % SCRUB_DECIMATION != 0 &&
+				playback.scrub_tick % SCRUB_DECIMATION != 0 &&
 				!async_has_worker(slot_idx)
 			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
 			if clip.is_still {
@@ -694,7 +699,7 @@ update_preview_slots :: proc() -> bool {
 			// latch stays put until the asset changes. Clips outside the media
 			// bin (no asset entry) fall back to the proxy.
 			prefer_source := false
-			if playhead.playing && playback_dir == 1 {
+			if playhead.playing && playback.dir == 1 {
 				asset := find_asset(clip.asset_id)
 				prefer_source = asset != nil && asset_source_hw(asset)
 			}
@@ -901,10 +906,10 @@ update_preview_slots :: proc() -> bool {
 invalidate_preview_slots :: proc() {
 	// The warm decoder targets a clip that no longer exists; drop it so a
 	// stale hand-in can never occur.
-	if warm_valid {
-		clip_decoder_reset(&warm_decoder)
-		warm_valid = false
-		warm_clip_id = 0
+	if warm.valid {
+		clip_decoder_reset(&warm.decoder)
+		warm.valid = false
+		warm.clip_id = 0
 	}
 	for i in 0 ..< MAX_PREVIEW_SLOTS {
 		slot := &preview_slots[i]
@@ -988,8 +993,8 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		// it tracks the deepest descender and drags the baseline up.
 		base_bw, base_bh := text_buf_size_for_lines(
 			lines,
-			&text_clip_font,
-			&text_clip_font_init,
+			&text_clip_state.font,
+			&text_clip_state.font_init,
 			TEXT_CLIP_FONT_PIXELS,
 		)
 		need_base := base_bw * base_bh * 4
@@ -1008,8 +1013,8 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			slot.text_base_buf,
 			base_bw,
 			base_bh,
-			&text_clip_font,
-			&text_clip_font_init,
+			&text_clip_state.font,
+			&text_clip_state.font_init,
 			slot.text_scratch,
 			TEXT_CLIP_FONT_PIXELS,
 			context.temp_allocator,
@@ -1060,7 +1065,7 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			slot.text_scratch = {} // stale-len hazard (above)
 			slot.text_scratch = make([]u8, need_sc)
 		}
-		bw, bh := text_buf_size_for_lines(lines, &text_clip_font, &text_clip_font_init, font_px)
+		bw, bh := text_buf_size_for_lines(lines, &text_clip_state.font, &text_clip_state.font_init, font_px)
 		need := bw * bh * 4
 		if need > len(slot.text_buf) {
 			delete(slot.text_buf)
@@ -1072,8 +1077,8 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			slot.text_buf,
 			bw,
 			bh,
-			&text_clip_font,
-			&text_clip_font_init,
+			&text_clip_state.font,
+			&text_clip_state.font_init,
 			slot.text_scratch,
 			font_px,
 			context.temp_allocator,

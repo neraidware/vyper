@@ -10,7 +10,15 @@ import "core:unicode/utf8"
 // Font loading (via fontconfig) and Clay text-measurement/error callbacks.
 // ---------------------------------------------------------------------------
 
-font_data: []byte
+// Font_State is the loaded UI font: the in-memory TTF bytes and the
+// resolved fontconfig path buffer used to find them. Owned by load_font_data /
+// system_monospace_font; read by Clay setup.
+Font_State :: struct {
+	data:       []byte,
+	// sys_path is where system_monospace_font writes the resolved path.
+	sys_path:   [1024]byte,
+}
+font_state: Font_State
 
 load_font_data :: proc() -> bool {
 	path := string(system_monospace_font())
@@ -19,26 +27,25 @@ load_font_data :: proc() -> bool {
 		fmt.println("Could not load font:", path)
 		return false
 	}
-	font_data = data
+	font_state.data = data
 	return true
 }
 
-system_font_path: [1024]byte
-
 system_monospace_font :: proc() -> cstring {
+	sys := &font_state.sys_path
 	when ODIN_OS == .Windows {
 		// No fontconfig on Windows: prefer Noto Sans if present, else Segoe UI
 		// (the default sans face that ships with every install).
 		noto := "C:\\Windows\\Fonts\\NotoSans-Regular.ttf"
 		if os.exists(noto) {
-			n := copy(system_font_path[:], noto)
-			system_font_path[n] = 0
-			return cstring(&system_font_path[0])
+			n := copy(sys[:], noto)
+			sys[n] = 0
+			return cstring(&sys[0])
 		}
 		computed := "C:\\Windows\\Fonts\\segoeui.ttf"
-		n := copy(system_font_path[:], computed)
-		system_font_path[n] = 0
-		return cstring(&system_font_path[0])
+		n := copy(sys[:], computed)
+		sys[n] = 0
+		return cstring(&sys[0])
 	} else {
 		// Ask Fontconfig for DejaVu Sans (the editor UI + title/subtitle clips),
 		// instead of hard-coding a path. fc-match aliases "DejaVu Sans" and falls
@@ -46,10 +53,10 @@ system_monospace_font :: proc() -> cstring {
 		out, _, okin := run_capture({"fc-match", "-f", "%{file}", "monospace"})
 		defer delete(out)
 		if okin && len(out) > 0 {
-			n := copy(system_font_path[:], strings.trim_space(out))
-			system_font_path[n] = 0
-			if system_font_path[0] != 0 {
-				return cstring(&system_font_path[0])
+n := copy(sys[:], strings.trim_space(out))
+			sys[n] = 0
+			if sys[0] != 0 {
+				return cstring(&sys[0])
 			}
 		}
 		return "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"

@@ -81,18 +81,18 @@ undo_probe_run :: proc() {
 	}
 	want_nodes := []i32{7, 6, 5, 4, 3, -1, 2, 1, 0}
 	undo_view_rebuild()
-	check(len(undo_view_lines) == len(expected), "line count", &fail)
-	for i := 0; i < min(len(undo_view_lines), len(expected)); i += 1 {
-		got := string(undo_view_line_bufs[i][:undo_view_lines[i].text_len])
+	check(len(undo_tree_view.lines) == len(expected), "line count", &fail)
+	for i := 0; i < min(len(undo_tree_view.lines), len(expected)); i += 1 {
+		got := string(undo_tree_view.line_bufs[i][:undo_tree_view.lines[i].text_len])
 		want := expected[i]
 		check(got == want, fmt.tprintf("line %d text mismatch: got %q want %q", i, got, want), &fail)
-		check(undo_view_lines[i].node == want_nodes[i], fmt.tprintf("line %d node mismatch", i), &fail)
+		check(undo_tree_view.lines[i].node == want_nodes[i], fmt.tprintf("line %d node mismatch", i), &fail)
 	}
 
 	// Rebuild is keyed on tree growth: a cursor move must NOT re-run it.
 	undo_go_to(4)
 	check(int(undo_hist.current) == 4, "go_to(4)", &fail)
-	check(undo_view_built_count == len(undo_hist.slots), "rebuild key stays valid", &fail)
+	check(undo_tree_view.built_count == len(undo_hist.slots), "rebuild key stays valid", &fail)
 	undo_go_to(7)
 
 	// undo/redo cursor walking.
@@ -170,14 +170,14 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// A numeric transform edit is a discrete node: committing a property field
 	// records it and undo brings the old value back. Reset to a clean base first.
 	undo_init()
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	before_x := timeline.tracks[0].clips[0].transform_x
-	editing_field = .X
-	edit_chars[0] = '2'
-	edit_chars[1] = '5'
-	edit_chars[2] = '0'
-	edit_len = 3
+	edit_state.field = .X
+	edit_state.chars[0] = '2'
+	edit_state.chars[1] = '5'
+	edit_state.chars[2] = '0'
+	edit_state.len = 3
 	edit_commit()
 	rcheck(undo_count() == 1, "transform edit adds one node", fail)
 	rcheck(timeline.tracks[0].clips[0].transform_x == 250, "transform field applied", fail)
@@ -193,8 +193,8 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// undo/redo both re-adopted the timeline above; selection must survive the
 	// restore by clip_id (indices shift), not get wiped.
 	rcheck(
-		selected_track == 0 &&
-			selected_index == 0 &&
+		selection.track == 0 &&
+			selection.index == 0 &&
 			timeline.tracks[0].clips[0].clip_id == 1,
 		"selection survives undo/redo",
 		fail,
@@ -209,11 +209,11 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	clip0 := &timeline.tracks[0].clips[0]
 	kf_geom_set_lane_key(clip0, "transform.x", 5, 100.0)
 	kf_geom_set_lane_key(clip0, "transform.x", 20, 50.0)
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	kf_select(0, 0, 0, 0)
 	rcheck(
-		selected_track == -1 && selected_index == -1 && len(selected_set) == 0,
+		selection.track == -1 && selection.index == -1 && len(selection.extra_set) == 0,
 		"keyframe selection clears the clip selection",
 		fail,
 	)
@@ -238,10 +238,10 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 
 	// A keyframe value edit commits through undo like a numeric field.
 	kf_select(0, 0, 0, 0)
-	editing_field = .Kf_Value
-	edit_chars[0] = '4'
-	edit_chars[1] = '2'
-	edit_len = 2
+	edit_state.field = .Kf_Value
+	edit_state.chars[0] = '4'
+	edit_state.chars[1] = '2'
+	edit_state.len = 2
 	edit_commit()
 	rcheck(undo_count() == 1, "keyframe value edit adds one node", fail)
 	rcheck(
@@ -322,7 +322,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	kf_add_prop(clip0, "scale", 1.0)
 	rcheck(undo_count() == 1, "add keyframe adds one node", fail)
 	rcheck(
-		selected_track == 0 && selected_index == 0,
+		selection.track == 0 && selection.index == 0,
 		"add keyframe leaves the clip selection alone",
 		fail,
 	)
@@ -354,13 +354,13 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	rcheck(kf_sel.active, "drag press selects the key", fail)
 	undo_begin()
 	if _, _, k, kok := kf_selected(); kok {
-		kf_drag_start_frame = k.frame_off // press
+		kf_move.start_frame = k.frame_off // press
 		k.frame_off += 7                  // the per-frame update applied 7 frames
 		commit_keyframe_drag()            // release
 	}
 	rcheck(undo_count() == 2, "move keyframe adds one node", fail)
 	rcheck(
-		kf_sel.active && kf_sel.gen == kf_structure_gen,
+		kf_sel.active && kf_sel.gen == kf_view.structure_gen,
 		"moved key re-selected under the fresh structure gen",
 		fail,
 	)
@@ -397,7 +397,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	kf_select(0, 0, 1, 0)
 	undo_begin()
 	if _, _, k, kok := kf_selected(); kok {
-		kf_drag_start_frame = k.frame_off // the update ran at the same position
+		kf_move.start_frame = k.frame_off // the update ran at the same position
 		commit_keyframe_drag()
 	}
 	rcheck(undo_count() == 2, "no-move click commits nothing", fail)

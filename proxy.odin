@@ -33,10 +33,43 @@ import sdl "vendor:sdl3"
 // from different folders stay distinct. The naming scheme is unchanged:
 PROXY_SUFFIX := ".vyperproxy.mp4"
 
-// proxy_cache_ready is memoized true once the cache dir is known to exist; the
-// mkdir is skipped on the hot read path (proxy_pick_for_frame) but re-attempted
-// immediately if any build fails, so a raced/removed dir self-heals.
-proxy_cache_ready: bool
+// Proxy_Encoder is BOTH halves of the proxy-cache contract in one object: the
+// identity that names the cache entry (suffix — proxy_path_for appends it to
+// the source stem) and the encode settings that the cache entry was produced
+// with (proxy_encode_video reads them from the same instance). The cache key's
+// derivation lives with its inputs, so a settings change has one obvious place
+// to bump the key (the suffix / a version stamp next to it) instead of
+// silently reusing a proxy encoded with different pixels.
+Proxy_Encoder :: struct {
+	suffix: string, // on-disk cache class, appended to the source stem
+	preset: cstring,
+	tune:   cstring,
+	crf:    cstring,
+	gop:    i32, // keyframe gap; 1 = every frame a keyframe (all-intra scrub)
+}
+
+proxy_encoder: Proxy_Encoder = {
+	suffix = PROXY_SUFFIX,
+	preset = "ultrafast",
+	tune   = "fastdecode",
+	crf    = "26",
+	gop    = 1,
+}
+
+// Proxy_State is the proxy subsystem's module state: memoized cache-dir
+// readiness (set true once the dir is known to exist; the mkdir is skipped on
+// the hot read path but re-attempted immediately if any build fails, so a
+// raced/removed dir self-heals), the picker's single-slot destination cache
+// (the resolver entry, shared by proxy_pick_for_frame), and the scheduler's
+// look-ahead margin (how much source footage stays proxied ahead of the
+// playhead, read each scheduling tick; defaults to PROXY_MARGIN_SECONDS,
+// probes/tuning override it via VYPER_PROXY_MARGIN_SECONDS).
+Proxy_State :: struct {
+	cache_ready: bool,
+	resolver:    proxy_resolver_entry,
+	sched_margin: f64,
+}
+proxy_state: Proxy_State = {sched_margin = PROXY_MARGIN_SECONDS}
 
 // proxy_cache_prefix writes the vyper proxy cache dir into buf (trailing '/'
 // included, NUL-terminated), creating it and any missing parents on first use.
@@ -74,14 +107,14 @@ proxy_cache_prefix :: proc(buf: []u8) -> (int, bool) {
 	copy(buf[:n], home)
 	copy(buf[len(home):n], rel)
 	buf[n] = 0
-	if !proxy_cache_ready {
+	if !proxy_state.cache_ready {
 		// make_directory_all returns .Exist when the dir already exists (a plain
 		// idempotent success for our purpose), so treat it as ready -- otherwise
 		// the cache dir ever existing beforehand disables proxying for the whole
 		// session until the dir is removed.
 		if err := os.make_directory_all(string(cstring(&buf[0])));
 		   err == os.General_Error.None || err == os.General_Error.Exist {
-			proxy_cache_ready = true
+			proxy_state.cache_ready = true
 		} else {
 			return 0, false
 		}
@@ -130,11 +163,11 @@ proxy_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
 	if !stok {
 		return "", false
 	}
-	if s + len(PROXY_SUFFIX) + 1 > len(buf) {
+	if s + len(proxy_encoder.suffix) + 1 > len(buf) {
 		return "", false
 	}
-	copy(buf[s:s + len(PROXY_SUFFIX)], PROXY_SUFFIX)
-	s += len(PROXY_SUFFIX)
+	copy(buf[s:s + len(proxy_encoder.suffix)], proxy_encoder.suffix)
+	s += len(proxy_encoder.suffix)
 	buf[s] = 0
 	return cstring(&buf[0]), true
 }
@@ -182,11 +215,11 @@ proxy_encode_threads :: proc() -> c.int {
 }
 
 // proxy_transcode builds (or rebuilds) the all-intra low-res proxy for a source
-// video. In live editing (async_import_mode) it enqueues the build on the
+// video. In live editing (editor_flags.async_import_mode) it enqueues the build on the
 // background worker and returns immediately -- `src_dur_us` (the source
 // duration) becomes the progress denominator -- so importing never blocks on
 // the transcode; the proxy appears once the worker finishes + verifies it. In
-// probe/CI mode (async_import_mode=false) it keeps the historical synchronous
+// probe/CI mode (editor_flags.async_import_mode=false) it keeps the historical synchronous
 // build so the proxy exists on disk when import returns. Returns the proxy path
 // when one is ready right now (fast disk-cache hit, or the sync build), or
 // cstring(nil) when the build is deferred (async) or failed. `src_frames` is the
@@ -198,7 +231,7 @@ proxy_transcode :: proc(
 	src_dur_us: i64,
 	out_buf: []u8,
 ) -> cstring {
-	if !preview_proxy_enabled {
+	if !editor_flags.preview_proxy_enabled {
 		return nil
 	}
 	proxy, ok := proxy_path_for(src, out_buf)
@@ -208,7 +241,7 @@ proxy_transcode :: proc(
 	if proxy_valid_cache_hit(proxy, src_frames) {
 		return proxy
 	}
-	if async_import_mode {
+	if editor_flags.async_import_mode {
 		// Proxy building is ON-DEMAND now (proxy_build_schedule asks the worker
 		// for the playhead's window), so import itself enqueues nothing: it
 		// returns immediately and the clip previews from the ORIGINAL until the
@@ -404,13 +437,8 @@ proxy_seg_count :: proc(frames: i64) -> int {
 // retargets instead of enqueuing an hour of encodes nobody will watch.
 PROXY_MARGIN_SECONDS :: 240
 
-// proxy_sched_margin_seconds is how much source footage the scheduler keeps
-// proxied ahead of the playhead, read each scheduling tick. Defaults to
-// PROXY_MARGIN_SECONDS; probes/tuning override it (VYPER_PROXY_MARGIN_SECONDS).
-proxy_sched_margin_seconds: f64 = PROXY_MARGIN_SECONDS
-
 proxy_build_schedule :: proc() {
-	if !async_import_mode || !preview_proxy_enabled {
+	if !editor_flags.async_import_mode || !editor_flags.preview_proxy_enabled {
 		return
 	}
 	// The clip the user is actually looking at is the frontmost non-text video
@@ -446,7 +474,7 @@ proxy_build_schedule :: proc() {
 	// segment.
 	fps := f64(asset.frame_count) * 1e6 / f64(asset.dur_us)
 	seg_total := proxy_seg_count(asset.frame_count)
-	seg_margin := max(1, int(proxy_sched_margin_seconds * fps / f64(PROXY_SEG_FRAMES)) + 1)
+	seg_margin := max(1, int(proxy_state.sched_margin * fps / f64(PROXY_SEG_FRAMES)) + 1)
 	k := proxy_seg_for_frame(src_frame)
 	if k < 0 {
 		k = 0
@@ -698,8 +726,6 @@ proxy_resolver_entry :: struct {
 	valid_k:     int,
 }
 
-proxy_resolver_cache: proxy_resolver_entry
-
 // proxy_pick_for_frame returns the prebuilt proxy file the preview decoder
 // should serve source `frame` of `src` from, or nil to decode the source
 // itself. Unlike the old whole-file proxy_pick (one resolution per clip), this
@@ -723,7 +749,7 @@ proxy_pick_for_frame :: proc(
 	cstring,
 	i64,
 ) {
-	if !preview_proxy_enabled {
+	if !editor_flags.preview_proxy_enabled {
 		return nil, 0
 	}
 	spall_scope(#procedure)
@@ -737,7 +763,7 @@ proxy_pick_for_frame :: proc(
 	// Resolution per frame: source frame -> segment index.
 	k := proxy_seg_for_frame(frame)
 
-	rc := &proxy_resolver_cache
+	rc := &proxy_state.resolver
 	// rc.src is a NUL-terminated [4096]u8; string([:]) keeps the full 4096-byte
 	// length, so it can never equal a strlen'd cstring and the cache would reset
 	// EVERY call (per-frame .idx re-read + stat thrash). Re-derive length via the
@@ -854,7 +880,7 @@ proxy_pick_for_frame :: proc(
 	// entire segmented rebuild. Without this, a re-import degrades the preview to
 	// full-res source decode (~200ms/frame) for the whole build even when a fine
 	// proxy already exists.
-	if import_bg_building_for(string(src)) && !async_import_mode {
+	if import_bg_building_for(string(src)) && !editor_flags.async_import_mode {
 		return nil, 0
 	}
 	if rc.whole_valid {
@@ -895,7 +921,7 @@ proxy_cleanup_artifacts :: proc(src: cstring) {
 		os.remove(string(ip))
 	}
 	// Drop cache references so a re-import of the same path re-derives state.
-	rc := &proxy_resolver_cache
+	rc := &proxy_state.resolver
 	// Same NUL-terminated compare as proxy_pick_for_frame; rc.src is a [4096]u8.
 	if string(cstring(&rc.src[0])) == string(src) {
 		if rc.idx_valid {

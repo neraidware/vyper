@@ -803,13 +803,13 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	// With the toggle on, a change to an ALREADY-keyed property writes a key at
 	// the playhead; a key already on the frame is updated in place (its interp
 	// survives); an unkeyed property or a playhead outside the clip declines.
-	ak_saved_toggle := auto_keyframe
+	ak_saved_toggle := editor_flags.auto_keyframe
 	ak_saved_ph := playhead.frame
 	defer {
-		auto_keyframe = ak_saved_toggle
+		editor_flags.auto_keyframe = ak_saved_toggle
 		playhead.frame = ak_saved_ph
 	}
-	auto_keyframe = true
+	editor_flags.auto_keyframe = true
 	ak := Clip {timeline_start_frame = 10, source_length_frames = 40}
 	kf_set_key(&ak, "gain", 5, 1.0)
 	kf_set_key(&ak, "gain", 30, 2.0)
@@ -853,7 +853,7 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_probe_check(ak_ok, "auto-key declines when the playhead sits outside the clip")
 
 	// Toggle off: declined entirely.
-	auto_keyframe = false
+	editor_flags.auto_keyframe = false
 	playhead.frame = 20
 	ak_ok = !kf_auto_key(&ak, "gain", 4.0)
 	kf_probe_check(ak_ok, "auto-key declines when the toggle is off")

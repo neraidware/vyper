@@ -44,12 +44,12 @@ tl_scene :: proc() {
 	append(&timeline.tracks[0].clips, mk_tl_clip(1001, 9001, 10, 100, 10, .Video))
 	append(&timeline.tracks[1].clips, mk_tl_clip(1002, 9001, 10, 90, 10, .Audio))
 	append(&timeline.tracks[2].clips, mk_tl_clip(1003, 0, 0, 40, 0, .Video))
-	selected_track = -1
-	selected_index = -1
+	selection.track = -1
+	selection.index = -1
 	playhead.frame = 0
-	timeline_view_start = 0
-	drag_group_delta = 0
-	clear(&drag_group_orig)
+	timeline_view.start = 0
+	clip_move.group_delta = 0
+	clear(&clip_move.group_orig)
 }
 
 // tl_single_clip_scene replaces the timeline with one unlinked clip on one
@@ -64,9 +64,9 @@ tl_single_clip_scene :: proc(clip_start, clip_len: i64) {
 		&timeline.tracks[0].clips,
 		mk_tl_clip(3001, 0, 0, clip_len, clip_start, .Video),
 	)
-	selected_track = -1
-	selected_index = -1
-	timeline_view_start = 0
+	selection.track = -1
+	selection.index = -1
+	timeline_view.start = 0
 }
 
 // tl_group_starts returns the current timeline starts of the two L1 members
@@ -141,8 +141,8 @@ tl_assert_aligned :: proc(what: string) {
 // link group. ("not cutting the right shit" — the old code refused because the
 // selected clip didn't straddle the playhead.)
 test_cut_resolves_playhead :: proc() {
-	selected_track = 2
-	selected_index = 0
+	selection.track = 2
+	selection.index = 0
 	playhead.frame = 60
 	split_clip_at_playhead()
 
@@ -222,18 +222,18 @@ test_cut_resolves_playhead :: proc() {
 	)
 	// Selection should now point at the just-cut clip (its left half).
 	tl_probe_check(
-		selected_track == 0 && selected_index == 0,
+		selection.track == 0 && selection.index == 0,
 		"selection should move to the cut clip, got (%d,%d)",
-		selected_track,
-		selected_index,
+		selection.track,
+		selection.index,
 	)
 }
 
 // test_cut_selection_straddle: when the SELECTED clip straddles the playhead,
 // S keeps cutting the selection (and its linked partner) exactly as before.
 test_cut_selection_straddle :: proc() {
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	playhead.frame = 55
 	split_clip_at_playhead()
 
@@ -277,9 +277,9 @@ test_drag_group_alignment :: proc() {
 	deltas: []i64 = {30, 80, 85, 5, -10}
 	for delta in deltas {
 		if group_delta_feasible(delta) {
-			drag_clip = &timeline.tracks[0].clips[0]
-			if drag_clip.timeline_start_frame != drag_group_orig[0].start + delta {
-				drag_clip.timeline_start_frame = drag_group_orig[0].start + delta
+			clip_move.clip = &timeline.tracks[0].clips[0]
+			if clip_move.clip.timeline_start_frame != clip_move.group_orig[0].start + delta {
+				clip_move.clip.timeline_start_frame = clip_move.group_orig[0].start + delta
 			}
 			apply_group_drag_to_members(delta)
 		}
@@ -311,8 +311,8 @@ test_drag_same_track_leftedge :: proc() {
 	v1, v2 := tl_two_starts()
 	tl_probe_check(v1 == 0 && v2 == 200, "left edge holds both (V1@%d V2@%d)", v1, v2)
 	tl_probe_check(group_delta_feasible(10), "delta +10 must be feasible")
-	drag_clip = &timeline.tracks[0].clips[0]
-	drag_clip.timeline_start_frame = 10
+	clip_move.clip = &timeline.tracks[0].clips[0]
+	clip_move.clip.timeline_start_frame = 10
 	apply_group_drag_to_members(10)
 	v1, v2 = tl_two_starts()
 	tl_probe_check(v1 == 10 && v2 == 210, "offset preserved (V1@%d V2@%d expected 10/210)", v1, v2)
@@ -329,8 +329,8 @@ test_drag_blocked_holds :: proc() {
 	tl_probe_check(v == 10 && a == 10, "blocked delta must move nobody (V@%d A@%d)", v, a)
 	// Retreat to a feasible delta must keep everyone aligned.
 	tl_probe_check(group_delta_feasible(0), "delta 0 must be feasible")
-	drag_clip = &timeline.tracks[0].clips[0]
-	drag_clip.timeline_start_frame = drag_group_orig[0].start + 0
+	clip_move.clip = &timeline.tracks[0].clips[0]
+	clip_move.clip.timeline_start_frame = clip_move.group_orig[0].start + 0
 	apply_group_drag_to_members(0)
 	v, a = tl_group_starts()
 	tl_probe_check(v == 10 && a == 10, "retreat keeps V@%d A@%d", v, a)
@@ -360,18 +360,18 @@ test_drag_left_blocked_holds :: proc() {
 	tl_probe_check(v == 100 && a == 100, "blocked leftward must move nobody (V@%d A@%d)", v, a)
 	// A free leftward delta that clears B of X must move the whole pair.
 	tl_probe_check(group_delta_feasible(-30), "leftward -30 must be feasible (B clears X)")
-	drag_clip = &timeline.tracks[0].clips[0]
-	drag_clip.timeline_start_frame = drag_group_orig[0].start + -30
+	clip_move.clip = &timeline.tracks[0].clips[0]
+	clip_move.clip.timeline_start_frame = clip_move.group_orig[0].start + -30
 	apply_group_drag_to_members(-30)
 	v, a = tl_group_starts()
 	tl_probe_check(v == 70 && a == 70, "leftward move keeps the pair aligned (V@%d A@%d)", v, a)
 }
 
 // test_vertical_drop_alignment: a vertical group drop commits every member at
-// m.start + drag_group_delta on its destination lane, all still linked+aligned.
+// m.start + clip_move.group_delta on its destination lane, all still linked+aligned.
 test_vertical_drop_alignment :: proc() {
 	capture_link_group(&timeline.tracks[0].clips[0], 0)
-	drag_group_delta = 40
+	clip_move.group_delta = 40
 	ok := move_linked_group(1)
 	tl_probe_check(ok, "vertical drop must succeed")
 	v, a := tl_group_starts()
@@ -561,26 +561,26 @@ test_ripple_playhead_follow :: proc() {
 	// The view pans by the playhead's delta, so the playhead keeps its on-screen
 	// position while the gap collapses.
 	tl_single_clip_scene(200, 50)
-	timeline_view_start = 200
+	timeline_view.start = 200
 	playhead.frame = 300
 	ripple_delete_region(100, 50)
 	tl_probe_check(
-		playhead.frame == 250 && timeline_view_start == 150,
+		playhead.frame == 250 && timeline_view.start == 150,
 		"view-pan after-region: want ph 250 view 150, got ph %d view %.0f",
 		playhead.frame,
-		timeline_view_start,
+		timeline_view.start,
 	)
 
 	// Before the region: the playhead doesn't move, so the view doesn't pan.
 	tl_single_clip_scene(200, 50)
-	timeline_view_start = 200
+	timeline_view.start = 200
 	playhead.frame = 50
 	ripple_delete_region(100, 50)
 	tl_probe_check(
-		playhead.frame == 50 && timeline_view_start == 200,
+		playhead.frame == 50 && timeline_view.start == 200,
 		"view-pan before-region: want ph 50 view 200, got ph %d view %.0f",
 		playhead.frame,
-		timeline_view_start,
+		timeline_view.start,
 	)
 
 	// Linked group: playhead follows the selected member's span.
@@ -591,8 +591,8 @@ test_ripple_playhead_follow :: proc() {
 	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
 	append(&timeline.tracks[0].clips, mk_tl_clip(3101, 777, 0, 50, 200, .Video))
 	append(&timeline.tracks[1].clips, mk_tl_clip(3102, 777, 0, 50, 200, .Audio))
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	playhead.frame = 250
 	ripple_delete_linked_group(777)
 	tl_probe_check(playhead.frame == 200, "linked-group: want 200, got %d", playhead.frame)
@@ -610,8 +610,8 @@ test_still_resize_free :: proc() {
 	c := mk_tl_clip(4001, 0, 0, 60, 100, .Video)
 	c.is_still = true
 	append(&timeline.tracks[0].clips, c)
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 
 	// Right edge: grow far past the 60-frame (1 s) default.
 	got := resize_clip_right(&timeline.tracks[0], 0, 100 + 600)
@@ -645,8 +645,8 @@ test_still_resize_free :: proc() {
 // single frame. The audio lane grows to its real duration and can regrow after
 // a shrink, while a video clip on a video asset still caps at frame_count.
 test_audio_resize_source_bound :: proc() {
-	clear(&media_assets)
-	append(&media_assets, Media_Asset{id = 7001, kind = .Audio, frame_count = 1, audio_frames = 500})
+	clear(&media_bin.assets)
+	append(&media_bin.assets, Media_Asset{id = 7001, kind = .Audio, frame_count = 1, audio_frames = 500})
 	timeline = Timeline {
 		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
 	}
@@ -669,8 +669,8 @@ test_audio_resize_source_bound :: proc() {
 	tl_probe_check(got == 480, "audio resize regrow: want 480, got %d", got)
 
 	// A video lane on a video asset still caps at frame_count.
-	clear(&media_assets)
-	append(&media_assets, Media_Asset{id = 7002, kind = .Video, frame_count = 300, audio_frames = 500})
+	clear(&media_bin.assets)
+	append(&media_bin.assets, Media_Asset{id = 7002, kind = .Video, frame_count = 300, audio_frames = 500})
 	timeline.tracks[0].clips = nil
 	vc := mk_tl_clip(7002, 0, 0, 100, 0, .Video)
 	vc.asset_id = 7002
@@ -678,7 +678,7 @@ test_audio_resize_source_bound :: proc() {
 	got = resize_clip_right(&timeline.tracks[0], 0, 9999)
 	tl_probe_check(got == 300, "video resize right cap: want 300, got %d", got)
 
-	clear(&media_assets)
+	clear(&media_bin.assets)
 }
 
 timeline_probe_run :: proc(_: string) {
@@ -744,8 +744,8 @@ timeline_probe_run :: proc(_: string) {
 // historic symptom (clip stops mid-stroke when the cursor flees the clip)
 // lived in the caller's lane gate; the model must be lane- and speed-blind.
 drag_probe_run :: proc(seed: string) {
-	snap_clips_to_playhead = true
-	timeline_zoom = 1.0
+	editor_flags.snap_clips_to_playhead = true
+	timeline_view.zoom = 1.0
 
 	drag_scene :: proc() {
 		timeline = Timeline {
@@ -754,11 +754,11 @@ drag_probe_run :: proc(seed: string) {
 		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
 		append(&timeline.tracks[0].clips, mk_tl_clip(7001, 0, 50, 100, 50, .Video))    // dragged
 		append(&timeline.tracks[0].clips, mk_tl_clip(7002, 0, 500, 100, 500, .Video))  // right neighbor
-		drag_clip = &timeline.tracks[0].clips[0]
-		drag_source_track = 0
-		drag_source_index = 0
-		drag_hover_track = 0
-		clear(&drag_group_orig)
+		clip_move.clip = &timeline.tracks[0].clips[0]
+		clip_move.source_track = 0
+		clip_move.source_index = 0
+		clip_move.hover_track = 0
+		clear(&clip_move.group_orig)
 		playhead.frame = 250
 	}
 
@@ -772,30 +772,30 @@ drag_probe_run :: proc(seed: string) {
 	drag_move_in_place(f32(520))
 	drag_move_in_place(f32(700))
 	tl_probe_check(
-		drag_clip.timeline_start_frame == 400,
+		clip_move.clip.timeline_start_frame == 400,
 		"fast rightward flick parked %d, want 400 (flush with neighbor@500, len 100)",
-		drag_clip.timeline_start_frame,
+		clip_move.clip.timeline_start_frame,
 	)
 
 	// Case 2: pointer resting mid-gap must track EXACTLY (no truncation lag).
 	drag_scene()
 	drag_move_in_place(f32(234))
 	tl_probe_check(
-		drag_clip.timeline_start_frame == 234,
+		clip_move.clip.timeline_start_frame == 234,
 		"mid-gap target parked %d, want 234",
-		drag_clip.timeline_start_frame,
+		clip_move.clip.timeline_start_frame,
 	)
 
 	// Case 3: live-follow must continue even while the pointer rests in a DIFFERENT
 	// lane (the model is lane-blind; hover only picks the ghost/drop target).
 	drag_scene()
-	drag_hover_track = 1
+	clip_move.hover_track = 1
 	drag_move_in_place(f32(330))
 	drag_move_in_place(f32(520))
 	tl_probe_check(
-		drag_clip.timeline_start_frame == 400,
+		clip_move.clip.timeline_start_frame == 400,
 		"cross-lane flick parked %d, want 400 (flush)",
-		drag_clip.timeline_start_frame,
+		clip_move.clip.timeline_start_frame,
 	)
 
 	// Case 4: leftward from a position already FLUSH against a left neighbor
@@ -808,20 +808,20 @@ drag_probe_run :: proc(seed: string) {
 	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
 	append(&timeline.tracks[0].clips, mk_tl_clip(7003, 0, 300, 100, 300, .Video))  // left neighbor covers [300,400)
 	append(&timeline.tracks[0].clips, mk_tl_clip(7004, 0, 400, 100, 400, .Video))  // dragged, flush at 400
-	drag_clip = &timeline.tracks[0].clips[1]
-	drag_source_track = 0
-	drag_source_index = 1
-	drag_hover_track = 0
-	clear(&drag_group_orig)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clear(&clip_move.group_orig)
 	playhead.frame = 250
 	drag_move_in_place(f32(380))
 	drag_move_in_place(f32(260))
 	drag_move_in_place(f32(120))
 	drag_move_in_place(f32(10))
 	tl_probe_check(
-		drag_clip.timeline_start_frame == 400,
+		clip_move.clip.timeline_start_frame == 400,
 		"leftward from flush-against-left-neighbor slipped to %d, want 400 (blocked; neighbor body in the way)",
-		drag_clip.timeline_start_frame,
+		clip_move.clip.timeline_start_frame,
 	)
 
 	// Case 4b: leftward APPROACH toward a left neighbor (clip starts right of a
@@ -832,20 +832,20 @@ drag_probe_run :: proc(seed: string) {
 	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
 	append(&timeline.tracks[0].clips, mk_tl_clip(7008, 0, 300, 100, 300, .Video))  // left neighbor covers [300,400)
 	append(&timeline.tracks[0].clips, mk_tl_clip(7009, 0, 450, 100, 450, .Video))  // dragged, in gap [400,..)
-	drag_clip = &timeline.tracks[0].clips[1]
-	drag_source_track = 0
-	drag_source_index = 1
-	drag_hover_track = 0
-	clear(&drag_group_orig)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clear(&clip_move.group_orig)
 	playhead.frame = 250
 	drag_move_in_place(f32(430))
 	drag_move_in_place(f32(410))
 	drag_move_in_place(f32(395))
 	drag_move_in_place(f32(300))
 	tl_probe_check(
-		drag_clip.timeline_start_frame == 400,
+		clip_move.clip.timeline_start_frame == 400,
 		"leftward approach parked %d, want 400 (flush with left neighbour end)",
-		drag_clip.timeline_start_frame,
+		clip_move.clip.timeline_start_frame,
 	)
 
 	// Case 5: packed timeline (dragged clip already flush against a LEFT
@@ -859,11 +859,11 @@ drag_probe_run :: proc(seed: string) {
 	append(&timeline.tracks[0].clips, mk_tl_clip(7005, 0, 0, 100, 0, .Video))
 	append(&timeline.tracks[0].clips, mk_tl_clip(7006, 0, 100, 100, 100, .Video))
 	append(&timeline.tracks[0].clips, mk_tl_clip(7007, 0, 320, 100, 320, .Video))
-	drag_clip = &timeline.tracks[0].clips[1]
-	drag_source_track = 0
-	drag_source_index = 1
-	drag_hover_track = 0
-	clear(&drag_group_orig)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clear(&clip_move.group_orig)
 	playhead.frame = 250
 	drag_move_in_place(f32(130))
 	drag_move_in_place(f32(240))
@@ -871,9 +871,9 @@ drag_probe_run :: proc(seed: string) {
 	drag_move_in_place(f32(450))
 	drag_move_in_place(f32(620))
 	tl_probe_check(
-		drag_clip.timeline_start_frame == 220,
+		clip_move.clip.timeline_start_frame == 220,
 		"packed rightward approach parked %d, want 220 (flush with right neighbor@320)",
-		drag_clip.timeline_start_frame,
+		clip_move.clip.timeline_start_frame,
 	)
 
 	// Case 6: the traced STALL — a linked group flicked LEFT with a member
@@ -890,10 +890,10 @@ drag_probe_run :: proc(seed: string) {
 	append(&timeline.tracks[1].clips, mk_tl_clip(1002, 9003, 100, 50, 100, .Audio))
 	append(&timeline.tracks[1].clips, mk_tl_clip(6003, 0, 25, 40, 25, .Audio)) // blocker [25,65)
 	capture_link_group(&timeline.tracks[0].clips[0], 0)
-	drag_clip = &timeline.tracks[0].clips[0]
-	drag_source_track = 0
-	drag_source_index = 0
-	drag_hover_track = 0
+	clip_move.clip = &timeline.tracks[0].clips[0]
+	clip_move.source_track = 0
+	clip_move.source_index = 0
+	clip_move.hover_track = 0
 	// One violent left flick to frame 50 (delta -50, lands the audio member
 	// ON the blocker). Clamp must park BOTH at 65 (delta -35, flush right of
 	// X's end), not freeze the anchor at 100.

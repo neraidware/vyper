@@ -261,8 +261,8 @@ undo_restore :: proc(idx: i32) {
 		sel_id = c.clip_id
 		has_sel = true
 	}
-	extra_ids := make([dynamic]u64, 0, len(selected_set), context.temp_allocator)
-	for id in selected_set {
+	extra_ids := make([dynamic]u64, 0, len(selection.extra_set), context.temp_allocator)
+	for id in selection.extra_set {
 		append(&extra_ids, id)
 	}
 
@@ -272,9 +272,9 @@ undo_restore :: proc(idx: i32) {
 	undo_hist.current = idx
 	undo_hist.pending = {}
 	undo_hist.pending_valid = false
-	clear(&selected_set)
-	selected_track = -1
-	selected_index = -1
+	clear(&selection.extra_set)
+	selection.track = -1
+	selection.index = -1
 	// The keyframe selection is INDEX-keyed to whatever document was live; the
 	// restore has replaced it wholesale, and a keyframe has no stable id to
 	// re-resolve the way clips do — so drop it rather than alias whatever now
@@ -282,26 +282,26 @@ undo_restore :: proc(idx: i32) {
 	kf_sel = {}
 	if has_sel {
 		if tr, c, ok := find_clip_by_id(sel_id); ok {
-			selected_track = track_index_of(tr)
-			selected_index = clip_index_on_track(tr, c)
+			selection.track = track_index_of(tr)
+			selection.index = clip_index_on_track(tr, c)
 		}
 	}
 	for id in extra_ids {
 		if _, _, ok := find_clip_by_id(id); ok {
-			selected_set[id] = true
+			selection.extra_set[id] = true
 		}
 	}
-	dragging_handle = nil
-	handle_kind = .None
+	handle_drag.handle = nil
+	handle_drag.kind = .None
 	active_interaction = .None
-	drag_clip = nil
-	drag_source_track = -1
-	drag_source_index = -1
-	drag_hover_track = -1
-	drag_group_delta = 0
-	clear(&drag_group_orig)
-	resize_edge = -1
-	resize_moved = false
+	clip_move.clip = nil
+	clip_move.source_track = -1
+	clip_move.source_index = -1
+	clip_move.hover_track = -1
+	clip_move.group_delta = 0
+	clear(&clip_move.group_orig)
+	clip_resize.edge = -1
+	clip_resize.moved = false
 	invalidate_preview_slots()
 	audio_note_edit()
 }

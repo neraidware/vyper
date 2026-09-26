@@ -25,9 +25,17 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 
-spall_enabled: bool
-spall_ctx:     spall.Context // shared by every thread (read-only after init)
-spall_deadline_ns: i64     // capture duration limit (0 = unbounded)
+// Spall_State is the shared profiler state: whether profiling is enabled for
+// this run, the shared Context (file writer, read-only after init), and the
+// capture duration limit in ns (0 = unbounded). Read by instrumentation on the
+// hot path only via the stable enable flag (see the header note on the scoped
+// end hook re-checking the gate).
+Spall_State :: struct {
+	enabled:     bool,
+	ctx:         spall.Context,
+	deadline_ns: i64,
+}
+spall_state: Spall_State
 
 @(thread_local) spall_buffer: spall.Buffer
 @(thread_local) spall_buffer_data: [spall.BUFFER_DEFAULT_SIZE]u8
@@ -38,7 +46,7 @@ spall_deadline_ns: i64     // capture duration limit (0 = unbounded)
 spall_prof_init :: proc() -> bool {
 	path := os.get_env_alloc("VYPER_SPALL", context.temp_allocator)
 	if path == "" {
-		spall_enabled = false
+		spall_state.enabled = false
 		return true
 	}
 	// precise_time=false: timestamps come from CLOCK_MONOTONIC_RAW (ns), so the
@@ -47,18 +55,18 @@ spall_prof_init :: proc() -> bool {
 	ctx, ok := spall.context_create_with_scale(path, false, 1.0)
 	if !ok {
 		fmt.eprintf("[spall] could not open capture file %q\n", path)
-		spall_enabled = false
+		spall_state.enabled = false
 		return true
 	}
-	spall_ctx = ctx
-	spall_enabled = true
+	spall_state.ctx = ctx
+	spall_state.enabled = true
 	spall_thread_init("render")
 	// Optional capture-duration limit (ms): lets a scripted run take a bounded
 	// trace and exit cleanly so the shutdown defers flush the buffers. The
 	// render loop calls spall_expired() each frame and breaks when reached.
 	if ms := os.get_env_alloc("VYPER_SPALL_MS", context.temp_allocator); ms != "" {
 		if v, ok := strconv.parse_i64(strings.trim_space(ms)); ok && v > 0 {
-			spall_deadline_ns = time.now()._nsec + v * 1_000_000
+			spall_state.deadline_ns = time.now()._nsec + v * 1_000_000
 		}
 	}
 	return true
@@ -68,28 +76,28 @@ spall_prof_init :: proc() -> bool {
 // (render loop breaks so startup defers flush the trace). Always false when no
 // limit was set or profiling is off.
 spall_expired :: proc() -> bool {
-	if !spall_enabled || spall_deadline_ns == 0 {
+	if !spall_state.enabled || spall_state.deadline_ns == 0 {
 		return false
 	}
-	return time.now()._nsec >= spall_deadline_ns
+	return time.now()._nsec >= spall_state.deadline_ns
 }
 
 // spall_prof_shutdown flushes the render-thread buffer and closes the file.
 // Must run after every worker thread has called spall_thread_term (main already
 // defers the worker shutdowns above its own shutdown).
 spall_prof_shutdown :: proc() {
-	if !spall_enabled {
+	if !spall_state.enabled {
 		return
 	}
 	spall_thread_term()
-	spall.context_destroy(&spall_ctx)
-	spall_enabled = false
+	spall.context_destroy(&spall_state.ctx)
+	spall_state.enabled = false
 }
 
 // spall_thread_init arms the calling thread's buffer (worker threads must call
 // this at thread start; the render thread gets it from spall_prof_init).
 spall_thread_init :: proc(name: string) {
-	if !spall_enabled {
+	if !spall_state.enabled {
 		return
 	}
 	buf, ok := spall.buffer_create(spall_buffer_data[:], u32(sync.current_thread_id()))
@@ -98,16 +106,16 @@ spall_thread_init :: proc(name: string) {
 	}
 	spall_buffer = buf
 	spall_thread_active = true
-	spall._buffer_name_thread(&spall_ctx, &spall_buffer, name)
+	spall._buffer_name_thread(&spall_state.ctx, &spall_buffer, name)
 }
 
 // spall_thread_term flushes the calling thread's buffer (must run at thread
 // exit so no pending events are lost).
 spall_thread_term :: proc() {
-	if !spall_enabled || !spall_thread_active {
+	if !spall_state.enabled || !spall_thread_active {
 		return
 	}
-	spall.buffer_destroy(&spall_ctx, &spall_buffer)
+	spall.buffer_destroy(&spall_state.ctx, &spall_buffer)
 	spall_thread_active = false
 }
 
@@ -117,19 +125,19 @@ spall_thread_term :: proc() {
 @(deferred_in = spall_scope_end)
 @(no_instrumentation)
 spall_scope :: proc(name: string) -> bool {
-	if !spall_enabled || !spall_thread_active {
+	if !spall_state.enabled || !spall_thread_active {
 		return false
 	}
-	spall._buffer_begin(&spall_ctx, &spall_buffer, name)
+	spall._buffer_begin(&spall_state.ctx, &spall_buffer, name)
 	return true
 }
 
 @(no_instrumentation)
 spall_scope_end :: proc(name: string) {
-	if !spall_enabled || !spall_thread_active {
+	if !spall_state.enabled || !spall_thread_active {
 		return
 	}
-	spall._buffer_end(&spall_ctx, &spall_buffer)
+	spall._buffer_end(&spall_state.ctx, &spall_buffer)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,18 +158,18 @@ when #config(VYPER_INSTRUMENT, false) {
 
 	@(instrumentation_enter)
 	profiler_enter :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {
-		if !spall_enabled || !spall_thread_active {
+		if !spall_state.enabled || !spall_thread_active {
 			return
 		}
-		spall._buffer_begin(&spall_ctx, &spall_buffer, "", "", loc)
+		spall._buffer_begin(&spall_state.ctx, &spall_buffer, "", "", loc)
 	}
 
 	@(instrumentation_exit)
 	profiler_exit :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {
-		if !spall_enabled || !spall_thread_active {
+		if !spall_state.enabled || !spall_thread_active {
 			return
 		}
-		spall._buffer_end(&spall_ctx, &spall_buffer)
+		spall._buffer_end(&spall_state.ctx, &spall_buffer)
 	}
 
 }

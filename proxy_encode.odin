@@ -255,14 +255,14 @@ proxy_encode_range :: proc(
 	enc.height = out_h
 	enc.pix_fmt = avutil.PixelFormat.YUV420P
 	enc.time_base = {num = fps.den, den = fps.num}
-	enc.gop_size = 1
+	enc.gop_size = proxy_encoder.gop
 	enc.max_b_frames = 0
 	enc.thread_count = threads
 	if is_x264 {
 		// x264-private rate-control/tuning knobs, identical to the old argv.
-		avutil.opt_set(enc, "preset", "ultrafast", 0)
-		avutil.opt_set(enc, "tune", "fastdecode", 0)
-		avutil.opt_set(enc, "crf", "26", 0)
+		avutil.opt_set(enc, "preset", proxy_encoder.preset, 0)
+		avutil.opt_set(enc, "tune", proxy_encoder.tune, 0)
+		avutil.opt_set(enc, "crf", proxy_encoder.crf, 0)
 	}
 	// Without this flag avcodec_send_frame zeroes frame.duration, so libx264
 	// emits pkt.duration=0 and the mp4 muxer sizes the final stts sample to

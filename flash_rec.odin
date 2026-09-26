@@ -21,34 +21,40 @@ import "core:os"
 // /tmp/vyper_flash_rec.log (truncated each launch); override with
 // VYPER_FLASH_LOG=/path. A banner prints to stdout on launch so "is it on?"
 // never has to be asked.
-flash_rec_enabled := false
-flash_rec_file: ^os.File
+// Flash_Rec is the flash-recorder's sink state: whether recording is enabled
+// (loaded from VYPER_FLASH_REC at init) and the opened log file (nil until a
+// valid open).
+Flash_Rec :: struct {
+	enabled: bool,
+	file:    ^os.File,
+}
+flash_rec: Flash_Rec
 
 flash_rec_init :: proc() {
 	if v, _ := os.lookup_env_alloc("VYPER_FLASH_REC", context.temp_allocator); v == "" {
 		return
 	}
-	flash_rec_enabled = true
+	flash_rec.enabled = true
 	path := "/tmp/vyper_flash_rec.log"
 	if override, _ := os.lookup_env_alloc("VYPER_FLASH_LOG", context.temp_allocator); override != "" {
 		path = override
 	}
 	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
 	if err == nil {
-		flash_rec_file = f
+		flash_rec.file = f
 	}
-	fmt.printf("[flash-rec] ENABLED, logging to %s (file_ok=%v)\n", path, flash_rec_file != nil)
+	fmt.printf("[flash-rec] ENABLED, logging to %s (file_ok=%v)\n", path, flash_rec.file != nil)
 }
 
 flash_rec_emit :: proc(line: string) {
-	if flash_rec_file != nil {
-		fmt.fprintln(flash_rec_file, line)
+	if flash_rec.file != nil {
+		fmt.fprintln(flash_rec.file, line)
 	}
 	fmt.println(line)
 }
 
 flash_rec_after_slots :: proc() {
-	if !flash_rec_enabled {
+	if !flash_rec.enabled {
 		return
 	}
 	// update_preview_slots just ran for this frame. Emit ONE forensic line per
@@ -67,7 +73,7 @@ flash_rec_after_slots :: proc() {
 		playhead.frame,
 		playhead.frame,
 		playhead.playing,
-		playback_dir,
+		playback.dir,
 		active_interaction,
 	))
 	// Same-source half boundary passing under clips above the cut? The
@@ -78,8 +84,8 @@ flash_rec_after_slots :: proc() {
 	} else {
 		off += len(fmt.bprintf(ob[off:], "boundary=0 "))
 	}
-	if warm_valid {
-		off += len(fmt.bprintf(ob[off:], "warm=%d ", warm_clip_id))
+	if warm.valid {
+		off += len(fmt.bprintf(ob[off:], "warm=%d ", warm.clip_id))
 	} else {
 		off += len(fmt.bprintf(ob[off:], "warm=none "))
 	}
@@ -182,7 +188,7 @@ flash_rec_boundary_at :: proc(f: i64) -> (found: bool, a_start, a_end: i64) {
 // anchor-shift vs reassign vs claim tells which free-list decision took the
 // slot the flashing clip needed.
 flash_rec_note_kill :: proc(slot_idx: int, reason: cstring) {
-	if !flash_rec_enabled {
+	if !flash_rec.enabled {
 		return
 	}
 	if slot_idx < 0 {
@@ -215,7 +221,7 @@ flash_rec_note_kill :: proc(slot_idx: int, reason: cstring) {
 	kb: [512]u8
 	kn := len(fmt.bprintf(
 		kb[:],
-		"[flash-rec] frame=%d slot=%d clip=%d %s KILLED by %s (has_frame_was=%v covered=%v warm_valid=%v warm_clip=%d playing=%v dir=%d)%s\n",
+		"[flash-rec] frame=%d slot=%d clip=%d %s KILLED by %s (has_frame_was=%v covered=%v warm.valid=%v warm_clip=%d playing=%v dir=%d)%s\n",
 		playhead.frame,
 		slot_idx,
 		slot.clip_id,
@@ -223,10 +229,10 @@ flash_rec_note_kill :: proc(slot_idx: int, reason: cstring) {
 		reason,
 		slot.has_frame,
 		covered,
-		warm_valid,
-		warm_clip_id,
+		warm.valid,
+		warm.clip_id,
 		playhead.playing,
-		playback_dir,
+		playback.dir,
 		span_desc[:],
 	))
 	flash_rec_emit(string(kb[:kn]))

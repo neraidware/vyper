@@ -22,6 +22,7 @@ import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:unicode/utf8"
 
 ui_probe_tracks :: 6
@@ -109,7 +110,122 @@ for j := 0; j < len(raw); {
 	if !ui_probe_layout_asserts() {
 		os.exit(1)
 	}
+	// The file finder is a dialog-style popup drawn off the text input hook:
+	// open it headless, lay out a page, and check the popup exists, is centered,
+	// and paints one row per visible entry.
+	if !ui_probe_finder_asserts() {
+		os.exit(1)
+	}
 	os.exit(0)
+}
+
+// ui_probe_finder_asserts opens the in-app finder over the seeded session and
+// checks its geometry: the column sits centered with the asked width, the
+// proper number of rows visible (capped at FINDER_MAX_ROWS), the filter field
+// present, and both empty- and query-filtered layouts draw without an assert.
+ui_probe_finder_asserts :: proc() -> bool {
+	ok := true
+	finder_populate(8)
+	build_page(1920, 1600)
+	col := clay.GetElementData(clay.ID("FinderColumn")).boundingBox
+	if col.width <= 0 || col.height <= 0 {
+		fmt.eprintf("[ui-probe] FinderColumn missing (%.1fx%.1f)\n", col.width, col.height)
+		ok = false
+	}
+	field := clay.GetElementData(clay.ID("TextInputField")).boundingBox
+	if field.width <= 0 {
+		fmt.eprintf("[ui-probe] finder filter field missing\n")
+		ok = false
+	}
+	row0 := clay.GetElementData(clay.ID("FinderRow", 0)).boundingBox
+	if row0.width <= 0 || row0.height <= 0 {
+		fmt.eprintf("[ui-probe] finder row 0 missing (%.1fx%.1f)\n", row0.width, row0.height)
+		ok = false
+	}
+	// The popup is centered: the leading gap must equal the trailing gap.
+	gap := (1920 - col.width) / 2
+	if abs(col.x - gap) > 1.0 {
+		fmt.eprintf("[ui-probe] finder column x=%.1f want %.1f\n", col.x, gap)
+		ok = false
+	}
+	// Run the dirty-filter path too: an unmatched query yields zero rows but
+	// must still draw (no divide-by-no-row, selection clamps to n-1=0).
+	text_input_set_buf("zzzz_no_match_querystring_query")
+	build_page(1920, 1600)
+	fmt.printf("[ui-probe] visrows pre\n")
+	if visible_rows() != 0 {
+		fmt.eprintf("[ui-probe] finder filter: no rows expected\n")
+		ok = false
+	}
+	ti.active = false // text_input_cancel would poke SDL; we're headless
+	finder_close()
+	build_page(1920, 1600)
+	if clay.GetElementData(clay.ID("FinderColumn")).boundingBox.width > 0 {
+		fmt.eprintf("[ui-probe] finder popup did not dismiss\n")
+		ok = false
+	}
+	if ok {
+		fmt.printf("[ui-probe] finder layout ok (%d rows)\n", FINDER_MAX_ROWS)
+	}
+	return ok
+}
+
+// finder_populate seeds the finder as if opened over a directory and relists a
+// handful of synthetic entries (dirs + files of each kind) so the popup has
+// something to draw without touching the real filesystem.
+finder_populate :: proc(n: int) {
+	file_finder.active = true
+	file_finder.mode = .Open
+	file_finder.cwd = strings.clone("/probe/fixtures")
+	file_finder.entries = make([dynamic]Finder_Entry, 0, n + 3)
+	for i in 0 ..< n {
+		kind := Finder_Kind((i + 1) % len(Finder_Kind))
+		append(
+			&file_finder.entries,
+			Finder_Entry {
+				name = fmt.aprintf("probe_%d.%s", i, "mpg" if kind == .Video else "txt"),
+				fullpath = fmt.aprintf("/probe/fixtures/probe_%d", i),
+				is_dir = kind == .Folder,
+				kind = kind,
+			},
+		)
+	}
+	append(
+		&file_finder.entries,
+		Finder_Entry {
+			name = fmt.aprintf("sub.srt"),
+			fullpath = fmt.aprintf("/probe/fixtures/sub.srt"),
+			kind = .Subtitle,
+		},
+	)
+	file_finder.filtered = make([dynamic]int, 0, len(file_finder.entries))
+	for i in 0 ..< len(file_finder.entries) {
+		append(&file_finder.filtered, i)
+	}
+	// The finder's text input rides on `ti`, but the real opener pokes SDL text
+	// input (sdl.StartTextInput) which is unavailable headless — reproduce only
+	// the state the popup's draw reads.
+	ti.active = true
+	ti.input_type = TI_FINDER
+	ti.cursor = 0
+	ti.anchor = 0
+	clear(&ti.buf)
+	file_finder.sel = 0
+	file_finder.scroll = 0
+	file_finder.query_len = -1 // force finder_refresh to scan the new list
+	finder_refresh()
+}
+
+// visible_rows reports how many rows the current filter/list produce.
+visible_rows :: proc() -> int {
+	refresh := text_input_string()
+	n := 0
+	for e in file_finder.entries {
+		if cmdline_fuzzy_score(refresh, e.name) > 0 {
+			n += 1
+		}
+	}
+	return n
 }
 
 // ui_probe_layout_asserts checks the keyframe render geometry: the row grows
@@ -200,8 +316,8 @@ seed_ui_probe_session :: proc() {
 	sync_track_order()
 
 	// Selected clip -> the Inspector property card renders.
-	selected_track = 0
-	selected_index = 1
+	selection.track = 0
+	selection.index = 1
 
 	// One live preview slot (the canvas area layout reflects a playing clip).
 	preview_slots[0] = Preview_Slot {

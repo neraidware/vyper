@@ -40,11 +40,21 @@ AAC_FRAME_SIZE :: 1024
 RENDER_VIDEO_PRESET :: "fast"
 Render_Default_Path :: "render.mp4"
 
-// render_overwrite_out: when off (default) a render points itself at a free
-// <name>_<n>.<ext> instead of clobbering an existing file of the same name.
-render_overwrite_out: bool
+// Render_Output is the export target state: the overwrite policy, the output
+// path chosen with the save dialog (fixed buffer, written by the SDL callback,
+// read on the main thread when starting a render), and the scratch used by
+// render_resolve_output_path (used at most once per render start, so a single
+// shared buffer is fine).
+Render_Output :: struct {
+	overwrite: bool,
+	path_buf:  [4096]u8,
+	path_len:  int,
+	path_set:  bool, // default path is filled in at startup
+	resolve_scratch: [4096]u8,
+}
+render_output: Render_Output = {path_set = true}
 
-// render_encoder_choice picks the export video encoder family: .GPU is the
+// render_encoder_ui.choice picks the export video encoder family: .GPU is the
 // default -- it tries the first hardware H.264 encoder that actually opens on
 // this machine and ends with libx264 as the guaranteed fallback, because a
 // GPU choice must never fail the render just because the device is absent.
@@ -55,8 +65,11 @@ Render_Encoder_Choice :: enum u32 {
 	CPU,
 	GPU,
 }
-render_encoder_choice: Render_Encoder_Choice = .GPU
-render_encoder_menu_open: bool
+Render_Encoder_UI :: struct {
+	choice:     Render_Encoder_Choice,
+	menu_open:  bool, // the export-encoder dropdown ("GPU" / "CPU" readout)
+}
+render_encoder_ui: Render_Encoder_UI = {choice = .GPU}
 
 // Encoder candidate order per platform, most platform-appropriate first (probed
 // in order; each is only accepted when a real open succeeds — see
@@ -65,9 +78,9 @@ ENC_CANDIDATES_LINUX := []cstring{"h264_nvenc", "h264_vaapi", "h264_qsv", "h264_
 ENC_CANDIDATES_MACOS := []cstring{"h264_videotoolbox"}
 ENC_CANDIDATES_WINDOWS := []cstring{"h264_nvenc", "h264_qsv", "h264_amf"}
 
-// resolve_out_scratch holds the resolved path; used at most once per render
-// start, so a single shared buffer is fine.
-resolve_out_scratch: [4096]u8
+// app_window is the SDL window handle, owned by the main thread (window
+// creation in main.odin, size reads here and in textinput.odin).
+app_window: ^sdl.Window
 
 // render_resolve_output_path returns the path a fresh render should write (the
 // plain target when overwrite is on or the file doesn't exist yet, else
@@ -75,7 +88,7 @@ resolve_out_scratch: [4096]u8
 // cap is somehow exhausted, in which case it falls back to the raw target.
 render_resolve_output_path :: proc() -> string {
 	target := render_out_path()
-	if render_overwrite_out || !os.exists(target) {
+	if render_output.overwrite || !os.exists(target) {
 		return target
 	}
 	dir_end := 0
@@ -91,7 +104,7 @@ render_resolve_output_path :: proc() -> string {
 		base, ext = stem[:dot], stem[dot:]
 	}
 	for n := 1; n < 1_000_000; n += 1 {
-		name := fmt.bprintf(resolve_out_scratch[:], "%s%s_%d%s", target[:dir_end], base, n, ext)
+		name := fmt.bprintf(render_output.resolve_scratch[:], "%s%s_%d%s", target[:dir_end], base, n, ext)
 		if !os.exists(name) {
 			return name
 		}
@@ -130,14 +143,6 @@ render_default_output_path :: proc(buf: []u8) -> string {
 	return fmt.bprintf(buf, "%s/render.mp4", dir)
 }
 
-// Output path chosen with the save dialog (fixed buffer, written by the SDL
-// callback, read on the main thread when starting a render).
-render_out_path_buf: [4096]u8
-render_out_path_len: int
-render_out_path_set: bool = true // default path is filled in at startup
-
-app_window: ^sdl.Window
-
 Render_Status :: enum {
 	Idle,
 	Rendering,
@@ -146,33 +151,36 @@ Render_Status :: enum {
 	Cancelled,
 }
 
-// render_progress is the only state shared with the worker thread. Single-writer
+// Render_Progress is the only state shared with the worker thread. Single-writer
 // handoff, no mutex: the worker writes status/error/frames_done and the main
 // thread writes frames_total; status is the release/acquire gate, so the error
 // buffer and counters are settled before a reader sees the state that consumes
 // them (UI reading .Failed sees a fully-written error string, render_start
 // reading .Rendering sees a settled frames_total).
-render_progress: struct {
+Render_Progress :: struct {
 	status:       u32, // atomic
 	frames_done:  i64, // atomic
 	frames_total: i64, // atomic
 	error:        [256]u8,
 }
+render_progress: Render_Progress
 
-// status_text_buf is render_status_text's fixed scratch; the UI formats into it
-// and hands it to clay in the same frame, so a single shared buffer is fine.
-status_text_buf: [256]u8
-
-// Render FPS meter: the worker writes frames_done atomically; the UI samples it
-// here each tick. EWMA over ~250 ms windows — a bare instant per UI tick would
-// jitter with the 16 ms frame cadence. Only the UI thread touches the window.
+// Render_Meter is the render-status UI readout: the status line scratch, the
+// FPS meter's EWMA window (the worker writes frames_done atomically; the UI
+// samples from render_progress here each tick; a bare instant per UI tick
+// would jitter with the 16 ms frame cadence), and the FPS text buffer. Only
+// the UI thread touches the window.
 RENDER_FPS_WINDOW_S :: 0.25
-render_fps_wnd: struct {
-	prev_ns:   i64,
-	prev_done: i64,
-	fps:       f64,
+Render_Meter :: struct {
+	status_buf: [256]u8,
+	fps_wnd: struct {
+		prev_ns:   i64,
+		prev_done: i64,
+		fps:       f64,
+	},
+	fps_buf: [32]u8,
 }
-render_fps_buf: [32]u8
+render_meter: Render_Meter
 
 render_status :: proc() -> Render_Status {
 	return Render_Status(sync.atomic_load(&render_progress.status))
@@ -182,7 +190,7 @@ render_status :: proc() -> Render_Status {
 // the first window has completed frames). done < prev_done means a new render
 // run reset frames_done to 0, which (re)anchors the window.
 render_fps_text :: proc(done: i64) -> string {
-	wnd := &render_fps_wnd
+	wnd := &render_meter.fps_wnd
 	now := i64(sdl.GetTicksNS())
 	if wnd.prev_ns == 0 || done < wnd.prev_done {
 		wnd.prev_ns = now
@@ -202,7 +210,7 @@ render_fps_text :: proc(done: i64) -> string {
 	if wnd.fps <= 0 {
 		return ""
 	}
-	text := fmt.bprintf(render_fps_buf[:], " · %.1f fps", wnd.fps)
+	text := fmt.bprintf(render_meter.fps_buf[:], " · %.1f fps", wnd.fps)
 	return string(text)
 }
 
@@ -218,12 +226,12 @@ render_status_text :: proc() -> string {
 			return "Rendering..."
 		}
 		pct := i64(100) * done / total
-		text := fmt.bprintf(status_text_buf[:], "Rendering %d / %d (%d%%)%s", done, total, pct, render_fps_text(done))
+		text := fmt.bprintf(render_meter.status_buf[:], "Rendering %d / %d (%d%%)%s", done, total, pct, render_fps_text(done))
 		return string(text)
 	case .Done:
 		return "Render complete"
 	case .Failed:
-		text := fmt.bprintf(status_text_buf[:], "Failed: %s", cstring(&render_progress.error[0]))
+		text := fmt.bprintf(render_meter.status_buf[:], "Failed: %s", cstring(&render_progress.error[0]))
 		return string(text)
 	case .Cancelled:
 		return "Render cancelled"
@@ -232,10 +240,10 @@ render_status_text :: proc() -> string {
 }
 
 render_output_name :: proc() -> string {
-	if render_out_path_len == 0 {
+	if render_output.path_len == 0 {
 		return "No output path"
 	}
-	return path_basename(cstring(&render_out_path_buf[0]))
+	return path_basename(cstring(&render_output.path_buf[0]))
 }
 
 // ---------------------------------------------------------------------------
@@ -705,11 +713,19 @@ Render_Text_Src :: struct {
 	source_h:             c.int, // text_h (tight ink height, text px)
 }
 
-// The render worker rasterizes text with its own font + scratch so it never
-// races the UI thread's shared text_clip_font/text_clip_scratch globals (the
-// preview thread can be compositing a text slot while the worker renders).
-render_text_font: stb.fontinfo
-render_text_font_init: bool
+// Render_Text_Font is the render worker's private text rasterization state. The
+// render worker rasterizes text with its own font + scratch so it never races
+// the UI thread's shared text_clip_state globals (the preview
+// thread can be compositing a text slot while the worker renders). setup_scratch
+// is the worker's own dynamic scratch for baked fonts (the shared fixed
+// 8192-glyph buffers are too small once the font grows to 48*scale); sized per
+// setup via text_scratch_size_for.
+Render_Text_Font :: struct {
+	font:       stb.fontinfo,
+	init:       bool,
+	setup_scratch: []u8,
+}
+render_text_font: Render_Text_Font
 
 // Render_Text_Job is a text clip's per-render precomputed raster + box, built
 // once in render_worker_run so each frame just blits it. Baking the clip's
@@ -722,11 +738,6 @@ Render_Text_Job :: struct {
 	ox, oy, ow, oh: int, // tight ink rect in raster
 	blit_scale:     f32,
 }
-
-// text_scratch: worker needs its own dynamic scratch for baked fonts (the
-// shared 8192 text_clip_scratch / render_text_scratch are too small once the
-// font grows to 48*scale). Sized per setup via text_scratch_size_for.
-render_text_setup_scratch: []u8
 
 // setup_text_job rasterizes a text clip at the baked font matching its snapshot.
 // source_w/source_h are the BASE tight dims (font 48, scale-independent) and
@@ -741,20 +752,20 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 		return
 	}
 	font_px := f32(TEXT_CLIP_FONT_PIXELS) * t.scale
-	bw, bh := text_buf_size_for(t.name, &render_text_font, &render_text_font_init, font_px)
+	bw, bh := text_buf_size_for(t.name, &render_text_font.font, &render_text_font.init, font_px)
 	buf := make([]u8, bw * bh * 4)
-	if len(render_text_setup_scratch) < text_scratch_size_for(font_px) {
-		delete(render_text_setup_scratch)
-		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
+	if len(render_text_font.setup_scratch) < text_scratch_size_for(font_px) {
+		delete(render_text_font.setup_scratch)
+		render_text_font.setup_scratch = make([]u8, text_scratch_size_for(font_px))
 	}
 	ox, oy, ow, oh := rasterize_title_into_buffer(
 		t.name,
 		buf,
 		bw,
 		bh,
-		&render_text_font,
-		&render_text_font_init,
-		render_text_setup_scratch,
+		&render_text_font.font,
+		&render_text_font.init,
+		render_text_font.setup_scratch,
 		font_px,
 	)
 	if ow <= 0 || oh <= 0 {
@@ -811,23 +822,23 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		return
 	}
 	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
-	bw, bh := text_buf_size_for_lines(lines, &render_text_font, &render_text_font_init, font_px)
+	bw, bh := text_buf_size_for_lines(lines, &render_text_font.font, &render_text_font.init, font_px)
 	if bw <= 0 || bh <= 0 {
 		return
 	}
 	buf := make([]u8, bw * bh * 4)
-	if len(render_text_setup_scratch) < text_scratch_size_for(font_px) {
-		delete(render_text_setup_scratch)
-		render_text_setup_scratch = make([]u8, text_scratch_size_for(font_px))
+	if len(render_text_font.setup_scratch) < text_scratch_size_for(font_px) {
+		delete(render_text_font.setup_scratch)
+		render_text_font.setup_scratch = make([]u8, text_scratch_size_for(font_px))
 	}
 	ox, oy, ow, oh := rasterize_lines_into_buffer(
 		lines,
 		buf,
 		bw,
 		bh,
-		&render_text_font,
-		&render_text_font_init,
-		render_text_setup_scratch,
+		&render_text_font.font,
+		&render_text_font.init,
+		render_text_font.setup_scratch,
 		font_px,
 		context.allocator,
 	)
@@ -866,16 +877,22 @@ Render_Audio_Src :: struct {
 	have48:               i64, // content frames produced so far (next un-produced)
 }
 
-render_job_videos: []Render_Video_Src
-render_job_audios: []Render_Audio_Src
-render_job_texts: []Render_Text_Src
-render_job_subs: []Render_Sub_Src
-render_job_out_path: cstring
-render_job_width: c.int
-render_job_height: c.int
-render_job_start: i64
-render_job_end: i64 // inclusive
-render_job_nframes: i64
+// Render_Job is the timeline snapshot taken on the main thread when a render
+// starts, so the worker never touches live timeline state: one slab per source
+// kind plus the output geometry/range it renders.
+Render_Job :: struct {
+	videos:   []Render_Video_Src,
+	audios:   []Render_Audio_Src,
+	texts:    []Render_Text_Src,
+	subs:     []Render_Sub_Src,
+	out_path: cstring,
+	width:    c.int,
+	height:   c.int,
+	start:    i64,
+	end:      i64, // inclusive
+	nframes:  i64,
+}
+render_job: Render_Job
 
 // clip_full_box_dims works on ^Clip; mirrored here for snapshot structs.
 // Source-relative: scale 1 is the clip's native pixel size in output pixels;
@@ -1086,7 +1103,7 @@ HwFramesContext :: struct {
 // libx264 directly; GPU probes the platform's hardware encoders first and ends
 // with libx264 as the guaranteed last resort.
 enc_encoder_candidates :: proc() -> (names: [dynamic]cstring) {
-	if render_encoder_choice == .CPU {
+	if render_encoder_ui.choice == .CPU {
 		append(&names, "libx264")
 		return
 	}
@@ -1538,7 +1555,7 @@ rend_enc_video_frame :: proc(
 			cast([^]c.int)&e.yuv_linesize[0],
 		)
 	}
-	render_enc_sws_ns += time.now()._nsec - t_sws
+	render_pipe.enc_sws_ns += time.now()._nsec - t_sws
 	frame := avutil.frame_alloc()
 	if frame == nil {
 		return false
@@ -1580,7 +1597,7 @@ rend_enc_video_frame :: proc(
 			fmt.println("av_hwframe_transfer_data:", ff_err_str(ret))
 			return false
 		}
-		render_enc_upload_ns += time.now()._nsec - t_up
+		render_pipe.enc_upload_ns += time.now()._nsec - t_up
 		hw_frame.pts = frame_index
 		hw_frame.duration = 1
 		to_send = hw_frame
@@ -1590,10 +1607,10 @@ rend_enc_video_frame :: proc(
 		fmt.println("avcodec_send_frame (video):", ff_err_str(ret))
 		return false
 	}
-	render_enc_send_ns += time.now()._nsec - t_send
+	render_pipe.enc_send_ns += time.now()._nsec - t_send
 	t_drain := time.now()._nsec
 	ok := enc_drain(e, e.vcodec_ctx, e.vstream, e.vpkt)
-	render_enc_drain_ns += time.now()._nsec - t_drain
+	render_pipe.enc_drain_ns += time.now()._nsec - t_drain
 	return ok
 }
 
@@ -1693,70 +1710,77 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 // Main worker.
 // ---------------------------------------------------------------------------
 
-render_worker_thread: ^thread.Thread
-
-// P5 decode pipeline: a second thread (render_decode_thread) owns every video
-// decoder and scales frame N into blit_slots[N & 1] while the worker composites
-// frame N-1 out of blit_slots[(N-1) & 1]. Handoff is two release/acquire
-// counters with a two-slot depth (see render_decode_proc for the slot-reuse
-// bound); cancellation/teardown rides render_dec_stop. The worker touches no
-// decoder field after this split — decoders are single-writer, producer-owned.
-render_decode_thread:   ^thread.Thread
-render_dec_stop:        bool  // atomic: worker sets, producer polls (also in waits)
-render_dec_produced:    i64   // atomic: frames decoded+published by the producer
-render_dec_consumed:    i64   // atomic: frames composited by the worker
-// Producer-side wall time: decode + scale + transfer into the blit slot.
-render_dec_ns:          i64
-// Sub-split: codec+frame-cache/transfer versus the scale into the blit slot.
-render_dec_codec_ns:    i64
-render_dec_scale_ns:    i64
-
-// P6 encode pipeline: a third thread (render_enc_thread) owns the muxer and both
-// encoders after render_open_output. The composite thread fills a
-// RENDER_ENC_SLOTS-deep ring of {canvas, audio mix} slots and publishes
-// produced; the encoder converts/uploads/sends/drains/muxes each slot and
-// publishes consumed. Slot N&(SLOTS-1) is safe to refill once the encoder has
-// finished frame N-SLOTS (consumed >= N-SLOTS+1) — same release/acquire shape as
-// the decode ring. Teardown rides render_enc_stop; the encoder drains whatever
-// was produced and finalizes only when every frame was produced, so a cancel or
-// early failure leaves a partial, trailerless file exactly as the old inline
-// path did. A canvas per slot is the cost of letting the encoder run ahead of
-// the compositor (SLOTS*w*h*4 bytes: 33 MB at 1080p).
+// Render_Enc_Slot is one entry of the encode ring.
 RENDER_ENC_SLOTS :: 4
 Render_Enc_Slot :: struct {
 	canvas: []u8,
 	mix:    []f32,
 	spf:    int,
 }
-render_enc_thread:    ^thread.Thread
-render_enc_stop:      bool // atomic: worker sets at EOF/cancel; encoder polls
-render_enc_produced:  i64  // atomic: slots filled by the composite thread
-render_enc_consumed:  i64  // atomic: slots encoded by the encoder thread
-render_enc_has_audio: bool
-render_enc_fail:      bool // encoder set a failure; worker reports it after join
-render_enc_err:       [128]u8
-render_enc_err_len:   int
-// Blocking slot handoff (futex-backed semaphores): free counts slots the
-// composite may write, ready counts slots the encoder may read. A spin-yield
-// here starves the encoder's own worker threads and buys nothing — the wait is
-// long (encode outlasts composite), so the threads must actually sleep. The
-// counts are self-balancing across a render: every ready post is matched by one
-// ready wait and every free wait by one free post, including the cancel drain.
-render_enc_free:  sync.Sema
-render_enc_ready: sync.Sema
-render_enc_sema_init: bool
-// Encoder-thread timing, written before it exits and read after the join.
-render_enc_video_ns: i64
-render_enc_audio_ns: i64
-// Sub-split of render_enc_video_ns for the hw-upload path probe: how much is
-// CPU RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
-// send+drain (encoder wait).
-render_enc_sws_ns:    i64
-render_enc_upload_ns: i64
-render_enc_send_ns:   i64
-render_enc_drain_ns:  i64
-render_enc_slots: [RENDER_ENC_SLOTS]Render_Enc_Slot
-render_enc_ptr: ^Render_Enc
+
+// Render_Pipeline is the render's thread + pipeline handoff state: the worker
+// thread and the two pipeline threads below it. Everything here is either a
+// thread handle or an atomic handoff counter / stop flag; writers and readers
+// are documented per field.
+Render_Pipeline :: struct {
+	// Worker.
+	worker: ^thread.Thread,
+	// P5 decode pipeline: render_decode owns every video decoder and scales
+	// frame N into blit_slots[N & 1] while the worker composites frame N-1 out
+	// of blit_slots[(N-1) & 1]. Handoff is two release/acquire counters with a
+	// two-slot depth (see render_decode_proc for the slot-reuse bound);
+	// cancellation/teardown rides dec_stop. The worker touches no decoder field
+	// after this split — decoders are single-writer, producer-owned.
+	decode:           ^thread.Thread,
+	dec_stop:         bool, // atomic: worker sets, producer polls (also in waits)
+	dec_produced:     i64,  // atomic: frames decoded+published by the producer
+	dec_consumed:     i64,  // atomic: frames composited by the worker
+	dec_ns:           i64, // producer-side wall time: decode + scale + transfer
+	dec_codec_ns:     i64, // sub-slice: codec + frame-cache/transfer...
+	dec_scale_ns:     i64, // ...versus the scale into the blit slot
+	// P6 encode pipeline: render_enc owns the muxer and both encoders after
+	// render_open_output. The composite thread fills a RENDER_ENC_SLOTS-deep
+	// ring of {canvas, audio mix} slots and publishes enc_produced; the
+	// encoder converts/uploads/sends/drains/muxes each slot and publishes
+	// enc_consumed. Slot N&(SLOTS-1) is safe to refill once the encoder has
+	// finished frame N-SLOTS (consumed >= N-SLOTS+1) — same release/acquire
+	// shape as the decode ring. Teardown rides enc_stop; the encoder drains
+	// whatever was produced and finalizes only when every frame was produced,
+	// so a cancel or early failure leaves a partial, trailerless file exactly
+	// as the old inline path did. A canvas per slot is the cost of letting the
+	// encoder run ahead of the compositor (SLOTS*w*h*4 bytes: 33 MB at 1080p).
+	enc:              ^thread.Thread,
+	enc_stop:         bool, // atomic: worker sets at EOF/cancel; encoder polls
+	enc_produced:     i64,  // atomic: slots filled by the composite thread
+	enc_consumed:     i64,  // atomic: slots encoded by the encoder thread
+	enc_has_audio:    bool,
+	enc_fail:         bool, // encoder set a failure; worker reports it after join
+	enc_err:          [128]u8,
+	enc_err_len:      int,
+	// Blocking slot handoff (futex-backed semaphores): free counts slots the
+	// composite may write, ready counts slots the encoder may read. A
+	// spin-yield here starves the encoder's own worker threads and buys
+	// nothing — the wait is long (encode outlasts composite), so the threads
+	// must actually sleep. The counts are self-balancing across a render:
+	// every ready post is matched by one ready wait and every free wait by one
+	// free post, including the cancel drain.
+	enc_free:          sync.Sema,
+	enc_ready:         sync.Sema,
+	enc_sema_init:     bool,
+	// Encoder-thread timing, written before it exits and read after the join.
+	enc_video_ns:      i64,
+	enc_audio_ns:      i64,
+	// Sub-split of enc_video_ns for the hw-upload path probe: how much is CPU
+	// RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
+	// send+drain (encoder wait).
+	enc_sws_ns:        i64,
+	enc_upload_ns:     i64,
+	enc_send_ns:       i64,
+	enc_drain_ns:      i64,
+	enc_slots:         [RENDER_ENC_SLOTS]Render_Enc_Slot,
+	enc_ptr:           ^Render_Enc,
+}
+render_pipe: Render_Pipeline
 
 render_worker :: proc(t: ^thread.Thread) {
 	render_worker_run()
@@ -1771,21 +1795,21 @@ render_worker :: proc(t: ^thread.Thread) {
 // The decode path makes no Odin-side allocations (FFmpeg allocates internally),
 // so this thread's default allocator is never touched.
 render_decode_proc :: proc() {
-	for frame_idx in 0 ..< render_job_nframes {
-		for sync.atomic_load(&render_dec_consumed) < frame_idx - 1 {
-			if sync.atomic_load(&render_dec_stop) {
+	for frame_idx in 0 ..< render_job.nframes {
+		for sync.atomic_load(&render_pipe.dec_consumed) < frame_idx - 1 {
+			if sync.atomic_load(&render_pipe.dec_stop) {
 				return
 			}
 			thread.yield()
 		}
-		if sync.atomic_load(&render_dec_stop) {
+		if sync.atomic_load(&render_pipe.dec_stop) {
 			return
 		}
 slot_idx := int(frame_idx & 1)
-	timeline_frame := render_job_start + frame_idx
+	timeline_frame := render_job.start + frame_idx
 	t_frame := time.now()._nsec
-	for i in 0 ..< len(render_job_videos) {
-			v := &render_job_videos[i]
+	for i in 0 ..< len(render_job.videos) {
+			v := &render_job.videos[i]
 			if timeline_frame < v.timeline_start_frame ||
 			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
 				continue
@@ -1806,10 +1830,10 @@ slot_idx := int(frame_idx & 1)
 				slot.ok = false
 				continue
 			}
-			render_dec_codec_ns += time.now()._nsec - t_src
+			render_pipe.dec_codec_ns += time.now()._nsec - t_src
 			t_scale := time.now()._nsec
 			decode_into_buffer(&v.dec, slot.blit, v.fw, v.fh)
-			render_dec_scale_ns += time.now()._nsec - t_scale
+			render_pipe.dec_scale_ns += time.now()._nsec - t_scale
 			slot.ok = true
 			// Publish the crop geometry the worker's render_blit needs; the
 			// resolution is decoder-side (can change on the first hardware
@@ -1821,8 +1845,8 @@ slot_idx := int(frame_idx & 1)
 		}
 		// Release: the slot writes above are visible to the worker's acquire
 		// load of produced before it composites frame frame_idx.
-		sync.atomic_store(&render_dec_produced, frame_idx + 1)
-		render_dec_ns += time.now()._nsec - t_frame
+		sync.atomic_store(&render_pipe.dec_produced, frame_idx + 1)
+		render_pipe.dec_ns += time.now()._nsec - t_frame
 	}
 }
 
@@ -1833,29 +1857,29 @@ render_decode :: proc(t: ^thread.Thread) {
 // render_enc_fail_set records an encoder-thread failure for the worker to pick
 // up after the join. Encoder-thread only, read by the worker only post-join.
 render_enc_fail_set :: proc(msg: string) {
-	n := min(len(msg), len(render_enc_err))
-	copy(render_enc_err[:n], msg[:n])
-	render_enc_err_len = n
-	render_enc_fail = true
+	n := min(len(msg), len(render_pipe.enc_err))
+	copy(render_pipe.enc_err[:n], msg[:n])
+	render_pipe.enc_err_len = n
+	render_pipe.enc_fail = true
 }
 
 // render_enc_encode_slot converts+encodes+muxes one composited slot and, if the
 // job carries audio, its mixed PCM. Encoder-thread only.
 render_enc_encode_slot :: proc(e: ^Render_Enc, fi: i64) {
-	slot := &render_enc_slots[fi & (RENDER_ENC_SLOTS - 1)]
+	slot := &render_pipe.enc_slots[fi & (RENDER_ENC_SLOTS - 1)]
 	t0 := time.now()._nsec
-	if !rend_enc_video_frame(e, slot.canvas, render_job_width, render_job_height, fi) {
+	if !rend_enc_video_frame(e, slot.canvas, render_job.width, render_job.height, fi) {
 		render_enc_fail_set("video encoding failed")
 		return
 	}
-	render_enc_video_ns += time.now()._nsec - t0
-	if render_enc_has_audio && slot.spf > 0 {
+	render_pipe.enc_video_ns += time.now()._nsec - t0
+	if render_pipe.enc_has_audio && slot.spf > 0 {
 		t1 := time.now()._nsec
 		if !rend_enc_push_audio(e, slot.mix[:slot.spf * 2]) {
 			render_enc_fail_set("audio encoding failed")
 			return
 		}
-		render_enc_audio_ns += time.now()._nsec - t1
+		render_pipe.enc_audio_ns += time.now()._nsec - t1
 	}
 }
 
@@ -1867,7 +1891,7 @@ render_enc_flush :: proc(e: ^Render_Enc) -> bool {
 		render_enc_fail_set("video flush failed")
 		return false
 	}
-	if render_enc_has_audio {
+	if render_pipe.enc_has_audio {
 		avcodec.send_frame(e.acodec_ctx, nil)
 		if !enc_drain(e, e.acodec_ctx, e.astream, e.apkt) {
 			render_enc_fail_set("audio flush failed")
@@ -1886,42 +1910,42 @@ render_enc_flush :: proc(e: ^Render_Enc) -> bool {
 // slot the composite thread published (acquire load of produced), encodes it,
 // then publishes consumed. On failure it stops doing work but keeps advancing
 // consumed so the composite thread can never stall waiting for a slot; the
-// failure is reported to the worker through render_enc_fail after the join.
+// failure is reported to the worker through render_pipe.enc_fail after the join.
 render_enc_proc :: proc() {
-	e := render_enc_ptr
+	e := render_pipe.enc_ptr
 	dead := false
 	for {
-		if sync.atomic_load(&render_enc_stop) {
+		if sync.atomic_load(&render_pipe.enc_stop) {
 			// Consume the ready tokens for the frames the composite posted but
 			// we have not taken (each is guaranteed available), drain them, and
 			// release their slots so the counts stay balanced. Finalize only a
 			// complete render (cancel/early-fail: no trailer).
-			for sync.atomic_load(&render_enc_consumed) < sync.atomic_load(&render_enc_produced) {
-				sync.sema_wait(&render_enc_ready)
-				fi := sync.atomic_load(&render_enc_consumed)
+			for sync.atomic_load(&render_pipe.enc_consumed) < sync.atomic_load(&render_pipe.enc_produced) {
+				sync.sema_wait(&render_pipe.enc_ready)
+				fi := sync.atomic_load(&render_pipe.enc_consumed)
 				if !dead {
 					render_enc_encode_slot(e, fi)
-					dead = render_enc_fail
+					dead = render_pipe.enc_fail
 				}
-				sync.atomic_store(&render_enc_consumed, fi + 1)
-				sync.sema_post(&render_enc_free)
+				sync.atomic_store(&render_pipe.enc_consumed, fi + 1)
+				sync.sema_post(&render_pipe.enc_free)
 			}
-			if !dead && sync.atomic_load(&render_enc_produced) >= render_job_nframes {
+			if !dead && sync.atomic_load(&render_pipe.enc_produced) >= render_job.nframes {
 				render_enc_flush(e)
 			}
 			return
 		}
 		// Wake periodically to re-check stop (a cancel joins this thread).
-		if !sync.sema_wait_with_timeout(&render_enc_ready, 5 * time.Millisecond) {
+		if !sync.sema_wait_with_timeout(&render_pipe.enc_ready, 5 * time.Millisecond) {
 			continue
 		}
-		fi := sync.atomic_load(&render_enc_consumed)
+		fi := sync.atomic_load(&render_pipe.enc_consumed)
 		if !dead {
 			render_enc_encode_slot(e, fi)
-			dead = render_enc_fail
+			dead = render_pipe.enc_fail
 		}
-		sync.atomic_store(&render_enc_consumed, fi + 1)
-		sync.sema_post(&render_enc_free)
+		sync.atomic_store(&render_pipe.enc_consumed, fi + 1)
+		sync.sema_post(&render_pipe.enc_free)
 	}
 }
 
@@ -1944,9 +1968,9 @@ render_worker_run :: proc() {
 	fail := false
 	e := Render_Enc{}
 	err_msg := ""
-	render_enc_thread = nil
-	render_enc_fail = false
-	render_enc_err_len = 0
+	render_pipe.enc = nil
+	render_pipe.enc_fail = false
+	render_pipe.enc_err_len = 0
 	// Per-frame split timing (VYPER_FRAME_TIME="1"): wall time for the
 	// composite + audio pull/mix block on this thread vs the video-encode and
 	// audio-encode blocks on the encoder thread, printed once at the end. The
@@ -1961,42 +1985,42 @@ render_worker_run :: proc() {
 		// producer owns them (single-writer), so a reset while it is in a
 		// decode call is a use-after-free. destroy() joins, and the producer
 		// polls stop in both its waits, so this cannot hang.
-		if render_decode_thread != nil {
-			sync.atomic_store(&render_dec_stop, true)
-			thread.destroy(render_decode_thread)
-			render_decode_thread = nil
+		if render_pipe.decode != nil {
+			sync.atomic_store(&render_pipe.dec_stop, true)
+			thread.destroy(render_pipe.decode)
+			render_pipe.decode = nil
 		}
 		// Stop+join the encode consumer before enc_cleanup: after the handoff
 		// the encoder thread owns e (muxer + codecs), so cleanup must follow the
 		// join. Its drain-on-stop finalizes the file when every frame was
 		// produced.
-		sync.atomic_store(&render_enc_stop, true)
-		if render_enc_thread != nil {
-			thread.destroy(render_enc_thread)
-			render_enc_thread = nil
+		sync.atomic_store(&render_pipe.enc_stop, true)
+		if render_pipe.enc != nil {
+			thread.destroy(render_pipe.enc)
+			render_pipe.enc = nil
 		}
-		render_enc_ptr = nil
-		if render_enc_fail {
+		render_pipe.enc_ptr = nil
+		if render_pipe.enc_fail {
 			fail = true
-			if render_enc_err_len > 0 {
-				err_msg = string(render_enc_err[:render_enc_err_len])
+			if render_pipe.enc_err_len > 0 {
+				err_msg = string(render_pipe.enc_err[:render_pipe.enc_err_len])
 			}
 		}
 		enc_cleanup(&e)
-		for &v in render_job_videos {
+		for &v in render_job.videos {
 			if v.crop_ctx != nil {
 				sws.freeContext(v.crop_ctx)
 				v.crop_ctx = nil
 			}
 			clip_decoder_reset(&v.dec)
 		}
-		for &a in render_job_audios {
+		for &a in render_job.audios {
 			if a.dec.opened {
 				audio_decoder_reset(&a.dec)
 			}
 		}
 		mem.dynamic_arena_destroy(&job_arena)
-		render_text_setup_scratch = nil
+		render_text_font.setup_scratch = nil
 		status := fail ? Render_Status.Failed : (cancelled() ? .Cancelled : .Done)
 		if fail && len(err_msg) > 0 {
 			set_status(.Failed, err_msg)
@@ -2008,38 +2032,38 @@ render_worker_run :: proc() {
 		} else {
 			set_status(status, "")
 		}
-		if split_timing && (composite_ns + audio_ns + render_enc_video_ns + render_enc_audio_ns) > 0 {
-			total := f64(composite_ns + audio_ns + render_enc_video_ns + render_enc_audio_ns)
-			frames := max(1, render_job_nframes)
+		if split_timing && (composite_ns + audio_ns + render_pipe.enc_video_ns + render_pipe.enc_audio_ns) > 0 {
+			total := f64(composite_ns + audio_ns + render_pipe.enc_video_ns + render_pipe.enc_audio_ns)
+			frames := max(1, render_job.nframes)
 			fmt.printf(
 				"[frame-time] composite=%.2f%% (%gs, %.2fms/f) videoenc=%.2f%% (%gs, %.2fms/f) audio=%.2f%% (%gs, %.2fms/f)\n",
 				100 * f64(composite_ns + audio_ns) / total,
 				f64(composite_ns + audio_ns) / 1e9,
 				f64(composite_ns + audio_ns) / 1e6 / f64(frames),
-				100 * f64(render_enc_video_ns) / total,
-				f64(render_enc_video_ns) / 1e9,
-				f64(render_enc_video_ns) / 1e6 / f64(frames),
-				100 * f64(render_enc_audio_ns) / total,
-				f64(render_enc_audio_ns) / 1e9,
-				f64(render_enc_audio_ns) / 1e6 / f64(frames),
+				100 * f64(render_pipe.enc_video_ns) / total,
+				f64(render_pipe.enc_video_ns) / 1e9,
+				f64(render_pipe.enc_video_ns) / 1e6 / f64(frames),
+				100 * f64(render_pipe.enc_audio_ns) / total,
+				f64(render_pipe.enc_audio_ns) / 1e9,
+				f64(render_pipe.enc_audio_ns) / 1e6 / f64(frames),
 			)
 			fmt.printf(
 				"[frame-time]   videoenc split: sws=%.2fms/f upload=%.2fms/f send=%.2fms/f drain=%.2fms/f\n",
-				f64(render_enc_sws_ns) / 1e6 / f64(frames),
-				f64(render_enc_upload_ns) / 1e6 / f64(frames),
-				f64(render_enc_send_ns) / 1e6 / f64(frames),
-				f64(render_enc_drain_ns) / 1e6 / f64(frames),
+				f64(render_pipe.enc_sws_ns) / 1e6 / f64(frames),
+				f64(render_pipe.enc_upload_ns) / 1e6 / f64(frames),
+				f64(render_pipe.enc_send_ns) / 1e6 / f64(frames),
+				f64(render_pipe.enc_drain_ns) / 1e6 / f64(frames),
 			)
 			fmt.printf("[frame-time]   decode(producer)=%.2fms/f (codec=%.2fms/f scale=%.2fms/f)\n",
-				f64(render_dec_ns) / 1e6 / f64(frames),
-				f64(render_dec_codec_ns) / 1e6 / f64(frames),
-				f64(render_dec_scale_ns) / 1e6 / f64(frames))
+				f64(render_pipe.dec_ns) / 1e6 / f64(frames),
+				f64(render_pipe.dec_codec_ns) / 1e6 / f64(frames),
+				f64(render_pipe.dec_scale_ns) / 1e6 / f64(frames))
 		}
 	}
 
 	// Prepare compositing state for each video source.
-	for i in 0 ..< len(render_job_videos) {
-		v := &render_job_videos[i]
+	for i in 0 ..< len(render_job.videos) {
+		v := &render_job.videos[i]
 		if v.geom_keyed {
 			// S6 animated path: decode ONCE at a stage sized to the max scale
 			// this clip reaches (resting or keyed), then per frame the
@@ -2060,14 +2084,14 @@ render_worker_run :: proc() {
 				v.source_w,
 				v.source_h,
 				v.stage_scale,
-				f32(render_job_width),
-				f32(render_job_height),
+				f32(render_job.width),
+				f32(render_job.height),
 			)
 			v.fw = max(1, c.int(scw + 0.5))
 			v.fh = max(1, c.int(sch + 0.5))
 			// Seed the display rect with the resting pose; the composite
 			// recomputes it per frame before every blit.
-			l, t, r, b := render_display_rect(v, render_job_width, render_job_height)
+			l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
 			v.rw = max(1, c.int(r - l + 0.5))
 			v.rh = max(1, c.int(b - t + 0.5))
 			v.ox = c.int(l + 0.5)
@@ -2087,7 +2111,7 @@ render_worker_run :: proc() {
 			}
 			continue
 		}
-		l, t, r, b := render_display_rect(v, render_job_width, render_job_height)
+		l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
 		v.rw = max(1, c.int(r - l + 0.5))
 		v.rh = max(1, c.int(b - t + 0.5))
 		v.ox = c.int(l + 0.5)
@@ -2098,15 +2122,15 @@ render_worker_run :: proc() {
 			v.source_w,
 			v.source_h,
 			v.scale,
-			f32(render_job_width),
-			f32(render_job_height),
+			f32(render_job.width),
+			f32(render_job.height),
 		)
 		v.fw = max(1, c.int(cw + 0.5))
 		v.fh = max(1, c.int(ch + 0.5))
 		// Fully off-canvas: never drawn, so no decode at all. The frame loop
 		// skips v.fw <= 0 before touching the decoder.
-		if c.int(r) <= 0 || c.int(l) >= render_job_width ||
-		   c.int(b) <= 0 || c.int(t) >= render_job_height {
+		if c.int(r) <= 0 || c.int(l) >= render_job.width ||
+		   c.int(b) <= 0 || c.int(t) >= render_job.height {
 			v.fw = 0
 			v.fh = 0
 			continue
@@ -2120,8 +2144,8 @@ render_worker_run :: proc() {
 		// by the decoder's reset when zero).
 		vis_left := max(0, c.int(l + 0.5))
 		vis_top := max(0, c.int(t + 0.5))
-		vis_right := min(render_job_width, c.int(r + 0.5))
-		vis_bottom := min(render_job_height, c.int(b + 0.5))
+		vis_right := min(render_job.width, c.int(r + 0.5))
+		vis_bottom := min(render_job.height, c.int(b + 0.5))
 		box_left := v.transform_x - cw / 2
 		box_top := v.transform_y - ch / 2
 		box_ox := c.int(box_left + 0.5)
@@ -2183,38 +2207,38 @@ render_worker_run :: proc() {
 	// ALSO defeats it: its rect moves every frame, so a stale pose could
 	// leak where it was.
 	any_keyed := false
-	for &v in render_job_videos {
+	for &v in render_job.videos {
 		if v.geom_keyed {
 			any_keyed = true
 			break
 		}
 	}
 	skip_canvas_zero :=
-		len(render_job_videos) > 0 &&
+		len(render_job.videos) > 0 &&
 		!any_keyed &&
 		render_span_cover_canvas(
-			render_job_videos,
-			render_job_start,
-			render_job_nframes,
-			render_job_width,
-			render_job_height,
+			render_job.videos,
+			render_job.start,
+			render_job.nframes,
+			render_job.width,
+			render_job.height,
 		)
 
 	// Start the P5 decode-ahead producer once every decoder is open and its
 	// blit slots are allocated. The producer owns all decoders from here on;
 	// the composite below reads only the published slots. A fresh default
 	// context is fine: the decode path makes no Odin allocations.
-	render_dec_stop, render_dec_produced, render_dec_consumed = false, 0, 0
-	render_dec_ns = 0
-	render_dec_codec_ns, render_dec_scale_ns = 0, 0
-	if len(render_job_videos) > 0 {
-		render_decode_thread = thread.create(render_decode)
-		if render_decode_thread == nil {
+	render_pipe.dec_stop, render_pipe.dec_produced, render_pipe.dec_consumed = false, 0, 0
+	render_pipe.dec_ns = 0
+	render_pipe.dec_codec_ns, render_pipe.dec_scale_ns = 0, 0
+	if len(render_job.videos) > 0 {
+		render_pipe.decode = thread.create(render_decode)
+		if render_pipe.decode == nil {
 			err_msg = "could not start decode thread"
 			fail = true
 			return
 		}
-		thread.start(render_decode_thread)
+		thread.start(render_pipe.decode)
 	}
 
 	// The output frame rate: an explicit project fps wins; otherwise it comes
@@ -2224,9 +2248,9 @@ render_worker_run :: proc() {
 	rfps_num, rfps_den := c.int(60), c.int(1)
 	if project.frame_rate > 0 {
 		rfps_num, rfps_den = 0, 1
-	} else if len(render_job_videos) > 0 {
-		rfps_num = render_job_videos[0].dec.fps_num
-		rfps_den = render_job_videos[0].dec.fps_den
+	} else if len(render_job.videos) > 0 {
+		rfps_num = render_job.videos[0].dec.fps_num
+		rfps_den = render_job.videos[0].dec.fps_den
 		if rfps_num <= 0 || rfps_den <= 0 {
 			rfps_num, rfps_den = 60, 1
 		}
@@ -2248,11 +2272,11 @@ render_worker_run :: proc() {
 		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(0, int(math.round(48000.0 / rfps))))
 	}
 
-	has_audio := len(render_job_audios) > 0
+	has_audio := len(render_job.audios) > 0
 	if has_audio {
-		for i in 0 ..< len(render_job_audios) {
-			a := &render_job_audios[i]
-			if !render_audio_open(a, render_job_start, rfps) {
+		for i in 0 ..< len(render_job.audios) {
+			a := &render_job.audios[i]
+			if !render_audio_open(a, render_job.start, rfps) {
 				a.dec.opened = false
 			}
 		}
@@ -2260,9 +2284,9 @@ render_worker_run :: proc() {
 
 	if !render_open_output(
 		&e,
-		render_job_out_path,
-		render_job_width,
-		render_job_height,
+		render_job.out_path,
+		render_job.width,
+		render_job.height,
 		has_audio,
 		rfps_num,
 		rfps_den,
@@ -2281,66 +2305,66 @@ render_worker_run :: proc() {
 	// point (only e.enc_name after the join). Slots + header must exist before
 	// the thread starts.
 	for i in 0 ..< RENDER_ENC_SLOTS {
-		render_enc_slots[i].canvas = make([]u8, int(render_job_width) * int(render_job_height) * 4)
-		render_enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
+		render_pipe.enc_slots[i].canvas = make([]u8, int(render_job.width) * int(render_job.height) * 4)
+		render_pipe.enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
 	}
-	render_enc_stop, render_enc_produced, render_enc_consumed = false, 0, 0
-	render_enc_has_audio = has_audio
-	render_enc_fail, render_enc_err_len = false, 0
-	render_enc_video_ns, render_enc_audio_ns = 0, 0
-	render_enc_sws_ns, render_enc_upload_ns, render_enc_send_ns, render_enc_drain_ns = 0, 0, 0, 0
+	render_pipe.enc_stop, render_pipe.enc_produced, render_pipe.enc_consumed = false, 0, 0
+	render_pipe.enc_has_audio = has_audio
+	render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
+	render_pipe.enc_video_ns, render_pipe.enc_audio_ns = 0, 0
+	render_pipe.enc_sws_ns, render_pipe.enc_upload_ns, render_pipe.enc_send_ns, render_pipe.enc_drain_ns = 0, 0, 0, 0
 	// One-time semaphore priming: counts are self-balancing across renders, so
 	// only the very first job needs the initial SLOTS free tokens.
-	if !render_enc_sema_init {
-		sync.sema_post(&render_enc_free, RENDER_ENC_SLOTS)
-		render_enc_sema_init = true
+	if !render_pipe.enc_sema_init {
+		sync.sema_post(&render_pipe.enc_free, RENDER_ENC_SLOTS)
+		render_pipe.enc_sema_init = true
 	}
-	render_enc_ptr = &e
-	render_enc_thread = thread.create(render_enc)
-	if render_enc_thread == nil {
+	render_pipe.enc_ptr = &e
+	render_pipe.enc = thread.create(render_enc)
+	if render_pipe.enc == nil {
 		err_msg = "could not start encode thread"
 		fail = true
 		return
 	}
-	thread.start(render_enc_thread)
+	thread.start(render_pipe.enc)
 
 	// Text compositing: each text clip gets a precomputed raster (baked font)
 	// + blit box built once below, then alpha-blitted on the canvas each frame.
 	// Built before the frame loop (titles + transforms are static for a job).
-	text_jobs := make([]Render_Text_Job, max(len(render_job_texts), 1))
-	for i in 0 ..< len(render_job_texts) {
-		setup_text_job(&text_jobs[i], render_job_texts[i])
+	text_jobs := make([]Render_Text_Job, max(len(render_job.texts), 1))
+	for i in 0 ..< len(render_job.texts) {
+		setup_text_job(&text_jobs[i], render_job.texts[i])
 	}
 
 	// Subtitle compositing: per-clip anchor (the box center to keep fixed across
 	// cue changes) + a one-slot active-cue raster cache. Cues play forward in
 	// population order, so a single slot per clip is a near-perfect LRU.
-	sub_cues := make([]Render_Sub_Cue, max(len(render_job_subs), 1))
-	sub_factor := f32(render_job_width) / f32(PREVIEW_W)
-	for i in 0 ..< len(render_job_subs) {
-		s := &render_job_subs[i]
+	sub_cues := make([]Render_Sub_Cue, max(len(render_job.subs), 1))
+	sub_factor := f32(render_job.width) / f32(PREVIEW_W)
+	for i in 0 ..< len(render_job.subs) {
+		s := &render_job.subs[i]
 		if s.source_w > 0 && s.source_h > 0 {
 			s.anchor_x = s.transform_x + f32(s.source_w) * s.scale * sub_factor / 2
 			s.anchor_y = s.transform_y + f32(s.source_h) * s.scale * sub_factor / 2
 		} else {
-			s.anchor_x = f32(render_job_width) / 2
-			s.anchor_y = f32(render_job_height) / 2
+			s.anchor_x = f32(render_job.width) / 2
+			s.anchor_y = f32(render_job.height) / 2
 		}
 	}
 
-	for frame_idx in 0 ..< render_job_nframes {
+	for frame_idx in 0 ..< render_job.nframes {
 		if poll_cancel() {
 			return
 		}
-		timeline_frame := render_job_start + frame_idx
+		timeline_frame := render_job.start + frame_idx
 		// Composite all video clips covering this frame (bottom track first so
 		// the top track paints last, matching the preview). With the P5
 		// pipeline the decode for this frame is produced ahead on the second
 		// thread: wait for it, then read only the published slot (never the
 		// decoder). The acquire load on produced pairs with the producer's
 		// release store, ordering every slot write before this read.
-		if len(render_job_videos) > 0 {
-			for sync.atomic_load(&render_dec_produced) <= frame_idx {
+		if len(render_job.videos) > 0 {
+			for sync.atomic_load(&render_pipe.dec_produced) <= frame_idx {
 				if poll_cancel() {
 					return
 				}
@@ -2351,7 +2375,7 @@ render_worker_run :: proc() {
 		// counting semaphore guarantees at most SLOTS frames are outstanding;
 		// frame N always maps to slot N&(SLOTS-1) because both sides consume in
 		// order. The timeout lets a cancel be observed promptly.
-		for !sync.sema_wait_with_timeout(&render_enc_free, 5 * time.Millisecond) {
+		for !sync.sema_wait_with_timeout(&render_pipe.enc_free, 5 * time.Millisecond) {
 			if poll_cancel() {
 				return
 			}
@@ -2360,12 +2384,12 @@ render_worker_run :: proc() {
 			loop_start = time.now()._nsec
 		}
 		slot_idx := int(frame_idx & 1)
-		eslot := &render_enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
+		eslot := &render_pipe.enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
 		if !skip_canvas_zero {
 			mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
 		}
-		for i := len(render_job_videos) - 1; i >= 0; i -= 1 {
-			v := &render_job_videos[i]
+		for i := len(render_job.videos) - 1; i >= 0; i -= 1 {
+			v := &render_job.videos[i]
 			if timeline_frame < v.timeline_start_frame ||
 			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
 				continue
@@ -2381,13 +2405,13 @@ render_worker_run :: proc() {
 			if v.geom_keyed {
 				render_eval_keyed_geom(v, timeline_frame, slot, eslot.canvas)
 			} else {
-				render_blit(eslot.canvas, render_job_width, render_job_height, v, slot)
+				render_blit(eslot.canvas, render_job.width, render_job.height, v, slot)
 			}
 		}
 		// Composite all text clips covering this frame (after the decodable
 		// clips, alpha-blended on top, matching the preview layering).
-		for i := 0; i < len(render_job_texts); i += 1 {
-			t := &render_job_texts[i]
+		for i := 0; i < len(render_job.texts); i += 1 {
+			t := &render_job.texts[i]
 			if timeline_frame < t.timeline_start_frame ||
 			   timeline_frame >= t.timeline_start_frame + t.source_length_frames {
 				continue
@@ -2401,8 +2425,8 @@ render_worker_run :: proc() {
 			}
 			render_text_blit(
 				eslot.canvas,
-				render_job_width,
-				render_job_height,
+				render_job.width,
+				render_job.height,
 				j.raster,
 				j.bw,
 				j.ox,
@@ -2417,8 +2441,8 @@ render_worker_run :: proc() {
 		// Composite subtitle-generator clips last (on top of everything else —
 		// the natural subtitle layering; matches the preview, where the topmost
 		// text/bottom-most slot order puts subtitles above the decoded faces).
-		for i in 0 ..< len(render_job_subs) {
-			s := &render_job_subs[i]
+		for i in 0 ..< len(render_job.subs) {
+			s := &render_job.subs[i]
 			if timeline_frame < s.timeline_start_frame ||
 			   timeline_frame >= s.timeline_start_frame + s.source_length_frames {
 				continue
@@ -2475,8 +2499,8 @@ render_worker_run :: proc() {
 			}
 			render_text_blit(
 				eslot.canvas,
-				render_job_width,
-				render_job_height,
+				render_job.width,
+				render_job.height,
 				jc.raster,
 				jc.bw,
 				jc.ox,
@@ -2509,8 +2533,8 @@ render_worker_run :: proc() {
 				b1 := audio_frame_boundary48(timeline_frame + 1, rfps)
 				cur_spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
 			}
-			for aa in 0 ..< len(render_job_audios) {
-				a := &render_job_audios[aa]
+			for aa in 0 ..< len(render_job.audios) {
+				a := &render_job.audios[aa]
 				if !a.dec.opened {
 					continue
 				}
@@ -2554,14 +2578,14 @@ render_worker_run :: proc() {
 		// Release: the canvas + mix writes above are visible to the encoder's
 		// acquire load of produced before it encodes frame frame_idx. The ready
 		// post wakes it; posting after the store orders the slot writes first.
-		sync.atomic_store(&render_enc_produced, frame_idx + 1)
-		sync.sema_post(&render_enc_ready)
+		sync.atomic_store(&render_pipe.enc_produced, frame_idx + 1)
+		sync.sema_post(&render_pipe.enc_ready)
 		sync.atomic_store(&render_progress.frames_done, frame_idx + 1)
-		if len(render_job_videos) > 0 {
+		if len(render_job.videos) > 0 {
 			// Release: this frame's decode slot is no longer being read, so the
 			// producer can reuse it (its slot-reuse bound is consumed >= N-1
 			// before writing frame N, i.e. this frame's parity slot).
-			sync.atomic_store(&render_dec_consumed, frame_idx + 1)
+			sync.atomic_store(&render_pipe.dec_consumed, frame_idx + 1)
 		}
 	}
 }
@@ -2676,11 +2700,11 @@ render_eval_keyed_geom :: proc(
 			off,
 			v.transform_x, v.transform_y, v.scale,
 			v.crop_l, v.crop_r, v.crop_t, v.crop_b,
-			render_job_width, render_job_height,
+			render_job.width, render_job.height,
 			v.source_w, v.source_h, v.fw, v.fh,
 		)
 	v.rw, v.rh, v.ox, v.oy = rw, rh, ox, oy
-	if ox >= render_job_width || oy >= render_job_height ||
+	if ox >= render_job.width || oy >= render_job.height ||
 	   ox + rw <= 0 || oy + rh <= 0 {
 		return false
 	}
@@ -2713,12 +2737,12 @@ render_eval_keyed_geom :: proc(
 		) < 0 {
 			return true
 		}
-		render_blit_region(canvas, render_job_width, render_job_height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
+		render_blit_region(canvas, render_job.width, render_job.height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
 		return true
 	}
 	// Scale fixed: the stage is already the box, so the crop sub-rect pixels
 	// equal the display pixels — one lossless region copy.
-	render_blit_region(canvas, render_job_width, render_job_height, slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh)
+	render_blit_region(canvas, render_job.width, render_job.height, slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh)
 	return true
 }
 
@@ -2897,7 +2921,7 @@ render_cancel :: proc() {
 }
 
 render_out_path :: proc() -> string {
-	return string(render_out_path_buf[:render_out_path_len])
+	return string(render_output.path_buf[:render_output.path_len])
 }
 
 // render_pick_output_path opens the platform save-as dialog (XDG portal on
@@ -2911,12 +2935,12 @@ render_pick_output_path :: proc() {
 		return
 	}
 	src := string(path)
-	render_out_path_len = min(len(src), len(render_out_path_buf) - 1)
-	for i in 0 ..< render_out_path_len {
-		render_out_path_buf[i] = u8(src[i])
+	render_output.path_len = min(len(src), len(render_output.path_buf) - 1)
+	for i in 0 ..< render_output.path_len {
+		render_output.path_buf[i] = u8(src[i])
 	}
-	render_out_path_buf[render_out_path_len] = 0
-	render_out_path_set = true
+	render_output.path_buf[render_output.path_len] = 0
+	render_output.path_set = true
 }
 
 // render_start snapshots the timeline and launches the worker thread.
@@ -2924,7 +2948,7 @@ render_start :: proc() {
 	if render_is_busy() {
 		return
 	}
-	if !render_out_path_set || render_out_path_len == 0 {
+	if !render_output.path_set || render_output.path_len == 0 {
 		set_status(.Failed, "pick an output file path first")
 		return
 	}
@@ -3070,48 +3094,48 @@ render_start :: proc() {
 			}
 		}
 	}
-	render_job_videos = cls[:]
-	render_job_audios = auds[:]
-	render_job_texts = txts[:]
-	render_job_subs = subs[:]
-	render_job_width = project.width
-	render_job_height = project.height
-	render_job_start = start_frame
-	render_job_end = end_frame - 1
-	render_job_nframes = end_frame - start_frame
-	render_job_out_path = strings.clone_to_cstring(render_out_path())
+	render_job.videos = cls[:]
+	render_job.audios = auds[:]
+	render_job.texts = txts[:]
+	render_job.subs = subs[:]
+	render_job.width = project.width
+	render_job.height = project.height
+	render_job.start = start_frame
+	render_job.end = end_frame - 1
+	render_job.nframes = end_frame - start_frame
+	render_job.out_path = strings.clone_to_cstring(render_out_path())
 
 	// Even output dimensions for yuv420p.
-	if render_job_width % 2 != 0 {
-		render_job_width += 1
+	if render_job.width % 2 != 0 {
+		render_job.width += 1
 	}
-	if render_job_height % 2 != 0 {
-		render_job_height += 1
+	if render_job.height % 2 != 0 {
+		render_job.height += 1
 	}
 
 	// Publish job bounds, then status: the release store on status orders the
 	// counter stores, so the worker's reader can never see .Rendering with stale
 	// frames_total.
 	sync.atomic_store(&render_progress.frames_done, 0)
-	sync.atomic_store(&render_progress.frames_total, render_job_nframes)
+	sync.atomic_store(&render_progress.frames_total, render_job.nframes)
 	sync.atomic_store(&render_progress.status, u32(Render_Status.Rendering))
 
-	render_worker_thread = thread.create(render_worker)
-	if render_worker_thread == nil {
+	render_pipe.worker = thread.create(render_worker)
+	if render_pipe.worker == nil {
 		set_status(.Failed, "could not start render thread")
 		render_free_workbook()
 		return
 	}
-	thread.start(render_worker_thread)
+	thread.start(render_pipe.worker)
 }
 
 // poll_completed_thread joins+destroys the worker once its status is terminal,
 // then releases the main-thread snapshot (render_free_workbook). Runs every UI
 // frame, but only does work on the finish transition.
 poll_completed_thread :: proc() {
-	if !render_is_busy() && render_worker_thread != nil {
-		thread.destroy(render_worker_thread)
-		render_worker_thread = nil
+	if !render_is_busy() && render_pipe.worker != nil {
+		thread.destroy(render_pipe.worker)
+		render_pipe.worker = nil
 		render_free_workbook()
 	}
 }
@@ -3120,36 +3144,36 @@ poll_completed_thread :: proc() {
 // render_start built on the main thread. The worker never touches them after it
 // returns (its job arena died with it), so this is always main-thread-only.
 render_free_workbook :: proc() {
-	for &v in render_job_videos {
+	for &v in render_job.videos {
 		if v.path != nil {
 			mem.delete_cstring(v.path)
 		}
 	}
-	for &a in render_job_audios {
+	for &a in render_job.audios {
 		if a.path != nil {
 			mem.delete_cstring(a.path)
 		}
 		ring_destroy(&a.fifo)
 	}
-	for &t in render_job_texts {
+	for &t in render_job.texts {
 		if t.name != "" {
 			delete(t.name)
 			t.name = ""
 		}
 	}
-	delete(render_job_videos)
-	delete(render_job_audios)
-	delete(render_job_texts)
-	if render_job_subs != nil {
-		delete(render_job_subs)
+	delete(render_job.videos)
+	delete(render_job.audios)
+	delete(render_job.texts)
+	if render_job.subs != nil {
+		delete(render_job.subs)
 	}
-	render_job_videos = nil
-	render_job_audios = nil
-	render_job_texts = nil
-	render_job_subs = nil
-	if render_job_out_path != nil {
-		mem.delete_cstring(render_job_out_path)
-		render_job_out_path = nil
+	render_job.videos = nil
+	render_job.audios = nil
+	render_job.texts = nil
+	render_job.subs = nil
+	if render_job.out_path != nil {
+		mem.delete_cstring(render_job.out_path)
+		render_job.out_path = nil
 	}
 }
 
@@ -3157,23 +3181,23 @@ render_free_workbook :: proc() {
 render_init :: proc() {
 	init_buf: [512]u8
 	def := render_default_output_path(init_buf[:])
-	render_out_path_len = len(def)
+	render_output.path_len = len(def)
 	for i in 0 ..< len(def) {
-		render_out_path_buf[i] = u8(def[i])
+		render_output.path_buf[i] = u8(def[i])
 	}
-	render_out_path_buf[render_out_path_len] = 0
-	render_out_path_set = true
+	render_output.path_buf[render_output.path_len] = 0
+	render_output.path_set = true
 }
 
 render_set_out_path :: proc(s: string) {
 	i := 0
-	for i < len(s) && i < len(render_out_path_buf) - 1 {
-		render_out_path_buf[i] = u8(s[i])
+	for i < len(s) && i < len(render_output.path_buf) - 1 {
+		render_output.path_buf[i] = u8(s[i])
 		i += 1
 	}
-	render_out_path_buf[i] = 0
-	render_out_path_len = i
-	render_out_path_set = true
+	render_output.path_buf[i] = 0
+	render_output.path_len = i
+	render_output.path_set = true
 }
 
 // ---------------------------------------------------------------------------
@@ -3248,12 +3272,12 @@ render_test_run :: proc(paths: [2]string) {
 	// timings headlessly.
 	if oc, oc_ok := os.lookup_env_alloc("VYPER_ENC", context.allocator); oc_ok && oc != "" {
 		if oc == "GPU" {
-			render_encoder_choice = .GPU
+			render_encoder_ui.choice = .GPU
 		} else {
-			render_encoder_choice = .CPU
+			render_encoder_ui.choice = .CPU
 		}
 	}
-	render_overwrite_out = true // the test must write exactly the requested path
+	render_output.overwrite = true // the test must write exactly the requested path
 	render_start()
 	for render_is_busy() {
 		time.sleep(50 * time.Millisecond)
@@ -3340,7 +3364,7 @@ probe_ground_truth :: proc(
 }
 
 preview_probe_run :: proc(paths: [2]string) {
-	preview_proxy_enabled = false // ground truth vs the original decode path
+	editor_flags.preview_proxy_enabled = false // ground truth vs the original decode path
 	if len(paths[0]) == 0 {
 		fmt.println("preview-probe: need VYPER_PREVIEW_PROBE=\"<in>|<split_at>\"")
 		os.exit(2)
@@ -3373,8 +3397,8 @@ preview_probe_run :: proc(paths: [2]string) {
 	playhead.frame = split_at
 	// The probe bypasses the UI: split_clip_at_playhead now only splits the
 	// currently selected clip, so select track 0's first clip first.
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	split_clip_at_playhead()
 	fmt.println("[probe] after split at", split_at, "tracks:")
 	for t := 0; t < len(timeline.tracks); t += 1 {
@@ -3416,6 +3440,10 @@ preview_probe_run :: proc(paths: [2]string) {
 	// head-trim bug). Report it, then rebuild the scene the way the DRAG path
 	// does it: split, delete the left half raw, drag the right half back with
 	// clip_slide_in_track (gap-preserving move).
+	if len(timeline.tracks) < 2 || len(timeline.tracks[1].clips) == 0 {
+		fmt.eprintln("preview-probe: needs a video+audio file (the A/V-glue check reads tracks[1])")
+		os.exit(2)
+	}
 	fmt.printf(
 		"[probe] AUDIO_DESYNC_CHECK: video_clip src_start=%d, audio_clip src_start=%d (should match for A/V glue)\n",
 		timeline.tracks[0].clips[0].source_start_frame,
@@ -3429,12 +3457,12 @@ preview_probe_run :: proc(paths: [2]string) {
 	clear(&track1.clips)
 	import_media(cstring(&probe_input_buf[0]))
 	playhead.frame = split_at
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	split_clip_at_playhead()
 	// Raw delete of the LEFT half (clip[0]) leaves a gap; right half stays put.
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	delete_selected_clip_raw()
 	fmt.println("[probe] after raw-delete left, before drag-back:")
 	for t := 0; t < len(timeline.tracks); t += 1 {
@@ -3566,7 +3594,7 @@ boundary_probe_print_clips :: proc() {
 }
 
 boundary_probe_run :: proc(v: string) {
-	preview_proxy_enabled = false // ground truth vs the original decode path
+	editor_flags.preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 2 {
 		fmt.println("boundary-probe: need VYPER_BOUNDARY_PROBE=\"<file>|<split1>[|<split2>]\"")
@@ -3578,8 +3606,10 @@ boundary_probe_run :: proc(v: string) {
 		s1 = sv
 	}
 	s2: i64 = 184
-	if sv, ok := strconv.parse_i64(parts[2]); ok {
-		s2 = sv
+	if len(parts) >= 3 {
+		if sv, ok := strconv.parse_i64(parts[2]); ok {
+			s2 = sv
+		}
 	}
 	total_frames := i64(s2 + 400)
 	inp: [4096]u8
@@ -3593,20 +3623,20 @@ boundary_probe_run :: proc(v: string) {
 	import_media(path)
 
 	// Split 1 at s1 on clip 0 (tl [0,total) src [0,total)).
-	selected_track = 0
-	selected_index = 0
+	selection.track = 0
+	selection.index = 0
 	playhead.frame = s1
 	split_clip_at_playhead()
 	// Split 2 at s2 on clip index 1 (the [s1,total) half).
-	selected_track = 0
-	selected_index = 1
+	selection.track = 0
+	selection.index = 1
 	playhead.frame = s2
 	split_clip_at_playhead()
 	fmt.println("[bprobe] after splits at", s1, s2)
 	boundary_probe_print_clips()
 	// Raw-delete the middle [s1,s2) clip.
-	selected_track = 0
-	selected_index = 1
+	selection.track = 0
+	selection.index = 1
 	delete_selected_clip_raw()
 	// Drag the tail back flush: nearest valid non-overlapping start near s1.
 	track := &timeline.tracks[0]
@@ -3789,7 +3819,7 @@ probe_hash_decode_sync :: proc(path: cstring, clip_frame: i64) -> (u64, bool) {
 }
 
 preview_framecheck_run :: proc(v: string) {
-	preview_proxy_enabled = false // ground truth vs the original decode path
+	editor_flags.preview_proxy_enabled = false // ground truth vs the original decode path
 	parts := strings.split(v, "|")
 	if len(parts) < 3 {
 		fmt.println("frame-probe: need VYPER_FRAME_PROBE=\"<file>|<start>-<end>|<stride>\"")

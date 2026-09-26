@@ -33,7 +33,7 @@ import clay "clay-odin"
 //   - exactly one build runs at a time; a request posted while a build is
 //     running is kept as the next job (latest request wins, older are dropped).
 //
-// `async_import_mode` (state.odin) switches this off for probe/CI runs: those
+// `editor_flags.async_import_mode` (state.odin) switches this off for probe/CI runs: those
 // assert the proxy exists on disk immediately after import_media returns, so
 // they keep the historical synchronous whole-file `proxy_transcode` build.
 // ---------------------------------------------------------------------------
@@ -111,7 +111,15 @@ Proxy_Builder :: struct {
 	progress: f64, // 0..1 while Building, -1 while estimating
 }
 
-import_builder: Proxy_Builder
+// Import_UI_State is the async-import dialog's UI state: the Proxy_Builder
+// driving the background segment encode, plus the cancel button's hit box
+// (filled each frame the dialog draws). Both live together because the cancel
+// box only matters for the dialog this builder feeds.
+Import_UI_State :: struct {
+	builder:  Proxy_Builder,
+	cancel_box: clay.BoundingBox,
+}
+import_ui: Import_UI_State
 
 // import_bg_request enqueues a proxy build of the SEGMENT WINDOW
 // [seg_lo, seg_hi) of `src` (half-open; seg_lo..seg_hi-1). Safe to call with a
@@ -127,7 +135,7 @@ import_bg_request :: proc(
 	w, h: c.int,
 	seg_lo, seg_hi: int,
 ) {
-	ib := &import_builder
+	ib := &import_ui.builder
 	if ib.worker.thread == nil {
 		return
 	}
@@ -160,7 +168,7 @@ import_bg_redefine :: proc(
 	w, h: c.int,
 	seg_lo, seg_hi: int,
 ) {
-	ib := &import_builder
+	ib := &import_ui.builder
 	if ib.worker.thread == nil {
 		return
 	}
@@ -190,7 +198,7 @@ import_bg_redefine :: proc(
 // against the source's frame count would delete it while the worker is still
 // writing (a lost artifact + a removed artifact from under its open handle).
 import_bg_building_for :: proc(src: string) -> bool {
-	ib := &import_builder
+	ib := &import_ui.builder
 	sync.mutex_lock(&ib.worker.mutex)
 	defer sync.mutex_unlock(&ib.worker.mutex)
 	if ib.phase == .Building || ib.phase == .Verifying {
@@ -204,7 +212,7 @@ import_bg_building_for :: proc(src: string) -> bool {
 // import_bg_cancel aborts the current proxy job (running or queued). The worker
 // aborts on its next cancel poll and deletes the partial proxy it was on.
 import_bg_cancel :: proc() {
-	ib := &import_builder
+	ib := &import_ui.builder
 	if ib.worker.thread == nil {
 		return
 	}
@@ -217,7 +225,7 @@ import_bg_cancel :: proc() {
 // import_bg_active reports whether the corner build badge should show (a build
 // is running or one is queued).
 import_bg_active :: proc() -> bool {
-	ib := &import_builder
+	ib := &import_ui.builder
 	sync.mutex_lock(&ib.worker.mutex)
 	defer sync.mutex_unlock(&ib.worker.mutex)
 	return ib.phase == .Building || ib.phase == .Verifying || ib.req_valid
@@ -235,7 +243,7 @@ box_contains :: proc(b: clay.BoundingBox, x, y: f32) -> bool {
 // import_bg_status snapshots the builder for the corner build badge. `src`
 // points into the builder's own buffers (stable until the next request/claim).
 import_bg_status :: proc() -> (active: bool, frac: f64, phase: Build_Phase, src: cstring) {
-	ib := &import_builder
+	ib := &import_ui.builder
 	sync.mutex_lock(&ib.worker.mutex)
 	defer sync.mutex_unlock(&ib.worker.mutex)
 	active = ib.phase == .Building || ib.phase == .Verifying || ib.req_valid
@@ -258,7 +266,7 @@ import_bg_status :: proc() -> (active: bool, frac: f64, phase: Build_Phase, src:
 // just failed until the playhead moves on. The worker clears both when it
 // claims the NEXT request.
 import_bg_consume_done :: proc() {
-	ib := &import_builder
+	ib := &import_ui.builder
 	sync.mutex_lock(&ib.worker.mutex)
 	defer sync.mutex_unlock(&ib.worker.mutex)
 	#partial switch ib.phase {
@@ -296,7 +304,7 @@ import_bg_window :: proc() -> (
 	last_result_src: cstring,
 	last_result_lo, last_result_hi: int,
 ) {
-	ib := &import_builder
+	ib := &import_ui.builder
 	sync.mutex_lock(&ib.worker.mutex)
 	defer sync.mutex_unlock(&ib.worker.mutex)
 	req_src = cstring(&ib.req_src[0])
@@ -314,7 +322,7 @@ import_bg_window :: proc() -> (
 }
 
 import_bg_init :: proc() {
-	ib := &import_builder
+	ib := &import_ui.builder
 	ib.phase = .Idle
 	ib.progress = -1
 	worker_start(&ib.worker, import_bg_worker, ib)
@@ -324,7 +332,7 @@ import_bg_init :: proc() {
 // flight is cancelled (in-flight encode aborted, partial proxy removed) rather
 // than waited out.
 import_bg_shutdown :: proc() {
-	ib := &import_builder
+	ib := &import_ui.builder
 	if ib.worker.thread == nil {
 		return
 	}

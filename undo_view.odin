@@ -26,16 +26,27 @@ UNDO_ROW_TEXT :: u16(18)  // layout height of the row text
 
 // One emitted display line. `node` is the undo slot for an action line and -1
 // for a connector-only line (never clickable, never highlighted). `text_len` is
-// the bytes actually written into undo_view_line_bufs for this line — clay does
+// the bytes actually written into undo_tree_view.line_bufs for this line — clay does
 // not copy text and a whole fixed buffer would measure 256 columns wide.
 Undo_View_Line :: struct {
 	node:     i32,
 	text_len: int,
 }
 
-undo_view_lines: [dynamic]Undo_View_Line
-undo_view_line_bufs: [dynamic][256]u8
-undo_view_built_count: int = -1 // len(slots) the lines were built from
+// Undo_View is the undo-tree viewer's display state: the rebuilt line list
+// (slots + text buffers — clay does not copy text and a whole fixed buffer
+// would measure 256 columns wide, so each line records its byte count), the
+// slot count the lines were built from (len(slots)), the rebuild scratch (one
+// slot per display column of the port of mbbill/undotree), and the stats line
+// buffer.
+Undo_View :: struct {
+	lines:      [dynamic]Undo_View_Line,
+	line_bufs:  [dynamic][256]u8,
+	built_count: int, // len(slots) the lines were built from
+	scratch:    [dynamic]Undo_View_Slot,
+	stats_buf:  [128]u8,
+}
+undo_tree_view: Undo_View = {built_count = -1}
 
 // ---------------------------------------------------------------------------
 // undotree slot machine (port of mbbill/undotree Render()).
@@ -57,19 +68,17 @@ Undo_View_Slot :: struct {
 	count: int, // P: number of siblings
 }
 
-undo_view_scratch: [dynamic]Undo_View_Slot
-
 undo_view_rebuild :: proc() {
 	n := len(undo_hist.slots)
-	clear(&undo_view_lines)
-	clear(&undo_view_line_bufs)
+	clear(&undo_tree_view.lines)
+	clear(&undo_tree_view.line_bufs)
 	// Scratch holds one slot per display column; a fork P expansion inserts two
 	// slots where one was, so give it two slots of headroom.
-	if len(undo_view_scratch) < n + 2 {
-		resize(&undo_view_scratch, n + 2)
+	if len(undo_tree_view.scratch) < n + 2 {
+		resize(&undo_tree_view.scratch, n + 2)
 	}
 
-	scratch := undo_view_scratch[:]
+	scratch := undo_tree_view.scratch[:]
 	scratch[0] = Undo_View_Slot{kind = .E, node = 0}
 	nslots := 1
 
@@ -224,19 +233,19 @@ undo_view_rebuild :: proc() {
 			w -= 1
 		}
 		if w > 1 {
-			append(&undo_view_line_bufs, [256]u8{})
-			copy(undo_view_line_bufs[len(undo_view_line_bufs)-1][:], line[:w])
-			append(&undo_view_lines, Undo_View_Line{node = line_node, text_len = w})
+			append(&undo_tree_view.line_bufs, [256]u8{})
+			copy(undo_tree_view.line_bufs[len(undo_tree_view.line_bufs)-1][:], line[:w])
+			append(&undo_tree_view.lines, Undo_View_Line{node = line_node, text_len = w})
 		}
 	}
 
 	// The machine emits root-first; the view is newest-first.
-	for i := 0; i < len(undo_view_lines) / 2; i += 1 {
-		j := len(undo_view_lines) - 1 - i
-		undo_view_lines[i], undo_view_lines[j] = undo_view_lines[j], undo_view_lines[i]
-		undo_view_line_bufs[i], undo_view_line_bufs[j] = undo_view_line_bufs[j], undo_view_line_bufs[i]
+	for i := 0; i < len(undo_tree_view.lines) / 2; i += 1 {
+		j := len(undo_tree_view.lines) - 1 - i
+		undo_tree_view.lines[i], undo_tree_view.lines[j] = undo_tree_view.lines[j], undo_tree_view.lines[i]
+		undo_tree_view.line_bufs[i], undo_tree_view.line_bufs[j] = undo_tree_view.line_bufs[j], undo_tree_view.line_bufs[i]
 	}
-	undo_view_built_count = n
+	undo_tree_view.built_count = n
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +265,7 @@ undo_view_max_scroll :: proc() -> f32 {
 }
 
 undo_row :: proc(line_i: int) {
-	line := undo_view_lines[line_i]
+	line := undo_tree_view.lines[line_i]
 	cur := line.node >= 0 && int(line.node) == int(undo_hist.current)
 	id := clay.ID("UndoRow", u32(line_i))
 	hovered := line.node >= 0 && clay.PointerOver(id)
@@ -278,7 +287,7 @@ undo_row :: proc(line_i: int) {
 		},
 	) {
 		clay.Text(
-			string(undo_view_line_bufs[line_i][:line.text_len]),
+			string(undo_tree_view.line_bufs[line_i][:line.text_len]),
 			clay.TextElementConfig{
 				textColor = cur ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_SMALL,
@@ -296,7 +305,7 @@ undo_row :: proc(line_i: int) {
 // tree.
 undo_view_header :: proc() {
 	stats := fmt.bprintf(
-		undo_view_stats_buf[:],
+		undo_tree_view.stats_buf[:],
 		"Undo tree · %d action%s · cursor %d",
 		undo_count(),
 		undo_count() == 1 ? "" : "s",
@@ -324,7 +333,7 @@ undo_view_content :: proc() {
 		return
 	}
 	// Structure only changes on a push; cursor moves reuse the built lines.
-	if undo_view_built_count != len(undo_hist.slots) {
+	if undo_tree_view.built_count != len(undo_hist.slots) {
 		undo_view_rebuild()
 	}
 	// Width is plain grow: every line is a fixed slice sized to its real text.
@@ -359,7 +368,7 @@ undo_view_content :: proc() {
 					},
 				},
 			) {
-				for i in 0 ..< len(undo_view_lines) {
+				for i in 0 ..< len(undo_tree_view.lines) {
 					undo_row(i)
 				}
 			}
@@ -373,25 +382,23 @@ undo_view_content :: proc() {
 	}
 }
 
-undo_view_stats_buf: [128]u8
-
-// undo_view_row_click wires row clicks: any click inside an action row moves the
+// undo_row_click wires row clicks: any click inside an action row moves the
 // cursor to that action. Connector rows are inert. Added first in the click
 // chain so the undo view claims its own rows before anything underneath.
 // Returns false when the media bin isn't showing the tree.
 undo_view_row_click :: proc(inp: Mouse_Input) -> bool {
-	if media_bin_view != .Undo || len(undo_hist.slots) <= 1 {
+	if panel_views.media_bin_view != .Undo || len(undo_hist.slots) <= 1 {
 		return false
 	}
-	if undo_view_built_count != len(undo_hist.slots) {
+	if undo_tree_view.built_count != len(undo_hist.slots) {
 		undo_view_rebuild()
 	}
-	for i in 0 ..< len(undo_view_lines) {
-		if undo_view_lines[i].node < 0 {
+	for i in 0 ..< len(undo_tree_view.lines) {
+		if undo_tree_view.lines[i].node < 0 {
 			continue
 		}
 		if clay.PointerOver(clay.ID("UndoRow", u32(i))) {
-			undo_go_to(int(undo_view_lines[i].node))
+			undo_go_to(int(undo_tree_view.lines[i].node))
 			return true
 		}
 	}

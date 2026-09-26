@@ -48,9 +48,9 @@ flash_probe_play_across :: proc(
 	tally_from: i64,
 ) -> int {
 	playhead.playing = true
-	playback_dir = 1
+	playback.dir = 1
 	if dir < 0 {
-		playback_dir = -1
+		playback.dir = -1
 	}
 	active_interaction = .None
 	drops := 0
@@ -101,7 +101,7 @@ flash_probe_play_across :: proc(
 // whose slot drops and re-acquires (has_frame going false while the video
 // halves hand over) is the flash -- that is the drop to catch and count.
 flash_probe_run :: proc(v: string) {
-	async_import_mode = false
+	editor_flags.async_import_mode = false
 	inp: [4096]u8
 	n := 0
 	for n < len(v) && n < len(inp) - 1 {
@@ -268,7 +268,7 @@ flash_probe_run :: proc(v: string) {
 	// cut, or this probe is set up wrong (nothing to "keep riding").
 	playhead.frame = cut_at - 2
 	playhead.playing = true
-	playback_dir = 1
+	playback.dir = 1
 	active_interaction = .None
 	update_preview_slots()
 	if overlay_clip != nil {
@@ -355,7 +355,7 @@ flash_probe_run :: proc(v: string) {
 		// Start again before the cut, like a real second play-through.
 		playhead.frame = cut_at - 2
 		playhead.playing = true
-		playback_dir = 1
+		playback.dir = 1
 		active_interaction = .None
 		update_preview_slots()
 		fwd2_drops = flash_probe_play_across(

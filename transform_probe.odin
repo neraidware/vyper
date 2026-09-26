@@ -38,9 +38,9 @@ mk_probe_clip :: proc() -> (c: Clip) {
 // probe_canvas maps pixel space 1:1 onto project resolution (identity camera,
 // canvas == project size), so pixel<->project conversions are identity.
 probe_canvas :: proc() -> clay.BoundingBox {
-	preview_cam_zoom = 1
-	preview_cam_ox = 0
-	preview_cam_oy = 0
+	preview_cam.zoom = 1
+	preview_cam.ox = 0
+	preview_cam.oy = 0
 	return {x = 0, y = 0, width = f32(project.width), height = f32(project.height)}
 }
 
@@ -360,16 +360,16 @@ transform_probe_run :: proc(v: string) {
 	// even when zoom/pan were dirtied, and releasing it lets the manual camera
 	// apply. This is the "always fits" invariant the toolbar toggle relies on.
 	{
-		preview_fit_to_window = true
-		preview_cam_zoom = 4
-		preview_cam_ox = 123
-		preview_cam_oy = -45
+		preview_cam.fit_to_window = true
+		preview_cam.zoom = 4
+		preview_cam.ox = 123
+		preview_cam.oy = -45
 		v := preview_view(canvas)
 		check(
 			&fail,
-			abs(preview_cam_zoom - 1) <= 0.0001 &&
-			abs(preview_cam_ox) <= 0.0001 &&
-			abs(preview_cam_oy) <= 0.0001,
+			abs(preview_cam.zoom - 1) <= 0.0001 &&
+			abs(preview_cam.ox) <= 0.0001 &&
+			abs(preview_cam.oy) <= 0.0001,
 			"fit: dirty camera must snap back to zoom 1 / no pan",
 			v.x,
 			v.x + v.width,
@@ -385,8 +385,8 @@ transform_probe_run :: proc(v: string) {
 			v.y,
 			v.y + v.height,
 		)
-		preview_fit_to_window = false
-		preview_cam_zoom = 2
+		preview_cam.fit_to_window = false
+		preview_cam.zoom = 2
 		v = preview_view(canvas)
 		check(
 			&fail,
@@ -397,7 +397,7 @@ transform_probe_run :: proc(v: string) {
 			v.y,
 			v.y + v.height,
 		)
-		preview_fit_to_window = true
+		preview_cam.fit_to_window = true
 	}
 
 	if !fail {

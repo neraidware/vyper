@@ -141,7 +141,7 @@ lane_blocked :: proc(track: ^Track, start, length: i64) -> bool {
 // frames when zoomed out, gluing drags and scrubs onto snap points across the
 // whole timeline.)
 snap_margin_frames :: proc() -> f32 {
-	return f32(SNAP_PIXELS) / timeline_zoom
+	return f32(SNAP_PIXELS) / timeline_view.zoom
 }
 
 // snap_to_playhead latches a clip-drag target onto the playhead when it comes
@@ -322,7 +322,7 @@ clip_slide_in_track :: proc(
 // capping on it would lock the clip to a single frame. Used to cap lengthening
 // so a clip never references past the end of its source media.
 asset_source_frames :: proc(asset_id: u64, kind: Media_Kind) -> i64 {
-	for &a in media_assets {
+	for &a in media_bin.assets {
 		if a.id == asset_id {
 			return kind == .Audio ? a.audio_frames : a.frame_count
 		}
@@ -444,8 +444,8 @@ split_clip_at_playhead :: proc() {
 		if !ok || clip == nil {
 			return
 		}
-		selected_track = track_index_of(tr)
-		selected_index = clip_index_on_track(tr, clip)
+		selection.track = track_index_of(tr)
+		selection.index = clip_index_on_track(tr, clip)
 	}
 	local := frame - clip.timeline_start_frame
 	if local <= 0 || local >= clip.source_length_frames {
@@ -473,7 +473,7 @@ split_clip_at_playhead :: proc() {
 			}
 		}
 	} else {
-		append(&targets, SplitTarget{selected_track, selected_index})
+		append(&targets, SplitTarget{selection.track, selection.index})
 	}
 	if len(targets) == 0 {
 		return
@@ -561,7 +561,7 @@ unlink_selected_clips :: proc() {
 		return
 	}
 	// Any group drag math captured earlier is now invalid: members are free.
-	clear(&drag_group_orig)
+	clear(&clip_move.group_orig)
 	audio_note_edit()
 	if vyper_trace {
 		fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
@@ -569,18 +569,18 @@ unlink_selected_clips :: proc() {
 }
 
 // toggle_links_for_selection links or unlinks the current selection: the anchor
-// clip plus every Shift+clicked clip in selected_set. A lone selection unlinks
+// clip plus every Shift+clicked clip in selection.extra_set. A lone selection unlinks
 // that clip's whole link group (video + audio become independent). With several
 // clips the action toggles: if they already share one link_id every selected
 // member is unlinked, otherwise they all join a fresh link group so later
 // cuts/moves/deletes treat them as one unit.
 toggle_links_for_selection :: proc() {
 	_, anchor, ok := selected_clip()
-	ids := make([dynamic]u64, 0, len(selected_set) + 1, context.temp_allocator)
+	ids := make([dynamic]u64, 0, len(selection.extra_set) + 1, context.temp_allocator)
 	if ok && anchor != nil {
 		append(&ids, anchor.clip_id)
 	}
-	for id in selected_set {
+	for id in selection.extra_set {
 		dup := false
 		for o in ids {
 			if o == id {
@@ -642,7 +642,7 @@ toggle_links_for_selection :: proc() {
 			break
 		}
 	}
-	clear(&drag_group_orig)
+	clear(&clip_move.group_orig)
 	if same_group {
 		for c in resolved {
 			c.link_id = 0
@@ -686,15 +686,15 @@ filter_markers_in_range :: proc(
 // showing the clip(s) (a gap stays where they were). The group scope keeps a cut
 // from leaving its video behind with no audio (or vice versa).
 delete_selected_clip_raw :: proc() {
-	if selected_track < 0 || selected_track >= len(timeline.tracks) {
+	if selection.track < 0 || selection.track >= len(timeline.tracks) {
 		return
 	}
-	track := &timeline.tracks[selected_track]
-	if selected_index < 0 || selected_index >= len(track.clips) {
+	track := &timeline.tracks[selection.track]
+	if selection.index < 0 || selection.index >= len(track.clips) {
 		return
 	}
 	undo_begin()
-	link := track.clips[selected_index].link_id
+	link := track.clips[selection.index].link_id
 	Target :: struct {
 		track, index: int,
 	}
@@ -708,7 +708,7 @@ delete_selected_clip_raw :: proc() {
 			}
 		}
 	} else {
-		append(&targets, Target{selected_track, selected_index})
+		append(&targets, Target{selection.track, selection.index})
 	}
 	// Descending (track, index) so a removal on one track never invalidates a
 	// still-pending target's index on the same track.
@@ -749,8 +749,8 @@ delete_selected_clip_raw :: proc() {
 	if vyper_trace {
 		fmt.printf("[tl] deleted clip group link=%d (%d clips)\n", link, len(targets))
 	}
-	selected_track = -1
-	selected_index = -1
+	selection.track = -1
+	selection.index = -1
 	// CRITICAL: invalidation MUST follow every delete. The timeline no longer
 	// references `removed`, but the per-clip preview slots still hold this
 	// clip's decoded frames, open decoder, and GPU texture. Without
@@ -758,10 +758,10 @@ delete_selected_clip_raw :: proc() {
 	// (classic "deleted clip still renders" bug). Do not remove this regardless
 	// of how the delete is wired — any new delete path must do the same.
 	active_interaction = .None
-	drag_clip = nil
-	drag_source_track = -1
-	drag_source_index = -1
-	drag_hover_track = -1
+	clip_move.clip = nil
+	clip_move.source_track = -1
+	clip_move.source_index = -1
+	clip_move.hover_track = -1
 	invalidate_preview_slots()
 	undo_push(.Delete, "Delete clip")
 	audio_note_edit()
@@ -889,8 +889,8 @@ ripple_playhead_after_region :: proc(start, end, length: i64) {
 		playhead.frame = start
 	}
 	if delta := playhead.frame - before; delta != 0 {
-		timeline_view_start = clamp(
-			timeline_view_start + f32(delta),
+		timeline_view.start = clamp(
+			timeline_view.start + f32(delta),
 			0,
 			f32(timeline_duration()),
 		)
@@ -915,16 +915,16 @@ ripple_delete_region :: proc(start, length: i64) {
 	// cached for it: cancel any in-flight drag and drop the preview slots so the
 	// next update re-derives them purely from the edited timeline.
 	active_interaction = .None
-	drag_clip = nil
-	drag_source_track = -1
-	drag_source_index = -1
-	drag_hover_track = -1
+	clip_move.clip = nil
+	clip_move.source_track = -1
+	clip_move.source_index = -1
+	clip_move.hover_track = -1
 	invalidate_preview_slots()
 	if vyper_trace {
 		fmt.printf("[tl] ripple delete region [%d, %d)\n", start, start + length)
 	}
-	selected_track = -1
-	selected_index = -1
+	selection.track = -1
+	selection.index = -1
 	undo_push(.Delete, "Delete region")
 	audio_note_edit()
 }
@@ -963,11 +963,11 @@ ripple_delete_linked_group :: proc(link: u64) {
 	// frame of reference.
 	anchor_start, anchor_len: i64
 	have_anchor := false
-	if selected_track >= 0 &&
-	   selected_track < len(timeline.tracks) &&
-	   selected_index >= 0 &&
-	   selected_index < len(timeline.tracks[selected_track].clips) {
-		anchor := timeline.tracks[selected_track].clips[selected_index]
+	if selection.track >= 0 &&
+	   selection.track < len(timeline.tracks) &&
+	   selection.index >= 0 &&
+	   selection.index < len(timeline.tracks[selection.track].clips) {
+		anchor := timeline.tracks[selection.track].clips[selection.index]
 		if anchor.link_id == link {
 			anchor_start = anchor.timeline_start_frame
 			anchor_len = anchor.source_length_frames
@@ -996,16 +996,16 @@ ripple_delete_linked_group :: proc(link: u64) {
 		)
 	}
 	active_interaction = .None
-	drag_clip = nil
-	drag_source_track = -1
-	drag_source_index = -1
-	drag_hover_track = -1
+	clip_move.clip = nil
+	clip_move.source_track = -1
+	clip_move.source_index = -1
+	clip_move.hover_track = -1
 	invalidate_preview_slots()
 	if vyper_trace {
 		fmt.printf("[tl] ripple delete linked group link=%d (%d members)\n", link, len(spans))
 	}
-	selected_track = -1
-	selected_index = -1
+	selection.track = -1
+	selection.index = -1
 	undo_push(.Delete, "Delete group")
 	audio_note_edit()
 }
@@ -1022,10 +1022,10 @@ ruler_steps :: proc(duration: i64) -> (minor, major: i64) {
 }
 
 selected_clip :: proc() -> (^Track, ^Clip, bool) {
-	if selected_track >= 0 && selected_track < len(timeline.tracks) {
-		tr := &timeline.tracks[selected_track]
-		if selected_index >= 0 && selected_index < len(tr.clips) {
-			return tr, &tr.clips[selected_index], true
+	if selection.track >= 0 && selection.track < len(timeline.tracks) {
+		tr := &timeline.tracks[selection.track]
+		if selection.index >= 0 && selection.index < len(tr.clips) {
+			return tr, &tr.clips[selection.index], true
 		}
 	}
 	return nil, nil, false
@@ -1071,7 +1071,7 @@ clip_index_on_track :: proc(tr: ^Track, clip: ^Clip) -> int {
 // clip's link group. Highlighting every linked member makes a linked cut/move
 // read as one unit instead of a lone border on the grabbed clip.
 is_clip_selected :: proc(track_idx, index: int) -> bool {
-	if track_idx == selected_track && index == selected_index {
+	if track_idx == selection.track && index == selection.index {
 		return true
 	}
 	if track_idx < 0 ||
@@ -1081,7 +1081,7 @@ is_clip_selected :: proc(track_idx, index: int) -> bool {
 		return false
 	}
 	candidate := &timeline.tracks[track_idx].clips[index]
-	if candidate.clip_id in selected_set {
+	if candidate.clip_id in selection.extra_set {
 		return true
 	}
 	_, sel, ok := selected_clip()
@@ -1155,11 +1155,11 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 		dst.clips[i], dst.clips[i - 1] = dst.clips[i - 1], dst.clips[i]
 	}
 	// Refresh selection to the moved clip.
-	selected_track = dst_track
-	selected_index = len(dst.clips) - 1
+	selection.track = dst_track
+	selection.index = len(dst.clips) - 1
 	for i in 0 ..< len(dst.clips) {
 		if dst.clips[i].timeline_start_frame == placed {
-			selected_index = i
+			selection.index = i
 			break
 		}
 	}
@@ -1177,7 +1177,7 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 	// slots from the edited timeline instead of reusing the old covering state.
 	invalidate_preview_slots()
 	audio_note_edit()
-	return selected_index
+	return selection.index
 }
 
 // clip_index_by_id returns the index of the clip with the given clip_id on the
@@ -1193,18 +1193,18 @@ clip_index_by_id :: proc(track: ^Track, id: u64) -> int {
 }
 
 // capture_link_group snapshots the original (track, start, length) of every clip
-// sharing clip's link_id into drag_group_orig, anchor first. Non-linked clips
+// sharing clip's link_id into clip_move.group_orig, anchor first. Non-linked clips
 // leave the array empty (len 0 = single-clip edit; len 1 = linked clip that is
 // its own whole group, e.g. single-lane media). Call at gesture start, before any
 // mutation: the captured originals are the invariant the group delta is computed
 // against on every following frame.
 capture_link_group :: proc(clip: ^Clip, track: int) {
-	clear(&drag_group_orig)
+	clear(&clip_move.group_orig)
 	if clip.link_id == 0 {
 		return
 	}
 	append(
-		&drag_group_orig,
+		&clip_move.group_orig,
 		Drag_Group_Orig {
 			clip_id = clip.clip_id,
 			track = track,
@@ -1217,7 +1217,7 @@ capture_link_group :: proc(clip: ^Clip, track: int) {
 			c := &timeline.tracks[t].clips[i]
 			if c.link_id == clip.link_id && c.clip_id != clip.clip_id {
 				append(
-					&drag_group_orig,
+					&clip_move.group_orig,
 					Drag_Group_Orig {
 						clip_id = c.clip_id,
 						track = t,
@@ -1239,11 +1239,11 @@ capture_link_group :: proc(clip: ^Clip, track: int) {
 // a hard left-edge always clamps the same member short). Horizontal moves of a
 // link group keep all members time-aligned with the anchor.
 apply_group_drag_to_members :: proc(anchor_delta: i64) {
-	if len(drag_group_orig) <= 1 {
+	if len(clip_move.group_orig) <= 1 {
 		return
 	}
-	anchor_id := drag_group_orig[0].clip_id
-	for m in drag_group_orig {
+	anchor_id := clip_move.group_orig[0].clip_id
+	for m in clip_move.group_orig {
 		if m.clip_id == anchor_id {
 			continue
 		}
@@ -1266,14 +1266,14 @@ apply_group_drag_to_members :: proc(anchor_delta: i64) {
 // feasible for every member: the anchor must never move into a slot a partner
 // cannot reach.
 group_delta_feasible :: proc(delta: i64) -> bool {
-	if len(drag_group_orig) <= 1 {
+	if len(clip_move.group_orig) <= 1 {
 		return true
 	}
-	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
-	for m in drag_group_orig {
+	members := make(map[u64]bool, len(clip_move.group_orig), context.temp_allocator)
+	for m in clip_move.group_orig {
 		members[m.clip_id] = true
 	}
-	for m in drag_group_orig {
+	for m in clip_move.group_orig {
 		if m.track < 0 || m.track >= len(timeline.tracks) {
 			return false
 		}
@@ -1308,16 +1308,16 @@ group_delta_feasible :: proc(delta: i64) -> bool {
 // The walls are the blockers at-or-left / at-or-right of each member's CURRENT
 // position, so the clamp never jumps a band (matching single-clip behavior).
 group_clamp_delta :: proc(delta: i64) -> i64 {
-	if len(drag_group_orig) <= 1 {
+	if len(clip_move.group_orig) <= 1 {
 		return delta
 	}
-	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
-	for m in drag_group_orig {
+	members := make(map[u64]bool, len(clip_move.group_orig), context.temp_allocator)
+	for m in clip_move.group_orig {
 		members[m.clip_id] = true
 	}
-	d_cur := drag_clip.timeline_start_frame - drag_group_orig[0].start
+	d_cur := clip_move.clip.timeline_start_frame - clip_move.group_orig[0].start
 	lo, hi := i64(-1 << 40), i64(1 << 40)
-	for m in drag_group_orig {
+	for m in clip_move.group_orig {
 		if m.track < 0 || m.track >= len(timeline.tracks) {
 			return delta
 		}
@@ -1354,15 +1354,15 @@ group_clamp_delta :: proc(delta: i64) -> i64 {
 // the group may span non-adjacent storage indices, but the overlap checks
 // target the correct destination track.
 group_vertical_feasible :: proc(track_delta_visual: int, delta: i64) -> bool {
-	if len(drag_group_orig) == 0 {
+	if len(clip_move.group_orig) == 0 {
 		return false
 	}
 	sync_track_order()
-	members := make(map[u64]bool, len(drag_group_orig), context.temp_allocator)
-	for m in drag_group_orig {
+	members := make(map[u64]bool, len(clip_move.group_orig), context.temp_allocator)
+	for m in clip_move.group_orig {
 		members[m.clip_id] = true
 	}
-	for m in drag_group_orig {
+	for m in clip_move.group_orig {
 		src_row := order_row_of(m.track)
 		if src_row < 0 {
 			return false
@@ -1387,19 +1387,19 @@ group_vertical_feasible :: proc(track_delta_visual: int, delta: i64) -> bool {
 	return true
 }
 
-// move_linked_group relocates every clip captured in drag_group_orig by
+// move_linked_group relocates every clip captured in clip_move.group_orig by
 // track_delta_visual rows in the visual stack (the anchor's vertical drop),
 // keeping each member laid-out at the same mouse-aligned horizontal offset the
-// ghost showed: start = m.start + drag_group_delta. Refused (returns false,
+// ghost showed: start = m.start + clip_move.group_delta. Refused (returns false,
 // nothing moves) unless EVERY member can land at that exact spot on its
 // destination lane without overlapping a non-member clip, then re-selects the
 // anchor in its new home.
 move_linked_group :: proc(track_delta_visual: int) -> bool {
-	if track_delta_visual == 0 || len(drag_group_orig) == 0 {
+	if track_delta_visual == 0 || len(clip_move.group_orig) == 0 {
 		return false
 	}
 	sync_track_order()
-	if !group_vertical_feasible(track_delta_visual, drag_group_delta) {
+	if !group_vertical_feasible(track_delta_visual, clip_move.group_delta) {
 		return false
 	}
 	PlannedMove :: struct {
@@ -1407,8 +1407,8 @@ move_linked_group :: proc(track_delta_visual: int) -> bool {
 		start:                i64,
 		clip:                 Clip,
 	}
-	planned := make([dynamic]PlannedMove, 0, len(drag_group_orig), context.temp_allocator)
-	for m in drag_group_orig {
+	planned := make([dynamic]PlannedMove, 0, len(clip_move.group_orig), context.temp_allocator)
+	for m in clip_move.group_orig {
 		src_row := order_row_of(m.track)
 		if src_row < 0 {
 			return false
@@ -1423,7 +1423,7 @@ move_linked_group :: proc(track_delta_visual: int) -> bool {
 			continue
 		}
 		clip := src.clips[idx]
-		start := m.start + drag_group_delta
+		start := m.start + clip_move.group_delta
 		append(
 			&planned,
 			PlannedMove{src_track = m.track, dst_track = dst, start = start, clip = clip},
@@ -1457,9 +1457,9 @@ move_linked_group :: proc(track_delta_visual: int) -> bool {
 	// Re-select the anchor in its new home.
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
-			if timeline.tracks[t].clips[i].clip_id == drag_group_orig[0].clip_id {
-				selected_track = t
-				selected_index = i
+			if timeline.tracks[t].clips[i].clip_id == clip_move.group_orig[0].clip_id {
+				selection.track = t
+				selection.index = i
 			}
 		}
 	}
@@ -1469,15 +1469,15 @@ move_linked_group :: proc(track_delta_visual: int) -> bool {
 // resize_group_right resizes the whole link group's right edge to new_tail: the
 // anchor clip is resized exactly as a single clip, then every other member's
 // tail moves by the same delta, each clamped to its own lane/source. Returns the
-// anchor's applied length. No-op for unlinked clips (drag_group_orig empty).
+// anchor's applied length. No-op for unlinked clips (clip_move.group_orig empty).
 resize_group_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 	applied := resize_clip_right(track, idx, new_tail)
-	if len(drag_group_orig) == 0 || drag_group_orig[0].clip_id != track.clips[idx].clip_id {
+	if len(clip_move.group_orig) == 0 || clip_move.group_orig[0].clip_id != track.clips[idx].clip_id {
 		return applied
 	}
-	delta := applied - drag_group_orig[0].length
-	for m in drag_group_orig {
-		if m.clip_id == drag_group_orig[0].clip_id {
+	delta := applied - clip_move.group_orig[0].length
+	for m in clip_move.group_orig {
+		if m.clip_id == clip_move.group_orig[0].clip_id {
 			continue
 		}
 		if m.track < 0 || m.track >= len(timeline.tracks) {
@@ -1500,12 +1500,12 @@ resize_group_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 // length. No-op for unlinked clips.
 resize_group_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	applied := resize_clip_left(track, idx, new_head)
-	if len(drag_group_orig) == 0 || drag_group_orig[0].clip_id != track.clips[idx].clip_id {
+	if len(clip_move.group_orig) == 0 || clip_move.group_orig[0].clip_id != track.clips[idx].clip_id {
 		return applied
 	}
-	delta := track.clips[idx].timeline_start_frame - drag_group_orig[0].start
-	for m in drag_group_orig {
-		if m.clip_id == drag_group_orig[0].clip_id {
+	delta := track.clips[idx].timeline_start_frame - clip_move.group_orig[0].start
+	for m in clip_move.group_orig {
+		if m.clip_id == clip_move.group_orig[0].clip_id {
 			continue
 		}
 		if m.track < 0 || m.track >= len(timeline.tracks) {
@@ -1588,7 +1588,7 @@ track_at_row :: proc(r: int) -> int {
 // insert_track inserts a new empty track at visual position order_pos in the
 // track stack (0 = topmost, len = bottom): the row appears where the gap it
 // was clicked sits, and every row below shifts down. Storage is append-only,
-// so existing STORAGE indices (selected_track, drag targets) never move.
+// so existing STORAGE indices (selection.track, drag targets) never move.
 insert_track :: proc(order_pos: int) {
 	undo_begin()
 	sync_track_order()
@@ -1602,7 +1602,7 @@ insert_track :: proc(order_pos: int) {
 // move_track_to_row moves the track at STORAGE index `ti` so it occupies the
 // visual stack position `target_row` (0 = top, len(track_order) = bottom,
 // matching insert_track's order_pos and the gap keys the drag hovers).
-// Storage stays append-only -- the track array never moves -- so selected_track
+// Storage stays append-only -- the track array never moves -- so selection.track
 // and other STORAGE indices remain valid; only track_order changes.
 //
 // target_row == src_row is the track's own gap (no move) and target_row ==
@@ -1758,7 +1758,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 // remove_track deletes the track at index (and all of its clips) from the
 // timeline. Frees per-clip markers and the track's owned arrays, clears or
 // adjusts the saved selection (clips on other tracks keep their indices, so
-// selected_index is preserved), and invalidates the preview/audio state the
+// selection.index is preserved), and invalidates the preview/audio state the
 // way every clip-delete path must (see delete_selected_clip_raw).
 remove_track :: proc(index: int) {
 	sync_track_order()
@@ -1788,17 +1788,17 @@ remove_track :: proc(index: int) {
 		}
 	}
 	switch {
-	case selected_track == index:
-		selected_track = -1
-		selected_index = -1
-	case selected_track > index:
-		selected_track -= 1
+	case selection.track == index:
+		selection.track = -1
+		selection.index = -1
+	case selection.track > index:
+		selection.track -= 1
 	}
 	active_interaction = .None
-	drag_clip = nil
-	drag_source_track = -1
-	drag_source_index = -1
-	drag_hover_track = -1
+	clip_move.clip = nil
+	clip_move.source_track = -1
+	clip_move.source_index = -1
+	clip_move.hover_track = -1
 	// CRITICAL: the removed clips' decoded frames/decoders/GPU textures must be
 	// dropped or they keep painting at the playhead. Same rule as any delete.
 	invalidate_preview_slots()

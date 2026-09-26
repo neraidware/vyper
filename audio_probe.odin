@@ -32,7 +32,7 @@ audio_probe_run :: proc(v: string) -> int {
 		lanes, _ = strconv.parse_int(parts[2])
 	}
 
-	async_import_mode = false
+	editor_flags.async_import_mode = false
 	buf: [4096]u8
 	n := 0
 	for n < len(path) && n < len(buf) - 1 {
@@ -97,8 +97,8 @@ audio_probe_run :: proc(v: string) -> int {
 			continue
 		}
 		_, _ = tr, clip
-		selected_track = track_index_of(tr)
-		selected_index = clip_index_on_track(tr, clip)
+		selection.track = track_index_of(tr)
+		selection.index = clip_index_on_track(tr, clip)
 		split_clip_at_playhead()
 	}
 	_ = sel_track
@@ -114,29 +114,29 @@ audio_probe_run :: proc(v: string) -> int {
 	fmt.printf("[ap] after %d splits: tracks=%d audio_clips=%d\n", splits, len(timeline.tracks), total_audio)
 
 	audio_geometry_commit()
-	slot := &audio_geom[sync.atomic_load(&audio_geom_idx)]
+	slot := &audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)]
 	fmt.printf("[ap] geometry chips=%d (geom cap %d)\n", slot.n, AUDIO_GEOM_MAX_CLIPS)
 
 	// Provision at the timeline start: the worst case, since every segment is
 	// in the future and each wants its own decoder.
-	audio_trace = true
+	audio_rpt.trace = true
 	prov_t0 := sdl.GetTicksNS()
 	audio_provision(0)
 	prov_ms := f64(sdl.GetTicksNS()-prov_t0) / 1e6
 	fmt.printf(
-		"[ap] audio_provision took %.1f ms, play_src_count=%d (MAX_PLAY_AUDIO=%d)\n",
+		"[ap] audio_provision took %.1f ms, audio_src.count=%d (MAX_PLAY_AUDIO=%d)\n",
 		prov_ms,
-		play_src_count,
+		audio_src.count,
 		MAX_PLAY_AUDIO,
 	)
 	seg_total := 0
-	for k in 0 ..< play_src_count {
-		seg_total += play_srcs[k].seg_count
+	for k in 0 ..< audio_src.count {
+		seg_total += audio_src.slots[k].seg_count
 	}
-	fmt.printf("[ap] provisioned %d groups / %d segments (chips=%d)\n", play_src_count, seg_total, slot.n)
+	fmt.printf("[ap] provisioned %d groups / %d segments (chips=%d)\n", audio_src.count, seg_total, slot.n)
 	fps := timeline_fps()
-	for k in 0 ..< play_src_count {
-		s := &play_srcs[k]
+	for k in 0 ..< audio_src.count {
+		s := &audio_src.slots[k]
 		start_a, start_s, len_a := i64(0), i64(0), i64(0)
 		if first := play_src_first_seg_at(s, 0); first != nil {
 			start_a, start_s, len_a = first.start_a, first.start_s, first.len_a
@@ -191,8 +191,8 @@ audio_probe_run :: proc(v: string) -> int {
 	samples := []i64{0, end / 4, end / 2, 3 * end / 4, end - 30}
 	for sample in samples {
 		cov := 0
-		for k in 0 ..< play_src_count {
-			s := &play_srcs[k]
+		for k in 0 ..< audio_src.count {
+			s := &audio_src.slots[k]
 			if s.dec.opened && play_src_seg_at(s, sample) != nil {
 				cov += 1
 			}
@@ -204,7 +204,7 @@ audio_probe_run :: proc(v: string) -> int {
 	// call audio_mix_frame (which pulls/decodes each covering source), and count
 	// frames that delivered nothing (a hole => the device gets silence).
 	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
-	audio_trace = true
+	audio_rpt.trace = true
 	had_deliver := false
 	run_start := i64(-1)
 	holes, delivered := i64(0), i64(0)
@@ -274,7 +274,7 @@ audio_probe_mix_peak :: proc(mix: []f32, start: i64, frames: i64, fps: f64) -> f
 }
 
 // audio_probe_live_gain_check verifies the producer-side live gain fold (the
-// audio_gain_epoch + audio_gain_fold path the feed loop uses during a knob
+// audio_geom_state.gain_epoch + audio_gain_fold path the feed loop uses during a knob
 // drag): after the first window is mixed at unity, the clips' gains are edited
 // and committed -- which must bump the epoch -- then folded into the already
 // provisioned segments WITHOUT reset/re-provision. A second window mixed from
@@ -305,14 +305,14 @@ audio_probe_live_gain_check :: proc() -> bool {
 			}
 		}
 	}
-	epoch_before := sync.atomic_load(&audio_gain_epoch)
+	epoch_before := sync.atomic_load(&audio_geom_state.gain_epoch)
 	audio_geometry_commit()
-	if sync.atomic_load(&audio_gain_epoch) == epoch_before {
-		fmt.println("[ap] live fold: commit did not bump audio_gain_epoch (gain change missed)")
+	if sync.atomic_load(&audio_geom_state.gain_epoch) == epoch_before {
+		fmt.println("[ap] live fold: commit did not bump audio_geom_state.gain_epoch (gain change missed)")
 		return false
 	}
-	audio_gain_fold(&audio_geom[sync.atomic_load(&audio_geom_idx)])
-	audio_gain_folded_epoch = sync.atomic_load(&audio_gain_epoch)
+	audio_gain_fold(&audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)])
+	audio_geom_state.gain_folded_epoch = sync.atomic_load(&audio_geom_state.gain_epoch)
 	peak_live := audio_probe_mix_peak(mix[:], gain_frames, gain_frames, fps)
 	expected := db_to_linear(-20)
 	ratio := peak_unity > 0 ? peak_live / peak_unity : 0
