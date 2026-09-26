@@ -100,6 +100,27 @@ effective_playback_rate :: proc() -> f64 {
 	return playback.rate * f64(1 + max(0, playback.boost))
 }
 
+// track_gutter_hit_test returns the track whose NAME GUTTER contains (mx,my),
+// or -1. This is the right-click target for the dedicated track menu: the
+// gutter is the column that identifies a track, so a right-click there means
+// "this track" rather than "this frame" (which is what the clip lanes mean).
+// Horizontal bounds come from the TrackName box, so the two columns can never
+// overlap and a right-click in the lanes can never reach this.
+track_gutter_hit_test :: proc(mx, my: f32) -> int {
+	for ti in 0 ..< len(timeline.tracks) {
+		row := clay.GetElementData(clay.ID("TrackRow", u32(ti))).boundingBox
+		name := clay.GetElementData(clay.ID("TrackName", u32(ti))).boundingBox
+		if my < row.y ||
+		   my > row.y + row.height ||
+		   mx < name.x ||
+		   mx >= name.x + name.width {
+			continue
+		}
+		return ti
+	}
+	return -1
+}
+
 // timeline_track_hit_test returns the timeline track whose empty (non-clip)
 // region the pointer is over, or -1 if the pointer is on a clip, the track
 // name, or outside the timeline. Only the clips region of a track (right of the
@@ -194,6 +215,58 @@ timeline_tracks_max_top :: proc() -> f32 {
 		return 0
 	}
 	return max(timeline_tracks_content_height() - sec.height, 0)
+}
+
+// TRACKS_FIT_TARGET is how many track rows the timeline is fitted to show when
+// a clip is imported or a project loads: enough lanes to work in without
+// pushing the preview off screen, and the rest reachable by scrolling.
+TRACKS_FIT_TARGET :: 5
+
+// tracks_view_height_for is the track-list height that shows `rows` rows
+// exactly: the rows, plus the insert gap above each one and the trailing gap
+// below the last (the list renders one more gap than it has rows).
+tracks_view_height_for :: proc(rows: int) -> f32 {
+	return f32(rows) * (TRACK_ROW_H + TRACK_GAP_H) + TRACK_GAP_H
+}
+
+// panel_clamp_bounds are the limits on the upper area's height, shared by the
+// divider drag and the automatic track fit so both enforce one rule: a short
+// window never lets the two areas collide, and the track list keeps room.
+panel_clamp_bounds :: proc(window_h: f32) -> (min_h, max_h: f32) {
+	min_h = min(460.0, window_h * 0.35)
+	max_h = max(min_h, window_h - 140)
+	return
+}
+
+// fit_timeline_to_tracks makes the track list show at most TRACKS_FIT_TARGET
+// rows and scrolls it to the top, so tracks that were just created (or loaded)
+// are on screen instead of below the fold. Run on media import and project load.
+//
+// "At most" is deliberate: the divider only ever moves IN, never out. A user who
+// dragged it to a deliberately small track list keeps that, and one whose list
+// would show more than the target gets it pulled back — but an import never
+// yanks the divider away from a layout they chose.
+//
+// The window height is read here rather than passed in: both callers (media
+// import, project load) run outside the render loop and have no height, and
+// asking the one place that knows beats threading a parameter through two
+// unrelated paths.
+fit_timeline_to_tracks :: proc() {
+	window_h := f32(WINDOW_HEIGHT)
+	if app_window != nil {
+		w, h: c.int
+		sdl.GetWindowSize(app_window, &w, &h)
+		window_h = f32(h)
+	}
+	chrome := APP_BAR_H + EDITOR_DIVIDER_H
+	tracks_h := tracks_view_height_for(TRACKS_FIT_TARGET)
+	current_tracks_h := window_h - chrome - panel_layout.upper_area_height
+	if current_tracks_h > tracks_h {
+		min_h, max_h := panel_clamp_bounds(window_h)
+		panel_layout.upper_area_height =
+			clamp(window_h - chrome - tracks_h, min_h, max_h)
+	}
+	timeline_view.top = 0
 }
 
 // scrollbar_geometry turns a container's content and viewport heights into its
@@ -295,6 +368,9 @@ update_timeline_cursor :: proc(mx, my: f32) {
 // the original right-click location, not where the pointer ends up hovering
 // over the menu.
 open_track_context_menu :: proc(mx, my: f32, track: int) {
+	// The track menu is a separate popup, but never two at once: right-clicking
+	// the lanes while the gutter menu is up replaces it.
+	close_track_action_menu()
 	ctx_menu.open = true
 	// Keep the floating menu fully on-screen: it's about 180px wide and one
 	// row tall (+padding), so clamp the anchor so a right-click near a window
@@ -326,11 +402,69 @@ close_context_menu :: proc() {
 	ctx_menu.target_clip_index = -1
 }
 
+// TRACK_MENU_W is the dedicated track menu's row width. Wider than
+// CONTEXT_MENU_W because "Duplicate Track" is the longest label either menu
+// shows.
+TRACK_MENU_W :: 168
+
+// open_track_action_menu shows the track menu at the pointer for `track`,
+// replacing the two always-visible gutter buttons it supersedes. Opening it
+// closes the timeline menu, so a right-click never leaves two popups up.
+open_track_action_menu :: proc(mx, my: f32, track: int) {
+	close_context_menu()
+	track_ctx.open = true
+	track_ctx.target_track = track
+	// Keep the popup fully on-screen, same clamp the timeline menu uses.
+	if app_window != nil {
+		w, h: c.int
+		sdl.GetWindowSize(app_window, &w, &h)
+		track_ctx.x = clamp(mx, 0, f32(w) - f32(TRACK_MENU_W) - 2 * CONTEXT_MENU_EDGE)
+		track_ctx.y = clamp(my, 0, f32(h) - 80)
+	} else {
+		track_ctx.x = mx
+		track_ctx.y = my
+	}
+}
+
+// close_track_action_menu dismisses the track menu, if open.
+close_track_action_menu :: proc() {
+	track_ctx.open = false
+	track_ctx.target_track = -1
+}
+
+// track_action_menu_hover reports whether (mx,my) is inside the track menu
+// popup. Like the timeline menu's hover test this reads last frame's element
+// geometry rather than clay.PointerOver, so a click on the frame the popup
+// mounts still routes to the handler instead of dismissing it.
+track_action_menu_hover :: proc(mx, my: f32) -> bool {
+	return ctx_point_in(mx, my, clay.GetElementData(clay.ID("TrackMenu")).boundingBox)
+}
+
+// handle_track_action_option runs the track-menu action under (mx,my). The
+// target is snapshotted at open time, so a click acts on the track that was
+// right-clicked even if the pointer has since moved.
+handle_track_action_option :: proc(mx, my: f32) {
+	t := track_ctx.target_track
+	if t < 0 || t >= len(timeline.tracks) {
+		close_track_action_menu()
+		return
+	}
+	row := ctx_row_hit(mx, my, clay.GetElementData(clay.ID("TrackMenu")).boundingBox)
+	switch row {
+	case 0:
+		duplicate_track(t)
+	case 1:
+		remove_track(t)
+	}
+	close_track_action_menu()
+}
+
 // escape_dismiss closes any transient overlay (right-click context menu, the
 // playback-rate dropdown, the help overlay). Called on ESC while not editing a
 // text field.
 escape_dismiss :: proc() {
 	close_context_menu()
+	close_track_action_menu()
 	playback.rate_open = false
 	editor_flags.help_open = false
 }

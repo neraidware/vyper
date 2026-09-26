@@ -110,6 +110,11 @@ for j := 0; j < len(raw); {
 	if !ui_probe_layout_asserts() {
 		os.exit(1)
 	}
+	// Track rows: buttons moved to the dedicated menu, and the timeline fits
+	// TRACKS_FIT_TARGET rows on import/load.
+	if !ui_probe_track_menu_asserts() {
+		os.exit(1)
+	}
 	// The file finder is a dialog-style popup drawn off the text input hook:
 	// open it headless, lay out a page, and check the popup exists, is centered,
 	// and paints one row per visible entry.
@@ -774,6 +779,120 @@ ui_probe_layout_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] keyframe layout ok\n")
+	}
+	return ok
+}
+
+// ui_probe_track_menu_asserts covers the track row rework: the duplicate/delete
+// buttons are gone from the gutter (they moved to the dedicated right-click
+// menu), the row is short enough that TRACKS_FIT_TARGET of them fit the fitted
+// timeline, and the fit actually places the divider so exactly that many rows
+// are on screen.
+ui_probe_track_menu_asserts :: proc() -> bool {
+	ok := true
+
+	// The gutter no longer carries the two buttons. clay keeps an element's
+	// last box, so a stale rect here would mean the elements are still being
+	// emitted (and would be hoverable, i.e. silently still clickable).
+	build_page(1920, 1600)
+	// Guard the guard: an id that was never laid out must read back as a zero
+	// box, or the assertions below would pass (or fail) for the wrong reason.
+	bogus := clay.GetElementData(clay.ID("NoSuchElementEver", 0)).boundingBox
+	if bogus.width != 0 || bogus.height != 0 {
+		fmt.eprintf("[ui-probe] missing element id reported a box\n")
+		ok = false
+	}
+	gone := []string{"DuplicateTrack", "RemoveTrack", "TrackButtons"}
+	for ti in 0 ..< len(timeline.tracks) {
+		for id_name in gone {
+			box := clay.GetElementData(clay.ID(id_name, u32(ti))).boundingBox
+			if box.width > 0 || box.height > 0 {
+				fmt.eprintf(
+					"[ui-probe] %s still laid out (%dx%d) on track %d\n",
+					id_name,
+					int(box.width),
+					int(box.height),
+					ti,
+				)
+				ok = false
+			}
+		}
+	}
+
+	fit_tracks_h := tracks_view_height_for(TRACKS_FIT_TARGET)
+	rows_that_fit := int((fit_tracks_h - TRACK_GAP_H) / (TRACK_ROW_H + TRACK_GAP_H))
+	if rows_that_fit != TRACKS_FIT_TARGET {
+		fmt.eprintf(
+			"[ui-probe] fit height %.1f shows %d rows, want %d\n",
+			fit_tracks_h,
+			rows_that_fit,
+			TRACKS_FIT_TARGET,
+		)
+		ok = false
+	}
+
+	// A track list that would show MORE than the target gets pulled in to
+	// exactly the target.
+	chrome := APP_BAR_H + EDITOR_DIVIDER_H
+	panel_layout.upper_area_height = 200 // leaves 720-60-200 = 460px of tracks
+	fit_timeline_to_tracks()
+	want_upper := f32(WINDOW_HEIGHT) - chrome - fit_tracks_h
+	if abs(panel_layout.upper_area_height - want_upper) > 0.5 {
+		fmt.eprintf(
+			"[ui-probe] fit set upper area to %.1f, want %.1f\n",
+			panel_layout.upper_area_height,
+			want_upper,
+		)
+		ok = false
+	}
+	// ...and one that already shows fewer is left alone: an import must not
+	// drag the divider away from a layout the user chose.
+	panel_layout.upper_area_height = f32(WINDOW_HEIGHT) - chrome - 100
+	kept := panel_layout.upper_area_height
+	fit_timeline_to_tracks()
+	if panel_layout.upper_area_height != kept {
+		fmt.eprintf(
+			"[ui-probe] fit expanded a small track list: %.1f -> %.1f\n",
+			kept,
+			panel_layout.upper_area_height,
+		)
+		ok = false
+	}
+	if timeline_view.top != 0 {
+		fmt.eprintf("[ui-probe] fit left track scroll at %.1f\n", timeline_view.top)
+		ok = false
+	}
+
+	// The track menu is its own popup, separate from the timeline menu, and
+	// only one of the two is ever open.
+	open_track_action_menu(10, 10, 0)
+	if !track_ctx.open || ctx_menu.open {
+		fmt.eprintf("[ui-probe] track menu did not open exclusively\n")
+		ok = false
+	}
+	open_track_context_menu(400, 400, 0)
+	if track_ctx.open || !ctx_menu.open {
+		fmt.eprintf("[ui-probe] timeline menu did not take over from track menu\n")
+		ok = false
+	}
+	close_context_menu()
+	close_track_action_menu()
+	if track_ctx.open || ctx_menu.open {
+		fmt.eprintf("[ui-probe] menus did not both close\n")
+		ok = false
+	}
+	// A target that has since been removed must not act: the handler re-checks
+	// the snapshot against the live track list.
+	open_track_action_menu(10, 10, 0)
+	track_ctx.target_track = 9999
+	handle_track_action_option(-1000, -1000)
+	if track_ctx.open {
+		fmt.eprintf("[ui-probe] stale track target left the menu open\n")
+		ok = false
+	}
+
+	if ok {
+		fmt.printf("[ui-probe] track menu ok\n")
 	}
 	return ok
 }

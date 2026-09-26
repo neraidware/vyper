@@ -509,28 +509,10 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		return false
 	},
-	proc(inp: Mouse_Input) -> bool {
-		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
-			if clay.PointerOver(clay.ID("DuplicateTrack", u32(track_idx))) {
-				duplicate_track(track_idx)
-				return true
-			}
-		}
-		return false
-	},
-	proc(inp: Mouse_Input) -> bool {
-		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
-			if clay.PointerOver(clay.ID("RemoveTrack", u32(track_idx))) {
-				remove_track(track_idx)
-				return true
-			}
-		}
-		return false
-	},
 	// Grab a track by its name gutter and drag it onto an insert gap to
-	// reorder the stack. Runs AFTER the duplicate/remove buttons (they live in
-	// the same gutter) so a press on those still wins; a plain click that never
-	// hovers a gap ends as a no-op.
+	// reorder the stack. Runs after the insert-gap button (they share the
+	// gutter) so a press on that still wins; a plain click that never hovers a
+	// gap ends as a no-op.
 	proc(inp: Mouse_Input) -> bool {
 		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 			if clay.PointerOver(clay.ID("TrackName", u32(track_idx))) {
@@ -1053,9 +1035,9 @@ interaction_post_build :: proc(
 			panel_layout.upper_area_height = inp.y - APP_BAR_H - EDITOR_DIVIDER_H * 0.5
 			// Keep a lower-bound that scales with the window so a short window
 			// never lets the upper and lower areas collide (the old hardcoded
-			// 460/180 bounds collapsed on windows shorter than ~640px).
-			min_h := min(460.0, f32(height) * 0.35)
-			max_h := max(min_h, f32(height) - 140)
+			// 460/180 bounds collapsed on windows shorter than ~640px). Same
+			// bounds the automatic track fit uses.
+			min_h, max_h := panel_clamp_bounds(f32(height))
 			panel_layout.upper_area_height = clamp(panel_layout.upper_area_height, min_h, max_h)
 		case .Preview_Move:
 			if sel, ok := transformable_selected(); ok {
@@ -1396,19 +1378,29 @@ interaction_post_build :: proc(
 			preview_fit_reset()
 		}
 	}
-	// Right-click: a clip gets a clip menu; empty space gets the track menu.
-	// Any fresh left-click or a new right-click that lands elsewhere closes
-	// an open menu first.
+	// Right-click: the track NAME GUTTER gets the dedicated track menu; the
+	// clip lanes get the timeline menu (a clip gets clip actions, empty space
+	// gets the track "Add" menu). Any fresh left-click, or a new right-click
+	// that lands elsewhere, closes whatever menu was open first.
 	if inp.right && !prev_right_down {
-		if ct, ci := clip_under_pointer(); ct >= 0 {
+		if track := track_gutter_hit_test(inp.x, inp.y); track >= 0 {
+			open_track_action_menu(inp.x, inp.y, track)
+		} else if ct, ci := clip_under_pointer(); ct >= 0 {
 			open_clip_context_menu(inp.x, inp.y, ct, ci)
 		} else if track := timeline_track_hit_test(inp.x, inp.y); track >= 0 {
 			open_track_context_menu(inp.x, inp.y, track)
 		} else {
 			close_context_menu()
+			close_track_action_menu()
 		}
-	} else if was_click && ctx_menu.open {
-		if pointer_over_context_menu(inp.x, inp.y) {
+	} else if was_click && (ctx_menu.open || track_ctx.open) {
+		if track_ctx.open {
+			if track_action_menu_hover(inp.x, inp.y) {
+				handle_track_action_option(inp.x, inp.y)
+			} else {
+				close_track_action_menu()
+			}
+		} else if pointer_over_context_menu(inp.x, inp.y) {
 			handle_ctx_option(inp.x, inp.y)
 		} else {
 			close_context_menu()

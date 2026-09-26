@@ -429,6 +429,9 @@ session_rebuild :: proc(pf: ^Project_File) {
 
 	// The loaded session is undo's new baseline.
 	undo_init()
+	// A loaded project can carry more tracks than fit; fit the track list so the
+	// first ones are visible without scrolling.
+	fit_timeline_to_tracks()
 }
 
 // project_file_open reads `path` as CBOR and makes it the live session,

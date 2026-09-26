@@ -48,22 +48,25 @@ FONT_HEADING :: 18 // track names, clip labels, big buttons
 
 // Fixed structural sizes.
 GUTTER_WIDTH :: 140        // Track-name / ruler-gutter column width.
-CLIP_TILE_HEIGHT :: f32(56) // Height of one timeline clip tile.
-TRACK_ROW_H :: CLIP_TILE_HEIGHT // One track row is exactly one clip tile tall. The
-                                // name gutter fits the same 56px (heading text 18 +
-                                // 4px childGap + 34px buttons), so neither the clip
-                                // lane nor the gutter leaves slack at the row's
-                                // bottom. A track carrying keyframed clips grows by
-                                // KF_ROW_H per lane (see kf_rows_for). Fixed (not
-                                // measured) so track-list scroll geometry stays a pure
-                                // function of the track count and their keyframe
-                                // lane counts, never of layout timing.
-TRACK_GAP_H :: 18          // Height of the insert gap above each track row.
+CLIP_TILE_HEIGHT :: f32(36) // Height of one timeline clip tile. Shrunk from 56 so
+                                // more tracks fit on screen; the track-name gutter
+                                // is text-only now (duplicate/delete moved to the
+                                // track context menu), so nothing in the row needs
+                                // the old button-height budget.
+TRACK_ROW_H :: CLIP_TILE_HEIGHT // One track row is exactly one clip tile tall, so
+                                // the clip lane and its name gutter can never
+                                // disagree on where a row ends. A track carrying
+                                // keyframed clips grows by KF_ROW_H per lane (see
+                                // kf_rows_for). Fixed (not measured) so track-list
+                                // scroll geometry stays a pure function of the
+                                // track count and their keyframe lane counts,
+                                // never of layout timing.
+TRACK_GAP_H :: 8           // Height of the insert gap above each track row.
 // Keyframe lanes: one KF_ROW_H strip below a keyframed clip tile holds that
 // clip's keyframe diamonds; a track row grows by KF_ROW_H per lane the tallest
 // clip in it carries. A diamond is the 45°-rotated square SDF (KF_DIAMOND_ROT),
 // corners rounded just enough to stay crisp.
-KF_ROW_H :: f32(22)        // One keyframe lane height.
+KF_ROW_H :: f32(18)        // One keyframe lane height.
 KF_DIAMOND_R :: f32(4)     // Half of the diamond's bounding square (8px across).
 KF_DIAMOND_ROT :: [2]f32{0.70710678, 0.70710678} // cos/sin of 45°: squares up at the screen.
 KF_DIAMOND_CORNER :: 2     // Diamond corner rounding, keeps a point on each axis.

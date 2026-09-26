@@ -602,6 +602,9 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	audio_reset_for_load()
 	invalidate_preview_slots()
 	audio_note_edit()
+	// The import may have created lanes below the fold; fit the track list so
+	// they are actually on screen.
+	fit_timeline_to_tracks()
 	clear(&selection.extra_set)
 	selection.track = -1
 	selection.index = -1

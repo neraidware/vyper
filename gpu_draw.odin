@@ -1454,44 +1454,8 @@ draw_ui_icons :: proc(
 		playhead.playing && playback.dir == 1,
 		15,
 	)
-	// NOTE: The Duplicate/Remove icons sit in the scrolled track-name gutters,
-	// so their clay boxes move off-window when a track scrolls out of view.
-	// render_icon draws with no scissor: clip the whole gutter-icon pass to the
-	// TracksSection viewport so off-screen gutter icons never paint over the
-	// ruler/timeline bar.
-	sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
-	if sec.width > 0 && sec.height > 0 {
-		sdl.SetGPUScissor(
-			pass,
-			sdl.Rect{c.int(sec.x), c.int(sec.y), c.int(sec.width), c.int(sec.height)},
-		)
-	}
-	for ti in 0 ..< len(timeline.tracks) {
-		track_id := clay.ID("DuplicateTrack", u32(ti))
-		dup_color := clay.PointerOver(track_id) ? BUTTON_BORDER_HOVER : TEXT
-		draw_icon_in_element_color(
-			renderer,
-			command_buffer,
-			pass,
-			"DuplicateTrack",
-			.Duplicate,
-			dup_color,
-			16,
-			u32(ti),
-		)
-		remove_id := clay.ID("RemoveTrack", u32(ti))
-		remove_color := clay.PointerOver(remove_id) ? BUTTON_BORDER_HOVER : TEXT
-		draw_icon_in_element_color(
-			renderer,
-			command_buffer,
-			pass,
-			"RemoveTrack",
-			.RemoveTrack,
-			remove_color,
-			16,
-			u32(ti),
-		)
-	}
+	// The Duplicate/Remove track icons moved to the track context menu, so the
+	// per-track gutter icon pass (and the scissor that clipped it) is gone.
 	sdl.SetGPUScissor(pass, sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)})
 }
 

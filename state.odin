@@ -1089,3 +1089,18 @@ ContextMenu :: struct {
 	target_clip_index: int, // index within target_clip_track
 }
 ctx_menu: ContextMenu
+
+// Track_Context_Menu is the right-click menu over a track's NAME GUTTER. It is
+// deliberately a separate transient from the timeline ContextMenu rather than
+// another row set inside it: that menu's rows act on the clip and the frame
+// under the cursor, this one's act on a whole track. Sharing one popup forced
+// the row indices to mean different things depending on what was clicked, and
+// the track gutter is a different place on screen with a different hit test.
+// Only one of the two is ever open (a right-click opens one or the other).
+Track_Context_Menu :: struct {
+	open:         bool,
+	x:            f32,
+	y:            f32,
+	target_track: int, // -1 = none
+}
+track_ctx: Track_Context_Menu

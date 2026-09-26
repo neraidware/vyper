@@ -21,8 +21,6 @@ Icon_Id :: enum {
 	SnapClipToPlayhead, // "Clip >"
 	SnapPlayheadToClip, // "> Clip"
 	AutoKeyframe, // the timeline bottom-bar auto-keyframing toggle
-	Duplicate,
-	RemoveTrack,
 	Import,
 	FinderFolder,
 	FinderVideo,
@@ -32,7 +30,7 @@ Icon_Id :: enum {
 	FinderFile,
 }
 
-ICON_COUNT :: 14
+ICON_COUNT :: 12
 ICON_RASTER :: 96 // rasterized texture size per icon (px).
 
 skip_back_svg := #load("icons/skip_back.svg")
@@ -40,8 +38,6 @@ skip_forward_svg := #load("icons/skip_forward.svg")
 snap_clip_to_playhead_svg := #load("icons/snap_clip_to_playhead.svg")
 snap_playhead_to_clip_svg := #load("icons/snap_playhead_to_clip.svg")
 auto_keyframe_svg := #load("icons/auto_keyframe.svg")
-duplicate_svg := #load("icons/duplicate.svg")
-remove_track_svg := #load("icons/remove_track.svg")
 import_svg := #load("icons/import.svg")
 folder_svg := #load("icons/folder.svg")
 video_svg := #load("icons/video.svg")
@@ -62,10 +58,6 @@ get_icon_svg :: proc(id: Icon_Id) -> []u8 {
 		return snap_playhead_to_clip_svg
 	case .AutoKeyframe:
 		return auto_keyframe_svg
-	case .Duplicate:
-		return duplicate_svg
-	case .RemoveTrack:
-		return remove_track_svg
 	case .Import:
 		return import_svg
 	case .FinderFolder:

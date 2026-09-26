@@ -594,6 +594,63 @@ loaded session), autosave, double-click-to-save, extension enforcement for
 `:save <path>` (S11 only appends the extension in the finder's Save mode), and
 version/format negotiation.
 
+## Active 7 — Track context menu, compact rows, fitted divider
+
+**Why:** the track gutter spent a 56px row on two icon buttons per track, and
+duplicate/delete were the only gutter actions reachable at all. At that height
+only ~10 tracks fit, and a project with more lanes opened scrolled to nothing.
+Moving the actions to a right-click menu and shortening the row buys vertical
+room, and an automatic fit on import/load means the lanes you just created are
+on screen instead of below the fold.
+
+**Scope (per user, 2026-09-26):** duplicate/delete move to a context menu
+separate from the existing timeline menu; track row goes to 36px; importing a
+clip or loading a project fits the divider to at most 5 tracks on screen.
+
+- [x] S1. Dedicated track menu: `Track_Context_Menu`/`track_ctx`, opened by
+      right-clicking the track name or the empty space in a track's clip lane
+      (`track_gutter_hit_test`), drawn by `draw_track_action_menu` next to the
+      existing menu. Deliberately a SEPARATE popup from `ctx_menu`, not extra
+      rows on it: the track menu is a different subject, and folding it in
+      would have meant the track list's `Add Track` action and a track's
+      `Duplicate/Delete` sharing one enumeration whose meaning depends on what
+      was clicked. The two are mutually exclusive in both directions —
+      opening either closes the other — because a right-click that lands
+      elsewhere must not leave two popups up.
+- [x] S2. Removed the per-track buttons: the `TrackButtons` Clay subtree, the
+      duplicate/remove icon overlay and its scissor pass in `gpu_draw`, and both
+      click handlers in `interaction`. Hit-testing now resolves the row from the
+      `TrackName` box. The `.Duplicate`/`.RemoveTrack` icons went with them
+      (enum members, `ICON_COUNT`, both `icons/*.svg`) — nothing references them
+      now, and a live enum member for a button that doesn't exist is a lie the
+      next reader would have to chase.
+- [x] S3. Compact geometry: `CLIP_TILE_HEIGHT` 56 → 36, `TRACK_GAP_H` 18 → 8,
+      `KF_ROW_H` 22 → 18. The keyframe lane had to shrink with the row or a
+      single-lane clip would have measured taller than a keyframed track beside
+      it.
+- [x] S4. `fit_timeline_to_tracks` runs at the end of `add_asset_to_timeline`
+      and `session_rebuild`. It is "at most", not "exactly": the divider only
+      ever moves IN, so a user whose track list already shows fewer than 5 rows
+      keeps their layout and an import never yanks the divider away from a
+      layout they chose. It reads the window height from `app_window` itself,
+      since both callers run outside the render loop and have none to pass.
+      Divider drag and the fit now share `panel_clamp_bounds` instead of
+      duplicating the bounds, so the fit can't land somewhere the user can't
+      drag back to.
+- [x] Probe: `ui_probe_track_menu_asserts` covers the buttons no longer being
+      laid out (guarded by a missing-id check so it can't pass vacuously), the
+      5-row fit height, both directions of the fit, menu exclusivity, and a
+      stale track target leaving the menu closed. Mutation-checked: re-adding
+      `TrackButtons` and dropping the "only pull in" guard both fail the probe.
+- [ ] ACCEPT: manual pass — right-click a track name gives a menu with only
+      Duplicate/Delete (no Add Track), right-click empty timeline space still
+      gives Add Track, the two never show at once, both actions still work, rows
+      are visibly shorter, and importing a clip or opening a project with more
+      than 5 tracks leaves exactly 5 visible without scrolling.
+
+Out of scope: reordering tracks by drag, a context menu on the clip lane
+(already exists), renaming a track in place.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

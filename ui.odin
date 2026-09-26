@@ -667,57 +667,9 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 											fontSize = FONT_HEADING,
 										},
 									)
-									if clay.UI(clay.ID("TrackButtons", u32(ti)))(
-									{
-										layout = {
-											sizing = {
-												width = clay.SizingGrow({}),
-												height = clay.SizingFit({}),
-											},
-											layoutDirection = .LeftToRight,
-											childGap = 4,
-										},
-									},
-									) {
-										if clay.UI(clay.ID("DuplicateTrack", u32(ti)))(
-										{
-											layout = {
-												sizing = {
-													width = clay.SizingFixed(30),
-													height = clay.SizingFixed(34),
-												},
-												childAlignment = {x = .Center, y = .Center},
-											},
-											backgroundColor = clay.PointerOver(clay.ID("DuplicateTrack", u32(ti))) ? BUTTON_HOVER : BUTTON,
-											border = {
-												color = clay.PointerOver(clay.ID("DuplicateTrack", u32(ti))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-												width = clay.BorderOutside(1),
-											},
-											cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-										},
-										) {
-											// Duplicate glyph is drawn as an embedded icon overlay.
-										}
-										if clay.UI(clay.ID("RemoveTrack", u32(ti)))(
-										{
-											layout = {
-												sizing = {
-													width = clay.SizingFixed(30),
-													height = clay.SizingFixed(34),
-												},
-												childAlignment = {x = .Center, y = .Center},
-											},
-											backgroundColor = clay.PointerOver(clay.ID("RemoveTrack", u32(ti))) ? BUTTON_HOVER : BUTTON,
-											border = {
-												color = clay.PointerOver(clay.ID("RemoveTrack", u32(ti))) ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-												width = clay.BorderOutside(1),
-											},
-											cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-										},
-										) {
-											// Remove glyph is drawn as an embedded icon overlay.
-										}
-									}
+									// No per-track buttons here: duplicate/delete moved
+									// to the track menu (right-click the gutter), which
+									// keeps the row short enough to fit more tracks.
 									if kf_rows > 0 {
 										// Keyframe property labels: one KF_ROW_H line per
 										// visible lane, stacked under the buttons so they
@@ -966,6 +918,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		}
 	}
 	draw_context_menu()
+	draw_track_action_menu()
 	draw_help_overlay(width, height)
 	draw_text_input_popup(width, height)
 
@@ -2372,13 +2325,15 @@ ctx_row_hit :: proc(x, y: f32, box: clay.BoundingBox) -> int {
 // ctx_option renders one row (option) of the floating timeline context menu.
 // Rows are borderless and highlight as a solid band on hover so the menu reads
 // as one widget, not a grid of cells.
-ctx_option :: proc(id_name: string, label: string) {
+// ctx_option renders one menu row. `width` defaults to the timeline menu's
+// width; the dedicated track menu passes its own (longer labels).
+ctx_option :: proc(id_name: string, label: string, width: f32 = CONTEXT_MENU_W) {
 	hover := clay.PointerOver(clay.ID(id_name))
 	if clay.UI(clay.ID(id_name))(
 	{
 		layout = {
 			sizing = {
-				width = clay.SizingFixed(CONTEXT_MENU_W),
+				width = clay.SizingFixed(width),
 				height = clay.SizingFixed(BUTTON_HEIGHT),
 			},
 			padding = clay.Padding{left = BUTTON_H_PAD, right = BUTTON_H_PAD},
@@ -2520,10 +2475,42 @@ draw_context_menu :: proc() {
 	}
 }
 
+// draw_track_action_menu renders the dedicated track menu (right-click on a
+// track's name gutter) as a floating overlay. It is a separate popup from
+// draw_context_menu on purpose: that one acts on clips and the frame under the
+// cursor, this one acts on a whole track. Row order must match
+// handle_track_action_option: 0 Duplicate, 1 Delete.
+draw_track_action_menu :: proc() {
+	if !track_ctx.open {
+		return
+	}
+	if clay.UI(clay.ID("TrackMenu"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})},
+			layoutDirection = .TopToBottom,
+			childGap = CTX_ROW_GAP,
+			padding = clay.PaddingAll(CONTEXT_MENU_PAD),
+		},
+		backgroundColor = BUTTON,
+		border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_WIDGET),
+		floating = {
+			offset = {track_ctx.x, track_ctx.y},
+			zIndex = 2000,
+			attachTo = .Root,
+			pointerCaptureMode = .Capture,
+		},
+	},
+	) {
+		ctx_option("TrackMenuDuplicate", "Duplicate Track", TRACK_MENU_W)
+		ctx_option("TrackMenuDelete", "Delete Track", TRACK_MENU_W)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Help overlay ("?" / F1).
 // ---------------------------------------------------------------------------
-
 // Help_Shortcut is one row of the help overlay: the key(s) and what they do.
 Help_Shortcut :: struct {
 	key:    string,
@@ -2540,6 +2527,8 @@ HELP_SHORTCUTS :: []Help_Shortcut {
 	{"U", "Link / unlink selection"},
 	{"Backspace", "Delete (ripple) selected clip or group"},
 	{"Delete", "Delete selected clip (raw)"},
+	{"Right-click track name", "Track menu (duplicate / delete track)"},
+	{"Right-click clip lane", "Add clip, or clip actions on the clip under the cursor"},
 	{"Esc", "Dismiss menu / dialog"},
 	{"F1 / ?", "Toggle this overlay"},
 	{"Media Bin tabs", "Switch between the media grid and the undo tree"},
