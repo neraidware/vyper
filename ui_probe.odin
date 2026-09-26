@@ -262,15 +262,14 @@ ui_probe_finder_asserts :: proc() -> bool {
 ui_probe_text_buf: [64]u8
 
 // ui_probe_push_text queues a real SDL_TEXT_INPUT event through SDL's own event
-// queue, so the command-line opener is exercised through the same path a
-// keypress takes.
+// queue. Note the tag is set explicitly: writing a #raw_union's variant does NOT
+// set it, so a synthetic event otherwise stays FIRST and the app's switch never
+// matches TEXT_INPUT.
 ui_probe_push_text :: proc(s: string) {
 	n := min(len(s), len(ui_probe_text_buf) - 1)
 	copy(ui_probe_text_buf[:n], s[:n])
 	ui_probe_text_buf[n] = 0
-	// cstring is [^]u8, so transmute the pointer, not the slice. The tag is set
-	// explicitly because writing a raw_union's variant does NOT set it — a union
-	// built this way stays FIRST and the app's switch never matches TEXT_INPUT.
+	// cstring is [^]u8, so transmute the pointer, not the slice.
 	raw: [^]u8 = raw_data(ui_probe_text_buf[:])
 	ev: sdl.Event
 	ev.type = .TEXT_INPUT
@@ -280,62 +279,89 @@ ui_probe_push_text :: proc(s: string) {
 	}
 }
 
+// ui_probe_push_opener_key queues the KEY_DOWN that opens the command line. On a
+// US layout ":" is Shift+";", so SDL reports the base keycode with the shift
+// modifier — that is the case the app's K_SEMICOLON branch exists for, and the
+// one worth driving here.
+ui_probe_push_opener_key :: proc() {
+	ev: sdl.Event
+	ev.type = .KEY_DOWN
+	ev.key.key = sdl.K_SEMICOLON
+	// key.mod is a Keymod (a bit_set over KeymodFlag), not a KeymodFlag, so the
+	// flag set needs converting at the boundary.
+	ev.key.mod = sdl.Keymod{sdl.KeymodFlag.LSHIFT}
+	ev.key.repeat = false
+	ev.key.down = true
+	if !sdl.PushEvent(&ev) {
+		fmt.eprintf("[ui-probe] SDL_PushEvent failed for the opener key\n")
+	}
+}
+
 // ui_probe_cmdline_opener_asserts drives the command line through real SDL
-// text events. The opener used to be a KEY_DOWN case that then had to suppress
-// its own keypress's TEXT_INPUT echo, and the suppression was a flag eating
-// "the next event" — so a keypress that produced no text event left it armed and
-// it consumed the user's first real character. Opening on the text event
-// removes the second event entirely, and this asserts the behaviour that was
-// reported: the first character typed after ":" must survive.
+// events. One keypress produces TWO of them: the KEY_DOWN that opens the prompt,
+// then that same keypress's own TEXT_INPUT echo (which text_input_begin
+// re-enables text input to receive). The opener must consume the echo without
+// eating anything else, and the case that matters is the reported bug: a
+// keypress that produces NO echo must not leave the suppressor armed.
 ui_probe_cmdline_opener_asserts :: proc() -> bool {
 	ok := true
 	running := true
 
 	// This probe path returns from main before the app's sdl.Init, so there is
-	// no event queue to push into. The event subsystem needs no display, so
-	// bring up just that and tear it down after.
+	// no event queue to push into. The event subsystem needs no display.
 	if !sdl.Init(sdl.INIT_EVENTS) {
 		fmt.eprintf("[ui-probe] SDL_Init(EVENTS) failed\n")
 		return false
 	}
 	defer sdl.Quit()
 
-	// No field open, prompt closed.
+	// Case 1: keypress WITH its echo. The echo is swallowed, the next real
+	// character lands.
 	text_input_cancel()
 	ti.active = false
+	ui_probe_push_opener_key()
 	ui_probe_push_text(CMDLINE_OPENER)
 	handle_sdl_events(&running)
 	if !ti.active || ti.input_type != TI_CMDLINE {
-		fmt.eprintf("[ui-probe] %q did not open the command line\n", CMDLINE_OPENER)
+		fmt.eprintf("[ui-probe] the opener key did not open the command line\n")
 		return false
 	}
-	// The opener consumes itself: the prompt starts empty, not ":".
 	if got := text_input_string(); len(got) != 0 {
 		fmt.eprintf("[ui-probe] prompt opened with %q, want empty\n", got)
 		ok = false
 	}
-	// The reported bug: the FIRST character typed must land.
+	ui_probe_push_text("o")
+	handle_sdl_events(&running)
+	if got := text_input_string(); got != "o" {
+		fmt.eprintf("[ui-probe] char after the echo gave %q, want \"o\"\n", got)
+		ok = false
+	}
+
+	// Case 2: keypress with NO echo at all (layout/IME differences). This is
+	// the reported bug: the suppressor used to drop "the next text event", so
+	// the first real keystroke was eaten. Matching the CHARACTER is what makes
+	// a missing echo harmless.
+	text_input_cancel()
+	ti.active = false
+	ui_probe_push_opener_key()
+	handle_sdl_events(&running)
+	if !ti.active {
+		fmt.eprintf("[ui-probe] opener key did not open the prompt (no-echo case)\n")
+		ok = false
+	}
 	ui_probe_push_text("o")
 	handle_sdl_events(&running)
 	if got := text_input_string(); got != "o" {
 		fmt.eprintf("[ui-probe] first typed char gave %q, want \"o\"\n", got)
 		ok = false
 	}
-	// A ":" typed into an open prompt IS data (a Windows drive path), so it
-	// must be inserted rather than treated as another opener.
+
+	// A ":" typed into an already-open prompt is DATA, not another opener:
+	// "open C:/foo" is a legal command on Windows.
 	ui_probe_push_text("C:/x")
 	handle_sdl_events(&running)
 	if got := text_input_string(); got != "oC:/x" {
 		fmt.eprintf("[ui-probe] drive path gave %q, want \"oC:/x\"\n", got)
-		ok = false
-	}
-	// Multi-byte text must not be mistaken for the opener.
-	text_input_cancel()
-	ti.active = false
-	ui_probe_push_text("é")
-	handle_sdl_events(&running)
-	if ti.active {
-		fmt.eprintf("[ui-probe] non-opener text %q opened the prompt\n", "é")
 		ok = false
 	}
 

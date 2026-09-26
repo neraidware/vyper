@@ -697,6 +697,15 @@ Text_Input :: struct {
 	// clip (rather than renaming an existing one): the clip only survives if a
 	// non-empty name is committed. Applies both to renamed (commit) and cancel.
 	is_create:  bool,
+	// swallow_char is the exact byte to discard from the next text-input event
+	// (0 = nothing pending). The ":" shortcut both opens the command line AND
+	// (via the same keypress's TEXT_INPUT) would echo a ":" into the buffer; the
+	// prompt must start empty, so the opener swallows its own keypress's text.
+	// Matching the CHARACTER rather than blindly dropping the next event is
+	// what makes this safe: a keypress that produces no text event at all
+	// (layout/IME differences) used to leave a pending swallow that ate the
+	// user's next real keystroke.
+	swallow_char: u8,
 }
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.
@@ -712,11 +721,11 @@ TI_CMDLINE :: 3
 // argument, and the open/import buttons). The field is the finder's filter;
 // Enter descends or opens, Esc closes.
 TI_FINDER :: 4
-// CMDLINE_OPENER is the character that opens the command line. It is matched on
-// the TEXT_INPUT event, not on a keycode: the text event IS the character, so
-// the opener consumes itself and nothing has to suppress a second event for the
-// same keypress. Not a legal character anywhere in a command (a leading ":" is
-// not a verb apply_command knows), which is exactly why it must never reach the
+// CMDLINE_OPENER is the character that opens the command line, and the one
+// character its own keypress must not echo into the buffer. Named because it is
+// used in two places that must agree: the keycode opener arms the swallow with
+// it, and the text branch drops an echo by comparing against it. A leading ":"
+// is not a verb apply_command knows, which is why it must never reach the
 // buffer.
 CMDLINE_OPENER :: ":"
 

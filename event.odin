@@ -100,6 +100,41 @@ handle_sdl_events :: proc(running: ^bool) {
 				escape_dismiss()
 			} else if !event.key.repeat {
 				switch event.key.key {
+				case sdl.K_COLON:
+					// Vim-style ":" opens the command line.
+					//
+					// This MUST be a keycode case, not a TEXT_INPUT case, and
+					// that is forced by SDL: with no field open
+					// text_input_cancel has called StopTextInput, and SDL
+					// delivers no TEXT_INPUT at all while text input is
+					// stopped — so a text-driven opener never fires. (Tried
+					// that way; the prompt simply did not open.) KEY_DOWN is
+					// the only event that arrives in this state.
+					//
+					// The cost is that one keypress now produces two events:
+					// text_input_begin re-enables text input, so the same
+					// keypress's own TEXT_INPUT(":") follows and would land in
+					// the buffer. Hence swallow_char — which must match the
+					// CHARACTER, not swallow "the next event", so a keypress
+					// that produces no echo cannot leave it armed to eat the
+					// user's next keystroke.
+					text_input_begin("", TI_CMDLINE, 0)
+					ti.swallow_char = CMDLINE_OPENER[0]
+				case sdl.K_SEMICOLON:
+					// On a US layout ":" is Shift+";", so SDL reports the
+					// base key with the shift modifier rather than a distinct
+					// K_COLON keycode. Same opener.
+					//
+					// Read the modifier off THIS event, not sdl.GetModState():
+					// the event carries the modifier that was held when the key
+					// went down, whereas the global state is sampled when the
+					// event is handled — a Shift released in between loses the
+					// opener, which is the reported "prompt never opens" symptom.
+					mods := event.key.mod
+					if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
+						text_input_begin("", TI_CMDLINE, 0)
+						ti.swallow_char = CMDLINE_OPENER[0]
+					}
 				case sdl.K_F1:
 					// Always-available shortcut reference.
 					editor_flags.help_open = !editor_flags.help_open
@@ -180,21 +215,22 @@ case sdl.K_BACKSPACE:
 				}
 			}
 		case .TEXT_INPUT:
-			// The vim-style ":" prompt opener lives HERE, on the text event,
-			// not on KEY_DOWN. The text event IS the character, so consuming it
-			// is the entire job: there is no second event to suppress and no
-			// state correlating the two, which is all the old swallow flag ever
-			// did — and what let it eat the user's next keystroke whenever a
-			// keypress produced no text event. Keying off the character instead
-			// of a keycode also drops the K_COLON-vs-";"-with-Shift guessing:
-			// a ":" from any layout, dead key, or IME arrives identically.
-			text := string(event.text.text)
-			if !ti.active && edit_state.field == .None && text == CMDLINE_OPENER {
-				text_input_begin("", TI_CMDLINE, 0)
-			} else if ti.active {
-				text_input_insert(text)
+			if ti.active {
+				text := string(event.text.text)
+				// Drop the swallowed CHARACTER, not merely the next event. A
+				// text event always consumes the swallow (one-shot), so a ":"
+				// keypress that produced no echo can't leave a pending swallow
+				// behind to eat the user's next real keystroke. Matching the
+				// character is also what keeps "open C:/foo" working: a ":"
+				// typed into an open prompt is data (a Windows drive path),
+				// not another opener.
+				swallow := ti.swallow_char
+				ti.swallow_char = 0
+				if !(swallow != 0 && len(text) > 0 && text[0] == swallow) {
+					text_input_insert(text)
+				}
 			} else if edit_state.field != .None {
-				for ch in text {
+				for ch in string(event.text.text) {
 					// Only accept printable ASCII that makes sense in a number.
 					if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
 						edit_append(u8(ch))
