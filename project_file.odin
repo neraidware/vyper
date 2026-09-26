@@ -5,7 +5,12 @@
 // frame rate, render range, resolution lock) AND the editing session: the media
 // bin, the subtitle cache, and the timeline (tracks, clips, markers, keyframe
 // tracks, track order, playhead). `:open <path.vyproj>` reads it back and makes
-// it the live session, replacing whatever was open.
+// it the live session, replacing whatever was open. Bare `:save` opens the
+// in-app file finder in Save mode, which suggests `<project name>.vyproj` as
+// the field's placeholder and writes the name typed there in the browsed
+// directory; bare `:open` pops the same finder in Open mode. The finder is the
+// picker for both verbs, so both must agree on what a project file is
+// (PROJECT_FILE_EXTENSION).
 //
 // Format: core:encoding/cbor, reflection-marshaled over Project_File. No
 // version/escalation machinery: single-user tool, the file layout only ever has
@@ -449,9 +454,14 @@ project_file_open :: proc(path: string) -> string {
 	return ""
 }
 
+// PROJECT_FILE_EXTENSION marks a file as a project: `:open` and the finder
+// dispatch on it, so it is the single source of truth for both the routing test
+// and the name Save mode suggests.
+PROJECT_FILE_EXTENSION :: ".vyproj"
+
 // project_path_is_project reports whether a path names a project file (by its
 // .vyproj extension). The finder and :open route non-project paths to media;
 // this is the dispatch test.
 project_path_is_project :: proc(path: string) -> bool {
-	return strings.has_suffix(path, ".vyproj")
+	return strings.has_suffix(path, PROJECT_FILE_EXTENSION)
 }

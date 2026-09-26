@@ -563,12 +563,35 @@ Steps (each lands + probe + vet before the next):
       `delete_selected_clip_raw`, `remove_track`) go through `free_markers`.
       `duplicate_track`/`duplicate_clip` already deep-cloned. Valgrind: 0
       definitely lost, 0 indirectly lost, 0 invalid read/write/free.
+- [x] S11. Bare `:save` opens the in-app file finder in a new `.Save` commit
+      mode instead of printing a usage notice, so saving and opening share one
+      picker (`:open` still opens it in `.Open`). The field is a file NAME
+      rather than a filter, which changes the Enter rule: a typed name is the
+      commit, an empty field keeps the row semantics (Enter on a folder still
+      descends) so both navigating and naming stay on one key. The suggested
+      name (`<project name>.vyproj`) is drawn as a placeholder, not field text
+      — pre-filling it would make the very first Enter a save and strand the
+      user in the starting directory. A name with no extension gets
+      `PROJECT_FILE_EXTENSION`; an explicit extension is left alone. A failed
+      save keeps the finder open so the name can be corrected; a successful one
+      closes it. Fixed two leaks this path exposed: `finder_kind_of` called
+      `strings.to_lower` once per listed entry per relist (now lowercased in a
+      stack buffer), and `show_ui_notice` copies, so every
+      `show_ui_notice(fmt.aprintf(...))` call site leaked its temporary
+      (now `show_ui_noticef`, which formats in a callee-owned buffer).
+      Probe: `ui_probe_finder_save_asserts` covers the mode, the unfiltered
+      rows, the empty-at-open field, both extension cases, and a load-back of
+      what the finder wrote.
 - [ ] ACCEPT: manual pass — `:save test.vyproj`, `:open test.vyproj` shows
-      "Editing <name>" and the full timeline/bin restored, bare `:save` and bad
-      paths give notices, finder open loads a project.
+      "Editing <name>" and the full timeline/bin restored, bad paths give
+      notices, finder open loads a project, and bare `:save` pops the finder:
+      typing a name and Enter writes it in the browsed directory (with
+      `.vyproj` appended when no extension was typed) while Enter on a folder
+      still descends.
 
 Out of scope (future): undo-history serialization (the baseline resets to the
-loaded session), autosave, double-click-to-save, extension enforcement,
+loaded session), autosave, double-click-to-save, extension enforcement for
+`:save <path>` (S11 only appends the extension in the finder's Save mode), and
 version/format negotiation.
 
 ## Queued — Performance / Cleanup

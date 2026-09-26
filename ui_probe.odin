@@ -116,6 +116,12 @@ for j := 0; j < len(raw); {
 	if !ui_probe_finder_asserts() {
 		os.exit(1)
 	}
+	// Finder Save mode: the field is a name, not a filter, and what it writes
+	// must be a project file `:open` can read back. Runs before the round-trip
+	// probe because it saves and reloads the live session.
+	if !ui_probe_finder_save_asserts() {
+		os.exit(1)
+	}
 	// Project file round-trip: a :save-style write must come back identical to
 	// a :open-style read through the live Project global.
 	if !ui_probe_project_file_asserts() {
@@ -234,6 +240,138 @@ ui_probe_finder_asserts :: proc() -> bool {
 	return ok
 }
 
+// ui_probe_finder_save_asserts covers the finder's Save mode, where the field
+// is a file NAME instead of a filter. The three things that can silently break
+// it: typing must not narrow the rows (they are how you reach another
+// directory), the field must start empty so the first Enter descends rather
+// than saving, and a name typed without an extension must land as a real
+// project file (`:open` dispatches on the suffix). Ends by loading back what it
+// wrote, so a save that is not openable is caught here.
+ui_probe_finder_save_asserts :: proc() -> bool {
+	ok := true
+	dir := "/tmp/opencode/ui_probe_save"
+	os.remove_all(dir)
+	os.make_directory(dir)
+	// Real files, so "Save mode does not filter" is tested against a listing
+	// with something to over-filter rather than an empty directory.
+	seed_names := []string {"alpha.vyproj", "beta.vyproj", "gamma.mp4"}
+	for s in seed_names {
+		full := fmt.aprintf("%s/%s", dir, s)
+		if err := os.write_entire_file(full, "probe"); err != nil {
+			fmt.eprintf("[ui-probe] could not seed %s: %v\n", full, err)
+			ok = false
+		}
+		delete(full)
+	}
+
+	finder_open(.Save)
+	defer finder_close()
+	if file_finder.mode != .Save || !file_finder.active {
+		fmt.eprintf("[ui-probe] finder did not open in Save mode\n")
+		return false
+	}
+	// Empty at open: a pre-filled name would turn the first Enter (on the ".."
+	// row) into a save and make navigating to another directory impossible.
+	if got := text_input_string(); len(got) != 0 {
+		fmt.eprintf("[ui-probe] Save field not empty at open: %q\n", got)
+		ok = false
+	}
+
+	finder_descend(dir)
+	rows_all := len(file_finder.entries)
+	text_input_set_buf("zzz-no-such-entry")
+	finder_refresh()
+	if len(file_finder.filtered) != rows_all {
+		fmt.eprintf(
+			"[ui-probe] Save mode filtered rows: %d of %d survived\n",
+			len(file_finder.filtered),
+			rows_all,
+		)
+		ok = false
+	}
+
+	// No extension typed -> one is appended, and the result must open.
+	text_input_set_buf("probe_saved")
+	finder_enter()
+	saved := fmt.aprintf("%s/probe_saved%s", dir, PROJECT_FILE_EXTENSION)
+	defer delete(saved)
+	if !os.exists(saved) {
+		fmt.eprintf("[ui-probe] save did not write %s\n", saved)
+		ok = false
+	} else {
+		// A successful save closes the finder; a failed one keeps it open so
+		// the name can be corrected. Both halves are checked here, and the
+		// file is loaded back so a write that is not openable cannot pass.
+		if file_finder.active {
+			fmt.eprintf("[ui-probe] finder stayed open after a successful save\n")
+			ok = false
+		}
+		if err := project_file_open(saved); len(err) > 0 {
+			fmt.eprintf("[ui-probe] saved project did not load: %s\n", err)
+			ok = false
+		}
+	}
+
+	// An explicit extension is the user's call and is left alone.
+	finder_open(.Save)
+	finder_descend(dir)
+	text_input_set_buf("probe_named.custom")
+	finder_enter()
+	named := fmt.aprintf("%s/probe_named.custom", dir)
+	defer delete(named)
+	if !os.exists(named) {
+		fmt.eprintf("[ui-probe] explicit extension not honored: %s missing\n", named)
+		ok = false
+	}
+
+	// The suggested name carries the project extension, so the common case
+	// needs no typing beyond accepting it.
+	hint_buf: [128]u8
+	hint := finder_default_save_name(hint_buf[:])
+	if !strings.has_suffix(hint, PROJECT_FILE_EXTENSION) {
+		fmt.eprintf("[ui-probe] suggested name %q lacks %s\n", hint, PROJECT_FILE_EXTENSION)
+		ok = false
+	}
+
+	// Icon classification is a string compare against a lowercased copy, so it
+	// fails silently (everything falls to .File) if the lowercase buffer is
+	// sliced to the wrong length. Assert a case from each kind, plus the
+	// fall-throughs.
+	kind_cases := []struct {
+		name: string,
+		want: Finder_Kind,
+	}{
+		{"a.mp4", .Video},
+		{"a.MP4", .Video},
+		{"a.flac", .Audio},
+		{"a.PNG", .Image},
+		{"a.srt", .Subtitle},
+		// Project files have no kind of their own yet; they render as a
+		// generic document.
+		{"a.vyproj", .File},
+		{"a.bin", .File},
+		{"noextension", .File},
+		{".hidden", .File},
+	}
+	for tc in kind_cases {
+		if got := finder_kind_of(tc.name); got != tc.want {
+			fmt.eprintf(
+				"[ui-probe] finder_kind_of(%q) = %v, want %v\n",
+				tc.name,
+				got,
+				tc.want,
+			)
+			ok = false
+		}
+	}
+
+	os.remove_all(dir)
+	if ok {
+		fmt.printf("[ui-probe] finder save mode ok\n")
+	}
+	return ok
+}
+
 // finder_populate seeds the finder as if opened over a directory and relists a
 // handful of synthetic entries (dirs + files of each kind) so the popup has
 // something to draw without touching the real filesystem.
@@ -301,7 +439,10 @@ visible_rows :: proc() -> int {
 // (not stored) on reload, and a file-backed clip's path is checked to match its
 // asset.
 seed_roundtrip_session :: proc() {
-	project.name = "Probe Project"
+	// Through the setter, never by direct assignment: a bare
+	// `project.name = "..."` leaves project_name_owned describing a different
+	// pointer, and the next project_set_name would delete a string literal.
+	project_set_name("Probe Project")
 	project.width = 640
 	project.height = 360
 	project.frame_rate = 30

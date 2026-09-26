@@ -43,7 +43,9 @@ handle_sdl_events :: proc(running: ^bool) {
 				// descends into the selected directory or opens the selected
 				// file — Enter never commits the field (the finder stays open
 				// across a descend), so it is handled before the generic
-				// commit path. Esc still cancels through the text field.
+				// commit path. In Save mode the field is a name, so Enter saves
+				// that name; the row only picks "commit" over "descend". Esc
+				// still cancels through the text field.
 				if ti.input_type == TI_FINDER {
 					switch event.key.key {
 					case sdl.K_TAB:

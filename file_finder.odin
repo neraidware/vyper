@@ -13,6 +13,11 @@ import "core:strings"
 // OS-native open/import dialogs (`:open` bare, Open File and Bin Import
 // buttons) so every platform shares one file-management UI.
 //
+// The field's meaning is the one thing that differs per mode: Open/ImportBin
+// type a fuzzy filter that narrows the rows, while Save types a file NAME and
+// leaves every row visible for navigation (see finder_refresh). Save commits
+// that name against the browsed directory, not the highlighted row.
+//
 // Memory model: the listing is session-owned (freed by finder_close/reset);
 // each entry holds a cloned basename + fullpath. `cwd` is a cloned absolute
 // path of the directory being browsed. Filter text lives in the shared `ti`
@@ -23,7 +28,7 @@ FINDER_MAX_ROWS :: 16    // visible rows under the filter (popup height cap)
 FINDER_ENTRIES_MAX :: 20000 // safety cap: stop scanning past this many entries
 FINDER_QUERY_MAX :: 127  // filter bytes considered for matching/draw
 
-Finder_Commit_Mode :: enum { Open, ImportBin }
+Finder_Commit_Mode :: enum { Open, ImportBin, Save }
 
 Finder_Kind :: enum { Folder, Video, Audio, Image, Subtitle, File }
 
@@ -48,12 +53,28 @@ File_Finder :: struct {
 }
 file_finder: File_Finder
 
+// FINDER_EXT_MAX bounds the extension this proc lowercases. Every extension it
+// matches is far shorter; a longer one matches nothing and falls to .File
+// anyway, so it is left alone rather than truncated into a wrong answer.
+FINDER_EXT_MAX :: 16
+
 // finder_kind_of classifies a file by extension into an icon kind. Unrecognized
 // extensions (and extensionless files) fall to .File — a generic document.
 finder_kind_of :: proc(name: string) -> Finder_Kind {
 	ext := ""
 	if dot := strings.last_index(name, "."); dot >= 0 && dot + 1 < len(name) {
-		ext = strings.to_lower(name[dot + 1:])
+		// Lowercased into a stack buffer, not with strings.to_lower: this runs
+		// once per listed entry on every relist, and to_lower heap-allocates a
+		// string that was then dropped on the floor.
+		raw := name[dot + 1:]
+		if len(raw) <= FINDER_EXT_MAX {
+			buf: [FINDER_EXT_MAX]u8
+			for i in 0 ..< len(raw) {
+				b := raw[i]
+				buf[i] = (b >= 'A' && b <= 'Z') ? b + ('a' - 'A') : b
+			}
+			ext = string(buf[:len(raw)])
+		}
 	}
 	switch ext {
 	case "mp4", "mov", "mkv", "webm", "avi", "m4v", "ts", "mts", "m2ts", "mpg", "mpeg":
@@ -163,8 +184,14 @@ finder_refresh :: proc() {
 	copy(file_finder.query_buf[:qn], query[:qn])
 	file_finder.query_len = qn
 	clear(&file_finder.filtered)
+	// Save mode types a file NAME, not a query: the field must not narrow the
+	// listing, or the rows used to navigate to a directory would vanish as
+	// soon as the first character is typed.
+	match_all := file_finder.mode == .Save
 	for i in 0 ..< len(file_finder.entries) {
-		if qn == 0 || cmdline_fuzzy_score(query[:qn], file_finder.entries[i].name) > 0 {
+		if match_all ||
+		   qn == 0 ||
+		   cmdline_fuzzy_score(query[:qn], file_finder.entries[i].name) > 0 {
 			append(&file_finder.filtered, i)
 		}
 	}
@@ -226,8 +253,20 @@ finder_selected :: proc() -> (^Finder_Entry, bool) {
 
 // finder_enter commits the selected row: a directory descends (relist the
 // target and clear the filter), a file invokes the caller's commit proc.
+//
+// Save mode splits the two: a typed name IS the commit, so Enter saves it and
+// the highlighted row is ignored. An EMPTY field keeps the row semantics, which
+// is what keeps both actions on one key — otherwise a pre-filled suggestion
+// would make the first Enter a save and navigating to another directory
+// impossible (or, the other way, Enter on ".." would navigate when the user
+// meant to save).
 finder_enter :: proc() {
 	if !file_finder.active {
+		return
+	}
+	if file_finder.mode == .Save &&
+	   len(strings.trim_space(text_input_string())) > 0 {
+		finder_save_typed_name()
 		return
 	}
 	entry, ok := finder_selected()
@@ -304,7 +343,8 @@ finder_go_up :: proc() {
 
 // finder_commit applies the chosen file through the finder's commit mode:
 // .Open opens like the Open File button (decodable media/subtitle only),
-// .ImportBin imports into the media bin without touching the timeline.
+// .ImportBin imports into the media bin without touching the timeline,
+// .Save writes the project to the name typed in the field.
 finder_commit :: proc(entry: Finder_Entry) {
 	switch file_finder.mode {
 	case .Open:
@@ -312,9 +352,10 @@ finder_commit :: proc(entry: Finder_Entry) {
 			// A project file picked in the finder loads like `:open` would —
 			// the finder is the bare :open's picker, so both paths must agree.
 			if err := project_file_open(entry.fullpath); len(err) > 0 {
+				defer delete(err)
 				show_ui_notice(err, 4000)
 			} else {
-				show_ui_notice(fmt.aprintf("Editing '%s'", project.name), 3000)
+				show_ui_noticef(3000, "Editing '%s'", project.name)
 			}
 			finder_close()
 			return
@@ -351,11 +392,79 @@ finder_commit :: proc(entry: Finder_Entry) {
 		} else {
 			import_media_to_bin(cpath)
 		}
+	case .Save:
+		// Reached only when Enter landed on a file row with an empty field
+		// (a typed name is handled earlier, in finder_enter), so there is
+		// nothing to save yet — say so instead of writing an unnamed file.
+		finder_save_typed_name()
+		return
 	}
 	finder_close()
 }
 
+// finder_default_save_name writes the name Save mode suggests — the project's
+// name plus the project extension — into `buf` and returns the written span.
+// It allocates nothing: the finder draws this as the field's placeholder every
+// frame, and a per-frame heap allocation is never acceptable. Path separators
+// become '_' because the field resolves against the browsed directory, and a
+// separator in a project name would aim the save at a path the user never
+// chose. An unnamed project still gets a usable name rather than a bare
+// ".vyproj" (a hidden file). A name too long for `buf` is truncated, which is
+// fine for a suggestion the user edits.
+finder_default_save_name :: proc(buf: []u8) -> string {
+	n := 0
+	if len(project.name) == 0 {
+		copy(buf, "project")
+		n = len("project")
+	} else {
+		// Byte-wise so multi-byte UTF-8 passes through untouched; only the
+		// ASCII separators are replaced.
+		for i in 0 ..< len(project.name) {
+			// Leave room for the extension.
+			if n >= len(buf) - len(PROJECT_FILE_EXTENSION) {
+				break
+			}
+			b := project.name[i]
+			buf[n] = (b == '/' || b == '\\') ? '_' : b
+			n += 1
+		}
+	}
+	copy(buf[n:], PROJECT_FILE_EXTENSION)
+	n += len(PROJECT_FILE_EXTENSION)
+	return string(buf[:n])
+}
+
+// finder_save_typed_name saves the project under the name typed in the field,
+// resolved against the directory being browsed. The finder stays open when the
+// save fails so the name can be corrected and retried.
+finder_save_typed_name :: proc() {
+	name := strings.trim_space(text_input_string())
+	if len(name) == 0 {
+		show_ui_notice("Type a name to save the project", 3000)
+		return
+	}
+	// `:open` routes on the .vyproj suffix, so a name typed with no extension
+	// at all gets one. An explicit extension is left alone: the typed form of
+	// `:save <path>` accepts any extension, and second-guessing a name the
+	// user finished typing is worse than honoring it.
+	suffix := ""
+	if !strings.contains(path_last_component(name), ".") {
+		suffix = PROJECT_FILE_EXTENSION
+	}
+	path := fmt.aprintf("%s/%s%s", file_finder.cwd, name, suffix)
+	defer delete(path)
+	if err := project_file_save(path); len(err) > 0 {
+		defer delete(err)
+		show_ui_notice(err, 4000)
+		return
+	}
+	show_ui_noticef(3000, "Saved '%s'", path)
+	finder_close()
+}
+
 // finder_open starts the finder from the process cwd in the given commit mode.
+// The field always starts empty: Open/ImportBin use it as a filter, and Save
+// uses it as a name it must not pre-fill (see finder_enter).
 finder_open :: proc(mode: Finder_Commit_Mode) {
 	if file_finder.active {
 		finder_close()

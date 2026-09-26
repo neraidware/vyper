@@ -405,15 +405,19 @@ apply_command :: proc() {
 
 	switch verb {
 	case "save":
+		// Bare ":save" opens the in-app file finder in Save mode (same picker
+		// bare ":open" uses) instead of demanding a typed path.
 		if len(arg) == 0 {
-			show_ui_notice("Usage: save <file.vyproj>", 3000)
+			finder_open(.Save)
 			return
 		}
 		if err := project_file_save(arg); len(err) > 0 {
+			// show_ui_notice copies, so `err` is ours to free.
+			defer delete(err)
 			show_ui_notice(err, 4000)
 			return
 		}
-		show_ui_notice(fmt.aprintf("Saved '%s'", arg), 3000)
+		show_ui_noticef(3000, "Saved '%s'", arg)
 	case "open":
 		// Bare ":open" (no argument) launches the in-app fuzzy file finder
 		// instead of the OS dialog that the Open File button uses; a typed
@@ -424,14 +428,15 @@ apply_command :: proc() {
 		}
 		if project_path_is_project(arg) {
 			if err := project_file_open(arg); len(err) > 0 {
+				defer delete(err)
 				show_ui_notice(err, 4000)
 				return
 			}
-			show_ui_notice(fmt.aprintf("Editing '%s'", project.name), 3000)
+			show_ui_noticef(3000, "Editing '%s'", project.name)
 			return
 		}
 		if !os.exists(arg) {
-			show_ui_notice(fmt.aprintf("No such file '%s'", arg), 4000)
+			show_ui_noticef(4000, "No such file '%s'", arg)
 			return
 		}
 		// open_file_at only reads `cpath` (the bin clones it), so the scratch
@@ -932,10 +937,7 @@ add_subtitle_clip_at :: proc() {
 	}
 	srt_id := srt_load(path)
 	if srt_id < 0 {
-		show_ui_notice(
-			fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)),
-			4000,
-		)
+		show_ui_noticef(4000, "Could not load subtitles from '%s'", path_basename(path))
 		return
 	}
 	name := strings.clone(path_basename(path))

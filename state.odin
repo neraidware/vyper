@@ -2,6 +2,7 @@ package main
 
 import clay "clay-odin"
 import "core:c"
+import "core:fmt"
 import "core:strings"
 import sdl "vendor:sdl3"
 
@@ -893,13 +894,31 @@ Ui_Notice :: struct {
 ui_notice: Ui_Notice
 
 // show_ui_notice displays a transient message centered on the window for the
-// given duration (ms), replacing any current notice.
+// given duration (ms), replacing any current notice. It COPIES `text`, so the
+// caller keeps ownership — a notice outlives the frame it was raised in.
 show_ui_notice :: proc(text: string, duration_ms: u64) {
 	if len(ui_notice.text) > 0 {
 		delete(ui_notice.text)
 	}
 	ui_notice.text = strings.clone(text)
 	ui_notice.until = sdl.GetTicks() + duration_ms
+}
+
+// UI_NOTICE_MAX bounds a formatted notice. Notices are one-line status
+// messages; anything longer is a bug in the message, not a real case.
+UI_NOTICE_MAX :: 256
+
+// show_ui_noticef is show_ui_notice for a formatted message. The text is built
+// in a stack buffer that dies at return, which is what makes this the right
+// form for a call site with arguments: show_ui_notice copies, so passing
+// fmt.aprintf(...) left the caller owning a heap string it had to remember to
+// free — and every such call site leaked it. Here the caller owns nothing.
+//
+// A message too long for the buffer is truncated; notices are short by
+// construction, so this is a backstop, not a case to handle.
+show_ui_noticef :: proc(duration_ms: u64, format: string, args: ..any) {
+	buf: [UI_NOTICE_MAX]u8
+	show_ui_notice(fmt.bprintf(buf[:], format, ..args), duration_ms)
 }
 
 // clear_expired_ui_notice frees the notice string once its time is up.

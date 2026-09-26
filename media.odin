@@ -435,10 +435,7 @@ import_srt_to_bin :: proc(path: cstring) -> u64 {
 	}
 	srt_id := srt_load(path)
 	if srt_id < 0 {
-		show_ui_notice(
-			fmt.aprintf("Could not load subtitles from '%s'", path_basename(path)),
-			4000,
-		)
+		show_ui_noticef(4000, "Could not load subtitles from '%s'", path_basename(path))
 		return 0
 	}
 	one_sec := i64(math.round(timeline_fps()))
@@ -457,7 +454,7 @@ import_srt_to_bin :: proc(path: cstring) -> u64 {
 			thumb_tex_dirty = true,
 		},
 	)
-	show_ui_notice(fmt.aprintf("Subtitles '%s' added to the media bin", path_basename(path)), 2000)
+	show_ui_noticef(2000, "Subtitles '%s' added to the media bin", path_basename(path))
 	return asset_id
 }
 
@@ -656,10 +653,7 @@ open_file_at :: proc(path: cstring) -> (opened: bool) {
 	}
 	probe := probe_streams(path)
 	if !probe.has_video && !probe.has_audio && !media_is_image(path) {
-		show_ui_notice(
-			fmt.aprintf("Could not open '%s': not decodable media", path_basename(path)),
-			4000,
-		)
+		show_ui_noticef(4000, "Could not open '%s': not decodable media", path_basename(path))
 		return false
 	}
 	if asset_id := import_media_to_bin(path); asset_id != 0 {

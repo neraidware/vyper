@@ -68,9 +68,12 @@ UI_Text_Buffers :: struct {
 		name:  [64]u8,
 		label: [64]u8,
 	},
-	// file-finder scratch: the current-directory header and the symlink suffix.
+	// file-finder scratch: the current-directory header, the symlink suffix, and
+	// the Save-mode field placeholder (the suggested project name, drawn only
+	// while the field is empty so Enter still means "descend" until typed).
 	finder_dir: [512]u8,
 	finder_sym: [512]u8,
+	finder_save_hint: [128]u8,
 }
 
 ui_text: UI_Text_Buffers
@@ -2904,6 +2907,14 @@ draw_finder_popup :: proc(width, height: c.int) {
 		},
 		) {
 			text := "filter files…"
+			if file_finder.mode == .Save {
+				// Save mode types a name, not a query: say so, or the
+				// unfiltered list below reads as a broken filter. The suggested
+				// name is a PLACEHOLDER, not field text — real text would make
+				// the very first Enter a save, and Enter on ".." must still
+				// descend until the user has actually typed a name.
+				text = finder_default_save_name(ui_text.finder_save_hint[:])
+			}
 			col := CMDLINE_PLACEHOLDER
 			if len(ti.buf) > 0 {
 				text = text_input_string()
