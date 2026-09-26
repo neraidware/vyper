@@ -342,6 +342,30 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   whole session; the env vars that control this live in the build
   script, not memorized.
 
+## 9b. Valgrind is the memory gate; the ownership model is only a claim until it runs
+
+- The ownership matrix in §1 is a set of claims, not a guarantee. `scripts/gate.sh
+  valgrind` is what checks them: **0 definitely lost, 0 indirectly lost, no
+  invalid read/write/free**, asserted by the target rather than eyeballed in the
+  log. Run it for anything that allocates, frees, or hands a buffer across a
+  boundary — and for anything a probe changed, since a probe seeding live state
+  can orphan a buffer the shipped code never touches.
+- Valgrind's own exit code is always 99 here: FFmpeg and the Odin runtime report
+  errors this program does not own. Do not gate on the exit code and do not
+  "fix" that noise — gate on the four invariants above, and watch the error
+  *context count* for a jump that means something new appeared.
+- Two real leaks this caught, both invisible to the compiler: a dynamic array
+  orphaned by `arr = make(...)` over a populated one (Odin's `clear` KEEPS
+  capacity, so the seeding code must `reserve` and reuse), and a per-entry
+  string cloned per relist. Neither showed up as a wrong answer — only as bytes
+  that never came back.
+- Don't reach for valgrind to answer a question a probe answers better: a
+  *logic* bug is a probe assertion (§6), a *leak* is valgrind. Reach for Spall
+  (§9) when the question is speed.
+- No build/profiling invocation belongs in your head or in this file. If you
+  catch yourself typing `odin check`/`odin build`/`valgrind` by hand, the target
+  is missing from `scripts/gate.sh` — add the target, don't memorize the flags.
+
 ## 10. Build flags live in scripts, not your head
 
 - Typing any build/profiling flag by hand instead of running a named
