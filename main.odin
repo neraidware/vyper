@@ -434,14 +434,11 @@ apply_command :: proc() {
 			show_ui_notice(fmt.aprintf("No such file '%s'", arg), 4000)
 			return
 		}
-		// The asset retains this cstring (like the picker's glib-owned buffer),
-		// so it must outlive the command input buffer: clone to session heap
-		// and only free when open_file_at says nothing new stored it.
+		// open_file_at only reads `cpath` (the bin clones it), so the scratch
+		// copy is freed as soon as the open returns.
 		cpath := strings.clone_to_cstring(arg)
-		_, retained := open_file_at(cpath)
-		if !retained {
-			delete(cpath)
-		}
+		open_file_at(cpath)
+		delete(cpath)
 	case:
 		// Unknown command or empty filter text commit; no-op.
 	}
@@ -1455,9 +1452,8 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// Media file arguments: `vyper media.mp4 ...` opens each listed file through
 	// the normal Open-File flow (probe -> bin + timeline append; a bad path
 	// shows the notice and is skipped). This is what the desktop entry's
-	// "Open with vyper" hands over. os.args strings live for the whole process,
-	// so assets may reference the argv bytes directly — no clone needed (unlike
-	// the env-var autoplay below, whose string is temp-arena memory).
+	// "Open with vyper" hands over. open_file_at only reads the cstring (the bin
+	// clones it), so the argv bytes are safe to point at directly.
 	for arg_i := 1; arg_i < len(os.args); arg_i += 1 {
 		path := cstring(raw_data(os.args[arg_i]))
 		if vyper_trace {
@@ -1474,9 +1470,8 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		if vyper_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 		}
-		// The asset/clip paths store the passed cstring by reference, so the
-		// autoplay path must be owned on the long-lived allocator (assets never
-		// free their paths), not the per-frame temp arena.
+		// import_media only reads this cstring (the bin clones it into session
+		// heap), so the null-terminated scratch copy dies with the frame arena.
 		import_media(strings.clone_to_cstring(autoplay))
 		if vyper_trace {
 			fmt.printf(

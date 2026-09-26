@@ -525,7 +525,7 @@ split_clip_at_playhead :: proc() {
 			right.source_start_frame,
 			right_len,
 		)
-		delete(old_markers)
+		free_markers(&old_markers)
 		// Split remap (slice-1 rule): left keeps keys < left_len, right gets
 		// keys >= left_len re-relativized by -left_len; values preserved. The
 		// old shared backing is freed; each half owns fresh clones.
@@ -663,6 +663,26 @@ toggle_links_for_selection :: proc() {
 	}
 }
 
+// Marker ownership: every Clip_Marker.label is a uniquely owned heap string.
+// Any proc that copies a marker into a second array (range filter, timeline
+// snapshot) must clone the label, and every proc that discards a marker array
+// must go through free_markers — otherwise the copies either dangle (freed
+// twice) or leak (freed never).
+clone_marker :: proc(m: ^Clip_Marker) -> Clip_Marker {
+	return Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)}
+}
+
+free_markers :: proc(markers: ^[dynamic]Clip_Marker) {
+	if markers^ == nil {
+		return
+	}
+	for m in markers^ {
+		delete(m.label)
+	}
+	delete(markers^)
+	markers^ = nil
+}
+
 // filter_markers_in_range returns a new dynamic array with the markers whose
 // source_frame lies in [start, start+length). The result is PERSISTED on the
 // caller's clip (.markers survives across frames), so it allocates on
@@ -672,9 +692,10 @@ filter_markers_in_range :: proc(
 	start, length: i64,
 ) -> [dynamic]Clip_Marker {
 	out := make([dynamic]Clip_Marker)
-	for m in markers {
+	for i in 0 ..< len(markers) {
+		m := markers[i]
 		if m.source_frame >= start && m.source_frame < start + length {
-			append(&out, m)
+			append(&out, clone_marker(&markers[i]))
 		}
 	}
 	return out
@@ -731,7 +752,7 @@ delete_selected_clip_raw :: proc() {
 		}
 		removed := tt.clips[target.index]
 		ordered_remove(&tt.clips, target.index)
-		delete(removed.markers)
+		free_markers(&removed.markers)
 		kf_free_tracks(removed.keyframe_tracks)
 		if vyper_trace {
 			fmt.printf(
@@ -811,7 +832,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			}
 			right.source_length_frames = ce - end
 			right.timeline_start_frame = start
-right.markers = filter_markers_in_range(
+			right.markers = filter_markers_in_range(
 				right.markers[:],
 				right.source_start_frame,
 				right.source_length_frames,
@@ -823,7 +844,7 @@ right.markers = filter_markers_in_range(
 			append(&new_clips, left)
 			append(&new_clips, right)
 			// Original markers array no longer referenced by any copy.
-			delete(c.markers)
+			free_markers(&c.markers)
 		case cs < start:
 			// Overlaps the left edge only: trim its tail.
 			old_markers := c.markers
@@ -835,7 +856,7 @@ right.markers = filter_markers_in_range(
 			)
 			kf_trim_tail(&c, i32(start - cs))
 			append(&new_clips, c)
-			delete(old_markers)
+			free_markers(&old_markers)
 		case ce > end:
 			// Overlaps the right edge only: trim its head, shifted to start.
 			// The trimmed head is [cs, end), so the source advances by end - cs
@@ -859,10 +880,10 @@ right.markers = filter_markers_in_range(
 			// - (start-cs).
 			kf_trim_head(&c, i32(start - cs))
 			append(&new_clips, c)
-			delete(old_markers)
+			free_markers(&old_markers)
 		case cs >= start && ce <= end:
 			// Otherwise the clip is entirely inside the region: dropped.
-			delete(c.markers)
+			free_markers(&c.markers)
 			kf_free_tracks(c.keyframe_tracks)
 		}
 	}
@@ -1768,7 +1789,7 @@ remove_track :: proc(index: int) {
 	undo_begin()
 	removed := timeline.tracks[index]
 	for &c in removed.clips {
-		delete(c.markers)
+		free_markers(&c.markers)
 		kf_free_tracks(c.keyframe_tracks)
 	}
 	delete(removed.clips)

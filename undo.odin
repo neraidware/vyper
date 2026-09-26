@@ -67,11 +67,11 @@ undo_hist: Undo_History
 
 // ---------------------------------------------------------------------------
 // Snapshot ownership. A snapshot duplicates the owned dynamic arrays and the
-// owned string fields (track.name, clip.name) — the two the live code also
-// frees (remove_track, rename) — so a stored snapshot never dangles when the
-// live copy is freed, and free_timeline can release both without leaking on
-// repeated undo. clip.path (asset-owned) and marker labels (shared by
-// duplicate_track, never freed) are shared as-is and never freed here.
+// owned string fields (track.name, clip.name, marker labels) — every heap
+// string free_timeline releases — so a stored snapshot never dangles when the
+// live copy is freed, and free_timeline can release all of it without leaking
+// on repeated undo. clip.path (asset-owned) is shared as-is and never freed
+// here: it points into the media bin, which outlives every timeline.
 // ---------------------------------------------------------------------------
 
 clone_timeline :: proc(src: Timeline) -> Timeline {
@@ -96,7 +96,9 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 			c.name = strings.clone(c.name)
 			if len(c.markers) > 0 {
 				c.markers = make([dynamic]Clip_Marker, len(c.markers))
-				copy(c.markers[:], st.clips[j].markers[:])
+				for k in 0 ..< len(st.clips[j].markers) {
+					c.markers[k] = clone_marker(&st.clips[j].markers[k])
+				}
 			} else {
 				c.markers = nil
 			}
@@ -112,9 +114,7 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 free_timeline :: proc(t: ^Timeline) {
 	for &tr in t.tracks {
 		for &c in tr.clips {
-			if c.markers != nil {
-				delete(c.markers)
-			}
+			free_markers(&c.markers)
 			if c.keyframe_tracks != nil {
 				kf_free_tracks(c.keyframe_tracks)
 				c.keyframe_tracks = nil

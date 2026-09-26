@@ -495,11 +495,13 @@ and session state can't be carried across runs. A `.vyproj` file gives the
 project a name, resolution, frame rate, and render range that persist, so
 reopening the same media set later starts from the same canvas.
 
-**Scope (per user, 2026-09-26):** "literally just :save and :open" — the file
-carries **project metadata only**. No timeline, media bin, or undo restore:
-`:open` loads the metadata and says what project is being edited. User is the
-only operator, so no versioning / backward-compat machinery — the file is
-recoded from `Project_File` if its shape changes.
+**Scope (per user, 2026-09-26):** first cut "literally just :save and :open" —
+the file carried **project metadata only** (shipped as S1–S3 below). **Scope
+expansion (2026-09-26, same session):** serialize what matters — media bin,
+timeline tracks/clips, markers, keyframe tracks, and the srt cache — so
+`:save`/`:open` round-trip the actual project content, not just its metadata.
+User is the only operator, so no versioning / backward-compat machinery — the
+file is recoded from `Project_File` if its shape changes.
 
 **Design decisions (2026-09-26):**
 - Format: `core:encoding/cbor`, reflection-marshaled over a plain
@@ -523,12 +525,51 @@ Steps (each lands + probe + vet before the next):
       `:open`, finder `.Open` + `.ImportBin` routing.
 - [x] S3. Probe: `ui_probe_project_file_asserts` save → reset globals → double
       open → field equality + name ownership.
+- [x] S4. Path/metadata ownership (Option B). `import_media_to_bin` and
+      `import_srt_to_bin` `clone_to_cstring` the incoming path into a
+      session cstring the asset owns; `probe_media` returns a heap clone on the
+      `unavail` literal path too. This removes the latent bug where probes store
+      a STACK buffer as `asset.path` (flash_probe.odin:141, render.odin:3235) and
+      makes teardown uniform — no per-asset ownership flag, because the bin
+      always owns a copy. `open_file_at` no longer needs its `retained` handshake
+      (callers can free their buffer unconditionally); finder/`:`/argv/autoplay
+      call sites updated.
+- [x] S5. `srt_cache_free_all()` + media-bin teardown proc: free each asset's
+      owned path cstring + metadata clone, break the `project.info_text` alias
+      first, release GPU thumbs when a renderer exists. This is the first real
+      mid-process session teardown the app introduces (loading a `.vyproj`
+      replaces the current session).
+- [x] S6. Extend `Project_File` DTO: `Saved_Asset` / `Saved_Track` / `Saved_Clip`
+      (clip `path` NOT serialized — derived from asset_id on load). Reuse live
+      `Clip_Marker`, `Kf_Track`, `Srt_Source`, `Srt_Cue` (all cbor-safe).
+- [x] S7. Save side: `project_to_file` snapshots media_bin (with `next_id`),
+      srt_cache in order (so `srt_id` indices line up), timeline tracks/clips,
+      track_order, playhead_frame, timeline frame_rate.
+- [x] S8. Load side: teardown old session → rebuild bin (ids + next_id +
+      re-decode thumbs) → rebuild srt_cache in order → rebuild timeline (clip
+      paths from `find_asset`, clone names/markers/kf) → apply project meta →
+      reset undo baseline.
+- [x] S9. Probe: full session round-trip (clips, scalar + packed `[7]f32`
+      keyframes, markers, srt, track_order, playhead, asset ids, next_id) and a
+      second-load leak/ownership exercise (load tears down a live session twice).
+- [x] S10. Marker-label ownership made real (needed by S8's teardown). Labels
+      were previously immortal-shared: `clone_timeline` copied marker structs
+      into undo snapshots and `filter_markers_in_range` copied them across split
+      halves, so `free_timeline` could not free a label without double-freeing
+      the other holder — every loaded marker leaked its label instead. Now every
+      `Clip_Marker.label` is uniquely owned: `clone_marker` clones it,
+      `filter_markers_in_range` and `clone_timeline` clone per copy, and all 8
+      discard sites (`free_timeline`, both region-trim paths, both split paths,
+      `delete_selected_clip_raw`, `remove_track`) go through `free_markers`.
+      `duplicate_track`/`duplicate_clip` already deep-cloned. Valgrind: 0
+      definitely lost, 0 indirectly lost, 0 invalid read/write/free.
 - [ ] ACCEPT: manual pass — `:save test.vyproj`, `:open test.vyproj` shows
-      "Editing <name>", bare `:save` and bad paths give notices, finder open
-      loads a project.
+      "Editing <name>" and the full timeline/bin restored, bare `:save` and bad
+      paths give notices, finder open loads a project.
 
-Out of scope (future): session restore (timeline/bin/undo), autosave,
-double-click-to-save, extension enforcement, version/format negotiation.
+Out of scope (future): undo-history serialization (the baseline resets to the
+loaded session), autosave, double-click-to-save, extension enforcement,
+version/format negotiation.
 
 ## Queued — Performance / Cleanup
 

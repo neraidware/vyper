@@ -14,10 +14,10 @@ import "core:strings"
 // (`GetOpenFileNameW`).
 //
 // The returned value is a cstring cloned to the session allocator, owned for
-// the rest of the program. Assets and clips store their path by reference
-// (`Media_Asset.path = path`), so each call must mint its own buffer: a shared
-// one would be overwritten by the next import, silently retargeting earlier
-// assets and clips to the latest file. This mirrors the per-call
+// the rest of the program. Assets and clips copy this path into their own
+// session buffers (`import_media_to_bin` clones it), so each call mints its own
+// buffer for the caller's own bookkeeping, and a shared one would be
+// overwritten by the next import. This mirrors the per-call
 // `g_filename_from_uri` results the Linux portal returns.
 // ---------------------------------------------------------------------------
 

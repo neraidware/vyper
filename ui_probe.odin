@@ -121,7 +121,66 @@ for j := 0; j < len(raw); {
 	if !ui_probe_project_file_asserts() {
 		os.exit(1)
 	}
+	// Marker-label ownership: the round-trip above frees labels through
+	// free_timeline but never copies them, so cover the copy paths here.
+	if !ui_probe_marker_ownership_asserts() {
+		os.exit(1)
+	}
 	os.exit(0)
+}
+
+// ui_probe_marker_ownership_asserts covers the marker-label ownership rule
+// without media: every Clip_Marker.label is uniquely owned, so the two procs
+// that copy markers (clone_timeline for undo snapshots,
+// filter_markers_in_range for split) must clone the label, and every discard
+// goes through free_markers. Getting this wrong shows up as either a
+// double-free (valgrind "Invalid free" / "Mismatched free") or a definite leak
+// (a label whose only other holder was already freed), so the whole point is
+// that this proc frees four independent marker sets and exits clean.
+ui_probe_marker_ownership_asserts :: proc() -> bool {
+	ok := true
+	src := Timeline{tracks = make([dynamic]Track, 1)}
+	src.tracks[0].name = strings.clone("marker-owner")
+	src.tracks[0].clips = make([dynamic]Clip, 1)
+	src.tracks[0].clips[0].name = strings.clone("marker-clip")
+	src.tracks[0].clips[0].markers = make([dynamic]Clip_Marker, 0, 4)
+	for i in 0 ..< 3 {
+		buf: [32]u8
+		s := fmt.bprintf(buf[:], "m%d", i)
+		append(
+			&src.tracks[0].clips[0].markers,
+			Clip_Marker{source_frame = i64(i) * 10, label = strings.clone(s)},
+		)
+	}
+	orig := src.tracks[0].clips[0].markers
+
+	// Snapshot clone (undo path) and two range filters (split path): each must
+	// carry its own labels, so editing or freeing one never touches another.
+	snap := clone_timeline(src)
+	lo := filter_markers_in_range(orig[:], 0, 20)
+	hi := filter_markers_in_range(orig[:], 20, 20)
+
+	if len(lo) != 2 || lo[0].label != "m0" || lo[1].label != "m1" {
+		fmt.eprintf("[ui-probe] lo markers wrong: n=%d\n", len(lo))
+		ok = false
+	}
+	if len(hi) != 1 || hi[0].label != "m2" {
+		fmt.eprintf("[ui-probe] hi markers wrong: n=%d\n", len(hi))
+		ok = false
+	}
+	snap_markers := snap.tracks[0].clips[0].markers
+	if len(snap_markers) != 3 ||
+	   snap_markers[2].label != "m2" ||
+	   snap_markers[2].source_frame != 20 {
+		fmt.eprintf("[ui-probe] snapshot markers wrong: n=%d\n", len(snap_markers))
+		ok = false
+	}
+
+	free_timeline(&snap)
+	free_timeline(&src)
+	free_markers(&lo)
+	free_markers(&hi)
+	return ok
 }
 
 // ui_probe_finder_asserts opens the in-app finder over the seeded session and
@@ -233,14 +292,15 @@ visible_rows :: proc() -> int {
 	return n
 }
 
-// ui_probe_project_file_asserts saves the seeded project to a temp .vyproj,
-// resets the live Project globals, reloads the file, and confirms every field
-// round-trips and the loaded name is owned (a second load must not leak or
-// use-after-free the first).
-ui_probe_project_file_asserts :: proc() -> bool {
-	ok := true
-	path := "/tmp/opencode/ui_probe_roundtrip.vyproj"
-
+// seed_roundtrip_session builds a complete, fully-owned synthetic session for
+// the project-file round-trip: project identity, a media bin (one video asset
+// + one subtitle asset), one parsed srt cache entry, two tracks whose clips
+// carry markers, a scalar AND a packed keyframe, a custom track order, and a
+// playhead. Every string/array it installs is heap-owned so the load's
+// teardown frees them the way a real session's are freed. clip.path is derived
+// (not stored) on reload, and a file-backed clip's path is checked to match its
+// asset.
+seed_roundtrip_session :: proc() {
 	project.name = "Probe Project"
 	project.width = 640
 	project.height = 360
@@ -248,30 +308,171 @@ ui_probe_project_file_asserts :: proc() -> bool {
 	project.start_frame = 10
 	project.end_frame = 220
 	project.resolution_locked = true
+
+	// Media bin. Ids come from the real allocator so next_id advances like a
+	// live import; paths/metadata are heap clones (the bin owns both).
+	vid_id := next_asset_id()
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id            = vid_id,
+			path          = strings.clone_to_cstring("/probe/clip.mp4"),
+			kind          = .Video,
+			metadata      = strings.clone("duration=1.0\n"),
+			frame_count   = 300,
+			dur_us        = 1_000_000,
+			src_w         = 1920,
+			src_h         = 1080,
+			audio_streams = 1,
+			audio_frames  = 300,
+		},
+	)
+	srt_id_asset := next_asset_id()
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id          = srt_id_asset,
+			path        = strings.clone_to_cstring("/probe/subs.srt"),
+			kind        = .Subtitles,
+			metadata    = strings.clone("subs.srt"),
+			frame_count = 120,
+			srt_id      = 0,
+		},
+	)
+
+	// One parsed srt cache entry (index 0, what the subtitle asset/clip point at).
+	src := Srt_Source {
+		path = strings.clone("/probe/subs.srt"),
+		cues = make([dynamic]Srt_Cue, 0, 2),
+	}
+	append(&src.cues, Srt_Cue {start_ms = 0, end_ms = 1000, text = strings.clone("hello")})
+	append(&src.cues, Srt_Cue {start_ms = 1000, end_ms = 2000, text = strings.clone("world")})
+	append(&srt_cache, src)
+
+	// Two tracks. Track 0: a file-backed video clip (path derived from the
+	// asset on reload) with a marker, a scalar key, and a packed key. Track 1:
+	// a subtitle generator clip (no path) and a text generator clip.
+	timeline.tracks = make([dynamic]Track, 0, 2)
+	vclip := Clip {
+		clip_id              = 100,
+		asset_id             = vid_id,
+		link_id              = 7,
+		name                 = strings.clone("main"),
+		kind                 = .Video,
+		generator            = .None,
+		source_start_frame   = 5,
+		source_length_frames = 300,
+		timeline_start_frame = 40,
+		source_w             = 1920,
+		source_h             = 1080,
+		transform_x          = 320,
+		transform_y          = 180,
+		scale                = 1.5,
+		crop_l               = 0.1,
+		crop_r               = 0.2,
+		crop_t               = 0.3,
+		crop_b               = 0.4,
+		markers = make([dynamic]Clip_Marker, 0, 1),
+	}
+	append(&vclip.markers, Clip_Marker {source_frame = 12, label = strings.clone("chapter")})
+	vclip.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
+	append(&vclip.keyframe_tracks, Kf_Track {name = strings.clone("scale"), keys = make([dynamic]Keyframe, 0, 2)})
+	append(
+		&vclip.keyframe_tracks[0].keys,
+		Keyframe {frame_off = 0, value = 1.0},
+		Keyframe {frame_off = 60, value = 2.0, interp = .Elastic},
+	)
+	append(&vclip.keyframe_tracks, Kf_Track {name = strings.clone("crop"), keys = make([dynamic]Keyframe, 0, 1)})
+	// A packed key: mask != 0, value carries the [KF_PACK_MAX]f32 payload.
+	append(
+		&vclip.keyframe_tracks[1].keys,
+		Keyframe {frame_off = 10, mask = 0b101, value = [KF_PACK_MAX]f32{1, 2, 3, 4, 5, 6, 7}},
+	)
+
+	tr0 := Track {name = strings.clone("V1"), clips = make([dynamic]Clip, 0, 1)}
+	append(&tr0.clips, vclip)
+
+	sclip := Clip {
+		clip_id              = 101,
+		asset_id             = srt_id_asset,
+		name                 = strings.clone("subs"),
+		kind                 = .Text,
+		generator            = .Subtitles,
+		srt_id               = 0,
+		source_length_frames = 120,
+		timeline_start_frame = 0,
+	}
+	tclip := Clip {
+		clip_id              = 102,
+		generator            = .Text,
+		name                 = strings.clone("title"),
+		kind                 = .Text,
+		source_length_frames = 90,
+		timeline_start_frame = 500,
+	}
+	tr1 := Track {name = strings.clone("S1"), clips = make([dynamic]Clip, 0, 2)}
+	append(&tr1.clips, sclip)
+	append(&tr1.clips, tclip)
+
+	append(&timeline.tracks, tr0)
+	append(&timeline.tracks, tr1)
+
+	// Custom on-screen order: S1 above V1 (storage order stays V1, S1).
+	timeline.track_order = make([dynamic]int, 0, 2)
+	append(&timeline.track_order, 1)
+	append(&timeline.track_order, 0)
+
+	timeline.playhead_frame = 123
+	timeline.frame_rate = 30
+}
+
+// ui_probe_project_file_asserts round-trips a full session through a temp
+// .vyproj: it tears down the layout seed's session, builds a synthetic one
+// (seed_roundtrip_session), saves, loads (which tears the synthetic session
+// down and rebuilds from the file), and confirms the project identity, media
+// bin, srt cache, tracks, clips, markers, scalar+packed keyframes, track order,
+// playhead, and id allocator all come back. It loads a second time to exercise
+// teardown of an already-loaded session (no leak / no use-after-free), then
+// tears down once more so the probe leaves nothing allocated for valgrind.
+ui_probe_project_file_asserts :: proc() -> bool {
+	ok := true
+	path := "/tmp/opencode/ui_probe_roundtrip.vyproj"
+
+	// The layout/finder probes above seeded a live timeline; free it so the
+	// round-trip starts from a clean, fully-owned session.
+	session_teardown()
+	seed_roundtrip_session()
+
 	if err := project_file_save(path); len(err) > 0 {
 		fmt.eprintf("[ui-probe] save failed: %s\n", err)
 		delete(err)
 		return false
 	}
 
-	// Reset the live globals so a pass only proves a real load restored them.
-	project.name = "Untitled Project"
-	project.width = 1920
-	project.height = 1080
-	project.frame_rate = 0
-	project.start_frame = -1
-	project.end_frame = -1
-	project.resolution_locked = false
-
-	// Load twice: the second replaces the first's owned name (leak/use-after-
-	// free exercise for project_name_owned).
+	// Load twice: the second replaces the first (a real teardown of a loaded
+	// session, plus project_name_owned replacement).
 	for pass in 0 ..< 2 {
 		if err := project_file_open(path); len(err) > 0 {
 			fmt.eprintf("[ui-probe] open %d failed: %s\n", pass, err)
 			delete(err)
 			return false
 		}
+		ok = project_roundtrip_asserts(pass == 1) && ok
 	}
+
+	os.remove(path)
+	// Free everything the loads built so the probe's allocations all end up
+	// released (a definite-leak check under valgrind).
+	session_teardown()
+	return ok
+}
+
+// project_roundtrip_asserts checks the live session against what
+// seed_roundtrip_session built. On the second pass the project name has been
+// replaced once already, so it doubles as the name-ownership check.
+project_roundtrip_asserts :: proc(second_pass: bool) -> bool {
+	ok := true
+	// Project identity.
 	if project.name != "Probe Project" {
 		fmt.eprintf("[ui-probe] name %q want \"Probe Project\"\n", project.name)
 		ok = false
@@ -280,20 +481,123 @@ ui_probe_project_file_asserts :: proc() -> bool {
 		fmt.eprintf("[ui-probe] resolution %dx%d want 640x360\n", project.width, project.height)
 		ok = false
 	}
-	if project.frame_rate != 30 {
-		fmt.eprintf("[ui-probe] frame_rate %v want 30\n", project.frame_rate)
+	if project.frame_rate != 30 || !project.resolution_locked {
+		fmt.eprintf("[ui-probe] project frame_rate/lock mismatch\n")
 		ok = false
 	}
 	if project.start_frame != 10 || project.end_frame != 220 {
 		fmt.eprintf("[ui-probe] render range %d-%d want 10-220\n", project.start_frame, project.end_frame)
 		ok = false
 	}
-	if !project.resolution_locked {
-		fmt.eprintf("[ui-probe] resolution_locked false, want true\n")
+
+	// Media bin: two assets, ids preserved, the id allocator kept ahead of them.
+	if len(media_bin.assets) != 2 {
+		fmt.eprintf("[ui-probe] bin %d assets want 2\n", len(media_bin.assets))
+		return false
+	}
+	vid := media_bin.assets[0]
+	if string(vid.path) != "/probe/clip.mp4" {
+		fmt.eprintf("[ui-probe] asset0 path %q want /probe/clip.mp4\n", string(vid.path))
+		ok = false
+	}
+	if vid.kind != .Video || vid.frame_count != 300 || vid.src_w != 1920 {
+		fmt.eprintf("[ui-probe] asset0 probe fields mismatch\n")
+		ok = false
+	}
+	if string(vid.metadata) != "duration=1.0\n" {
+		fmt.eprintf("[ui-probe] asset0 metadata mismatch\n")
+		ok = false
+	}
+	if media_bin.assets[1].kind != .Subtitles || media_bin.assets[1].srt_id != 0 {
+		fmt.eprintf("[ui-probe] asset1 subtitle fields mismatch\n")
+		ok = false
+	}
+	// The allocator must not hand out an id an asset already holds.
+	if media_bin.next_id <= vid.id {
+		fmt.eprintf("[ui-probe] next_id %d <= max asset id %d\n", media_bin.next_id, vid.id)
 		ok = false
 	}
 
-	os.remove(path)
+	// srt cache rebuilt in order, cues owned.
+	if len(srt_cache) != 1 || len(srt_cache[0].cues) != 2 {
+		fmt.eprintf("[ui-probe] srt cache %d sources want 1\n", len(srt_cache))
+		return false
+	}
+	if srt_cache[0].cues[1].text != "world" || srt_cache[0].cues[0].end_ms != 1000 {
+		fmt.eprintf("[ui-probe] srt cue text/times mismatch\n")
+		ok = false
+	}
+
+	// Timeline: two tracks, custom order, playhead.
+	if len(timeline.tracks) != 2 {
+		fmt.eprintf("[ui-probe] %d tracks want 2\n", len(timeline.tracks))
+		return false
+	}
+	if timeline.tracks[0].name != "V1" || timeline.tracks[1].name != "S1" {
+		fmt.eprintf("[ui-probe] track names mismatch\n")
+		ok = false
+	}
+	if len(timeline.track_order) != 2 || timeline.track_order[0] != 1 || timeline.track_order[1] != 0 {
+		fmt.eprintf("[ui-probe] track_order mismatch\n")
+		ok = false
+	}
+	if timeline.playhead_frame != 123 {
+		fmt.eprintf("[ui-probe] playhead %d want 123\n", timeline.playhead_frame)
+		ok = false
+	}
+
+	// Track 0's video clip: path derived from the asset, scalars, marker, keys.
+	c := timeline.tracks[0].clips[0]
+	if c.clip_id != 100 || c.asset_id != vid.id || c.link_id != 7 {
+		fmt.eprintf("[ui-probe] clip identity mismatch\n")
+		ok = false
+	}
+	if c.path == nil || string(c.path) != "/probe/clip.mp4" {
+		fmt.eprintf("[ui-probe] clip path not derived from asset\n")
+		ok = false
+	}
+	if c.scale != 1.5 || c.crop_l != 0.1 || c.crop_b != 0.4 || c.source_start_frame != 5 {
+		fmt.eprintf("[ui-probe] clip transform/crop mismatch\n")
+		ok = false
+	}
+	if len(c.markers) != 1 || c.markers[0].label != "chapter" || c.markers[0].source_frame != 12 {
+		fmt.eprintf("[ui-probe] marker mismatch\n")
+		ok = false
+	}
+	if len(c.keyframe_tracks) != 2 {
+		fmt.eprintf("[ui-probe] %d kf tracks want 2\n", len(c.keyframe_tracks))
+		ok = false
+	} else {
+		sk := c.keyframe_tracks[0]
+		if sk.name != "scale" || len(sk.keys) != 2 {
+			fmt.eprintf("[ui-probe] scalar kf track mismatch\n")
+			ok = false
+		} else if sk.keys[1].value != 2.0 || sk.keys[1].interp != .Elastic {
+			fmt.eprintf("[ui-probe] scalar key value/interp mismatch\n")
+			ok = false
+		}
+		packed := c.keyframe_tracks[1]
+		if len(packed.keys) != 1 || packed.keys[0].mask != 0b101 {
+			fmt.eprintf("[ui-probe] packed key mask mismatch\n")
+			ok = false
+		} else if v, is_packed := packed.keys[0].value.([KF_PACK_MAX]f32); !is_packed || v[6] != 7 {
+			fmt.eprintf("[ui-probe] packed key payload mismatch\n")
+			ok = false
+		}
+	}
+
+	// Track 1: subtitle generator clip keeps srt_id, text clip has no path.
+	sclip := timeline.tracks[1].clips[0]
+	if sclip.generator != .Subtitles || sclip.srt_id != 0 || sclip.path != nil {
+		fmt.eprintf("[ui-probe] subtitle clip mismatch\n")
+		ok = false
+	}
+	if timeline.tracks[1].clips[1].generator != .Text ||
+	   timeline.tracks[1].clips[1].path != nil {
+		fmt.eprintf("[ui-probe] text clip mismatch\n")
+		ok = false
+	}
+	_ = second_pass
 	return ok
 }
 
@@ -375,11 +679,14 @@ seed_ui_probe_session :: proc() {
 
 	// One keyframed clip (two tracks) exercises the grown-row layout and the
 	// diamond lanes, so the probe also guards the keyframe render geometry.
+	// Track names are heap clones (not literals): the project-file round-trip
+	// later tears this session down, and free_timeline frees keyframe-track
+	// names, exactly as a real session's are freed.
 	kf0 := &timeline.tracks[0].clips[0]
 	kf0.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
-	append(&kf0.keyframe_tracks, Kf_Track {name = "transform.x", keys = make([dynamic]Keyframe, 0, 4)})
+	append(&kf0.keyframe_tracks, Kf_Track {name = strings.clone("transform.x"), keys = make([dynamic]Keyframe, 0, 4)})
 	append(&kf0.keyframe_tracks[0].keys, Keyframe {frame_off = 0, value = 0}, Keyframe {frame_off = 120, value = 1})
-	append(&kf0.keyframe_tracks, Kf_Track {name = "zoom", keys = make([dynamic]Keyframe, 0, 4)})
+	append(&kf0.keyframe_tracks, Kf_Track {name = strings.clone("zoom"), keys = make([dynamic]Keyframe, 0, 4)})
 	append(&kf0.keyframe_tracks[1].keys, Keyframe {frame_off = 30, value = 1})
 
 	sync_track_order()

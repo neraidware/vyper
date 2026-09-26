@@ -319,14 +319,11 @@ finder_commit :: proc(entry: Finder_Entry) {
 			finder_close()
 			return
 		}
-		// The asset retains this cstring when opened (like the picker's
-		// glib-owned buffer), so it must outlive the finder: clone to session
-		// heap and only free when open_file_at says nothing stored it.
+		// open_file_at only reads `cpath` (the bin clones it), so the scratch
+		// copy is freed as soon as the open returns.
 		cpath := strings.clone_to_cstring(entry.fullpath)
-		_, retained := open_file_at(cpath)
-		if !retained {
-			delete(cpath)
-		}
+		open_file_at(cpath)
+		delete(cpath)
 	case .ImportBin:
 		// A project file is not media; importing it into the bin is a mistake.
 		if project_path_is_project(entry.fullpath) {

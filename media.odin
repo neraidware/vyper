@@ -65,13 +65,17 @@ probe_video_size :: proc(path: cstring) -> (w, h: c.int, ok: bool) {
 // downstream frame-count consumer wants.
 probe_media :: proc(path: cstring) -> string {
 	fmt_ctx: ^avfmt.FormatContext
+	// The caller (import_media_to_bin) stores this straight into the asset's
+	// session-heap metadata, so BOTH returns must be heap-owned -- the
+	// unavailable line is cloned too, so teardown can free every asset's
+	// metadata unconditionally without tracking literals.
 	unavail := "Length: unavailable\nFormat: unavailable\nCodecs: unavailable\nSize: unavailable"
 	if ret := avfmt.open_input(&fmt_ctx, path, nil, nil); ret < 0 {
-		return unavail
+		return strings.clone(unavail)
 	}
 	defer avfmt.close_input(&fmt_ctx)
 	if ret := avfmt.find_stream_info(fmt_ctx, nil); ret < 0 {
-		return unavail
+		return strings.clone(unavail)
 	}
 	sb := strings.builder_make(context.temp_allocator)
 	if fmt_ctx.iformat != nil && fmt_ctx.iformat.name != nil {
@@ -247,6 +251,26 @@ find_asset :: proc(asset_id: u64) -> ^Media_Asset {
 	return nil
 }
 
+// media_bin_free frees the session-heap memory every bin entry owns -- its path
+// cstring and its metadata clone -- and empties the bin. The GPU thumbnail
+// textures are NOT touched here (a headless session-switch has no device); the
+// caller releases them with release_media_asset_textures(device) first when a
+// renderer exists.
+//
+// project.info_text is set to the empty literal first: the most recent media
+// import's asset.metadata IS that same allocation (import_media_to_bin stores
+// `metadata = project.info_text`), so dropping the alias before freeing the
+// per-asset metadata is what keeps info_text from dangling at the freed string.
+media_bin_free :: proc() {
+	project.info_text = ""
+	for &a in media_bin.assets {
+		delete(a.metadata)
+		delete(a.path)
+	}
+	clear(&media_bin.assets)
+	media_bin.next_id = 0
+}
+
 // downscale_rgba box-filters a tightly-packed RGBA image into dst (dst must be
 // dw*dh*4 bytes). Used to shrink the PREVIEW decode into the bin thumbnail.
 downscale_rgba :: proc(src: []u8, sw, sh: int, dst: []u8, dw, dh: int) {
@@ -302,7 +326,10 @@ decode_asset_thumbnail :: proc(asset: ^Media_Asset) {
 
 // import_media_to_bin probes a media file and adds it to the media bin as a
 // Media_Asset (thumbnail + proxy built, no timeline change). Returns the new
-// asset's id, or 0 if the file could not be probed.
+// asset's id, or 0 if the file could not be probed. The incoming `path` is only
+// read: the bin stores its own session-heap clone, so the caller may free or
+// reuse its buffer as soon as this returns (callers pass argv bytes, stack probe
+// buffers, and picker-owned strings — none of which outlive the import).
 import_media_to_bin :: proc(path: cstring) -> u64 {
 	// One bin entry per file path: importing a file that's already in the bin
 	// is a no-op returning the existing asset's id, so re-imports don't stack
@@ -355,7 +382,11 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 		&media_bin.assets,
 		Media_Asset {
 			id = asset_id,
-			path = path,
+			// The bin owns its copy of the path (see the proc comment): every
+			// asset's path is a session-heap cstring freed at session teardown,
+			// so no caller-supplied buffer (argv, stack, picker) is ever
+			// referenced by the bin.
+			path = strings.clone_to_cstring(string(path)),
 			kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
 			metadata = project.info_text,
 			frame_count = frame_count,
@@ -394,7 +425,8 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 // timeline change: the clip appears only when the user drags the asset onto the
 // timeline, like any other bin media). One bin entry per path; re-importing the
 // same subtitle yields the existing asset's id. Returns 0 when the file cannot
-// be parsed as SRT.
+// be parsed as SRT. Like import_media_to_bin, the bin stores its own session
+// clone of `path` and only reads the incoming buffer.
 import_srt_to_bin :: proc(path: cstring) -> u64 {
 	for &a in media_bin.assets {
 		if strings.compare(string(a.path), string(path)) == 0 {
@@ -416,7 +448,7 @@ import_srt_to_bin :: proc(path: cstring) -> u64 {
 		&media_bin.assets,
 		Media_Asset {
 			id = asset_id,
-			path = path,
+			path = strings.clone_to_cstring(string(path)),
 			kind = .Subtitles,
 			metadata = strings.clone(path_basename(path)),
 			frame_count = length,
@@ -614,15 +646,13 @@ import_media :: proc(path: cstring) {
 // files load into the bin only (the user drags them onto a track), decodable
 // media imports to the bin AND is placed on the timeline (appended at the end).
 // Non-decodable files (and, for the ":" command line, a nonexistent path) show
-// a notice and change nothing. Returns (opened, retained): `retained` is true
-// when a NEW asset stored `path`, so the caller must keep it alive; on the
-// dedup path (file already in the bin) opened=true but retained=false and the
-// caller may free `path` — the existing asset's copy is what stays alive.
-open_file_at :: proc(path: cstring) -> (opened, retained: bool) {
+// a notice and change nothing. Returns whether the open happened. `path` is only
+// read -- the bin clones it (import_media_to_bin/import_srt_to_bin), so the
+// caller owns and may free its buffer as soon as this returns.
+open_file_at :: proc(path: cstring) -> (opened: bool) {
 	if is_srt_pick(path) {
-		before := len(media_bin.assets)
 		opened = import_srt_to_bin(path) != 0
-		return opened, len(media_bin.assets) > before
+		return
 	}
 	probe := probe_streams(path)
 	if !probe.has_video && !probe.has_audio && !media_is_image(path) {
@@ -630,14 +660,13 @@ open_file_at :: proc(path: cstring) -> (opened, retained: bool) {
 			fmt.aprintf("Could not open '%s': not decodable media", path_basename(path)),
 			4000,
 		)
-		return false, false
+		return false
 	}
-	before := len(media_bin.assets)
 	if asset_id := import_media_to_bin(path); asset_id != 0 {
 		add_asset_to_timeline(asset_id, 0, timeline_duration())
-		return true, len(media_bin.assets) > before
+		return true
 	}
-	return false, false
+	return false
 }
 
 open_file_picker :: proc() -> cstring {

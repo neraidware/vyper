@@ -16,10 +16,12 @@ import "core:strings"
 //   - cue ms convert to frames at the project frame rate on every hit-test and
 //     render, so boundaries land on exact frame positions.
 //
-// The cache is session-scoped and append-only: every unique path resolves once
-// and stays resident for the run, so the cache index (`srt_id`) is a stable
-// clip handle and clips never own or free the path. Duplicate/delete of a
-// subtitle clip touches no cached string memory.
+// The cache is session-scoped and append-only within a session: every unique
+// path resolves once and stays resident for the run, so the cache index
+// (`srt_id`) is a stable clip handle and clips never own or free the path.
+// Duplicate/delete of a subtitle clip touches no cached string memory. A project
+// load is the one boundary that empties it (srt_cache_free_all) and rebuilds it
+// in the saved order.
 // ---------------------------------------------------------------------------
 
 Srt_Cue :: struct {
@@ -104,6 +106,22 @@ srt_source :: proc(id: int) -> ^Srt_Source {
 		return nil
 	}
 	return &srt_cache[id]
+}
+
+// srt_cache_free_all frees every parsed source (its owned path string, each
+// cue's owned text string, and the cue arrays) and empties the cache. Used when
+// a project load replaces the session: the load rebuilds srt_cache in the saved
+// order so the srt_id indices in the restored clips/assets point at the same
+// sources they did before.
+srt_cache_free_all :: proc() {
+	for &src in srt_cache {
+		delete(src.path)
+		for &cue in src.cues {
+			delete(cue.text)
+		}
+		delete(src.cues)
+	}
+	clear(&srt_cache)
 }
 
 // srt_load parses `path` once (cached by path) and returns its cache index,
