@@ -487,6 +487,49 @@ Steps (each lands + probe + vet before the next):
 Out of scope (future): recursive/bookmark walking, mouse row activation,
 clock-stamped recency sorting, portal/win32 picker deletion.
 
+## Active 6 — Project files (:save / :open)
+
+**Why:** the project is unnamed and unsaved: its identity lives only in the
+live `Project` struct (coordinate-less until a media file happens to open),
+and session state can't be carried across runs. A `.vyproj` file gives the
+project a name, resolution, frame rate, and render range that persist, so
+reopening the same media set later starts from the same canvas.
+
+**Scope (per user, 2026-09-26):** "literally just :save and :open" — the file
+carries **project metadata only**. No timeline, media bin, or undo restore:
+`:open` loads the metadata and says what project is being edited. User is the
+only operator, so no versioning / backward-compat machinery — the file is
+recoded from `Project_File` if its shape changes.
+
+**Design decisions (2026-09-26):**
+- Format: `core:encoding/cbor`, reflection-marshaled over a plain
+  `Project_File` struct (name, width, height, frame_rate, start/end_frame,
+  resolution_locked) — no hand-rolled codec, no vendor.
+- `:save <path>` writes the snapshot (any extension accepted by `:save`;
+  `:open` dispatches on the `.vyproj` suffix), `:open <path>` routes `.vyproj`
+  → project load, anything else → existing media open. Bare `:save` → usage
+  notice; bare `:open` still pops the finder.
+- Finders: `.Open` commit mode loads `.vyproj` the same as `:open`; `.ImportBin`
+  rejects project files with a notice.
+- `project.name` lifetime: starts as the literal "Untitled Project" (never
+  freed); a loaded name becomes a session-heap clone tracked by
+  `project_name_owned`, freed on the next load. Repeated `:open` must not
+  leak or UAF.
+
+Steps (each lands + probe + vet before the next):
+- [x] S1. `project_file.odin`: `Project_File`, `project_file_save/open`, name
+      ownership. cbor import confirmed in vendored Odin (no vendor needed).
+- [x] S2. Wiring: `:save` token in `apply_command`, `.vyproj` dispatch in
+      `:open`, finder `.Open` + `.ImportBin` routing.
+- [x] S3. Probe: `ui_probe_project_file_asserts` save → reset globals → double
+      open → field equality + name ownership.
+- [ ] ACCEPT: manual pass — `:save test.vyproj`, `:open test.vyproj` shows
+      "Editing <name>", bare `:save` and bad paths give notices, finder open
+      loads a project.
+
+Out of scope (future): session restore (timeline/bin/undo), autosave,
+double-click-to-save, extension enforcement, version/format negotiation.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

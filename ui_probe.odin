@@ -116,6 +116,11 @@ for j := 0; j < len(raw); {
 	if !ui_probe_finder_asserts() {
 		os.exit(1)
 	}
+	// Project file round-trip: a :save-style write must come back identical to
+	// a :open-style read through the live Project global.
+	if !ui_probe_project_file_asserts() {
+		os.exit(1)
+	}
 	os.exit(0)
 }
 
@@ -226,6 +231,70 @@ visible_rows :: proc() -> int {
 		}
 	}
 	return n
+}
+
+// ui_probe_project_file_asserts saves the seeded project to a temp .vyproj,
+// resets the live Project globals, reloads the file, and confirms every field
+// round-trips and the loaded name is owned (a second load must not leak or
+// use-after-free the first).
+ui_probe_project_file_asserts :: proc() -> bool {
+	ok := true
+	path := "/tmp/opencode/ui_probe_roundtrip.vyproj"
+
+	project.name = "Probe Project"
+	project.width = 640
+	project.height = 360
+	project.frame_rate = 30
+	project.start_frame = 10
+	project.end_frame = 220
+	project.resolution_locked = true
+	if err := project_file_save(path); len(err) > 0 {
+		fmt.eprintf("[ui-probe] save failed: %s\n", err)
+		delete(err)
+		return false
+	}
+
+	// Reset the live globals so a pass only proves a real load restored them.
+	project.name = "Untitled Project"
+	project.width = 1920
+	project.height = 1080
+	project.frame_rate = 0
+	project.start_frame = -1
+	project.end_frame = -1
+	project.resolution_locked = false
+
+	// Load twice: the second replaces the first's owned name (leak/use-after-
+	// free exercise for project_name_owned).
+	for pass in 0 ..< 2 {
+		if err := project_file_open(path); len(err) > 0 {
+			fmt.eprintf("[ui-probe] open %d failed: %s\n", pass, err)
+			delete(err)
+			return false
+		}
+	}
+	if project.name != "Probe Project" {
+		fmt.eprintf("[ui-probe] name %q want \"Probe Project\"\n", project.name)
+		ok = false
+	}
+	if project.width != 640 || project.height != 360 {
+		fmt.eprintf("[ui-probe] resolution %dx%d want 640x360\n", project.width, project.height)
+		ok = false
+	}
+	if project.frame_rate != 30 {
+		fmt.eprintf("[ui-probe] frame_rate %v want 30\n", project.frame_rate)
+		ok = false
+	}
+	if project.start_frame != 10 || project.end_frame != 220 {
+		fmt.eprintf("[ui-probe] render range %d-%d want 10-220\n", project.start_frame, project.end_frame)
+		ok = false
+	}
+	if !project.resolution_locked {
+		fmt.eprintf("[ui-probe] resolution_locked false, want true\n")
+		ok = false
+	}
+
+	os.remove(path)
+	return ok
 }
 
 // ui_probe_layout_asserts checks the keyframe render geometry: the row grows

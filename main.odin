@@ -383,8 +383,11 @@ apply_rename :: proc() {
 // apply_command handles a committed command line: it records the text as
 // last_command (the prompt's placeholder) and, when the command is known,
 // executes it. Supported:
-//   open <file>  — open a media/subtitle file through the same flow as the
-//                  Open File button (decodable only: no silent junk imports).
+//   open <file>      — open a media/subtitle file through the same flow as the
+//                      Open File button (decodable only: no silent junk
+//                      imports), or a .vyproj project file (loads its
+//                      metadata).
+//   save <file>      — write the current project metadata to a .vyproj file.
 apply_command :: proc() {
 	cmd := text_input_string()
 	if len(cmdline_match_state.last_command) > 0 {
@@ -397,31 +400,50 @@ apply_command :: proc() {
 	for sp < len(trimmed) && trimmed[sp] != ' ' && trimmed[sp] != '\t' {
 		sp += 1
 	}
-	if sp == len(trimmed) || trimmed[:sp] != "open" {
+	verb := trimmed[:sp]
+	arg := strings.trim_space(trimmed[sp:])
+
+	switch verb {
+	case "save":
+		if len(arg) == 0 {
+			show_ui_notice("Usage: save <file.vyproj>", 3000)
+			return
+		}
+		if err := project_file_save(arg); len(err) > 0 {
+			show_ui_notice(err, 4000)
+			return
+		}
+		show_ui_notice(fmt.aprintf("Saved '%s'", arg), 3000)
+	case "open":
 		// Bare ":open" (no argument) launches the in-app fuzzy file finder
 		// instead of the OS dialog that the Open File button uses; a typed
 		// path after "open" still goes down the direct-open path below.
-		if trimmed == "open" {
+		if len(arg) == 0 {
 			finder_open(.Open)
+			return
 		}
-		return
-	}
-	path := strings.trim_space(trimmed[sp:])
-	if len(path) == 0 {
-		finder_open(.Open)
-		return
-	}
-	if !os.exists(path) {
-		show_ui_notice(fmt.aprintf("No such file '%s'", path), 4000)
-		return
-	}
-	// The asset retains this cstring (like the picker's glib-owned buffer), so
-	// it must outlive the command input buffer: clone to session heap and only
-	// free when open_file_at says nothing new stored it.
-	cpath := strings.clone_to_cstring(path)
-	_, retained := open_file_at(cpath)
-	if !retained {
-		delete(cpath)
+		if project_path_is_project(arg) {
+			if err := project_file_open(arg); len(err) > 0 {
+				show_ui_notice(err, 4000)
+				return
+			}
+			show_ui_notice(fmt.aprintf("Editing '%s'", project.name), 3000)
+			return
+		}
+		if !os.exists(arg) {
+			show_ui_notice(fmt.aprintf("No such file '%s'", arg), 4000)
+			return
+		}
+		// The asset retains this cstring (like the picker's glib-owned buffer),
+		// so it must outlive the command input buffer: clone to session heap
+		// and only free when open_file_at says nothing new stored it.
+		cpath := strings.clone_to_cstring(arg)
+		_, retained := open_file_at(cpath)
+		if !retained {
+			delete(cpath)
+		}
+	case:
+		// Unknown command or empty filter text commit; no-op.
 	}
 }
 

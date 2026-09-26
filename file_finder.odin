@@ -308,6 +308,17 @@ finder_go_up :: proc() {
 finder_commit :: proc(entry: Finder_Entry) {
 	switch file_finder.mode {
 	case .Open:
+		if project_path_is_project(entry.fullpath) {
+			// A project file picked in the finder loads like `:open` would —
+			// the finder is the bare :open's picker, so both paths must agree.
+			if err := project_file_open(entry.fullpath); len(err) > 0 {
+				show_ui_notice(err, 4000)
+			} else {
+				show_ui_notice(fmt.aprintf("Editing '%s'", project.name), 3000)
+			}
+			finder_close()
+			return
+		}
 		// The asset retains this cstring when opened (like the picker's
 		// glib-owned buffer), so it must outlive the finder: clone to session
 		// heap and only free when open_file_at says nothing stored it.
@@ -317,6 +328,11 @@ finder_commit :: proc(entry: Finder_Entry) {
 			delete(cpath)
 		}
 	case .ImportBin:
+		// A project file is not media; importing it into the bin is a mistake.
+		if project_path_is_project(entry.fullpath) {
+			show_ui_notice("Project files can't be imported into the media bin", 4000)
+			return
+		}
 		// import_media_to_bin/import_srt_to_bin store the path directly on the
 		// asset, so the clone becomes bin-owned when a new asset is appended;
 		// on a dedup no-op (path already in the bin) nothing stores it, so we
