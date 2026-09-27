@@ -836,3 +836,25 @@ Details TBD when Phase 2 reaches maturity.
   ~2.4 vs ~5.5 ms/f). Default is `h264_nvenc → h264_vaapi → h264_qsv →
   h264_amf → libx264`, so software runs only when no hardware encoder opens.
   Manual "High quality (CPU)" still available in the encoder menu.
+
+## Implemented — miniaudio audio backend (2026-09-26)
+
+- Replaced SDL audio with vendored miniaudio (0.11.25). Device opens via
+  `ma.context_init` (default backend enumeration, null last), negotiated
+  at 48 kHz stereo S16; resampler uses `ma.resample_algorithm.linear` only
+  when rate differs. Callback and ring are lock-free SPSC; device started
+  once for lifetime with atomic transport gate.
+- Moved audio device state to `audio_device.odin`. `audio.odin` contains no
+  SDL audio calls. Producer/telemetry integration unchanged in shape.
+- Producer→ring write loops on short grants (cursor wraps to 0 on commit),
+  so a partial contiguous grant is retried inside the same push; the former
+  producer-side carry buffer was removed entirely. Consumer callback loops
+  across ring wrap on read (direct and resampled paths). These are the
+  invariant fixes for the measured 1024-frame clamp per wrap.
+- Added frame-domain accounting, underrun/callback diagnostics, and explicit
+  clear/active semantics. Probe/autoplay exercised decode, mix, callback and
+  queue depth remains stable at the target cushion.
+- `./scripts/gate.sh check build probe smoke` pass; Valgrind: 0 definitely
+  lost, 0 indirectly lost, no invalid access; error contexts unchanged from
+  baseline (FFmpeg/Odin noise only). Branch `audio/miniaudio`, baseline
+  `97f5267`, committed locally (no push).

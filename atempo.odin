@@ -42,10 +42,17 @@ ATEMPO_MAX_STAGES :: 8
 // frames, so a small pool is ample.
 ATEMPO_IN_POOL :: 8
 
-// ATEMPO_OUT_CAP bounds the samples accumulated by one feed. A feed pushes one
-// content frame (~1601 samples at 29.97) and pulls whatever the graph emits;
-// the ragged remainder keeps output near-nominal, and aformated FLT forces a
-// single copy. 4096 stereo frames (32 KB) covers a content frame plus burst.
+// ATEMPO_OUT_CAP bounds the frames accumulated by one feed, and the producer
+// sizes its f32->i16 conversion buffer from it, so the two cannot drift.
+//
+// A feed pushes one content frame (~1601 frames at 29.97) and drains whatever
+// the graph emits; the ragged remainder keeps output near-nominal, and aformated
+// FLT forces a single copy. The graph only ever runs at max(1.0, playback.rate),
+// i.e. speed-up, so it emits FEWER frames than it consumes and one content frame
+// is the real ceiling. The 4x is headroom for a graph that bursts on a rate
+// change, not a working figure: sizing the conversion buffer to
+// MAX_AUDIO_FRAME_SAMPLES instead overflowed it by 4x the moment that headroom
+// was actually needed.
 ATEMPO_OUT_CAP :: MAX_AUDIO_FRAME_SAMPLES * 4
 
 Atempo_Graph :: struct {

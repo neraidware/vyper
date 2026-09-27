@@ -22,7 +22,7 @@ AUDIO_MAX_CH :: 8
 
 // Audio_Clip_Decoder decodes one audio stream of a media file and converts it
 // to interleaved signed-16 PCM at the stream's native rate/channel count. The
-// SDL audio stream handles final rate/channel conversion to the device.
+// miniaudio device handles final rate/channel conversion to the hardware.
 Audio_Clip_Decoder :: struct {
 	opened:  bool,
 	fmt_ctx: ^avfmt.FormatContext,
@@ -331,36 +331,23 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 // (render.odin). One decoder + forward-only fifo per clip (a snapshot of the
 // timeline taken at provision, so the producer thread never touches live clip
 // memory). The mixer runs on its own producer thread, driven by a wall-clock
-// anchor the UI refreshes every frame; the SDL stream therefore keeps playing
+// anchor the UI refreshes every frame; the device therefore keeps playing
 // through UI stalls (AV1 decode hiccups no longer starve it) and the playhead
 // cannot fall out of sync with what the device actually outputs.
 // ---------------------------------------------------------------------------
 
-// Audio_Device is the SDL output side of the player: the opened device, its
-// opening spec (kept as the rate/format source for the stream), the ready
-// flag, the stream that bridges mixer output into the device, and the
-// atempo graph below. All of it is owned by the main/producer boundary —
-// written at open/reset, read by the producer thread.
-Audio_Device :: struct {
-	device: sdl.AudioDeviceID,
-	spec:   sdl.AudioSpec,
-	ready:  bool,
-	stream: ^sdl.AudioStream,
-	// audio_dev.atempo is the pitch-preserving playback-rate graph
-	// (abuffer->atempo*->aformat->abuffersink) owned by the producer thread.
-	// SetAudioStreamFrequencyRatio is replaced by this: the device always runs
-	// at 1.0, and the rate is applied as time-stretch on the mix instead of
-	// resample. Rebuilt on rate change, jump, and provision (the graph's
-	// internal window would otherwise leak pre-jump samples). rate == 1.0
-	// leaves the graph nil and bypasses it entirely.
-	atempo: Atempo_Graph,
-}
-audio_dev: Audio_Device
-
-// AUDIO_CUSHION_SEC is how far ahead of the playhead the producer keeps the
-// device, and the queue-fill ceiling. On the producer thread this absorbs the
-// whole UI frame cost; only stalls longer than this resync.
-AUDIO_CUSHION_SEC :: 0.25
+// audio_atempo is the pitch-preserving playback-rate graph
+// (abuffer->atempo*->aformat->abuffersink) owned by the producer thread. It
+// used to hang off the device struct, but it is not the device's business: the
+// device always runs at 1.0, and the rate is applied as time-stretch on the mix
+// rather than by resampling. It belongs to whoever produces the mix. Rebuilt on
+// rate change, jump, and provision (the graph's internal window would otherwise
+// leak pre-jump samples). rate == 1.0 leaves the graph nil and bypasses it
+// entirely.
+//
+// The output device itself is not here: it lives behind a narrow push/query
+// interface in audio_device.odin, so nothing in the engine knows what backs it.
+audio_atempo: Atempo_Graph
 
 // AUDIO_AUDIBLE_SKEW_TOL is the maximum wall-time the audible content position
 // (playback.dev_frame) may trail the playhead before audio_update forces a
@@ -594,11 +581,11 @@ Audio_Report :: struct {
 	// Last-report snapshot (read for the on-screen meters).
 	tick:         u64,
 	frame:        i64,
-	queued:       c.int,
+	queued:       i64, // bus sample-frames in the device bridge at last report
 	holes:        i64,
-	fed:          u64, // total_fed_bytes at last report (for true device-rate)
+	fed:          u64, // total_fed_frames at last report (for true bus rate)
 	// Monotonic totals, never cleared by reseeds.
-	total_fed_bytes: u64,
+	total_fed_frames: u64,
 	// playhead-writer labels for the drift diagnostics: ph_src is the last
 	// writer of playhead.frame (1=mouse scrub, 2=auto catch-up burst); ph_catch
 	// is the frames jumped in the last auto catch-up burst (atomic on writer
@@ -607,15 +594,15 @@ Audio_Report :: struct {
 	ph_catch: i64,
 	// Per-report feed/mix statistics (producer thread only, reset at each
 	// report).
-	push:         u64, // pushes into the SDL stream
-	skip_full:    u64, // feed() exits because the stream hit max_queue
+	push:         u64, // pushes into the device bridge ring
+	skip_full:    u64, // feed() exits because the ring hit max_queue
 	skip_nocov:   u64, // feed() exits because no clip covers the next frame
 	rate_rebuilt: u64, // rate-graph (re)builds that re-anchored to the playhead
 	wedge_heal:   u64, // backlog drops when prod was queue-capped short of target
 	mix_us:       u64, // time spent inside audio_mix_frame (decode + resample + mix)
 	feed_us:      u64, // time spent in audio_producer_feed outside mix
-	min_q:        i64, // smallest queued bytes seen in the window
-	max_q:        i64, // largest queued bytes seen in the window
+	min_q:        i64, // smallest queue depth (frames) seen in the window
+	max_q:        i64, // largest queue depth (frames) seen in the window
 	// Log/env toggles. VYPER_AUDIO_LOG=ms overrides the report interval
 	// (default 1000 ms); VYPER_AUDIO_FULL=1 adds per-source fifo lines and
 	// playhead-jump logging.
@@ -858,7 +845,7 @@ audio_gain_fold :: proc(slot: ^Audio_Geom_Slot) {
 // new state.
 audio_note_edit :: proc() {
 	audio_geometry_commit()
-	if !audio_dev.ready {
+	if !audio_device_ready() {
 		return
 	}
 	audio_seek(playhead.frame)
@@ -920,7 +907,7 @@ audio_provision_find_group :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chi
 audio_provision :: proc(play_frame: i64) {
 	sync.atomic_store(&audio_prod.provisioning, true)
 	defer sync.atomic_store(&audio_prod.provisioning, false)
-	atempo_reset(&audio_dev.atempo) // graph window may hold pre-provision samples
+	atempo_reset(&audio_atempo) // graph window may hold pre-provision samples
 	audio_dec_dump_open()
 	audio_reset_play()
 	audio_src.next_frame = play_frame
@@ -1172,40 +1159,9 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 }
 
 audio_init :: proc() -> bool {
-	spec := sdl.AudioSpec{format = .S16, channels = 2, freq = 48000}
-	dev := sdl.OpenAudioDevice(sdl.AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec)
-	if dev == 0 {
-		fmt.println("OpenAudioDevice failed:", sdl.GetError())
-		return false
-	}
-	device_spec: sdl.AudioSpec
-	sample_frames: c.int
-	if !sdl.GetAudioDeviceFormat(dev, &device_spec, &sample_frames) {
-		fmt.println("GetAudioDeviceFormat failed:", sdl.GetError())
-		sdl.CloseAudioDevice(dev)
-		return false
-	}
-	audio_dev.device = dev
-	audio_dev.spec = device_spec
-	audio_dev.ready = true
-	// Fixed 48 kHz stereo S16 source; every clip is resampled to this bus, so
-	// the stream outlives individual clips (all clip PCM is downmixed into it).
-	src_spec := sdl.AudioSpec{format = .S16, channels = 2, freq = 48000}
-	audio_dev.stream = sdl.CreateAudioStream(&src_spec, &device_spec)
-	if audio_dev.stream == nil {
-		fmt.println("CreateAudioStream failed:", sdl.GetError())
-		sdl.CloseAudioDevice(dev)
-		audio_dev.ready = false
-		return false
-	}
-	if !sdl.BindAudioStream(audio_dev.device, audio_dev.stream) {
-		fmt.println("BindAudioStream failed:", sdl.GetError())
-		audio_dev.ready = false
-		return false
-	}
-	if audio_rpt.trace {
-		fmt.printf("audio device ready (%d Hz, %dch, fmt %d)\n", device_spec.freq, device_spec.channels, device_spec.format)
-	}
+	// Read the log toggles BEFORE opening the device: the device announces its
+	// negotiated shape under trace, and the old order had that print fire before
+	// trace was ever set, so it had never printed once.
 	if interval := os.get_env_alloc("VYPER_AUDIO_LOG", context.temp_allocator); interval != "" {
 		v, ok := strconv.parse_i64(interval)
 		if ok && v >= 50 {
@@ -1214,7 +1170,15 @@ audio_init :: proc() -> bool {
 	}
 	audio_rpt.log_full = os.get_env_alloc("VYPER_AUDIO_FULL", context.temp_allocator) == "1"
 	audio_rpt.trace = os.get_env_alloc("VYPER_AUDIO_TRACE", context.temp_allocator) == "1"
-	sdl.PauseAudioDevice(dev)
+	// The device, the bridge ring, and the resampler live in audio_device.odin
+	// behind a narrow interface; this only decides whether playback is possible at
+	// all. Failure is not fatal (the app runs silent), which is exactly what
+	// SDL's failure path produced.
+	audio_device_init()
+	// Starts closed: the device runs, the gate does not, so nothing plays until the
+	// transport opens it. The old code paused the device here for the same reason,
+	// at the cost of a stop/start cycle on every play.
+	audio_device_set_active(false)
 	sync.atomic_store(&audio_prod.stop, false)
 	sync.atomic_store(&audio_prod.done, false)
 	sync.atomic_store(&audio_prod.run, false)
@@ -1238,15 +1202,9 @@ audio_shutdown :: proc() {
 		audio_prod.thread = nil
 	}
 	audio_reset_play()
-	if audio_dev.stream != nil {
-		atempo_graph_destroy(&audio_dev.atempo) // producer thread is joined by now; safe
-		sdl.DestroyAudioStream(audio_dev.stream)
-		audio_dev.stream = nil
-	}
-	if audio_dev.ready {
-		sdl.CloseAudioDevice(audio_dev.device)
-		audio_dev.ready = false
-	}
+	// The producer thread is joined by now, so nothing else is writing the ring.
+	atempo_graph_destroy(&audio_atempo)
+	audio_device_shutdown()
 }
 
 // audio_reset_for_load asks the producer to pause and drop all audio state when
@@ -1295,7 +1253,7 @@ timeline_has_audio_at :: proc(f: i64) -> bool {
 audio_producer_feed :: proc() {
 	feed_t0 := sdl.GetTicksNS()
 	defer audio_rpt.feed_us += u64(sdl.GetTicksNS() - feed_t0)
-	if !audio_dev.ready || audio_dev.stream == nil {
+	if !audio_device_ready() {
 		return
 	}
 	// Playback-rate: rebuild the atempo graph so the mix is time-stretched
@@ -1304,7 +1262,7 @@ audio_producer_feed :: proc() {
 	// every ~2ms, and rebuilding a filter graph is cheap (a few ms) but not
 	// free per feed.
 	want_ratio := max(1.0, playback.rate)
-	if atempo_rate_set(&audio_dev.atempo, want_ratio) {
+	if atempo_rate_set(&audio_atempo, want_ratio) {
 		// The playhead and the device both kept running while the graph was
 		// being built, so audio_src.next_frame is stale by the build duration (which
 		// scales with the playhead once the rate is live: a ~150ms build at 4x
@@ -1356,18 +1314,18 @@ audio_producer_feed :: proc() {
 			}
 		}
 		audio_src.next_frame = jmp
-		sdl.ClearAudioStream(audio_dev.stream)
-		atempo_reset(&audio_dev.atempo) // graph window holds pre-jump samples otherwise
+		audio_device_clear()
+		atempo_reset(&audio_atempo) // graph window holds pre-jump samples otherwise
 		sync.atomic_store(&audio_prod.jump_frame, 0)
 	}
-	max_queue := c.int(f64(48000) * AUDIO_CUSHION_SEC * 2 * 2)
+	max_queue := i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC)
 	cushion_frames := i64(AUDIO_CUSHION_SEC * f64(fps) * want_ratio + 1)
 	// The device consumes 48k stream-samples/sec regardless of rate: atempo
 	// compresses content to spf/rate output samples per frame, so queued bytes
 	// represent content/rate worth — scale back up to content-frame depth so
 	// dev_pos stays honest at every rate.
 	rate_sc := max(1.0, want_ratio)
-	queued_frames := i64(f64(sdl.GetAudioStreamQueued(audio_dev.stream)) * rate_sc / f64(spf * 2 * 2))
+	queued_frames := i64(f64(audio_device_queued()) * rate_sc / f64(spf))
 	dev_pos := audio_src.next_frame - queued_frames
 	// Publish at_ns BEFORE dev: a reader sampling dev then at_ns under-extrapolates
 	// (at_ns can only be newer), which is the safe direction — never a position
@@ -1402,8 +1360,8 @@ audio_producer_feed :: proc() {
 	// to prod, the fill loop re-fills against the true target, and dev lands
 	// back on the playhead. Self-limiting — after the heal prod sits at target,
 	// so the condition stops.
-	if target > audio_src.next_frame && i64(sdl.GetAudioStreamQueued(audio_dev.stream)) >= i64(max_queue) && audio_src.next_frame < target-i64(AUDIO_AUDIBLE_SKEW_TOL*want_ratio*f64(fps)) {
-		sdl.ClearAudioStream(audio_dev.stream)
+	if target > audio_src.next_frame && audio_device_queued() >= max_queue && audio_src.next_frame < target-i64(AUDIO_AUDIBLE_SKEW_TOL*want_ratio*f64(fps)) {
+		audio_device_clear()
 		queued_frames = 0
 		dev_pos = audio_src.next_frame
 		sync.atomic_store(&playback.dev_at_ns, i64(sdl.GetTicksNS()))
@@ -1414,9 +1372,13 @@ audio_producer_feed :: proc() {
 		return
 	}
 	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
-	pcm: [MAX_AUDIO_FRAME_SAMPLES * 2]i16
+	// Sized from ATEMPO_OUT_CAP, not MAX_AUDIO_FRAME_SAMPLES: with atempo active
+	// the block length is the graph's output, not the content frame. Asserted
+	// below so a future change to the cap cannot turn this into a silent stack
+	// overflow of up to 4x.
+	pcm: [ATEMPO_OUT_CAP * 2]i16
 	for audio_src.next_frame < target {
-		if sdl.GetAudioStreamQueued(audio_dev.stream) >= max_queue {
+		if audio_device_queued() >= max_queue {
 			audio_rpt.skip_full += 1
 			break
 		}
@@ -1446,24 +1408,28 @@ audio_producer_feed :: proc() {
 		// through verbatim, identical to the pre-atempo path.
 		push_frames := cur_spf
 		src := mix[:]
-		if audio_dev.atempo.graph != nil {
-			atempo_process(&audio_dev.atempo, mix[:], cur_spf)
-			push_frames = audio_dev.atempo.out_n
-			src = audio_dev.atempo.out_buf[:]
+		if audio_atempo.graph != nil {
+			atempo_process(&audio_atempo, mix[:], cur_spf)
+			push_frames = audio_atempo.out_n
+			src = audio_atempo.out_buf[:]
 		}
+		assert(
+			push_frames <= ATEMPO_OUT_CAP,
+			"producer: mixed block exceeds the conversion buffer",
+		)
 		for f in 0 ..< push_frames {
 			l := src[f * 2 + 0] * 32767.0
 			r := src[f * 2 + 1] * 32767.0
 			pcm[f * 2 + 0] = i16(clamp(l, -32768.0, 32767.0))
 			pcm[f * 2 + 1] = i16(clamp(r, -32768.0, 32767.0))
 		}
-		out_bytes := push_frames * 2 * 2
+		out_bytes := push_frames * AUDIO_BUS_FRAME_BYTES
 		if out_bytes > 0 {
-			sdl.PutAudioStreamData(audio_dev.stream, raw_data(pcm[:]), c.int(out_bytes))
-			audio_rpt.total_fed_bytes += u64(out_bytes)
+			audio_device_push(pcm[:], push_frames)
+			audio_rpt.total_fed_frames += u64(push_frames)
 		}
 		audio_rpt.push += 1
-		qnow := i64(sdl.GetAudioStreamQueued(audio_dev.stream))
+		qnow := audio_device_queued()
 		audio_rpt.min_q = min(audio_rpt.min_q, qnow)
 		audio_rpt.max_q = max(audio_rpt.max_q, qnow)
 		if audio_dump.pcm != nil {
@@ -1485,10 +1451,10 @@ audio_producer_feed :: proc() {
 }
 
 // audio_producer_proc is the dedicated playback thread. It owns every decoder
-// and the SDL stream, feeding the device asynchronously from the UI loop so UI
+// and the atempo graph, feeding the device asynchronously from the UI loop so UI
 // stalls (AV1 decode, layout, uploads) cannot starve the audio output.
 audio_producer_proc :: proc(t: ^thread.Thread) {
-	if !audio_dev.ready || audio_dev.stream == nil {
+	if !audio_device_ready() {
 		sync.atomic_store(&audio_prod.done, true)
 		return
 	}
@@ -1505,10 +1471,12 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 			if evt != last_evt || !had_evt {
 				last_evt = evt
 				open_start := sdl.GetTicksNS()
-				sdl.ClearAudioStream(audio_dev.stream)
-				sdl.FlushAudioStream(audio_dev.stream)
+				// Drop the queue and the resampler history together, then open
+				// the gate. The gate, not a device stop/start, is what starts
+				// and stops output: the device runs for the process lifetime.
+				audio_device_clear()
 				had_evt = true
-				sdl.ResumeAudioDevice(audio_dev.device)
+				audio_device_set_active(true)
 				audio_provision(sync.atomic_load(&audio_prod.anchor_frame))
 				// Provisioning reopens every decoder synchronously -- hundreds
 				// of ms once several sources are open. Video runs on the wall
@@ -1531,25 +1499,31 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				if now := sdl.GetTicksNS(); now - last_report >= u64(audio_rpt.log_ms) * 1_000_000 {
 					elapsed := f64(now - audio_rpt.tick) / 1e9
 				delta := audio_src.next_frame - audio_rpt.frame
-				queued_bytes := sdl.GetAudioStreamQueued(audio_dev.stream)
+				queued := audio_device_queued()
 				fps := timeline_fps()
 				spf := int(48000.0 / fps + 0.5)
 				rate_sc := max(1.0, playback.rate)
-				queued_frames := int(f64(queued_bytes) * rate_sc) / (spf * 2 * 2)
+				queued_frames := int(f64(queued) * rate_sc / f64(spf))
 				cursor := audio_src.next_frame - i64(queued_frames)
 				rate_fps := elapsed > 0 && delta >= 0 ? f64(delta) / elapsed : 0
-				queued_delta := f64(i64(queued_bytes) - i64(audio_rpt.queued))
-				consumed_bytes := f64(audio_rpt.total_fed_bytes - audio_rpt.fed) - queued_delta
-				drain_hz := elapsed > 0 && consumed_bytes > 0 ? consumed_bytes / 4.0 / elapsed : 0
-				dev_hz := elapsed > 0 ? consumed_bytes / 4.0 / elapsed : 0
-				dev_ratio := audio_dev.spec.freq > 0 ? dev_hz / f64(audio_dev.spec.freq) : 0
-				max_queue := c.int(f64(48000) * AUDIO_CUSHION_SEC * 2 * 2)
+				queued_delta := f64(queued - audio_rpt.queued)
+				// What the device actually pulled is the fed delta minus the
+				// queue delta; in frames, so no bytes-per-frame factor is needed.
+				consumed_frames := f64(audio_rpt.total_fed_frames - audio_rpt.fed) - queued_delta
+				drain_hz := elapsed > 0 && consumed_frames > 0 ? consumed_frames / elapsed : 0
+				dev_hz := elapsed > 0 ? consumed_frames / elapsed : 0
+				// Bus rate, NOT the negotiated device rate: consumed_frames counts
+				// 48 kHz bus frames that miniaudio resamples on the way out, so
+				// dividing by the device rate reads ~1.09x on a 44.1 kHz card and
+				// trips the SLOW/FAST warning for a device that is exactly on pace.
+				dev_ratio := dev_hz / f64(AUDIO_BUS_RATE)
+				max_queue := i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC)
 				holes := sync.atomic_load(&audio_rpt.silence_holes)
 				holes_delta := holes - audio_rpt.holes
 				resync := sync.atomic_load(&audio_prod.resync)
 				anchor := sync.atomic_load(&audio_prod.anchor_frame)
 				cover := audio_src_covers_frame(playhead.frame)
-				avail_bytes := sdl.GetAudioStreamAvailable(audio_dev.stream)
+				avail := audio_device_available()
 				pace := "ok"
 				if elapsed > 1.0 {
 					if dev_ratio < 0.9 {
@@ -1558,9 +1532,9 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 						pace = "FAST"
 					}
 				}
-				q_min := min(audio_rpt.min_q, i64(queued_bytes))
-				q_max := max(audio_rpt.max_q, i64(queued_bytes))
-				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%d/%db(%dfr,min=%dq,max=%dq,avail=%db) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) resync=%d dev=%dHz/%dch\n",
+				q_min := min(audio_rpt.min_q, queued)
+				q_max := max(audio_rpt.max_q, queued)
+				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) resync=%d dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
 					f64(now-audio_rpt.thread_start_ns)/1e9,
 					playhead.frame, f64(playhead.frame)/fps, playhead.playing,
 					sync.atomic_load(&audio_rpt.ph_src) == 1 ? "mouse" : sync.atomic_load(&audio_rpt.ph_src) == 2 ? "auto" : "?",
@@ -1570,14 +1544,15 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					rate_fps,
 					drain_hz,
 					pace, dev_hz, dev_ratio,
-					queued_bytes, max_queue, queued_frames,
-					q_min, q_max, avail_bytes,
+					queued, max_queue,
+					q_min, q_max, avail,
 					audio_rpt.push, audio_rpt.skip_full, audio_rpt.skip_nocov,
 					f64(audio_rpt.mix_us)/1e6, f64(audio_rpt.feed_us)/1e6,
 					cover ? 1 : 0,
 					holes_delta, holes,
 					resync,
-					audio_dev.spec.freq, audio_dev.spec.channels)
+					audio_device_rate(), audio_device_channels(), audio_device_bits(),
+					audio_device_underruns(), audio_device_clears(), audio_rpt.wedge_heal)
 				if audio_rpt.log_full {
 					for k in 0 ..< audio_src.count {
 						s := &audio_src.slots[k]
@@ -1599,24 +1574,23 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				}
 				audio_rpt.tick = now
 				audio_rpt.frame = audio_src.next_frame
-				audio_rpt.queued = queued_bytes
+				audio_rpt.queued = queued
 				audio_rpt.holes = holes
-				audio_rpt.fed = audio_rpt.total_fed_bytes
+				audio_rpt.fed = audio_rpt.total_fed_frames
 				audio_rpt.push = 0
 				audio_rpt.skip_full = 0
 				audio_rpt.skip_nocov = 0
 				audio_rpt.mix_us = 0
 				audio_rpt.feed_us = 0
-				audio_rpt.min_q = i64(queued_bytes)
-				audio_rpt.max_q = i64(queued_bytes)
+				audio_rpt.min_q = queued
+				audio_rpt.max_q = queued
 				last_report = now
 				}
 			}
 		} else {
 			if had_evt {
-				sdl.PauseAudioDevice(audio_dev.device)
-				sdl.ClearAudioStream(audio_dev.stream)
-				sdl.FlushAudioStream(audio_dev.stream)
+				audio_device_set_active(false)
+				audio_device_clear()
 				audio_reset_play()
 				had_evt = false
 			}
@@ -1642,7 +1616,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 // and genuine leaps (backward, or forward beyond the audio cushion). Steady
 // playback needs no work here: the producer runs on its own clock.
 audio_update :: proc() {
-	if !audio_dev.ready {
+	if !audio_device_ready() {
 		return
 	}
 	// Backward playback runs video only: the audio producer/decoders/stream are
