@@ -93,18 +93,25 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 		fmt.println("gpu-probe: CreateGPUDevice failed:", sdl.GetError())
 		return
 	}
-	// Announced once, on the first device that actually exists. Which adapter
-	// these numbers describe matters more than the numbers: a box with no render
-	// node falls back to a SOFTWARE Vulkan rasterizer, where the blit path works
-	// but mip LOD selection is inert (a sampler mip_lod_bias of +4.0 moves the
-	// 3x row by 0.00, so the higher levels are never read). Software adapters
-	// also report driver "vulkan", so this line cannot be trusted to distinguish
-	// them -- see TODO.md S1b, which records the whole limitation.
+	// Announced once, on the first device that actually exists.
+	//
+	// The driver name alone CANNOT tell you whether you are on hardware. A
+	// software Vulkan rasterizer also reports "vulkan", so a green run of this
+	// probe is not evidence that a GPU did the work. To find out for real, watch
+	// the loader enumerate adapters:
+	//
+	//   VK_LOADER_DEBUG=info ./vyper 2>&1 | grep -i physical
+	//
+	// A hardware adapter shows up there; if the only entry is `llvmpipe`, these
+	// numbers are software and say nothing about GPU behaviour. This bit us:
+	// the box has an AMD card on the amdgpu driver, but no hardware ICD binds to
+	// it, so SDL3 silently hands us llvmpipe. See TODO.md Active 4 S1b.
 	if !adapter_announced {
 		adapter_announced = true
+		fmt.println("gpu-probe: adapter driver =", sdl.GetGPUDeviceDriver(p.device))
 		fmt.println(
-			"gpu-probe: adapter driver =", sdl.GetGPUDeviceDriver(p.device),
-			"(software Vulkan adapters also report \"vulkan\"; their mip LOD is inert -- see TODO.md S1b)",
+			"gpu-probe: verify this is hardware, not a software rasterizer, with:",
+			"VK_LOADER_DEBUG=info ./vyper 2>&1 | grep -i physical",
 		)
 	}
 	// A sampler with linear min/mag filtering is the whole point: the hardware

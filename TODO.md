@@ -495,12 +495,22 @@ throughput. See the note appended to S2.
       resamplers differ by phase, and asserting it would demand one filter's
       convention rather than quality.
 
-      **BLOCKER for flipping the default: this machine has no GPU.** Measured
-      2026-09-27. `/dev/dri` contains no render nodes, there is no `/dev/nvidia*`,
-      and the only loadable Vulkan ICD is `lvp_icd` (lavapipe, Mesa's *software*
-      rasterizer). So every figure above is software-Vulkan behaviour, and the
-      9-12x win is a win over a scalar CPU kernel on a CPU-emulated device — not
-      a measurement of real hardware.
+      **BLOCKER for flipping the default: Vulkan resolves to a software
+      rasterizer here.** Measured 2026-09-27. The machine DOES have a GPU --
+      AMD, `amdgpu` kernel driver, PCI `1002:15BF` (Navi-class, ASUS
+      subvendor), with `/dev/dri/card0` and `/dev/dri/renderD128`. The blocker is
+      that no hardware Vulkan ICD binds to it: the loader finds `radeon_icd`,
+      `libvulkan_radeon.so` loads with all dependencies resolved, and then
+      enumerates zero AMD devices, dropping radeon/intel/nouveau/asahi/virtio
+      with "not having any physical devices" and leaving only `llvmpipe`. SDL3
+      therefore hands the export a software rasterizer, so every figure above is
+      software-Vulkan behaviour, and the 9-12x is a win over a scalar CPU kernel
+      on a CPU-emulated device -- not a measurement of real hardware.
+
+      (An earlier revision of this note claimed the box had no GPU at all. That
+      was wrong, and the check behind it was worthless: `lspci` is not installed
+      on this machine, so its empty output was absence of evidence, and a
+      truncated `ls` hid the render node. Do not repeat either check.)
 
       Two attempts to fix the aliasing, both blocked the same way:
 
@@ -509,17 +519,19 @@ throughput. See the note appended to S2.
         surface suggests and cost several wrong turns: `BeginGPUComputePass`
         binds only *writeable* storage textures, so a readonly input must go
         through the separate `SDL_BindGPUComputeStorageTextures`; and SPIR-V
-        compute sets are fixed and validated — set 0 sampled + readonly storage,
+        compute sets are fixed and validated -- set 0 sampled + readonly storage,
         set 1 read-write storage, set 2 uniforms. Getting either wrong compiles
         cleanly and then writes nothing at all, which reads as "all pixels
-        zero", not as an error. Not pursued further until there is a real GPU to
-        validate it on.
+        zero", not as an error. Worth retrying once a real adapter is available,
+        because the API is now understood.
       - **Mip levels + automatic LOD** (the far smaller change: same blit shader,
-        full mip chain, `mipmap_mode = .LINEAR`). Inert on this adapter — a
+        full mip chain, `mipmap_mode = .LINEAR`). Inert on `llvmpipe` -- a
         sampler `mip_lod_bias` of +4.0 moves the 3x row by exactly 0.00, so the
         higher levels are never sampled. The chain is built (11 levels at
         1600x900) and `GenerateMipmapsForGPUTexture` is called outside any pass
-        as the header requires; the adapter simply does not select those levels.
+        as the header requires. Whether this is an `llvmpipe` limitation or a
+        bug in the blit is UNKNOWN, because `llvmpipe` cannot tell us. Retest on
+        the AMD adapter before concluding mips are the wrong fix.
 
       So the aliasing *risk* is established (a single bilinear tap aliases under
       minification on any conformant implementation) but the *fix* is unvalidated
