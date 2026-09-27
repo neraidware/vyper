@@ -537,6 +537,34 @@ ui_probe_cmdline_opener_asserts :: proc() -> bool {
 		ok = false
 	}
 
+	// Case 3: an echo-less opener followed by a ":" as the FIRST thing typed.
+	// This is the row the drain scoping fixes. The old suppressor cleared the
+	// pending swallow on whatever text event arrived next, so its correctness
+	// depended on an unrelated keystroke happening to come along first: type
+	// "o" and the flag was consumed harmlessly, but type ":" — or paste
+	// anything starting with one — and that character was silently eaten as
+	// though it were the opener's echo. The whole buffer came back empty.
+	//
+	// Worth being precise about what was NOT broken: `open C:/foo` worked,
+	// because its "o" cleared the stale flag before the path's colon arrived.
+	// The earlier note in TODO.md claimed that case was broken and was wrong.
+	// It needs its own probe either way, since the drive-path row above cannot
+	// distinguish "correct" from "correct by coincidence".
+	text_input_cancel()
+	ti.active = false
+	ui_probe_push_opener_key()
+	handle_sdl_events(&running)
+	if !ti.active {
+		fmt.eprintf("[ui-probe] opener did not open the prompt (echo-less colon case)\n")
+		ok = false
+	}
+	ui_probe_push_text(":C:/x")
+	handle_sdl_events(&running)
+	if got := text_input_string(); got != ":C:/x" {
+		fmt.eprintf("[ui-probe] \":\" right after an echo-less opener gave %q, want \":C:/x\"\n", got)
+		ok = false
+	}
+
 	text_input_cancel()
 	if ok {
 		fmt.printf("[ui-probe] cmdline opener ok\n")

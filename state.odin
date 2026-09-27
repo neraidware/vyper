@@ -705,7 +705,23 @@ Text_Input :: struct {
 	// what makes this safe: a keypress that produces no text event at all
 	// (layout/IME differences) used to leave a pending swallow that ate the
 	// user's next real keystroke.
-	swallow_char: u8,
+	//
+	// swallow_drain is the kbd.drain the swallow was armed in, and it is what
+	// bounds the suppression to the opener's own burst of input. Character
+	// matching alone is still not enough: when the opener produces no echo the
+	// swallow stays armed forever, and the first ":" the user later types as
+	// DATA gets eaten — which broke `open C:/foo`. Scoping it to the drain
+	// means a same-drain text event is the echo (drop it) and a later one is
+	// real input (keep it).
+	//
+	// The cost is a rare misfire: if SDL ever delivered the echo more than one
+	// drain after the keypress, the buffer would start "::" instead of ":". A
+	// single-drain stall is the only way that happens, and it is a cosmetic
+	// duplicate character rather than a swallowed keystroke, so it is the
+	// better trade. A stale swallow is inert once the drain has moved on, so it
+	// is not cleared on expiry — nothing matches it again.
+	swallow_char:  u8,
+	swallow_drain: u32,
 }
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.

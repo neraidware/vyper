@@ -43,9 +43,17 @@ handle_sdl_events :: proc(running: ^bool) {
 				// character is also what keeps "open C:/foo" working: a ":"
 				// typed into an open prompt is data (a Windows drive path),
 				// not another opener.
+				//
+				// The drain check is what makes that true rather than
+				// accidental. Without it a swallow armed by an opener that
+				// produced no echo stayed armed indefinitely, and the first
+				// ":" the user typed as DATA — in `open C:/foo`, a later
+				// keystroke, not the opener's echo — was silently eaten. A
+				// same-drain text event is the echo; a later one is real input.
 				swallow := ti.swallow_char
+				same_drain := ti.swallow_drain == kbd.drain
 				ti.swallow_char = 0
-				if !(swallow != 0 && len(text) > 0 && text[0] == swallow) {
+				if !(swallow != 0 && same_drain && len(text) > 0 && text[0] == swallow) {
 					text_input_insert(text)
 				}
 			} else if edit_state.field != .None {
@@ -348,9 +356,11 @@ dispatch_action :: proc(act: Action) {
 	switch act {
 	case .Open_Command_Line:
 		// Opens empty; the keypress's own text echo is dropped by the
-		// suppressor in the TEXT_INPUT branch.
+		// suppressor in the TEXT_INPUT branch. The drain is recorded so the
+		// suppression covers this keypress's echo and nothing else.
 		text_input_begin("", TI_CMDLINE, 0)
 		ti.swallow_char = CMDLINE_OPENER[0]
+		ti.swallow_drain = kbd.drain
 	case .Toggle_Help:
 		// Always-available shortcut reference.
 		editor_flags.help_open = !editor_flags.help_open

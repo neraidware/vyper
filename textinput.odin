@@ -87,8 +87,10 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 	ti.is_create = false
 	// Drop any pending swallow from a previous session. A begin that follows a
 	// keypress which never produced a text event could otherwise carry a stale
-	// one into this session; the opener arms a fresh one right after.
+	// one into this session; the opener arms a fresh one right after. The drain
+	// is cleared too so a stale pair can never be half-live.
 	ti.swallow_char = 0
+	ti.swallow_drain = 0
 	// Each ":" session starts with a fresh fuzzy file list (walked lazily on
 	// the first non-empty query) and a clear match highlight.
 	if input_type == TI_CMDLINE {

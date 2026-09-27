@@ -798,15 +798,29 @@ later work-stream that plugs into it without reshaping what is here.
       an enum) — an unmatched key just falls out, which is why
       `edit_field_claims_key` needs an explicit claimed flag to report whether
       it matched.
-- [ ] I6. Drain-scoped echo fix, which I5 makes free. The suppressor is
-      already correct for the stall case (character-match, not
-      drain-bounded — under a 200 ms main-thread stall the user types `:` then
-      `o`, both queue, both drain together, and a drain-bounded discard would
-      eat the `o`). What it gets wrong is the later-drain case: a `:` typed as
-      DATA in a subsequent drain is dropped, breaking `open C:/foo`. Scoping
-      the existing character-match to the opening drain fixes that row and no
-      other, turning `swallow_char` into a `(drain, byte)` pair. Net: 4 rows
-      correct instead of 3.
+- [x] I6. Drain-scoped echo. `swallow_char` became a
+      `(swallow_char, swallow_drain)` pair; the suppressor only drops a text
+      event when the drain matches the one the opener was armed in, so a
+      same-drain event is the echo (dropped) and a later one is real input
+      (kept). The character match stays — it is what makes a MISSING echo
+      harmless, which a drain-bounded discard cannot do: under a long main-thread
+      stall the user types `:` then `o`, both queue, both drain together, and
+      discarding by drain would eat the `o`.
+      **Correction to the original I6 rationale, which was wrong.** It claimed
+      this was "breaking `open C:/foo`". It was not. The old suppressor cleared
+      `swallow_char` on *any* text event, so in `open C:/foo` the leading `o`
+      consumed the stale flag before the path's colon ever arrived — the case
+      passed by coincidence, not by design.
+      The real defect is narrower and worse in its own row: after an echo-less
+      opener, the pending swallow stayed armed until some unrelated text event
+      consumed it, so if the first thing typed was itself a `:` — or a paste
+      beginning with one — that character was eaten as though it were the
+      opener's echo, and the whole buffer came back empty. Verified by
+      temporarily disabling the drain check and watching the new probe fail
+      with `""` instead of `":C:/x"`, so the probe genuinely tests the fix.
+      Accepted cost: an echo delivered more than one drain late would now leave
+      a duplicate `:` rather than being cleaned up. Cosmetic, and rarer than the
+      bug it removes.
 - [ ] ACCEPT: `:` opens empty; first char lands; `open C:/x` keeps its colon
       in the same drain AND a later one; jog repeats when held; no jog while a
       field is open; Ctrl+Z/Ctrl+Space still fire with a queued modifier.
