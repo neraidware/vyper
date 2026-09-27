@@ -1235,11 +1235,36 @@ shader/uniform pair is proven on the export path — but `scripts/gate.sh probe`
 submits no GPU work at all, so it cannot show the moiré is gone. That needs a
 probe that renders the preview and reads it back.
 
-**Step B — geometry dedup.** `clip_full_box_dims` (preview_transform.odin) and
-`render_full_box_dims` (render.odin) have identical bodies; the render.odin
-copy carried a comment admitting it was "mirrored here for snapshot structs".
-The `center - size/2 + crop*size` formula is likewise written twice, once in
-float screen pixels and once rounded to ints.
+**Step B — DONE: geometry dedup into `project_geom.odin`.** `clip_full_box_dims`
+(preview_transform.odin) and `render_full_box_dims` (render.odin) had identical
+bodies, and the render copy carried a comment admitting it was "mirrored here
+for snapshot structs". The `center - size/2 + crop*size` formula was likewise
+written twice, once in float screen pixels and once rounded to ints.
+
+New `project_geom.odin` owns two PURE primitives: `full_box_dims` and
+`cropped_box_edges`. The preview's `clip_full_box_dims` survives as a 6-line
+wrapper and that is deliberate, not leftover indirection: the export compositor
+runs on a worker thread against a `Render_Job` snapshot and must not read the
+`project` globals at all, so it needs the canvas size passed in, while the
+preview legitimately reads live state. One implementation, two honest access
+patterns.
+
+`cropped_box_edges` returns EDGES rather than origin+extent on purpose. The
+export rounds the edges to whole output pixels, so a width formed any other way
+can differ from `r - l` by a pixel. The preview now derives its extent from the
+same edges instead of recomputing `sw*(1-crop_l-crop_r)`, which is the ULP-level
+disagreement that let the two drift.
+
+Verified: `keyed_export` still reports `1.0x PSNR = inf` and
+`0.5x PSNR = 58.707992`, i.e. export output is bit-identical.
+
+**Orphan probe found while doing B.** `transform_probe.odin` is a 23-case
+regression check for the preview handle/snap geometry, and it is the only thing
+that exercises `clip_full_box_dims` and the crop/edge math — the exact code B
+touched. It was reachable only by setting `VYPER_TRANSFORM_PROBE` by hand and
+had no target in `gate.sh`, so it had not been running: a regression in the
+geometry B refactors would have been invisible. Added `target_transform_probe`
+and put it in the `all` list. It passes.
 
 **Step C — one ordered visual list for export, fixing bug 2.** Merge the video
 and text snapshots into ONE track-ordered list (tagged union) and composite it

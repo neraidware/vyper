@@ -892,21 +892,10 @@ Render_Job :: struct {
 }
 render_job: Render_Job
 
-// clip_full_box_dims works on ^Clip; mirrored here for snapshot structs.
-// Source-relative: scale 1 is the clip's native pixel size in output pixels;
-// a clip with a known source size never stretches (uniform both axes). With an
-// unknown source size it falls back to the canvas box (stretch-to-fill).
-render_full_box_dims :: proc(sw0, sh0: c.int, scale, pw, ph: f32) -> (f32, f32) {
-	if sw0 > 0 && sh0 > 0 {
-		return f32(sw0) * scale, f32(sh0) * scale
-	}
-	return pw * scale, ph * scale
-}
-
 // render_display_rect returns the clip's visible rect in project (output)
 // pixels, honoring source aspect (letterbox) and crop insets.
 render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, b: f32) {
-	cw, ch := render_full_box_dims(
+	cw, ch := full_box_dims(
 		src.source_w,
 		src.source_h,
 		src.scale,
@@ -945,11 +934,10 @@ render_kf_geom_rect :: proc(
 	cr, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_R)].keys[:geom[int(Render_Geom_Prop.Crop_R)].n], off, base_cr)
 	ct, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_T)].keys[:geom[int(Render_Geom_Prop.Crop_T)].n], off, base_ct)
 	cb, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_B)].keys[:geom[int(Render_Geom_Prop.Crop_B)].n], off, base_cb)
-	cw, ch := render_full_box_dims(source_w, source_h, s, f32(draw_w), f32(draw_h))
-	l := tx - cw / 2 + cl * cw
-	r := tx + cw / 2 - cr * cw
-	t := ty - ch / 2 + ct * ch
-	b := ty + ch / 2 - cb * ch
+	cw, ch := full_box_dims(source_w, source_h, s, f32(draw_w), f32(draw_h))
+	// The shared geometry (project_geom.odin), so a crop lands identically in
+	// the export and in the preview.
+	l, t, r, b := cropped_box_edges(tx, ty, cw, ch, cl, cr, ct, cb)
 	ox = c.int(math.round(l))
 	oy = c.int(math.round(t))
 	rw = max(1, c.int(r - l + 0.5))
@@ -2015,7 +2003,7 @@ render_worker_run :: proc() {
 				}
 			}
 			v.stage_scale = max(stage_scale, 0.0001)
-			scw, sch := render_full_box_dims(
+			scw, sch := full_box_dims(
 				v.source_w,
 				v.source_h,
 				v.stage_scale,
@@ -2053,7 +2041,7 @@ render_worker_run :: proc() {
 		v.oy = c.int(t + 0.5)
 		// Decode the frame at the full (pre-crop) box size so the cropped
 		// region can be sampled out of it (render_blit).
-		cw, ch := render_full_box_dims(
+		cw, ch := full_box_dims(
 			v.source_w,
 			v.source_h,
 			v.scale,

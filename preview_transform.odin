@@ -122,16 +122,19 @@ snap_margin :: proc(canvas: clay.BoundingBox, preview_px: f32) -> f32 {
 	return preview_px * f32(project.width) / v.width
 }
 
-// clip_full_box_dims returns the uncropped full-image size (project units) for
-// a clip at the given scale, measured from the SOURCE's own pixels: scale 1 is
-// the clip at native size (1 source pixel = 1 project-canvas pixel), uniform
-// in both axes so the clip never distorts. With an unknown source size (0) it
-// is the plain canvas box, preserving the old stretch-to-fill behavior.
+// clip_full_box_dims is full_box_dims (project_geom.odin) with the live canvas
+// size filled in. The wrapper is not redundant indirection: the export
+// compositor cannot do this, because it runs on a worker thread against a
+// Render_Job snapshot and must not read the `project` globals at all. The
+// preview is the interactive side and legitimately reads live state.
 clip_full_box_dims :: proc(clip: ^Clip, scale: f32) -> (f32, f32) {
-	if clip.source_w > 0 && clip.source_h > 0 {
-		return f32(clip.source_w) * scale, f32(clip.source_h) * scale
-	}
-	return f32(project.width) * scale, f32(project.height) * scale
+	return full_box_dims(
+		clip.source_w,
+		clip.source_h,
+		scale,
+		f32(project.width),
+		f32(project.height),
+	)
 }
 
 // snap_transform snaps the clip's visible (cropped) box edges to the project
@@ -448,9 +451,12 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	k := v.width / pu
 	sw := cu_w * k
 	sh := cu_h * k
-	x := cx - sw / 2 + clip.crop_l * sw
-	y := cy - sh / 2 + clip.crop_t * sh
-	return {x = x, y = y, width = sw * (1 - clip.crop_l - clip.crop_r), height = sh * (1 - clip.crop_t - clip.crop_b)}
+	// The shared geometry, so the preview and the export place a crop the same
+	// way. The extent is derived from the edges rather than recomputed as
+	// sw*(1-crop_l-crop_r): the export rounds these edges, and a width formed
+	// any other way can differ from it by a pixel.
+	l, t, r, b := cropped_box_edges(cx, cy, sw, sh, clip.crop_l, clip.crop_r, clip.crop_t, clip.crop_b)
+	return {x = l, y = t, width = r - l, height = b - t}
 }
 
 // CROP_MIN_VISIBLE_FRAC is the smallest crop window (as a fraction of the full
