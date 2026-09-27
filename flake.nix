@@ -42,6 +42,12 @@
             glslangValidator -V shaders/text.vert -o shaders/text.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
+            # The offscreen blit/resample pair used by the export compositor and
+            # its probe. box.frag is the real resample; lod.frag is a diagnostic
+            # that hardcodes LOD 3. Same target-env as the probe builds them.
+            glslangValidator -V --target-env vulkan1.1 shaders/blit.vert -o shaders/blit.vert.spv
+            glslangValidator -V --target-env vulkan1.1 shaders/blit_box.frag -o shaders/blit_box.frag.spv
+            glslangValidator -V --target-env vulkan1.1 shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
@@ -95,6 +101,12 @@
             glslangValidator -V shaders/text.vert -o shaders/text.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
+            # The offscreen blit/resample pair used by the export compositor and
+            # its probe. box.frag is the real resample; lod.frag is a diagnostic
+            # that hardcodes LOD 3. Same target-env as the probe builds them.
+            glslangValidator -V --target-env vulkan1.1 shaders/blit.vert -o shaders/blit.vert.spv
+            glslangValidator -V --target-env vulkan1.1 shaders/blit_box.frag -o shaders/blit_box.frag.spv
+            glslangValidator -V --target-env vulkan1.1 shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c

@@ -22,7 +22,23 @@ target_check() {
 	nix develop -c odin check . -strict-style -vet-using-param -vet-using-stmt
 }
 
+# Shader compilation is a build step, not a thing you remember to do by hand.
+# The SPVs are #load-ed into the binary at compile time, so editing a .frag and
+# rebuilding without recompiling it silently keeps the OLD shader and the run
+# reports the previous shader's results as if they were the new one. That is not
+# hypothetical: it happened here, and it produced a measurement that was
+# confidently wrong. Anything that builds the binary compiles shaders first.
+target_shaders() {
+	nix develop -c sh -c '
+		set -e
+		for src in shaders/blit.vert shaders/blit_box.frag shaders/blit_lod.frag; do
+			glslangValidator -V --target-env vulkan1.1 "$src" -o "$src.spv"
+		done
+	'
+}
+
 target_build() {
+	target_shaders
 	nix develop -c odin build . -debug -vet-style -vet-semicolon -out:vyper
 }
 
@@ -120,6 +136,7 @@ target_all() {
 main() {
 	case "${1:-all}" in
 	check) target_check ;;
+	shaders) target_shaders ;;
 	build) target_build ;;
 	bench) target_bench ;;
 	probe) target_probe ;;
@@ -128,7 +145,7 @@ main() {
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|build|bench|probe|gpu_probe|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|gpu_probe|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac

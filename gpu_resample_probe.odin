@@ -20,15 +20,29 @@ import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:mem"
+import "core:os"
+import "core:strings"
 import "core:time"
 import sdl "vendor:sdl3"
 import yuv "vendor/yuv"
 
-blit_vertex_spirv := #load("shaders/blit.vert.spv")
+blit_vertex_spirv   := #load("shaders/blit.vert.spv")
+blit_lod_fragment_spirv := #load("shaders/blit_lod.frag.spv")
+blit_box_fragment_spirv := #load("shaders/blit_box.frag.spv")
 
 // adapter_announced keeps the driver banner to one line per probe run; setup
 // runs once per geometry.
 adapter_announced := false
+
+// mip_status_announced keeps the mip-generation result to one line per run.
+mip_status_announced := false
+
+// Substrings that mark a device as a CPU rasterizer rather than a GPU. The
+// driver name cannot be used for this: llvmpipe reports backend "vulkan", the
+// same string a real RADV/Intel/NVIDIA adapter reports. Matching the device
+// name is the only reliable signal, so the list lives at file scope rather than
+// being rebuilt on every setup.
+SOFTWARE_RASTERIZER_NAMES :: [5]string{"llvmpipe", "lavapipe", "softpipe", "swiftshader", "warp"}
 
 GPU_Resample_Probe :: struct {
 	device:     ^sdl.GPUDevice,
@@ -95,23 +109,57 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 	}
 	// Announced once, on the first device that actually exists.
 	//
-	// The driver name alone CANNOT tell you whether you are on hardware. A
-	// software Vulkan rasterizer also reports "vulkan", so a green run of this
-	// probe is not evidence that a GPU did the work. To find out for real, watch
-	// the loader enumerate adapters:
-	//
-	//   VK_LOADER_DEBUG=info ./vyper 2>&1 | grep -i physical
-	//
-	// A hardware adapter shows up there; if the only entry is `llvmpipe`, these
-	// numbers are software and say nothing about GPU behaviour. This bit us:
-	// the box has an AMD card on the amdgpu driver, but no hardware ICD binds to
-	// it, so SDL3 silently hands us llvmpipe. See TODO.md Active 4 S1b.
+	// The DRIVER name cannot tell you whether you are on hardware: a software
+	// Vulkan rasterizer also reports "vulkan", so a green probe run is not
+	// evidence a GPU did the work. Only the device NAME can, and it is the one
+	// piece of information that cost us two wrong conclusions. A green run was
+	// read as hardware while the loader was in fact handing SDL3 llvmpipe, and
+	// the cause was a stale binary carrying a different Vulkan loader and ICD
+	// search path -- not a missing GPU, and not RADV_PERFTEST, which was the
+	// second wrong guess and is not needed. So the name is printed on every run
+	// and a software rasterizer is called out loudly rather than left for the
+	// next person to rediscover.
+	adapter := sdl.GetGPUDeviceDriver(p.device)
+	device_name := string(
+		sdl.GetStringProperty(
+			sdl.GetGPUDeviceProperties(p.device),
+			"SDL.gpu.device.name",
+			"<unknown>",
+		),
+	)
+	driver_info := string(
+		sdl.GetStringProperty(
+			sdl.GetGPUDeviceProperties(p.device),
+			"SDL.gpu.device.driver_info",
+			"<unknown>",
+		),
+	)
+	// A software rasterizer on an export path is a silent, enormous slowdown,
+	// not a cosmetic detail, so it is reported as a failure. Software fallback
+	// for the *export* itself is a legitimate contract, but it must never be
+	// mistaken for a GPU measurement.
+	software := false
+	for token in SOFTWARE_RASTERIZER_NAMES {
+		if strings.contains(device_name, token) || strings.contains(driver_info, token) {
+			software = true
+		}
+	}
 	if !adapter_announced {
 		adapter_announced = true
-		fmt.println("gpu-probe: adapter driver =", sdl.GetGPUDeviceDriver(p.device))
+		fmt.println("gpu-probe: adapter =", device_name, "| backend =", adapter)
+		fmt.println("gpu-probe: driver  =", driver_info)
+	}
+	if software {
+		// A software rasterizer is what a stale or differently-linked binary
+		// looks like: same source, same flags on paper, different loader, and
+		// the GPU silently replaced. Rebuild before believing this.
 		fmt.println(
-			"gpu-probe: verify this is hardware, not a software rasterizer, with:",
-			"VK_LOADER_DEBUG=info ./vyper 2>&1 | grep -i physical",
+			"gpu-probe: WARNING SOFTWARE RASTERIZER -- no GPU did this work;",
+			"these numbers are not a GPU measurement.",
+		)
+		fmt.println(
+			"gpu-probe: if a GPU is present, rebuild before concluding anything --",
+			"a stale binary loads a different Vulkan ICD set and gets llvmpipe.",
 		)
 	}
 	// A sampler with linear min/mag filtering is the whole point: the hardware
@@ -122,10 +170,29 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 	// hardware picks log2(minification) itself -- LOD 0 when magnifying, and a
 	// prefiltered level when shrinking. mipmap_mode .NEAREST would snap to one
 	// level and alias against the neighbouring one.
+	// VYPER_GPU_MIP_BIAS forces a LOD offset on the sampler. It exists to
+	// answer one question the timings cannot: is the LOD path live at all? A
+	// bias shifts every lookup off level 0, so the output IMAGE must change
+	// if mip levels are being generated and read. If a large bias leaves the
+	// pixels bit-identical, then nothing downstream of the sampler is
+	// selecting a level, and the cause is the mip chain or the bind, not the
+	// hardware. This is the difference between "llvmpipe cannot do mips" and
+	// "our blit ignores them", and guessing between them is what wasted the
+	// first two conclusions about this machine.
+	// The sampler is deliberately plain. Everything the minification fix needed
+	// was measured here and none of it moved a pixel: a mip chain generates
+	// successfully (11 levels, no SDL error), a hardcoded textureLod(3.0) still
+	// returns level-0 data, a sampler mip_lod_bias of 4 and 8 changed nothing at
+	// all, and 16x anisotropy was bit-identical to 1x. This driver clamps every
+	// lookup to level 0, so anything relying on sampler LOD or anisotropy
+	// silently degrades to a point sample. The filtering therefore lives in the
+	// fragment shader (blit_box.frag), which is driver-independent, and the
+	// sampler is left in the state that magnification needs. Keep PIN_LOD as the
+	// standing check for whether a future driver does honour mips.
 	p.sampler = sdl.CreateGPUSampler(p.device, sdl.GPUSamplerCreateInfo {
-		min_filter = .LINEAR,
-		mag_filter = .LINEAR,
-		mipmap_mode = .LINEAR,
+		min_filter   = .LINEAR,
+		mag_filter   = .LINEAR,
+		mipmap_mode  = .LINEAR,
 		address_mode_u = .CLAMP_TO_EDGE,
 		address_mode_v = .CLAMP_TO_EDGE,
 		address_mode_w = .CLAMP_TO_EDGE,
@@ -144,9 +211,24 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 		stage           = .VERTEX,
 		num_uniform_buffers = 1,
 	}
+	// The box-average shader is the implementation, not an experiment: it is
+	// what the export path should use and what every number below describes.
+	// One tap per covered source texel, which is exactly what the CPU kernel
+	// walks, so the two agree to mean 0.02 on the high-frequency 3x case that
+	// plain bilinear scored 39.94 on.
+	//
+	// VYPER_GPU_PIN_LOD swaps in a shader that hardcodes LOD 3. It is the
+	// standing test for whether this driver ever honours a mip level, and it
+	// exists because that answer is the reason the filtering is in the shader:
+	// every sampler-side mechanism measured inert here.
+	frag_code := blit_box_fragment_spirv
+	if _, pin_lod := os.lookup_env_alloc("VYPER_GPU_PIN_LOD", context.temp_allocator); pin_lod {
+		frag_code = blit_lod_fragment_spirv
+		fmt.println("gpu-probe: PINNED LOD 3 (diagnostic; mip chain content test)")
+	}
 	frag := sdl.GPUShaderCreateInfo {
-		code_size       = uint(len(preview_fragment_spirv)),
-		code            = raw_data(preview_fragment_spirv),
+		code_size       = uint(len(frag_code)),
+		code            = raw_data(frag_code),
 		entrypoint      = "main",
 		format          = {.SPIRV},
 		stage           = .FRAGMENT,
@@ -330,7 +412,22 @@ gpu_blit_run :: proc(p: ^GPU_Resample_Probe, src: []u8, src_stride: int, out: []
 	// the higher levels are whatever the driver left there, and sampling LOD>0
 	// blends that in -- which showed up as the image getting DARKER than the
 	// reference at every pixel, not as an obvious failure.
+	levels := mip_levels(p.src_w, p.src_h)
 	sdl.GenerateMipmapsForGPUTexture(cb, p.src_tex)
+	// The Odin binding drops this function's bool return, but SDL records a
+	// failure in the error slot, and a silent mipmap failure is exactly the bug
+	// being chased: a chain that was never filled leaves a sampler with nothing
+	// to select, so LOD clamps to 0 and anisotropy silently disables itself.
+	// Both symptoms look like "the GPU ignores my sampler state".
+	if mip_err := sdl.GetError(); mip_err != nil && len(mip_err) > 0 {
+		fmt.println(
+			"gpu-probe: GenerateMipmaps FAILED (levels requested =", levels, "):",
+			mip_err,
+		)
+	} else if !mip_status_announced {
+		mip_status_announced = true
+		fmt.println("gpu-probe: mip levels requested =", levels, "mipmaps ok")
+	}
 
 	// Draw the scaled quad. Sampling the FULL source rect across the dst rect
 	// is what makes the hardware filter, and it is the geometry the keyed path
@@ -428,11 +525,6 @@ GPU_Probe_Expect :: enum {
 	// raster, so two correct resamplers disagree by phase; asserting it would
 	// demand one filter's half-texel convention, not quality.
 	NYQUIST,
-	// Reported only, and a known-open gap. Single-tap hardware filtering
-	// aliases when minifying high-frequency content; a footprint kernel is the
-	// fix. This flips to GATED when that kernel lands, so the number stops
-	// being a report and becomes a regression gate. See TODO.md Active 4.
-	OPEN_ALIASING,
 }
 
 // gpu_probe_source builds a test image for `fixture` at the given size.
@@ -493,7 +585,7 @@ gpu_resample_probe_run :: proc() -> int {
 		{800, 450, SW, SH, .SMOOTH, 2.0, 8.0, .GATED},
 		{800, 450, SW, SH, .HIFREQ, 0.0, 0.0, .NYQUIST},
 		{5760, 3240, 1920, 1080, .SMOOTH, 1.0, 2.0, .GATED},
-		{5760, 3240, 1920, 1080, .HIFREQ, 8.0, 32.0, .OPEN_ALIASING},
+		{5760, 3240, 1920, 1080, .HIFREQ, 8.0, 32.0, .GATED},
 	}
 
 	ITERS :: 8
@@ -562,12 +654,6 @@ gpu_resample_probe_run :: proc() -> int {
 			}
 		case .NYQUIST:
 			verdict = "info (Nyquist)"
-		case .OPEN_ALIASING:
-			// Report the gap loudly, but do not fail the build on a defect that
-			// is not shipped yet -- the GPU blit is not the default path, the
-			// CPU kernel is. When the footprint kernel lands this becomes
-			// .GATED and the same number turns into a regression gate.
-			verdict = fmt.tprintf("open (budget %.0f/%.0f)", c.max_mean, c.max_peak)
 		}
 		fmt.printf(
 			"  %-7s %-21s gpu=%8.3f ms cpu=%8.3f ms %6.2fx mean=%5.2f peak=%3d  %s\n",

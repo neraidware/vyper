@@ -495,50 +495,85 @@ throughput. See the note appended to S2.
       resamplers differ by phase, and asserting it would demand one filter's
       convention rather than quality.
 
-      **BLOCKER for flipping the default: Vulkan resolves to a software
-      rasterizer here.** Measured 2026-09-27. The machine DOES have a GPU --
-      AMD, `amdgpu` kernel driver, PCI `1002:15BF` (Navi-class, ASUS
-      subvendor), with `/dev/dri/card0` and `/dev/dri/renderD128`. The blocker is
-      that no hardware Vulkan ICD binds to it: the loader finds `radeon_icd`,
-      `libvulkan_radeon.so` loads with all dependencies resolved, and then
-      enumerates zero AMD devices, dropping radeon/intel/nouveau/asahi/virtio
-      with "not having any physical devices" and leaving only `llvmpipe`. SDL3
-      therefore hands the export a software rasterizer, so every figure above is
-      software-Vulkan behaviour, and the 9-12x is a win over a scalar CPU kernel
-      on a CPU-emulated device -- not a measurement of real hardware.
+      **RESOLVED 2026-09-27 -- aliasing fixed and gated; the default can flip.**
+      The blocker was never the hardware. Recapping, because two wrong turns got
+      here and the notes should not repeat them:
 
-      (An earlier revision of this note claimed the box had no GPU at all. That
-      was wrong, and the check behind it was worthless: `lspci` is not installed
-      on this machine, so its empty output was absence of evidence, and a
-      truncated `ls` hid the render node. Do not repeat either check.)
+      - The box has an AMD GPU: `amdgpu` kernel driver, PCI `1002:15BF`
+        (Navi 33 / Radeon 760M), with `/dev/dri/card0` and
+        `/dev/dri/renderD128`. An earlier revision of this note claimed no GPU
+        at all. That came from `lspci` not being installed -- its empty output
+        was absence of evidence -- plus a truncated `ls` that hid the render
+        node. Never infer hardware from a tool that is not installed.
+      - The loader really was handing SDL3 `llvmpipe`, but the cause was a
+        **stale binary** carrying a different Vulkan loader and ICD search path,
+        not a missing ICD and not `RADV_PERFTEST` (the second wrong guess;
+        `RADV_PERFTEST` is unset on this box and the 760M is used regardless).
+        The permanent fix is that the probe now prints
+        `SDL_PROP_GPU_DEVICE_NAME_STRING` on every run, because the driver
+        string cannot distinguish hardware from software -- llvmpipe reports
+        backend `vulkan` exactly like a real adapter, which is what made a
+        green run readable as hardware. A software rasterizer is now a loud
+        warning, not a silent substitution.
 
-      Two attempts to fix the aliasing, both blocked the same way:
+      **The aliasing fix is a fragment-shader box filter** (`shaders/blit_box.frag`),
+      one `texelFetch` per covered source texel -- the same footprint the CPU
+      kernel walks. Sampler-side reconstruction was measured and is dead on this
+      driver, so it is not relied on:
 
-      - **Compute footprint kernel** (one thread per output pixel, averaging the
-        source box). SDL3's storage-texture story is stricter than the API
-        surface suggests and cost several wrong turns: `BeginGPUComputePass`
-        binds only *writeable* storage textures, so a readonly input must go
-        through the separate `SDL_BindGPUComputeStorageTextures`; and SPIR-V
-        compute sets are fixed and validated -- set 0 sampled + readonly storage,
-        set 1 read-write storage, set 2 uniforms. Getting either wrong compiles
-        cleanly and then writes nothing at all, which reads as "all pixels
-        zero", not as an error. Worth retrying once a real adapter is available,
-        because the API is now understood.
-      - **Mip levels + automatic LOD** (the far smaller change: same blit shader,
-        full mip chain, `mipmap_mode = .LINEAR`). Inert on `llvmpipe` -- a
-        sampler `mip_lod_bias` of +4.0 moves the 3x row by exactly 0.00, so the
-        higher levels are never sampled. The chain is built (11 levels at
-        1600x900) and `GenerateMipmapsForGPUTexture` is called outside any pass
-        as the header requires. Whether this is an `llvmpipe` limitation or a
-        bug in the blit is UNKNOWN, because `llvmpipe` cannot tell us. Retest on
-        the AMD adapter before concluding mips are the wrong fix.
+      - The mip chain generates successfully (11 levels at 1600x900, no SDL
+        error) and a shader hardcoding `textureLod(3.0)` still returns level-0
+        data, bit for bit.
+      - A sampler `mip_lod_bias` of 4.0 and 8.0 changed nothing, including at
+        1:1 where a live bias must visibly blur.
+      - 16x anisotropy was bit-identical to 1x. Aniso needs mips, so both being
+        inert is the same fact: this driver clamps every lookup to level 0.
+      - `VYPER_GPU_PIN_LOD` is kept as the standing test for whether a future
+        driver does honour a mip level.
 
-      So the aliasing *risk* is established (a single bilinear tap aliases under
-      minification on any conformant implementation) but the *fix* is unvalidated
-      here. Do not flip the default on this box: shipping it would trade a
-      measured 3x-downscale quality regression for a speedup that has never run
-      on hardware. The CPU kernel stays the default until a real-GPU run shows
-      the prefiltered path inside the 8/32 budget.
+      Two shader details were load-bearing, and both were found by measuring
+      rather than reasoning:
+
+      - Taps must be `texelFetch`, not `texture`. Filtering taps interpolate
+        before averaging, double-blurring on top of the box: the 2:1 case
+        measured mean 5.07 / peak 36 against the CPU reference, worse than no
+        averaging at all.
+      - The footprint must start at the first texel whose *centre* is inside it,
+        `floor(center - rho/2 + 0.5)`, not `floor(center - rho/2)`. The bare
+        floor lands a whole texel low, which is the off-by-one the failure
+        samples showed at the last pixel, `(1599,0899) gpu=102,084,063` against
+        `cpu=103,085,064`.
+
+      Results on the 760M, box path, against the CPU kernel as reference:
+
+      | case | mean | peak | budget | was (bilinear) |
+      |---|---|---|---|---|
+      | 1:1 SMOOTH | 0.00 | 0 | exact | 0.00 |
+      | 1:1 HIFREQ | 0.00 | 0 | exact | 0.00 |
+      | 0.5x SMOOTH | 0.20 | 1 | ok | 0.20 |
+      | 0.5x HIFREQ | 0.11 | 1 | ok | 0.11 |
+      | 2x SMOOTH | 1.16 | 7 | ok | 1.16 |
+      | 3x SMOOTH | 0.02 | 1 | ok | 0.05 |
+      | **3x HIFREQ** | **0.02** | **1** | **8/32** | **39.94 / 202** |
+
+      The 3x high-frequency row is the one that mattered and it went from a
+      severe aliasing regression to agreement with the CPU kernel. That row is
+      now `GATED` at 8/32 rather than reported, so it is a regression gate. The
+      `NYQUIST` magnification row stays ungated permanently: at 1px checkerboard
+      two correct resamplers differ by phase, and asserting it would demand one
+      filter's convention rather than quality.
+
+      Speed on the 760M, end to end including upload and synchronous readback:
+      0.5x downscale ~9-10x, 2x upscale ~45-50x, 3x downscale ~7.5-8x, all
+      against the scalar CPU kernel. 1:1 is slower on the GPU (0.9-1.7 ms vs
+      0.2-0.3 ms) because the probe pays upload and `WaitForGPUIdle` per
+      iteration, which is exactly the cost the direct NV12 hand-off would remove.
+
+      Shader compilation is now a build step (`scripts/gate.sh shaders`, run by
+      `build`) and the blit shaders are in the flake's `buildPhase`. The SPVs
+      are `#load`-ed at compile time, so rebuilding without recompiling keeps
+      the old shader -- which happened here and produced a confidently wrong
+      measurement.
 
       Remaining for S1b: footprint kernel, keyed-path GPU compositor, GPU
       RGBA->NV12, and direct NV12 hand-off to `hw_frames_ctx` to drop the
