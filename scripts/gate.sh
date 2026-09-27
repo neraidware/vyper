@@ -41,6 +41,20 @@ target_bench() {
 	./bin_swsbench
 }
 
+# Headless GPU export probe. Separate from target_probe because it exits with
+# the probe's own code and needs a real GPU device -- a driver without the
+# required capabilities must degrade to the CPU path, not fail the build, so
+# the probe reports "falling back to CPU" and the target still passes when
+# every case ran. A non-zero exit is a real correctness failure (the 1:1 row is
+# not an exact copy, or the numbers did not print at all).
+target_gpu_probe() {
+	if [ ! -x ./vyper ]; then
+		echo "gpu-probe: ./vyper missing, run scripts/gate.sh build first" >&2
+		return 1
+	fi
+	VYPER_GPU_PROBE=1 timeout 300 ./vyper
+}
+
 target_probe() {
 	env $PROBE_ENV timeout 120 ./vyper
 }
@@ -97,7 +111,7 @@ target_valgrind() {
 
 target_all() {
 	local t
-	for t in check build probe smoke valgrind; do
+	for t in check build probe gpu_probe smoke valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -109,11 +123,12 @@ main() {
 	build) target_build ;;
 	bench) target_bench ;;
 	probe) target_probe ;;
+	gpu_probe) target_gpu_probe ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|build|bench|probe|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|build|bench|probe|gpu_probe|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac

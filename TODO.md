@@ -450,6 +450,54 @@ throughput. See the note appended to S2.
       `canvas` to `rend_enc_video_frame`), and a capability check with the CPU
       kernel as the fallback when no usable context exists. Kept as a separate
       step because it is a compositor change, not a resampler change.
+
+      **Status: stage 1 landed as a probe (`gpu_resample_probe.odin`,
+      `scripts/gate.sh gpu_probe`), measured 2026-09-27.** Headless offscreen GPU
+      resample works with no window: `SDL_Init(SDL_INIT_VIDEO)` is still
+      required (`CreateGPUDevice` fails with "Video subsystem not
+      initialized" otherwise), and `CreateGPUDevice`'s third argument is the
+      `SDL_HINT_GPU_DRIVER` *value*, not a device name — a free-form string there
+      is rejected as an unknown driver. `nil` auto-selects; `"vulkan"` is the
+      explicit retry.
+
+      Measured against the S0 kernel, 1600x900/800x450 source pair:
+
+      | geometry | GPU | CPU kernel | speedup | mean/peak |
+      |---|---|---|---|---|
+      | 1600x900 -> 1600x900 | 1.31 ms | 0.35 ms | 0.27x | 0.00 / 0 |
+      | 1600x900 -> 800x450 | 0.99 ms | 10.8 ms | 10.9x | 0.20 / 1 |
+      | 800x450 -> 1600x900 | 0.78 ms | 49.5 ms | 63.5x | 1.16 / 7 |
+      | 5760x3240 -> 1920x1080 | 8.57 ms | 92.7 ms | 10.8x | 0.05 / 1 |
+
+      Two findings that change the design:
+
+      1. **A half-texel inset is wrong here.** Mapping destination pixel center
+         `p` to `p/src_w` is exact for 1:1, so `src_rect` must be the exact
+         source rect `(0,0,1,1)`. Insetting the endpoints shifts the image half
+         a texel; the 1:1 exactness gate is what caught it, which is why that
+         gate is not optional.
+      2. **A single point-sampled bilinear fetch ALIASES under minification.**
+         On a high-frequency fixture (1px checkerboard + 1px rules + hash) the
+         3x downscale reads mean 39.9 / peak 202 against the box reference,
+         because the box averages a 3x3 footprint to uniform grey while one
+         bilinear tap keeps checkerboard contrast. A band-limited fixture hides
+         this entirely (the same row reads mean 0.05), so the probe runs BOTH:
+         `SMOOTH` catches geometry errors, `HIFREQ` catches filtering errors.
+
+      Consequence: hardware filtering alone is **not** an acceptable export
+      default for minification. S1b needs a footprint kernel (compute, summing
+      the source box) rather than one filtered quad, which also has the useful
+      property of making the GPU and the CPU fallback produce the same image —
+      otherwise "fallback" is a silent quality change. The probe's
+      `OPEN_ALIASING` row is deliberately reported-not-asserted until that
+      kernel lands, then flips to `GATED` with the 8/32 budget it already
+      carries. The `NYQUIST` rows stay ungated permanently: at 1px checkerboard
+      two correct resamplers differ by phase, and asserting it would demand one
+      filter's convention rather than quality.
+
+      Remaining for S1b: footprint kernel, keyed-path GPU compositor, GPU
+      RGBA->NV12, and direct NV12 hand-off to `hw_frames_ctx` to drop the
+      readback.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve

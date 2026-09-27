@@ -1447,6 +1447,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.
+	// Headless GPU export probe: creates a GPU device with no window, resamples
+	// on the hardware sampler, reads back, and gates the result against the
+	// committed CPU kernel. This is the first gate of the GPU export path --
+	// if the device, the SPIR-V, or the readback does not work here, the export
+	// falls back to the CPU and there is nothing further to tune.
+	if g, _ := os.lookup_env_alloc("VYPER_GPU_PROBE", context.temp_allocator); g != "" {
+		os.exit(gpu_resample_probe_run())
+	}
 	if v, _ := os.lookup_env_alloc("VYPER_UI_PROBE", context.temp_allocator); v != "" {
 		ui_draw_probe_run()
 	}
