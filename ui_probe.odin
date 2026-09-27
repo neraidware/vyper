@@ -131,6 +131,11 @@ for j := 0; j < len(raw); {
 	if !ui_probe_action_table_asserts() {
 		os.exit(1)
 	}
+	// The router's owner order and each owner's claim, pinned without firing
+	// real actions at the seeded session.
+	if !ui_probe_key_routing_asserts() {
+		os.exit(1)
+	}
 	// The file finder is a dialog-style popup drawn off the text input hook:
 	// open it headless, lay out a page, and check the popup exists, is centered,
 	// and paints one row per visible entry.
@@ -408,6 +413,64 @@ ui_probe_action_table_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] action table ok (%d cases)\n", len(cases))
+	}
+	return ok
+}
+
+// The router replaced a nested if/else chain, so what matters is that each
+// owner claims exactly what it used to. These assert the CLAIM, not the side
+// effect: firing real actions here would split clips and move the playhead in
+// the middle of the other probes.
+ui_probe_key_routing_asserts :: proc() -> bool {
+	ok := true
+
+	// No field open: the text field must claim nothing. This is the guard that
+	// keeps a stale ti.input_type from swallowing the whole keyboard after a
+	// prompt is closed.
+	ti.active = false
+	if field_claims_key(sdl.K_U, {}) {
+		fmt.eprintf("[ui-probe] the text field claimed a key with no field open\n")
+		ok = false
+	}
+
+	// Field open: a key the field does not act on is still claimed, which is
+	// the pre-existing behaviour (no exit from the old branch). If this ever
+	// becomes false it is a deliberate change, not an accident.
+	ti.active = true
+	claimed := field_claims_key(sdl.K_U, {})
+	ti.active = false
+	if !claimed {
+		fmt.eprintf("[ui-probe] the text field passed an unhandled key to the app\n")
+		ok = false
+	}
+
+	// The number field is the opposite: it takes three keys and lets the rest
+	// through, so a shortcut still works while the playhead is being typed.
+	Claim :: struct {
+		key:   sdl.Keycode,
+		want:  bool,
+		which: string,
+	}
+	claims := [?]Claim {
+		{ sdl.K_U, false, "an unbound key reaches the app" },
+		{ sdl.K_ESCAPE, true, "Esc cancels the field" },
+		{ sdl.K_RETURN, true, "Enter commits the field" },
+		{ sdl.K_RETURN2, true, "the keypad Enter commits too" },
+		{ sdl.K_BACKSPACE, true, "Backspace edits the field" },
+		{ sdl.K_DELETE, false, "Delete is NOT the number field's: it deletes a clip" },
+		{ sdl.K_F1, false, "F1 stays a global shortcut" },
+	}
+	for c in claims {
+		if got := edit_field_claims_key(c.key); got != c.want {
+			fmt.eprintf(
+				"[ui-probe] edit_field_claims_key(K_%v) = %v, want %v (%s)\n",
+				c.key, got, c.want, c.which,
+			)
+			ok = false
+		}
+	}
+	if ok {
+		fmt.printf("[ui-probe] key routing ok\n")
 	}
 	return ok
 }

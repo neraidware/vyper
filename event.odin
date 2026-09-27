@@ -32,177 +32,7 @@ handle_sdl_events :: proc(running: ^bool) {
 			kbd_note_key(event.key.key, false)
 		case .KEY_DOWN:
 			kbd_note_key(event.key.key, true)
-			if ti.active {
-				// Modifiers come off the event, never sdl.GetModState(): the
-				// event snapshots what was held at key-down, the global state
-				// is sampled at handling time. They diverge whenever the main
-				// thread stalls long enough for events to queue and the user
-				// releases or changes a modifier before the queue drains.
-				mods := event.key.mod
-				shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
-				ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
-				// Cmdline match navigation: Tab/arrows move the highlighted
-				// row; handled here so the generic text field stays generic.
-				if ti.input_type == TI_CMDLINE {
-					switch event.key.key {
-					case sdl.K_TAB:
-						cmdline_match_navigate(shift ? -1 : 1)
-						continue
-					case sdl.K_UP:
-						cmdline_match_navigate(-1)
-						continue
-					case sdl.K_DOWN:
-						cmdline_match_navigate(1)
-						continue
-					}
-				}
-				// Finder navigation: Tab/Up/Down move the highlight, Enter
-				// descends into the selected directory or opens the selected
-				// file — Enter never commits the field (the finder stays open
-				// across a descend), so it is handled before the generic
-				// commit path. In Save mode the field is a name, so Enter saves
-				// that name; the row only picks "commit" over "descend". Esc
-				// still cancels through the text field.
-				if ti.input_type == TI_FINDER {
-					switch event.key.key {
-					case sdl.K_TAB:
-						finder_navigate(shift ? -1 : 1)
-						continue
-					case sdl.K_UP:
-						finder_navigate(-1)
-						continue
-					case sdl.K_DOWN:
-						finder_navigate(1)
-						continue
-					case sdl.K_RETURN, sdl.K_RETURN2:
-						finder_refresh()
-						finder_enter()
-						continue
-					}
-				}
-				r := text_input_handle_key(event.key.key, shift, ctrl)
-				if r == .Commit {
-					if ti.input_type == TI_PLAYHEAD {
-						apply_playhead_time()
-					} else if ti.input_type == TI_CMDLINE {
-						// Rewrites the buffer to `open <highlighted>` when a
-						// match row is selected, so the normal command path
-						// opens that file; otherwise leaves typed text alone.
-						cmdline_match_apply_selection()
-						apply_command()
-					} else {
-						apply_rename()
-					}
-				} else if r == .Cancel {
-					if ti.input_type == TI_FINDER {
-						// Esc dismissed the finder's filter field.
-						finder_close()
-					} else if ti.is_create {
-						// Aborted a clip-create dialog: drop the clip that was
-						// temporarily inserted so no nameless clip remains.
-						delete_selected_clip_raw()
-						ti.is_create = false
-					}
-				}
-			} else if edit_state.field != .None {
-				switch event.key.key {
-				case sdl.K_BACKSPACE:
-					edit_backspace()
-				case sdl.K_RETURN, sdl.K_RETURN2:
-					edit_commit()
-				case sdl.K_ESCAPE:
-					edit_cancel()
-				}
-			} else if event.key.key == sdl.K_ESCAPE && !event.key.repeat {
-				escape_dismiss()
-			} else {
-				// Continuous actions run on auto-repeat as well as on the
-				// initial press, which is what makes holding a key jog. This
-				// branch is reached only when no field owns the key, so a jog
-				// can never fire while the user is typing.
-				//
-				// key_repeat is true only for a DOWN of a key that was already
-				// down — the OS auto-repeat event — so this does not double up
-				// with the one-shot press handled by the switch below.
-				if key_repeat(sdl.K_H) {
-					jog_playback(-1)
-				}
-				if key_repeat(sdl.K_L) {
-					jog_playback(1)
-				}
-				if !event.key.repeat {
-					// Every modifier test in this block reads event.key.mod, never
-					// sdl.GetModState(). The event snapshots what was held at
-					// key-down; the global state is sampled when the event is
-					// handled. They diverge whenever the main thread stalls long
-					// enough for input to queue and the user changes a modifier
-				// before the queue drains — which fires the wrong action, or
-				// none. A Shift released in between used to lose the ":"
-				// opener outright (the "prompt never opens" symptom).
-				switch action_for(event.key.key, event.key.mod) {
-				case .None:
-				case .Open_Command_Line:
-					// Opens empty; the keypress's own text echo is dropped by
-					// the suppressor in the TEXT_INPUT branch below.
-					text_input_begin("", TI_CMDLINE, 0)
-					ti.swallow_char = CMDLINE_OPENER[0]
-				case .Toggle_Help:
-					// Always-available shortcut reference.
-					editor_flags.help_open = !editor_flags.help_open
-				case .Undo:
-					undo_undo()
-				case .Redo:
-					undo_redo()
-				case .Toggle_Playback:
-					toggle_playback()
-				case .Play_Project_Area:
-					play_project_area()
-				case .Begin_Rename:
-					begin_clip_rename()
-				case .Split_At_Playhead:
-					split_clip_at_playhead()
-				case .Toggle_Links:
-					// Toggle link state across the selection: a lone clip
-					// unlinks its group; several Shift+clicked clips join into
-					// one link group (or all split apart when already linked).
-					toggle_links_for_selection()
-				case .Delete_At_Playhead:
-					if !delete_selected_keyframe() {
-						// Delete the selected clip's timeline area and close the
-						// gap (ripple). A linked clip rips the WHOLE group: every
-						// member's own span on its own track, so a ripple cut
-						// never leaves the partner clip behind (rippling only the
-						// selected member's region would strand the rest).
-						if tr, clip, ok := selected_clip(); ok {
-							if clip.link_id != 0 {
-								ripple_delete_linked_group(clip.link_id)
-							} else {
-								ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
-							}
-						}
-					}
-				case .Delete_Selection:
-					if !delete_selected_keyframe() {
-						// Delete the clip raw, nothing else.
-						delete_selected_clip_raw()
-					}
-				case .Set_In_Point:
-					// Set the render-range start at the playhead; collapsing the
-					// range to a single frame clears it.
-					project.start_frame = playhead.frame
-					if project.end_frame == playhead.frame {
-						project.start_frame = -1
-						project.end_frame = -1
-					}
-				case .Set_Out_Point:
-					project.end_frame = playhead.frame
-					if project.start_frame == playhead.frame {
-						project.start_frame = -1
-						project.end_frame = -1
-					}
-				}
-			}
-			}
+			route_key_down(event.key.key, event.key.mod, event.key.repeat)
 		case .TEXT_INPUT:
 			if ti.active {
 				text := string(event.text.text)
@@ -338,5 +168,243 @@ handle_sdl_events :: proc(running: ^bool) {
 				}
 			}
 		}
+	}
+}
+// ---------------------------------------------------------------------------
+// Key routing: one entry point, ordered owners, one place that says who gets
+// a key first.
+//
+// The order IS the policy, so it is written down once here instead of being
+// implied by the nesting depth of an if/else chain:
+//
+//	1. the text field (ti.active)
+//	2. the playhead/number field (edit_state.field)
+//	3. the app — global shortcuts and continuous controls
+//
+// Each owner returns whether it CLAIMED the key, and a claimed key stops
+// travelling. That is what makes "the field ate the opener's own echo" a
+// property of the structure rather than something a suppressor has to clean up
+// afterwards: there is one path to the app layer, and a field is on it.
+// ---------------------------------------------------------------------------
+
+route_key_down :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool {
+	if field_claims_key(key, mods) {
+		return true
+	}
+	if edit_field_claims_key(key) {
+		return true
+	}
+	return app_claims_key(key, mods, repeat)
+}
+
+// field_claims_key handles a key while a text field has focus.
+//
+// It claims EVERY key, not merely the ones it acts on. That is the
+// pre-existing behaviour and it is preserved deliberately: the old if/else had
+// no exit from this branch, so with the prompt open a shortcut key such as "u"
+// did nothing instead of falling through to toggle links. Letting unhandled
+// keys reach the app is arguably the better behaviour, but it is a behaviour
+// CHANGE, and this pass is a refactor — it is a one-line edit here once
+// someone decides they want it.
+field_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod) -> bool {
+	if !ti.active {
+		return false
+	}
+	// Modifiers come off the event, never sdl.GetModState(): the event
+	// snapshots what was held at key-down, the global state is sampled at
+	// handling time. They diverge whenever the main thread stalls long enough
+	// for events to queue and the user releases or changes a modifier before
+	// the queue drains.
+	shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
+	ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
+	// Cmdline match navigation: Tab/arrows move the highlighted row; handled
+	// here so the generic text field stays generic.
+	if ti.input_type == TI_CMDLINE {
+		switch key {
+		case sdl.K_TAB:
+			cmdline_match_navigate(shift ? -1 : 1)
+			return true
+		case sdl.K_UP:
+			cmdline_match_navigate(-1)
+			return true
+		case sdl.K_DOWN:
+			cmdline_match_navigate(1)
+			return true
+		}
+	}
+	// Finder navigation: Tab/Up/Down move the highlight, Enter descends into
+	// the selected directory or opens the selected file — Enter never commits
+	// the field (the finder stays open across a descend), so it is handled
+	// before the generic commit path. In Save mode the field is a name, so
+	// Enter saves that name; the row only picks "commit" over "descend". Esc
+	// still cancels through the text field.
+	if ti.input_type == TI_FINDER {
+		switch key {
+		case sdl.K_TAB:
+			finder_navigate(shift ? -1 : 1)
+			return true
+		case sdl.K_UP:
+			finder_navigate(-1)
+			return true
+		case sdl.K_DOWN:
+			finder_navigate(1)
+			return true
+		case sdl.K_RETURN, sdl.K_RETURN2:
+			finder_refresh()
+			finder_enter()
+			return true
+		}
+	}
+	r := text_input_handle_key(key, shift, ctrl)
+	if r == .Commit {
+		if ti.input_type == TI_PLAYHEAD {
+			apply_playhead_time()
+		} else if ti.input_type == TI_CMDLINE {
+			// Rewrites the buffer to `open <highlighted>` when a match row is
+			// selected, so the normal command path opens that file; otherwise
+			// leaves typed text alone.
+			cmdline_match_apply_selection()
+			apply_command()
+		} else {
+			apply_rename()
+		}
+	} else if r == .Cancel {
+		if ti.input_type == TI_FINDER {
+			// Esc dismissed the finder's filter field.
+			finder_close()
+		} else if ti.is_create {
+			// Aborted a clip-create dialog: drop the clip that was
+			// temporarily inserted so no nameless clip remains.
+			delete_selected_clip_raw()
+			ti.is_create = false
+		}
+	}
+	return true
+}
+
+// edit_field_claims_key handles the inline playhead/number field. Unlike the
+// text field it does NOT swallow the keyboard: it takes three keys and passes
+// the rest down to the app, so a shortcut still works while the playhead is
+// being typed into. That asymmetry is pre-existing and intentional — a number
+// field is a single digit you nudge, not a document you type into.
+edit_field_claims_key :: proc(key: sdl.Keycode) -> bool {
+	// sdl.Keycode is a distinct integer, not an enum, so this switch has
+	// neither a `default` clause (that is a `when` construct in Odin) nor
+	// `#partial` (that needs an enum): an unmatched key just falls out. Hence
+	// the flag — the switch alone cannot report whether it matched.
+	claimed := false
+	switch key {
+	case sdl.K_BACKSPACE:
+		edit_backspace()
+		claimed = true
+	case sdl.K_RETURN, sdl.K_RETURN2:
+		edit_commit()
+		claimed = true
+	case sdl.K_ESCAPE:
+		edit_cancel()
+		claimed = true
+	}
+	return claimed
+}
+
+// app_claims_key is the last owner: global shortcuts plus the continuous
+// controls. Reached only when no field took the key.
+app_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool {
+	if key == sdl.K_ESCAPE && !repeat {
+		escape_dismiss()
+		return true
+	}
+	claimed := false
+	// Continuous actions run on auto-repeat as well as on the initial press,
+	// which is what makes holding a key jog.
+	//
+	// key_repeat is true only for a DOWN of a key that was already down — the
+	// OS auto-repeat event — so it does not double up with the one-shot press
+	// the action table resolves below.
+	if key_repeat(sdl.K_H) {
+		jog_playback(-1)
+		claimed = true
+	}
+	if key_repeat(sdl.K_L) {
+		jog_playback(1)
+		claimed = true
+	}
+	// A bound action fires on the initial press only. Gating on the event's
+	// repeat flag rather than on key_press() keeps this identical to the
+	// pre-router code; the two agree for a real key press, and the event flag
+	// is what the old branch tested.
+	if repeat {
+		return claimed
+	}
+	act := action_for(key, mods)
+	if act == .None {
+		return claimed
+	}
+	dispatch_action(act)
+	return true
+}
+
+dispatch_action :: proc(act: Action) {
+	switch act {
+	case .Open_Command_Line:
+		// Opens empty; the keypress's own text echo is dropped by the
+		// suppressor in the TEXT_INPUT branch.
+		text_input_begin("", TI_CMDLINE, 0)
+		ti.swallow_char = CMDLINE_OPENER[0]
+	case .Toggle_Help:
+		// Always-available shortcut reference.
+		editor_flags.help_open = !editor_flags.help_open
+	case .Undo:
+		undo_undo()
+	case .Redo:
+		undo_redo()
+	case .Toggle_Playback:
+		toggle_playback()
+	case .Play_Project_Area:
+		play_project_area()
+	case .Begin_Rename:
+		begin_clip_rename()
+	case .Split_At_Playhead:
+		split_clip_at_playhead()
+	case .Toggle_Links:
+		// Toggle link state across the selection: a lone clip unlinks its
+		// group; several Shift+clicked clips join into one link group (or all
+		// split apart when already linked).
+		toggle_links_for_selection()
+	case .Delete_At_Playhead:
+		if !delete_selected_keyframe() {
+			// Delete the selected clip's timeline area and close the gap
+			// (ripple). A linked clip rips the WHOLE group: every member's own
+			// span on its own track, so a ripple cut never leaves the partner
+			// clip behind (rippling only the selected member's region would
+			// strand the rest).
+			if tr, clip, ok := selected_clip(); ok {
+				if clip.link_id != 0 {
+					ripple_delete_linked_group(clip.link_id)
+				} else {
+					ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+				}
+			}
+		}
+	case .Delete_Selection:
+		if !delete_selected_keyframe() {
+			// Delete the clip raw, nothing else.
+			delete_selected_clip_raw()
+		}
+	case .Set_In_Point:
+		// Set the render-range start at the playhead; collapsing the range to
+		// a single frame clears it.
+		project.start_frame = playhead.frame
+		if project.end_frame == playhead.frame {
+			project.start_frame = -1
+			project.end_frame = -1
+		}
+	case .Set_Out_Point:
+		project.end_frame = playhead.frame
+		if project.start_frame == playhead.frame {
+			project.start_frame = -1
+			project.end_frame = -1
+		}
+	case .None:
 	}
 }

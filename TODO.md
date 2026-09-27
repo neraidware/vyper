@@ -776,11 +776,28 @@ later work-stream that plugs into it without reshaping what is here.
       compiling. `mods_have` now walks the four L/R pairs and requires at least
       one side, falling back to a plain subset test for unpaired flags
       (CapsLock/NumLock). Pinned by probe cases for left *and* right Shift/Ctrl.
-- [ ] I5. Focus/consume routing: one entry point where a focused field gets
-      first refusal and the app layer never sees a consumed key. Replaces the
-      nested modal if/else. The point is structural — it makes "the opener
-      opened a field, the field then eats its own echo" impossible to express,
-      rather than something a suppressor has to clean up after.
+- [x] I5. Focus/consume routing. `route_key_down` is now the single entry point
+      for every KEY_DOWN, with the owner order stated once in a comment instead
+      of being implied by if/else nesting depth: text field -> number field ->
+      app. Each owner returns whether it CLAIMED the key and a claimed key stops
+      travelling, so there is exactly one path to the app layer. Split into
+      `field_claims_key` / `edit_field_claims_key` / `app_claims_key` plus
+      `dispatch_action`; `handle_sdl_events` now just calls the router and no
+      longer contains a 170-line nested branch.
+      Two owner behaviours preserved deliberately, and both are one-line changes
+      if anyone decides otherwise:
+      - The text field claims EVERY key, not just the ones it acts on. The old
+        branch had no exit, so with the prompt open `u` did nothing instead of
+        toggling links.
+      - The number field is the opposite: it takes Backspace/Enter/Esc and
+        passes everything else down, so shortcuts work while typing a playhead.
+      Pinned by probe (`key routing ok`), which asserts the CLAIM rather than
+      firing real actions at the seeded session.
+      Note: `sdl.Keycode` is a distinct integer, not an enum, so a switch on it
+      has neither `default` (a `when` construct in Odin) nor `#partial` (needs
+      an enum) — an unmatched key just falls out, which is why
+      `edit_field_claims_key` needs an explicit claimed flag to report whether
+      it matched.
 - [ ] I6. Drain-scoped echo fix, which I5 makes free. The suppressor is
       already correct for the stall case (character-match, not
       drain-bounded — under a 200 ms main-thread stall the user types `:` then
