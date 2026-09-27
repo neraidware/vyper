@@ -797,11 +797,18 @@ later work-stream that plugs into it without reshaping what is here.
         passes everything else down, so shortcuts work while typing a playhead.
       Pinned by probe (`key routing ok`), which asserts the CLAIM rather than
       firing real actions at the seeded session.
-      Note: a bare `case:` is Odin's default clause in a value switch, and
-      `#partial switch` is the enum-only form that falls out on no match.
-      `edit_field_claims_key` needs a `case:` arm purely so the switch can
-      report that it did not match — with no field open the router never calls
-      it, so the arm is inert.
+      Note, verified against the compiler rather than inferred: a bare `case:`
+      is the runtime else of an Odin value switch. `#partial switch` is the
+      enum-only variant that falls out on no match, and combines with a bare
+      `case:` to act as its else. A full switch on an enum is still required to
+      be exhaustive — a bare `case:` does NOT satisfy that, and the compiler
+      answers "Unhandled switch case" and suggests `#partial`, so reaching for
+      `case:` to silence it does not work. `when` is unrelated to all of this:
+      it is a compile-time conditional where only the taken branch is
+      typechecked, and its `default:` is compile-time dispatch rather than a
+      runtime fallback. `edit_field_claims_key` needs a `case:` arm purely so the
+      switch can report that it did not match — with no field open the router
+      never calls it, so the arm is inert.
 - [x] I6. Drain-scoped echo. `swallow_char` became a
       `(swallow_char, swallow_drain)` pair; the suppressor only drops a text
       event when the drain matches the one the opener was armed in, so a
