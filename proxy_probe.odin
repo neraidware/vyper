@@ -105,7 +105,16 @@ proxy_probe_run :: proc(v: string) {
 			fi, mean_src, buffer_mean(pxs[i][:]), mean_abs, int(max_abs))
 	}
 
-	// 4. Cleanup artifact.
+	// 4. Report the artifact size, then clean up. Size is the only place the
+	//    encoder's rate control is observable: a proxy that comes out wildly
+	//    larger than its duration justifies is a rate-control constant that
+	//    needs retuning, and nothing else in the pipeline would show it.
+	if fh, err := os.open(string(proxy)); err == nil {
+		if size, size_err := os.file_size(fh); size_err == nil {
+			fmt.printf("[proxy-probe] artifact: %d bytes\n", size)
+		}
+		os.close(fh)
+	}
 	os.remove(string(proxy))
 	fmt.println("[proxy-probe] OK: proxy transcoded, picked, decoded, matches source content")
 	os.exit(0)

@@ -28,7 +28,8 @@
 machine. We can't: our decoder is pure software (`avcodec.open2(ctx, codec, nil)`,
 decode.odin:355 — no `hw_device_ctx` anywhere), AV1 1080p60 software decode is
 one of the most expensive loop-carried jobs a CPU does and 2x doubles the per-
-wall-second decode load while the background proxy build software-encodes on top.
+wall-second decode load while the background proxy build runs on top (it
+hardware-encodes by default now, but its swscale+NV12 upload is still CPU work).
 We also never show the original: `proxy_pick_for_frame` serves the 768x432 proxy,
 so full quality is unreachable by design and host decode power goes unused.
 Audio speed is `SetAudioStreamFrequencyRatio` (audio.odin:347) — plain resampling,
@@ -144,8 +145,8 @@ Steps (each lands + probe + vet before the next):
       vaapi hw (pixfmt 44), process CPU ~20% during playback (frac of one
       core — cores free). GUI confirm + mpv recheck still outstanding.
 
-Out of scope (future): GPU→GPU zero-copy compositing, hw-encode for proxies,
-ICC color management, video interpolation (motion-estimated), A/V drift autotune.
+Out of scope (future): GPU→GPU zero-copy compositing, ICC color management,
+video interpolation (motion-estimated), A/V drift autotune.
 
 Open bug (shelved, resolved by S2): scheduler probe reported fresh
 segments verifying as `-1` (ffprobe code=1 empty stderr) while bg-test passes
@@ -906,13 +907,24 @@ later work-stream that plugs into it without reshaping what is here.
   the decoder returns consistent last-frame content) or pin encoder pacing;
   otherwise a cadence-only change can non-deterministically alter the last GOP
   of an export.
-- **GPU-side encode (NOT planned)** — Export is CPU-pipeline-bound; the
-  encoder thread is the gate at 3.74 ms/f for 240x1080p60 (RGB->NV12 SIMD
-  1.87 + VAAPI surface upload 1.03 + h264_vaapi 0.84), everything else
-  (producer 1.97, composite+audio 2.20) sits under it. The only meaningful
-  remaining win is removing that conversion+upload from the encoder thread
-  via Vulkan<->VAAPI dma-buf interop (VK_EXT_external_memory_dma_buf ->
-  prime fd into the VAAPI surface). Risky/hard: FFmpeg's vaapi encode path
+- **Zero-copy GPU->encoder interop (NOT planned; hardware encode itself IS
+  shipped)** — Hardware encode is already the export default. `.GPU` opens the
+  first encoder that actually works on the machine — `h264_nvenc`, `h264_vaapi`,
+  `h264_qsv`, `h264_amf` on Linux, `h264_videotoolbox` on macOS, nvenc/qsv/amf
+  on Windows — and falls back to libx264; the candidate list itself now lives in
+  `hw_encode.odin` (shared with the proxy path);
+  `enc_probe.odin` reports which one actually opened (`h264_vaapi` on this
+  box). What is NOT implemented is the step after that: keeping the composited
+  frame on the GPU so the pixel conversion and the surface upload never reach
+  the encoder thread at all.
+  Export is CPU-pipeline-bound; the encoder thread is the gate at 3.74 ms/f
+  for 240x1080p60 (RGB->NV12 SIMD 1.87 + VAAPI surface upload 1.03 +
+  h264_vaapi 0.84), everything else (producer 1.97, composite+audio 2.20) sits
+  under it. Note which terms are actually on the table: the `h264_vaapi` 0.84
+  is the hardware encoder ALREADY IN USE, so the remaining win is only the
+  conversion and the upload, via Vulkan<->VAAPI dma-buf interop
+  (VK_EXT_external_memory_dma_buf -> prime fd into the VAAPI surface).
+  Risky/hard: FFmpeg's vaapi encode path
   always copies sw frames into its own surfaces, so raw-VAAPI or forked
   send is involved; NVIDIA would be CUDA-only (this box is Intel). Floor if
   it works ~1.18s -> ~0.7s (240f). Decided against for now. If ever picked
@@ -994,6 +1006,26 @@ Details TBD when Phase 2 reaches maturity.
   ~2.4 vs ~5.5 ms/f). Default is `h264_nvenc → h264_vaapi → h264_qsv →
   h264_amf → libx264`, so software runs only when no hardware encoder opens.
   Manual "High quality (CPU)" still available in the encoder menu.
+- **Preview proxies encode on hardware by default, software = fallback** —
+  Same candidate list as export, now shared: `hw_encode.odin` owns
+  `hw_enc_candidate_names` / `hw_enc_open` and both `render.odin` and
+  `proxy_encode.odin` call it, so a hardware encoder is accepted only when a
+  real `avcodec_open2` succeeds (a registered name without the device behind
+  it is the common case on a machine with no hardware encoder). Proxy HW path
+  scales to NV12 and uploads via `av_hwframe_get_buffer` +
+  `av_hwframe_transfer_data` before the send; CPU keeps crf 26 / ultrafast /
+  fastdecode. `VYPER_PROXY_ENCODER=cpu` forces the fallback so a probe on a
+  machine that HAS hardware can still exercise it.
+  Rate control is sized per encoder, not shared: `proxy_hw_bitrate` derives
+  bits/pixel/frame (`PROXY_HW_BITS_PER_PIXEL`) because constant-quality has no
+  single option name across nvenc/vaapi/qsv/amf. Measured 10s 1080p source →
+  768x432 all-intra: VAAPI 957 KB vs libx264 1.48 MB, equal or better frame
+  agreement — the hardware path is also the smaller artifact, so the default is
+  a strict win. `PROXY_SUFFIX` deliberately does not encode the choice: keying
+  the cache by encoder would make the fallback permanent and invalidate every
+  existing proxy for output nobody watches.
+  `proxy_probe.odin` now reports artifact size — it is the only place rate
+  control is observable, so a retuned constant is visible instead of silent.
 
 ## Implemented — miniaudio audio backend (2026-09-26)
 

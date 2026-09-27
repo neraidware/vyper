@@ -240,40 +240,98 @@ proxy_encode_range :: proc(
 	}
 
 	// --- Encoder ---
-	enc_codec := avcodec.find_encoder_by_name("libx264")
-	is_x264 := enc_codec != nil
-	if enc_codec == nil {
-		enc_codec = avcodec.find_encoder(avcodec.CodecID.H264)
+	// Hardware encoders first, libx264 as the guaranteed fallback, on the same
+	// candidate list the export path uses (hw_encode.odin). A proxy is the case
+	// that wants this most: it is the thing standing between an unscrubbable
+	// timeline and a usable one, and it is all-intra, which is the shape
+	// hardware encode is cheapest on.
+	//
+	// The two paths differ in rate control rather than in plumbing. libx264
+	// keeps the original crf/preset/tune; hardware encoders get a bitrate
+	// derived from the proxy's own dimensions, because constant-quality has no
+	// single option name across nvenc/vaapi/qsv/amf and inventing one here
+	// would be a per-vendor special case for no benefit on a 768x432 preview.
+	enc: ^avcodec.CodecContext
+	defer if enc != nil {
+		avcodec.free_context(&enc)
 	}
-	if enc_codec == nil {
-		fmt.println("[enc] no H.264 encoder available")
+	enc_sw_pix_fmt := avutil.PixelFormat.YUV420P
+	is_x264 := false
+	use_hw := false
+	enc_codec: ^avcodec.Codec
+
+	names := hw_enc_candidate_names(!proxy_encoder_use_hw())
+	opened := false
+	for name in names {
+		codec := avcodec.find_encoder_by_name(name)
+		if codec == nil {
+			continue
+		}
+		ctx := avcodec.alloc_context3(codec)
+		if ctx == nil {
+			continue
+		}
+		ctx.width = out_w
+		ctx.height = out_h
+		ctx.time_base = {num = fps.den, den = fps.num}
+		ctx.gop_size = proxy_encoder.gop
+		ctx.max_b_frames = 0
+		ctx.thread_count = threads
+		// Without this flag avcodec_send_frame zeroes frame.duration, so the
+		// encoder emits pkt.duration=0 and the mp4 muxer sizes the final stts
+		// sample to zero — the last proxy frame becomes unaddressable by pts,
+		// which the timeline preview (frame -> pts -> seek) needs. Same defect
+		// and fix as the render path.
+		ctx.flags += {avcodec.CodecFlag.Frame_Duration}
+
+		if name == "libx264" {
+			// x264-private rate-control/tuning knobs, identical to the old argv.
+			ctx.pix_fmt = avutil.PixelFormat.YUV420P
+			avutil.opt_set(ctx, "preset", proxy_encoder.preset, 0)
+			avutil.opt_set(ctx, "tune", proxy_encoder.tune, 0)
+			avutil.opt_set(ctx, "crf", proxy_encoder.crf, 0)
+			if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
+				fmt.printf("[enc] avcodec_open2 (%s): %s\n", string(name), ff_err_str(ret))
+				avcodec.free_context(&ctx)
+				continue
+			}
+			enc_sw_pix_fmt = avutil.PixelFormat.YUV420P
+			is_x264 = true
+		} else {
+			ctx.bit_rate = proxy_hw_bitrate(out_w, out_h, f64(fps.num) / f64(fps.den))
+			// A hardware encoder is only accepted when a real open succeeds: a
+			// name can be registered in this build and still fail without the
+			// device behind it, which is the common case on a machine with no
+			// hardware encoder at all.
+			ok, dev, frames := hw_enc_open(ctx, codec, out_w, out_h)
+			if !ok {
+				// hw_enc_open releases its own refs on every failure path.
+				avcodec.free_context(&ctx)
+				continue
+			}
+			// Drop our copies of the device/frames refs straight away: ctx took
+			// its own references in hw_enc_open, and avcodec.free_context
+			// releases those with the context. The upload below reads
+			// enc.hw_frames_ctx, not these.
+			avutil.buffer_unref(&frames)
+			avutil.buffer_unref(&dev)
+			use_hw = true
+			enc_sw_pix_fmt = avutil.PixelFormat.NV12
+		}
+		enc = ctx
+		enc_codec = codec
+		opened = true
+		break
+	}
+	if !opened {
+		fmt.println("[enc] no H.264 encoder available (hardware and libx264 both failed)")
 		return .Fail, 0
 	}
-	enc := avcodec.alloc_context3(enc_codec)
-	defer avcodec.free_context(&enc)
-	enc.width = out_w
-	enc.height = out_h
-	enc.pix_fmt = avutil.PixelFormat.YUV420P
-	enc.time_base = {num = fps.den, den = fps.num}
-	enc.gop_size = proxy_encoder.gop
-	enc.max_b_frames = 0
-	enc.thread_count = threads
-	if is_x264 {
-		// x264-private rate-control/tuning knobs, identical to the old argv.
-		avutil.opt_set(enc, "preset", proxy_encoder.preset, 0)
-		avutil.opt_set(enc, "tune", proxy_encoder.tune, 0)
-		avutil.opt_set(enc, "crf", proxy_encoder.crf, 0)
-	}
-	// Without this flag avcodec_send_frame zeroes frame.duration, so libx264
-	// emits pkt.duration=0 and the mp4 muxer sizes the final stts sample to
-	// zero — the last proxy frame becomes unaddressable by pts, which the
-	// timeline preview (frame -> pts -> seek) needs. Same defect + fix as the
-	// render path.
-	enc.flags += {avcodec.CodecFlag.Frame_Duration}
-	if ret := avcodec.open2(enc, enc_codec, nil); ret < 0 {
-		fmt.printf("[enc] avcodec_open2 (encoder): %s\n", ff_err_str(ret))
-		return .Fail, 0
-	}
+	fmt.printf(
+		"[enc] proxy encoder: %s%s\n",
+		string(enc_codec.name),
+		is_x264 ? " (cpu)" : " (hardware)",
+	)
 
 	// sws is built lazily from the first decoded frame's actual format: the
 	// hw-decode path transfers to a sw frame whose format (NV12, etc.) differs
@@ -286,7 +344,10 @@ proxy_encode_range :: proc(
 
 	out_frame := avutil.frame_alloc()
 	defer avutil.frame_free(&out_frame)
-	out_frame.format = c.int(avutil.PixelFormat.YUV420P)
+	// The scaler and the encoder must agree on the format. A hardware encoder
+	// takes NV12 as its software carrier, so this is the same choice the
+	// encoder's frames context declared, not a separate decision.
+	out_frame.format = c.int(enc_sw_pix_fmt)
 	out_frame.width = out_w
 	out_frame.height = out_h
 	if avutil.frame_get_buffer(out_frame, 32) < 0 {
@@ -334,7 +395,10 @@ proxy_encode_range :: proc(
 			enc_src := staged[0]
 			staged[0], staged[1] = staged[1], nil
 			staged_n -= 1
-			if !encode_scale_send(enc_src, out_frame, &sws_ctx, out_w, out_h, enc, enc_pkt, oc, ost, done) {
+			if !encode_scale_send(
+				enc_src, out_frame, &sws_ctx, out_w, out_h, enc_sw_pix_fmt, use_hw, enc, enc_pkt,
+				oc, ost, done,
+			) {
 				return .Fail, done
 			}
 			done += 1
@@ -356,7 +420,10 @@ proxy_encode_range :: proc(
 			return .Ok, done
 		case .Ok:
 		}
-		if !encode_scale_send(in_frame, out_frame, &sws_ctx, out_w, out_h, enc, enc_pkt, oc, ost, done) {
+		if !encode_scale_send(
+			in_frame, out_frame, &sws_ctx, out_w, out_h, enc_sw_pix_fmt, use_hw, enc, enc_pkt,
+			oc, ost, done,
+		) {
 			return .Fail, done
 		}
 		done += 1
@@ -374,15 +441,23 @@ proxy_encode_range :: proc(
 	return .Ok, done
 }
 
-// encode_scale_send scales one decoded frame to the proxy's yuv420p buffer,
-// encodes it, and muxes all drained packets. Returns false on a hard libav
-// error (the caller drops the artifact). sws_ctx is built lazily from the first
-// frame's real format/dims (hw decode transfers to NV12 etc., which dec.pix_fmt
-// doesn't name); `out_w/out_h` are the proxy's fixed output size.
+// encode_scale_send scales one decoded frame to the proxy's encoder-input
+// buffer, encodes it, and muxes all drained packets. Returns false on a hard
+// libav error (the caller drops the artifact). sws_ctx is built lazily from the
+// first frame's real format/dims (hw decode transfers to NV12 etc., which
+// dec.pix_fmt doesn't name); `out_w/out_h` are the proxy's fixed output size.
+//
+// `dst_pix_fmt` is the encoder's software input format — YUV420P for libx264,
+// NV12 for a hardware encoder — and must match the format out_frame was
+// allocated with, or swscale writes a plane layout the encoder cannot read.
+// `use_hw` means hardware encode, and the scaled frame has to make the upload
+// into a device surface before the send.
 encode_scale_send :: proc(
 	src_frame, out_frame: ^avutil.Frame,
 	sws_ctx: ^^sws.Context,
 	out_w, out_h: c.int,
+	dst_pix_fmt: avutil.PixelFormat,
+	use_hw: bool,
 	enc: ^avcodec.CodecContext,
 	enc_pkt: ^avcodec.Packet,
 	oc: ^avfmt.FormatContext,
@@ -392,7 +467,7 @@ encode_scale_send :: proc(
 	if sws_ctx^ == nil {
 		sws_ctx^ = sws.getContext(
 			src_frame.width, src_frame.height, avutil.PixelFormat(src_frame.format),
-			out_w, out_h, avutil.PixelFormat.YUV420P,
+			out_w, out_h, dst_pix_fmt,
 			sws.Flags{.Bilinear}, nil, nil, nil,
 		)
 		if sws_ctx^ == nil {
@@ -409,7 +484,34 @@ encode_scale_send :: proc(
 	)
 	out_frame.pts = done
 	out_frame.duration = 1
-	if send_r := avcodec.send_frame(enc, out_frame); send_r < 0 {
+	to_send := out_frame
+	defer if to_send != out_frame {
+		avutil.frame_free(&to_send)
+	}
+	if use_hw {
+		// Hardware-surfaces encoder: move the scaled NV12 frame into a device
+		// surface before sending. The encoder takes its own references on the
+		// surface buffers when it accepts the frame, but our AVFrame wrapper
+		// must outlive the send, which the defer above guarantees.
+		hw_frame := avutil.frame_alloc()
+		if hw_frame == nil {
+			return false
+		}
+		if ret := avutil.hwframe_get_buffer(enc.hw_frames_ctx, hw_frame, 0); ret < 0 {
+			avutil.frame_free(&hw_frame)
+			fmt.printf("[enc] av_hwframe_get_buffer: %s\n", ff_err_str(ret))
+			return false
+		}
+		if ret := avutil.hwframe_transfer_data(hw_frame, out_frame, 0); ret < 0 {
+			avutil.frame_free(&hw_frame)
+			fmt.printf("[enc] av_hwframe_transfer_data: %s\n", ff_err_str(ret))
+			return false
+		}
+		hw_frame.pts = out_frame.pts
+		hw_frame.duration = out_frame.duration
+		to_send = hw_frame
+	}
+	if send_r := avcodec.send_frame(enc, to_send); send_r < 0 {
 		fmt.printf("[enc] avcodec_send_frame: %s\n", ff_err_str(send_r))
 		avcodec.packet_unref(enc_pkt)
 		return false

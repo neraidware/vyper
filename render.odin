@@ -71,12 +71,10 @@ Render_Encoder_UI :: struct {
 }
 render_encoder_ui: Render_Encoder_UI = {choice = .GPU}
 
-// Encoder candidate order per platform, most platform-appropriate first (probed
-// in order; each is only accepted when a real open succeeds — see
-// enc_open_video). libx264 is appended as the universal last resort.
-ENC_CANDIDATES_LINUX := []cstring{"h264_nvenc", "h264_vaapi", "h264_qsv", "h264_amf"}
-ENC_CANDIDATES_MACOS := []cstring{"h264_videotoolbox"}
-ENC_CANDIDATES_WINDOWS := []cstring{"h264_nvenc", "h264_qsv", "h264_amf"}
+// The per-platform hardware encoder candidate order lives in hw_encode.odin,
+// shared with the proxy encoder so both paths agree on what "hardware first"
+// means. Each candidate is only accepted when a real open succeeds; libx264 is
+// always the last resort.
 
 // app_window is the SDL window handle, owned by the main thread (window
 // creation in main.odin, size reads here and in textinput.odin).
@@ -1101,27 +1099,11 @@ HwFramesContext :: struct {
 
 // enc_encoder_candidates returns the encoder names to try, in order. CPU runs
 // libx264 directly; GPU probes the platform's hardware encoders first and ends
-// with libx264 as the guaranteed last resort.
-enc_encoder_candidates :: proc() -> (names: [dynamic]cstring) {
-	if render_encoder_ui.choice == .CPU {
-		append(&names, "libx264")
-		return
-	}
-	when ODIN_OS == .Linux {
-		for n in ENC_CANDIDATES_LINUX {
-			append(&names, n)
-		}
-	} else when ODIN_OS == .Darwin {
-		for n in ENC_CANDIDATES_MACOS {
-			append(&names, n)
-		}
-	} else when ODIN_OS == .Windows {
-		for n in ENC_CANDIDATES_WINDOWS {
-			append(&names, n)
-		}
-	}
-	append(&names, "libx264")
-	return
+// with libx264 as the guaranteed last resort. The candidate list itself is
+// shared with the proxy encoder (hw_encode.odin) so the two paths cannot
+// disagree about what "try the hardware first" means.
+enc_encoder_candidates :: proc() -> [dynamic]cstring {
+	return hw_enc_candidate_names(render_encoder_ui.choice == .CPU)
 }
 
 // enc_ctx_common fills the encoder context fields shared by every H.264
@@ -1163,71 +1145,24 @@ enc_ctx_common :: proc(ctx: ^avcodec.CodecContext, width, height: c.int, fps_num
 // frame-send path then uploads each sw NV12 frame into a hw surface. Fails
 // cleanly (releases everything acquired) when no config opens — the sw-input
 // path is tried next.
+//
+// The device/frames setup is shared with the proxy encoder (hw_encode.odin);
+// what stays here is the export-specific part, which is just recording the
+// refs so the send path can upload through them.
 enc_hw_upload_open :: proc(
 	e: ^Render_Enc,
 	ctx: ^avcodec.CodecContext,
 	codec: ^avcodec.Codec,
 	width, height: c.int,
 ) -> bool {
-	for i: c.int = 0; ; i += 1 {
-		cfg := avcodec.get_hw_config(codec, i)
-		if cfg == nil {
-			break
-		}
-		if .HW_Frames_Ctx not_in cfg.methods && .HW_Device_Ctx not_in cfg.methods {
-			continue
-		}
-		// A config whose pixel format isn't a real format is a sw-input hint,
-		// not a hw-upload target (the sw branch handles those).
-		if cfg.pix_fmt == .None {
-			continue
-		}
-		// A driver/device absence is expected and handled (we move on) but
-		// libav logs it at ERROR; suppress logging for the probe window, same
-		// as the decode probe does.
-		probe_level := avutil.log_get_level()
-		avutil.log_set_level(.Quiet)
-		dev_ref: ^avutil.BufferRef
-		dev_ok := avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, nil, nil, 0)
-		if dev_ok != 0 && cfg.device_type == .Vaapi {
-			dev_ok = avutil.hwdevice_ctx_create(&dev_ref, cfg.device_type, "/dev/dri/renderD128", nil, 0)
-		}
-		avutil.log_set_level(probe_level)
-		if dev_ok != 0 {
-			continue
-		}
-		frames_ref := avutil.hwframe_ctx_alloc(dev_ref)
-		if frames_ref == nil {
-			avutil.buffer_unref(&dev_ref)
-			continue
-		}
-		frm := (^HwFramesContext)(frames_ref.data)
-		frm.format = cfg.pix_fmt
-		frm.sw_format = .NV12
-		frm.width = width
-		frm.height = height
-		if ret := avutil.hwframe_ctx_init(frames_ref); ret < 0 {
-			avutil.buffer_unref(&frames_ref)
-			avutil.buffer_unref(&dev_ref)
-			continue
-		}
-		ctx.hw_device_ctx = avutil.buffer_ref(dev_ref)
-		ctx.hw_frames_ctx = avutil.buffer_ref(frames_ref)
-		ctx.pix_fmt = cfg.pix_fmt
-		if ret := avcodec.open2(ctx, codec, nil); ret < 0 {
-			// ctx owns the refs avcodec_free_context will release; free only
-			// our own duplicates. Unref'ing ctx's here and again later is a
-			// double-free crash.
-			avutil.buffer_unref(&frames_ref)
-			avutil.buffer_unref(&dev_ref)
-			continue
-		}
-		e.enc_hw_device = dev_ref
-		e.enc_hw_frames = frames_ref
-		e.enc_hw_upload = true
-		return true
+	ok, dev, frames := hw_enc_open(ctx, codec, width, height)
+	if !ok {
+		return false
 	}
-	return false
+	e.enc_hw_device = dev
+	e.enc_hw_frames = frames
+	e.enc_hw_upload = true
+	return true
 }
 
 // enc_convert_finish wires the RGBA -> encoder-input scaler + buffer for the

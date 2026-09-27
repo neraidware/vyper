@@ -48,6 +48,58 @@ Proxy_Encoder :: struct {
 	gop:    i32, // keyframe gap; 1 = every frame a keyframe (all-intra scrub)
 }
 
+// Proxy_Encoder_Choice mirrors Render_Encoder_Choice: hardware encoders are
+// tried first and libx264 is the guaranteed fallback. GPU is the default
+// because a proxy is a background, all-intra intermediate — exactly the shape
+// hardware encode is good at, and it is the path that decides whether the
+// timeline can scrub a 4K source on a weak host. No UI yet; VYPER_PROXY_ENCODER
+// selects it for probes and for a user whose hardware encoder misbehaves.
+//
+// PROXY_SUFFIX deliberately does NOT encode the choice. Both encoders produce a
+// valid scrubbable proxy from the same source, and a fallback user's artifact
+// is otherwise indistinguishable from a cached one — keying the cache by
+// encoder would make the fallback permanent (every launch re-encodes under the
+// other key) and would invalidate every existing proxy on upgrade for output
+// nobody watches. Rate control also differs by encoder (crf vs a derived
+// bitrate), so byte-identical output was never part of the contract.
+Proxy_Encoder_Choice :: enum u32 {
+	CPU,
+	GPU,
+}
+proxy_encoder_choice := Proxy_Encoder_Choice.GPU
+
+// PROXY_HW_BITS_PER_PIXEL sizes a proxy's bitrate from its pixel count. A
+// proxy is 768x432 at most and every frame is a keyframe, so the usual
+// "bits per second" intuition is misleading — what matters is bits per pixel
+// per frame. At 0.06 a 768x432/30fps all-intra proxy targets ~600 kbit, which
+// measured (VYPER_PROXY_PROBE, 10s 1080p source) lands a VAAPI artifact at
+// 957 KB against libx264 crf 26 ultrafast's 1.48 MB, with equal or better
+// frame agreement. A proxy only has to be scrubbable, not watchable, so
+// trading a little detail for never blocking the import worker is right — and
+// at this constant the hardware path is also the smaller file.
+PROXY_HW_BITS_PER_PIXEL :: 0.06
+PROXY_HW_MIN_BITRATE :: 250_000
+
+// proxy_hw_bitrate returns the hardware rate control for a proxy of out_w x
+// out_h at fps fps, derived rather than hardcoded so it tracks the proxy's own
+// dimensions instead of assuming 768x432.
+proxy_hw_bitrate :: proc(out_w, out_h: c.int, fps: f64) -> i64 {
+	if out_w <= 0 || out_h <= 0 || fps <= 0 {
+		return PROXY_HW_MIN_BITRATE
+	}
+	br := i64(f64(out_w) * f64(out_h) * fps * PROXY_HW_BITS_PER_PIXEL)
+	return max(br, i64(PROXY_HW_MIN_BITRATE))
+}
+
+// proxy_encoder_use_hw reports whether the proxy path should try hardware
+// encoders. The env override exists so the CPU fallback is reachable in a probe
+// on a machine that HAS a working hardware encoder — otherwise the fallback
+// only ever runs where there is no choice to make.
+proxy_encoder_use_hw :: proc() -> bool {
+	override := os.get_env_alloc("VYPER_PROXY_ENCODER", context.temp_allocator)
+	return proxy_encoder_choice == .GPU && override != "cpu"
+}
+
 proxy_encoder: Proxy_Encoder = {
 	suffix = PROXY_SUFFIX,
 	preset = "ultrafast",
