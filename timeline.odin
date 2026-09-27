@@ -1580,6 +1580,34 @@ sync_track_order :: proc() {
 		len(timeline.track_order) == len(timeline.tracks),
 		"sync_track_order: track_order longer than tracks",
 	)
+	// Length alone does not make it a permutation. Appending the missing tail
+	// assumes every existing entry is a DISTINCT index below len(tracks); an
+	// order that already repeats one silently omits another, and the omitted
+	// track then vanishes from every walk that goes through track_order -- the
+	// export compositor included, which renders a track's clips as if they were
+	// not on the timeline at all. That is a quiet wrong answer, so it is checked
+	// here rather than at each consumer.
+	//
+	// Checked as "every value is in range AND appears exactly once", which with
+	// the length assert above is exactly a permutation. Counted in place rather
+	// than sorted into a scratch slice: sync_track_order runs on rendering and
+	// mutation paths, and an assert must not be the thing that allocates.
+	for a in timeline.track_order {
+		assert(
+			a >= 0 && a < len(timeline.tracks),
+			"sync_track_order: track_order holds an out-of-range track index",
+		)
+		seen := 0
+		for b in timeline.track_order {
+			if b == a {
+				seen += 1
+			}
+		}
+		assert(
+			seen == 1,
+			"sync_track_order: track_order is not a permutation of the tracks (duplicate or gap)",
+		)
+	}
 }
 
 // order_row_of returns the top-to-bottom row (position in track_order) of the

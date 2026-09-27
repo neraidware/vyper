@@ -709,6 +709,34 @@ Render_Text_Src :: struct {
 	scale:                f32,
 	source_w:             c.int, // text_w (tight ink width, text px)
 	source_h:             c.int, // text_h (tight ink height, text px)
+
+	// Which entry of the worker's text_jobs array rasterizes this clip. Text
+	// shares one track-ordered list with video now (Render_Visual), so a text's
+	// position in that list is not its job index; recording the raster job
+	// explicitly keeps the two from being conflated.
+	job_idx: int,
+}
+
+// Render_Visual is one entry of the track-ordered visual stack: either a
+// snapshotted source or a text clip, in the order the user sees them. It stores
+// BORROWING pointers, not copies: the decoder opens each source and fills its
+// blit slots AFTER this list is built, so a copy taken during the walk would
+// composite an empty slot forever. The pointees are owned by Render_Job.videos
+// and .texts, which are fixed in size once the walk ends, and are freed there.
+//
+// It exists because video and text used to be snapshotted into two parallel
+// arrays and composited in two SEPARATE passes, which meant export drew every
+// text above every video no matter where the user put it -- the preview
+// interleaves them by track position, so a text clip on a lower track previewed
+// UNDER the video and exported OVER it. One list walked once removes the second
+// ordering authority instead of trying to keep two of them in agreement.
+//
+// Subtitles are deliberately NOT in here. They are pinned above everything in
+// both preview and export, because a burned-in subtitle hidden behind a video is
+// unreadable; that decision lives with the subs pass, not with track order.
+Render_Visual :: union {
+	^Render_Video_Src,
+	^Render_Text_Src,
 }
 
 // Render_Text_Font is the render worker's private text rasterization state. The
@@ -879,9 +907,12 @@ Render_Audio_Src :: struct {
 // starts, so the worker never touches live timeline state: one slab per source
 // kind plus the output geometry/range it renders.
 Render_Job :: struct {
+	// visuals is the composite ORDER only; videos and texts below own the
+	// payloads it borrows.
+	visuals:  []Render_Visual,
 	videos:   []Render_Video_Src,
 	audios:   []Render_Audio_Src,
-	texts:    []Render_Text_Src,
+	texts:    []Render_Text_Src, // owns the cloned clip names
 	subs:     []Render_Sub_Src,
 	out_path: cstring,
 	width:    c.int,
@@ -2311,55 +2342,59 @@ render_worker_run :: proc() {
 		if !skip_canvas_zero {
 			mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
 		}
-		for i := len(render_job.videos) - 1; i >= 0; i -= 1 {
-			v := &render_job.videos[i]
-			if timeline_frame < v.timeline_start_frame ||
-			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
-				continue
+		// One walk over the track-ordered visual stack, back-to-front, so the
+		// bottom track paints first and the top track last. Text and video are in
+		// the SAME list, so a text clip on a lower track composites under the
+		// video above it exactly as the preview does; it is no longer "all video,
+		// then all text".
+		for i := len(render_job.visuals) - 1; i >= 0; i -= 1 {
+			#partial switch src in render_job.visuals[i] {
+			case ^Render_Video_Src:
+				if timeline_frame < src.timeline_start_frame ||
+				   timeline_frame >= src.timeline_start_frame + src.source_length_frames {
+					continue
+				}
+				// Fully off-canvas clips were never opened (v.fw == 0 in setup).
+				if src.fw <= 0 {
+					continue
+				}
+				slot := &src.blit_slots[slot_idx]
+				if !slot.ok {
+					continue
+				}
+				if src.geom_keyed {
+					render_eval_keyed_geom(src, timeline_frame, slot, eslot.canvas)
+				} else {
+					render_blit(eslot.canvas, render_job.width, render_job.height, src, slot)
+				}
+			case ^Render_Text_Src:
+				t := src
+				if timeline_frame < t.timeline_start_frame ||
+				   timeline_frame >= t.timeline_start_frame + t.source_length_frames {
+					continue
+				}
+				if t.name == "" {
+					continue
+				}
+				j := &text_jobs[t.job_idx]
+				if j.raster == nil || j.ow <= 0 || j.oh <= 0 {
+					continue
+				}
+				render_text_blit(
+					eslot.canvas,
+					render_job.width,
+					render_job.height,
+					j.raster,
+					j.bw,
+					j.ox,
+					j.oy,
+					j.ow,
+					j.oh,
+					t.transform_x,
+					t.transform_y,
+					j.blit_scale,
+				)
 			}
-			// Fully off-canvas clips were never opened (v.fw == 0 in setup).
-			if v.fw <= 0 {
-				continue
-			}
-			slot := &v.blit_slots[slot_idx]
-			if !slot.ok {
-				continue
-			}
-			if v.geom_keyed {
-				render_eval_keyed_geom(v, timeline_frame, slot, eslot.canvas)
-			} else {
-				render_blit(eslot.canvas, render_job.width, render_job.height, v, slot)
-			}
-		}
-		// Composite all text clips covering this frame (after the decodable
-		// clips, alpha-blended on top, matching the preview layering).
-		for i := 0; i < len(render_job.texts); i += 1 {
-			t := &render_job.texts[i]
-			if timeline_frame < t.timeline_start_frame ||
-			   timeline_frame >= t.timeline_start_frame + t.source_length_frames {
-				continue
-			}
-			if t.name == "" {
-				continue
-			}
-			j := &text_jobs[i]
-			if j.raster == nil || j.ow <= 0 || j.oh <= 0 {
-				continue
-			}
-			render_text_blit(
-				eslot.canvas,
-				render_job.width,
-				render_job.height,
-				j.raster,
-				j.bw,
-				j.ox,
-				j.oy,
-				j.ow,
-				j.oh,
-				t.transform_x,
-				t.transform_y,
-				j.blit_scale,
-			)
 		}
 		// Composite subtitle-generator clips last (on top of everything else —
 		// the natural subtitle layering; matches the preview, where the topmost
@@ -2955,8 +2990,22 @@ render_start :: proc() {
 	cls := [dynamic]Render_Video_Src{}
 	auds := [dynamic]Render_Audio_Src{}
 	txts := [dynamic]Render_Text_Src{}
+	// Track order, appended in the SAME walk that fills cls/txts, so the
+	// compositing order is a property of the snapshot rather than a second thing
+	// the compositor has to re-derive. Its entries point into cls/txts, so those
+	// two are reserved before the walk: a mid-walk realloc would invalidate every
+	// &cls[i] / &txts[i] pointer already recorded in vis. vis itself needs no
+	// reserve -- reallocating it moves pointer values, not pointees. The bound is
+	// the clips actually walked, and a clip contributes at most one of each.
+	vis := [dynamic]Render_Visual{}
 	subs := [dynamic]Render_Sub_Src{}
 	sync_track_order()
+	n_clips := 0
+	for ti in timeline.track_order {
+		n_clips += len(timeline.tracks[ti].clips)
+	}
+	reserve(&cls, n_clips)
+	reserve(&txts, n_clips)
 	for w := 0; w < len(timeline.track_order); w += 1 {
 		ti := timeline.track_order[w]
 		tr := &timeline.tracks[ti]
@@ -2999,6 +3048,10 @@ render_start :: proc() {
 						}
 					}
 				}
+				// An untagged union is assigned, not compound-constructed: the tag
+				// IS the pointed-to type.
+				visual: Render_Visual = &cls[len(cls) - 1]
+				append(&vis, visual)
 			case .Audio:
 				append(
 					&auds,
@@ -3043,8 +3096,11 @@ render_start :: proc() {
 							scale = clip.scale,
 							source_w = clip.source_w,
 							source_h = clip.source_h,
+							job_idx = len(txts),
 						},
 					)
+					visual: Render_Visual = &txts[len(txts) - 1]
+					append(&vis, visual)
 				}
 			case .Subtitles:
 				// subtitle assets drop as .Text/.Subtitles generator clips (the
@@ -3069,6 +3125,7 @@ render_start :: proc() {
 			}
 		}
 	}
+	render_job.visuals = vis[:]
 	render_job.videos = cls[:]
 	render_job.audios = auds[:]
 	render_job.texts = txts[:]
@@ -3136,12 +3193,14 @@ render_free_workbook :: proc() {
 			t.name = ""
 		}
 	}
+	delete(render_job.visuals)
 	delete(render_job.videos)
 	delete(render_job.audios)
 	delete(render_job.texts)
 	if render_job.subs != nil {
 		delete(render_job.subs)
 	}
+	render_job.visuals = nil
 	render_job.videos = nil
 	render_job.audios = nil
 	render_job.texts = nil
@@ -3207,7 +3266,19 @@ render_test_run :: proc(paths: [2]string) {
 		n += 1
 	}
 	test_input_buf[n] = 0
+	// Text clips rasterize through font_state.data, and this probe is dispatched
+	// before main's load_font_data (main.odin returns here early), so the font has
+	// to be loaded here or exporting any text clip reads out of bounds.
+	if !load_font_data() {
+		fmt.println("render-test FAIL: could not load font data")
+		os.exit(3)
+	}
 	import_media(cstring(&test_input_buf[0]))
+	// The imported video's placement and span, captured while vclip is in scope
+	// for the VYPER_ZORDER text clip below. The insert there shifts the track
+	// slice, so vclip cannot be read after it.
+	z_place_x, z_place_y := f32(0), f32(0)
+	z_span := i64(0)
 	if len(timeline.tracks) > 0 && len(timeline.tracks[0].clips) > 0 {
 		vclip := &timeline.tracks[0].clips[0]
 		fmt.println("render-test clip markers:", len(vclip.markers))
@@ -3257,6 +3328,64 @@ render_test_run :: proc(paths: [2]string) {
 				vclip.scale = f32(vals[2])
 			}
 		}
+		z_place_x, z_place_y = vclip.transform_x, vclip.transform_y
+		z_span = vclip.source_length_frames
+	}
+	// VYPER_ZORDER=below|above adds a TEXT clip on a track under or over the
+	// video so the export's track-order compositing can be checked headlessly;
+	// omitting it is the video-only baseline the other two are compared against.
+	//
+	// The assertion this enables is a strict one that needs no color guessing: a
+	// text clip UNDER an opaque video must be completely invisible, so "below"
+	// has to come out PIXEL-IDENTICAL to the baseline. The two-pass compositor
+	// this replaced drew every text clip over every video regardless of track, so
+	// "below" differed from the baseline and the check failed. "above" must
+	// differ from the baseline, or the text was dropped rather than layered.
+	//
+	// Placement uses the video clip's own transform, read BEFORE the track insert
+	// because inserting shifts the track slice and would dangle vclip. A Text
+	// clip's transform is a TOP-LEFT anchor (unlike media, which is centered), so
+	// the video's CENTER puts the text box squarely on top of the video.
+	if zv, z_ok := os.lookup_env_alloc("VYPER_ZORDER", context.allocator); z_ok && zv != "" {
+		if z_span <= 0 {
+			fmt.println("render-test FAIL: VYPER_ZORDER set but no video clip to layer against")
+			os.exit(3)
+		}
+		// sync_track_order FIRST: it is what turns track_order into a permutation
+		// of the existing tracks, and injecting into a not-yet-synced (empty or
+		// short) order produces a DUPLICATE index, which then drops the video
+		// track from the export walk entirely -- a black frame that looks like a
+		// compositing bug and is not one.
+		sync_track_order()
+		append(&timeline.tracks, Track{name = "zorder-text"})
+		nt := len(timeline.tracks) - 1
+		// track_order is top-to-bottom rows, and the compositor walks it in
+		// reverse, so row 0 paints last (on top). Row 0 => text over video;
+		// the end => text under it.
+		pos := clamp(len(timeline.track_order), 0, len(timeline.track_order))
+		if zv == "above" {
+			pos = 0
+		}
+		inject_at_elem(&timeline.track_order, pos, nt)
+		append(
+			&timeline.tracks[nt].clips,
+			Clip {
+				clip_id = new_clip_id(),
+				name = "ZORDER",
+				kind = .Text,
+				generator = .Text,
+				timeline_start_frame = 0,
+				source_length_frames = z_span,
+				// Nominal tight ink dims: setup_text_job only requires them to be
+				// positive, then rasterizes the name and blits the real tight rect.
+				source_w = 320,
+				source_h = 96,
+				transform_x = z_place_x,
+				transform_y = z_place_y,
+				scale = 1,
+			},
+		)
+		fmt.println("render-test zorder:", zv, "text row", pos)
 	}
 	render_set_out_path(paths[1])
 	// VYPER_ENC="GPU" selects the hardware-encoder path (libx264 stays the CPU

@@ -155,6 +155,7 @@ target_gpu_probe() {
 KEYED_DIR=target/keyed_export
 KEYED_SRC="$KEYED_DIR/src.mp4"
 KEYED_MIN_DB=50
+ZORDER_DIR=target/zorder
 
 keyed_export_run() {
 	require_fresh_binary keyed-export || return 1
@@ -197,6 +198,77 @@ keyed_psnr_ok() {
 		return 0
 	fi
 	awk -v a="$v" -v b="$floor" 'BEGIN { exit !(a + 0 >= b + 0) }'
+}
+
+# Z-order: export must composite in TRACK order, not "all video then all text".
+# Three runs of the same source differ only in where a TEXT clip sits:
+#   base  - video only
+#   below - text on a track UNDER the video  => must be pixel-identical to base
+#   above - text on a track OVER the video   => must differ from base
+# The "below" arm is the one with teeth: a text clip hidden behind an opaque
+# video leaves no trace, so anything else means the compositor drew text on top
+# regardless of track (the bug this replaced). "above" guards the other failure,
+# a text clip dropped instead of layered. No pixel color is guessed -- only
+# equality against the baseline.
+zorder_run() {
+	local arm=$1
+	local zv=""
+	[ "$arm" = below ] && zv="VYPER_ZORDER=below"
+	[ "$arm" = above ] && zv="VYPER_ZORDER=above"
+	env $PROBE_ENV \
+		VYPER_RENDER_TEST="$KEYED_SRC|$ZORDER_DIR/$arm.mp4" \
+		VYPER_FRAME_TIME=1 \
+		$zv \
+		timeout 600 ./vyper >"$ZORDER_DIR/$arm.log" 2>&1
+}
+
+target_zorder() {
+	require_fresh_binary zorder || return 1
+	mkdir -p "$ZORDER_DIR"
+	local arm
+	for arm in base below above; do
+		zorder_run "$arm" || {
+			echo "zorder: $arm run failed; see $ZORDER_DIR/$arm.log" >&2
+			return 1
+		}
+	done
+
+	local below_psnr above_psnr
+	below_psnr=$(keyed_psnr "$ZORDER_DIR/base.mp4" "$ZORDER_DIR/below.mp4")
+	above_psnr=$(keyed_psnr "$ZORDER_DIR/base.mp4" "$ZORDER_DIR/above.mp4")
+	# Both arms must have produced text, or the comparison proves nothing: a
+	# raster that failed to build would make "below" identical for the wrong
+	# reason and "above" differ for the wrong one.
+	grep -q 'render-test zorder:' "$ZORDER_DIR/below.log" || {
+		echo "zorder: below run did not install a text clip" >&2
+		return 1
+	}
+	if [ "$below_psnr" != "inf" ]; then
+		echo "zorder: FAIL text UNDER the video is visible (base vs below PSNR $below_psnr, want inf)" >&2
+		return 1
+	fi
+	if [ "$above_psnr" = "inf" ]; then
+		echo "zorder: FAIL text OVER the video changed nothing (base vs above PSNR inf)" >&2
+		return 1
+	fi
+	echo "zorder: ok (below=inf hidden under video, above=$above_psnr drawn over it)"
+}
+
+# AGENTS.md 9b: the export compositor's ownership model changed (video/text are
+# now reached through a union of borrowed pointers into the job's own arrays),
+# and that is exactly the kind of claim only valgrind can check. The "above" arm
+# is the run that exercises it hardest: every frame walks the union, dereferences
+# a borrowed source, and rasterizes a text clip.
+target_render_valgrind() {
+	require_fresh_binary render-valgrind || return 1
+	mkdir -p "$ZORDER_DIR" target/valgrind
+	local log=target/valgrind/render.log
+	env $PROBE_ENV \
+		VYPER_RENDER_TEST="$KEYED_SRC|$ZORDER_DIR/above_valgrind.mp4" \
+		VYPER_ZORDER=above \
+		timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 ./vyper >"$log" 2>&1
+	valgrind_assert "$log" render-valgrind
 }
 
 target_keyed_ab() {
@@ -293,49 +365,54 @@ target_smoke() {
 	echo "smoke: ok (124)"
 }
 
-target_valgrind() {
-	require_fresh_binary valgrind || return 1
-	local log
-	log=$(mktemp)
-	env $PROBE_ENV timeout 900 valgrind --leak-check=full \
-		--error-exitcode=99 ./vyper >"$log" 2>&1
-	local rc=$?
-
-	# Ownership claims this codebase makes, asserted rather than eyeballed.
-	# A new leak or a bad free is a regression; the FFmpeg/Odin error contexts
-	# are pre-existing and tracked by count, not by exit code.
+# The four ownership invariants AGENTS.md 9b actually claims. Valgrind's own
+# exit code is always 99 here (FFmpeg and the Odin runtime report errors this
+# program does not own), so the exit code is reported, never gated on; what
+# gates is the claim. Shared by the probe-wide and render-path runs.
+valgrind_assert() {
+	local log=$1 label=$2
 	local failed=0
 	if ! grep -q "definitely lost: 0 bytes in 0 blocks" "$log"; then
-		echo "valgrind: memory was definitely lost" >&2
+		echo "$label: memory was definitely lost" >&2
 		grep -A6 "definitely lost in loss record" "$log" | head -40 >&2
 		failed=1
 	fi
 	if ! grep -q "indirectly lost: 0 bytes in 0 blocks" "$log"; then
-		echo "valgrind: memory was indirectly lost" >&2
+		echo "$label: memory was indirectly lost" >&2
 		failed=1
 	fi
 	if grep -qE "Invalid (free|read|write)" "$log"; then
-		echo "valgrind: invalid free/read/write" >&2
+		echo "$label: invalid free/read/write" >&2
 		grep -B2 -A8 -E "Invalid (free|read|write)" "$log" | head -40 >&2
 		failed=1
 	fi
-
 	# Report the noise baseline explicitly so a jump in contexts is visible
 	# even though it does not fail the gate on its own.
-	echo "valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
-	grep -E "definitely lost|indirectly lost|possibly lost|still reachable" "$log" || true
+	echo "$label: $(grep -E "definitely lost|indirectly lost" "$log" | tr '\n' ' ')"
 	grep "$VALGRIND_KNOWN_NOISE" "$log" || true
+	[ $failed -ne 0 ] && return 1
+	echo "$label: ok (no leaks, no invalid access; full log: $log)"
+}
 
-	if [ $failed -ne 0 ]; then
-		echo "valgrind: FAILED — see $log" >&2
-		return 1
-	fi
-	echo "valgrind: ok (no leaks, no invalid access; full log: $log)"
+target_valgrind() {
+	require_fresh_binary valgrind || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/probe.log
+	env $PROBE_ENV timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 ./vyper >"$log" 2>&1
+	local rc=$?
+	echo "valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+	valgrind_assert "$log" valgrind
 }
 
 target_all() {
 	local t
-	for t in check build probe transform_probe gpu_probe keyed_export smoke valgrind; do
+	# render_valgrind is deliberately NOT in this list yet: it fails on two
+	# pre-existing export/import-path leaks (see TODO.md "Export-path memory
+	# gate"), and a gate that is red for reasons unrelated to the change under
+	# test trains everyone to ignore it. It runs on demand:
+	#   ./scripts/gate.sh render_valgrind
+	for t in check build probe transform_probe gpu_probe keyed_export zorder smoke valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -351,11 +428,14 @@ main() {
 	transform_probe) target_transform_probe ;;
 	gpu_probe) target_gpu_probe ;;
 	keyed_export) target_keyed_ab ;;
+	zorder) target_zorder ;;
+	render_valgrind) target_render_valgrind ;;
+	zorder) target_zorder ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|gpu_probe|keyed_export|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|gpu_probe|keyed_export|zorder|render_valgrind|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac

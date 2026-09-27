@@ -1266,13 +1266,57 @@ had no target in `gate.sh`, so it had not been running: a regression in the
 geometry B refactors would have been invisible. Added `target_transform_probe`
 and put it in the `all` list. It passes.
 
-**Step C — one ordered visual list for export, fixing bug 2.** Merge the video
-and text snapshots into ONE track-ordered list (tagged union) and composite it
-in a single back-to-front loop, deleting the separate text pass. Subtitles stay
-in their own pinned pass, which export already has.
+**Step C — DONE: one ordered visual list for export, fixing bug 2.** Video and
+text were snapshotted into two parallel arrays and composited in two separate
+passes -- "all video, then all text" -- so export drew every text clip above
+every video regardless of track, while the preview interleaved them by track
+position: a text clip on a lower track previewed UNDER the video and exported
+OVER it. `Render_Visual` is now a union of BORROWING pointers
+(`^Render_Video_Src` / `Render_Text_Src`) that records composite order, built by
+the same track walk that fills the two arrays, and the compositor walks it once
+back-to-front with a `#partial switch`. Subtitles stay in their own pinned pass.
 
-**Step D — preview pins subtitle slots, fixing bug 3.** Subtitle-generator slots
-must draw after every layer-sorted slot instead of taking part in the sort.
+Two things this got wrong first, both worth recording:
+- The union originally held COPIES. The decoder opens each source and fills its
+  blit slots AFTER the walk, so a copy would composite an empty slot forever --
+  a black frame that looks like a decode failure, not an ordering bug.
+- Because the union borrows into `cls`/`txts`, both are `reserve`d before the
+  walk: a mid-walk realloc would dangle every pointer already recorded.
+
+**z-order test (`./scripts/gate.sh zorder`, in `all`).** Three runs of one
+source differing only in where a TEXT clip sits: `base` (video only), `below`
+(text on a track under the video), `above` (text over it). `below` must be
+PIXEL-IDENTICAL to base -- text behind an opaque video leaves no trace -- and
+`above` must differ. The two arms assert mutually exclusive outcomes, so a
+compositor that ignored track order (the old behavior, text on top either way)
+fails the `below` arm. No pixel color is guessed, only equality against the
+baseline. Result: `below=inf`, `above=27.377424`.
+
+**Step C also exposed a crash and a silent-corruption hole, both fixed:**
+- Exporting ANY text clip headlessly segfaulted. `render_test_run` is dispatched
+  at main.odin:1337, before `load_font_data()` at main.odin:1463, so
+  `font_state.data` was nil and `stbtt_InitFont` read out of bounds -- a crash
+  naming neither stb nor fonts. `text_metrics_px` and two sibling raster paths
+  each carried their own copy of the lazy init, so the fix is one
+  `ensure_text_font` that all three call, asserting the data is loaded at the
+  cause. The interactive app was never affected, which is why it survived.
+- `sync_track_order` asserted only that `track_order` had the right LENGTH, not
+  that it was a permutation -- weaker than the invariant its own comment claims.
+  Injecting a row into a not-yet-synced order produced `[1, 1]`, a duplicate that
+  silently omitted the video track, so the export rendered a black frame while
+  reporting success. It now asserts the permutation (in range, and each value
+  exactly once), counted in place: sync_track_order runs on rendering and
+  mutation paths, and an assert must not be the thing that allocates. An earlier
+  draft used a scratch slice and leaked 4,158 bytes in 66 blocks, which the
+  `valgrind` target caught immediately.
+
+**Step D — preview pins subtitle slots, fixing bug 3.** Still open.
+Subtitle-generator slots must draw after every layer-sorted slot instead of
+taking part in the sort. `preview_state.odin` already has a `subs_pinned` flag
+appended at the end of the sorted list; what is missing is marking the slots
+that are actually subtitle generators. Export is now correct by construction
+(subs are a separate pass after the single ordered visual walk), so this is
+preview-only.
 
 **Gate hardening (done with A1).** `target_gpu_probe`, `target_probe`,
 `target_smoke`, `target_valgrind` and `keyed_export` all ran `./vyper` WITHOUT
@@ -1556,3 +1600,36 @@ Details TBD when Phase 2 reaches maturity.
   lost, 0 indirectly lost, no invalid access; error contexts unchanged from
   baseline (FFmpeg/Odin noise only). Branch `audio/miniaudio`, baseline
   `97f5267`, committed locally (no push).
+
+
+---
+
+## Export-path memory gate (new, found while testing Step C)
+
+`./scripts/gate.sh render_valgrind` runs the export worker under valgrind -- the
+check AGENTS.md 9b asks for on any change to the render path's ownership, and
+which nothing exercised before, because every prior valgrind run was the probe
+path and no probe renders. It currently FAILS on two pre-existing leaks that no
+recent change introduced; neither stack passes through the composite union.
+
+1. **262,627 bytes (280 direct, 262,347 indirect) -- `render_open_output`
+   (render.odin:1468).** `avformat_alloc_output_context2` and the codec contexts
+   and stream state it owns are never released: there is no
+   `avformat_free_context` in the encoder teardown. The four early returns after
+   that alloc also leak on their unwind paths, which is AGENTS.md 1's "a setup
+   proc that acquires several resources must unwind on partial failure".
+2. **1,327,105 bytes -- `open_clip_decoder_ex` (decode.odin:650) via
+   `decode_asset_thumbnail` (media.odin:320).** The thumbnail decoder's
+   `av_image_alloc` buffer plus its `frame_alloc` / `hold` / `packet_alloc` are
+   never freed: the import path opens a decoder and does not close it.
+
+Smaller records (23, 31, 47, 127, 271 bytes) are also in the export path. Total
+1,327,884 bytes definitely lost in 7 blocks; 487 errors from 137 contexts.
+
+**Why the target is not in `gate.sh all` yet:** a gate that is red for reasons
+unrelated to the change under test trains everyone to ignore it. It runs on
+demand. Add it to `all` in the same commit that fixes the two leaks above.
+
+Steps: read the FFmpeg teardown for the encoder and for the thumbnail decoder ->
+free what each owns at its real teardown boundary (not at each early return) ->
+`render_valgrind` back to 0 definitely / 0 indirectly -> add the target to `all`.

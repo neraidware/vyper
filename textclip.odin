@@ -35,6 +35,26 @@ TEXT_BOX_PAD :: 2
 // `px`: ascent_px pixels above the baseline, and the full line_h = ascent +
 // descent. Sizing a text box off these (rather than this title's ink) gives a
 // box that is a CONSTANT per font+size and automatically leaves room for
+// ensure_text_font initializes `font` from the process-wide font data exactly
+// once. All three raster paths (metrics, rasterize, and the title blit) share
+// this rather than repeating the lazy init, because the invariant it protects
+// is the same in all three and a site that forgets it is a segfault: with no
+// data loaded, stbtt_InitFont dereferences a nil buffer and reads out of
+// bounds, and the crash names neither stb nor fonts. font_state.data is filled
+// once at startup by load_font_data, so any headless path that renders text
+// before that (the export test) must load it first.
+ensure_text_font :: proc(font: ^stb.fontinfo, font_init: ^bool) {
+	if font_init^ {
+		return
+	}
+	assert(
+		len(font_state.data) > 0,
+		"ensure_text_font: font data not loaded (call load_font_data before rendering text)",
+	)
+	stb.InitFont(font, raw_data(font_state.data), 0)
+	font_init^ = true
+}
+
 // descenders -- no jump when the deepest glyph in a string changes, no dead
 // margin when a string has no descenders.
 text_metrics_px :: proc(
@@ -48,10 +68,7 @@ text_metrics_px :: proc(
 	if epx <= 0 {
 		epx = TEXT_CLIP_FONT_PIXELS
 	}
-	if !font_init^ {
-		stb.InitFont(font, raw_data(font_state.data), 0)
-		font_init^ = true
-	}
+	ensure_text_font(font, font_init)
 	scale := stb.ScaleForPixelHeight(font, epx)
 	ascent, descent, _: c.int
 	stb.GetFontVMetrics(font, &ascent, &descent, nil)
@@ -139,10 +156,7 @@ rasterize_title_into_buffer :: proc(
 	if px <= 0 {
 		px = TEXT_CLIP_FONT_PIXELS
 	}
-	if !font_init^ {
-		stb.InitFont(font, raw_data(font_state.data), 0)
-		font_init^ = true
-	}
+	ensure_text_font(font, font_init)
 	scale := stb.ScaleForPixelHeight(font, px)
 	ascent, descent, linegap: c.int
 	stb.GetFontVMetrics(font, &ascent, &descent, &linegap)
@@ -291,10 +305,7 @@ rasterize_lines_into_buffer :: proc(
 	if px <= 0 {
 		px = TEXT_CLIP_FONT_PIXELS
 	}
-	if !font_init^ {
-		stb.InitFont(font, raw_data(font_state.data), 0)
-		font_init^ = true
-	}
+	ensure_text_font(font, font_init)
 
 	// Per-line rasterize into `allocator`-backed scratch first: every line is
 	// measured/positioned before compositing because centering needs the widest

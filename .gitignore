@@ -6,6 +6,11 @@
 # Render / probe output artifacts
 /render.mp4
 
+# Valgrind core dumps. A crashed run leaves one in the cwd and it is ~650MB;
+# `git add -A` will otherwise commit it alongside the change that caused the
+# crash. The log under target/valgrind/ is the artifact worth keeping.
+/vgcore.*
+
 # nix build result symlink
 /result
 
