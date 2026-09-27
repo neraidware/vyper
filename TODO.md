@@ -1187,6 +1187,87 @@ later work-stream that plugs into it without reshaping what is here.
   up, start with a 2-3 day spike: render one NV12 frame into a dma-buf,
   import it into a VAAPI surface, check whether iHD encodes it without a
   copy; only proceed on a pass.
+- **Incremental export via a chunk cache (NOT planned now — design note so the
+  idea is not re-derived)** — render the export as a sequence of ~1 second
+  chunks (N frames at the project framerate) instead of one pass. Each chunk is
+  encoded to its own file in a cache folder. On a later export, a chunk whose
+  inputs are unchanged and whose file is already present is reused verbatim, and
+  only the changed chunks are re-rendered. The chunk files are then concatenated
+  into the final deliverable. The payoff is proportional to how often exports are
+  re-run after small edits: changing one clip re-renders the chunks its visible
+  span overlaps rather than the whole timeline.
+
+  This is a design note, not a commitment. The hard parts are not the cache --
+  they are the parts that decide whether the output is *correct*:
+
+  1. **The cache key has to mean "nothing that affects these frames changed",
+     and that is a much stronger claim than "the project file is unchanged."**
+     At minimum the key covers: source identity (path + size + mtime, or a
+     content digest of the bytes the chunk actually reads), the timeline state
+     of every clip/effect/marker/text overlapping the chunk's time range, the
+     global render settings (size, framerate, pix_fmt, codec, rate control), and
+     **a renderer version**. That last one is the trap: without it, a change to
+     the compositor silently reuses chunks rendered by the old code and the
+     export is a mix of two renderers. Cheap-but-wrong is worse than no cache.
+  2. **Invalidation is per chunk, so the question "which timeline items affect
+     this chunk" has to be answered by evaluating the timeline over that range,
+     not by diffing the project file.** A global change (resolution, codec)
+     invalidates everything; a local edit invalidates only overlapping chunks.
+     Anything with a tail longer than its own span (crossfades, envelopes,
+     transition handles) widens the invalidation window, and that has to be
+     derived, not assumed.
+  3. **Concatenation must be a stream copy, which constrains the encoder.**
+     All chunks need identical codec parameters (SPS/PPS, profile, level,
+     timebase, pix_fmt) and each must start on a keyframe with a closed GOP, so
+     every chunk is independently decodable. That means forcing a keyframe at
+     each chunk boundary. `ffmpeg -f concat -c copy` then works without
+     re-encoding, and frame counts must sum exactly -- no dropped or duplicated
+     frame at a seam.
+  4. **Per-chunk encoding is not the same encode.** Rate control looks ahead
+     and allocates bits using future frames; a single pass over N frames is not
+     the concatenation of chunk-wise encodes. Each chunk restarts its rate
+     control, so the first frames of every second get more bits and quality
+     pulses once per chunk. Fixed-QP/CRF largely avoids this; ABR does not.
+     Decide explicitly whether "the export is always rendered chunk-wise" is
+     acceptable, because otherwise the cached result and a fresh single-pass
+     export are different encodes of the same timeline.
+  5. **Audio is worse than video here.** Per-chunk audio encoding introduces
+     encoder priming/padding (AAC delay) at every boundary, which shows up as
+     clicks or drifting A/V sync. Most likely the mix has to be rendered once
+     over the full range and muxed at the end, so only the video chunks are
+     cached -- worth deciding before building, since it changes the shape.
+  6. **A truncated chunk must never look valid.** Write to a temp name and
+     rename only on successful completion, keyed by the content hash in the
+     filename. An interrupted export that leaves a half-written chunk which the
+     next run happily reuses is silent corruption, and it is the failure mode
+     this whole feature is most likely to produce.
+  7. **The cache needs a size bound and an eviction policy.** A 1080p export is
+     on the order of gigabytes for a long timeline. Location should follow the
+     existing cache convention (`$XDG_CACHE_HOME/vyper/...`, as the proxy cache
+     note above intends) rather than the source directory, with LRU eviction and
+     a documented cap.
+
+  Related: the aliasing/GPU work in S1b/S1c makes this more valuable, not less
+  -- a re-export after a one-second edit re-renders one second of GPU work
+  instead of the whole timeline, which is the difference between an interactive
+  and an unusable iteration loop. It also compounds the existing "HW-encode tail
+  is cadence-sensitive" note above: chunking adds cadence boundaries to a
+  cadence bug that is already open.
+
+  The alternative worth pricing before building the encoded-chunk version:
+  cache *raw* composited frames instead. It sidesteps concatenation, codec
+  matching, rate-control resets, and audio priming entirely, and allows
+  re-encoding with different settings from the same cache -- but raw RGBA is
+  ~8 MB per 1080p frame, so it is only viable for short ranges or as
+  short-lived scratch. The encoded-chunk design is the one that scales to a full
+  timeline; the raw-frame design is much simpler and is the right choice if the
+  real use case is "re-render after a tweak" rather than "export repeatedly".
+
+  If ever picked up, start with a spike that answers the two questions that
+  decide the design: (a) can `ffmpeg -f concat -c copy` of forced-keyframe
+  closed-GOP chunks preserve exact frame count and A/V sync, and (b) how large
+  is the per-chunk key in practice once the overlapping-timeline-set is
+  computed. Both are cheap to test and either can invalidate the design.
 - Proxy cache directory: move proxies out of source dir into
   `$XDG_CACHE_HOME/vyper/proxies` keyed by stable source-path hash.
 - Per-asset decoder cache: share one decoder + pool across clips referencing
