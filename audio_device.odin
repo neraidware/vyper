@@ -16,6 +16,7 @@ package main
 
 import "core:fmt"
 import "core:mem"
+import "core:os"
 import "core:sync"
 import ma "vendor:miniaudio"
 
@@ -162,7 +163,9 @@ audio_device_data :: proc "c" (pDevice: ^ma.device, pOutput, pInput: rawptr, fra
 			break
 		}
 		n := min(int(frameCount) - filled, int(avail))
-		copy(out[filled:filled + n], mem.slice_ptr(cast([^]i16)buf, n)[:n])
+		samples := n * AUDIO_BUS_CHANNELS
+		ob := filled * AUDIO_BUS_CHANNELS
+		copy(out[ob:ob+samples], mem.slice_ptr(cast([^]i16)buf, samples)[:samples])
 		ma.pcm_rb_commit_read(&audio_dev.rb, u32(n))
 		filled += n
 	}
@@ -191,6 +194,11 @@ audio_device_pull_resampled :: proc "c" (pOutput: rawptr, frameCount: u32) {
 		) != ma.result.SUCCESS {
 			break
 		}
+		// Bound the request by what the ring can actually hold as one contiguous
+		// window: acquiring more than available and then resampling only part of
+		// it would leave the cursor un-committed at the wrap and desync. AUDIO_BRIDGE_FRAMES
+		// is the ring's total capacity, so min() against it plus the commit-loop
+		// below keeps every acquire satisfiable.
 		avail: u32 = u32(min(need, u64(AUDIO_BRIDGE_FRAMES)))
 		buf: rawptr
 		if ma.pcm_rb_acquire_read(&audio_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
@@ -424,7 +432,8 @@ audio_ring_write :: proc(src: []i16, frames: int) -> int {
 			break
 		}
 		n := min(frames - written, int(avail))
-		copy(mem.slice_ptr(cast([^]i16)buf, n)[:n], src[written * AUDIO_BUS_CHANNELS:(written + n) * AUDIO_BUS_CHANNELS])
+		samples := n * AUDIO_BUS_CHANNELS
+		copy(mem.slice_ptr(cast([^]i16)buf, samples)[:samples], src[written * AUDIO_BUS_CHANNELS:(written + n) * AUDIO_BUS_CHANNELS])
 		ma.pcm_rb_commit_write(&audio_dev.rb, u32(n))
 		written += n
 	}
