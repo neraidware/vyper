@@ -58,12 +58,26 @@ Binding :: struct {
 // must be tested before Ctrl+Z (undo), and Ctrl+Space (play project area)
 // before bare Space (transport toggle). Reordering these changes behaviour.
 BINDINGS := [?]Binding {
-	// The `:` opener MUST be bound to a keycode, not to text input, and that
-	// is forced by SDL rather than chosen: with no field open,
-	// text_input_cancel has called StopTextInput, and SDL delivers no
-	// TEXT_INPUT at all while text input is stopped — so a text-driven opener
-	// never fires. A redesign that moved it to the TEXT_INPUT branch was tried
-	// and reverted; the prompt simply did not open.
+	// Two input layers, deliberately kept apart:
+	//
+	//   KEYBINDS are raw. Every action resolves from a keycode and the
+	//   modifier mask on the event — never from a text event. A keybind has to
+	//   be decidable while no field is open, which a text event is not.
+	//   TEXT EDITING is IME-capable. SDL's TEXT_INPUT still drives character
+	//   entry, so dead keys and CJK input work inside a field.
+	//
+	// The `:` opener is the clearest case for the first rule, and the reason is
+	// mechanical rather than stylistic: with no field open, text_input_cancel
+	// has called StopTextInput, and SDL delivers no TEXT_INPUT at all while
+	// text input is stopped. A text-driven opener therefore never fires — it
+	// was tried, and reverted (97f5267) with the prompt simply not opening.
+	//
+	// The cost of keeping both layers is one seam: the opener's keypress can
+	// echo a ":" into the field it just opened, and SDL's TEXT_INPUT carries no
+	// keycode, so that echo cannot be correlated to its keypress — only guessed
+	// at. Hence the drain-scoped suppressor in event.odin. It is a heuristic by
+	// necessity, not by choice, and it is the only place the two layers touch.
+	// Removing it means deriving characters from keycodes too, which drops IME.
 	{ .Open_Command_Line, sdl.K_COLON, {} },
 	// On a US layout ":" is Shift+";", so SDL reports the base key with the
 	// shift modifier rather than a distinct K_COLON keycode. Requiring shift is

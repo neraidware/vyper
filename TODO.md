@@ -829,9 +829,31 @@ later work-stream that plugs into it without reshaping what is here.
       opener's echo, and the whole buffer came back empty. Verified by
       temporarily disabling the drain check and watching the new probe fail
       with `""` instead of `":C:/x"`, so the probe genuinely tests the fix.
-      Accepted cost: an echo delivered more than one drain late would now leave
-      a duplicate `:` rather than being cleaned up. Cosmetic, and rarer than the
-      bug it removes.
+      **Why the suppressor still exists, since "just use raw input" is the
+      obvious question.** The app runs two input layers on purpose: KEYBINDS
+      resolve from keycode + modifier and never from a text event, while TEXT
+      EDITING stays on SDL's TEXT_INPUT so dead keys and IME work in a field.
+      Keeping IME is a deliberate choice, and it is what leaves one seam — the
+      opener's keypress can echo a `:` into the field it just opened. SDL's
+      TEXT_INPUT carries no keycode, so that echo cannot be correlated to the
+      keypress that made it; it can only be guessed at, which is why the
+      suppressor tests character AND drain rather than one or the other. It is a
+      heuristic by necessity, not by choice, and it is the only place the two
+      layers touch.
+      Deleting it means deriving characters from keycodes too — which is a small
+      change (paste already reads the clipboard directly and Ctrl+V is a
+      keycode, so SDL text input is only ever used to turn keypresses into
+      characters) but it drops dead keys, IME, and typing non-ASCII directly.
+      Recorded here so the tradeoff is a decision rather than an accident.
+      Considered and rejected: threading a "a key was seen since the field
+      opened" flag through to tighten the heuristic. It only helps when the echo
+      arrives with a character other than the expected one, which is a case that
+      cannot be demonstrated here, and state that only exists to service a
+      hypothetical is its own bug.
+      Accepted cost of the drain scoping: an echo delivered more than one drain
+      after its keypress would now leave a duplicate `:` rather than being
+      cleaned up. That needs a multi-frame stall to happen, and it is a cosmetic
+      duplicate character rather than a swallowed keystroke — the better trade.
 - [x] ACCEPT: `:` opens empty; first char lands; a `:` typed as data in a
       LATER drain is kept and one in the same drain is eaten as the echo;
       jog moves on the tap AND on auto-repeat, and does not fire while a field
