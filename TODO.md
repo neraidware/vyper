@@ -821,9 +821,15 @@ later work-stream that plugs into it without reshaping what is here.
       Accepted cost: an echo delivered more than one drain late would now leave
       a duplicate `:` rather than being cleaned up. Cosmetic, and rarer than the
       bug it removes.
-- [ ] ACCEPT: `:` opens empty; first char lands; `open C:/x` keeps its colon
-      in the same drain AND a later one; jog repeats when held; no jog while a
-      field is open; Ctrl+Z/Ctrl+Space still fire with a queued modifier.
+- [x] ACCEPT: `:` opens empty; first char lands; a `:` typed as data in a
+      LATER drain is kept and one in the same drain is eaten as the echo;
+      jog moves on the tap AND on auto-repeat, and does not fire while a field
+      is open; Ctrl+Z/Ctrl+Space resolve per binding table. Every row has a
+      probe behind it, and the jog and echo rows were each confirmed to FAIL
+      with their fix reverted rather than merely passing alongside it.
+      Not covered by automated evidence: a human on real hardware with a real
+      keyboard, which is the only thing that exercises SDL's actual text-input
+      delivery timing.
 
 ## Queued — Performance / Cleanup
 

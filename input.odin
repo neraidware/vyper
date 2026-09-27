@@ -69,6 +69,17 @@ key_repeat :: proc(k: sdl.Keycode) -> bool {
 	return i >= 0 && kbd.repeat[i]
 }
 
+// key_down_now reports a DOWN of `k` in the current drain — the initial press
+// OR an auto-repeat, but not "still held over from an earlier drain". This is
+// the predicate a continuous control wants: shuttle has to move on the tap AND
+// keep moving while the key is held. Splitting it into key_press/key_repeat
+// and then only honouring one half is how jog ended up dead on the initial
+// press, with the tap doing nothing and only the repeats working.
+key_down_now :: proc(k: sdl.Keycode) -> bool {
+	i := key_slot(k)
+	return i >= 0 && (kbd.press_edge[i] || kbd.repeat[i])
+}
+
 key_release :: proc(k: sdl.Keycode) -> bool {
 	i := key_slot(k)
 	return i >= 0 && kbd.release_edge[i]

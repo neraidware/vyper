@@ -136,6 +136,11 @@ for j := 0; j < len(raw); {
 	if !ui_probe_key_routing_asserts() {
 		os.exit(1)
 	}
+	// Hold-to-jog, observed through the real router rather than inferred from
+	// its shape.
+	if !ui_probe_jog_asserts() {
+		os.exit(1)
+	}
 	// The file finder is a dialog-style popup drawn off the text input hook:
 	// open it headless, lay out a page, and check the popup exists, is centered,
 	// and paints one row per visible entry.
@@ -471,6 +476,104 @@ ui_probe_key_routing_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] key routing ok\n")
+	}
+	return ok
+}
+
+// Hold-to-jog is the one input behaviour whose evidence so far was structural
+// ("the router puts the field first") rather than observed. Drive the keys
+// through the real router and read the state jog_playback actually sets.
+ui_probe_jog_asserts :: proc() -> bool {
+	ok := true
+
+	// jog_playback starts playback rather than moving the frame directly, so
+	// the assertion is on what it sets. Save everything it touches: the probe
+	// session is shared with the probes that run after this one.
+	saved_playing := playhead.playing
+	saved_frame := playhead.frame
+	saved_dir := playback.dir
+	saved_stop := playback.stop_frame
+	saved_preview := preview.playing
+
+	playhead.playing = false
+	playhead.frame = 120
+	playback.dir = 0
+	playback.stop_frame = 0
+	preview.playing = false
+	ti.active = false
+	edit_state.field = .None
+
+	// Initial press of K_H: claimed, and directed backwards.
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_H, true)
+	if !app_claims_key(sdl.K_H, {}, false) {
+		fmt.eprintf("[ui-probe] K_H was not claimed on its initial press\n")
+		ok = false
+	}
+	if playback.dir != -1 {
+		fmt.eprintf("[ui-probe] K_H gave dir %d, want -1\n", playback.dir)
+		ok = false
+	}
+	if !playhead.playing {
+		fmt.eprintf("[ui-probe] K_H did not start shuttle playback\n")
+		ok = false
+	}
+
+	// Auto-repeat: the key is already down, so this is the edge the old code
+	// threw away. It must still drive the jog -- that is the whole point of
+	// adding a KEY_UP path.
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_H, true)
+	if !key_repeat(sdl.K_H) {
+		fmt.eprintf("[ui-probe] the held K_H was not reported as a repeat\n")
+		ok = false
+	}
+	if !app_claims_key(sdl.K_H, {}, true) {
+		fmt.eprintf("[ui-probe] a repeating K_H was not claimed\n")
+		ok = false
+	}
+	if playback.dir != -1 {
+		fmt.eprintf("[ui-probe] a repeating K_H gave dir %d, want -1\n", playback.dir)
+		ok = false
+	}
+
+	// And forwards for K_L.
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_L, true)
+	app_claims_key(sdl.K_L, {}, false)
+	if playback.dir != 1 {
+		fmt.eprintf("[ui-probe] K_L gave dir %d, want 1\n", playback.dir)
+		ok = false
+	}
+
+	// The load-bearing safety property: a jog must not fire while a field has
+	// the keyboard. Observed rather than inferred from the router's shape.
+	playhead.playing = false
+	playback.dir = 0
+	ti.active = true
+	ti.input_type = 0 // no TI_NONE constant; 0 is the implicit none
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_H, true)
+	if !route_key_down(sdl.K_H, {}, false) {
+		fmt.eprintf("[ui-probe] K_H was not claimed by the field\n")
+		ok = false
+	}
+	if playhead.playing || playback.dir != 0 {
+		fmt.eprintf("[ui-probe] K_H started a jog while a field was open\n")
+		ok = false
+	}
+	ti.active = false
+	ti.input_type = 0 // no TI_NONE constant; 0 is the implicit none
+
+	playhead.playing = saved_playing
+	playhead.frame = saved_frame
+	playback.dir = saved_dir
+	playback.stop_frame = saved_stop
+	preview.playing = saved_preview
+	kbd_begin_drain()
+
+	if ok {
+		fmt.printf("[ui-probe] jog ok\n")
 	}
 	return ok
 }

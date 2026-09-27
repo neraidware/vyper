@@ -323,17 +323,15 @@ app_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool
 		return true
 	}
 	claimed := false
-	// Continuous actions run on auto-repeat as well as on the initial press,
-	// which is what makes holding a key jog.
-	//
-	// key_repeat is true only for a DOWN of a key that was already down — the
-	// OS auto-repeat event — so it does not double up with the one-shot press
-	// the action table resolves below.
-	if key_repeat(sdl.K_H) {
+	// Continuous actions run on the initial press AND on auto-repeat, which is
+	// what makes shuttle work: a tap nudges one step, holding it keeps
+	// nudging. key_down_now covers both halves — key_press alone would move
+	// only on the tap, key_repeat alone only while held.
+	if key_down_now(sdl.K_H) {
 		jog_playback(-1)
 		claimed = true
 	}
-	if key_repeat(sdl.K_L) {
+	if key_down_now(sdl.K_L) {
 		jog_playback(1)
 		claimed = true
 	}
