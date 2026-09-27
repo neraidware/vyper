@@ -26,6 +26,21 @@ target_build() {
 	nix develop -c odin build . -debug -vet-style -vet-semicolon -out:vyper
 }
 
+# swscale/resample microbenchmarks. Separate package (swsbench) so it can link
+# the vendored FFmpeg without dragging in the whole app; it exists to keep
+# claims about scaler cost measured rather than remembered.
+target_bench() {
+	# The script runs without `set -e`, so a failed build would otherwise fall
+	# through to executing the previous binary and reporting stale numbers as
+	# current — which is worse than no benchmark, because it looks like data.
+	if ! nix develop -c odin build swsbench -out:bin_swsbench \
+		-microarch:native -o:aggressive -no-bounds-check; then
+		echo "bench: build failed" >&2
+		return 1
+	fi
+	./bin_swsbench
+}
+
 target_probe() {
 	env $PROBE_ENV timeout 120 ./vyper
 }
@@ -92,12 +107,13 @@ main() {
 	case "${1:-all}" in
 	check) target_check ;;
 	build) target_build ;;
+	bench) target_bench ;;
 	probe) target_probe ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|build|probe|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|build|bench|probe|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac

@@ -2647,31 +2647,28 @@ render_eval_keyed_geom :: proc(
 		// Animated scale: the box is a resample of the whole frame (the stage
 		// was decoded at max scale), so resample the crop sub-rect of the
 		// stage down to the display rect.
-		ctx := sws.getContext(
-			srcw, srch, avutil.PixelFormat.RGBA,
-			rw, rh, avutil.PixelFormat.RGBA,
-			sws.Flags{.Bilinear}, nil, nil, nil,
-		)
-		if ctx == nil {
+		//
+		// yuvconv.rgba_resample, not swscale. Building a sws context per frame and
+		// running its generic filtered RGBA->RGBA path here cost 15.4 ms/frame
+		// on a 1600x900 crop, against 0.17 ms for the same pixels 1:1 -- the
+		// source of the "50x slower when scaling" symptom. The in-tree kernel
+		// is 1.4 ms on that case (10.8x) and byte-comparable to swscale:
+		// exact at 1:1, mean 0.11/255 at 0.5x, mean 1.16/255 at 2x
+		// (swsbench's kf_vs_swscale asserts those bounds). It also allocates
+		// nothing per frame, so v.kres_scratch is the only buffer needed.
+		//
+		// The context was never the cost -- sws_getContext/free measured at
+		// 0.1-0.2 ms, so reusing one buys nothing and would just be the old
+		// path with extra state.
+		if !yuvconv.rgba_resample(
+			raw_data(slot.blit), int(v.fw) * 4,
+			int(srcx), int(srcy), int(srcw), int(srch),
+			raw_data(v.kres_scratch), int(rw) * 4,
+			int(rw), int(rh),
+		) {
 			return true
 		}
-		defer sws.freeContext(ctx)
-		src_ptr := cast([^]u8)(uintptr(raw_data(slot.blit)) + uintptr((int(srcy) * int(v.fw) + int(srcx)) * 4))
-		dst_ptr := raw_data(v.kres_scratch)
-		sln: [1][^]u8 = {src_ptr}
-		ls:  [4]c.int = {c.int(v.fw) * 4, 0, 0, 0}
-		dln: [4]c.int = {c.int(rw) * 4, 0, 0, 0}
-		dsln: [1][^]u8 = {dst_ptr}
-		if sws.scale(
-			ctx,
-			cast([^][^]u8)&sln[0],
-			cast([^]c.int)&ls[0],
-			0, srch,
-			cast([^][^]u8)&dsln[0],
-			cast([^]c.int)&dln[0],
-		) < 0 {
-			return true
-		}
+		render_keyed_frames += 1
 		render_blit_region(canvas, render_job.width, render_job.height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
 		return true
 	}
@@ -2879,6 +2876,12 @@ render_pick_output_path :: proc() {
 }
 
 // render_start snapshots the timeline and launches the worker thread.
+// render_keyed_frames counts frames that went through the animated-scale
+// (scale_keyed) resample path. VYPER_RENDER_TEST prints it so the keyed probe
+// can assert the path was actually taken -- a probe that silently renders
+// through the static path and reports a good time is worse than no probe.
+render_keyed_frames: int
+
 render_start :: proc() {
 	if render_is_busy() {
 		return
@@ -2895,6 +2898,7 @@ render_start :: proc() {
 	}
 	// Clean up a finished previous run.
 	poll_completed_thread()
+	render_keyed_frames = 0
 
 	// Render range.
 	start_frame := project.start_frame
@@ -3186,6 +3190,23 @@ render_test_run :: proc(paths: [2]string) {
 				vclip.crop_b = f32(vals[3])
 			}
 		}
+		// VYPER_KEYED_SCALE="0:0.9,30:0.95,60:0.92" installs scale keyframes
+		// on the first clip, which is the only thing that makes the worker
+		// snapshot src.scale_keyed and route frames through the animated
+		// resample path. VYPER_TX cannot reach it: a static transform takes
+		// the lossless region-copy path instead.
+		if kv, kv_ok := os.lookup_env_alloc("VYPER_KEYED_SCALE", context.allocator); kv_ok && kv != "" {
+			for pair in strings.split(kv, ",") {
+				kv2 := strings.split(pair, ":")
+				if len(kv2) == 2 {
+					fo, fo_ok := strconv.parse_f64(kv2[0])
+					val, val_ok := strconv.parse_f64(kv2[1])
+					if fo_ok && val_ok {
+						kf_set_key(vclip, "scale", i32(fo), f32(val))
+					}
+				}
+			}
+		}
 		// VYPER_TX="x,y,scale" overrides the first clip's transform so the
 		// render can be exercised off-canvas / scaled headlessly.
 		if tv, tv_ok := os.lookup_env_alloc("VYPER_TX", context.allocator); tv_ok && tv != "" {
@@ -3220,6 +3241,11 @@ render_test_run :: proc(paths: [2]string) {
 	poll_completed_thread()
 	st := render_status_text()
 	fmt.println("render-test status:", st)
+	fmt.println("render-test keyed frames:", render_keyed_frames)
+	if _, keyed_req := os.lookup_env_alloc("VYPER_KEYED_SCALE", context.allocator); keyed_req && render_keyed_frames == 0 {
+		fmt.println("render-test FAIL: keyed scale requested but no frame took the animated path")
+		os.exit(3)
+	}
 	os.exit(render_status() == .Done ? 0 : 1)
 }
 

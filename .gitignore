@@ -1,5 +1,7 @@
 # Build output
 /vyper
+# swsbench binary from `./scripts/gate.sh bench`
+/bin_swsbench
 
 # Render / probe output artifacts
 /render.mp4

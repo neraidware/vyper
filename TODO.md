@@ -400,11 +400,56 @@ The producer timing labelled `codec` includes `scale_decoded_frame`; its jump
 is stage scaling, not primarily decoder seeking. Off-canvas pixels and a
 one-frame maximum key therefore inflate both producer and compositor work.
 
+**Landed 2026-09-27 — in-tree CPU resampler replaces per-frame `sws` in the
+keyed path.** `yuv.rgba_resample` (new, `vendor/yuv/resample.odin`) does 1:1
+copy, box for minification, 2x2 bilinear for magnification, allocation-free per
+frame, driven by an incremental 16.16 footprint walk. `render_eval_keyed_geom`
+now calls it; the per-frame `sws.getContext`/`freeContext`/`scale` is gone from
+that branch. Measured (`./scripts/gate.sh bench`, `swsbench/bench.odin`):
+
+| case | swscale | kernel | speedup |
+| --- | --- | --- | --- |
+| animated ~0.9 (near 1:1) | 15.5 ms | 1.47 ms | 10.6x |
+| 0.5x downscale | 7.16 ms | 2.51 ms | 2.9x |
+| **3x downscale (the reported 1->3)** | **68.3 ms** | **20.6 ms** | **3.2x** |
+| 1:1 | 0.22 ms | exact copy | - |
+
+End-to-end on a 600-frame 1080p keyed export with a real resample every frame:
+14.15 s -> 8.50 s (1.66x), PSNR 37.5 dB between the two encodes. Against the
+119.3 ms/frame baseline recorded above, the kernel is 5.8x on the reported
+shape.
+
+Correctness is gated, not assumed: `swsbench`'s `kf_vs_swscale` compares the
+kernel to swscale per geometry and currently reads mean_abs `0.11` (0.5x),
+`1.16` (2x upscale), `0.06` (3x downscale), `0.00` (1:1, exact). Three real
+bugs were caught this way and would all have shipped silently on timing alone:
+bilinear used as a minification filter (point-samples every other pixel under
+2:1), a packed-u32 accumulator carrying alpha overflow into blue, and a
+reciprocal scaled by 65536 with no compensating shift.
+
+**Still open — the GPU path, which is the real default.** 20.6 ms/frame on the
+3x shape is 18.7 Mpx of scalar taps; on the GPU the same box filter is a few
+texture fetches, so the ceiling here is the CPU's tap count, not its
+throughput. See the note appended to S2.
+
 **Implementation order (each step lands with probe + vet before next):**
+- [x] S0. In-tree CPU resampler for the keyed path (landed above). This is the
+      fallback the GPU path must match or beat, and the correctness gate every
+      later step is measured against.
 - [ ] S1. Add an opt-in headless export benchmark fixture for scale `1 -> 2`,
       `1 -> 3`, constant scale, transform-only, crop-only, reversed scale, and
       off-canvas motion. Record wall time, producer time, keyed `sws`, stage
       dimensions, output frame count, and a reference-frame hash/PSNR.
+- [ ] S1b. GPU resample as the DEFAULT, CPU kernel as the fallback. Decode the
+      keyed stage once into a texture, then resolve the animated box as a
+      filtered textured quad (a hardware bilinear sample per output pixel) with
+      no per-frame CPU resample at all — the Resolve pattern. This is the
+      largest remaining win on the 3x shape and the reason S0 is a fallback
+      rather than the destination. Needs: a keyed-path GPU compositor, a
+      readback or GPU-side encode hand-off (the export currently hands a CPU
+      `canvas` to `rend_enc_video_frame`), and a capability check with the CPU
+      kernel as the fallback when no usable context exists. Kept as a separate
+      step because it is a compositor change, not a resampler change.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve
