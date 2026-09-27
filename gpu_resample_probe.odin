@@ -26,6 +26,10 @@ import yuv "vendor/yuv"
 
 blit_vertex_spirv := #load("shaders/blit.vert.spv")
 
+// adapter_announced keeps the driver banner to one line per probe run; setup
+// runs once per geometry.
+adapter_announced := false
+
 GPU_Resample_Probe :: struct {
 	device:     ^sdl.GPUDevice,
 	pipeline:   ^sdl.GPUGraphicsPipeline,
@@ -50,6 +54,20 @@ GPU_Resample_Probe :: struct {
 // textures and transfer buffers are sized here and reused, because this runs
 // inside the export loop and a per-frame texture create/release is a driver
 // allocation on the hot path.
+// mip_levels returns the full mip-chain length for a w x h texture: 1 for a
+// 1x1, 2 for 2x2, and so on down the largest axis.
+mip_levels :: proc(w, h: int) -> u32 {
+	n := w
+	if h > n {
+		n = h
+	}
+	levels: u32 = 1
+	for m := n; m > 1; m >>= 1 {
+		levels += 1
+	}
+	return levels
+}
+
 gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_Probe, ok: bool) {
 	p.src_w, p.src_h, p.dst_w, p.dst_h = src_w, src_h, dst_w, dst_h
 
@@ -75,12 +93,32 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 		fmt.println("gpu-probe: CreateGPUDevice failed:", sdl.GetError())
 		return
 	}
+	// Announced once, on the first device that actually exists. Which adapter
+	// these numbers describe matters more than the numbers: a box with no render
+	// node falls back to a SOFTWARE Vulkan rasterizer, where the blit path works
+	// but mip LOD selection is inert (a sampler mip_lod_bias of +4.0 moves the
+	// 3x row by 0.00, so the higher levels are never read). Software adapters
+	// also report driver "vulkan", so this line cannot be trusted to distinguish
+	// them -- see TODO.md S1b, which records the whole limitation.
+	if !adapter_announced {
+		adapter_announced = true
+		fmt.println(
+			"gpu-probe: adapter driver =", sdl.GetGPUDeviceDriver(p.device),
+			"(software Vulkan adapters also report \"vulkan\"; their mip LOD is inert -- see TODO.md S1b)",
+		)
+	}
 	// A sampler with linear min/mag filtering is the whole point: the hardware
 	// does the resample. NEAREST here would make the probe measure a copy.
+	// min_filter/mag_filter LINEAR plus mipmap_mode LINEAR is what makes this a
+	// RESAMPLE rather than a copy. The LOD is left automatic: the quad's
+	// texcoord derivative is exactly 1/scale for an axis-aligned blit, so the
+	// hardware picks log2(minification) itself -- LOD 0 when magnifying, and a
+	// prefiltered level when shrinking. mipmap_mode .NEAREST would snap to one
+	// level and alias against the neighbouring one.
 	p.sampler = sdl.CreateGPUSampler(p.device, sdl.GPUSamplerCreateInfo {
 		min_filter = .LINEAR,
 		mag_filter = .LINEAR,
-		mipmap_mode = .NEAREST,
+		mipmap_mode = .LINEAR,
 		address_mode_u = .CLAMP_TO_EDGE,
 		address_mode_v = .CLAMP_TO_EDGE,
 		address_mode_w = .CLAMP_TO_EDGE,
@@ -150,9 +188,13 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 	p.src_tex = sdl.CreateGPUTexture(
 		p.device,
 		sdl.GPUTextureCreateInfo {
+			// A full mip chain is the anti-aliasing: the hardware blends two
+			// prefiltered levels when the derivative lands between them, which is
+			// what stops a shrunk sample of high-frequency content from keeping
+			// contrast the output cannot represent.
 			type = .D2, format = .R8G8B8A8_UNORM, usage = {.SAMPLER},
 			width = u32(src_w), height = u32(src_h), layer_count_or_depth = 1,
-			num_levels = 1, sample_count = ._1,
+			num_levels = mip_levels(src_w, src_h), sample_count = ._1,
 		},
 	)
 	p.dst_tex = sdl.CreateGPUTexture(
@@ -234,7 +276,7 @@ transfer_of :: proc(
 // draws it scaled into the render target and reads the result back into `out`
 // (dst_w*dst_h*4). Returns false if any step fails, which is the caller's cue
 // to fall back to the CPU kernel.
-gpu_resample_run :: proc(p: ^GPU_Resample_Probe, src: []u8, src_stride: int, out: []u8) -> bool {
+gpu_blit_run :: proc(p: ^GPU_Resample_Probe, src: []u8, src_stride: int, out: []u8) -> bool {
 	device := p.device
 	src_bytes := p.src_w * p.src_h * 4
 	dst_bytes := p.dst_w * p.dst_h * 4
@@ -276,6 +318,12 @@ gpu_resample_run :: proc(p: ^GPU_Resample_Probe, src: []u8, src_stride: int, out
 		false,
 	)
 	sdl.EndGPUCopyPass(cp)
+
+	// The mip chain is only anti-aliasing if it is actually filled. Without this
+	// the higher levels are whatever the driver left there, and sampling LOD>0
+	// blends that in -- which showed up as the image getting DARKER than the
+	// reference at every pixel, not as an obvious failure.
+	sdl.GenerateMipmapsForGPUTexture(cb, p.src_tex)
 
 	// Draw the scaled quad. Sampling the FULL source rect across the dst rect
 	// is what makes the hardware filter, and it is the geometry the keyed path
@@ -465,14 +513,14 @@ gpu_resample_probe_run :: proc() -> int {
 			raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
 		)
 
-		if !gpu_resample_run(&p, case_src, c.src_w * 4, got) {
+		if !gpu_blit_run(&p, case_src, c.src_w * 4, got) {
 			fmt.println("gpu-probe: run failed, falling back to CPU")
 			gpu_resample_teardown(&p)
 			continue
 		}
 		t0 := time.tick_now()
 		for _ in 0 ..< ITERS {
-			gpu_resample_run(&p, case_src, c.src_w * 4, got)
+			gpu_blit_run(&p, case_src, c.src_w * 4, got)
 		}
 		gpu_ms := f64(time.tick_since(t0)) / 1e6 / f64(ITERS)
 
@@ -512,7 +560,7 @@ gpu_resample_probe_run :: proc() -> int {
 			// is not shipped yet -- the GPU blit is not the default path, the
 			// CPU kernel is. When the footprint kernel lands this becomes
 			// .GATED and the same number turns into a regression gate.
-			verdict = fmt.tprintf("open (needs footprint, budget %.0f/%.0f)", c.max_mean, c.max_peak)
+			verdict = fmt.tprintf("open (budget %.0f/%.0f)", c.max_mean, c.max_peak)
 		}
 		fmt.printf(
 			"  %-7s %-21s gpu=%8.3f ms cpu=%8.3f ms %6.2fx mean=%5.2f peak=%3d  %s\n",
@@ -520,6 +568,29 @@ gpu_resample_probe_run :: proc() -> int {
 			fmt.tprintf("%dx%d->%dx%d", c.src_w, c.src_h, c.dst_w, c.dst_h),
 			gpu_ms, cpu_ms, cpu_ms / max(gpu_ms, 0.0001), mean, peak, verdict,
 		)
+		if verdict == "FAIL" {
+			// "mean 39" could be all-black, channel-shifted, or flipped, and
+			// those are different bugs. Guessing between them is how a plumbing
+			// mistake survives as a tuning problem.
+		// Sample the actual bytes on a failure: "mean 145" could be all-black,
+		// channel-swapped, or shifted by a row, and those are different bugs.
+		// Guessing between them is how a plumbing mistake survives as a "tuning"
+		// problem.
+		{
+			w, hh := c.dst_w, c.dst_h
+			pts := [4][2]int{{0, 0}, {w / 2, hh / 2}, {w - 1, hh - 1}, {w / 3, hh / 4}}
+			for pt in pts {
+				o := (pt[1] * w + pt[0]) * 4
+				fmt.printf(
+					"        at (%4d,%4d) gpu=%3d,%3d,%3d,%3d cpu=%3d,%3d,%3d,%3d\n",
+					pt[0], pt[1],
+					got[o], got[o + 1], got[o + 2], got[o + 3],
+					want[o], want[o + 1], want[o + 2], want[o + 3],
+				)
+			}
+		}
+
+		}
 		gpu_resample_teardown(&p)
 	}
 

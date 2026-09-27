@@ -485,15 +485,48 @@ throughput. See the note appended to S2.
          `SMOOTH` catches geometry errors, `HIFREQ` catches filtering errors.
 
       Consequence: hardware filtering alone is **not** an acceptable export
-      default for minification. S1b needs a footprint kernel (compute, summing
-      the source box) rather than one filtered quad, which also has the useful
-      property of making the GPU and the CPU fallback produce the same image —
-      otherwise "fallback" is a silent quality change. The probe's
+      default for minification. S1b needs prefiltered downsampling (a footprint
+      kernel, or mip levels) rather than one filtered quad, which also has the
+      useful property of making the GPU and the CPU fallback produce the same
+      image — otherwise "fallback" is a silent quality change. The probe's
       `OPEN_ALIASING` row is deliberately reported-not-asserted until that
-      kernel lands, then flips to `GATED` with the 8/32 budget it already
-      carries. The `NYQUIST` rows stay ungated permanently: at 1px checkerboard
-      two correct resamplers differ by phase, and asserting it would demand one
-      filter's convention rather than quality.
+      lands, then flips to `GATED` with the 8/32 budget it already carries. The
+      `NYQUIST` rows stay ungated permanently: at 1px checkerboard two correct
+      resamplers differ by phase, and asserting it would demand one filter's
+      convention rather than quality.
+
+      **BLOCKER for flipping the default: this machine has no GPU.** Measured
+      2026-09-27. `/dev/dri` contains no render nodes, there is no `/dev/nvidia*`,
+      and the only loadable Vulkan ICD is `lvp_icd` (lavapipe, Mesa's *software*
+      rasterizer). So every figure above is software-Vulkan behaviour, and the
+      9-12x win is a win over a scalar CPU kernel on a CPU-emulated device — not
+      a measurement of real hardware.
+
+      Two attempts to fix the aliasing, both blocked the same way:
+
+      - **Compute footprint kernel** (one thread per output pixel, averaging the
+        source box). SDL3's storage-texture story is stricter than the API
+        surface suggests and cost several wrong turns: `BeginGPUComputePass`
+        binds only *writeable* storage textures, so a readonly input must go
+        through the separate `SDL_BindGPUComputeStorageTextures`; and SPIR-V
+        compute sets are fixed and validated — set 0 sampled + readonly storage,
+        set 1 read-write storage, set 2 uniforms. Getting either wrong compiles
+        cleanly and then writes nothing at all, which reads as "all pixels
+        zero", not as an error. Not pursued further until there is a real GPU to
+        validate it on.
+      - **Mip levels + automatic LOD** (the far smaller change: same blit shader,
+        full mip chain, `mipmap_mode = .LINEAR`). Inert on this adapter — a
+        sampler `mip_lod_bias` of +4.0 moves the 3x row by exactly 0.00, so the
+        higher levels are never sampled. The chain is built (11 levels at
+        1600x900) and `GenerateMipmapsForGPUTexture` is called outside any pass
+        as the header requires; the adapter simply does not select those levels.
+
+      So the aliasing *risk* is established (a single bilinear tap aliases under
+      minification on any conformant implementation) but the *fix* is unvalidated
+      here. Do not flip the default on this box: shipping it would trade a
+      measured 3x-downscale quality regression for a speedup that has never run
+      on hardware. The CPU kernel stays the default until a real-GPU run shows
+      the prefiltered path inside the 8/32 budget.
 
       Remaining for S1b: footprint kernel, keyed-path GPU compositor, GPU
       RGBA->NV12, and direct NV12 hand-off to `hw_frames_ctx` to drop the
