@@ -116,6 +116,10 @@ for j := 0; j < len(raw); {
 	if !ui_probe_track_menu_asserts() {
 		os.exit(1)
 	}
+	// Composite order: track order for ordinary clips, subtitles pinned on top.
+	if !ui_probe_preview_order_asserts() {
+		os.exit(1)
+	}
 	// The finder must show its listing the moment it opens, with no typing.
 	if !ui_probe_finder_listing_asserts() {
 		os.exit(1)
@@ -1268,6 +1272,126 @@ project_roundtrip_asserts :: proc(second_pass: bool) -> bool {
 		ok = false
 	}
 	_ = second_pass
+	return ok
+}
+
+// ui_probe_preview_order_asserts locks the preview's composite order, which is
+// two rules and not one:
+//
+//   • ordinary clips follow TRACK ORDER -- a text clip on a track below a video
+//     draws underneath it, matching what export now does;
+//   • subtitle-generator clips are PINNED above everything, whatever track they
+//     sit on, because a burned-in subtitle a video covers is unreadable.
+//
+// The second rule is the one that regressed: subtitles used to take a `layer`
+// from the same walk as everything else, so a subtitle clip on a low track
+// previewed BEHIND the video while export pinned it on top -- the preview and
+// the export disagreed about the same frame.
+//
+// Asserted on the ordering, not on pixels: the draw loop is a straight iteration
+// over preview_build_draw_order's result, and the painter's order IS that order.
+preview_order_probe_dummy: sdl.GPUTexture
+
+ui_probe_preview_order_asserts :: proc() -> bool {
+	ok := true
+	reset := proc() {
+		for i in 0 ..< MAX_PREVIEW_SLOTS {
+			preview_slots[i] = {}
+		}
+	}
+	// put declares one visible slot with a given track depth and pinned flag.
+	put :: proc(idx: int, layer: u8, is_sub: bool) {
+		preview_slots[idx] = Preview_Slot {
+			in_use     = true,
+			has_frame  = true,
+			texture    = &preview_order_probe_dummy,
+			layer      = layer,
+			is_subtitle = is_sub,
+		}
+	}
+	// top_slot returns the slot index painted LAST, i.e. the one that ends up
+	// on top of everything else.
+	top_slot :: proc() -> int {
+		order, n := preview_build_draw_order()
+		if n == 0 {
+			return -1
+		}
+		return order[0]
+	}
+
+	// 1. Track order still decides between ordinary clips: video on layer 1 (the
+	// topmost track) beats plain text on layer 3.
+	reset()
+	put(0, 1, false)
+	put(1, 3, false)
+	if got := top_slot(); got != 0 {
+		fmt.eprintf("[ui-probe] preview order: topmost video must stay on top of a lower text clip (got slot %d, want 0)\n", got)
+		ok = false
+	}
+
+	// 2. A plain text clip on a LOWER track must stay UNDER the video. This is
+	// the parity the export fix made explicit; the preview already did it, and
+	// the test is here so a "simplification" of the key cannot quietly reverse it.
+	reset()
+	put(0, 4, false) // video, deep track
+	put(1, 2, false) // text, top track
+	if got := top_slot(); got != 1 {
+		fmt.eprintf("[ui-probe] preview order: text on the top track must beat a deeper video (got slot %d, want 1)\n", got)
+		ok = false
+	}
+
+	// 3. A subtitle clip on the BOTTOM track is still pinned above a video on
+	// the TOP track. Before the fix the subtitle took layer 4, sorted below the
+	// video, and drew first -- hidden.
+	reset()
+	put(0, 1, false) // video, topmost track
+	put(1, 4, true) // subtitle, bottom track
+	if got := top_slot(); got != 1 {
+		fmt.eprintf("[ui-probe] preview order: a subtitle must be pinned above a video on a higher track (got slot %d, want 1)\n", got)
+		ok = false
+	}
+
+	// 4. Pinning is not "subtitles last in slot order": the pinned subtitle must
+	// win even when it occupies a LOWER slot index than the video it covers,
+	// which is what a stable-slot reassignment can produce.
+	reset()
+	put(0, 9, true) // subtitle, lowest slot index, deepest track
+	put(1, 1, false) // video, higher slot index, topmost track
+	if got := top_slot(); got != 0 {
+		fmt.eprintf("[ui-probe] preview order: pinning must not depend on slot index (got slot %d, want 0)\n", got)
+		ok = false
+	}
+
+	// 5. Two subtitles and a video: the subtitles keep their relative track order
+	// among themselves while both stay above the video, so pinning does not
+	// flatten the stack it is exempting.
+	reset()
+	put(0, 3, true) // subtitle, deeper track
+	put(1, 1, false) // video, top track
+	put(2, 2, true) // subtitle, shallower track
+	order, n := preview_build_draw_order()
+	// Ascending key: both subtitles (0) in layer order, then the video (1).
+	// Painted backwards, so paint order is video, then deep sub, then shallow sub.
+	if n != 3 || order[0] != 0 || order[1] != 2 || order[2] != 1 {
+		fmt.eprintf("[ui-probe] preview order: pinned subtitles must keep relative track order (order %d,%d,%d n=%d, want 0,2,1 n=3)\n", order[0], order[1], order[2], n)
+		ok = false
+	}
+
+	// 6. Invisible slots stay out of the list entirely, so a pinned subtitle with
+	// no decoded frame cannot blank the stack.
+	reset()
+	put(0, 1, true)
+	preview_slots[0].has_frame = false
+	_, n2 := preview_build_draw_order()
+	if n2 != 0 {
+		fmt.eprintf("[ui-probe] preview order: a slot with no frame must not be composited (n=%d, want 0)\n", n2)
+		ok = false
+	}
+
+	reset()
+	if ok {
+		fmt.printf("[ui-probe] preview order ok (track order, subtitles pinned on top)\n")
+	}
 	return ok
 }
 

@@ -782,6 +782,15 @@ Preview_Slot :: struct {
 	// is_text marks a slot holding a text clip's tight raster (own text_buf +
 	// tight texture) rather than a video decode into the fixed buffer.
 	is_text:              bool,
+	// is_subtitle marks a subtitle-generator text slot, which is PINNED above
+	// every other clip instead of taking its depth from the track walk. A
+	// burned-in subtitle that a video covers is unreadable, so this is a
+	// deliberate exception to track order -- the export compositor pins its subs
+	// pass for the same reason. It is a flag and not a `layer` value because
+	// `layer` is also the flash overlay's depth (flash_rec.odin) and must keep
+	// meaning "where this clip sits in the stack"; the pinned depth is derived
+	// at the draw site (preview_draw_key).
+	is_subtitle:          bool,
 	// text_buf is the RGBA raster for a text slot, dynamically sized to the
 	// estimated buffer bw x bh (which fits the baked text at font 48*scale; the
 	// tight ink sub-rect is text_x/text_y/text_w/text_h within it. The matching

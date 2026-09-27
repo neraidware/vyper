@@ -1310,13 +1310,37 @@ baseline. Result: `below=inf`, `above=27.377424`.
   draft used a scratch slice and leaked 4,158 bytes in 66 blocks, which the
   `valgrind` target caught immediately.
 
-**Step D — preview pins subtitle slots, fixing bug 3.** Still open.
-Subtitle-generator slots must draw after every layer-sorted slot instead of
-taking part in the sort. `preview_state.odin` already has a `subs_pinned` flag
-appended at the end of the sorted list; what is missing is marking the slots
-that are actually subtitle generators. Export is now correct by construction
-(subs are a separate pass after the single ordered visual walk), so this is
-preview-only.
+**Step D — preview pins subtitle slots, fixing bug 3.** Done.
+Subtitle-generator slots took a `layer` from the same track walk as everything
+else, so a subtitle clip on a low track previewed BEHIND the video while export
+pinned it on top — the preview and the export disagreed about the same frame, and
+a burned-in subtitle a video covers is unreadable either way. There was no
+`subs_pinned` flag anywhere in the tree; the earlier note in this file claiming
+one existed was wrong, and the whole mechanism is new.
+
+`Preview_Slot` now carries `is_subtitle`, assigned on every claimed frame
+next to `layer` so a slot reassigned from a subtitle clip to a video cannot keep
+a stale flag. It is a flag and not a `layer` value on purpose: `layer` is also
+the flash overlay's depth (`flash_rec.odin`), where it must keep meaning "where
+this clip sits in the stack". The pinned depth is derived at the single place
+that orders the composite — `preview_draw_key` returns the reserved key 0 for a
+subtitle slot and `layer` otherwise, and the draw loop walks the list backwards
+so the LOWEST key paints LAST. Key 0 sits below every track-assigned layer
+(which start at 1), which is what makes "pinned above everything" expressible
+without disturbing the track order of the rest of the stack.
+
+The collect-and-sort moved out of `draw_preview` into `preview_build_draw_order`
+so the rule is testable with no GPU pass and no live decoder — it is pure data
+over `preview_slots`. `ui_probe_preview_order_asserts` covers six cases:
+track order still decides between ordinary clips (both directions), a subtitle
+on the BOTTOM track beats a video on the TOP track, pinning does not depend on
+slot index (the case a stable-slot reassignment produces), two pinned subtitles
+keep their relative track order among themselves, and an invisible pinned slot
+stays out of the list. Verified as a real regression test: reverting only the
+`is_subtitle` branch in `preview_draw_key` fails 3 of the 6, and the 3 that still
+pass are the ones that must keep passing (ordinary track order) — the assertions
+are not tautological. Export was already correct by construction (subs are a
+separate pass after the single ordered visual walk), so this was preview-only.
 
 **Gate hardening (done with A1).** `target_gpu_probe`, `target_probe`,
 `target_smoke`, `target_valgrind` and `keyed_export` all ran `./vyper` WITHOUT

@@ -337,6 +337,10 @@ update_preview_slots :: proc() -> bool {
 			layer += 1
 			slot := &preview_slots[slot_idx]
 			slot.layer = layer
+			// Assigned every claimed frame, next to `layer`, so a slot reassigned
+			// from a subtitle clip to a video (or the reverse) cannot keep a stale
+			// pinning flag.
+			slot.is_subtitle = clip.kind == .Text && clip.generator == .Subtitles
 			fresh_claim := !slot.in_use || slot.clip_id != clip.clip_id
 			// Identity is the clip instance (clip_id), not its asset or its
 			// position: asset_id alone would conflate two different clips of

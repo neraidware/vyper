@@ -2096,6 +2096,62 @@ draw_image_layer :: proc(
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
 
+// SUBTITLE_PIN_KEY is the draw depth reserved for pinned subtitle slots. It sits
+// below every track-assigned layer (the walk starts at 1), which is what makes
+// "pinned on top" expressible: the preview draws the LOWEST key last.
+SUBTITLE_PIN_KEY :: 0
+
+// preview_draw_key is the depth a preview slot sorts by when compositing. LOWER
+// draws LATER and therefore ends up on top.
+//
+// Track order alone already gets this right for ordinary clips: `layer` is the
+// track-order walk position, the topmost track gets layer 1, and the draw loop
+// walks the sorted list backwards, so the top track paints last. Subtitle slots
+// are the exception -- they are pinned ABOVE every other clip, because a
+// burned-in subtitle that a video covers is unreadable, and a subtitle clip on a
+// low track must still land on top.
+//
+// This is derived at the draw site rather than folded into `layer` because
+// `layer` is also the flash overlay's depth (flash_rec.odin), where it must keep
+// meaning "where this clip sits in the stack" and not "pinned above subtitles".
+preview_draw_key :: proc(slot: ^Preview_Slot) -> int {
+	if slot.is_subtitle {
+		return SUBTITLE_PIN_KEY
+	}
+	return int(slot.layer)
+}
+
+// preview_build_draw_order collects every visible slot and returns their indices
+// sorted by preview_draw_key ASCENDING. The caller walks the result BACKWARDS, so
+// the last slot painted is order[0] -- the lowest key, i.e. the topmost clip.
+//
+// Split out of draw_preview so the ordering rule is testable without a GPU pass
+// or a live decoder: it is pure data over preview_slots, which is the whole
+// point of the rule, and asserting it here is what keeps "pinned subtitles"
+// from quietly becoming "subtitles wherever the track walk happened to put them".
+preview_build_draw_order :: proc() -> (order: [MAX_PREVIEW_SLOTS]int, n: int) {
+	n = 0
+	for i := 0; i < MAX_PREVIEW_SLOTS; i += 1 {
+		if s := &preview_slots[i]; s.in_use && s.has_frame && s.texture != nil {
+			order[n] = i
+			n += 1
+		}
+	}
+	// Insertion sort: MAX_PREVIEW_SLOTS is a small fixed bound and the visible
+	// set is far smaller, so this beats anything with a setup cost.
+	for a := 1; a < n; a += 1 {
+		key := order[a]
+		b := a
+		for b > 0 &&
+		   preview_draw_key(&preview_slots[order[b - 1]]) > preview_draw_key(&preview_slots[key]) {
+			order[b] = order[b - 1]
+			b -= 1
+		}
+		order[b] = key
+	}
+	return
+}
+
 draw_preview :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
@@ -2138,26 +2194,11 @@ draw_preview :: proc(
 
 	// Paint every clip covering the playhead with the top track on top. Slots
 	// keep a STABLE index per clip identity (update_preview_slots), so index
-	// order no longer means depth: sort the visible slots by layer (the
-	// track-order walk position, lowest = topmost) and draw the lowest layer
-	// last so the top track's clip appears on top.
-	order: [MAX_PREVIEW_SLOTS]int
-	n := 0
-	for i := 0; i < MAX_PREVIEW_SLOTS; i += 1 {
-		if s := &preview_slots[i]; s.in_use && s.has_frame && s.texture != nil {
-			order[n] = i
-			n += 1
-		}
-	}
-	for a := 1; a < n; a += 1 {
-		key := order[a]
-		b := a
-		for b > 0 && preview_slots[order[b - 1]].layer > preview_slots[key].layer {
-			order[b] = order[b - 1]
-			b -= 1
-		}
-		order[b] = key
-	}
+	// order no longer means depth: sort the visible slots by draw key and draw the
+	// LOWEST key last, so the topmost clip is painted last and appears on top.
+	// The key is the track-order walk position (lowest = topmost), except that
+	// subtitle slots are pinned above everything -- see preview_draw_key.
+	order, n := preview_build_draw_order()
 	for k := n - 1; k >= 0; k -= 1 {
 		slot := &preview_slots[order[k]]
 		is_text := slot.text_w > 0 && slot.text_h > 0
