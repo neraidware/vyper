@@ -125,6 +125,12 @@ for j := 0; j < len(raw); {
 	if !ui_probe_cmdline_opener_asserts() {
 		os.exit(1)
 	}
+	// The shortcut table is data now, so pin the resolutions the old inline
+	// switch made — especially the key/mode pairs that need most-specific-first
+	// ordering, which a silent reorder would rebind.
+	if !ui_probe_action_table_asserts() {
+		os.exit(1)
+	}
 	// The file finder is a dialog-style popup drawn off the text input hook:
 	// open it headless, lay out a page, and check the popup exists, is centered,
 	// and paints one row per visible entry.
@@ -303,6 +309,109 @@ ui_probe_push_opener_key :: proc() {
 // re-enables text input to receive). The opener must consume the echo without
 // eating anything else, and the case that matters is the reported bug: a
 // keypress that produces NO echo must not leave the suppressor armed.
+// The action table replaced an inline `switch event.key.key`, so this pins the
+// resolutions that switch used to make. The interesting cases are the ones
+// where one key maps to DIFFERENT actions by modifier, because those depend
+// entirely on BINDINGS being ordered most-specific-first — a reorder compiles
+// fine and silently rebinds the app.
+ui_probe_action_table_asserts :: proc() -> bool {
+	ok := true
+	ctrl := sdl.KMOD_CTRL
+	shift := sdl.KMOD_SHIFT
+
+	Case :: struct {
+		key:     sdl.Keycode,
+		mods:    sdl.Keymod,
+		want:    Action,
+		because: string,
+	}
+	cases := [?]Case {
+		{ sdl.K_COLON, {}, .Open_Command_Line, "the \":\" opener is keycode-bound and modifier-insensitive" },
+		{ sdl.K_SEMICOLON, shift, .Open_Command_Line, "Shift+\";\" is the same opener on a US layout" },
+		{ sdl.K_SEMICOLON, sdl.KMOD_LSHIFT, .Open_Command_Line, "left Shift must satisfy the shift binding" },
+		{ sdl.K_SEMICOLON, sdl.KMOD_RSHIFT, .Open_Command_Line, "right Shift must satisfy it too" },
+		{ sdl.K_SEMICOLON, {}, .None, "a bare \";\" must NOT open the prompt" },
+		{ sdl.K_Z, ctrl, .Undo, "Ctrl+Z undoes" },
+		{ sdl.K_Z, sdl.KMOD_RCTRL, .Undo, "right Ctrl must satisfy the Ctrl bindings" },
+		{ sdl.K_Z, ctrl | shift, .Redo, "Ctrl+Shift+Z redoes, and must beat the Ctrl+Z row" },
+		{ sdl.K_Z, {}, .None, "a bare \"z\" does nothing" },
+		{ sdl.K_Y, ctrl, .Redo, "Ctrl+Y redoes" },
+		{ sdl.K_SPACE, ctrl, .Play_Project_Area, "Ctrl+Space plays the project area, and must beat the bare-Space row" },
+		{ sdl.K_SPACE, {}, .Toggle_Playback, "bare Space toggles transport" },
+		{ sdl.K_R, ctrl, .Begin_Rename, "Ctrl+R renames" },
+		{ sdl.K_R, {}, .None, "a bare \"r\" does nothing" },
+		{ sdl.K_F1, {}, .Toggle_Help, "F1 toggles help" },
+		{ sdl.K_S, {}, .Split_At_Playhead, "S splits at the playhead" },
+		// Ctrl+S splitting a clip is almost certainly a pre-existing binding
+		// bug, but the table must reproduce the app's ACTUAL behaviour, not the
+		// behaviour anyone would have chosen. Changing it is its own change.
+		{ sdl.K_S, ctrl, .Split_At_Playhead, "Ctrl+S still splits: preserved pre-existing behaviour" },
+		{ sdl.K_U, {}, .Toggle_Links, "U toggles links" },
+		{ sdl.K_BACKSPACE, {}, .Delete_At_Playhead, "Backspace deletes the keyframe or ripples" },
+		{ sdl.K_DELETE, {}, .Delete_Selection, "Delete removes the clip raw" },
+		{ sdl.K_I, {}, .Set_In_Point, "I sets the in point" },
+		{ sdl.K_O, {}, .Set_Out_Point, "O sets the out point" },
+		// Jog is driven by key repeat, not by the table, so it must not be
+		// reachable as a one-shot action.
+		{ sdl.K_H, {}, .None, "jog is a repeat-driven rate, not a bound action" },
+		{ sdl.K_L, {}, .None, "jog is a repeat-driven rate, not a bound action" },
+	}
+
+	for c in cases {
+		got := action_for(c.key, c.mods)
+		if got != c.want {
+			fmt.eprintf(
+				"[ui-probe] action_for(K_%v, mods=%v) = %v, want %v (%s)\n",
+				c.key, c.mods, got, c.want, c.because,
+			)
+			ok = false
+		}
+	}
+
+	// Keyboard state: the definition of a repeat is "already down", and an
+	// action must fire on the initial press only, never on the repeats after it.
+	before := kbd.drain
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_H, true)
+	if !key_press(sdl.K_H) || key_repeat(sdl.K_H) {
+		fmt.eprintf("[ui-probe] the first KEY_DOWN reported a repeat\n")
+		ok = false
+	}
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_H, true)
+	if key_press(sdl.K_H) || !key_repeat(sdl.K_H) {
+		fmt.eprintf("[ui-probe] holding KEY_DOWN did not report a repeat\n")
+		ok = false
+	}
+	kbd_begin_drain()
+	kbd_note_key(sdl.K_H, false)
+	if key_held(sdl.K_H) || !key_release(sdl.K_H) {
+		fmt.eprintf("[ui-probe] KEY_UP did not clear the held state\n")
+		ok = false
+	}
+	// A key that never went down has no edges, and a stale handle from a
+	// previous drain must not resurrect one.
+	kbd_begin_drain()
+	if key_held(sdl.K_H) || key_press(sdl.K_H) || key_repeat(sdl.K_H) || key_release(sdl.K_H) {
+		fmt.eprintf("[ui-probe] keyboard edges survived a drain\n")
+		ok = false
+	}
+	// An out-of-range keycode must be refused, not written past the table end.
+	kbd_note_key(sdl.Keycode(KEYCODE_SLOTS + 1), true)
+	if key_held(sdl.Keycode(KEYCODE_SLOTS + 1)) {
+		fmt.eprintf("[ui-probe] an out-of-range keycode was accepted\n")
+		ok = false
+	}
+	if kbd.drain <= before {
+		fmt.eprintf("[ui-probe] the drain counter did not advance\n")
+		ok = false
+	}
+	if ok {
+		fmt.printf("[ui-probe] action table ok (%d cases)\n", len(cases))
+	}
+	return ok
+}
+
 ui_probe_cmdline_opener_asserts :: proc() -> bool {
 	ok := true
 	running := true

@@ -710,9 +710,89 @@ stylistic choice, and the comment at the site now says so.
       synthetic event stays `FIRST` and the app's switch never matches unless the
       tag is set explicitly. The S3 fix is what made the probe able to drive a
       modifier at all.
-- [ ] ACCEPT: manual pass — press `:` and the prompt opens EMPTY, the first
+- [x] S4. The other four `GetModState()` call sites in the shortcut switch
+      (`K_Z` undo, `K_Y` redo, `K_SPACE` play, `K_R` rename) plus the
+      `ti.active` text-field path now read `event.key.mod` like the opener,
+      and the reasoning is stated once above the switch instead of per-site.
+      This is the latent race S3 named and deferred. It is not a
+      microsecond-window problem: the app's main thread stalls (decode, GPU
+      work), input queues, and by the time a queued KEY_DOWN is handled the
+      user has typically released or changed the modifier — so Ctrl+Z can fire
+      as a bare `z`, and Ctrl+Space as plain Space (a real transport toggle).
+- [x] S5. The two `GetModState()` calls that must NOT change are now
+      documented at their sites so the next audit does not "fix" them:
+      `MOUSE_WHEEL` + Alt has no event-side alternative (SDL's
+      `MouseWheelEvent` carries no `mod` field at all, unlike
+      `KeyboardEvent`), and `read_mouse_input` is a per-frame sample of what
+      is held *now* for shift-click/alt-click, with no discrete event behind it.
+- [x] ACCEPT: manual pass — press `:` and the prompt opens EMPTY, the first
       character typed shows up, `open C:/x` keeps its colon, and
       F1/undo/redo shortcuts still fire.
+
+## Active 9 — Input layer: key state, actions, focus/consume routing
+
+**Why:** the app had no `KEY_UP` path at all, so "is this key down" was
+unanswerable; every consumer re-derived press-vs-repeat from raw events; the
+shortcut table was a keycode switch inline in the poll loop; and text input was
+routed by a nested `ti.active` → `edit_state.field` → shortcuts if/else, which
+is why the `:` opener needs a post-hoc echo suppressor at all.
+
+**Scope decision (2026-09-26): build the input METHOD, not a text editor.**
+More advanced text editing is expected eventually, so the routing has to
+accommodate a future editor owning keys — but no editor, undo stack, or
+multi-line buffer is built now. The seam is the deliverable; the editor is a
+later work-stream that plugs into it without reshaping what is here.
+
+- [x] I1. `input.odin`: key state as the single source of truth —
+      `held` / `press_edge` / `repeat` / `release_edge` tables plus a `drain`
+      counter. Repeat is derived from "was already down" rather than the
+      event's own `repeat` flag, because that flag is absent on some platform
+      paths and "already down" is the definition either way. Fixed global, not
+      a per-frame allocation: a key held across frames is still held, so this
+      belongs to the session bucket, not frame temp.
+- [x] I2. `KEY_UP` is now handled, and `handle_sdl_events` is documented as
+      the app's only SDL poll site — which is what makes `drain` a meaningful
+      scope (one call empties the queue, so "same burst of input" is
+      comparable).
+- [x] I3. Hold-to-jog. `K_H`/`K_L` sat inside the `!repeat` guard, so holding
+      them did nothing and shuttle needed a tap per step. A repeat-aware branch
+      now runs the jog on auto-repeat, placed so it is only reached when no
+      field owns the key — a jog can never fire while the user is typing.
+- [x] I4. `action.odin`: `Action` enum + one fixed binding table, replacing the
+      inline keycode switch. `.None` is the zero value so an unresolved key needs
+      no dummy and no parallel bool. Table is ordered MOST SPECIFIC FIRST and
+      resolution takes the first match, which is what preserves `Ctrl+Shift+Z`
+      (redo) beating `Ctrl+Z` (undo) and `Ctrl+Space` beating bare `Space`.
+      Continuous jog is deliberately NOT an action — it is a repeat-driven rate,
+      and a second definition of "held" in the table would conflict with `kbd`.
+      No remap UI, no persistence. Behaviour preserved exactly, including that a
+      bare binding fires regardless of extra modifiers (`Ctrl+S` still splits a
+      clip — surprising, but this pass reproduces what the app does, not what it
+      should do).
+      **The modifier match is not a bitwise subset test, and the probe caught
+      why.** SDL's combined masks are `KMOD_SHIFT == LSHIFT|RSHIFT`, meaning
+      "either", so `(got & KMOD_SHIFT) == KMOD_SHIFT` demands BOTH shift keys and
+      never matches — which silently disables every modified binding while still
+      compiling. `mods_have` now walks the four L/R pairs and requires at least
+      one side, falling back to a plain subset test for unpaired flags
+      (CapsLock/NumLock). Pinned by probe cases for left *and* right Shift/Ctrl.
+- [ ] I5. Focus/consume routing: one entry point where a focused field gets
+      first refusal and the app layer never sees a consumed key. Replaces the
+      nested modal if/else. The point is structural — it makes "the opener
+      opened a field, the field then eats its own echo" impossible to express,
+      rather than something a suppressor has to clean up after.
+- [ ] I6. Drain-scoped echo fix, which I5 makes free. The suppressor is
+      already correct for the stall case (character-match, not
+      drain-bounded — under a 200 ms main-thread stall the user types `:` then
+      `o`, both queue, both drain together, and a drain-bounded discard would
+      eat the `o`). What it gets wrong is the later-drain case: a `:` typed as
+      DATA in a subsequent drain is dropped, breaking `open C:/foo`. Scoping
+      the existing character-match to the opening drain fixes that row and no
+      other, turning `swallow_char` into a `(drain, byte)` pair. Net: 4 rows
+      correct instead of 3.
+- [ ] ACCEPT: `:` opens empty; first char lands; `open C:/x` keeps its colon
+      in the same drain AND a later one; jog repeats when held; no jog while a
+      field is open; Ctrl+Z/Ctrl+Space still fire with a queued modifier.
 
 ## Queued — Performance / Cleanup
 

@@ -13,15 +13,32 @@ import sdl "vendor:sdl3"
 // fields, then app shortcuts), text input, and wheel scrolling per widget.
 // Sets *running = false on a quit/close event. Nothing here depends on the
 // current mouse position.
+//
+// This is the app's ONLY SDL poll site, which is what makes kbd.drain a
+// meaningful scope: one call empties the queue, so anything that needs to know
+// whether two events arrived in the same burst of input compares drain ids.
 handle_sdl_events :: proc(running: ^bool) {
+	kbd_begin_drain()
 	event: sdl.Event
 	for sdl.PollEvent(&event) {
 		#partial switch event.type {
 		case .QUIT, .WINDOW_CLOSE_REQUESTED:
 			running^ = false
+		case .KEY_UP:
+			// The app had no key-up path at all, so "is this key down" was
+			// unanswerable and hold-to-repeat could not be told apart from a
+			// fresh press. Recorded here and consumed by nobody else: a key
+			// release has no meaning to the UI or to the fields.
+			kbd_note_key(event.key.key, false)
 		case .KEY_DOWN:
+			kbd_note_key(event.key.key, true)
 			if ti.active {
-				mods := sdl.GetModState()
+				// Modifiers come off the event, never sdl.GetModState(): the
+				// event snapshots what was held at key-down, the global state
+				// is sampled at handling time. They diverge whenever the main
+				// thread stalls long enough for events to queue and the user
+				// releases or changes a modifier before the queue drains.
+				mods := event.key.mod
 				shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
 				ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
 				// Cmdline match navigation: Tab/arrows move the highlighted
@@ -98,107 +115,78 @@ handle_sdl_events :: proc(running: ^bool) {
 				}
 			} else if event.key.key == sdl.K_ESCAPE && !event.key.repeat {
 				escape_dismiss()
-			} else if !event.key.repeat {
-				switch event.key.key {
-				case sdl.K_COLON:
-					// Vim-style ":" opens the command line.
-					//
-					// This MUST be a keycode case, not a TEXT_INPUT case, and
-					// that is forced by SDL: with no field open
-					// text_input_cancel has called StopTextInput, and SDL
-					// delivers no TEXT_INPUT at all while text input is
-					// stopped — so a text-driven opener never fires. (Tried
-					// that way; the prompt simply did not open.) KEY_DOWN is
-					// the only event that arrives in this state.
-					//
-					// The cost is that one keypress now produces two events:
-					// text_input_begin re-enables text input, so the same
-					// keypress's own TEXT_INPUT(":") follows and would land in
-					// the buffer. Hence swallow_char — which must match the
-					// CHARACTER, not swallow "the next event", so a keypress
-					// that produces no echo cannot leave it armed to eat the
-					// user's next keystroke.
+			} else {
+				// Continuous actions run on auto-repeat as well as on the
+				// initial press, which is what makes holding a key jog. This
+				// branch is reached only when no field owns the key, so a jog
+				// can never fire while the user is typing.
+				//
+				// key_repeat is true only for a DOWN of a key that was already
+				// down — the OS auto-repeat event — so this does not double up
+				// with the one-shot press handled by the switch below.
+				if key_repeat(sdl.K_H) {
+					jog_playback(-1)
+				}
+				if key_repeat(sdl.K_L) {
+					jog_playback(1)
+				}
+				if !event.key.repeat {
+					// Every modifier test in this block reads event.key.mod, never
+					// sdl.GetModState(). The event snapshots what was held at
+					// key-down; the global state is sampled when the event is
+					// handled. They diverge whenever the main thread stalls long
+					// enough for input to queue and the user changes a modifier
+				// before the queue drains — which fires the wrong action, or
+				// none. A Shift released in between used to lose the ":"
+				// opener outright (the "prompt never opens" symptom).
+				switch action_for(event.key.key, event.key.mod) {
+				case .None:
+				case .Open_Command_Line:
+					// Opens empty; the keypress's own text echo is dropped by
+					// the suppressor in the TEXT_INPUT branch below.
 					text_input_begin("", TI_CMDLINE, 0)
 					ti.swallow_char = CMDLINE_OPENER[0]
-				case sdl.K_SEMICOLON:
-					// On a US layout ":" is Shift+";", so SDL reports the
-					// base key with the shift modifier rather than a distinct
-					// K_COLON keycode. Same opener.
-					//
-					// Read the modifier off THIS event, not sdl.GetModState():
-					// the event carries the modifier that was held when the key
-					// went down, whereas the global state is sampled when the
-					// event is handled — a Shift released in between loses the
-					// opener, which is the reported "prompt never opens" symptom.
-					mods := event.key.mod
-					if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
-						text_input_begin("", TI_CMDLINE, 0)
-						ti.swallow_char = CMDLINE_OPENER[0]
-					}
-				case sdl.K_F1:
+				case .Toggle_Help:
 					// Always-available shortcut reference.
 					editor_flags.help_open = !editor_flags.help_open
-				case sdl.K_Z:
-					mods := sdl.GetModState()
-					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
-						if sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods {
-							undo_redo()
-						} else {
-							undo_undo()
-						}
-					}
-				case sdl.K_Y:
-					mods := sdl.GetModState()
-					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
-						undo_redo()
-					}
-				case sdl.K_SPACE:
-					mods := sdl.GetModState()
-					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
-						play_project_area()
-					} else {
-						toggle_playback()
-					}
-				case sdl.K_H:
-					// Jog backward (mirrors the backward button).
-					jog_playback(-1)
-				case sdl.K_L:
-					// Jog forward (mirrors the forward button).
-					jog_playback(1)
-				case sdl.K_S:
+				case .Undo:
+					undo_undo()
+				case .Redo:
+					undo_redo()
+				case .Toggle_Playback:
+					toggle_playback()
+				case .Play_Project_Area:
+					play_project_area()
+				case .Begin_Rename:
+					begin_clip_rename()
+				case .Split_At_Playhead:
 					split_clip_at_playhead()
-				case sdl.K_R:
-					// Ctrl+R renames the selected clip.
-					mods := sdl.GetModState()
-					if sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods {
-						begin_clip_rename()
-					}
-				case sdl.K_U:
+				case .Toggle_Links:
 					// Toggle link state across the selection: a lone clip
 					// unlinks its group; several Shift+clicked clips join into
 					// one link group (or all split apart when already linked).
 					toggle_links_for_selection()
-case sdl.K_BACKSPACE:
-				if !delete_selected_keyframe() {
-					// Delete the selected clip's timeline area and close the
-					// gap (ripple). A linked clip rips the WHOLE group: every
-					// member's own span on its own track, so a ripple cut
-					// never leaves the partner clip behind (rippling only the
-					// selected member's region would strand the rest).
-					if tr, clip, ok := selected_clip(); ok {
-						if clip.link_id != 0 {
-							ripple_delete_linked_group(clip.link_id)
-						} else {
-							ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+				case .Delete_At_Playhead:
+					if !delete_selected_keyframe() {
+						// Delete the selected clip's timeline area and close the
+						// gap (ripple). A linked clip rips the WHOLE group: every
+						// member's own span on its own track, so a ripple cut
+						// never leaves the partner clip behind (rippling only the
+						// selected member's region would strand the rest).
+						if tr, clip, ok := selected_clip(); ok {
+							if clip.link_id != 0 {
+								ripple_delete_linked_group(clip.link_id)
+							} else {
+								ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+							}
 						}
 					}
-				}
-			case sdl.K_DELETE:
-				if !delete_selected_keyframe() {
-					// Delete the clip raw, nothing else.
-					delete_selected_clip_raw()
-				}
-				case sdl.K_I:
+				case .Delete_Selection:
+					if !delete_selected_keyframe() {
+						// Delete the clip raw, nothing else.
+						delete_selected_clip_raw()
+					}
+				case .Set_In_Point:
 					// Set the render-range start at the playhead; collapsing the
 					// range to a single frame clears it.
 					project.start_frame = playhead.frame
@@ -206,13 +194,14 @@ case sdl.K_BACKSPACE:
 						project.start_frame = -1
 						project.end_frame = -1
 					}
-				case sdl.K_O:
+				case .Set_Out_Point:
 					project.end_frame = playhead.frame
 					if project.start_frame == playhead.frame {
 						project.start_frame = -1
 						project.end_frame = -1
 					}
 				}
+			}
 			}
 		case .TEXT_INPUT:
 			if ti.active {
@@ -311,6 +300,12 @@ case sdl.K_BACKSPACE:
 			if event.wheel.mouse_x >= pb.x && event.wheel.mouse_x <= pb.x + pb.width &&
 				event.wheel.mouse_y >= pb.y && event.wheel.mouse_y <= pb.y + pb.height {
 				if event.wheel.y != 0 {
+					// The one deliberate exception to "modifiers off the
+					// event": SDL's MouseWheelEvent carries no `mod` field at
+					// all (see vendor:sdl3 KeyboardEvent, which has one, and
+					// MouseWheelEvent, which does not), so there is nothing to
+					// read but the live state. Do not "fix" this to match the
+					// key handlers — it is not the same situation.
 					mods := sdl.GetModState()
 					if sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods {
 						if sel, ok := transformable_selected(); ok && sel.kind != .Text {

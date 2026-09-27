@@ -26,6 +26,10 @@ Mouse_Input :: struct {
 }
 
 // read_mouse_input snapshots the mouse buttons + modifiers for this frame.
+// GetModState is correct here and is NOT the modifier-race bug fixed in
+// event.odin: this is a per-frame sample of what is held *now*, for
+// shift-click / alt-click style interactions. There is no discrete event to
+// read the modifier off, and a frame snapshot should reflect the frame.
 read_mouse_input :: proc() -> Mouse_Input {
 	mx, my: f32
 	buttons := sdl.GetMouseState(&mx, &my)
