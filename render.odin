@@ -973,10 +973,13 @@ render_kf_geom_rect :: proc(
 	oy = c.int(math.round(t))
 	rw = max(1, c.int(r - l + 0.5))
 	rh = max(1, c.int(b - t + 0.5))
-	srcx = clamp(c.int(cl * f32(stage_w) + 0.5), 0, stage_w - 1)
-	srcy = clamp(c.int(ct * f32(stage_h) + 0.5), 0, stage_h - 1)
-	srcw = clamp(c.int(f32(stage_w) * (1.0 - cl - cr) + 0.5), 1, stage_w - srcx)
-	srch = clamp(c.int(f32(stage_h) * (1.0 - ct - cb) + 0.5), 1, stage_h - srcy)
+	// Which source pixels the crop selects in the STAGED texture (the shared
+	// geometry, so this and the CPU sws path below pick the same pixels).
+	csr := crop_src_rect(int(stage_w), int(stage_h), cl, cr, ct, cb)
+	srcx = c.int(csr.x)
+	srcy = c.int(csr.y)
+	srcw = c.int(csr.w)
+	srch = c.int(csr.h)
 	// Never copy past the stage bounds.
 	rw = min(rw, stage_w - srcx)
 	rh = min(rh, stage_h - srcy)
@@ -2128,17 +2131,14 @@ render_worker_run :: proc() {
 		// rect is quantized to whole blit pixels; bilinear filtering makes the
 		// sub-pixel remainder a quality improvement, not a bug.
 		if v.crop_l != 0 || v.crop_r != 0 || v.crop_t != 0 || v.crop_b != 0 {
-			sx := int(f64(v.crop_l) * f64(v.fw) + 0.5)
-			sy := int(f64(v.crop_t) * f64(v.fh) + 0.5)
-			sw := int(f64(v.fw) * f64(1 - v.crop_l - v.crop_r) + 0.5)
-			sh := int(f64(v.fh) * f64(1 - v.crop_t - v.crop_b) + 0.5)
-			sx = clamp(sx, 0, int(v.fw) - 1)
-			sy = clamp(sy, 0, int(v.fh) - 1)
-			sw = clamp(sw, 1, int(v.fw) - sx)
-			sh = clamp(sh, 1, int(v.fh) - sy)
-			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(sx), c.int(sy), c.int(sw), c.int(sh)
+			// The same crop_src_rect the GPU staging path uses, over the full-box
+			// blit (which holds the same pixels the stage does). keyed_export
+			// scores the GPU result against this path, so "same crop" has to mean
+			// the same rect here, not merely a similar one.
+			csr := crop_src_rect(int(v.fw), int(v.fh), v.crop_l, v.crop_r, v.crop_t, v.crop_b)
+			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(csr.x), c.int(csr.y), c.int(csr.w), c.int(csr.h)
 			v.crop_ctx = sws.getContext(
-				c.int(sw), c.int(sh), avutil.PixelFormat.RGBA,
+				c.int(csr.w), c.int(csr.h), avutil.PixelFormat.RGBA,
 				v.rw, v.rh, avutil.PixelFormat.RGBA,
 				sws.Flags{.Bilinear}, nil, nil, nil,
 			)

@@ -50,3 +50,46 @@ cropped_box_edges :: proc(
 	b = cy + fh / 2 - crop_b * fh
 	return
 }
+
+// Crop_Src_Rect is a source pixel region selected by a clip's crop insets.
+Crop_Src_Rect :: struct {
+	x, y: int,
+	w, h: int,
+}
+
+// crop_src_rect resolves normalized crop insets over an image of (fw, fh) into
+// the SOURCE PIXEL RECT they select: origin from the leading insets, extent from
+// the remaining span, both rounded to nearest and clamped to stay inside the
+// image.
+//
+// The name says SOURCE, not destination, because the insets are a fraction of
+// the source: where those pixels land on screen is cropped_box_edges' job. The
+// destination rect is intentionally derived separately, so a caller cannot
+// accidentally reuse this one for both.
+//
+// Shared because the export has TWO paths that must agree on this answer, and
+// were computing it separately. The GPU path takes the rect in the STAGED
+// texture (which holds the full uncropped frame), the CPU sws path takes it in
+// the full-box blit (same pixels, different buffer). keyed_export measures GPU
+// output against the CPU path as its reference, so the two agreeing is the
+// premise of that PSNR gate -- a rounding or clamp policy that drifted between
+// them would quietly lower the score instead of failing, which is the one
+// failure mode a reference-comparison gate cannot catch.
+//
+// Arithmetic is f32 to match the GPU path, which is the one with a bit-exact
+// gate (keyed_export inf at 1:1) and therefore the strictest opinion on what the
+// correct rounding is. The CPU path adopted f32 to match it; the gate's PSNR is
+// unmoved, so the difference was never load-bearing.
+crop_src_rect :: proc(fw, fh: int, crop_l, crop_r, crop_t, crop_b: f32) -> Crop_Src_Rect {
+	fw32 := f32(fw)
+	fh32 := f32(fh)
+	r := Crop_Src_Rect {
+		x = clamp(int(f32(crop_l) * fw32 + 0.5), 0, fw - 1),
+		y = clamp(int(f32(crop_t) * fh32 + 0.5), 0, fh - 1),
+	}
+	// Extent is bounded by what is LEFT after the origin, not by the full image,
+	// so a crop right at the far edge cannot ask for a rect that runs off it.
+	r.w = clamp(int(fw32 * (1.0 - crop_l - crop_r) + 0.5), 1, fw - r.x)
+	r.h = clamp(int(fh32 * (1.0 - crop_t - crop_b) + 0.5), 1, fh - r.y)
+	return r
+}

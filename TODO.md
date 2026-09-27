@@ -1136,6 +1136,12 @@ machinery and fix the bugs that duplication already caused, BEFORE attempting to
 unify the two pipelines. Unification itself is deliberately not started: it
 needs a zero-copy interop spike (Active 1 / S1c) and is a project of its own.
 
+All three parity bugs are fixed (A1/A2 for the filter, B/B2 for geometry, C for
+layering, D for subtitles) and `all` is green. Still open in this section: the
+preview's UV arithmetic is NOT merged with the export's, on purpose — see the
+note under B2 — and the remaining duplicated machinery is decode/stage sizing
+and preview/export text rasterization.
+
 Three SHIPPED bugs were found while mapping the duplication, all of them
 consequences of two systems maintaining the same fact independently:
 
@@ -1153,7 +1159,9 @@ consequences of two systems maintaining the same fact independently:
 3. **Subtitles vs everything diverges.** Subtitle generator clips arrive in
    preview as `kind == .Text` + `generator == .Subtitles`, so they take a
    `layer` from the same walk and interleave. Export pinned all subs above
-   everything, with a comment claiming that matches the preview.
+   everything, with a comment claiming that matches the preview. (Fixed by
+   Step D; there was no `subs_pinned` flag in the tree despite an earlier
+   note here saying there was.)
 
 Decision (user, 2026-09-27): **track order is authoritative for text in both;
 subtitles stay pinned on top in both.** Text below a video must preview and
@@ -1257,6 +1265,32 @@ disagreement that let the two drift.
 
 Verified: `keyed_export` still reports `1.0x PSNR = inf` and
 `0.5x PSNR = 58.707992`, i.e. export output is bit-identical.
+
+**Step B2 — DONE: one crop→source-pixel-rect, closing the gate's blind spot.**
+`cropped_box_edges` (above) settles where a crop lands in DESTINATION space, but
+the export has a second, separate question it was answering twice: which SOURCE
+pixels does the crop select. Two copies, with different arithmetic:
+
+- `render.odin` (GPU staging): `clamp(c.int(cl * f32(stage_w) + 0.5), 0, ...)` in
+  f32, over the staged texture.
+- `render.odin` (CPU sws): `int(f64(v.crop_l) * f64(v.fw) + 0.5)` in f64, over
+  the full-box blit, with the same shape of clamp spelled out again.
+
+That second copy is not a style problem, it is a hole in the gate. `keyed_export`
+scores the GPU path against the CPU path as its reference, so the two agreeing on
+"this crop means these pixels" is the PREMISE of the PSNR number — and a rounding
+or clamp policy that drifted between them would quietly lower the score rather
+than fail, which is the one failure mode a reference-comparison gate structurally
+cannot catch. `crop_src_rect` in `project_geom.odin` is now the single answer, and
+both paths call it.
+
+The shared function is f32, matching the GPU path, because that is the one under
+the bit-exact gate (`1.0x PSNR = inf`) and therefore the strictest available
+opinion on the correct rounding; the CPU path adopted f32. Proven immaterial
+rather than assumed: rendered the whole clip with `VYPER_CROP="0.1,0.2,0.05,0.15"`
+before and after the refactor and compared — `average:inf`, bit-identical. Note
+that `keyed_export` itself never sets `VYPER_CROP`, so its green result does NOT
+cover the crop path; the before/after render is the evidence, not the gate.
 
 **Orphan probe found while doing B.** `transform_probe.odin` is a 23-case
 regression check for the preview handle/snap geometry, and it is the only thing
