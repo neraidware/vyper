@@ -683,13 +683,13 @@ all while text input is stopped — so a text-driven opener can never fire. Veri
 by pressing it: the prompt did not open. The keycode case is forced by SDL, not a
 stylistic choice, and the comment at the site now says so.
 
-- [x] S1. Reverted to the keycode opener, keeping the parts of the redesign that
-      were right: `CMDLINE_OPENER` names the character and is the single thing
-      the opener arms the suppressor with and the text branch compares against,
-      so the two sites can't drift.
-- [x] S2. The suppressor matches the CHARACTER (`text[0] == swallow`), so a
-      missing echo is harmless, and `open C:/foo` keeps its colon — a `:` typed
-      into an open prompt is data, not another opener.
+- [x] S1. Reverted to the keycode opener. `CMDLINE_OPENER` and the character
+      match both existed only to serve the suppressor, and are gone with it — the
+      opener is now a plain keycode binding with no echo cleanup kept in sync
+      against it, so the two sites that had to agree are down to one.
+- [x] S2. A `:` typed into an open prompt is data, not another opener
+      (`open C:/foo`), which the keycode opener gets for free: nothing inspects
+      the character to decide, so there is no match to get wrong.
 - [x] S3. The opener reads the modifier off `event.key.mod`, not
       `sdl.GetModState()`. The event carries the modifier held when the key went
       down; the global state is sampled when the event is handled, so a Shift
@@ -809,60 +809,68 @@ later work-stream that plugs into it without reshaping what is here.
       runtime fallback. `edit_field_claims_key` needs a `case:` arm purely so the
       switch can report that it did not match — with no field open the router
       never calls it, so the arm is inert.
-- [x] I6. Drain-scoped echo. `swallow_char` became a
-      `(swallow_char, swallow_drain)` pair; the suppressor only drops a text
-      event when the drain matches the one the opener was armed in, so a
-      same-drain event is the echo (dropped) and a later one is real input
-      (kept). The character match stays — it is what makes a MISSING echo
-      harmless, which a drain-bounded discard cannot do: under a long main-thread
-      stall the user types `:` then `o`, both queue, both drain together, and
-      discarding by drain would eat the `o`.
-      **Correction to the original I6 rationale, which was wrong.** It claimed
-      this was "breaking `open C:/foo`". It was not. The old suppressor cleared
-      `swallow_char` on *any* text event, so in `open C:/foo` the leading `o`
-      consumed the stale flag before the path's colon ever arrived — the case
-      passed by coincidence, not by design.
-      The real defect is narrower and worse in its own row: after an echo-less
-      opener, the pending swallow stayed armed until some unrelated text event
-      consumed it, so if the first thing typed was itself a `:` — or a paste
-      beginning with one — that character was eaten as though it were the
-      opener's echo, and the whole buffer came back empty. Verified by
-      temporarily disabling the drain check and watching the new probe fail
-      with `""` instead of `":C:/x"`, so the probe genuinely tests the fix.
-      **Why the suppressor still exists, since "just use raw input" is the
-      obvious question.** The app runs two input layers on purpose: KEYBINDS
-      resolve from keycode + modifier and never from a text event, while TEXT
-      EDITING stays on SDL's TEXT_INPUT so dead keys and IME work in a field.
-      Keeping IME is a deliberate choice, and it is what leaves one seam — the
-      opener's keypress can echo a `:` into the field it just opened. SDL's
-      TEXT_INPUT carries no keycode, so that echo cannot be correlated to the
-      keypress that made it; it can only be guessed at, which is why the
-      suppressor tests character AND drain rather than one or the other. It is a
-      heuristic by necessity, not by choice, and it is the only place the two
-      layers touch.
-      Deleting it means deriving characters from keycodes too — which is a small
-      change (paste already reads the clipboard directly and Ctrl+V is a
-      keycode, so SDL text input is only ever used to turn keypresses into
-      characters) but it drops dead keys, IME, and typing non-ASCII directly.
-      Recorded here so the tradeoff is a decision rather than an accident.
-      Considered and rejected: threading a "a key was seen since the field
-      opened" flag through to tighten the heuristic. It only helps when the echo
-      arrives with a character other than the expected one, which is a case that
-      cannot be demonstrated here, and state that only exists to service a
-      hypothetical is its own bug.
-      Accepted cost of the drain scoping: an echo delivered more than one drain
-      after its keypress would now leave a duplicate `:` rather than being
-      cleaned up. That needs a multi-frame stall to happen, and it is a cosmetic
-      duplicate character rather than a swallowed keystroke — the better trade.
-- [x] ACCEPT: `:` opens empty; first char lands; a `:` typed as data in a
-      LATER drain is kept and one in the same drain is eaten as the echo;
-      jog moves on the tap AND on auto-repeat, and does not fire while a field
-      is open; Ctrl+Z/Ctrl+Space resolve per binding table. Every row has a
-      probe behind it, and the jog and echo rows were each confirmed to FAIL
-      with their fix reverted rather than merely passing alongside it.
+- [x] I6. Echo prevented at the source; the suppressor deleted. The echo was
+      never a stray event to filter — the app caused it. `text_input_begin`
+      called `sdl.StartTextInput` while the keypress that opened the field was
+      still being handled, and SDL's own header says activating an IME "can
+      prevent some key press events from being passed through" (`SDL_keyboard.h`,
+      `SDL_StartTextInput`). The opening `:` is not a typing keypress, but
+      enabling text input around it brought the IME up mid-handling, and the key
+      came back out as a text event that landed in the field it had just opened.
+      The suppressor was filtering a self-inflicted event, and everything it
+      needed — a character match, a drain counter, a one-shot latch — existed
+      only to guess which text events were the echo and which were real typing.
+      The fix is ordering, not filtering. A field now *requests* text input
+      (`ti.text_pending`), and `text_input_flush_pending` enables it once, after
+      the event drain. SDL emits no TEXT_INPUT while text input is stopped (the
+      fact the reverted text-driven opener established), so the opening keypress
+      is consumed with text input off and produces no text event at all. The
+      echo is ungenerable, which leaves nothing to correlate and nothing to
+      swallow. IME is untouched — it is simply brought up between keystrokes
+      rather than during one, which is also the only way to have it and still
+      have the IME idle when no field is focused.
+      `ti.text_on` records what SDL was actually told, separately from
+      `ti.active`, which is only what the app wants. The two differ for a field's
+      whole first frame, and a field that opens and closes inside a single drain
+      never turns SDL text input on at all, so it must not later stop text input
+      that was never started.
+      Cost, recorded: the pending request is consumed even when there is no
+      window to enable text input on, so a field opened before the window existed
+      would never get text input. The window is created at startup before any
+      field can open, so this is unreachable in the app; the probe runs in
+      exactly that state, which is why it asserts the bookkeeping and not
+      `SDL_TextInputActive`.
+      Correction to the original I6 rationale, which was wrong on both counts. It
+      claimed the drain scoping was "breaking `open C:/foo`" — it was not; the
+      old suppressor cleared its flag on *any* text event, so the leading `o`
+      consumed the stale flag before the path's colon arrived, and the case
+      passed by coincidence. And the follow-up claim that a `:` typed first into
+      an open prompt was "fixed" was describing a bug in a heuristic that no
+      longer exists: with nothing armed, there is no flag for a keystroke to
+      clear or trip over, and `:C:/x` lands whole.
+- [x] ACCEPT: `:` opens empty; the first typed character lands; a `:` typed as
+      data immediately after the opener lands whole (`:C:/x`), and a drive path
+      arriving in a later drain (`oC:/x`) is unaffected; a field opened during a
+      drain parks the text-input request instead of acting on it, and the request
+      does not outlive the flush; jog moves on the tap AND on auto-repeat, and
+      does not fire while a field is open; Ctrl+Z/Ctrl+Space resolve per binding
+      table.
+      The probe's echo case was DELETED rather than left passing. It asserted
+      that a synthetic echo could be filtered, which was a statement about the
+      suppressor and not about the app; keeping it would have left the probe
+      asserting the existence of the thing this step deleted. What replaced it
+      asserts the deferral directly — begin parks the request, flush consumes it.
+      Remaining risk, stated plainly: this rests on SDL honouring the documented
+      "no TEXT_INPUT while text input is stopped". A platform that echoed anyway
+      would insert a single stray `:` into the otherwise-empty prompt, so the
+      fault is visible rather than hidden — the prompt would start with `:` where
+      it should be blank. That is the right way round: the old suppressor hid
+      exactly this class of fault, and a bad platform now shows a cosmetic
+      artifact instead of quietly eating a keystroke. Only real hardware can
+      settle which platforms do which.
       Not covered by automated evidence: a human on real hardware with a real
-      keyboard, which is the only thing that exercises SDL's actual text-input
-      delivery timing.
+      keyboard and a real IME, which is the only thing that exercises SDL's
+      actual IME activation timing.
 
 ## Queued — Performance / Cleanup
 

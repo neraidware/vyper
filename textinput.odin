@@ -72,12 +72,24 @@ text_input_sel :: proc() -> (int, int) {
 // text_input_begin starts a fresh edit session, pre-filled with `initial`.
 // input_type + target are caller discriminators resolved by the commit handler.
 text_input_begin :: proc(initial: string, input_type: int, target: u64) {
-	// Enable SDL text input for the session's lifetime so the IME never eats
-	// global hotkeys while no field is open; text_input_commit/cancel turn it
-	// back off. A re-begin while already editing keeps the current session.
-	if !ti.active {
-		_ = sdl.StartTextInput(app_window)
-	}
+	// REQUEST SDL text input, but do not enable it here.
+	//
+	// This proc runs while a keypress is being handled, and enabling text input
+	// mid-keypress is what used to require an echo suppressor. SDL's own header
+	// says activating an IME "can prevent some key press events from being
+	// passed through" (SDL_keyboard.h, SDL_StartTextInput): the opening ":" is
+	// not a typing keypress, but enabling text input while it is still being
+	// handled brings the IME up around it, and the key comes back out as a
+	// text event. The field then opened already containing the character that
+	// opened it.
+	//
+	// Deferring past the drain removes the cause instead of filtering the
+	// symptom. SDL emits no TEXT_INPUT while text input is stopped (which is
+	// what the reverted text-driven opener established), so the opening keypress
+	// is consumed with text input off and produces no text event at all. IME
+	// support is unaffected — it is simply brought up between keystrokes rather
+	// than during one.
+	ti.text_pending = true
 	clear(&ti.buf)
 	append(&ti.buf, ..transmute([]u8)initial)
 	ti.cursor = len(ti.buf)
@@ -85,12 +97,6 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 	ti.input_type = input_type
 	ti.target = target
 	ti.is_create = false
-	// Drop any pending swallow from a previous session. A begin that follows a
-	// keypress which never produced a text event could otherwise carry a stale
-	// one into this session; the opener arms a fresh one right after. The drain
-	// is cleared too so a stale pair can never be half-live.
-	ti.swallow_char = 0
-	ti.swallow_drain = 0
 	// Each ":" session starts with a fresh fuzzy file list (walked lazily on
 	// the first non-empty query) and a clear match highlight.
 	if input_type == TI_CMDLINE {
@@ -100,9 +106,7 @@ text_input_begin :: proc(initial: string, input_type: int, target: u64) {
 }
 
 text_input_cancel :: proc() {
-	if ti.active {
-		_ = sdl.StopTextInput(app_window)
-	}
+	text_input_stop()
 	ti.active = false
 	clear(&ti.buf)
 	ti.cursor = 0
@@ -112,12 +116,41 @@ text_input_cancel :: proc() {
 // text_input_commit dismisses the field; the caller applies the value (based on
 // input_type) from the buffer before it is cleared.
 text_input_commit :: proc() {
-	if ti.active {
-		_ = sdl.StopTextInput(app_window)
-	}
+	text_input_stop()
 	ti.active = false
 	ti.cursor = 0
 	ti.anchor = 0
+}
+
+// text_input_flush_pending enables SDL text input for a field that opened during
+// this frame's event drain. It is called once, after the drain, so the IME is
+// never brought up while a keypress is being handled — see text_input_begin for
+// why that ordering is load-bearing rather than incidental.
+text_input_flush_pending :: proc() {
+	if !ti.text_pending {
+		return
+	}
+	ti.text_pending = false
+	// A field can open and close inside one drain (the finder opening and
+	// immediately committing a synthetic value, a probe driving both), so the
+	// request is only honoured if the field is still open when the drain ends.
+	if !ti.active || app_window == nil {
+		return
+	}
+	_ = sdl.StartTextInput(app_window)
+	ti.text_on = true
+}
+
+// text_input_stop turns SDL text input off, so the IME does no work while no
+// field is focused. `text_on` records what SDL was actually told rather than
+// inferring it from `active`, so a field that opened and closed inside a single
+// drain cannot stop text input that was never started.
+text_input_stop :: proc() {
+	ti.text_pending = false
+	if ti.text_on {
+		_ = sdl.StopTextInput(app_window)
+		ti.text_on = false
+	}
 }
 
 // text_input_remove_selection deletes the selected range, leaving the cursor at

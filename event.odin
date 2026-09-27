@@ -34,28 +34,12 @@ handle_sdl_events :: proc(running: ^bool) {
 			kbd_note_key(event.key.key, true)
 			route_key_down(event.key.key, event.key.mod, event.key.repeat)
 		case .TEXT_INPUT:
+			// No echo suppression, and none is needed: a field enables SDL text
+			// input BETWEEN drains, never while the keypress that opened it is
+			// being handled, so the opener cannot produce a text event for
+			// itself. See text_input_begin.
 			if ti.active {
-				text := string(event.text.text)
-				// Drop the swallowed CHARACTER, not merely the next event. A
-				// text event always consumes the swallow (one-shot), so a ":"
-				// keypress that produced no echo can't leave a pending swallow
-				// behind to eat the user's next real keystroke. Matching the
-				// character is also what keeps "open C:/foo" working: a ":"
-				// typed into an open prompt is data (a Windows drive path),
-				// not another opener.
-				//
-				// The drain check is what makes that true rather than
-				// accidental. Without it a swallow armed by an opener that
-				// produced no echo stayed armed indefinitely, and the first
-				// ":" the user typed as DATA — in `open C:/foo`, a later
-				// keystroke, not the opener's echo — was silently eaten. A
-				// same-drain text event is the echo; a later one is real input.
-				swallow := ti.swallow_char
-				same_drain := ti.swallow_drain == kbd.drain
-				ti.swallow_char = 0
-				if !(swallow != 0 && same_drain && len(text) > 0 && text[0] == swallow) {
-					text_input_insert(text)
-				}
+				text_input_insert(string(event.text.text))
 			} else if edit_state.field != .None {
 				for ch in string(event.text.text) {
 					// Only accept printable ASCII that makes sense in a number.
@@ -177,6 +161,11 @@ handle_sdl_events :: proc(running: ^bool) {
 			}
 		}
 	}
+	// Between drains, never inside one. SDL documents that activating an IME
+	// "can prevent some key press events from being passed through", so a field
+	// that opened during this drain gets its text input here — with the opening
+	// keypress already consumed, and with no text input on to echo it.
+	text_input_flush_pending()
 }
 // ---------------------------------------------------------------------------
 // Key routing: one entry point, ordered owners, one place that says who gets
@@ -190,9 +179,10 @@ handle_sdl_events :: proc(running: ^bool) {
 //	3. the app — global shortcuts and continuous controls
 //
 // Each owner returns whether it CLAIMED the key, and a claimed key stops
-// travelling. That is what makes "the field ate the opener's own echo" a
-// property of the structure rather than something a suppressor has to clean up
-// afterwards: there is one path to the app layer, and a field is on it.
+// travelling. There is one path to the app layer, and a field is on it, so a
+// key that opens a field is decided exactly once. Nothing downstream needs to
+// undo it: the field's text input is enabled after the drain, not during the
+// keypress, so the opener never echoes into the field it opened.
 // ---------------------------------------------------------------------------
 
 route_key_down :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool {
@@ -351,12 +341,10 @@ app_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool
 dispatch_action :: proc(act: Action) {
 	switch act {
 	case .Open_Command_Line:
-		// Opens empty; the keypress's own text echo is dropped by the
-		// suppressor in the TEXT_INPUT branch. The drain is recorded so the
-		// suppression covers this keypress's echo and nothing else.
+		// Opens empty, and needs no echo cleanup: the field's SDL text input is
+		// enabled after this drain (text_input_flush_pending), not during this
+		// keypress, so no text event is ever generated for the ":" itself.
 		text_input_begin("", TI_CMDLINE, 0)
-		ti.swallow_char = CMDLINE_OPENER[0]
-		ti.swallow_drain = kbd.drain
 	case .Toggle_Help:
 		// Always-available shortcut reference.
 		editor_flags.help_open = !editor_flags.help_open

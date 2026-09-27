@@ -697,31 +697,19 @@ Text_Input :: struct {
 	// clip (rather than renaming an existing one): the clip only survives if a
 	// non-empty name is committed. Applies both to renamed (commit) and cancel.
 	is_create:  bool,
-	// swallow_char is the exact byte to discard from the next text-input event
-	// (0 = nothing pending). The ":" shortcut both opens the command line AND
-	// (via the same keypress's TEXT_INPUT) would echo a ":" into the buffer; the
-	// prompt must start empty, so the opener swallows its own keypress's text.
-	// Matching the CHARACTER rather than blindly dropping the next event is
-	// what makes this safe: a keypress that produces no text event at all
-	// (layout/IME differences) used to leave a pending swallow that ate the
-	// user's next real keystroke.
-	//
-	// swallow_drain is the kbd.drain the swallow was armed in, and it is what
-	// bounds the suppression to the opener's own burst of input. Character
-	// matching alone is still not enough: when the opener produces no echo the
-	// swallow stays armed forever, and the first ":" the user later types as
-	// DATA gets eaten — which broke `open C:/foo`. Scoping it to the drain
-	// means a same-drain text event is the echo (drop it) and a later one is
-	// real input (keep it).
-	//
-	// The cost is a rare misfire: if SDL ever delivered the echo more than one
-	// drain after the keypress, the buffer would start "::" instead of ":". A
-	// single-drain stall is the only way that happens, and it is a cosmetic
-	// duplicate character rather than a swallowed keystroke, so it is the
-	// better trade. A stale swallow is inert once the drain has moved on, so it
-	// is not cleared on expiry — nothing matches it again.
-	swallow_char:  u8,
-	swallow_drain: u32,
+	// text_pending means a field opened this frame and SDL text input still
+	// needs turning on. The enable is deferred to text_input_flush_pending,
+	// after the event drain, because activating an IME mid-keypress makes SDL
+	// route the keypress being handled through the new IME context — the field
+	// opens already containing the character that opened it.
+	text_pending: bool,
+	// text_on is what SDL was actually told, as opposed to `active`, which is
+	// only what the app wants. The two differ for the whole of a field's first
+	// frame, and a field that opens and closes inside one drain never has SDL
+	// text input turned on at all. Both are needed: `text_on` to avoid stopping
+	// text input that was never started, `active` to avoid starting it for a
+	// field that is already gone.
+	text_on: bool,
 }
 ti: Text_Input
 // TI_RENAME is the input_type value for clip renaming.
@@ -737,13 +725,6 @@ TI_CMDLINE :: 3
 // argument, and the open/import buttons). The field is the finder's filter;
 // Enter descends or opens, Esc closes.
 TI_FINDER :: 4
-// CMDLINE_OPENER is the character that opens the command line, and the one
-// character its own keypress must not echo into the buffer. Named because it is
-// used in two places that must agree: the keycode opener arms the swallow with
-// it, and the text branch drops an echo by comparing against it. A leading ":"
-// is not a verb apply_command knows, which is why it must never reach the
-// buffer.
-CMDLINE_OPENER :: ":"
 
 Preview_State :: struct {
 	buffer:  [PREVIEW_W * PREVIEW_H * 4]u8,

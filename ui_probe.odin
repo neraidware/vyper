@@ -590,12 +590,19 @@ ui_probe_cmdline_opener_asserts :: proc() -> bool {
 	}
 	defer sdl.Quit()
 
-	// Case 1: keypress WITH its echo. The echo is swallowed, the next real
-	// character lands.
+	// There is deliberately NO "opener keypress WITH its own echo" case. That
+	// state is unrepresentable now, and it was the only reason the suppressor
+	// existed: SDL emits no TEXT_INPUT while text input is stopped, and a field
+	// enables text input only after the drain, so the keypress that opens the
+	// prompt is consumed with text input off and cannot produce one. The old
+	// case asserted that a synthetic echo could be filtered, which was a
+	// statement about the suppressor, not about the app.
+	//
+	// What replaces it is the behavior that actually matters: the prompt opens
+	// empty, and the first real keystroke lands.
 	text_input_cancel()
 	ti.active = false
 	ui_probe_push_opener_key()
-	ui_probe_push_text(CMDLINE_OPENER)
 	handle_sdl_events(&running)
 	if !ti.active || ti.input_type != TI_CMDLINE {
 		fmt.eprintf("[ui-probe] the opener key did not open the command line\n")
@@ -608,7 +615,7 @@ ui_probe_cmdline_opener_asserts :: proc() -> bool {
 	ui_probe_push_text("o")
 	handle_sdl_events(&running)
 	if got := text_input_string(); got != "o" {
-		fmt.eprintf("[ui-probe] char after the echo gave %q, want \"o\"\n", got)
+		fmt.eprintf("[ui-probe] first typed char gave %q, want \"o\"\n", got)
 		ok = false
 	}
 
@@ -640,31 +647,53 @@ ui_probe_cmdline_opener_asserts :: proc() -> bool {
 		ok = false
 	}
 
-	// Case 3: an echo-less opener followed by a ":" as the FIRST thing typed.
-	// This is the row the drain scoping fixes. The old suppressor cleared the
-	// pending swallow on whatever text event arrived next, so its correctness
-	// depended on an unrelated keystroke happening to come along first: type
-	// "o" and the flag was consumed harmlessly, but type ":" — or paste
-	// anything starting with one — and that character was silently eaten as
-	// though it were the opener's echo. The whole buffer came back empty.
-	//
-	// Worth being precise about what was NOT broken: `open C:/foo` worked,
-	// because its "o" cleared the stale flag before the path's colon arrived.
-	// The earlier note in TODO.md claimed that case was broken and was wrong.
-	// It needs its own probe either way, since the drive-path row above cannot
-	// distinguish "correct" from "correct by coincidence".
+	// Case 2: an opener followed by a ":" as the FIRST thing typed. The old
+	// suppressor cleared its pending flag on whatever text event arrived next,
+	// so this was the row it got wrong: type "o" and the flag was consumed
+	// harmlessly, but type ":" — or paste anything starting with one — and that
+	// character was silently eaten as though it were the opener's echo, leaving
+	// the whole buffer empty. Nothing is armed any more, so there is no flag for
+	// a keystroke to clear or trip over.
 	text_input_cancel()
 	ti.active = false
 	ui_probe_push_opener_key()
 	handle_sdl_events(&running)
 	if !ti.active {
-		fmt.eprintf("[ui-probe] opener did not open the prompt (echo-less colon case)\n")
+		fmt.eprintf("[ui-probe] opener did not open the prompt\n")
 		ok = false
 	}
 	ui_probe_push_text(":C:/x")
 	handle_sdl_events(&running)
 	if got := text_input_string(); got != ":C:/x" {
-		fmt.eprintf("[ui-probe] \":\" right after an echo-less opener gave %q, want \":C:/x\"\n", got)
+		fmt.eprintf("[ui-probe] \":\" right after the opener gave %q, want \":C:/x\"\n", got)
+		ok = false
+	}
+
+	// The deferral itself, since the rows above only show the absence of a
+	// symptom. A field opening during a drain must park the request rather than
+	// act on it, and the request must not outlive the flush — together those pin
+	// the enable to between drains, which is the whole fix.
+	text_input_cancel()
+	if ti.text_pending || ti.text_on {
+		fmt.eprintf(
+			"[ui-probe] cancel left text input requested (pending=%v, on=%v)\n",
+			ti.text_pending,
+			ti.text_on,
+		)
+		ok = false
+	}
+	text_input_begin("", TI_CMDLINE, 0)
+	if !ti.text_pending {
+		fmt.eprintf("[ui-probe] text_input_begin did not request text input\n")
+		ok = false
+	}
+	if ti.text_on {
+		fmt.eprintf("[ui-probe] text_input_begin turned SDL text input on synchronously\n")
+		ok = false
+	}
+	text_input_flush_pending()
+	if ti.text_pending {
+		fmt.eprintf("[ui-probe] flush left the request pending\n")
 		ok = false
 	}
 
