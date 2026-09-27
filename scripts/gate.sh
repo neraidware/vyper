@@ -31,7 +31,12 @@ target_check() {
 target_shaders() {
 	nix develop -c sh -c '
 		set -e
-		# Every stage the binary #loads, with the same target-env flake.nix uses.
+		# Every stage the binary #loads, at the same target-env flake.nix uses.
+		# All of them are plain Vulkan 1.0 / SPIR-V 1.0: the resample shaders were
+		# originally built --target-env vulkan1.1, which raises the SPIR-V version
+		# word to 1.3 for an identical instruction stream and would make a Vulkan
+		# 1.0 device fail to create the pipeline now that preview binds the same
+		# resample shader the export path uses.
 		# The completeness check below exists because this list drifted once: it
 		# held only the blit trio, so editing preview.frag and running any target
 		# measured the OLD SPIR-V and reported it as the new one -- the exact
@@ -42,16 +47,10 @@ target_shaders() {
 			shaders/rounded_rect.frag \
 			shaders/quad.vert \
 			shaders/text.frag \
-			shaders/preview.frag \
 			shaders/blit_box.frag \
 			shaders/blit_lod.frag
 		for src in "$@"; do
-			case $src in
-			*blit_box.frag|*blit_lod.frag)
-				glslangValidator -V --target-env vulkan1.1 "$src" -o "$src.spv" ;;
-			*)
-				glslangValidator -V "$src" -o "$src.spv" ;;
-			esac
+			glslangValidator -V "$src" -o "$src.spv"
 		done
 		for src in shaders/*.vert shaders/*.frag; do
 			found=

@@ -1184,11 +1184,56 @@ rather than interleave.
   the exact hazard the shared type exists to prevent, and the most likely
   place for the next silent break.
 
-**Step A2 — NEXT: preview adopts `blit_box.frag`, fixing bug 1.** Needs a
-preview frame-time gate added first: the box filter's cost scales with the
-source footprint, and "it looks right" is not evidence it fits an interactive
-budget. `scripts/gate.sh probe` already asserts preview layout, so the
-timing assertion belongs there.
+**Step A2 — DONE: preview adopts `blit_box.frag`, fixing bug 1.** Bug 1 was the
+reason the export path had to be dragged into a preview conversation: two
+filters for one job, and the one preview used was the wrong one. `preview.frag`
+(a single `texture()` tap) is deleted; the preview pipeline binds the same
+`blit_box.frag` + `quad.vert` + `Quad_Uniforms` triple the export compositor
+uses, so the two can no longer disagree about filtering.
+
+Deployability: `blit_box.frag` was built `--target-env vulkan1.1`. Binding it
+into the preview pipeline would have made the WHOLE app fail to start on a
+Vulkan 1.0 device, since a failed `create_gpu_renderer` takes the window down
+with it. The shader uses nothing from 1.1 — recompiling at the default target
+env emits an identical instruction stream with only the SPIR-V version word
+changed (1.3 -> 1.0) — so every stage is now plain Vulkan 1.0 and the per-file
+env special case is gone from both build lists.
+
+**Cost, measured on this box (Radeon 760M) rather than eyeballed.** The box
+filter's tap count multiplies OUTPUT pixels, not source pixels, so the preview
+can afford it where the export cannot be casual about it. Two rows were added to
+the existing resample probe, which already takes arbitrary src/dst sizes, rather
+than inventing a new timing path:
+- `1920x1080 -> 600x340` (3.2x reduction, the common "1080p in a ~600px
+  widget" case): **1.69 ms**.
+- `5760x3240 -> 640x360` (9x, past `MAX_TAPS`, the worst case from zooming a
+  5K source out): **11.0 ms**. The 6x cost over the near-identical output size
+  of the row above is cache pressure from sampling a 75 MB source texture, not
+  extra taps — the tap count is capped at 4x4 either way.
+
+`MAX_TAPS = 4` already bounds this, so cost does not grow without limit as the
+user zooms out; the worst case is bounded, not merely smaller than export's.
+
+**A filter property the preview regime exposed.** The shader takes `ceil(rho)`
+taps per axis, while the CPU kernel walks the exact covered interval
+(`sx0 = floor(x_pos)`, `sx1 = floor(x_end)`, 16.16 fixed point). The two agree
+at INTEGER ratios, which is all the export ever produces because stages are
+sized as integer multiples — its rows measure mean 0.20 (2:1) and 0.02 (3:1).
+Preview ratios are arbitrary (1920/600 = 3.2), so the tap count overshoots the
+footprint by up to one texel per axis and the kernels drift: measured mean 2.22
+/ peak 11, about 0.9% of range on a smooth gradient. Imperceptible on an
+interactive surface, and the row is still GATED so a geometry or sampler
+regression cannot hide inside the budget. Making the shader track the CPU
+interval exactly would fix it properly, but it changes a filter the export path
+is BIT-EXACT on at 1:1 — if that anchor moves, the exactness gate stops meaning
+anything — so it wants its own re-validation, not a rider on a preview change.
+
+**Not yet done for A2:** the preview's own PIXELS have not been captured before
+and after. The filter is validated in isolation by the probe, the pipeline is
+confirmed created (no creation-failure output, `smoke` green), and the same
+shader/uniform pair is proven on the export path — but `scripts/gate.sh probe`
+submits no GPU work at all, so it cannot show the moiré is gone. That needs a
+probe that renders the preview and reads it back.
 
 **Step B — geometry dedup.** `clip_full_box_dims` (preview_transform.odin) and
 `render_full_box_dims` (render.odin) have identical bodies; the render.odin

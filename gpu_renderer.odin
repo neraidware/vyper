@@ -287,7 +287,12 @@ rounded_rect_vertex_spirv := #load("shaders/rounded_rect.vert.spv")
 rounded_rect_fragment_spirv := #load("shaders/rounded_rect.frag.spv")
 quad_vertex_spirv := #load("shaders/quad.vert.spv")
 text_fragment_spirv := #load("shaders/text.frag.spv")
-preview_fragment_spirv := #load("shaders/preview.frag.spv")
+// The resample filter, shared by BOTH the preview image pipeline and the export
+// compositor. Preview used to bind a single-tap shader of its own, which meant a
+// 1080p source in a ~600px widget was minified with one bilinear tap and no mip
+// chain -- the exact aliasing the export path had already fixed. There is one
+// filter now, so the two cannot drift apart again.
+blit_box_fragment_spirv := #load("shaders/blit_box.frag.spv")
 
 
 create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat, width, height: c.int) -> (result: GPU_Renderer, ok: bool) {
@@ -395,7 +400,7 @@ create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat
 	result.text_pipeline = text_pipeline
 
 	preview_fragment_info := sdl.GPUShaderCreateInfo{
-		code_size = uint(len(preview_fragment_spirv)), code = raw_data(preview_fragment_spirv),
+		code_size = uint(len(blit_box_fragment_spirv)), code = raw_data(blit_box_fragment_spirv),
 		entrypoint = "main", format = {.SPIRV}, stage = .FRAGMENT, num_samplers = 1,
 	}
 	preview_fragment_shader := sdl.CreateGPUShader(device, preview_fragment_info)

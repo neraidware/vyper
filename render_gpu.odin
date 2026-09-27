@@ -29,8 +29,10 @@ import "core:strings"
 import sdl "vendor:sdl3"
 import yuvconv "vendor/yuv"
 
-// The SPV blobs are loaded once in gpu_resample_probe.odin; sharing them keeps
-// one copy in the binary and one place that can go stale.
+// The SPV blobs are #load-ed once in gpu_renderer.odin next to the other
+// stages; sharing them keeps one copy in the binary and one place that can go
+// stale. quad_vertex_spirv and blit_box_fragment_spirv are the SAME pair the
+// preview pipeline binds, so the two paths cannot drift apart on filtering.
 
 GPU_Resample :: struct {
 	device:   ^sdl.GPUDevice,

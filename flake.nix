@@ -41,14 +41,13 @@
             glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
             glslangValidator -V shaders/quad.vert -o shaders/quad.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
-            glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
-            # The offscreen resample stages used by the export compositor and its
-            # probe. box.frag is the real resample; lod.frag is a diagnostic that
-            # hardcodes LOD 3. They pair with quad.vert above, which is the
-            # shared vertex stage -- kept at the default target-env so the text
-            # and preview paths keep working on a Vulkan 1.0 device.
-            glslangValidator -V --target-env vulkan1.1 shaders/blit_box.frag -o shaders/blit_box.frag.spv
-            glslangValidator -V --target-env vulkan1.1 shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
+            # The resample stages, shared by the export compositor, the preview
+            # pipeline and the probe. box.frag is the real resample; lod.frag is a
+            # diagnostic that hardcodes LOD 3. Plain Vulkan 1.0 on purpose: they
+            # used to be built --target-env vulkan1.1, which only raises the SPIR-V
+            # version word, and preview binding this shader would then need 1.1.
+            glslangValidator -V shaders/blit_box.frag -o shaders/blit_box.frag.spv
+            glslangValidator -V shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
@@ -101,14 +100,13 @@
             glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
             glslangValidator -V shaders/quad.vert -o shaders/quad.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
-            glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
-            # The offscreen resample stages used by the export compositor and its
-            # probe. box.frag is the real resample; lod.frag is a diagnostic that
-            # hardcodes LOD 3. They pair with quad.vert above, which is the
-            # shared vertex stage -- kept at the default target-env so the text
-            # and preview paths keep working on a Vulkan 1.0 device.
-            glslangValidator -V --target-env vulkan1.1 shaders/blit_box.frag -o shaders/blit_box.frag.spv
-            glslangValidator -V --target-env vulkan1.1 shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
+            # The resample stages, shared by the export compositor, the preview
+            # pipeline and the probe. box.frag is the real resample; lod.frag is a
+            # diagnostic that hardcodes LOD 3. Plain Vulkan 1.0 on purpose: they
+            # used to be built --target-env vulkan1.1, which only raises the SPIR-V
+            # version word, and preview binding this shader would then need 1.1.
+            glslangValidator -V shaders/blit_box.frag -o shaders/blit_box.frag.spv
+            glslangValidator -V shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
             mkdir -p clay-odin/linux
             clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c

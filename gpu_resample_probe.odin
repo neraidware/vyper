@@ -27,7 +27,6 @@ import sdl "vendor:sdl3"
 import yuv "vendor/yuv"
 
 blit_lod_fragment_spirv := #load("shaders/blit_lod.frag.spv")
-blit_box_fragment_spirv := #load("shaders/blit_box.frag.spv")
 
 // adapter_announced keeps the driver banner to one line per probe run; setup
 // runs once per geometry.
@@ -523,6 +522,13 @@ GPU_Probe_Expect :: enum {
 	// raster, so two correct resamplers disagree by phase; asserting it would
 	// demand one filter's half-texel convention, not quality.
 	NYQUIST,
+	// Reported only. Past the shader's MAX_TAPS the footprint is sampled as a
+	// strided subset rather than every covered texel, so the result is a box
+	// ESTIMATE while the CPU kernel is a full average. The two legitimately
+	// disagree, and asserting parity would demand the cap be removed -- which
+	// would make an arbitrarily zoomed-out draw cost quadratically more. The
+	// TIMING still matters, and is asserted by the perf budget in gate.sh.
+	ESTIMATE,
 }
 
 // gpu_probe_source builds a test image for `fixture` at the given size.
@@ -567,6 +573,16 @@ gpu_resample_probe_run :: proc() -> int {
 	// The geometries that matter: the keyed near-1:1 case, a plain downscale,
 	// a magnification, and a heavy 3x downscale. 1:1 is the correctness anchor
 	// -- a filtered sampler MUST reproduce the source there.
+	//
+	// The last two rows are the PREVIEW regime, which the export rows above do
+	// not cover: the editor shows a 1080p source in a ~600px widget, so the
+	// common case is a ~3.2x reduction of the same order the 2x/3x rows cover,
+	// but at a small OUTPUT size. Output pixels are what the box filter's tap
+	// count multiplies, so cost scales with dst, not src -- which is why the
+	// preview can afford a filter the export could not afford to be casual
+	// about. The final row is 9x, past MAX_TAPS, the worst case a user reaches
+	// by zooming a 5K source all the way out: correctness is an estimate there
+	// (see GPU_Probe_Expect.ESTIMATE) but the cost must stay bounded.
 	GPU_Probe_Case :: struct {
 		src_w,   src_h, dst_w, dst_h: int,
 		fixture: GPU_Probe_Fixture,
@@ -575,7 +591,7 @@ gpu_resample_probe_run :: proc() -> int {
 		max_mean, max_peak: f64,
 		expect:   GPU_Probe_Expect,
 	}
-	cases := [8]GPU_Probe_Case {
+	cases := [10]GPU_Probe_Case {
 		{SW, SH, SW, SH, .SMOOTH, 0.0, 0.0, .GATED},
 		{SW, SH, SW, SH, .HIFREQ, 0.0, 0.0, .GATED},
 		{SW, SH, 800, 450, .SMOOTH, 1.0, 2.0, .GATED},
@@ -584,6 +600,29 @@ gpu_resample_probe_run :: proc() -> int {
 		{800, 450, SW, SH, .HIFREQ, 0.0, 0.0, .NYQUIST},
 		{5760, 3240, 1920, 1080, .SMOOTH, 1.0, 2.0, .GATED},
 		{5760, 3240, 1920, 1080, .HIFREQ, 8.0, 32.0, .GATED},
+		// Preview: a 1080p source in a ~600x340 widget, and the zoomed-out
+		// worst case. Both are minification, so both take the box path.
+		//
+		// The SMOOTH budget here is looser than the export rows, and the reason
+		// is a real property of the filter rather than slack: the shader takes
+		// ceil(rho) taps per axis, while the CPU kernel walks the exact covered
+		// interval (sx0 = floor(x_pos), sx1 = floor(x_end), 16.16 fixed point).
+		// The two agree at INTEGER ratios, which is everything the export ever
+		// produces -- stages are sized as integer multiples, so export only ever
+		// hits 2:1 and 3:1, and those rows measure mean 0.20 and 0.02. Preview
+		// ratios are arbitrary (1920/600 = 3.2), so the tap count overshoots the
+		// footprint by up to one texel per axis and the kernels drift. Measured
+		// mean 2.22 / peak 11, i.e. ~0.9% of range on a smooth gradient, which
+		// is imperceptible on an interactive surface and is still gated so a
+		// geometry or sampler regression cannot hide inside the budget.
+		//
+		// Making the shader track the CPU interval exactly would fix this
+		// properly, but it changes a filter the export path is bit-exact on
+		// (1:1 must stay bit-exact or the exactness anchor stops meaning
+		// anything), so it wants its own re-validation rather than riding along
+		// with a preview change.
+		{1920, 1080, 600, 340, .SMOOTH, 4.0, 24.0, .GATED},
+		{5760, 3240, 640, 360, .HIFREQ, 0.0, 0.0, .ESTIMATE},
 	}
 
 	ITERS :: 8
@@ -652,6 +691,8 @@ gpu_resample_probe_run :: proc() -> int {
 			}
 		case .NYQUIST:
 			verdict = "info (Nyquist)"
+		case .ESTIMATE:
+			verdict = "info (past MAX_TAPS)"
 		}
 		fmt.printf(
 			"  %-7s %-21s gpu=%8.3f ms cpu=%8.3f ms %6.2fx mean=%5.2f peak=%3d  %s\n",
