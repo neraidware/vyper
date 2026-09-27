@@ -797,11 +797,11 @@ later work-stream that plugs into it without reshaping what is here.
         passes everything else down, so shortcuts work while typing a playhead.
       Pinned by probe (`key routing ok`), which asserts the CLAIM rather than
       firing real actions at the seeded session.
-      Note: `sdl.Keycode` is a distinct integer, not an enum, so a switch on it
-      has neither `default` (a `when` construct in Odin) nor `#partial` (needs
-      an enum) — an unmatched key just falls out, which is why
-      `edit_field_claims_key` needs an explicit claimed flag to report whether
-      it matched.
+      Note: a bare `case:` is Odin's default clause in a value switch, and
+      `#partial switch` is the enum-only form that falls out on no match.
+      `edit_field_claims_key` needs a `case:` arm purely so the switch can
+      report that it did not match — with no field open the router never calls
+      it, so the arm is inert.
 - [x] I6. Drain-scoped echo. `swallow_char` became a
       `(swallow_char, swallow_drain)` pair; the suppressor only drops a text
       event when the drain matches the one the opener was armed in, so a

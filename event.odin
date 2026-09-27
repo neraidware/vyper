@@ -296,23 +296,21 @@ field_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod) -> bool {
 // being typed into. That asymmetry is pre-existing and intentional — a number
 // field is a single digit you nudge, not a document you type into.
 edit_field_claims_key :: proc(key: sdl.Keycode) -> bool {
-	// sdl.Keycode is a distinct integer, not an enum, so this switch has
-	// neither a `default` clause (that is a `when` construct in Odin) nor
-	// `#partial` (that needs an enum): an unmatched key just falls out. Hence
-	// the flag — the switch alone cannot report whether it matched.
-	claimed := false
 	switch key {
 	case sdl.K_BACKSPACE:
 		edit_backspace()
-		claimed = true
 	case sdl.K_RETURN, sdl.K_RETURN2:
 		edit_commit()
-		claimed = true
 	case sdl.K_ESCAPE:
 		edit_cancel()
-		claimed = true
+	case:
+		// A bare `case:` is Odin's default clause in a value switch. This one
+		// is reachable only when no field is open (the router checks first),
+		// so the fallbacks are inert — it exists so the switch can REPORT that
+		// it did not match instead of falling out silently.
+		return false
 	}
-	return claimed
+	return true
 }
 
 // app_claims_key is the last owner: global shortcuts plus the continuous
