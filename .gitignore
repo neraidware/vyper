@@ -19,3 +19,7 @@
 /clay-odin/*/clay.a
 /clay-odin/*/clay.lib
 /clay-odin/*/clay.o
+
+# gate.sh keyed_export scratch: synthetic source and A/B encodes, regenerated
+# per run and never inputs.
+target/

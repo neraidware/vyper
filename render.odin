@@ -2660,6 +2660,32 @@ render_eval_keyed_geom :: proc(
 		// The context was never the cost -- sws_getContext/free measured at
 		// 0.1-0.2 ms, so reusing one buys nothing and would just be the old
 		// path with extra state.
+		//
+		// GPU first. This replaces only the resample: gpu_resample_into writes
+		// the same kres_scratch bytes the kernel would, so the blit below, the
+		// z-order, and the off-canvas clipping are all unchanged and the kernel
+		// stays a drop-in fallback on the same rect. Any failure returns false
+		// having written nothing, so there is no partial frame to unwind.
+		if keyed_gpu_enabled {
+			if g := gpu_resample_get(); g != nil {
+				if gpu_resample_into(
+					g,
+					raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
+					int(srcx), int(srcy), int(srcw), int(srch),
+					int(rw), int(rh),
+					raw_data(v.kres_scratch), len(v.kres_scratch),
+				) {
+					render_keyed_gpu_frames += 1
+					render_keyed_frames += 1
+					render_blit_region(
+						canvas, render_job.width, render_job.height,
+						v.kres_scratch, rw, 0, 0, ox, oy, rw, rh,
+					)
+					return true
+				}
+				render_keyed_fallbacks += 1
+			}
+		}
 		if !yuvconv.rgba_resample(
 			raw_data(slot.blit), int(v.fw) * 4,
 			int(srcx), int(srcy), int(srcw), int(srch),
@@ -2882,6 +2908,19 @@ render_pick_output_path :: proc() {
 // through the static path and reports a good time is worse than no probe.
 render_keyed_frames: int
 
+// render_keyed_gpu_frames counts the animated-scale frames the GPU resampler
+// actually served, and render_keyed_fallbacks the ones it handed back. Printed
+// beside render_keyed_frames so an A/B cannot silently measure the CPU kernel
+// and report it as a GPU number -- which is the failure mode this whole path
+// has already produced twice.
+render_keyed_gpu_frames: int
+render_keyed_fallbacks: int
+
+// keyed_gpu_enabled is the A/B switch. Default on: the GPU path is the
+// intended default and the CPU kernel is the fallback, not the reverse. Set
+// VYPER_KEYED_GPU=0 to pin the kernel for a controlled comparison.
+keyed_gpu_enabled := true
+
 render_start :: proc() {
 	if render_is_busy() {
 		return
@@ -2899,6 +2938,15 @@ render_start :: proc() {
 	// Clean up a finished previous run.
 	poll_completed_thread()
 	render_keyed_frames = 0
+	render_keyed_gpu_frames = 0
+	render_keyed_fallbacks = 0
+	// Read once per run, not per clip: os lookup on a hot path is a needless
+	// string compare per frame per clip.
+	_, gpu_off := os.lookup_env_alloc("VYPER_KEYED_GPU", context.temp_allocator)
+	keyed_gpu_enabled = !gpu_off
+	if !keyed_gpu_enabled {
+		fmt.println("render: VYPER_KEYED_GPU=0 -- pinned to the CPU resample kernel")
+	}
 
 	// Render range.
 	start_frame := project.start_frame
@@ -3242,6 +3290,16 @@ render_test_run :: proc(paths: [2]string) {
 	st := render_status_text()
 	fmt.println("render-test status:", st)
 	fmt.println("render-test keyed frames:", render_keyed_frames)
+	fmt.println(
+		"render-test gpu stage uploads:",
+		gpu_stage_uploads,
+	)
+	fmt.println(
+		"render-test keyed gpu frames:",
+		render_keyed_gpu_frames,
+		"cpu fallbacks:",
+		render_keyed_fallbacks,
+	)
 	if _, keyed_req := os.lookup_env_alloc("VYPER_KEYED_SCALE", context.allocator); keyed_req && render_keyed_frames == 0 {
 		fmt.println("render-test FAIL: keyed scale requested but no frame took the animated path")
 		os.exit(3)

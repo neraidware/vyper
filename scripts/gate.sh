@@ -71,6 +71,143 @@ target_gpu_probe() {
 	VYPER_GPU_PROBE=1 timeout 300 ./vyper
 }
 
+# A/B gate for the GPU keyed-resample seam in the real export pipeline.
+#
+# The resample probe proves the shader matches the kernel in isolation; this
+# proves the *seam* does -- crop sub-rect, dst rect, viewport, and the existing
+# CPU blit -- through the actual compositor and encoder, which is a different
+# code path from the probe and has broken parity before.
+#
+# The acceptance conditions are deliberately asymmetric:
+#   1:1  must be BIT-EXACT. That case is a copy, so any difference is a real
+#        defect (a half-texel inset or a wrong viewport would show here) and
+#        not a rounding question.
+#   0.5x must clear a PSNR floor. Minification legitimately differs in the
+#        last LSB: the shader derives its footprint start in float while the
+#        kernel works in integers. Equivalent, not identical -- and the target
+#        says so rather than pretending the two are the same code.
+#
+# The control matters more than the threshold. x264 is deterministic, so two
+# CPU-pinned runs of the same input are bit-identical; that is what licenses
+# reading a GPU-vs-CPU delta as resample difference rather than encoder noise.
+# Without that control this gate would be measuring the codec.
+KEYED_DIR=target/keyed_export
+KEYED_SRC="$KEYED_DIR/src.mp4"
+KEYED_MIN_DB=50
+
+keyed_export_run() {
+	if [ ! -x ./vyper ]; then
+		echo "keyed-export: ./vyper missing, run scripts/gate.sh build first" >&2
+		return 1
+	fi
+	mkdir -p "$KEYED_DIR"
+
+	# testsrc2 is deterministic and full of fine detail, which is the point:
+	# a minifying resample of a smooth gradient hides aliasing that a
+	# high-frequency source exposes. Regenerated only when absent because the
+	# content is deterministic, so a cached copy is the same clip.
+	if [ ! -s "$KEYED_SRC" ]; then
+		if ! nix develop -c ffmpeg -y -f lavfi -i \
+			"testsrc2=size=1920x1080:rate=30:duration=3" \
+			-c:v libx264 -pix_fmt yuv420p -crf 18 "$KEYED_SRC" >/dev/null 2>&1
+		then
+			echo "keyed-export: could not synthesize the source clip" >&2
+			return 1
+		fi
+	fi
+
+	local scale=$1 tag=$2
+	shift 2
+	env $PROBE_ENV \
+		VYPER_RENDER_TEST="$KEYED_SRC|$KEYED_DIR/$tag.mp4" \
+		VYPER_KEYED_SCALE="$scale" \
+		VYPER_FRAME_TIME=1 \
+		"$@" \
+		timeout 600 ./vyper >"$KEYED_DIR/$tag.log" 2>&1
+}
+
+# Echoes the average PSNR in dB between two clips, or "inf" when identical.
+keyed_psnr() {
+	nix develop -c ffmpeg -hide_banner -i "$1" -i "$2" -lavfi psnr -f null - 2>&1 \
+		| grep -o 'average:[a-z0-9.]*' | tail -1 | cut -d: -f2
+}
+
+# True when a PSNR value (possibly "inf") clears a dB floor.
+keyed_psnr_ok() {
+	local v=$1 floor=$2
+	if [ "$v" = "inf" ]; then
+		return 0
+	fi
+	awk -v a="$v" -v b="$floor" 'BEGIN { exit !(a + 0 >= b + 0) }'
+}
+
+target_keyed_ab() {
+	local failed=0
+	# 0.5x: the minifying case that is allowed to differ by rounding.
+	local spec_half="0:0.5,45:0.5,89:0.5"
+	# 1.0x: the copy case that must not differ at all.
+	local spec_one="0:1.0,45:1.0,89:1.0"
+
+	# Four runs, written out rather than looped: the scale spec contains the
+	# separator a loop would need, and a delimiter collision here would
+	# silently export the wrong keyframes instead of failing.
+	if ! keyed_export_run "$spec_half" half_gpu; then
+		echo "keyed-export: half_gpu run failed; see $KEYED_DIR/half_gpu.log" >&2
+		return 1
+	fi
+	if ! keyed_export_run "$spec_half" half_cpu VYPER_KEYED_GPU=0; then
+		echo "keyed-export: half_cpu run failed; see $KEYED_DIR/half_cpu.log" >&2
+		return 1
+	fi
+	if ! keyed_export_run "$spec_one" one_gpu; then
+		echo "keyed-export: one_gpu run failed; see $KEYED_DIR/one_gpu.log" >&2
+		return 1
+	fi
+	if ! keyed_export_run "$spec_one" one_cpu VYPER_KEYED_GPU=0; then
+		echo "keyed-export: one_cpu run failed; see $KEYED_DIR/one_cpu.log" >&2
+		return 1
+	fi
+
+	# The GPU run must have actually served the frames. A run that silently
+	# fell back to the kernel would otherwise "pass" every pixel comparison
+	# below while proving nothing about the GPU -- the same trap the keyed
+	# frame counter exists for.
+	local gpu_frames fallbacks
+	gpu_frames=$(grep -o 'keyed gpu frames: [0-9]*' "$KEYED_DIR/half_gpu.log" | grep -o '[0-9]*$')
+	fallbacks=$(grep -o 'cpu fallbacks: [0-9]*' "$KEYED_DIR/half_gpu.log" | grep -o '[0-9]*$')
+	if [ "${gpu_frames:-0}" -eq 0 ]; then
+		echo "keyed-export: GPU run served 0 keyed frames -- the seam was never exercised" >&2
+		failed=1
+	fi
+	if [ "${fallbacks:-0}" -ne 0 ]; then
+		echo "keyed-export: ${fallbacks} GPU failures fell back to the kernel" >&2
+		failed=1
+	fi
+	grep -h 'frame-time] composite=' "$KEYED_DIR/half_gpu.log" "$KEYED_DIR/half_cpu.log" \
+		| sed 's/^/keyed-export: /'
+
+	local v
+	v=$(keyed_psnr "$KEYED_DIR/one_gpu.mp4" "$KEYED_DIR/one_cpu.mp4")
+	echo "keyed-export: 1.0x PSNR = $v (want inf)"
+	if [ "$v" != "inf" ]; then
+		echo "keyed-export: 1:1 is not bit-exact -- the seam drifts on unscaled frames" >&2
+		failed=1
+	fi
+
+	v=$(keyed_psnr "$KEYED_DIR/half_gpu.mp4" "$KEYED_DIR/half_cpu.mp4")
+	echo "keyed-export: 0.5x PSNR = $v (floor ${KEYED_MIN_DB} dB)"
+	if ! keyed_psnr_ok "$v" "$KEYED_MIN_DB"; then
+		echo "keyed-export: minifying resample drifted past the floor" >&2
+		failed=1
+	fi
+
+	if [ $failed -ne 0 ]; then
+		echo "keyed-export: FAILED" >&2
+		return 1
+	fi
+	echo "keyed-export: ok"
+}
+
 target_probe() {
 	env $PROBE_ENV timeout 120 ./vyper
 }
@@ -127,7 +264,7 @@ target_valgrind() {
 
 target_all() {
 	local t
-	for t in check build probe gpu_probe smoke valgrind; do
+	for t in check build probe gpu_probe keyed_export smoke valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -141,11 +278,12 @@ main() {
 	bench) target_bench ;;
 	probe) target_probe ;;
 	gpu_probe) target_gpu_probe ;;
+	keyed_export) target_keyed_ab ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|gpu_probe|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|gpu_probe|keyed_export|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac

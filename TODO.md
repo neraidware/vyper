@@ -440,7 +440,7 @@ throughput. See the note appended to S2.
       `1 -> 3`, constant scale, transform-only, crop-only, reversed scale, and
       off-canvas motion. Record wall time, producer time, keyed `sws`, stage
       dimensions, output frame count, and a reference-frame hash/PSNR.
-- [ ] S1b. GPU resample as the DEFAULT, CPU kernel as the fallback. Decode the
+- [x] S1b. GPU resample as the DEFAULT, CPU kernel as the fallback. Decode the
       keyed stage once into a texture, then resolve the animated box as a
       filtered textured quad (a hardware bilinear sample per output pixel) with
       no per-frame CPU resample at all — the Resolve pattern. This is the
@@ -575,9 +575,90 @@ throughput. See the note appended to S2.
       the old shader -- which happened here and produced a confidently wrong
       measurement.
 
-      Remaining for S1b: footprint kernel, keyed-path GPU compositor, GPU
-      RGBA->NV12, and direct NV12 hand-off to `hw_frames_ctx` to drop the
-      readback.
+      **Stage 2 landed 2026-09-27 -- the GPU resampler is now the default on the
+      keyed path, with the CPU kernel as the automatic fallback**
+      (`render_gpu.odin`). `render_eval_keyed_geom` calls
+      `gpu_resample_into` for `scale_keyed` clips and falls through to
+      `yuvconv.rgba_resample` on any failure, so a driverless or capability-less
+      machine still exports correctly. `VYPER_KEYED_GPU=0` pins the kernel for a
+      controlled A/B.
+
+      Only the *resample* moved to the GPU. The result still lands in
+      `kres_scratch` and the existing `render_blit_region` copies it to canvas,
+      so z-order, keyed/static interleaving, and off-canvas clipping are
+      untouched and provably unchanged. The direct canvas composite and the
+      NV12 hand-off are the next step, not something this stage claims.
+
+      End-to-end on the synthetic 90-frame 1920x1080 keyed export at 0.5x
+      (`./scripts/gate.sh keyed_export`):
+
+      | | composite | videoenc |
+      |---|---|---|
+      | GPU (default) | 3.33 ms/f | 5.99 ms/f |
+      | CPU kernel (`VYPER_KEYED_GPU=0`) | 17.45 ms/f | 6.65 ms/f |
+
+      ~5.2x on the composite stage, which was 69-73% of the frame; the encoder
+      is unchanged as expected. The same shape as the isolated probe's 8-10x
+      because this measurement also pays the upload and the readback the
+      hand-off is meant to remove. Re-run with `./scripts/gate.sh keyed_export`;
+      the numbers move a few percent run to run.
+
+      **Parity, with the control that makes it readable.** The gate asserts two
+      things at two scales, and the 1:1 row is the load-bearing one:
+
+      - 1.0x: **bit-exact** (PSNR `inf`) against the kernel through the real
+        compositor and encoder. That case is a copy, so any difference is a real
+        seam defect -- a half-texel inset or a wrong viewport shows here -- not
+        a rounding question.
+      - 0.5x: 58.7 dB, floor 50. Minification legitimately differs in the last
+        LSB because the shader derives its footprint start in float while the
+        kernel walks integers. Equivalent, not identical, and the target says so
+        instead of implying the two are the same code.
+
+      The control is what licenses reading that 58.7 dB as resample difference:
+      x264 is deterministic, so two kernel-pinned runs of the same input are
+      bit-identical (`inf`), which means the encoder contributes exactly zero.
+      Without that run the gate would be measuring the codec.
+
+      Two things this stage got wrong before it was gated, both worth recording
+      because both would have shipped silently:
+
+      - **The stage upload cache never hit and was a stale-frame bug waiting to
+        happen.** It skipped the upload when the source address and size matched
+        the previous call. Measured: 90 uploads, 0 hits over 90 frames -- the
+        compositor's blit slots are a two-slot ring (`frame_idx & 1`) that is
+        re-pointed per frame, so the key never repeated. It bought nothing and
+        was one addressing change away from serving a stale frame, so it is
+        deleted rather than kept as a comment; the *texture* is still reused so
+        the hot path never re-creates a driver object.
+      - **A green PSNR number hid a stutter for a while.** `testsrc2` is mostly
+        static, so a frozen upload still scores well against a correct render
+        on a whole-video average. The check that actually settles it is
+        per-frame: `gpu[0]` vs `gpu[2]` reads the same 27.18 dB as the
+        `cpu[0]` vs `cpu[2]` control, so the GPU output tracks frame for frame.
+
+      The compositor is a process-lifetime singleton held as a *value*
+      (`gpu_resample_singleton`), not a heap pointer: one instance, created
+      once, nothing to free. A failed creation latches `gpu_resample_disabled`
+      so a driverless environment does not retry device creation on every keyed
+      clip of every frame. It initializes `SDL_INIT_VIDEO` itself when needed
+      and only calls `QuitSubSystem` if it was the one that brought video up --
+      a worker tearing down the subsystem would take the UI's window with it.
+      Source and destination byte counts are asserted at the boundary, because
+      both are raw pointers into a `w*h*4` copy and neither can be bounds
+      checked from the pointer alone.
+
+      Remaining for S1b: GPU composite straight to canvas (removing the
+      `kres_scratch` readback), GPU RGBA->NV12, and the direct NV12 hand-off to
+      `hw_frames_ctx`.
+- [ ] S1c. GPU composite straight to canvas, then GPU RGBA->NV12 handed
+      directly to `hw_frames_ctx`. S1b still round-trips each keyed resample
+      through `kres_scratch` and a CPU `render_blit_region` because keyed and
+      static clips interleave in z-order, so compositing on the GPU needs
+      either a reordering that preserves overlap semantics or one composite pass
+      per clip into a GPU canvas. Dropping the readback is what removes the
+      upload/download cost that currently caps the win at ~5x rather than the
+      probe's 8-10x.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve
@@ -609,8 +690,10 @@ throughput. See the note appended to S2.
       `VYPER_UI_PROBE`, `VYPER_TRANSFORM_PROBE`, `odin check`, and a fresh
       compositor spall trace all pass.
 
-**Out of scope:** preview keyframe sampling, encoder changes, and GPU compositor
-rewrite. Fix export geometry work first.
+**Out of scope:** preview keyframe sampling and encoder changes. The GPU
+compositor originally listed here is no longer out of scope -- S1b landed it
+because the remaining CPU geometry work (S2-S4) is bounded by a tap count the
+GPU does not have.
 
 ## Active 5 — In-app fuzzy file finder (replaces OS picker workflow)
 
