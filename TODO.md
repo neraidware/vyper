@@ -854,6 +854,14 @@ Details TBD when Phase 2 reaches maturity.
 - Added frame-domain accounting, underrun/callback diagnostics, and explicit
   clear/active semantics. Probe/autoplay exercised decode, mix, callback and
   queue depth remains stable at the target cushion.
+- Time base moved off SDL: `clock.odin` owns one monotonic source
+  (`CLOCK_MONOTONIC_RAW` via `core:time`) and native `time.sleep`, replacing
+  42 `sdl.GetTicksNS`/`GetTicks`/`Delay` sites across 9 files. Had to be
+  all-or-nothing: `gpu_draw.odin` subtracts the producer's `playback.dev_at_ns`
+  stamp from its own reading for the A/V skew HUD, so a partial swap would have
+  silently mixed two epochs and made that subtraction garbage. Also drops SDL's
+  u32 tick wrap (~49 days) from UI notice deadlines. Side effect: SDL is no
+  longer imported by any audio file.
 - `./scripts/gate.sh check build probe smoke` pass; Valgrind: 0 definitely
   lost, 0 indirectly lost, no invalid access; error contexts unchanged from
   baseline (FFmpeg/Odin noise only). Branch `audio/miniaudio`, baseline

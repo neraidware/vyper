@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:time"
-import sdl "vendor:sdl3"
 
 // ---------------------------------------------------------------------------
 // VYPER_PROXY_SCHED_TEST="<file>": headless regression for the on-demand proxy
@@ -48,8 +47,8 @@ sched_frame :: proc() {
 // reached. The worker resolves a request on its own thread; the scheduler tick
 // is only needed to POST new requests, which the scenario does explicitly.
 sched_wait_terminal :: proc(want_lo, want_hi: int, what: string) -> (phase: Build_Phase) {
-	deadline := sdl.GetTicksNS() + 60_000_000_000
-	for sdl.GetTicksNS() < deadline {
+	deadline := monotonic_ns() + 60_000_000_000
+	for monotonic_ns() < deadline {
 		_, _, _, _, _, _, _, _, _, _, _, _, lr_phase, _, lr_lo, lr_hi := import_bg_window()
 		if lr_phase == .Done_Ok || lr_phase == .Done_Cancelled || lr_phase == .Done_Fail {
 			if lr_lo == want_lo && lr_hi == want_hi {
@@ -82,8 +81,8 @@ sched_building_win :: proc(want_lo, want_hi: int) -> bool {
 
 // sched_wait_building waits until the worker is actively building [lo, hi).
 sched_wait_building :: proc(want_lo, want_hi: int, what: string) -> bool {
-	deadline := sdl.GetTicksNS() + 30_000_000_000
-	for sdl.GetTicksNS() < deadline {
+	deadline := monotonic_ns() + 30_000_000_000
+	for monotonic_ns() < deadline {
 		if sched_building_win(want_lo, want_hi) {
 			return true
 		}

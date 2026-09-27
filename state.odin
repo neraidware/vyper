@@ -367,12 +367,12 @@ Playback :: struct {
 	// uses, across any UI update gap. Guarded by the seqlock seq so the pair is
 	// never read torn; non-explicit Odin atomics are sequentially consistent.
 	ui_frame:      i64, // atomic, guarded by seq
-	ui_ns:         i64, // atomic, sdl.GetTicksNS() when ui_frame was current
+	ui_ns:         i64, // atomic, monotonic_ns() when ui_frame was current
 	seq:           u64, // atomic seqlock: odd while publishing
 	// dev_frame is the content frame the sound device has actually consumed
 	// (everything the producer pushed minus what is still queued); published
 	// every feed pass so the preview HUD can show the audio clock next to the
-	// video one. dev_at_ns is the GetTicksNS() that belonged to the same feed
+	// video one. dev_at_ns is the monotonic_ns() that belonged to the same feed
 	// pass, so a reader can extrapolate the device position to its own "now" and
 	// compare against the extrapolated playhead at the same instant -- the
 	// stepped publish alone would show a full frame of phantom skew
@@ -912,7 +912,7 @@ show_ui_notice :: proc(text: string, duration_ms: u64) {
 		delete(ui_notice.text)
 	}
 	ui_notice.text = strings.clone(text)
-	ui_notice.until = sdl.GetTicks() + duration_ms
+	ui_notice.until = monotonic_ms() + duration_ms
 }
 
 // UI_NOTICE_MAX bounds a formatted notice. Notices are one-line status
@@ -934,7 +934,7 @@ show_ui_noticef :: proc(duration_ms: u64, format: string, args: ..any) {
 
 // clear_expired_ui_notice frees the notice string once its time is up.
 clear_expired_ui_notice :: proc() {
-	if len(ui_notice.text) > 0 && sdl.GetTicks() >= ui_notice.until {
+	if len(ui_notice.text) > 0 && monotonic_ms() >= ui_notice.until {
 		delete(ui_notice.text)
 		ui_notice.text = ""
 	}

@@ -5,7 +5,6 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
-import sdl "vendor:sdl3"
 
 // Large probe buffers live at package scope to avoid stack pressure.
 gts, pxs: [3][PREVIEW_W * PREVIEW_H * 4]u8
@@ -267,13 +266,13 @@ proxy_bg_probe_run :: proc(v: string) {
 		asset = &media_bin.assets[len(media_bin.assets) - 1]
 	}
 
-	deadline := sdl.GetTicksNS() + 300_000_000_000
-	last_report := sdl.GetTicksNS()
+	deadline := monotonic_ns() + 300_000_000_000
+	last_report := monotonic_ns()
 	cancel_sent := false
 	reported: int = -1
 	for {
 		active, frac, phase, _ := import_bg_status()
-		now := sdl.GetTicksNS()
+		now := monotonic_ns()
 
 		// A proxy already complete at import (a prior session's build, cache
 		// kept) short-circuits: there is nothing to wait for. Verify the

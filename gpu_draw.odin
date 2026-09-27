@@ -438,7 +438,7 @@ draw_text_input_caret :: proc(
 		)
 	}
 	// Blinking caret.
-	blink := (sdl.GetTicks() / 500) % 2 == 0
+	blink := (monotonic_ms() / 500) % 2 == 0
 	if blink {
 		cx := text_x + input_advance_up_to(renderer, ti.cursor, scale)
 		render_sdf_rect(
@@ -1539,7 +1539,7 @@ draw_preview_hud :: proc(
 	// phantom skew that is never audible. Extrapolate both off the same wall
 	// clock (the way the producer pins its queue target) — the residual is the
 	// true device-vs-playhead offset, a few ms at most.
-	now := sdl.GetTicksNS()
+	now := monotonic_ns()
 	dev_at := sync.atomic_load(&playback.dev_at_ns)
 	dev_raw := sync.atomic_load(&playback.dev_frame)
 	rate_sc := max(1.0, playback.rate)
@@ -1557,7 +1557,7 @@ draw_preview_hud :: proc(
 		f64(ph) / fps,
 		f64(dev - ph) / fps,
 	)
-	if now := sdl.GetTicksNS(); dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
+	if now := monotonic_ns(); dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
 		rsync := sync.atomic_load(&audio_prod.resync)
 		prod := sync.atomic_load(&audio_prod.prod_frame)
 		holes := sync.atomic_load(&audio_rpt.silence_holes)
@@ -1626,7 +1626,7 @@ draw_ui_notice :: proc(
 	pass: ^sdl.GPURenderPass,
 	win_w, win_h: f32,
 ) {
-	if len(ui_notice.text) == 0 || sdl.GetTicks() >= ui_notice.until {
+	if len(ui_notice.text) == 0 || monotonic_ms() >= ui_notice.until {
 		return
 	}
 	render_sdf_rect(renderer, command_buffer, pass, {0, 0, win_w, win_h}, {6, 7, 10, 205}, 0, 0)

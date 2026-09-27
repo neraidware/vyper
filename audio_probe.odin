@@ -6,7 +6,6 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
-import sdl "vendor:sdl3"
 
 // Headless reproducibility probe for the "after many splits audio drops to a
 // blip" bug: VYPER_AUDIO_PROBE="<file>|<splits>|<audio_tracks>". Runs without an
@@ -120,9 +119,9 @@ audio_probe_run :: proc(v: string) -> int {
 	// Provision at the timeline start: the worst case, since every segment is
 	// in the future and each wants its own decoder.
 	audio_rpt.trace = true
-	prov_t0 := sdl.GetTicksNS()
+	prov_t0 := monotonic_ns()
 	audio_provision(0)
-	prov_ms := f64(sdl.GetTicksNS()-prov_t0) / 1e6
+	prov_ms := f64(monotonic_ns()-prov_t0) / 1e6
 	fmt.printf(
 		"[ap] audio_provision took %.1f ms, audio_src.count=%d (MAX_PLAY_AUDIO=%d)\n",
 		prov_ms,

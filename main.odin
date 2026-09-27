@@ -35,7 +35,7 @@ toggle_playback :: proc() {
 	}
 	playback.stop_frame = -1
 	playback.accumulator = 0
-	playback.last_tick_ns = sdl.GetTicksNS()
+	playback.last_tick_ns = monotonic_ns()
 	audio_prod.was_playing = false
 	playhead.playing = true
 	preview.playing = true
@@ -65,7 +65,7 @@ jog_playback :: proc(dir: int) {
 		}
 		playback.stop_frame = -1
 		playback.accumulator = 0
-		playback.last_tick_ns = sdl.GetTicksNS()
+		playback.last_tick_ns = monotonic_ns()
 		audio_prod.was_playing = false
 		playhead.playing = true
 		preview.playing = true
@@ -1183,7 +1183,7 @@ play_project_area :: proc() {
 	playback.dir = 1
 	playback.boost = 0
 	playback.accumulator = 0
-	playback.last_tick_ns = sdl.GetTicksNS()
+	playback.last_tick_ns = monotonic_ns()
 	audio_prod.was_playing = false
 	playhead.playing = true
 	preview.playing = true
@@ -1625,14 +1625,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			}
 			os.exit(1)
 		}
-		sdl.Delay(2500)
+		sleep_ms(2500)
 		if vyper_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
 		}
 		playhead.playing = true
 		preview.playing = true
 		playback.accumulator = 0
-		playback.last_tick_ns = sdl.GetTicksNS()
+		playback.last_tick_ns = monotonic_ns()
 		if sec := os.get_env_alloc("VYPER_PLAY_SEC", context.temp_allocator); sec != "" {
 			if v, okf := strconv.parse_f64(sec); okf && v > 0 {
 				playback.stop_frame = i64(v * timeline_fps())
@@ -1685,7 +1685,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			height,
 		)
 
-		now_ns := sdl.GetTicksNS()
+		now_ns := monotonic_ns()
 		playback_update(now_ns)
 		playback_publish(playhead.frame, now_ns)
 		audio_update()

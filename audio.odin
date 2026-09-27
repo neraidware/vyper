@@ -13,7 +13,6 @@ import avcodec "vendor/ffmpeg/avcodec"
 import avfmt "vendor/ffmpeg/avformat"
 import avutil "vendor/ffmpeg/avutil"
 import swres "vendor/ffmpeg/swresample"
-import sdl "vendor:sdl3"
 
 // AUDIO_CHUNK is the number of output sample-frames decoded in one step.
 AUDIO_CHUNK :: 4096
@@ -544,7 +543,7 @@ Audio_Producer :: struct {
 	run:      bool, // false pauses the device and frees sources (atomic)
 	resync:   i64, // bump forces clear + re-provision at the anchor (atomic)
 	// anchor_frame is the playhead frame the UI last seeded for a resync
-	// (atomic); anchor_now is sdl.GetTicksNS() when that frame was seeded.
+	// (atomic); anchor_now is monotonic_ns() when that frame was seeded.
 	anchor_frame: i64,
 	anchor_now:   i64,
 	// prod_frame is the producer's current content frame, published for the
@@ -1196,7 +1195,7 @@ audio_shutdown :: proc() {
 	if audio_prod.thread != nil {
 		sync.atomic_store(&audio_prod.stop, true)
 		for !sync.atomic_load(&audio_prod.done) {
-			sdl.Delay(1)
+			sleep_ms(1)
 		}
 		thread.destroy(audio_prod.thread)
 		audio_prod.thread = nil
@@ -1251,8 +1250,8 @@ timeline_has_audio_at :: proc(f: i64) -> bool {
 // ahead, on the queue ceiling, so processing rate can never differ from the
 // device's reproduction rate.
 audio_producer_feed :: proc() {
-	feed_t0 := sdl.GetTicksNS()
-	defer audio_rpt.feed_us += u64(sdl.GetTicksNS() - feed_t0)
+	feed_t0 := monotonic_ns()
+	defer audio_rpt.feed_us += u64(monotonic_ns() - feed_t0)
 	if !audio_device_ready() {
 		return
 	}
@@ -1274,7 +1273,7 @@ audio_producer_feed :: proc() {
 		// device's drain rate, which equals the playhead's rate, and the
 		// prod-keyed forward-skip in audio_update can't see the audible
 		// position that is behind.
-		sync.atomic_store(&audio_prod.jump_frame, playback_playhead_at(sdl.GetTicksNS(), want_ratio))
+		sync.atomic_store(&audio_prod.jump_frame, playback_playhead_at(monotonic_ns(), want_ratio))
 		audio_rpt.rate_rebuilt += 1
 	}
 	audio_pcm_dump_open()
@@ -1330,7 +1329,7 @@ audio_producer_feed :: proc() {
 	// Publish at_ns BEFORE dev: a reader sampling dev then at_ns under-extrapolates
 	// (at_ns can only be newer), which is the safe direction — never a position
 	// ahead of what the device truly consumed.
-	sync.atomic_store(&playback.dev_at_ns, i64(sdl.GetTicksNS()))
+	sync.atomic_store(&playback.dev_at_ns, i64(monotonic_ns()))
 	sync.atomic_store(&playback.dev_frame, dev_pos)
 	// Fold live gain edits (knob drag) into provisioned segments before mixing.
 	// The epoch check is cheap; folding only runs when the UI published a gain
@@ -1348,7 +1347,7 @@ audio_producer_feed :: proc() {
 	// playhead and locks a permanent offset after the stall. Extrapolating the
 	// same wall clock the UI uses keeps audio glued to where the playhead really
 	// is. dev_pos is kept only as the telemetry/health signal stored above.
-	ph := playback_playhead_at(sdl.GetTicksNS(), want_ratio)
+	ph := playback_playhead_at(monotonic_ns(), want_ratio)
 	target := ph + cushion_frames
 	// Wedge watchdog: at the queue cap, prod is throttled to the device drain
 	// rate — exactly the playhead's rate — so any deficit born while the device
@@ -1364,7 +1363,7 @@ audio_producer_feed :: proc() {
 		audio_device_clear()
 		queued_frames = 0
 		dev_pos = audio_src.next_frame
-		sync.atomic_store(&playback.dev_at_ns, i64(sdl.GetTicksNS()))
+		sync.atomic_store(&playback.dev_at_ns, i64(monotonic_ns()))
 		sync.atomic_store(&playback.dev_frame, dev_pos)
 		audio_rpt.wedge_heal += 1
 	}
@@ -1398,11 +1397,11 @@ audio_producer_feed :: proc() {
 			b1 := audio_frame_boundary48(audio_src.next_frame + 1, fps)
 			cur_spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
 		}
-		mix_t0 := sdl.GetTicksNS()
+		mix_t0 := monotonic_ns()
 		if !audio_mix_frame(mix[:], audio_src.next_frame, cur_spf) {
 			sync.atomic_add(&audio_rpt.silence_holes, 1)
 		}
-		audio_rpt.mix_us += u64(sdl.GetTicksNS() - mix_t0)
+		audio_rpt.mix_us += u64(monotonic_ns() - mix_t0)
 		// Playback-rate: atempo stretches mixed content to cur_spf/rate output
 		// samples with pitch preserved. Inactive graph (rate 1.0) feeds the mix
 		// through verbatim, identical to the pre-atempo path.
@@ -1443,7 +1442,7 @@ audio_producer_feed :: proc() {
 		if audio_rpt.trace {
 			fmt.printf(
 				"[tr feed] fr=%d devpos=%d target=%d q=%db ph=%d prod=%d dev=%d mix=%.2fs\n",
-				audio_src.next_frame - 1, dev_pos, target, qnow, ph, audio_src.next_frame, playback.dev_frame, f64(sdl.GetTicksNS() - feed_t0) / 1e9,
+				audio_src.next_frame - 1, dev_pos, target, qnow, ph, audio_src.next_frame, playback.dev_frame, f64(monotonic_ns() - feed_t0) / 1e9,
 			)
 		}
 	}
@@ -1463,14 +1462,14 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 	if audio_rpt.trace {
 		fmt.println("[audio] producer thread up")
 	}
-	audio_rpt.thread_start_ns = sdl.GetTicksNS()
+	audio_rpt.thread_start_ns = monotonic_ns()
 	last_report := u64(0)
 	for !sync.atomic_load(&audio_prod.stop) {
 		if sync.atomic_load(&audio_prod.run) {
 			evt := sync.atomic_load(&audio_prod.resync)
 			if evt != last_evt || !had_evt {
 				last_evt = evt
-				open_start := sdl.GetTicksNS()
+				open_start := monotonic_ns()
 				// Drop the queue and the resampler history together, then open
 				// the gate. The gate, not a device stop/start, is what starts
 				// and stops output: the device runs for the process lifetime.
@@ -1487,16 +1486,16 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				// at realtime the lag is frozen in (measurably ~the provision
 				// duration, which is exactly why a manual seek clears it).
 				// Skip forward to where playback actually is instead.
-				if hop := playback_playhead_at(sdl.GetTicksNS(), max(1.0, playback.rate)); hop > audio_src.next_frame {
+				if hop := playback_playhead_at(monotonic_ns(), max(1.0, playback.rate)); hop > audio_src.next_frame {
 					sync.atomic_store(&audio_prod.jump_frame, hop)
 				}
 				if audio_rpt.trace {
-					fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", audio_src.count, sync.atomic_load(&audio_prod.anchor_frame), f64(sdl.GetTicksNS()-open_start)/1e6)
+					fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", audio_src.count, sync.atomic_load(&audio_prod.anchor_frame), f64(monotonic_ns()-open_start)/1e6)
 				}
 			}
 			audio_producer_feed()
 			if audio_rpt.log_ms > 0 {
-				if now := sdl.GetTicksNS(); now - last_report >= u64(audio_rpt.log_ms) * 1_000_000 {
+				if now := monotonic_ns(); now - last_report >= u64(audio_rpt.log_ms) * 1_000_000 {
 					elapsed := f64(now - audio_rpt.tick) / 1e9
 				delta := audio_src.next_frame - audio_rpt.frame
 				queued := audio_device_queued()
@@ -1594,10 +1593,10 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				audio_reset_play()
 				had_evt = false
 			}
-			sdl.Delay(4)
+			sleep_ms(4)
 			continue
 		}
-		sdl.Delay(2)
+		sleep_ms(2)
 	}
 	audio_reset_play()
 	if audio_dump.pcm != nil {
@@ -1640,7 +1639,7 @@ audio_update :: proc() {
 	if fwd > 3 || fwd < -1 {
 		if audio_rpt.trace {
 			fmt.printf("[ph] t=%.2fs ph=%d fwd=%+d (last_ui=%d) -> jump/health check\n",
-				f64(sdl.GetTicksNS()-audio_rpt.thread_start_ns)/1e9,
+				f64(monotonic_ns()-audio_rpt.thread_start_ns)/1e9,
 				playhead.frame, fwd, audio_prod.last_ui_frame)
 		}
 	}
@@ -1648,7 +1647,7 @@ audio_update :: proc() {
 	// refill a full cushion at device rate before it can race ahead again.
 	// Coalesce re-checks well past that recovery window so the forward-gap guard
 	// below cannot re-trigger a self-sustaining reseed loop.
-	now := sdl.GetTicksNS()
+	now := monotonic_ns()
 	last_seed := u64(sync.atomic_load(&audio_prod.anchor_now))
 	if now - last_seed < 200_000_000 {
 		return
@@ -1715,6 +1714,6 @@ audio_seek :: proc(frame: i64) {
 		fmt.printf("[tr seek] to=%d\n", frame)
 	}
 	sync.atomic_store(&audio_prod.anchor_frame, frame)
-	sync.atomic_store(&audio_prod.anchor_now, i64(sdl.GetTicksNS()))
+	sync.atomic_store(&audio_prod.anchor_now, i64(monotonic_ns()))
 	sync.atomic_add(&audio_prod.resync, 1)
 }

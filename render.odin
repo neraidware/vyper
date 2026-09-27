@@ -191,7 +191,7 @@ render_status :: proc() -> Render_Status {
 // run reset frames_done to 0, which (re)anchors the window.
 render_fps_text :: proc(done: i64) -> string {
 	wnd := &render_meter.fps_wnd
-	now := i64(sdl.GetTicksNS())
+	now := i64(monotonic_ns())
 	if wnd.prev_ns == 0 || done < wnd.prev_done {
 		wnd.prev_ns = now
 		wnd.prev_done = done
