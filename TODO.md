@@ -725,9 +725,13 @@ stylistic choice, and the comment at the site now says so.
       `MouseWheelEvent` carries no `mod` field at all, unlike
       `KeyboardEvent`), and `read_mouse_input` is a per-frame sample of what
       is held *now* for shift-click/alt-click, with no discrete event behind it.
-- [x] ACCEPT: manual pass — press `:` and the prompt opens EMPTY, the first
-      character typed shows up, `open C:/x` keeps its colon, and
-      F1/undo/redo shortcuts still fire.
+- [x] ACCEPT: covered headlessly by the cmdline-opener probe (opens EMPTY, first
+      character lands with and without a text echo, a data `:` survives) and by
+      the action-table probe (F1/undo/redo resolution). Correcting an earlier
+      entry here: this was previously ticked as a "manual pass", which no human
+      ever performed — every check here is a synthetic SDL event, never a real
+      keyboard. A human on hardware is still worth doing once, mainly because it
+      is the only thing that exercises SDL's real text-input delivery timing.
 
 ## Active 9 — Input layer: key state, actions, focus/consume routing
 
