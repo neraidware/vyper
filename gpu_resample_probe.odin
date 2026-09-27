@@ -26,7 +26,6 @@ import "core:time"
 import sdl "vendor:sdl3"
 import yuv "vendor/yuv"
 
-blit_vertex_spirv   := #load("shaders/blit.vert.spv")
 blit_lod_fragment_spirv := #load("shaders/blit_lod.frag.spv")
 blit_box_fragment_spirv := #load("shaders/blit_box.frag.spv")
 
@@ -204,8 +203,8 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 	}
 
 	vtx := sdl.GPUShaderCreateInfo {
-		code_size       = uint(len(blit_vertex_spirv)),
-		code            = raw_data(blit_vertex_spirv),
+		code_size       = uint(len(quad_vertex_spirv)),
+		code            = raw_data(quad_vertex_spirv),
 		entrypoint      = "main",
 		format          = {.SPIRV},
 		stage           = .VERTEX,
@@ -449,19 +448,18 @@ gpu_blit_run :: proc(p: ^GPU_Resample_Probe, src: []u8, src_stride: int, out: []
 	sdl.BindGPUGraphicsPipeline(pass, p.pipeline)
 	binding := sdl.GPUTextureSamplerBinding{texture = p.src_tex, sampler = p.sampler}
 	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-	u := struct {
-		dst_rect: [4]f32,
-		src_rect: [4]f32,
-		viewport: [2]f32,
-	}{
-		dst_rect = {0, 0, f32(p.dst_w), f32(p.dst_h)},
+	// The shared quad uniform, NOT an inline literal: the byte order has to
+	// match shaders/quad.vert, and an anonymous struct here is exactly how the
+	// fields silently land in the wrong place when the vertex stage changes.
+	u := Quad_Uniforms {
+		bounds = {0, 0, f32(p.dst_w), f32(p.dst_h)},
 		// The EXACT source rect, with no half-texel inset. Destination pixel
 		// center p lands at corner p/dst_w, so uv = p/src_w, and a 1:1 draw
 		// samples every texel center exactly. Insetting the endpoints by half a
 		// texel (the reflex when porting a GL blit) shifts the whole image by
 		// half a texel -- caught by the 1:1 exactness gate below, which is
 		// exactly why that gate exists.
-		src_rect = {0.0, 0.0, 1.0, 1.0},
+		uv       = {0.0, 0.0, 1.0, 1.0},
 		viewport = {f32(p.dst_w), f32(p.dst_h)},
 	}
 	sdl.PushGPUVertexUniformData(cb, 0, &u, u32(size_of(u)))

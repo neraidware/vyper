@@ -1129,6 +1129,99 @@ later work-stream that plugs into it without reshaping what is here.
       keyboard and a real IME, which is the only thing that exercises SDL's
       actual IME activation timing.
 
+## Active 10 — Preview/export parity cleanup (shared geometry, filter, layering)
+
+**Status:** started 2026-09-27. Goal is to remove the duplicated preview/export
+machinery and fix the bugs that duplication already caused, BEFORE attempting to
+unify the two pipelines. Unification itself is deliberately not started: it
+needs a zero-copy interop spike (Active 1 / S1c) and is a project of its own.
+
+Three SHIPPED bugs were found while mapping the duplication, all of them
+consequences of two systems maintaining the same fact independently:
+
+1. **Preview minification aliases.** `preview.frag` is a single `texture()`
+   tap and the preview sampler is `LINEAR` with `max_lod = 1`, so a 1080p
+   source shown in a ~600px widget is minified with one bilinear tap and no
+   mip chain. The export side already got this right via
+   `shaders/blit_box.frag`; preview never adopted it.
+2. **Text vs video layering diverges.** Preview walks the track order once and
+   interleaves `.Video` and `.Text` by that walk position. Export ran three
+   SEPARATE passes: videos in reverse `render_job.videos` order, then all
+   texts, then all subs. A text clip on a track below a video therefore
+   previews underneath but exports on top. The comment at the text pass
+   claimed it "match[es] the preview layering" — it did not.
+3. **Subtitles vs everything diverges.** Subtitle generator clips arrive in
+   preview as `kind == .Text` + `generator == .Subtitles`, so they take a
+   `layer` from the same walk and interleave. Export pinned all subs above
+   everything, with a comment claiming that matches the preview.
+
+Decision (user, 2026-09-27): **track order is authoritative for text in both;
+subtitles stay pinned on top in both.** Text below a video must preview and
+export identically (WYSIWYG). Burned-in subtitles stay above everything because
+a subtitle hidden behind a video is unreadable, so preview must pin them too
+rather than interleave.
+
+**Step A1 — DONE: one vertex stage, one uniform type, one shader load.**
+- `shaders/text.vert` and `shaders/blit.vert` were byte-identical in math
+  (same `corners[6]`, same `bounds.xy + corner*bounds.zw`, same NDC + Y-flip,
+  same `mix(uv.xy, uv.zw, corner)`) and differed only in field names. Merged
+  into `shaders/quad.vert`; both old files deleted. Kept at the default
+  target-env so the text/preview paths still run on a Vulkan 1.0 device.
+- `TextVertexUniforms` and `Blit_Uniform` were two types for the same block
+  with INCOMPATIBLE field order (text: bounds, viewport, pad, uv; blit:
+  dst_rect, src_rect, viewport). Now one `Quad_Uniforms` matching
+  `shaders/quad.vert`, with the byte-layout contract documented on the type.
+  The `_padding` is load-bearing: it puts `uv` at offset 32, where std140
+  puts the vec4 following a vec2.
+- `render_gpu.odin` referenced `blit_vertex_spirv`, which was `#load`-ed in
+  `gpu_resample_probe.odin`. Production code depended on a symbol declared in a
+  probe file; deleting the probe would have broken the build. The load now
+  lives with the other `#load`s in `gpu_renderer.odin` and all three
+  consumers share it.
+- The probe built its uniform as an INLINE ANONYMOUS STRUCT in the old blit
+  order, which is how the fields land in the wrong place when the vertex
+  stage changes — it failed the probe until it used the shared type. That is
+  the exact hazard the shared type exists to prevent, and the most likely
+  place for the next silent break.
+
+**Step A2 — NEXT: preview adopts `blit_box.frag`, fixing bug 1.** Needs a
+preview frame-time gate added first: the box filter's cost scales with the
+source footprint, and "it looks right" is not evidence it fits an interactive
+budget. `scripts/gate.sh probe` already asserts preview layout, so the
+timing assertion belongs there.
+
+**Step B — geometry dedup.** `clip_full_box_dims` (preview_transform.odin) and
+`render_full_box_dims` (render.odin) have identical bodies; the render.odin
+copy carried a comment admitting it was "mirrored here for snapshot structs".
+The `center - size/2 + crop*size` formula is likewise written twice, once in
+float screen pixels and once rounded to ints.
+
+**Step C — one ordered visual list for export, fixing bug 2.** Merge the video
+and text snapshots into ONE track-ordered list (tagged union) and composite it
+in a single back-to-front loop, deleting the separate text pass. Subtitles stay
+in their own pinned pass, which export already has.
+
+**Step D — preview pins subtitle slots, fixing bug 3.** Subtitle-generator slots
+must draw after every layer-sorted slot instead of taking part in the sort.
+
+**Gate hardening (done with A1).** `target_gpu_probe`, `target_probe`,
+`target_smoke`, `target_valgrind` and `keyed_export` all ran `./vyper` WITHOUT
+building it, checking only that it existed. Editing a source and re-running one
+measured the PREVIOUS binary and reported it as the new one — the stale-SPIR-V
+hazard the file already warns about, in its worse form. This actually caused a
+misdiagnosis here: a real failure was chased as pre-existing and then as a
+clean pass, when both runs were the same stale executable. All five now call
+`require_fresh_binary`, which fails loudly (rather than silently rebuilding)
+when any `.odin` or `shaders/*.spv` is newer than `./vyper`. Separately,
+`target_shaders` listed only the blit trio, so editing `preview.frag` and
+running a target measured the old SPIR-V; it now compiles every stage and
+fails if a shader on disk is not in the list.
+
+**Evidence for A1 (behavior-preserving):** with a real rebuild, `gpu_probe`
+reproduces the baseline error metrics row-for-row (1:1 `mean=00.00`; 0.5x
+`00.20`/`00.11`; upscale `01.16`; 5K `00.02`) and `keyed_export` reproduces
+`1.0x PSNR = inf` and `0.5x PSNR = 58.707992` exactly.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

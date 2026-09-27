@@ -31,8 +31,40 @@ target_check() {
 target_shaders() {
 	nix develop -c sh -c '
 		set -e
-		for src in shaders/blit.vert shaders/blit_box.frag shaders/blit_lod.frag; do
-			glslangValidator -V --target-env vulkan1.1 "$src" -o "$src.spv"
+		# Every stage the binary #loads, with the same target-env flake.nix uses.
+		# The completeness check below exists because this list drifted once: it
+		# held only the blit trio, so editing preview.frag and running any target
+		# measured the OLD SPIR-V and reported it as the new one -- the exact
+		# failure the comment above warns about. A new shader that is not listed
+		# here fails the build rather than being silently skipped.
+		set -- \
+			shaders/rounded_rect.vert \
+			shaders/rounded_rect.frag \
+			shaders/quad.vert \
+			shaders/text.frag \
+			shaders/preview.frag \
+			shaders/blit_box.frag \
+			shaders/blit_lod.frag
+		for src in "$@"; do
+			case $src in
+			*blit_box.frag|*blit_lod.frag)
+				glslangValidator -V --target-env vulkan1.1 "$src" -o "$src.spv" ;;
+			*)
+				glslangValidator -V "$src" -o "$src.spv" ;;
+			esac
+		done
+		for src in shaders/*.vert shaders/*.frag; do
+			found=
+			for want in "$@"; do
+				if [ "$src" = "$want" ]; then
+					found=1
+					break
+				fi
+			done
+			if [ -z "$found" ]; then
+				echo "target_shaders: $src is not in the list -- add it" >&2
+				exit 1
+			fi
 		done
 	'
 }
@@ -40,6 +72,39 @@ target_shaders() {
 target_build() {
 	target_shaders
 	nix develop -c odin build . -debug -vet-style -vet-semicolon -out:vyper
+}
+
+# Every target that runs ./vyper must call this first.
+#
+# The stale-SPIR-V hazard above has a twin that is worse, because it is silent:
+# these targets do NOT build, they only check that ./vyper exists. Editing a
+# source and re-running one therefore measures the PREVIOUS binary and reports
+# it as the new one. That is not hypothetical either -- a probe failure here was
+# chased as a pre-existing regression and then as a clean pass, when both runs
+# were the same stale executable and only a real rebuild told the truth.
+#
+# Fails loudly rather than rebuilding: an automatic rebuild hides "I meant to
+# measure the previous build", and a wrong measurement reported confidently is
+# the exact failure this file already exists to prevent.
+require_fresh_binary() {
+	local target_name=$1
+	if [ ! -x ./vyper ]; then
+		echo "$target_name: ./vyper missing -- run scripts/gate.sh build" >&2
+		return 1
+	fi
+	# -nt is "newer than": any source or SPIR-V newer than the binary means the
+	# binary cannot reflect the tree. Includes the SPVs because a .frag edit
+	# changes the binary only after target_shaders + a rebuild.
+	local stale
+	stale=$(find . -maxdepth 1 -name '*.odin' -newer ./vyper -print -quit)
+	if [ -z "$stale" ]; then
+		stale=$(find shaders -name '*.spv' -newer ./vyper -print -quit)
+	fi
+	if [ -n "$stale" ]; then
+		echo "$target_name: ./vyper is older than $stale" >&2
+		echo "$target_name: this would measure the PREVIOUS binary -- run scripts/gate.sh build" >&2
+		return 1
+	fi
 }
 
 # swscale/resample microbenchmarks. Separate package (swsbench) so it can link
@@ -64,10 +129,7 @@ target_bench() {
 # every case ran. A non-zero exit is a real correctness failure (the 1:1 row is
 # not an exact copy, or the numbers did not print at all).
 target_gpu_probe() {
-	if [ ! -x ./vyper ]; then
-		echo "gpu-probe: ./vyper missing, run scripts/gate.sh build first" >&2
-		return 1
-	fi
+	require_fresh_binary gpu-probe || return 1
 	VYPER_GPU_PROBE=1 timeout 300 ./vyper
 }
 
@@ -96,10 +158,7 @@ KEYED_SRC="$KEYED_DIR/src.mp4"
 KEYED_MIN_DB=50
 
 keyed_export_run() {
-	if [ ! -x ./vyper ]; then
-		echo "keyed-export: ./vyper missing, run scripts/gate.sh build first" >&2
-		return 1
-	fi
+	require_fresh_binary keyed-export || return 1
 	mkdir -p "$KEYED_DIR"
 
 	# testsrc2 is deterministic and full of fine detail, which is the point:
@@ -209,11 +268,13 @@ target_keyed_ab() {
 }
 
 target_probe() {
+	require_fresh_binary probe || return 1
 	env $PROBE_ENV timeout 120 ./vyper
 }
 
 # The app must still be running when the timeout kills it; 124 is the pass.
 target_smoke() {
+	require_fresh_binary smoke || return 1
 	timeout 4 ./vyper
 	local rc=$?
 	if [ $rc -ne 124 ]; then
@@ -224,6 +285,7 @@ target_smoke() {
 }
 
 target_valgrind() {
+	require_fresh_binary valgrind || return 1
 	local log
 	log=$(mktemp)
 	env $PROBE_ENV timeout 900 valgrind --leak-check=full \

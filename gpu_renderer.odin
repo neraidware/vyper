@@ -23,11 +23,18 @@ RectFragmentUniforms :: struct {
 	mode:  [4]f32, // x: 0 = circular-arc corner, 1 = squircle
 }
 
-TextVertexUniforms :: struct {
-	bounds:   [4]f32,
-	viewport: [2]f32,
+// Quad_Uniforms is the set=1 binding=0 vertex block shared by every textured
+// quad draw: text glyphs, preview image layers, and the export resampler. The
+// field order and the names must stay byte-identical to shaders/quad.vert --
+// it is the single vertex stage all three pipelines bind, so this one type is
+// the only place that has to agree with it. The `_padding` is not optional: it
+// puts `uv` at offset 32, which is where std140 puts the vec4 that follows a
+// vec2 in the shader.
+Quad_Uniforms :: struct {
+	bounds:   [4]f32, // destination rect: x, y, w, h in render-target pixels
+	viewport: [2]f32, // render-target size in pixels
 	_padding: [2]f32,
-	uv:       [4]f32,
+	uv:       [4]f32, // source sub-rect: (u0, v0, u1, v1), normalized
 }
 
 TextFragmentUniforms :: struct {
@@ -278,7 +285,7 @@ GPU_Renderer :: struct {
 
 rounded_rect_vertex_spirv := #load("shaders/rounded_rect.vert.spv")
 rounded_rect_fragment_spirv := #load("shaders/rounded_rect.frag.spv")
-text_vertex_spirv := #load("shaders/text.vert.spv")
+quad_vertex_spirv := #load("shaders/quad.vert.spv")
 text_fragment_spirv := #load("shaders/text.frag.spv")
 preview_fragment_spirv := #load("shaders/preview.frag.spv")
 
@@ -359,24 +366,24 @@ create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat
 		return
 	}
 	result.pipeline = pipeline
-	text_vertex_info := sdl.GPUShaderCreateInfo{
-		code_size = uint(len(text_vertex_spirv)), code = raw_data(text_vertex_spirv),
+	quad_vertex_info := sdl.GPUShaderCreateInfo{
+		code_size = uint(len(quad_vertex_spirv)), code = raw_data(quad_vertex_spirv),
 		entrypoint = "main", format = {.SPIRV}, stage = .VERTEX, num_uniform_buffers = 1,
 	}
 	text_fragment_info := sdl.GPUShaderCreateInfo{
 		code_size = uint(len(text_fragment_spirv)), code = raw_data(text_fragment_spirv),
 		entrypoint = "main", format = {.SPIRV}, stage = .FRAGMENT, num_samplers = 1, num_uniform_buffers = 1,
 	}
-	text_vertex_shader := sdl.CreateGPUShader(device, text_vertex_info)
+	quad_vertex_shader := sdl.CreateGPUShader(device, quad_vertex_info)
 	text_fragment_shader := sdl.CreateGPUShader(device, text_fragment_info)
-	if text_vertex_shader == nil || text_fragment_shader == nil {
-		fmt.println("Text shader creation failed:", sdl.GetError())
+	if quad_vertex_shader == nil || text_fragment_shader == nil {
+		fmt.println("Quad vertex/text shader creation failed:", sdl.GetError())
 		return
 	}
-	defer sdl.ReleaseGPUShader(device, text_vertex_shader)
+	defer sdl.ReleaseGPUShader(device, quad_vertex_shader)
 	defer sdl.ReleaseGPUShader(device, text_fragment_shader)
 	text_pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
-		vertex_shader = text_vertex_shader, fragment_shader = text_fragment_shader, primitive_type = .TRIANGLELIST,
+		vertex_shader = quad_vertex_shader, fragment_shader = text_fragment_shader, primitive_type = .TRIANGLELIST,
 		rasterizer_state = {fill_mode = .FILL, cull_mode = .NONE, front_face = .COUNTER_CLOCKWISE, enable_depth_clip = true},
 		multisample_state = {sample_count = ._1}, target_info = {color_target_descriptions = &target, num_color_targets = 1},
 	}
@@ -398,7 +405,7 @@ create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat
 	}
 	defer sdl.ReleaseGPUShader(device, preview_fragment_shader)
 	preview_pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
-		vertex_shader = text_vertex_shader, fragment_shader = preview_fragment_shader, primitive_type = .TRIANGLELIST,
+		vertex_shader = quad_vertex_shader, fragment_shader = preview_fragment_shader, primitive_type = .TRIANGLELIST,
 		rasterizer_state = {fill_mode = .FILL, cull_mode = .NONE, front_face = .COUNTER_CLOCKWISE, enable_depth_clip = true},
 		multisample_state = {sample_count = ._1}, target_info = {color_target_descriptions = &target, num_color_targets = 1},
 	}

@@ -308,7 +308,7 @@ draw_tex_quad :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBu
 	if renderer.preview_pipeline == nil || texture == nil {
 		return
 	}
-	vertex_uniforms := TextVertexUniforms{
+	vertex_uniforms := Quad_Uniforms{
 		bounds = {bounds.x, bounds.y, bounds.width, bounds.height},
 		viewport = renderer.viewport,
 		_padding = {},

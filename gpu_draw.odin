@@ -1048,7 +1048,7 @@ render_text :: proc(
 			cx, cy := glyph_atlas_cell_xy(atlas, slot.cell)
 			u0 := (f32(cx) * GLYPH_CELL_PX + GLYPH_CELL_PAD) / tex_px
 			v0 := (f32(cy) * GLYPH_CELL_PX + GLYPH_CELL_PAD) / tex_px
-			vertex_uniforms := TextVertexUniforms {
+			vertex_uniforms := Quad_Uniforms {
 				bounds   = {quad_bounds.x, quad_bounds.y, quad_bounds.width, quad_bounds.height},
 				viewport = renderer.viewport,
 				_padding = {},
@@ -1287,7 +1287,7 @@ render_icon :: proc(
 		sampler = renderer.preview_sampler,
 	}
 	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
-	vertex_uniforms := TextVertexUniforms {
+	vertex_uniforms := Quad_Uniforms {
 		bounds   = {bounds.x, bounds.y, bounds.width, bounds.height},
 		viewport = renderer.viewport,
 		_padding = {},
@@ -2084,7 +2084,7 @@ draw_image_layer :: proc(
 	command_buffer: ^sdl.GPUCommandBuffer,
 	texture: ^sdl.GPUTexture,
 	sampler: ^sdl.GPUSampler,
-	uniforms: TextVertexUniforms,
+	uniforms: Quad_Uniforms,
 ) {
 	sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
 	binding := sdl.GPUTextureSamplerBinding{texture = texture, sampler = sampler}
@@ -2210,7 +2210,7 @@ draw_preview :: proc(
 			v0 = v_base + slot.crop_t * v_span
 			v1 = v_base + (1 - slot.crop_b) * v_span
 		}
-		vertex_uniforms := TextVertexUniforms {
+		vertex_uniforms := Quad_Uniforms {
 			bounds   = {cb.x, cb.y, cb.width, cb.height},
 			viewport = renderer.viewport,
 			_padding = {},

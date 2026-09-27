@@ -39,13 +39,14 @@
             # The dev shell keeps mold for everyday local builds.
             glslangValidator -V shaders/rounded_rect.vert -o shaders/rounded_rect.vert.spv
             glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
-            glslangValidator -V shaders/text.vert -o shaders/text.vert.spv
+            glslangValidator -V shaders/quad.vert -o shaders/quad.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
-            # The offscreen blit/resample pair used by the export compositor and
-            # its probe. box.frag is the real resample; lod.frag is a diagnostic
-            # that hardcodes LOD 3. Same target-env as the probe builds them.
-            glslangValidator -V --target-env vulkan1.1 shaders/blit.vert -o shaders/blit.vert.spv
+            # The offscreen resample stages used by the export compositor and its
+            # probe. box.frag is the real resample; lod.frag is a diagnostic that
+            # hardcodes LOD 3. They pair with quad.vert above, which is the
+            # shared vertex stage -- kept at the default target-env so the text
+            # and preview paths keep working on a Vulkan 1.0 device.
             glslangValidator -V --target-env vulkan1.1 shaders/blit_box.frag -o shaders/blit_box.frag.spv
             glslangValidator -V --target-env vulkan1.1 shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
@@ -98,13 +99,14 @@
             # The dev shell keeps mold for everyday local builds.
             glslangValidator -V shaders/rounded_rect.vert -o shaders/rounded_rect.vert.spv
             glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
-            glslangValidator -V shaders/text.vert -o shaders/text.vert.spv
+            glslangValidator -V shaders/quad.vert -o shaders/quad.vert.spv
             glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
             glslangValidator -V shaders/preview.frag -o shaders/preview.frag.spv
-            # The offscreen blit/resample pair used by the export compositor and
-            # its probe. box.frag is the real resample; lod.frag is a diagnostic
-            # that hardcodes LOD 3. Same target-env as the probe builds them.
-            glslangValidator -V --target-env vulkan1.1 shaders/blit.vert -o shaders/blit.vert.spv
+            # The offscreen resample stages used by the export compositor and its
+            # probe. box.frag is the real resample; lod.frag is a diagnostic that
+            # hardcodes LOD 3. They pair with quad.vert above, which is the
+            # shared vertex stage -- kept at the default target-env so the text
+            # and preview paths keep working on a Vulkan 1.0 device.
             glslangValidator -V --target-env vulkan1.1 shaders/blit_box.frag -o shaders/blit_box.frag.spv
             glslangValidator -V --target-env vulkan1.1 shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
             clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c

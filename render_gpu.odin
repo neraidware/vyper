@@ -164,8 +164,8 @@ gpu_resample_create :: proc(g: ^GPU_Resample) -> bool {
 	}
 
 	vs := sdl.GPUShaderCreateInfo {
-		code_size          = uint(len(blit_vertex_spirv)),
-		code               = raw_data(blit_vertex_spirv),
+		code_size          = uint(len(quad_vertex_spirv)),
+		code               = raw_data(quad_vertex_spirv),
 		entrypoint         = "main",
 		format             = {.SPIRV},
 		stage              = .VERTEX,
@@ -218,15 +218,6 @@ gpu_resample_create :: proc(g: ^GPU_Resample) -> bool {
 
 	fmt.println("render-gpu: resample on", g.adapter)
 	return true
-}
-
-// Blit_Uniform is the per-draw block shared with shaders/blit.vert (set 1,
-// binding 0). A named type rather than a literal at the push site, so the
-// layout lives in one place next to the shader it has to agree with.
-Blit_Uniform :: struct {
-	dst_rect: [4]f32,
-	src_rect: [4]f32,
-	viewport: [2]f32,
 }
 
 // gpu_resample_stage makes sure `src` is resident as a sampled texture. The
@@ -401,7 +392,7 @@ gpu_resample_into :: proc(
 	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
 
 	// Same layout the probe validates, which is the whole point of reusing it:
-	// dst_rect in result pixels, src_rect normalized over the crop sub-rect,
+	// bounds in result pixels, uv normalized over the crop sub-rect,
 	// viewport = result size. The EXACT sub-rect with no half-texel inset is
 	// what keeps 1:1 bit-exact; a fractional inset shifts the image, and the
 	// probe's exactness gate exists to catch exactly that.
@@ -409,9 +400,9 @@ gpu_resample_into :: proc(
 	// Pushed through the command buffer rather than a persistent buffer write,
 	// matching the probe, so this path is known-good against the gate that
 	// already passes.
-	vals := Blit_Uniform {
-		dst_rect = {0, 0, f32(rw), f32(rh)},
-		src_rect = {
+	vals := Quad_Uniforms {
+		bounds = {0, 0, f32(rw), f32(rh)},
+		uv = {
 			f32(srcx) / f32(sw),
 			f32(srcy) / f32(sh),
 			(f32(srcx) + f32(srcw)) / f32(sw),
