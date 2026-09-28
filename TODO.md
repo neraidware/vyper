@@ -697,10 +697,51 @@ throughput. See the note appended to S2.
       GPU conversion against what it replaces -- `enc_convert_rgba_fast` (the
       in-tree SIMD kernel) and/or swscale -- headlessly, bit-exactly, the way
       `gpu_probe` already pins the resample kernel. Exactness is achievable in
-      principle (the matrix coefficients and the chroma siting are fixed) but
-      that is a claim to be MEASURED, not assumed; if the GPU pass cannot be made
-      byte-identical, the decision becomes "accept a changed 1:1 anchor" versus
-      "keep swscale", and that is a user-facing call.
+      principle but that is a claim to be MEASURED, not assumed, and two
+      measured facts now bound it.
+
+      **The in-tree CPU alternative is a dead end, measured.** `VYPER_YUV=1`
+      (`enc_convert_rgba_fast` -> `yuvconv.rgba_to_nv12`) is 3.2x SLOWER than
+      the swscale it would replace: 16.02 ms/f against 5.07 ms/f on the same
+      1920x1080 fixture. So `enc_convert_finish`'s "off by default" is not
+      conservatism about byte-exactness alone -- the default is also three times
+      faster, which is the real reason to leave it off. The CPU floor here is
+      swscale's ~5 ms/f with no cheap win below it. That is what makes the GPU
+      the only route to a large win, rather than a preference.
+
+      **swscale's RGBA->NV12 is a FILTERED conversion, which is the real
+      constraint.** Read in the build source rather than assumed
+      (`/tmp/opencode/ffmpeg9/libswscale`): `ff_get_unscaled_swscale` has NO
+      unscaled rgb->nv12 converter -- the unscaled set is rgb<->rgb,
+      rgb->planar-rgb, and yuv2rgb (the reverse direction). RGBA->NV12
+      therefore goes through the general `ff_sws_init_swscale` pipeline: an
+      `rgb24ToY` pass against the `ff_yuv2rgb_coeffs` table, `yuv2plane1_8_c`
+      for Y at 1:1, and CHROMA at half resolution through the horizontal scaler
+      (`hScale8To15` with `SWS_BILINEAR` coefficients) plus vertical
+      subsampling, in 15-bit fixed point with a final clipping shift. So the
+      chroma is NOT the plain 2x2 box average the in-tree kernel assumes --
+      which is precisely why that kernel is "byte-different by design".
+
+      Porting that to a shader means reproducing the coefficient table, the
+      rgb24ToY fixed-point form, the bilinear chroma taps at 1:1->1:2, the
+      15-bit intermediate precision, and the final shift -- several interacting
+      stages where a near-miss is visually identical but not byte-identical.
+      That near-miss is the exact failure the current comment warns about, so
+      the route is a real choice and is now the open question:
+
+      - **(A) Byte-exact port of swscale's filtered path.** Exported bytes do
+        not move at all and every existing anchor keeps its meaning, `inf` stays
+        `inf`. Cost is the port above plus a bit-exact probe, and it is
+        genuinely fussy; a near-miss is invisible until bytes are compared.
+      - **(B) Adopt the GPU conversion as the new reference** and pin it with a
+        new gate holding it to a PSNR floor against swscale (>=55 dB say),
+        keeping swscale as the fallback. Far cheaper and provably a negligible
+        change -- but exported files DO change bytes at the colorspace step,
+        which lands in an already-encoded timeline, not in a private refactor.
+
+      (B) is the cheap win, (A) is the safe one. This needs an explicit call
+      because the difference is a change to shipped output rather than an
+      internal choice.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve
