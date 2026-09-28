@@ -651,6 +651,59 @@ throughput. See the note appended to S2.
       Remaining for S1b: GPU composite straight to canvas (removing the
       `kres_scratch` readback), GPU RGBA->NV12, and the direct NV12 hand-off to
       `hw_frames_ctx`.
+
+      **The byte-exact gate this step depends on now EXISTS and is green
+      (2026-09-27).** `yuv_exact.odin` is a CPU RGBA->NV12 ground truth that
+      matches swscale with ZERO mismatches at every even size tested
+      (8/16/32/64/96/128/160/256), and `yuv_exact` is a gate target in `all`.
+      That is the prerequisite the entry above named: once preview and export
+      share the conversion, `keyed_export`'s 1.0x `PSNR=inf` anchor goes blind
+      to it, so a direct byte-for-byte comparison has to carry that job instead.
+      It compares swscale against the same code the shader will be written
+      against, and it is proven to fail: a one-unit change to `YUV_REF_BU` turns
+      it red.
+
+      Getting there took four corrections, three of which were mine and none of
+      which were visible in the output until measured:
+
+      - **The dither table is not zeros.** `yuv2nv12cX_c` seeds its accumulator
+        with `chrDither[i&7] << 12`, and with dithering off that table is
+        `sws_pb_64` = {64,64,64,64,64,64,64,64}. "pb" is plus-bias. So there is
+        a standing +262144, which is exactly half a byte after the `>>19` --
+        the output is round-to-nearest on P, not a truncation. I had read it as
+        a zero table, which is the obvious assumption from the name AND from the
+        dithering path that really is zero. This was the entire half-byte.
+      - **The vertical filter is `[1,3,3,1]/8`, not `[2,7,7,2]/18`.** Measured,
+        not guessed: with `P` exact and `flat` at 0, the four taps were solvable
+        from a y-only ramp, and least squares kept returning ~(1015,3080,3077,1020)
+        -- asymmetric, which ruled out any symmetric kernel, and close to
+        (1024,3072,3072,1024) = `[1,3,3,1]/8`. The earlier impulse reading of
+        `[2,7,7,2]` was taken while three other stages were still wrong, and
+        0.111 and 0.125 round to the same byte at that contrast.
+      - **The chroma coefficients were mis-transcribed.** Computed the way the C
+        does they are RU=-4865 GU=-9528 BU=14392 RV=14392 GV=-12061 BV=-2332;
+        I had -4862/14393/-12059/-2329. Luma (8414/16519/3208) was right, which
+        is why luma was byte-exact from the start and masked the error.
+      - **NV12 chroma is byte-interleaved `U,V,U,V`, not two planes.** The
+        original probe read it as contiguous U then V, which produced a phantom
+        asymmetric "kernel" and sent the whole search after a bug in the arbiter.
+
+      The lesson worth keeping: every one of the four was found by a probe that
+      disagreed, not by reading the source. Two of them (the coefficient
+      transcription, the `[2,7,7,2]` reading) looked entirely plausible and
+      survived several rounds of measurement because the error was inside the
+      noise of a weak test -- a 3-unit coefficient error is invisible against
+      64-wide quantisation buckets, and 0.111 vs 0.125 differs by one output
+      LSB. Isolating ONE axis per run (`flat` collapses the vertical filter,
+      `vgrad` collapses the horizontal) is what made each error separable, and
+      that is why the probe kept all three modes.
+
+      Domain: even dimensions only, asserted. 4:2:0 has no odd chroma grid and
+      the target encoders reject odd sizes. For an odd dimension swscale
+      silently changes its horizontal chroma siting rather than erroring --
+      measured, 77-7830 mismatches -- so the reference asserts instead of
+      returning quietly wrong bytes. That is the one case here that is a stated
+      limit rather than a solved one.
 - [ ] S1c. GPU composite straight to canvas, then GPU RGBA->NV12 handed
       directly to `hw_frames_ctx`. S1b still round-trips each keyed resample
       through `kres_scratch` and a CPU `render_blit_region` because keyed and

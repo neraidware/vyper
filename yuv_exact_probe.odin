@@ -106,7 +106,7 @@ yuv_probe_dump :: proc(w, h: c.int) -> int {
 	defer delete(rgba)
 	yuv_probe_fill_rgba(rgba, 0x12345678)
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -150,7 +150,7 @@ yuv_probe_taps :: proc(w, h: c.int) -> int {
 	rgba := make([]u8, w * h * 4)
 	defer delete(rgba)
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -239,7 +239,7 @@ yuv_probe_warm :: proc(w, h: c.int, calls: int) -> int {
 		rgba[px + 2] = 0
 	}
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -283,7 +283,7 @@ yuv_probe_hrow :: proc(w, h: c.int) -> int {
 		}
 	}
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -317,7 +317,7 @@ yuv_probe_hrow :: proc(w, h: c.int) -> int {
 // when the real kernel is 2D, and the fit "succeeds" while describing
 // nothing. Rows must differ here or this comparison cannot fail when it
 // should.
-yuv_probe_verify :: proc(w, h: c.int, flat: bool) -> int {
+yuv_probe_verify :: proc(w, h: c.int, flat, vgrad: bool) -> int {
 	rgba := make([]u8, w * h * 4)
 	defer delete(rgba)
 	// Row-constant variant: with every luma row identical the vertical
@@ -331,15 +331,23 @@ yuv_probe_verify :: proc(w, h: c.int, flat: bool) -> int {
 			sy = 0
 		}
 		for x in 0 ..< w {
+			// vgrad holds x at zero so only the vertical axis moves. Kept as a
+			// probe axis: flat (x varies, y frozen) and vgrad (x frozen, y
+			// varies) between them localise a mismatch to the horizontal or the
+			// vertical stage, which the 2D run alone cannot.
+			px_x := x
+			if vgrad {
+				px_x = 0
+			}
 			i := (y * w + x) * 4
-			rgba[i + 0] = u8((x * 7 + sy * 29 + 3) & 255)
-			rgba[i + 1] = u8((x * 11 + sy * 53 + 71) & 255)
-			rgba[i + 2] = u8((x * 17 + sy * 97 + 149) & 255)
+			rgba[i + 0] = u8((px_x * 7 + sy * 29 + 3) & 255)
+			rgba[i + 1] = u8((px_x * 11 + sy * 53 + 71) & 255)
+			rgba[i + 2] = u8((px_x * 17 + sy * 97 + 149) & 255)
 			rgba[i + 3] = 255
 		}
 	}
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -351,11 +359,15 @@ yuv_probe_verify :: proc(w, h: c.int, flat: bool) -> int {
 	defer sws.freeContext(ctx)
 
 	uv_w := w / 2
-	ref := make([]u8, y_ls * h * 3 / 2)
+	ref := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(ref)
-	su := make([]i32, w * h / 2)
+	// One i32 per chroma sample per luma row: ceil(w/2) samples across all h
+	// rows. Sizing this w*h/2 under-allocates for odd w, and the overflow only
+	// shows up as a corrupt last row rather than an obvious failure.
+	scratch_n := ((w + 1) / 2) * h
+	su := make([]i32, scratch_n)
 	defer delete(su)
-	sv := make([]i32, w * h / 2)
+	sv := make([]i32, scratch_n)
 	defer delete(sv)
 	yuv_ref_rgba_to_nv12(rgba, int(w), int(h), int(y_ls), int(y_ls), ref, su, sv)
 
@@ -464,7 +476,7 @@ yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int, col: int, bgv: int) -> int {
 	rgba[off + 1] = imp[ci][1]
 	rgba[off + 2] = imp[ci][2]
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -533,7 +545,7 @@ yuv_probe_single :: proc(w, h: c.int, vertical: bool) -> int {
 		}
 	}
 	y_ls := yuv_probe_linesize(w)
-	buf := make([]u8, y_ls * h * 3 / 2)
+	buf := make([]u8, y_ls * (h + (h + 1) / 2))
 	defer delete(buf)
 	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
 	ls: [4]c.int = {y_ls, y_ls, 0, 0}
@@ -620,11 +632,14 @@ yuv_exact_probe_run :: proc() -> int {
 	if strings.has_prefix(mode, "dump") {
 		return yuv_probe_dump(n, n)
 	}
+	if strings.has_prefix(mode, "vgrad") {
+		return yuv_probe_verify(n, n, false, true)
+	}
 	if strings.has_prefix(mode, "flat") {
-		return yuv_probe_verify(n, n, true)
+		return yuv_probe_verify(n, n, true, false)
 	}
 	if strings.has_prefix(mode, "verify") {
-		return yuv_probe_verify(n, n, false)
+		return yuv_probe_verify(n, n, false, false)
 	}
 	fmt.println("yuv-exact: need VYPER_YUV_EXACT_PROBE=\"dump[:N]\"")
 	return 2

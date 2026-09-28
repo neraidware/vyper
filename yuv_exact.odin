@@ -38,12 +38,12 @@ YUV_REF_ONE         :: 1 << YUV_REF_SHIFT
 YUV_REF_RY :: 8414
 YUV_REF_GY :: 16519
 YUV_REF_BY :: 3208
-YUV_REF_RU :: -4862
+YUV_REF_RU :: -4865
 YUV_REF_GU :: -9528
-YUV_REF_BU :: 14393
-YUV_REF_RV :: 14393
-YUV_REF_GV :: -12059
-YUV_REF_BV :: -2329
+YUV_REF_BU :: 14392
+YUV_REF_RV :: 14392
+YUV_REF_GV :: -12061
+YUV_REF_BV :: -2332
 
 // Luma pedestal: 16<<SHIFT for limited range plus half an LSB, so the shift
 // rounds instead of truncating. Solved against swscale over 65,536 random
@@ -66,12 +66,12 @@ YUV_REF_CHROMA_H_TAPS :: 2
 // because that is what swscale's scaler does and the rounding is observable:
 // dividing the weighted sum by 18 disagreed with swscale on 1435 of 4096
 // chroma bytes, almost all of them off by one. round(w/18 << 14) gives
-// 910, 3186, 3186, 910 -- which sum to exactly 8192, so the kernel is
+// 1024, 3072, 3072, 1024 -- which sum to exactly 8192, so the kernel is
 // still unity gain and the >> below is the only scaling.
-YUV_REF_CHROMA_V_C0 :: 910
-YUV_REF_CHROMA_V_C1 :: 3186
-YUV_REF_CHROMA_V_C2 :: 3186
-YUV_REF_CHROMA_V_C3 :: 910
+YUV_REF_CHROMA_V_C0 :: 1024
+YUV_REF_CHROMA_V_C1 :: 3072
+YUV_REF_CHROMA_V_C2 :: 3072
+YUV_REF_CHROMA_V_C3 :: 1024
 YUV_REF_CHROMA_V_NORM :: 13
 
 // Rounding half-add for the input converter.
@@ -83,6 +83,15 @@ YUV_REF_CHROMA_H_BIAS :: 1 << (YUV_REF_SHIFT - 6)
 // off-by-two this file had first. Neutral lands at 8192 = 128<<6, which is
 // the check -- with >>7 the neutral would be 64.
 YUV_REF_CHROMA_OUT_SHIFT :: YUV_REF_CHROMA_V_NORM + 6
+
+// yuv2nv12cX_c seeds its accumulator with chrDither[i&7] << 12 before summing
+// the filter, and with dithering off that table is sws_pb_64 -- which is
+// {64,64,64,64,64,64,64,64}, NOT zeros. "pb" is plus-bias. So the seed is a
+// standing +262144, which lands as exactly half a byte after the >>19: the
+// output is round-to-nearest on P, not a truncation. Reading it as a zero table
+// (the obvious assumption from the name, and from the dithering path that really
+// is zero) cost a consistent half-byte on every chroma sample.
+YUV_REF_CHROMA_DITHER_BIAS :: 64 << 12
 
 yuv_ref_clip8 :: proc(v: i32) -> u8 {
 	if v < 0 {
@@ -123,7 +132,15 @@ yuv_ref_chroma_row :: proc(rgba: []u8, w: int, u_out, v_out: []i32) {
 
 // Full-frame RGBA -> NV12 into swscale's own memory layout: plane 0 is w*h
 // luma bytes at `y_stride`; the chroma plane follows at y_stride*h and holds
-// w/2 U bytes then w/2 V bytes per row, h/2 rows, at `uv_stride`.
+// interleaved U,V bytes (NV12 is byte-interleaved, not two planes), w/2
+// chroma samples per row at `uv_stride`, h/2 chroma rows.
+//
+// w and h must be EVEN. 4:2:0 has no odd chroma grid, and for an odd
+// dimension swscale silently changes its horizontal chroma siting instead of
+// erroring -- measured here, not assumed: this reference is 0 mismatches at
+// every even size and 77-7830 at every odd one. A reference that quietly
+// returns wrong bytes is worse than one that refuses, so the contract is
+// asserted rather than approximated.
 //
 // `scratch_u` / `scratch_v` are caller-owned h*i32 buffers, one per luma row.
 yuv_ref_rgba_to_nv12 :: proc(
@@ -133,6 +150,10 @@ yuv_ref_rgba_to_nv12 :: proc(
 	yuv: []u8,
 	scratch_u, scratch_v: []i32,
 ) {
+	// 4:2:0 has no odd chroma grid, and the encoders this path targets
+	// (H.264/HEVC/AV1) reject odd dimensions anyway. See the note above.
+	assert(w % 2 == 0, "yuv_ref: width must be even for 4:2:0")
+	assert(h % 2 == 0, "yuv_ref: height must be even for 4:2:0")
 	uv_w := w / YUV_REF_CHROMA_H_TAPS
 	for y in 0 ..< h {
 		row := rgba[y * w * 4:]
@@ -169,8 +190,8 @@ yuv_ref_rgba_to_nv12 :: proc(
 				YUV_REF_CHROMA_V_C2 * a2[c] + YUV_REF_CHROMA_V_C3 * a3[c]
 			v := YUV_REF_CHROMA_V_C0 * b0[c] + YUV_REF_CHROMA_V_C1 * b1[c] +
 				YUV_REF_CHROMA_V_C2 * b2[c] + YUV_REF_CHROMA_V_C3 * b3[c]
-			dst[c * 2 + 0] = yuv_ref_clip8(u >> YUV_REF_CHROMA_OUT_SHIFT)
-			dst[c * 2 + 1] = yuv_ref_clip8(v >> YUV_REF_CHROMA_OUT_SHIFT)
+			dst[c * 2 + 0] = yuv_ref_clip8((u + YUV_REF_CHROMA_DITHER_BIAS) >> YUV_REF_CHROMA_OUT_SHIFT)
+			dst[c * 2 + 1] = yuv_ref_clip8((v + YUV_REF_CHROMA_DITHER_BIAS) >> YUV_REF_CHROMA_OUT_SHIFT)
 		}
 	}
 }

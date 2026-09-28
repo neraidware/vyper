@@ -365,6 +365,50 @@ target_timeline_probe() {
 	VYPER_TL_PROBE=1 timeout 120 ./vyper
 }
 
+# The byte-exact RGBA->NV12 ground truth (yuv_exact.odin) against swscale.
+#
+# This is the gate S1c's GPU shader cannot exist without. keyed_export's 1.0x
+# anchor goes PSNR=inf the moment preview and export share the conversion, so
+# from that point it stops being able to see a wrong conversion at all. Here the
+# comparison is direct -- reference vs swscale, byte for byte, zero tolerance --
+# and it runs the same code the shader will be written against.
+#
+# Even dimensions only, which is the whole domain: 4:2:0 has no odd chroma grid
+# and the target encoders reject odd sizes. The reference asserts that rather
+# than approximating, so an odd size is a loud failure, not a quiet one.
+target_yuv_exact() {
+	require_fresh_binary yuv-exact || return 1
+	local n out
+	for n in 8 16 32 64 96 128 160 256; do
+		out=$(VYPER_YUV_EXACT_PROBE="verify:$n" timeout 300 ./vyper 2>&1) || {
+			echo "yuv-exact: probe failed at $n" >&2
+			echo "$out" | tail -5 >&2
+			return 1
+		}
+		echo "$out" | grep -q 'mismatches = 0' || {
+			echo "yuv-exact: $n -> $out" >&2
+			return 1
+		}
+		echo "yuv-exact: $n ok"
+	done
+	# flat and vgrad are the two one-axis variants. Requiring them keeps the
+	# failure message honest: if only these break, the fault is the horizontal
+	# or vertical stage, not the full-frame path.
+	for n in 64; do
+		for mode in flat vgrad; do
+			out=$(VYPER_YUV_EXACT_PROBE="$mode:$n" timeout 300 ./vyper 2>&1) || {
+				echo "yuv-exact: $mode:$n probe failed" >&2
+				return 1
+			}
+			echo "$out" | grep -q 'mismatches = 0' || {
+				echo "yuv-exact: $mode:$n -> $out" >&2
+				return 1
+			}
+			echo "yuv-exact: $mode:$n ok"
+		done
+	done
+}
+
 # The app must still be running when the timeout kills it; 124 is the pass.
 target_smoke() {
 	require_fresh_binary smoke || return 1
@@ -455,7 +499,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe timeline_probe gpu_probe keyed_export zorder subtitle_probe smoke valgrind render_valgrind; do
+	for t in check build probe transform_probe timeline_probe yuv_exact gpu_probe keyed_export zorder subtitle_probe smoke valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -470,6 +514,7 @@ main() {
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
 	timeline_probe) target_timeline_probe ;;
+	yuv_exact) target_yuv_exact ;;
 	gpu_probe) target_gpu_probe ;;
 	keyed_export) target_keyed_ab ;;
 	zorder) target_zorder ;;
@@ -479,7 +524,7 @@ main() {
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|timeline_probe|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|timeline_probe|yuv_exact|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac
