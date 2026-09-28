@@ -562,25 +562,16 @@ update_preview_slots :: proc() -> bool {
 				if base_changed {
 					// Re-measure / re-derive the base dims at font 48 on rename.
 					need_base := base_bw * base_bh * 4
-					if need_base > len(slot.text_base_buf) {
-						delete(slot.text_base_buf)
-						slot.text_base_buf = make([]u8, need_base)
-					}
-					if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
-						delete(slot.text_scratch)
-						slot.text_scratch = make(
-							[]u8,
-							text_scratch_size_for(TEXT_CLIP_FONT_PIXELS),
-						)
-					}
+					base_buf := text_buf_ensure(&slot.text_base_buf, need_base)
+					scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
 					_, _, bw0, _ := rasterize_title_into_buffer(
 						clip.name,
-						slot.text_base_buf,
+						base_buf,
 						base_bw,
 						base_bh,
 						&text_clip_state.font,
 						&text_clip_state.font_init,
-						slot.text_scratch,
+						scratch,
 						TEXT_CLIP_FONT_PIXELS,
 					)
 					// Legacy clips (pre-metric model) carry a galley-height
@@ -603,11 +594,7 @@ update_preview_slots :: proc() -> bool {
 				if base_changed || stale_box || slot.text_font_px != font_px {
 					// Re-render at the baked font (48*scale) for the texture.
 					slot.text_font_px = font_px
-					need_sc := text_scratch_size_for(font_px)
-					if need_sc > len(slot.text_scratch) {
-						delete(slot.text_scratch)
-						slot.text_scratch = make([]u8, need_sc)
-					}
+					scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(font_px))
 					bw, bh := text_buf_size_for(
 						clip.name,
 						&text_clip_state.font,
@@ -615,18 +602,15 @@ update_preview_slots :: proc() -> bool {
 						font_px,
 					)
 					need := bw * bh * 4
-					if need > len(slot.text_buf) {
-						delete(slot.text_buf)
-						slot.text_buf = make([]u8, need)
-					}
+					tex_buf := text_buf_ensure(&slot.text_buf, need)
 					ink_x, _, ink_bw, _ := rasterize_title_into_buffer(
 						clip.name,
-						slot.text_buf,
+						tex_buf,
 						bw,
 						bh,
 						&text_clip_state.font,
 						&text_clip_state.font_init,
-						slot.text_scratch,
+						scratch,
 						font_px,
 					)
 					// Sample the tight ink horizontally (the width estimate is
@@ -1002,24 +986,16 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			TEXT_CLIP_FONT_PIXELS,
 		)
 		need_base := base_bw * base_bh * 4
-		if need_base > len(slot.text_base_buf) {
-			delete(slot.text_base_buf)
-			slot.text_base_buf = {} // NOTE: delete leaves a stale non-zero len; a later
-			slot.text_base_buf = make([]u8, need_base) // grow-check must not see it
-		}
-		if len(slot.text_scratch) < text_scratch_size_for(TEXT_CLIP_FONT_PIXELS) {
-			delete(slot.text_scratch)
-			slot.text_scratch = {} // NOTE: same stale-len hazard
-			slot.text_scratch = make([]u8, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
-		}
+		base_buf := text_buf_ensure(&slot.text_base_buf, need_base)
+		scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
 		_, _, ink_w, ink_h := rasterize_lines_into_buffer(
 			lines,
-			slot.text_base_buf,
+			base_buf,
 			base_bw,
 			base_bh,
 			&text_clip_state.font,
 			&text_clip_state.font_init,
-			slot.text_scratch,
+			scratch,
 			TEXT_CLIP_FONT_PIXELS,
 			context.temp_allocator,
 		)
@@ -1063,27 +1039,21 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 
 		// Re-render at the baked font (48*scale) for the texture.
 		slot.text_font_px = font_px
-		need_sc := text_scratch_size_for(font_px)
-		if need_sc > len(slot.text_scratch) {
-			delete(slot.text_scratch)
-			slot.text_scratch = {} // stale-len hazard (above)
-			slot.text_scratch = make([]u8, need_sc)
-		}
+		// The BAKED font's scratch and texture, distinct from the base
+		// measurement ones above: the same two buffers, asked for a bigger size
+		// (48*scale, not 48). Grow-only, so this supersedes rather than conflicts
+		// with the earlier ensure.
+		baked_scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(font_px))
 		bw, bh := text_buf_size_for_lines(lines, &text_clip_state.font, &text_clip_state.font_init, font_px)
-		need := bw * bh * 4
-		if need > len(slot.text_buf) {
-			delete(slot.text_buf)
-			slot.text_buf = {} // stale-len hazard (above)
-			slot.text_buf = make([]u8, need)
-		}
+		baked_buf := text_buf_ensure(&slot.text_buf, bw * bh * 4)
 		ink_x, _, ink_bw, _ := rasterize_lines_into_buffer(
 			lines,
-			slot.text_buf,
+			baked_buf,
 			bw,
 			bh,
 			&text_clip_state.font,
 			&text_clip_state.font_init,
-			slot.text_scratch,
+			baked_scratch,
 			font_px,
 			context.temp_allocator,
 		)

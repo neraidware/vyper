@@ -101,6 +101,35 @@ text_scratch_size_for :: proc(font_px: f32) -> int {
 	return fp * fp + 4096
 }
 
+// text_buf_ensure returns `*buf` grown to at least `need` bytes, reusing whatever
+// is already allocated, and returns it ready to use.
+//
+// Grow-only, never shrink. This is the hot path for every text clip and every
+// subtitle cue, so reallocating per call is exactly the per-frame allocation the
+// ownership rules forbid. It is ALSO what makes the four raster sites
+// interchangeable: the export worker and each preview slot each keep their own
+// buffer (the UI thread and the worker must not share one -- that would be a
+// data race), so the BUFFER differs per owner while the POLICY is identical.
+// Copy-pasted, it was four length checks that each recomputed the size twice and
+// could drift apart.
+//
+// The `delete` below is immediately followed by the assignment, and that
+// ordering is load-bearing rather than incidental. Odin's `delete` is a free,
+// not a destructor: the runtime's delete_slice only calls mem_free_with_size and
+// leaves the slice HEADER ALONE, so afterwards `buf^` still carries the old
+// length and a dangling pointer. Any read of `len(buf^)` in that window sees
+// stale data and would skip a needed grow. Zeroing first (the `= {}` some of
+// these sites used to do) papers over the window instead of closing it, which is
+// why it is not here: the check happens BEFORE the delete and the return reads
+// the freshly assigned header, so there is no window at all.
+text_buf_ensure :: proc(buf: ^[]u8, need: int) -> []u8 {
+	if len(buf^) < need {
+		delete(buf^)
+		buf^ = make([]u8, need)
+	}
+	return buf^
+}
+
 // text_buf_size_for estimates a tight RGBA buffer (bw x bh) large enough to
 // hold a title rasterized at the given glyph pixel height without clipping.
 // Width is a generous advance estimate (1.2*font_px per codepoint); height is

@@ -1341,6 +1341,39 @@ implementation, two destination sizes passed in as a parameter — which is what
 "shared" is supposed to look like. There was no second sizing implementation to
 remove; the duplication was export-INTERNAL, which is what B3 fixed.
 
+**Step B4 — DONE: the text buffers' grow policy, which was copy-pasted six
+times.** The raster core was already shared (`rasterize_title_into_buffer` /
+`rasterize_lines_into_buffer`), so what remained was the BUFFER POLICY around
+it: "if this byte slice is smaller than N, free it and make a bigger one". That
+grow-only check appeared six times -- twice in the export worker, four times in
+the preview slot (the title base re-measure, the title bake, the subtitle base
+measure, the subtitle bake) -- each spelling it out again and each recomputing
+the size TWICE, once in the comparison and once in the `make`.
+
+Two of the six carried a comment worth keeping: `slot.text_base_buf = {} //
+NOTE: delete leaves a stale non-zero len; a later grow-check must not see it`.
+That is CORRECT, and checking it against the runtime was worth doing
+(AGENTS.md 11): Odin's `delete_slice` only calls `mem_free_with_size` and
+leaves the slice HEADER alone, so afterwards the slice still reports the old
+length and a dangling pointer. It is a real gotcha, and the zeroing was
+treating the symptom.
+
+`text_buf_ensure` is now the one policy, and the stale-header hazard is
+documented where it is now handled rather than at each site: the check happens
+BEFORE the delete and the return reads the freshly assigned header, so there is
+no window for a stale length to be seen and the `= {}` is unnecessary. The
+buffer still differs per owner (the worker's `setup_scratch` vs each preview
+slot's own `text_scratch` -- the UI thread and the worker must not share one, it
+would be a data race) while the policy is shared, which is the actual shape of
+the duplication: same code, different owner, not something a blanket "share the
+buffer" refactor could have collapsed.
+
+Renaming the locals at the two subtitle sites (`baked_scratch` / `baked_buf`
+versus the base-measurement pair) is not cosmetic: the same two buffers are
+asked for two different sizes in one scope, base font and 48*scale, and the
+shadowing that produced was the compiler correctly reporting that they are
+different things.
+
 **Step C — DONE: one ordered visual list for export, fixing bug 2.** Video and
 text were snapshotted into two parallel arrays and composited in two separate
 passes -- "all video, then all text" -- so export drew every text clip above

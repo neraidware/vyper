@@ -780,10 +780,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 	font_px := f32(TEXT_CLIP_FONT_PIXELS) * t.scale
 	bw, bh := text_buf_size_for(t.name, &render_text_font.font, &render_text_font.init, font_px)
 	buf := make([]u8, bw * bh * 4)
-	if len(render_text_font.setup_scratch) < text_scratch_size_for(font_px) {
-		delete(render_text_font.setup_scratch)
-		render_text_font.setup_scratch = make([]u8, text_scratch_size_for(font_px))
-	}
+	scratch := text_buf_ensure(&render_text_font.setup_scratch, text_scratch_size_for(font_px))
 	ox, oy, ow, oh := rasterize_title_into_buffer(
 		t.name,
 		buf,
@@ -791,7 +788,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 		bh,
 		&render_text_font.font,
 		&render_text_font.init,
-		render_text_font.setup_scratch,
+		scratch,
 		font_px,
 	)
 	if ow <= 0 || oh <= 0 {
@@ -853,10 +850,7 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		return
 	}
 	buf := make([]u8, bw * bh * 4)
-	if len(render_text_font.setup_scratch) < text_scratch_size_for(font_px) {
-		delete(render_text_font.setup_scratch)
-		render_text_font.setup_scratch = make([]u8, text_scratch_size_for(font_px))
-	}
+	scratch := text_buf_ensure(&render_text_font.setup_scratch, text_scratch_size_for(font_px))
 	ox, oy, ow, oh := rasterize_lines_into_buffer(
 		lines,
 		buf,
@@ -864,7 +858,7 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		bh,
 		&render_text_font.font,
 		&render_text_font.init,
-		render_text_font.setup_scratch,
+		scratch,
 		font_px,
 		context.allocator,
 	)
