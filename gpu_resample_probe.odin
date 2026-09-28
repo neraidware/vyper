@@ -654,39 +654,64 @@ GPU_Probe_Case :: struct {
 			gpu_resample_teardown(&p)
 			continue
 		}
-		// THE CPU COLUMN IS NOT TRUSTWORTHY AS A TIMING. It reads ~10x higher
-		// than the exporter measures the SAME call on the SAME geometry
-		// (1920x1080->960x540, full stage): 11-16 ms here against 1.3-1.5 ms/f
-		// from VYPER_FRAME_TIME in the real export. Ruled out by measurement:
-		// the thread it runs on (a spawned worker thread reads the same),
-		// warm-up (a second immediate pass agrees within 1%), and loop order
-		// (timing the CPU loop first changes nothing). The kernel is
-		// data-independent, so the fixture content cannot explain it either.
-		// The mechanism is unresolved, so the ratio column below must not be
-		// used to decide anything -- the in-app counters are the trustworthy
-		// numbers. What this probe IS good for is the correctness columns,
-		// mean/peak against the CPU kernel, which is what the gate asserts.
-		t1 := time.tick_now()
-		for _ in 0 ..< ITERS {
+		// Per-iteration, not just the mean. rgba_resample has three branches
+		// whose costs differ by more than an order of magnitude -- 1:1 is a
+		// memcpy, a downscale is a box average, an upscale is bilinear -- and
+		// the mean over ITERS hides that. The exporter had to be taught the
+		// same lesson: it reports the same per-geometry split under
+		// VYPER_FRAME_TIME, because pooling them there produced a "1.4 ms/call"
+		// that was really 89 memcpys and one 15 ms downscale averaged together.
+		per_iter: [ITERS]f64
+		total_d: time.Duration
+		for it in 0 ..< ITERS {
+			ta := time.tick_now()
 			yuv.rgba_resample(
 				raw_data(case_src), c.src_w * 4, 0, 0, c.src_w, c.src_h,
 				raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
 			)
+			per_iter[it] = f64(time.tick_since(ta)) / 1e6
+			total_d += time.tick_since(ta)
 		}
-		cpu_ms := f64(time.tick_since(t1)) / 1e6 / f64(ITERS)
+		cpu_ms := f64(total_d) / 1e6 / f64(ITERS)
+		cpu_ms_last := per_iter[ITERS - 1]
 
-		// Time the SAME loop again immediately. If the second pass is much
-		// faster this is a warm-up effect and the first number is measuring
-		// page faults and cache fill, not the kernel. If both passes agree,
-		// the probe's call really is slower than the exporter's, and the
-		// difference is in the arguments, not the measurement.
-		t2 := time.tick_now()
-		for _ in 0 ..< ITERS {
-			yuv.rgba_resample(
-				raw_data(case_src), c.src_w * 4, 0, 0, c.src_w, c.src_h,
-				raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
-			)
+		// Same call, routed through the EXPORTER's call site. Both are in this
+		// binary, so if this is fast where the direct call above is slow, the
+		// difference is the call site (inlining/specialization), not the
+		// process, the buffers, or the kernel.
+		wr := resample_once_ms(
+			raw_data(case_src), c.src_w * 4, 0, 0, c.src_w, c.src_h,
+			raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
+		)
+		wr2 := resample_once_ms(
+			raw_data(case_src), c.src_w * 4, 0, 0, c.src_w, c.src_h,
+			raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
+		)
+		fmt.println("gpu-probe: via exporter call site:", wr, "ms then", wr2, "ms")
+		fmt.print("gpu-probe: per-iter ms:")
+		for it in 0 ..< ITERS {
+			fmt.printf(" %.2f", per_iter[it])
 		}
+		fmt.println()
+
+		// Same three-way baseline the exporter runs over the same geometry:
+		// raw byte scan, an inline 2x2 box of the same arithmetic, and the
+		// library call. If the scan and the inline box are ALSO ~10x slower
+		// here, this process's memory is slow and the library call is
+		// innocent. If they are normal and only the library call is slow, the
+		// cost is in that call, not in reaching the bytes.
+		base := resample_baseline(raw_data(case_src), c.src_w, c.src_h, raw_data(want), 4)
+		fmt.println(
+			"gpu-probe: baseline scan=",
+			f64(base.scan_ns) / 1e6,
+			"ms inline-box=",
+			f64(base.box_ns) / 1e6,
+			"ms library=",
+			cpu_ms,
+			"ms  (scan/inline=",
+			f64(base.scan_ns) / f64(max(base.box_ns, 1)),
+			"x)",
+		)
 
 
 		t0 := time.tick_now()

@@ -897,24 +897,62 @@ throughput. See the note appended to S2.
       its correctness columns (mean/peak vs the CPU kernel) are unaffected and
       are what the gate actually asserts.
 
-      **The consequence is a shipped regression, not just a bad number.** With
-      both sides measured in-app and in the shipping configuration:
+      **RESOLVED 2026-09-27, and the conclusion above was WRONG. There is no
+      shipped regression; the probe was right and my measurement was the broken
+      side.** Chasing the "10x" led to the actual defect, which was in how I was
+      reading the number rather than in either code path.
 
-      | keyed resample, 1920x1080 -> 960x540 | in-app cost |
-      |---|---|
-      | CPU kernel (`VYPER_KEYED_GPU=0`) | 1.45 ms/call, 90 calls |
-      | GPU round trip (`VYPER_KEYED_GPU=1`) | 3.06 ms/call |
+      `rgba_resample` has three branches whose costs differ by more than an
+      order of magnitude: 1:1 is `rgba_copy_rows` (a memcpy), a downscale is
+      `rgba_box_downscale`, an upscale is bilinear. A keyed scale animation
+      produces all of them across one run, and **I averaged them together.** On
+      the keyed_export fixture at 0.5x, 89 of 90 frames are 1:1 and exactly ONE
+      is a real downscale:
 
-      The GPU path costs ~1.6 ms/f MORE on this fixture, of which ~0.94 ms/f is
-      transfer the CPU path never pays. So the default `keyed_gpu_enabled = true`
-      is very likely a pessimization at this geometry, and the justification
-      recorded for it (the probe's 8-10x) does not survive. Follow-up, in
-      order: (1) find what makes the probe's CPU loop 10x slow, because the
-      answer may make the kernel itself 10x faster, which would be a much larger
-      win than either S1c item; (2) A/B the default across the fixture set
-      before flipping it, since the CPU kernel's 50x pathological case is real
-      and a per-geometry rule may be the honest answer; (3) only then revisit
-      the canvas/YUV ordering, which this changes but does not invalidate.
+      | per geometry, in-app | CPU kernel | GPU round trip | |
+      |---|---|---|---|
+      | 1:1 (89 of 90 frames) | **1.21 ms** | 2.51 ms | GPU 2.1x slower |
+      | downscale 1920x1080->960x540 (1 frame) | 15.34 ms | **5.71 ms** | GPU 2.7x faster |
+
+      So the pooled "CPU 1.39 ms/call vs GPU 3.06 ms/call" that made the GPU path
+      look like a pessimization was `(89 x 1.21 + 1 x 15.34) / 90` on one side
+      and a full round trip on every frame on the other. The probe's 10.5 ms for
+      a downscale and the exporter's 15.34 ms for one agree once you account for
+      the 1.44x pixel difference. **The probe's ratio column was correct the
+      whole time** and the annotation saying otherwise has been reverted.
+
+      The real defect this exposed is one of REPORTING, and it had been hiding a
+      genuine inefficiency: **the GPU path was running its full 8 MB upload +
+      pass + 8 MB download on the 89 frames that needed no resample at all**,
+      paying 2.51 ms to produce what a straight copy produces in 1.21 ms. Fixed
+      by short-circuiting 1:1 before either resampler, straight to the existing
+      fixed-scale blit (one copy from the decoded stage to the canvas, instead
+      of copy-to-`kres_scratch` then copy-from-it). Measured on the same
+      fixture, composite per frame:
+
+      | composite | before | after |
+      |---|---|---|
+      | GPU arm (default) | 5.50 ms/f | **2.26 ms/f** |
+      | CPU arm (`VYPER_KEYED_GPU=0`) | 2.66 ms/f walk | 2.90 ms/f walk |
+
+      `keyed_export` is byte-identical across the change (1.0x `inf`, 0.5x
+      58.707992), as it must be: the 1:1 GPU resample was already gated exact
+      (gpu_probe 1600x900->1600x900 mean=0.00 peak=0) and `rgba_resample` takes
+      its copy branch when dst == src, so this removes a resample, not a
+      resample plus a conversion.
+
+      **The 0.24 ms/f regression on the CPU arm is real and recorded rather than
+      waved off.** It is a cache effect, not extra work: the old path wrote
+      `kres_scratch` and then read it back hot, while the direct blit reads the
+      decoder's stage cold on another core. Kept anyway, because the default GPU
+      arm gains 3.24 ms/f from the same change and the fallback only runs when
+      the GPU path is unavailable or explicitly pinned -- but if the CPU arm
+      ever becomes the default, re-measure this before assuming the one-copy
+      version still wins.
+
+      Lesson worth keeping, because it is the same mistake twice: **a mean over
+      mixed geometries describes no frame that was ever rendered.** Both the
+      probe and the exporter now report per-geometry counts alongside the mean.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve

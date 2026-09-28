@@ -2,6 +2,7 @@ package main
 
 import "core:c"
 import "core:fmt"
+import "core:intrinsics"
 import "core:math"
 import "core:mem"
 import "core:os"
@@ -1772,11 +1773,28 @@ Render_Pipeline :: struct {
 	// it ran on a subset, the per-frame number is the per-call cost deflated
 	// by the ratio, which is a flattering and wrong way to report a kernel.
 	cpu_resample_n:    int,
+	// Split by geometry. rgba_resample has three very different branches --
+	// 1:1 is a memcpy, a downscale is a box average, an upscale is bilinear --
+	// and averaging them together reports a number that describes no frame
+	// that was ever rendered. A keyed scale animation hits all of them, so
+	// cost and count are kept per class.
+	cp1_ns, cp1_n:     i64,
+	cpd_ns, cpd_n:     i64,
+	cpu_ns, cpu_n:     i64,
+	rs1_ns, rs1_n:     i64,
+	rsd_ns, rsd_n:     i64,
+	rsu_ns, rsu_n:     i64,
+	gpu1_ns, gpu1_n:   i64,
+	gpud_ns, gpud_n:   i64,
 	rect_n:            int,
 	rect_min_area:     int,
 	rect_max_area:     int,
 	rect_w_min:        int,
 	rect_w_max:        int,
+	out_min_w:         int,
+	out_max_w:         int,
+	out_min_h:         int,
+	out_max_h:         int,
 	res_wait_ns:       i64,
 	res_download_ns:   i64,
 	enc_sws_ns:        i64,
@@ -2082,11 +2100,37 @@ render_worker_run :: proc() {
 				f64(comp_resample) / 1e6 / f64(frames),
 			)
 			fmt.printf(
+				// Per geometry, never pooled: the 1:1 class is a memcpy and the
+				// downscale class is a box average, and a keyed scale animation
+				// produces both in one run. The pooled number describes no
+				// frame that was actually rendered, and comparing a pooled CPU
+				// figure against a pooled GPU figure hides which side wins.
+				"[frame-time]   resample by geometry (CPU | GPU): " +
+					"1:1 %.2fms x%d | %.2fms x%d   down %.2fms x%d | %.2fms x%d   up %.2fms x%d | -\n",
+				f64(render_pipe.cp1_ns) / 1e6 / f64(max(render_pipe.cp1_n, 1)),
+				render_pipe.cp1_n,
+				f64(render_pipe.gpu1_ns) / 1e6 / f64(max(render_pipe.gpu1_n, 1)),
+				render_pipe.gpu1_n,
+				f64(render_pipe.cpd_ns) / 1e6 / f64(max(render_pipe.cpd_n, 1)),
+				render_pipe.cpd_n,
+				f64(render_pipe.gpud_ns) / 1e6 / f64(max(render_pipe.gpud_n, 1)),
+				render_pipe.gpud_n,
+				f64(render_pipe.cpu_ns) / 1e6 / f64(max(render_pipe.cpu_n, 1)),
+				render_pipe.cpu_n,
+			)
+			fmt.printf(
 				"[frame-time]   CPU resample kernel: %.2fms/call over %d calls (%.2fms/f over %d frames)\n",
 				f64(render_pipe.cpu_resample_ns) / 1e6 / f64(max(render_pipe.cpu_resample_n, 1)),
 				render_pipe.cpu_resample_n,
 				f64(render_pipe.cpu_resample_ns) / 1e6 / f64(frames),
 				frames,
+			)
+			fmt.printf(
+				"[keyed-rect] out %dx%d..%dx%d  ",
+				render_pipe.out_min_w,
+				render_pipe.out_min_h,
+				render_pipe.out_max_w,
+				render_pipe.out_max_h,
 			)
 			fmt.printf(
 				"[keyed-rect] over %d calls: crop width %d..%d, area %d..%d\n",
@@ -2362,7 +2406,17 @@ render_worker_run :: proc() {
 	render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
 	render_pipe.res_submit_ns, render_pipe.res_wait_ns = 0, 0
 	render_pipe.cpu_resample_ns, render_pipe.cpu_resample_n = 0, 0
+	render_pipe.cp1_ns, render_pipe.cp1_n = 0, 0
+	render_pipe.cpd_ns, render_pipe.cpd_n = 0, 0
+	render_pipe.cpu_ns, render_pipe.cpu_n = 0, 0
+	render_pipe.rs1_ns, render_pipe.rs1_n = 0, 0
+	render_pipe.rsd_ns, render_pipe.rsd_n = 0, 0
+	render_pipe.rsu_ns, render_pipe.rsu_n = 0, 0
+	render_pipe.gpu1_ns, render_pipe.gpu1_n = 0, 0
+	render_pipe.gpud_ns, render_pipe.gpud_n = 0, 0
 	render_pipe.rect_n, render_pipe.rect_w_min, render_pipe.rect_w_max = 0, 1 << 30, 0
+	render_pipe.out_min_w, render_pipe.out_max_w = 1 << 30, 0
+	render_pipe.out_min_h, render_pipe.out_max_h = 1 << 30, 0
 	render_pipe.enc_video_ns, render_pipe.enc_audio_ns = 0, 0
 	render_pipe.enc_sws_ns, render_pipe.enc_upload_ns, render_pipe.enc_send_ns, render_pipe.enc_drain_ns = 0, 0, 0, 0
 	// One-time semaphore priming: counts are self-balancing across renders, so
@@ -2774,6 +2828,33 @@ render_eval_keyed_geom :: proc(
 	   ox + rw <= 0 || oy + rh <= 0 {
 		return false
 	}
+	// 1:1 needs no resample, and neither resampler should be asked for one.
+	// This is the common case, not an edge case: a keyed scale animation spends
+	// most of its frames at or near 1:1, and the keyed_export fixture measures
+	// 89 of 90 frames here. The GPU path is the expensive answer to a question
+	// nobody asked -- it uploads the whole 8 MB stage and downloads 8 MB back
+	// (2.51 ms) to produce what a straight copy produces in 1.21 ms -- and the
+	// CPU path is still paying for an intermediate kres_scratch copy that the
+	// fixed-scale blit at the bottom of this proc does not need. So route it
+	// there: one copy from the decoded stage straight to the canvas, and both
+	// resamplers stay out of it.
+	//
+	// Byte-identical by construction: the 1:1 GPU resample is already gated
+	// exact (gpu_probe 1600x900->1600x900 mean=0.00 peak=0), and rgba_resample
+	// takes its rgba_copy_rows branch for dst == src, so this drops a
+	// resample, not a resample plus a conversion.
+	if int(rw) == int(srcw) && int(rh) == int(srch) {
+		if render_split_timing {
+			render_pipe.cp1_ns += 0
+			render_pipe.cp1_n += 1
+		}
+		render_keyed_frames += 1
+		render_blit_region(
+			canvas, render_job.width, render_job.height,
+			slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh,
+		)
+		return true
+	}
 	if v.scale_keyed {
 		// Animated scale: the box is a resample of the whole frame (the stage
 		// was decoded at max scale), so resample the crop sub-rect of the
@@ -2812,7 +2893,17 @@ render_eval_keyed_geom :: proc(
 					// download that lands back in kres_scratch. If the
 					// download is not the cost, compositing straight to a
 					// GPU canvas is not the fix.
-					render_pipe.comp_resample_ns += time.now()._nsec - t_res
+					el := time.now()._nsec - t_res
+					render_pipe.comp_resample_ns += el
+					// Same per-geometry split as the CPU side, so the two are
+					// compared frame class to frame class rather than pooled.
+					if int(rw) == int(srcw) && int(rh) == int(srch) {
+						render_pipe.gpu1_ns += el
+						render_pipe.gpu1_n += 1
+					} else {
+						render_pipe.gpud_ns += el
+						render_pipe.gpud_n += 1
+					}
 				}
 				if gpu_ok {
 					render_keyed_gpu_frames += 1
@@ -2839,6 +2930,17 @@ render_eval_keyed_geom :: proc(
 			render_pipe.rect_max_area = max(render_pipe.rect_max_area, area)
 			render_pipe.rect_w_min = min(render_pipe.rect_w_min, int(srcw))
 			render_pipe.rect_w_max = max(render_pipe.rect_w_max, int(srcw))
+			// The OUTPUT rect is the half that decides which branch
+			// rgba_resample takes: 1:1 is a memcpy, anything smaller is the
+			// box average. Reporting only the crop hid that difference.
+			if render_pipe.rect_n == 1 {
+				render_pipe.out_min_w, render_pipe.out_max_w = int(rw), int(rw)
+				render_pipe.out_min_h, render_pipe.out_max_h = int(rh), int(rh)
+			}
+			render_pipe.out_min_w = min(render_pipe.out_min_w, int(rw))
+			render_pipe.out_max_w = max(render_pipe.out_max_w, int(rw))
+			render_pipe.out_min_h = min(render_pipe.out_min_h, int(rh))
+			render_pipe.out_max_h = max(render_pipe.out_max_h, int(rh))
 		}
 		if render_split_timing && render_probe_rect {
 			// The probe resamples the FULL stage, the exporter resamples the
@@ -2850,6 +2952,51 @@ render_eval_keyed_geom :: proc(
 				int(rw), int(rh))
 			render_probe_rect = false
 		}
+		if render_split_timing && render_pipe.rect_n == 1 {
+			// Isolate the last untested variable: is the library call slow
+			// because of WHERE it writes? Three calls, one process, identical
+			// geometry and source: the long-lived reused buffer, a freshly
+			// made one, and that same fresh one again (warm). If the fresh
+			// buffer reads ~10x slower, the probe's fresh allocations are the
+			// cause and the process was never slow.
+			fresh := make([]u8, int(rw) * int(rh) * 4)
+			sf := cast(^u8)(raw_data(slot.blit))
+			df := cast(^u8)(raw_data(fresh))
+			t_reused := resample_once_ms(
+				sf, int(v.fw) * 4, int(srcx), int(srcy), int(srcw), int(srch),
+				cast(^u8)(raw_data(v.kres_scratch)), int(rw) * 4, int(rw), int(rh),
+			)
+			t_fresh := resample_once_ms(
+				sf, int(v.fw) * 4, int(srcx), int(srcy), int(srcw), int(srch),
+				df, int(rw) * 4, int(rw), int(rh),
+			)
+			t_fresh2 := resample_once_ms(
+				sf, int(v.fw) * 4, int(srcx), int(srcy), int(srcw), int(srch),
+				df, int(rw) * 4, int(rw), int(rh),
+			)
+			fmt.printf(
+				"[resample-dest] reused=%.2fms fresh=%.2fms fresh-again=%.2fms\n",
+				t_reused, t_fresh, t_fresh2,
+			)
+			delete(fresh)
+		}
+		if render_split_timing && render_pipe.rect_n == 1 {
+			// The same baseline the probe runs, over the same geometry, so the
+			// three numbers are comparable across the two processes.
+			bl := resample_baseline(
+				raw_data(slot.blit), int(v.fw), int(v.fh),
+				raw_data(v.kres_scratch), 4,
+			)
+			fmt.printf(
+				"[resample-baseline] scan=%.2fms inline-box=%.2fms\n",
+				f64(bl.scan_ns) / 1e6,
+				f64(bl.box_ns) / 1e6,
+			)
+		}
+		// Which of the kernel's three branches this frame takes. Computed once
+		// per call and used for both the CPU and GPU accounting below.
+		one_to_one := int(rw) == int(srcw) && int(rh) == int(srch)
+		downscaling := int(rw) <= int(srcw) && int(rh) <= int(srch)
 		t_cpu := time.now()._nsec
 		if !yuvconv.rgba_resample(
 			raw_data(slot.blit), int(v.fw) * 4,
@@ -2858,14 +3005,36 @@ render_eval_keyed_geom :: proc(
 			int(rw), int(rh),
 		) {
 			if render_split_timing {
-				render_pipe.cpu_resample_ns += time.now()._nsec - t_cpu
+				el := time.now()._nsec - t_cpu
+				render_pipe.cpu_resample_ns += el
 				render_pipe.cpu_resample_n += 1
+				if one_to_one {
+					render_pipe.cp1_ns += el
+					render_pipe.cp1_n += 1
+				} else if downscaling {
+					render_pipe.cpd_ns += el
+					render_pipe.cpd_n += 1
+				} else {
+					render_pipe.cpu_ns += el
+					render_pipe.cpu_n += 1
+				}
 			}
 			return true
 		}
 		if render_split_timing {
-			render_pipe.cpu_resample_ns += time.now()._nsec - t_cpu
+			el := time.now()._nsec - t_cpu
+			render_pipe.cpu_resample_ns += el
 			render_pipe.cpu_resample_n += 1
+			if one_to_one {
+				render_pipe.cp1_ns += el
+				render_pipe.cp1_n += 1
+			} else if downscaling {
+				render_pipe.cpd_ns += el
+				render_pipe.cpd_n += 1
+			} else {
+				render_pipe.cpu_ns += el
+				render_pipe.cpu_n += 1
+			}
 		}
 		render_keyed_frames += 1
 		render_blit_region(canvas, render_job.width, render_job.height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
@@ -3102,6 +3271,93 @@ render_split_timing := false
 // One-shot: print the keyed crop geometry once per run, because the resample
 // cost is meaningless without knowing how much of the stage it touches.
 render_probe_rect := false
+
+// Resample_Baseline times two things over the SAME buffer the resample reads:
+// a raw byte scan (pure memory reach) and an inline 2x2 box downscale written
+// here, which is the same arithmetic the library kernel does. Run from both
+// the exporter and gpu_resample_probe, so the three numbers -- baseline scan,
+// baseline box, library call -- say whether a process is slow because its
+// memory is slow or because that particular call is slow. `out` must hold
+// src_w*src_h/4 bytes.
+// resample_once_ms is one library resample call, timed. It exists so the
+// destination A/B above can make three identical calls without repeating the
+// ten arguments three times.
+resample_once_ms :: proc(
+	src: [^]u8, src_stride, src_x, src_y, src_w, src_h: int,
+	dst: [^]u8, dst_stride, dst_w, dst_h: int,
+) -> f64 {
+	t := time.now()._nsec
+	ok := yuvconv.rgba_resample(
+		src, src_stride, src_x, src_y, src_w, src_h,
+		dst, dst_stride, dst_w, dst_h,
+	)
+	assert(ok, "resample-dest A/B: library resample refused the geometry")
+	return f64(time.now()._nsec - t) / 1e6
+}
+
+Resample_Baseline :: struct {
+	scan_ns: i64,
+	box_ns:  i64,
+	sum:     u64,
+}
+
+rd32 :: proc(p: ^u8, off: int) -> u32 {
+	return intrinsics.unaligned_load(cast(^u32)(cast(^u8)(uintptr(p) + uintptr(off))))
+}
+
+// avg4 is the 2x2 box average of four taps, divide-free the same way the
+// library kernel does it, so this baseline is the same arithmetic and not a
+// slower re-implementation of it.
+avg4 :: proc(a, b, c, d: u32) -> u32 {
+	return u32((f32(a) + f32(b) + f32(c) + f32(d)) * 0.25 + 0.5)
+}
+
+resample_baseline :: proc(
+	src: [^]u8, src_w, src_h: int, out: [^]u8, iters: int,
+) -> Resample_Baseline {
+	res := Resample_Baseline{}
+	dw, dh := src_w / 2, src_h / 2
+
+	t0 := time.now()._nsec
+	for _ in 0 ..< iters {
+		acc: u64 = 0
+		// Stride by 1 through a raw pointer, not a slice: a []u8 subscript
+		// would bounds-check every byte, and the point of this loop is to
+		// measure memory reach, not the checker's throughput.
+		p := cast(^u8)(uintptr(src))
+		for _ in 0 ..< src_w * src_h * 4 {
+			acc += u64(p^)
+			p = cast(^u8)(uintptr(p) + 1)
+		}
+		res.sum += acc
+	}
+	res.scan_ns = (time.now()._nsec - t0) / i64(iters)
+
+	t1 := time.now()._nsec
+	for _ in 0 ..< iters {
+		for y in 0 ..< dh {
+			so := y * 2 * src_w * 4
+			drow := y * dw * 4
+			for x in 0 ..< dw {
+				s0 := so + x * 8
+				a := rd32(src, s0)
+				b := rd32(src, s0 + 4)
+				c := rd32(src, s0 + src_w * 4)
+				d := rd32(src, s0 + src_w * 4 + 4)
+				packed := (avg4(a & 0xFF, b & 0xFF, c & 0xFF, d & 0xFF)) |
+					(avg4(a >> 8 & 0xFF, b >> 8 & 0xFF, c >> 8 & 0xFF, d >> 8 & 0xFF) << 8) |
+					(avg4(a >> 16 & 0xFF, b >> 16 & 0xFF, c >> 16 & 0xFF, d >> 16 & 0xFF) << 16) |
+					(avg4(a >> 24 & 0xFF, b >> 24 & 0xFF, c >> 24 & 0xFF, d >> 24 & 0xFF) << 24)
+				intrinsics.unaligned_store(
+					cast(^u32)(cast(^u8)(uintptr(out) + uintptr(drow + x * 4))),
+					packed,
+				)
+			}
+		}
+	}
+	res.box_ns = (time.now()._nsec - t1) / i64(iters)
+	return res
+}
 
 render_start :: proc() {
 	if render_is_busy() {
