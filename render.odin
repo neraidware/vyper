@@ -933,11 +933,22 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 		f32(PW),
 		f32(PH),
 	)
-	l = src.transform_x - cw / 2 + src.crop_l * cw
-	r = src.transform_x + cw / 2 - src.crop_r * cw
-	t = src.transform_y - ch / 2 + src.crop_t * ch
-	b = src.transform_y + ch / 2 - src.crop_b * ch
-	return
+	// The shared edges, not a hand-inlined copy of them. Step B moved
+	// full_box_dims out but left these four lines behind, so this function was
+	// the one place in the export still deriving crop edges on its own -- and
+	// the preview has been reading the shared version the whole time, which is
+	// precisely the drift B existed to stop. render_kf_geom_rect below was
+	// already migrated; this is the static path.
+	return cropped_box_edges(
+		src.transform_x,
+		src.transform_y,
+		cw,
+		ch,
+		src.crop_l,
+		src.crop_r,
+		src.crop_t,
+		src.crop_b,
+	)
 }
 
 // render_kf_geom_rect evaluates a keyed clip's animation at clip offset `off`
@@ -971,8 +982,8 @@ render_kf_geom_rect :: proc(
 	l, t, r, b := cropped_box_edges(tx, ty, cw, ch, cl, cr, ct, cb)
 	ox = c.int(math.round(l))
 	oy = c.int(math.round(t))
-	rw = max(1, c.int(r - l + 0.5))
-	rh = max(1, c.int(b - t + 0.5))
+	rw = px_extent(r - l)
+	rh = px_extent(b - t)
 	// Which source pixels the crop selects in the STAGED texture (the shared
 	// geometry, so this and the CPU sws path below pick the same pixels).
 	csr := crop_src_rect(int(stage_w), int(stage_h), cl, cr, ct, cb)
@@ -2063,13 +2074,13 @@ render_worker_run :: proc() {
 				f32(render_job.width),
 				f32(render_job.height),
 			)
-			v.fw = max(1, c.int(scw + 0.5))
-			v.fh = max(1, c.int(sch + 0.5))
+			v.fw = px_extent(scw)
+			v.fh = px_extent(sch)
 			// Seed the display rect with the resting pose; the composite
 			// recomputes it per frame before every blit.
 			l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
-			v.rw = max(1, c.int(r - l + 0.5))
-			v.rh = max(1, c.int(b - t + 0.5))
+			v.rw = px_extent(r - l)
+			v.rh = px_extent(b - t)
 			v.ox = c.int(l + 0.5)
 			v.oy = c.int(t + 0.5)
 			for &slot in &v.blit_slots {
@@ -2088,8 +2099,8 @@ render_worker_run :: proc() {
 			continue
 		}
 		l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
-		v.rw = max(1, c.int(r - l + 0.5))
-		v.rh = max(1, c.int(b - t + 0.5))
+		v.rw = px_extent(r - l)
+		v.rh = px_extent(b - t)
 		v.ox = c.int(l + 0.5)
 		v.oy = c.int(t + 0.5)
 		// Decode the frame at the full (pre-crop) box size so the cropped
@@ -2101,8 +2112,8 @@ render_worker_run :: proc() {
 			f32(render_job.width),
 			f32(render_job.height),
 		)
-		v.fw = max(1, c.int(cw + 0.5))
-		v.fh = max(1, c.int(ch + 0.5))
+		v.fw = px_extent(cw)
+		v.fh = px_extent(ch)
 		// Fully off-canvas: never drawn, so no decode at all. The frame loop
 		// skips v.fw <= 0 before touching the decoder.
 		if c.int(r) <= 0 || c.int(l) >= render_job.width ||

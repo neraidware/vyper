@@ -1300,6 +1300,47 @@ had no target in `gate.sh`, so it had not been running: a regression in the
 geometry B refactors would have been invisible. Added `target_transform_probe`
 and put it in the `all` list. It passes.
 
+**Step B3 — DONE: the last hand-inlined crop edges, and the extent policy.**
+Two more duplications, both found by asking "who else derives this number"
+rather than by reading for style:
+
+- `render_display_rect` (render.odin:928) re-implemented
+  `cropped_box_edges` LINE FOR LINE — same `transform_x - cw/2 + crop_l*cw`,
+  same four terms — directly below its own call to the shared `full_box_dims`.
+  So Step B half-migrated that function: the box dims came from the shared
+  helper and the crop edges did not, leaving the ONE place in the export still
+  deriving crop edges on its own while the preview read the shared version the
+  whole time. `render_kf_geom_rect` had been migrated; the static path was the
+  odd one out. That is the drift B existed to stop, still present after B.
+- The "float extent -> pixel count" policy (`max(1, c.int(span + 0.5))`, round
+  half up, never zero) appeared 10 times across the keyed and static paths. It
+  is now `px_extent` in `project_geom.odin`. The floor is the load-bearing half
+  and the reason it is named: every caller sizes a blit rect or a GPU texture,
+  where zero is not a small image but an invalid one. Origins deliberately do
+  NOT route through it — those stay `c.int(math.round(v))` with no floor,
+  because a clip can legitimately hang off the canvas at a negative coordinate,
+  and flooring an origin to 1 would teleport every off-canvas clip to the
+  top-left corner.
+
+**`dec_crop_px` (decode.odin:1056) was left alone, deliberately.** It looks like
+a fourth copy of crop->pixel-rect, and it is the same ROUNDING AND CLAMPING
+policy, but it is a different function: it takes an already-computed normalized
+sub-rect (`crop_fx0/fy0/fw/fh`) rather than four insets, and it has a
+"zero fractions means no crop" contract that returns a `0,0,0,0` sentinel the
+export's `crop_src_rect` has no notion of. It also serves a different consumer:
+that rect crops the DECODER's own sws input, while `crop_src_rect` crops an
+already-decoded full-box blit at composite time. Different input shape,
+different contract, different job — merging them would be the "apparent
+conceptual similarity" AGENTS.md 2 warns about, and would have to invent a
+sentinel the export side has no use for.
+
+**Decode/stage sizing between preview and export turned out to need no work.**
+`open_clip_decoder_ex` has exactly two callers: the preview (decode.odin:380,
+fixed `PREVIEW_W x PREVIEW_H`) and the export (per-clip stage size). One
+implementation, two destination sizes passed in as a parameter — which is what
+"shared" is supposed to look like. There was no second sizing implementation to
+remove; the duplication was export-INTERNAL, which is what B3 fixed.
+
 **Step C — DONE: one ordered visual list for export, fixing bug 2.** Video and
 text were snapshotted into two parallel arrays and composited in two separate
 passes -- "all video, then all text" -- so export drew every text clip above

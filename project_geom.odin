@@ -51,6 +51,24 @@ cropped_box_edges :: proc(
 	return
 }
 
+// px_extent converts a float SPAN (a width or height) to a pixel count, rounding
+// half up and never returning less than 1.
+//
+// The floor is the point, not the rounding: every caller is sizing a blit rect
+// or a GPU texture, and a zero-sized one is not a small image, it is an invalid
+// one -- SDL rejects the texture and a zero-area quad divides by zero in the
+// shader. The floor is also the answer to "what does a crop that rounds to
+// nothing mean": one pixel, which is the same thing every one of those callers
+// already did by hand.
+//
+// Origins are NOT this and must not be routed through it. An origin is
+// `c.int(math.round(v))` with no floor, because a clip can legitimately hang off
+// the canvas at a negative coordinate. Rounding an origin half UP and clamping
+// it to 1 would teleport every off-canvas clip to the top-left corner.
+px_extent :: proc(span: f32) -> c.int {
+	return max(1, c.int(span + 0.5))
+}
+
 // Crop_Src_Rect is a source pixel region selected by a clip's crop insets.
 Crop_Src_Rect :: struct {
 	x, y: int,
