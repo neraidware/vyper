@@ -1235,7 +1235,7 @@ timeline_has_audio_at :: proc(f: i64) -> bool {
 		track := &timeline.tracks[tr]
 		for c in 0 ..< len(track.clips) {
 			clip := &track.clips[c]
-			if clip.kind == .Audio && f >= clip.timeline_start_frame && f < clip.timeline_start_frame + clip.source_length_frames {
+			if clip.kind == .Audio && clip_visible_at(f, clip.timeline_start_frame, clip.source_length_frames) {
 				return true
 			}
 		}

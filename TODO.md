@@ -1896,6 +1896,42 @@ reproduces the baseline error metrics row-for-row (1:1 `mean=00.00`; 0.5x
 `00.20`/`00.11`; upscale `01.16`; 5K `00.02`) and `keyed_export` reproduces
 `1.0x PSNR = inf` and `0.5x PSNR = 58.707992` exactly.
 
+**Step F — DONE 2026-09-27: the clip visibility predicate, which was the one
+duplicated RULE Active 10 had not caught.** Step E closed the layering rule;
+the predicate every pipeline uses to decide "is this clip on screen at frame
+F" was still written out longhand in ELEVEN places across nine files
+(`proxy.odin`, `render.odin` x5, `preview_state.odin` x2, `flash_rec.odin` x2,
+`timeline.odin` x2, `main.odin`, `audio.odin`). It had already drifted, which is
+the outcome AGENTS.md 2 predicts for copy-paste-and-tweak: `main.odin` used `>`
+where the other ten used `>=`, so the auto-keyframe gate accepted the playhead
+one frame PAST the clip end, and no gate caught it.
+
+  - `clip_visible_at(frame, start, length)` now states it once, half-open on
+    `[start, start+length)`. Three `i64` rather than a `Clip` parameter, because
+    the same test applies to sources the timeline does not own (`Render_Video_Src`,
+    `Render_Text_Src`, subtitle clips); a proc over `Clip` would have left the
+    non-`Clip` sites inlining the arithmetic, i.e. the duplication again.
+  - The off-by-one is gone as a side effect — that was the point.
+  - `timeline_probe.odin` pins the boundary: one frame before start, at start,
+    at the last frame, AT THE END (must not be visible), and a zero-length clip
+    (must never be visible, or a clip left by splitting at frame 0 would show
+    for exactly one frame while every other case still passed). Verified the
+    probe FAILS when the bound is flipped back to `>`, so it is a real pin and
+    not decoration.
+  - `timeline_probe` was, like `transform_probe` before it, reachable only by
+    setting `VYPER_TL_PROBE` by hand — no gate ran it, so the new assertion
+    would have been dead. It is now a gate target and a member of `all`.
+
+Not duplication, deliberately left alone: the two paint loops stay separate
+(one rasterises CPU pixels out of decode, the other draws a fractional UV quad
+on the GPU), and `flash_rec.odin:173`'s `b.start == a.start + a.length` is an
+adjacency test, not a visibility one. The remaining large unification —
+collapsing export's CPU raster -> readback -> swscale into the GPU pipeline —
+is S1c, not a refactor, and is tracked there.
+
+**Evidence (behavior-preserving):** full `all` green, including `valgrind` and
+`render_valgrind` at 0 definitely / 0 indirectly lost.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

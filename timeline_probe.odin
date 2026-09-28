@@ -18,6 +18,45 @@ tl_probe_check :: proc(cond: bool, msg: string, args: ..any) {
 	}
 }
 
+// clip_visible_at is half-open on [start, start+length), and the upper bound is
+// the one that has to be pinned. main.odin carried `>` where every other site
+// used `>=`, so the auto-keyframe gate accepted the playhead one frame past the
+// clip end -- and nothing caught it, because this test lived inline in eleven
+// places that were free to disagree with each other.
+test_clip_visible_half_open :: proc() {
+	start, length: i64 = 100, 24
+
+	tl_probe_check(
+		!clip_visible_at(start - 1, start, length),
+		"frame %d is before start %d and must not be visible",
+		start - 1,
+		start,
+	)
+	tl_probe_check(
+		clip_visible_at(start, start, length),
+		"frame %d is at start and must be visible",
+		start,
+	)
+	tl_probe_check(
+		clip_visible_at(start + length - 1, start, length),
+		"frame %d is the last frame and must be visible",
+		start + length - 1,
+	)
+	tl_probe_check(
+		!clip_visible_at(start + length, start, length),
+		"frame %d is at end %d and must NOT be visible (half-open upper bound)",
+		start + length,
+		start + length,
+	)
+	// A zero-length clip occupies no frames. Splitting at the very first frame
+	// can leave one behind, so an accidental >= here would show it for exactly
+	// one frame and every other case above would still pass.
+	tl_probe_check(
+		!clip_visible_at(start, start, 0),
+		"a zero-length clip must never be visible",
+	)
+}
+
 mk_tl_clip :: proc(cid, link: u64, start, slen, tstart: i64, kind: Media_Kind) -> Clip {
 	return Clip {
 		clip_id = cid,
@@ -728,6 +767,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_track_reorder()
 	fmt.println("[tl-probe] track-reorder ok")
+
+	test_clip_visible_half_open()
+	fmt.println("[tl-probe] clip-visible-half-open ok")
 
 	if tl_probe_fail {
 		fmt.println("[tl-probe] FAILED")

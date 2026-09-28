@@ -619,8 +619,11 @@ proxy_front_video_under_playhead :: proc() -> ^Clip {
 			if clip.kind != .Video {
 				continue
 			}
-			if playhead.frame < clip.timeline_start_frame ||
-			   playhead.frame >= clip.timeline_start_frame + clip.source_length_frames {
+			if !clip_visible_at(
+				playhead.frame,
+				clip.timeline_start_frame,
+				clip.source_length_frames,
+			) {
 				continue
 			}
 			return clip

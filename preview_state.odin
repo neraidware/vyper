@@ -84,8 +84,7 @@ prewarm_next_clip :: proc() {
 			if c.kind != .Video || c.path == nil {
 				continue
 			}
-			if playhead.frame >= c.timeline_start_frame &&
-			   playhead.frame < c.timeline_start_frame + c.source_length_frames {
+			if clip_visible_at(playhead.frame, c.timeline_start_frame, c.source_length_frames) {
 				active = c
 				break
 			}
@@ -237,7 +236,7 @@ slot_claim_flush_peer :: proc(clip: ^Clip, claimed: [MAX_PREVIEW_SLOTS]bool) -> 
 		// The peer must be on the OTHER side of the playhead's frame -- if it
 		// still covers the playhead it is a live clip, not a departing half.
 		frame := playhead.frame
-		if frame >= peer.timeline_start_frame && frame < peer_end {
+		if clip_visible_at(frame, peer.timeline_start_frame, peer.source_length_frames) {
 			continue
 		}
 		return s
@@ -289,8 +288,7 @@ update_preview_slots :: proc() -> bool {
 				continue
 			}
 			frame := playhead.frame
-			if frame < clip.timeline_start_frame ||
-			   frame >= clip.timeline_start_frame + clip.source_length_frames {
+			if !clip_visible_at(frame, clip.timeline_start_frame, clip.source_length_frames) {
 				continue
 			}
 			slot_idx := -1

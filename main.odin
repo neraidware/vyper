@@ -843,8 +843,7 @@ kf_auto_key :: proc(clip: ^Clip, name: string, value: f32) -> bool {
 	if !editor_flags.auto_keyframe {
 		return false
 	}
-	if playhead.frame < clip.timeline_start_frame ||
-	   playhead.frame > clip.timeline_start_frame + i64(clip.source_length_frames) {
+	if !clip_visible_at(playhead.frame, clip.timeline_start_frame, clip.source_length_frames) {
 		return false
 	}
 	if !kf_geom_prop_keyed(clip, name) {

@@ -1833,8 +1833,7 @@ slot_idx := int(frame_idx & 1)
 	t_frame := time.now()._nsec
 	for i in 0 ..< len(render_job.videos) {
 			v := &render_job.videos[i]
-			if timeline_frame < v.timeline_start_frame ||
-			   timeline_frame >= v.timeline_start_frame + v.source_length_frames {
+			if !clip_visible_at(timeline_frame, v.timeline_start_frame, v.source_length_frames) {
 				continue
 			}
 			// Fully off-canvas clips were never opened (v.fw == 0 in setup).
@@ -2505,8 +2504,7 @@ render_worker_run :: proc() {
 		for i := len(render_job.visuals) - 1; i >= 0; i -= 1 {
 			#partial switch src in render_job.visuals[i] {
 			case ^Render_Video_Src:
-				if timeline_frame < src.timeline_start_frame ||
-				   timeline_frame >= src.timeline_start_frame + src.source_length_frames {
+				if !clip_visible_at(timeline_frame, src.timeline_start_frame, src.source_length_frames) {
 					continue
 				}
 				// Fully off-canvas clips were never opened (v.fw == 0 in setup).
@@ -2524,8 +2522,7 @@ render_worker_run :: proc() {
 				}
 			case ^Render_Text_Src:
 				t := src
-				if timeline_frame < t.timeline_start_frame ||
-				   timeline_frame >= t.timeline_start_frame + t.source_length_frames {
+				if !clip_visible_at(timeline_frame, t.timeline_start_frame, t.source_length_frames) {
 					continue
 				}
 				if t.name == "" {
@@ -2573,8 +2570,7 @@ render_worker_run :: proc() {
 		// implementations agreeing.
 		for i in 0 ..< len(render_job.subs) {
 			s := &render_job.subs[i]
-			if timeline_frame < s.timeline_start_frame ||
-			   timeline_frame >= s.timeline_start_frame + s.source_length_frames {
+			if !clip_visible_at(timeline_frame, s.timeline_start_frame, s.source_length_frames) {
 				continue
 			}
 			src := srt_source(s.srt_id)
@@ -2668,8 +2664,7 @@ render_worker_run :: proc() {
 				if !a.dec.opened {
 					continue
 				}
-				if timeline_frame < a.timeline_start_frame ||
-				   timeline_frame >= a.timeline_start_frame + a.source_length_frames {
+				if !clip_visible_at(timeline_frame, a.timeline_start_frame, a.source_length_frames) {
 					continue
 				}
 				start48 := i64(

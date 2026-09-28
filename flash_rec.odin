@@ -100,8 +100,7 @@ flash_rec_after_slots :: proc() {
 				continue
 			}
 			f := playhead.frame
-			if f < c.timeline_start_frame ||
-			   f >= c.timeline_start_frame + c.source_length_frames {
+			if !clip_visible_at(f, c.timeline_start_frame, c.source_length_frames) {
 				continue
 			}
 			slot_layer := u8(0)
@@ -204,8 +203,7 @@ flash_rec_note_kill :: proc(slot_idx: int, reason: cstring) {
 	see_clip := slot_clip_with_id(slot.clip_id)
 	if see_clip != nil {
 		covered =
-			playhead.frame >= see_clip.timeline_start_frame &&
-			playhead.frame < see_clip.timeline_start_frame + see_clip.source_length_frames
+			clip_visible_at(playhead.frame, see_clip.timeline_start_frame, see_clip.source_length_frames)
 	}
 	span_desc: [64]u8
 	if see_clip != nil {

@@ -16,6 +16,21 @@ clip_timeline_end :: proc(clip: Clip) -> i64 {return(
 		clip.source_length_frames \
 	)}
 
+// clip_visible_at reports whether `frame` falls inside a clip occupying
+// [start, start+length). HALF-OPEN: the frame at start+length belongs to the
+// next clip, not this one, and every caller that wrote the test out longhand got
+// this wrong at least once -- main.odin had `>` instead of `>=`, so the
+// auto-keyframe gate accepted the playhead one frame past the clip end.
+//
+// Three i64 rather than a Clip parameter, because the same test applies to
+// sources the timeline does not own: Render_Video_Src, Render_Text_Src, subtitle
+// clips and the audio track all carry their own start/length pair. A proc over
+// Clip would have left those eleven sites inlining the arithmetic, which is
+// exactly the duplication this replaces.
+clip_visible_at :: proc(frame, start, length: i64) -> bool {
+	return frame >= start && frame < start + length
+}
+
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
 // starting at `start_frame` (timeline frames). The duration is one second at the
 // current timeline frame rate. If the free gap that contains start_frame can't
@@ -466,8 +481,7 @@ split_clip_at_playhead :: proc() {
 			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
 				c := &timeline.tracks[t].clips[i]
 				if c.link_id == link &&
-				   frame >= c.timeline_start_frame &&
-				   frame < clip_timeline_end(c^) {
+				   clip_visible_at(frame, c.timeline_start_frame, c.source_length_frames) {
 					append(&targets, SplitTarget{t, i})
 				}
 			}
@@ -1059,7 +1073,7 @@ clip_at_frame :: proc(frame: i64) -> (^Track, ^Clip, bool) {
 	for ti in 0 ..< len(timeline.tracks) {
 		for ci in 0 ..< len(timeline.tracks[ti].clips) {
 			c := &timeline.tracks[ti].clips[ci]
-			if frame >= c.timeline_start_frame && frame < clip_timeline_end(c^) {
+			if clip_visible_at(frame, c.timeline_start_frame, c.source_length_frames) {
 				return &timeline.tracks[ti], c, true
 			}
 		}
@@ -1133,8 +1147,7 @@ timeline_frame_at :: proc(frame: i64) -> Timeline_Frame {
 			if candidate.kind != .Video {
 				continue
 			}
-			if frame >= candidate.timeline_start_frame &&
-			   frame < candidate.timeline_start_frame + candidate.source_length_frames {
+			if clip_visible_at(frame, candidate.timeline_start_frame, candidate.source_length_frames) {
 				return {
 					active_clip = candidate,
 					clip_frame = candidate.source_start_frame +

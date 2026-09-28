@@ -354,6 +354,17 @@ target_transform_probe() {
 	VYPER_TRANSFORM_PROBE=1 timeout 120 ./vyper
 }
 
+# The timeline geometry/semantics regression check (timeline_probe.odin).
+# Same problem transform_probe above had: it was reachable only by setting
+# VYPER_TL_PROBE by hand, so nothing ran it. It covers cut resolution, drag
+# alignment, ripple and -- as of this commit -- the half-open clip visibility
+# bound, which is the predicate eleven call sites share and on which an
+# off-by-one had already shipped silently in main.odin. The probe exits 0/1.
+target_timeline_probe() {
+	require_fresh_binary timeline-probe || return 1
+	VYPER_TL_PROBE=1 timeout 120 ./vyper
+}
+
 # The app must still be running when the timeout kills it; 124 is the pass.
 target_smoke() {
 	require_fresh_binary smoke || return 1
@@ -444,7 +455,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe gpu_probe keyed_export zorder subtitle_probe smoke valgrind render_valgrind; do
+	for t in check build probe transform_probe timeline_probe gpu_probe keyed_export zorder subtitle_probe smoke valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -458,6 +469,7 @@ main() {
 	bench) target_bench ;;
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
+	timeline_probe) target_timeline_probe ;;
 	gpu_probe) target_gpu_probe ;;
 	keyed_export) target_keyed_ab ;;
 	zorder) target_zorder ;;
@@ -467,7 +479,7 @@ main() {
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|timeline_probe|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac
