@@ -66,13 +66,13 @@ YUV_REF_CHROMA_H_TAPS :: 2
 // because that is what swscale's scaler does and the rounding is observable:
 // dividing the weighted sum by 18 disagreed with swscale on 1435 of 4096
 // chroma bytes, almost all of them off by one. round(w/18 << 14) gives
-// 1820, 6372, 6372, 1820 -- which sum to exactly 16384, so the kernel is
+// 910, 3186, 3186, 910 -- which sum to exactly 8192, so the kernel is
 // still unity gain and the >> below is the only scaling.
-YUV_REF_CHROMA_V_C0 :: 1820
-YUV_REF_CHROMA_V_C1 :: 6372
-YUV_REF_CHROMA_V_C2 :: 6372
-YUV_REF_CHROMA_V_C3 :: 1820
-YUV_REF_CHROMA_V_NORM :: 14
+YUV_REF_CHROMA_V_C0 :: 910
+YUV_REF_CHROMA_V_C1 :: 3186
+YUV_REF_CHROMA_V_C2 :: 3186
+YUV_REF_CHROMA_V_C3 :: 910
+YUV_REF_CHROMA_V_NORM :: 13
 
 // Rounding half-add for the input converter.
 YUV_REF_CHROMA_H_BIAS :: 1 << (YUV_REF_SHIFT - 6)
