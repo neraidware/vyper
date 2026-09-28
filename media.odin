@@ -141,7 +141,12 @@ media_is_image :: proc(path: cstring) -> bool {
 media_frame_count :: proc(metadata: string) -> i64 {
 	duration: f64
 	frame_rate: f64
-	for line in strings.split_lines(metadata) {
+	// split_lines allocates a caller-owned []string; `for ... in` does not free
+	// it, and the loop returns early on the line it wants, so a plain `for` left
+	// the slice behind on every import.
+	lines := strings.split_lines(metadata)
+	defer delete(lines)
+	for line in lines {
 		if strings.has_prefix(line, "nb_frames=") {
 			value, ok := strconv.parse_i64(line[len("nb_frames="):])
 			if ok {

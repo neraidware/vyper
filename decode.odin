@@ -176,7 +176,12 @@ frame_cache_clear :: proc(dec: ^Clip_Decoder) {
 	for &e in dec.cache {
 		delete(e.data)
 	}
-	clear(&dec.cache)
+	// delete, NOT clear: Odin's clear empties a dynamic array but KEEPS its
+	// backing store, and the only caller (clip_decoder_reset) then wipes the
+	// struct with `dec^ = {}`, which drops the pointer on the floor. clear here
+	// leaked the cache's whole capacity on every reset -- 271 bytes per decoded
+	// clip, reported by render_valgrind as a lost block in cache_store.
+	delete(dec.cache)
 }
 
 ff_err_str :: proc(code: c.int) -> string {
@@ -251,24 +256,57 @@ asset_source_hw :: proc(a: ^Media_Asset) -> bool {
 	return a.src_hw
 }
 
+// clip_decoder_release_ffmpeg frees every ffmpeg-owned resource a decoder holds
+// and NULLs each pointer, so calling it twice is safe.
+//
+// Split out of clip_decoder_reset and deliberately NOT gated on `dec.opened`:
+// that flag means "usable", not "acquired", and open_clip_decoder_ex can fail
+// AFTER allocating the format context, the codec context, the scaler and the
+// destination image. Gating on `opened` meant every one of those early-return
+// paths leaked the lot -- the ownership model claimed they were released
+// because the caller defers a reset, while the reset itself skipped them.
+//
+// The frees are pointer tests, not a flag, because the pointers are the thing
+// actually owned. `dst` is the one that was simply missing: avutil.image_alloc
+// gave the decoder its RGBA destination buffer and nothing ever freed it, which
+// is the 1.3 MB per thumbnail the render_valgrind gate reported.
+clip_decoder_release_ffmpeg :: proc(dec: ^Clip_Decoder) {
+	if dec.fmt_ctx != nil {
+		avfmt.close_input(&dec.fmt_ctx)
+	}
+	if dec.dec_ctx != nil {
+		avcodec.free_context(&dec.dec_ctx)
+	}
+	if dec.sws_ctx != nil {
+		sws.freeContext(dec.sws_ctx)
+		dec.sws_ctx = nil
+	}
+	if dec.dst[0] != nil {
+		avutil.freep(&dec.dst[0])
+		dec.dst[0] = nil
+	}
+	if dec.frame != nil {
+		avutil.frame_free(&dec.frame)
+	}
+	if dec.hold != nil {
+		avutil.frame_free(&dec.hold)
+	}
+	if dec.pkt != nil {
+		avcodec.packet_free(&dec.pkt)
+	}
+	if dec.sw_frame != nil {
+		avutil.frame_free(&dec.sw_frame)
+	}
+	if dec.hw_device != nil {
+		avutil.buffer_unref(&dec.hw_device)
+	}
+}
+
 clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
 	if vyper_trace {
 		fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)
 	}
-	if dec.opened {
-		avfmt.close_input(&dec.fmt_ctx)
-		avcodec.free_context(&dec.dec_ctx)
-		sws.freeContext(dec.sws_ctx)
-		avutil.frame_free(&dec.frame)
-		avutil.frame_free(&dec.hold)
-		avcodec.packet_free(&dec.pkt)
-		if dec.sw_frame != nil {
-			avutil.frame_free(&dec.sw_frame)
-		}
-		if dec.hw_device != nil {
-			avutil.buffer_unref(&dec.hw_device)
-		}
-	}
+	clip_decoder_release_ffmpeg(dec)
 	frame_cache_clear(dec)
 	// Drop any EOF-tail frames parked by decode_one_forward. Each is a cloned
 	// avutil.Frame owning its buffer; frame_free the shell, then the slice.
@@ -400,6 +438,18 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	saved_base := dec.frame_base
 	if dec.opened {
 		clip_decoder_reset(dec)
+	}
+	// Unwind on every failure return below. This proc acquires the format
+	// context, the codec context, the scaler, the destination image and two
+	// frames in sequence, and each step after the first can fail; without this
+	// the caller's deferred reset was the only unwind, and the reset skipped a
+	// decoder that never reached `opened`. Deferred rather than written at each
+	// return: there are seven, and the ones added later are exactly the ones
+	// that would leak. Cancelled on success (below) because a live decoder must
+	// survive this proc returning.
+	opened_ok := false
+	defer if !opened_ok {
+		clip_decoder_release_ffmpeg(dec)
 	}
 
 	// Which physical file to open. For the PREVIEW path (fit=true) the caller
@@ -655,6 +705,9 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 	dec.hold = avutil.frame_alloc()
 	dec.pkt = avcodec.packet_alloc()
 	dec.opened = true
+	// Everything is acquired; the deferred unwind above must not run, or it
+	// would free the decoder this call is handing back.
+	opened_ok = true
 	ops := string(open_path)
 	on := min(len(ops), len(dec.opened_path_buf) - 1)
 	copy(dec.opened_path_buf[:on], ops[:on])

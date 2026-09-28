@@ -1662,32 +1662,58 @@ Details TBD when Phase 2 reaches maturity.
 
 ---
 
-## Export-path memory gate (new, found while testing Step C)
+## Export-path memory gate — FIXED, and now a member of `all`
 
-`./scripts/gate.sh render_valgrind` runs the export worker under valgrind -- the
-check AGENTS.md 9b asks for on any change to the render path's ownership, and
-which nothing exercised before, because every prior valgrind run was the probe
-path and no probe renders. It currently FAILS on two pre-existing leaks that no
-recent change introduced; neither stack passes through the composite union.
+`./scripts/gate.sh render_valgrind` runs the export worker under valgrind --
+the check AGENTS.md 9b asks for on any change to the render path's ownership,
+and which nothing exercised before, because every prior valgrind run was the
+probe path and no probe renders. It was added while testing Step C and FAILED
+on pre-existing leaks: 1,327,884 bytes definitely lost in 7 blocks, 262,347
+indirectly, 487 errors from 137 contexts.
 
 1. **262,627 bytes (280 direct, 262,347 indirect) -- `render_open_output`
-   (render.odin:1468).** `avformat_alloc_output_context2` and the codec contexts
-   and stream state it owns are never released: there is no
-   `avformat_free_context` in the encoder teardown. The four early returns after
-   that alloc also leak on their unwind paths, which is AGENTS.md 1's "a setup
-   proc that acquires several resources must unwind on partial failure".
+   (render.odin:1468).** The diagnosis was "no `avformat_free_context` in the
+   encoder teardown" and it was HALF RIGHT, which is the interesting part:
+   `enc_cleanup` existed, was complete, and was **never called from anywhere**.
+   The whole teardown had been written and simply not wired up, so every render
+   leaked the muxer/encoder state and -- separately -- the file's AVIO buffer
+   was never flushed, because `enc_cleanup` called only `avformat_free_context`,
+   which per the vendored header does NOT close a `pb` that `avio_open2`
+   created (that is the `AVFMT_FLAG_CUSTOM_IO` case, and this is not it). Both
+   halves are fixed: `defer enc_cleanup(&e)` in `render_worker_run`, and an
+   `avfmt.closep(&e.fmt_ctx.pb)` before the free. Deferred rather than
+   hand-written at each return because the worker has ~20 returns, and a leak
+   that only happens on the error paths is exactly what a manual unwind misses
+   (AGENTS.md 1).
 2. **1,327,105 bytes -- `open_clip_decoder_ex` (decode.odin:650) via
-   `decode_asset_thumbnail` (media.odin:320).** The thumbnail decoder's
-   `av_image_alloc` buffer plus its `frame_alloc` / `hold` / `packet_alloc` are
-   never freed: the import path opens a decoder and does not close it.
+   `decode_asset_thumbnail` (media.odin:320).** Also half right. The caller DOES
+   `defer clip_decoder_reset`, but the reset skipped `dec.dst` -- the
+   `avutil.image_alloc` destination buffer -- so the decoder's own output buffer
+   was never freed by anyone. Two further defects surfaced with it: the reset
+   gated every free on `dec.opened`, which means "usable", not "acquired", so
+   every partial-failure return in `open_clip_decoder_ex` (seven of them, after
+   the format context, codec context, scaler and image are already acquired)
+   leaked the lot; and `frame_cache_clear` used `clear`, which keeps the dynamic
+   array's capacity, while `clip_decoder_reset` then wiped the struct with
+   `dec^ = {}` -- the AGENTS.md 1 trap verbatim, orphaning the cache backing
+   store (271 bytes per decoded clip). Fixed by splitting
+   `clip_decoder_release_ffmpeg` out of the reset as pointer-test frees (so a
+   decoder that never reached `opened` still releases), a deferred unwind in
+   `open_clip_decoder_ex` cancelled on success, and `delete(dec.cache)`.
+3. **Three small records in the TEST HARNESS, plus one in the import path.**
+   47 bytes: `render_test_env`'s `strings.split` (render.odin:3268). 127 bytes:
+   `media_frame_count`'s `strings.split_lines` (media.odin:144) -- that returns
+   an allocated `[]string`, and a `for ... in` does not free it, worse when the
+   loop returns early on the line it wants. 271 bytes: the frame cache above.
+   All now `defer delete(...)`.
 
-Smaller records (23, 31, 47, 127, 271 bytes) are also in the export path. Total
-1,327,884 bytes definitely lost in 7 blocks; 487 errors from 137 contexts.
+**Result: 0 definitely lost, 0 indirectly lost, no invalid read/write/free.**
+Errors from 137 contexts down to 129 (the remainder is FFmpeg/Odin runtime
+noise, which per AGENTS.md 9b is never gated on).
 
-**Why the target is not in `gate.sh all` yet:** a gate that is red for reasons
-unrelated to the change under test trains everyone to ignore it. It runs on
-demand. Add it to `all` in the same commit that fixes the two leaks above.
-
-Steps: read the FFmpeg teardown for the encoder and for the thumbnail decoder ->
-free what each owns at its real teardown boundary (not at each early return) ->
-`render_valgrind` back to 0 definitely / 0 indirectly -> add the target to `all`.
+**`render_valgrind` is now in `gate.sh all`.** It was held out while red, on the
+reason that a gate red for reasons unrelated to the change under test trains
+everyone to ignore it -- which is right, and is exactly why the two fixes are
+this commit rather than a later one. The leaks it exists to catch were all
+reachable from the export path, which no other target in `all` executes, so
+without it `all` never touches that code's ownership at all.

@@ -407,12 +407,12 @@ target_valgrind() {
 
 target_all() {
 	local t
-	# render_valgrind is deliberately NOT in this list yet: it fails on two
-	# pre-existing export/import-path leaks (see TODO.md "Export-path memory
-	# gate"), and a gate that is red for reasons unrelated to the change under
-	# test trains everyone to ignore it. It runs on demand:
-	#   ./scripts/gate.sh render_valgrind
-	for t in check build probe transform_probe gpu_probe keyed_export zorder smoke valgrind; do
+	# render_valgrind was deliberately excluded here while it failed on two
+	# pre-existing export/import-path leaks. Both are fixed (the encoder had no
+	# teardown call at all, and the decoder never freed its destination image),
+	# so it is now a member: the leaks it exists to catch were all reachable
+	# from the export path, which no other target in this list executes.
+	for t in check build probe transform_probe gpu_probe keyed_export zorder smoke valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done

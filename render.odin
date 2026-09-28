@@ -1068,6 +1068,16 @@ enc_cleanup :: proc(e: ^Render_Enc) {
 		avutil.freep(&e.yuv_scratch[0])
 	}
 	if e.fmt_ctx != nil {
+		// Close the AVIOContext BEFORE freeing the container: avio_closep
+		// flushes its buffer and is the only thing that does, and
+		// avformat_free_context does not do it for a context avio_open2
+		// created (that is the AVFMT_FLAG_CUSTOM_IO case, which this is not).
+		// Skipping it loses the tail of the file AND leaks the AVIOContext.
+		if e.fmt_ctx.pb != nil {
+			avfmt.closep(&e.fmt_ctx.pb)
+		}
+		// Frees the container and every stream in it, which is what owns
+		// e.vstream / e.astream -- freeing those separately would double-free.
 		avfmt.free_context(e.fmt_ctx)
 	}
 	e^ = {}
@@ -1924,6 +1934,15 @@ render_worker_run :: proc() {
 	set_status(.Rendering, "")
 	fail := false
 	e := Render_Enc{}
+	// The encoder is a HANDOFF, not arena memory: avformat/avcodec own it behind
+	// C pointers, so the job arena cannot free it and `enc_cleanup` must run on
+	// every exit -- the success path, every `fail = true` early return, and a
+	// panic. It was written and never called, so a render leaked the whole
+	// muxer/encoder state (~1.3 MB, all of it still-reachable-but-lost) and the
+	// file's AVIO buffer was never flushed. Deferred rather than hand-written at
+	// each return: this proc has ~20 of them, and a leak that only happens on the
+	// error paths is exactly the kind a manual unwind misses.
+	defer enc_cleanup(&e)
 	err_msg := ""
 	render_pipe.enc = nil
 	render_pipe.enc_fail = false
@@ -3247,6 +3266,7 @@ render_test_env :: proc() -> (bool, [2]string) {
 		return false, [2]string{}
 	}
 	parts := strings.split(v, "|")
+	defer delete(parts)
 	res: [2]string
 	if len(parts) >= 2 {
 		res[0] = parts[0]
