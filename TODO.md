@@ -740,6 +740,37 @@ throughput. See the note appended to S2.
       channel. Both are per-byte-class failures a single `mismatches = 0`
       gate had to catch on first brush, and did.
 
+      **The composite contract is proven (2026-09-28).** The per-clip quad
+      draws into one GPU canvas reproduce render_blit_region's z-order,
+      clipping, and offset placement byte-for-byte: gpu_composite is a gate
+      target in `all`, and it is proven red on a dropped z-order op (skip the
+      op-4 draw and the pixels it owns fail exact). The ops sequence is hostile
+      on purpose -- 1:1 sub-rect copies, a 2x box downscale, a right-edge
+      clipped copy, a copy that over-writes the downscale, a left-clipped
+      downscale over that, and a nested over-write -- and the per-pixel
+      topmost-op mask is why a reorder is caught, not just a missing draw.
+
+      Two bounds were measured, not chosen. (1) The down regions use INTEGER
+      2x ratios because the GPU and CPU box kernels pick their integer tap sets
+      by different rules and only agree to ~0.1 mean there: at 64:24 the shader
+      always takes ceil(2.67)=3 taps while the CPU span count alternates
+      2/3, which is a full 5-6 mean on a changing image. That is a resample-
+      quality question that gpu_probe already owns, so this gate keeps the
+      ratios where the two align and the composite's OWN behavior is what gets
+      measured. (2) The `flat`/`vgrad` lesson repeated here: a LCG stage made
+      the kernel pair disagree hugely (11.3 mean) because independent per-byte
+      noise is the worst case for tap-count differences; correlated video-like
+      content is what both kernels actually process, so the probe uses a smooth
+      deterministic pattern instead.
+
+      **What this unblocks:** the export worker can now replace the CPU
+      canvas (render_blit_region calls + the kres_scratch round-trip) with one
+      GPU canvas texture, drawn in the same z-order the CPU walk used, with a
+      byte-exact contract on every pixel the exporter's own rule says must be
+      exact. The piece that remains is the plumbing itself: run these passes in
+      the render worker's frame loop and hand the surfaced NV12 to
+      hw_frames_ctx -- the correctness questions are all gated now.
+
       **What this unblocks:** the conversion is now replaceable end-to-end
       inside the export path (GPU composite -> shader -> pad/merge into the
       encoder's w/h NV12 buffers) with a byte-exact contract rather than a

@@ -1457,6 +1457,9 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if _, ok := os.lookup_env_alloc("VYPER_GPU_NV12_PROBE", context.temp_allocator); ok {
 		os.exit(gpu_nv12_probe_run())
 	}
+	if _, ok := os.lookup_env_alloc("VYPER_GPU_COMPOSITE_PROBE", context.temp_allocator); ok {
+		os.exit(gpu_composite_probe_run())
+	}
 	if _, ok := os.lookup_env_alloc("VYPER_YUV_EXACT_PROBE", context.temp_allocator); ok {
 		os.exit(yuv_exact_probe_run())
 	}
