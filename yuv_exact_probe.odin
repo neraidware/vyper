@@ -309,7 +309,120 @@ yuv_probe_hrow :: proc(w, h: c.int) -> int {
 // rather than in the probe has no way to tell which. Sweeping the primary
 // colors gives the sign pattern a control: if each color's U/V deltas track
 // the matrix row it should perturb, the footprint is real.
-yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int, col: int) -> int {
+// The arbiter: swscale and the reference, byte for byte, on the same input.
+//
+// The pattern deliberately varies along BOTH axes. An earlier fixture used a
+// full-period LCG whose every row was copied from row 0, which makes the
+// vertical stage collapse to a DC gain -- a 1D fit then looks legitimate
+// when the real kernel is 2D, and the fit "succeeds" while describing
+// nothing. Rows must differ here or this comparison cannot fail when it
+// should.
+yuv_probe_verify :: proc(w, h: c.int, flat: bool) -> int {
+	rgba := make([]u8, w * h * 4)
+	defer delete(rgba)
+	// Row-constant variant: with every luma row identical the vertical
+	// filter collapses to unity gain regardless of its taps, so swscale's
+	// byte exposes the per-pixel chroma P directly. That separates the two
+	// things a mismatch could mean -- wrong P, or wrong kernel -- which the
+	// combined run cannot.
+	for y in 0 ..< h {
+		sy := y
+		if flat {
+			sy = 0
+		}
+		for x in 0 ..< w {
+			i := (y * w + x) * 4
+			rgba[i + 0] = u8((x * 7 + sy * 29 + 3) & 255)
+			rgba[i + 1] = u8((x * 11 + sy * 53 + 71) & 255)
+			rgba[i + 2] = u8((x * 17 + sy * 97 + 149) & 255)
+			rgba[i + 3] = 255
+		}
+	}
+	y_ls := yuv_probe_linesize(w)
+	buf := make([]u8, y_ls * h * 3 / 2)
+	defer delete(buf)
+	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
+	ls: [4]c.int = {y_ls, y_ls, 0, 0}
+	ctx: ^sws.Context
+	if !yuv_probe_convert(rgba, w, h, &data, &ls, &ctx) {
+		fmt.println("yuv-exact: sws.scale failed")
+		return 1
+	}
+	defer sws.freeContext(ctx)
+
+	uv_w := w / 2
+	ref := make([]u8, y_ls * h * 3 / 2)
+	defer delete(ref)
+	su := make([]i32, w * h / 2)
+	defer delete(su)
+	sv := make([]i32, w * h / 2)
+	defer delete(sv)
+	yuv_ref_rgba_to_nv12(rgba, int(w), int(h), int(y_ls), int(y_ls), ref, su, sv)
+
+	// Compare only the regions swscale actually writes. The chroma rows are
+	// uv_w*2 bytes wide but sit at stride y_ls, so the tail of each row is
+	// untouched padding -- comparing it would report a mismatch that is not
+	// a conversion difference but a buffer we never asked anyone to fill.
+	mismatches := 0
+	first := 0
+	for y in 0 ..< h {
+		for x in 0 ..< w {
+			a := buf[y * y_ls + x]
+			b := ref[y * y_ls + x]
+			if a != b {
+				mismatches += 1
+				if first < 8 {
+					fmt.println(
+						"Y  mismatch at x =",
+						x,
+						", y =",
+						y,
+						"swscale =",
+						a,
+						"ref =",
+						b,
+					)
+					first += 1
+				}
+			}
+		}
+	}
+	uv_base := y_ls * h
+	for k in 0 ..< h / 2 {
+		for c in 0 ..< uv_w * 2 {
+			a := buf[uv_base + k * y_ls + c]
+			b := ref[uv_base + k * y_ls + c]
+			if a != b {
+				mismatches += 1
+				if first < 8 {
+					plane := "U"
+					if c & 1 == 1 {
+						plane = "V"
+					}
+					fmt.println(
+						plane,
+						" mismatch at",
+						c / 2,
+						",",
+						k,
+						"swscale =",
+						a,
+						"ref =",
+						b,
+					)
+					first += 1
+				}
+			}
+		}
+	}
+	fmt.println("yuv-exact: verify", w, "x", h, "mismatches =", mismatches)
+	if mismatches == 0 {
+		return 0
+	}
+	return 1
+}
+
+yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int, col: int, bgv: int) -> int {
 	// R, G, B of the single impulse; the plane constants are the YUV
 	// primaries, and white/gray are the neutral controls.
 	imp: [4][3]u8 = {
@@ -330,7 +443,13 @@ yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int, col: int) -> int {
 	}
 	rgba := make([]u8, w * h * 4)
 	defer delete(rgba)
-	bg: [3]u8 = {128, 128, 128}
+	// Background is a parameter because a 128-gray background makes the
+	// impulse deltas small (-7), and two unequal kernel weights can round to
+	// the SAME byte at that magnitude -- which is exactly how a 2-tap
+	// horizontal kernel was "confirmed" here when it is not. Black raises
+	// the delta enough that unequal weights cannot hide.
+	bgb := u8(bgv & 255)
+	bg: [3]u8 = {bgb, bgb, bgb}
 	if solid {
 		bg = imp[ci]
 	}
@@ -478,7 +597,13 @@ yuv_exact_probe_run :: proc() -> int {
 				col = int(v)
 			}
 		}
-		return yuv_probe_pixel(n, n, py, px, col)
+		bgv: int = 128
+		if len(fields) > 5 {
+			if v, ok := strconv.parse_int(fields[5]); ok {
+				bgv = int(v)
+			}
+		}
+		return yuv_probe_pixel(n, n, py, px, col, bgv)
 	}
 	if strings.has_prefix(mode, "warm") {
 		return yuv_probe_warm(n, n, 4)
@@ -494,6 +619,12 @@ yuv_exact_probe_run :: proc() -> int {
 	}
 	if strings.has_prefix(mode, "dump") {
 		return yuv_probe_dump(n, n)
+	}
+	if strings.has_prefix(mode, "flat") {
+		return yuv_probe_verify(n, n, true)
+	}
+	if strings.has_prefix(mode, "verify") {
+		return yuv_probe_verify(n, n, false)
 	}
 	fmt.println("yuv-exact: need VYPER_YUV_EXACT_PROBE=\"dump[:N]\"")
 	return 2
