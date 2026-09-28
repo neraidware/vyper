@@ -431,9 +431,11 @@ gpu_resample_into :: proc(
 		},
 	)
 	sdl.EndGPUCopyPass(cp)
+	pass_done := time.now()._nsec
 	if !sdl.SubmitGPUCommandBuffer(cb) {
 		return false
 	}
+	submitted := time.now()._nsec
 	if !sdl.WaitForGPUIdle(g.device) {
 		return false
 	}
@@ -443,6 +445,8 @@ gpu_resample_into :: proc(
 		// recorded, so the readback cost is not understated by putting
 		// the map outside.
 		render_pipe.res_gpu_ns += download_done - upload_done
+		render_pipe.res_submit_ns += submitted - pass_done
+		render_pipe.res_wait_ns += download_done - submitted
 	}
 	back := sdl.MapGPUTransferBuffer(g.device, g.down, true)
 	if back == nil {

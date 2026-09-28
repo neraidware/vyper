@@ -1758,6 +1758,26 @@ Render_Pipeline :: struct {
 	// upload and the resample itself are untouched by it.
 	res_upload_ns:     i64,
 	res_gpu_ns:        i64,
+	// res_gpu_ns split again, because "the GPU work" and "waiting for the GPU"
+	// are different costs: if WaitForGPUIdle is most of it, this is a pipeline
+	// stall and not compute, and the fix is a different thing entirely.
+	res_submit_ns:     i64,
+	// The CPU kernel's own time, in-app and next to the GPU numbers above.
+	// The probe times the same function in isolation and reports ~8x more
+	// than it costs here, so only this in-app number settles which resample
+	// path is actually cheaper in the shipping configuration.
+	cpu_resample_ns:   i64,
+	// Call count for cpu_resample_ns. Dividing the total by the run's frame
+	// count is only the per-call cost if the resample ran on EVERY frame; if
+	// it ran on a subset, the per-frame number is the per-call cost deflated
+	// by the ratio, which is a flattering and wrong way to report a kernel.
+	cpu_resample_n:    int,
+	rect_n:            int,
+	rect_min_area:     int,
+	rect_max_area:     int,
+	rect_w_min:        int,
+	rect_w_max:        int,
+	res_wait_ns:       i64,
 	res_download_ns:   i64,
 	enc_sws_ns:        i64,
 	enc_upload_ns:     i64,
@@ -1975,6 +1995,7 @@ render_worker_run :: proc() {
 	// defer so the report can read them on any exit path.
 	split_timing := os.get_env_alloc("VYPER_FRAME_TIME", context.temp_allocator) != ""
 	render_split_timing = split_timing
+	render_probe_rect = split_timing
 	audio_ns, composite_ns, loop_start := i64(0), i64(0), i64(0)
 	defer {
 		// Stop+join the decode producer BEFORE resetting the decoders: the
@@ -2061,9 +2082,26 @@ render_worker_run :: proc() {
 				f64(comp_resample) / 1e6 / f64(frames),
 			)
 			fmt.printf(
-				"[frame-time]   resample split: upload=%.2fms/f gpu=%.2fms/f download=%.2fms/f\n",
+				"[frame-time]   CPU resample kernel: %.2fms/call over %d calls (%.2fms/f over %d frames)\n",
+				f64(render_pipe.cpu_resample_ns) / 1e6 / f64(max(render_pipe.cpu_resample_n, 1)),
+				render_pipe.cpu_resample_n,
+				f64(render_pipe.cpu_resample_ns) / 1e6 / f64(frames),
+				frames,
+			)
+			fmt.printf(
+				"[keyed-rect] over %d calls: crop width %d..%d, area %d..%d\n",
+				render_pipe.rect_n,
+				render_pipe.rect_w_min,
+				render_pipe.rect_w_max,
+				render_pipe.rect_min_area,
+				render_pipe.rect_max_area,
+			)
+			fmt.printf(
+				"[frame-time]   resample split: upload=%.2fms/f record=%.2fms/f submit=%.2fms/f wait=%.2fms/f download=%.2fms/f\n",
 				f64(render_pipe.res_upload_ns) / 1e6 / f64(frames),
-				f64(render_pipe.res_gpu_ns) / 1e6 / f64(frames),
+				f64(render_pipe.res_gpu_ns - render_pipe.res_submit_ns - render_pipe.res_wait_ns) / 1e6 / f64(frames),
+				f64(render_pipe.res_submit_ns) / 1e6 / f64(frames),
+				f64(render_pipe.res_wait_ns) / 1e6 / f64(frames),
 				f64(render_pipe.res_download_ns) / 1e6 / f64(frames),
 			)
 			fmt.printf("[frame-time]   decode(producer)=%.2fms/f (codec=%.2fms/f scale=%.2fms/f)\n",
@@ -2322,6 +2360,9 @@ render_worker_run :: proc() {
 	render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
 	render_pipe.comp_zero_ns, render_pipe.comp_resample_ns, render_pipe.comp_blit_ns = 0, 0, 0
 	render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
+	render_pipe.res_submit_ns, render_pipe.res_wait_ns = 0, 0
+	render_pipe.cpu_resample_ns, render_pipe.cpu_resample_n = 0, 0
+	render_pipe.rect_n, render_pipe.rect_w_min, render_pipe.rect_w_max = 0, 1 << 30, 0
 	render_pipe.enc_video_ns, render_pipe.enc_audio_ns = 0, 0
 	render_pipe.enc_sws_ns, render_pipe.enc_upload_ns, render_pipe.enc_send_ns, render_pipe.enc_drain_ns = 0, 0, 0, 0
 	// One-time semaphore priming: counts are self-balancing across renders, so
@@ -2785,13 +2826,46 @@ render_eval_keyed_geom :: proc(
 				render_keyed_fallbacks += 1
 			}
 		}
+		if render_split_timing {
+			// Track the range, not just the first frame: if the crop moves or
+			// shrinks on later frames then the per-frame average below is not
+			// comparable to a probe case that resamples a whole stage.
+			area := int(srcw) * int(srch)
+			if render_pipe.rect_n == 0 {
+				render_pipe.rect_min_area, render_pipe.rect_max_area = area, area
+			}
+			render_pipe.rect_n += 1
+			render_pipe.rect_min_area = min(render_pipe.rect_min_area, area)
+			render_pipe.rect_max_area = max(render_pipe.rect_max_area, area)
+			render_pipe.rect_w_min = min(render_pipe.rect_w_min, int(srcw))
+			render_pipe.rect_w_max = max(render_pipe.rect_w_max, int(srcw))
+		}
+		if render_split_timing && render_probe_rect {
+			// The probe resamples the FULL stage, the exporter resamples the
+			// crop sub-rect of it. Without this the two CPU numbers cannot be
+			// compared, and the GPU one is worse still: it uploads the whole
+			// stage whatever the crop is.
+			fmt.printf("[keyed-rect] stage=%dx%d crop=%d,%d %dx%d -> out %dx%d\n",
+				int(v.fw), int(v.fh), int(srcx), int(srcy), int(srcw), int(srch),
+				int(rw), int(rh))
+			render_probe_rect = false
+		}
+		t_cpu := time.now()._nsec
 		if !yuvconv.rgba_resample(
 			raw_data(slot.blit), int(v.fw) * 4,
 			int(srcx), int(srcy), int(srcw), int(srch),
 			raw_data(v.kres_scratch), int(rw) * 4,
 			int(rw), int(rh),
 		) {
+			if render_split_timing {
+				render_pipe.cpu_resample_ns += time.now()._nsec - t_cpu
+				render_pipe.cpu_resample_n += 1
+			}
 			return true
+		}
+		if render_split_timing {
+			render_pipe.cpu_resample_ns += time.now()._nsec - t_cpu
+			render_pipe.cpu_resample_n += 1
 		}
 		render_keyed_frames += 1
 		render_blit_region(canvas, render_job.width, render_job.height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
@@ -3025,6 +3099,10 @@ keyed_gpu_enabled := true
 // export path pays nothing for the counters.
 render_split_timing := false
 
+// One-shot: print the keyed crop geometry once per run, because the resample
+// cost is meaningless without knowing how much of the stage it touches.
+render_probe_rect := false
+
 render_start :: proc() {
 	if render_is_busy() {
 		return
@@ -3046,8 +3124,15 @@ render_start :: proc() {
 	render_keyed_fallbacks = 0
 	// Read once per run, not per clip: os lookup on a hot path is a needless
 	// string compare per frame per clip.
-	_, gpu_off := os.lookup_env_alloc("VYPER_KEYED_GPU", context.temp_allocator)
-	keyed_gpu_enabled = !gpu_off
+	// The VALUE decides, not its presence. Presence-only parsing made
+	// VYPER_KEYED_GPU=1 mean "off", which is the exact opposite of what it
+	// reads like -- and the silent part is the problem, since the path is
+	// still correct, just slower, so a run that asked for the GPU and got
+	// the kernel looks like a measurement instead of a misparse. Only an
+	// explicit 0 pins the kernel; anything else, including 1, leaves the GPU
+	// on, so the knob cannot be set backwards.
+	gpu_setting, gpu_found := os.lookup_env_alloc("VYPER_KEYED_GPU", context.temp_allocator)
+	keyed_gpu_enabled = !(gpu_found && gpu_setting == "0")
 	if !keyed_gpu_enabled {
 		fmt.println("render: VYPER_KEYED_GPU=0 -- pinned to the CPU resample kernel")
 	}

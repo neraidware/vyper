@@ -862,10 +862,59 @@ throughput. See the note appended to S2.
       case is real and does not reproduce here, which is why both numbers
       exist -- but "GPU resample is 8x faster" is a probe claim, not a
       shipping claim, and any future decision that leans on the 8x is leaning
-      on the wrong number. Follow-up: re-run this A/B across the fixture set
-      with the in-app counters before drawing a conclusion, and treat the
-      contention hypothesis (probe vs decode thread) as the first thing to
-      test, not an established cause.
+      on the wrong number.
+
+      **RESOLVED 2026-09-27: the probe's CPU column is the broken number, and it
+      is wrong by ~10x, not merely optimistic.** Added the exporter's own
+      geometry as a probe case (1920x1080->960x540, full stage, exactly what the
+      exporter resamples) and it reads 15.7 ms in the probe against 1.3-1.5
+      ms/call in the exporter. Same `yuv.rgba_resample`, same package, same
+      geometry, and the exporter does 90 such calls per run at a constant
+      full-stage crop (verified: crop width 1920..1920, area 2073600 on all 90).
+      Everything that could explain it was tested and eliminated:
+
+      - **Not the thread.** Ran the identical loop on a spawned worker thread:
+        15.47 ms, matching main's 15.47 ms. The exporter's 1.45 ms is also a
+        worker thread, so "the exporter runs it on a better thread" is out.
+      - **Not warm-up or first touch.** Two back-to-back timed passes agreed to
+        within 1% (15.75 vs 16.84, and 11.09 vs 11.21). An 8-iteration average
+        cannot be hiding a ~115 ms one-time cost.
+      - **Not loop order / driver contention.** Moved the CPU timing to run
+        BEFORE the GPU timing: 10.98 ms against 11.05 ms before the move.
+      - **Not the data.** `rgba_box_downscale` branches only on geometry
+        (`span`/`rows` from 16.16 stepping), never on pixel values, so the
+        fixture pattern cannot change its cost.
+      - **Not the geometry.** All 90 exporter calls use the identical
+        full-stage rect, and the dedicated probe case uses the same numbers.
+
+      1.3-1.5 ms is also the physically plausible figure: ~2.07 M scalar
+      channel loads plus 518 K stores is ~10 MB of traffic, which is ~1 ms of
+      bandwidth. 15.7 ms works out to ~0.7 GB/s, which no memory subsystem on
+      this machine sustains. **The exporter's number is the credible one and the
+      probe's CPU column is measuring something other than the kernel.** The
+      mechanism is still unresolved, so the probe's timing columns and its
+      `N.NNx` ratio are now annotated in place as not-to-be-used-for-decisions;
+      its correctness columns (mean/peak vs the CPU kernel) are unaffected and
+      are what the gate actually asserts.
+
+      **The consequence is a shipped regression, not just a bad number.** With
+      both sides measured in-app and in the shipping configuration:
+
+      | keyed resample, 1920x1080 -> 960x540 | in-app cost |
+      |---|---|
+      | CPU kernel (`VYPER_KEYED_GPU=0`) | 1.45 ms/call, 90 calls |
+      | GPU round trip (`VYPER_KEYED_GPU=1`) | 3.06 ms/call |
+
+      The GPU path costs ~1.6 ms/f MORE on this fixture, of which ~0.94 ms/f is
+      transfer the CPU path never pays. So the default `keyed_gpu_enabled = true`
+      is very likely a pessimization at this geometry, and the justification
+      recorded for it (the probe's 8-10x) does not survive. Follow-up, in
+      order: (1) find what makes the probe's CPU loop 10x slow, because the
+      answer may make the kernel itself 10x faster, which would be a much larger
+      win than either S1c item; (2) A/B the default across the fixture set
+      before flipping it, since the CPU kernel's 50x pathological case is real
+      and a per-geometry rule may be the honest answer; (3) only then revisit
+      the canvas/YUV ordering, which this changes but does not invalidate.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve
