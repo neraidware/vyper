@@ -787,6 +787,33 @@ throughput. See the note appended to S2.
       upload/download cost that currently caps the win at ~5x rather than the
       probe's 8-10x.
 
+      **PART 1 LANDED 2026-09-28 — GPU canvas composite, one readback.**
+      The worker now composites the whole video visual stack into one GPU canvas
+      texture (render_gpu.odin `GPU_Composite` begin/draw/end) and reads it back
+      once per frame into the encoder slot, replacing the per-keyed
+      stage-upload + resample + readback round trip and the CPU
+      `render_blit_region` for static 1:1 clips. Keyed and static clips draw in
+      the same back-to-front z-order the CPU walk used; the first draw's CLEAR
+      is the background fill (skips mem.zero). The CPU canvas is the drop-in
+      fallback, selected up front when the job has a text clip, a subtitle clip,
+      or a crop-scaled static clip (needs swscale bilinear; its kernel differs
+      from blit_box on sub-pixel crops), or when the GPU device is absent;
+      `VYPER_KEYED_GPU=0` pins it for the A/B. `render_gpu_abort` latches a
+      mid-composite driver failure so the run stops instead of encoding a
+      partial frame.
+
+      **Gated by the existing `keyed_export` A/B, which now compares
+      GPU-composite against CPU-composite:** 1:1 PSNR `inf` (byte-identical),
+      0.5x 58.71 dB -- the same value as the previous GPU-resample-vs-CPU A/B,
+      so the canvas path changed no shipped bytes. Proven red: a +1 px dst
+      drift drops 1:1 off bit-exact (`1:1 is not bit-exact`) and 0.5x to
+      34.9 dB. `zorder` passes unchanged (text clip -> CPU fallback). Composite
+      time at 1:1 dropped 3.14 -> 2.42 ms/f (one readback against per-keyed
+      round trips); valgrind clean.
+
+      Remaining under this bullet: run the gated RGBA->NV12 passes on the canvas
+      (no readback) and hand NV12 directly to `hw_frames_ctx`.
+
       **MEASURED 2026-09-27, and it reorders this work.** `VYPER_FRAME_TIME=1`
       on the 1920x1080 keyed fixture, 1:1 and 0.5x:
 

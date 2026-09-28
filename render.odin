@@ -2456,6 +2456,31 @@ render_worker_run :: proc() {
 		}
 	}
 
+	// GPU canvas composite (S1c plumbing, part 1). A video-only job composites
+	// the whole visual stack into one GPU canvas and reads it back once per
+	// frame --
+	//   * dropping the per-keyed upload+readback round trip (the cheap thing
+	//     that made S1b's GPU resample worth less than the probe), and
+	//   * drawing static 1:1 clips as quads instead of CPU region copies.
+	// The CPU canvas is the drop-in fallback. It is selected (not merely the
+	// consequence of a failed create) when anything the quad path cannot yet
+	// reproduce byte-for-byte would be on the stack: a text clip, a subtitle
+	// clip, or a static clip whose crop insets need swscale bilinear (its
+	// kernel differs from blit_box on sub-pixel crops). VYPER_KEYED_GPU=0
+	// pins the CPU composite for the A/B.
+	gpu_frame_ok := keyed_gpu_enabled && len(render_job.texts) == 0 && len(render_job.subs) == 0
+	if gpu_frame_ok {
+		for &vv in render_job.videos {
+			if !vv.geom_keyed && vv.crop_ctx != nil {
+				gpu_frame_ok = false
+				break
+			}
+		}
+	}
+	if gpu_frame_ok && gpu_resample_get() == nil {
+		gpu_frame_ok = false
+	}
+
 	for frame_idx in 0 ..< render_job.nframes {
 		if poll_cancel() {
 			return
@@ -2489,21 +2514,34 @@ render_worker_run :: proc() {
 		}
 		slot_idx := int(frame_idx & 1)
 		eslot := &render_pipe.enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
-		t_stage := time.now()._nsec
-		if !skip_canvas_zero {
+		// The GPU composite begins before the zero fill: its first draw's
+		// CLEAR is the background fill, so the mem.zero is the CPU-only path.
+		gpu_canvas: GPU_Composite
+		gpu_active := false
+		t_walk := time.now()._nsec
+		if gpu_frame_ok {
+			if gc, gc_ok := gpu_composite_begin(gpu_resample_get(), int(render_job.width), int(render_job.height)); gc_ok {
+				gpu_canvas = gc
+				gpu_active = true
+			}
+		}
+		if !gpu_active && !skip_canvas_zero {
 			mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
 		}
 		zero_done := time.now()._nsec
-		render_pipe.comp_zero_ns += zero_done - t_stage
+		render_pipe.comp_zero_ns += zero_done - t_walk
 		// One walk over the track-ordered visual stack, back-to-front, so the
 		// bottom track paints first and the top track last. Text and video are in
 		// the SAME list, so a text clip on a lower track composites under the
 		// video above it exactly as the preview does; it is no longer "all video,
 		// then all text".
-		t_walk := time.now()._nsec
+		t_gpu := time.now()._nsec
 		for i := len(render_job.visuals) - 1; i >= 0; i -= 1 {
 			#partial switch src in render_job.visuals[i] {
 			case ^Render_Video_Src:
+				if gpu_active && render_gpu_abort {
+					continue
+				}
 				if !clip_visible_at(timeline_frame, src.timeline_start_frame, src.source_length_frames) {
 					continue
 				}
@@ -2515,10 +2553,14 @@ render_worker_run :: proc() {
 				if !slot.ok {
 					continue
 				}
+				gpu_ctx: ^GPU_Composite
+				if gpu_active {
+					gpu_ctx = &gpu_canvas
+				}
 				if src.geom_keyed {
-					render_eval_keyed_geom(src, timeline_frame, slot, eslot.canvas)
+					render_eval_keyed_geom(src, timeline_frame, slot, eslot.canvas, gpu_ctx)
 				} else {
-					render_blit(eslot.canvas, render_job.width, render_job.height, src, slot)
+					render_blit(eslot.canvas, render_job.width, render_job.height, src, slot, gpu_ctx)
 				}
 			case ^Render_Text_Src:
 				t := src
@@ -2548,12 +2590,25 @@ render_worker_run :: proc() {
 				)
 			}
 		}
+		// The GPU composite ends here, before the walk timing lands: the
+		// readback is part of the composite. An abort latches a driver-level
+		// failure; the remaining video draws were skipped (the guard in the
+		// walk) and the run stops below rather than encode a partial frame.
+		if gpu_active {
+			if !gpu_composite_end(&gpu_canvas, eslot.canvas) {
+				render_gpu_abort = true
+			}
+		}
+		if render_gpu_abort {
+			fmt.println("render-gpu: composite failed, aborting export")
+			return
+		}
 		// The whole visual walk, so the per-clip resample time is a SUBSET of
 		// this and the printed "blits" is a clean difference. Timing the walk
 		// as one span is what makes the split honest: a per-case accumulator
 		// placed before a clip's own work cannot contain that work, so
 		// subtracting the resample from it goes negative.
-		render_pipe.comp_blit_ns += time.now()._nsec - t_walk
+		render_pipe.comp_blit_ns += time.now()._nsec - t_gpu
 		// Composite subtitle-generator clips last. That is SUBTITLE_PIN_KEY
 		// showing up as code: the key is 0, the lowest, and both pipelines draw
 		// the lowest key last, so "pinned on top" is the same statement here as
@@ -2812,11 +2867,15 @@ render_blit_region :: proc(canvas: []u8, draw_w, draw_h: c.int, src_buf: []u8, s
 // max-scale stage slot. Returns true when the clip occupied (or attempted)
 // this frame; false means it was fully off-canvas and the composite skips it.
 // Worker thread: v.rw/rh/ox/oy are worker-owned and rewritten every frame.
+// gpu, when non-nil, composites the clip into the GPU canvas (draw in
+// z-order, no readback); nil keeps the CPU renders below. The geometry is the
+// same either way -- one source of the crop/dest rects for both paths.
 render_eval_keyed_geom :: proc(
 	v: ^Render_Video_Src,
 	timeline_frame: i64,
 	slot: ^Render_Blit_Slot,
 	canvas: []u8,
+	gpu: ^GPU_Composite,
 ) -> bool {
 	off := i32(timeline_frame - v.timeline_start_frame)
 	_, _, _, _, _, _, _, ox, oy, rw, rh, srcx, srcy, srcw, srch :=
@@ -2832,6 +2891,23 @@ render_eval_keyed_geom :: proc(
 	if ox >= render_job.width || oy >= render_job.height ||
 	   ox + rw <= 0 || oy + rh <= 0 {
 		return false
+	}
+	if gpu != nil {
+		// The GPU canvas draws the crop sub-rect of the stage to the dest
+		// rect in one pass -- the 1:1 case included, where blit_box's rho=1
+		// single-texel fetch is byte-exact. The CPU paths below are all
+		// kres_scratch round trips by comparison.
+		if !gpu_composite_draw(
+			gpu,
+			raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
+			int(srcx), int(srcy), int(srcw), int(srch),
+			int(ox), int(oy), int(rw), int(rh),
+		) {
+			return false
+		}
+		render_keyed_frames += 1
+		render_keyed_gpu_frames += 1
+		return true
 	}
 	// 1:1 needs no resample, and neither resampler should be asked for one.
 	// This is the common case, not an edge case: a keyed scale animation spends
@@ -3014,12 +3090,38 @@ render_eval_keyed_geom :: proc(
 // The slot holds the full (pre-crop) frame plus the crop geometry the producer
 // resolved; crop insets select the visible
 // source sub-region that fills the display box (matching the preview's UV crop).
-render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, slot: ^Render_Blit_Slot) {
+// gpu, when non-nil, draws the same pixels into the GPU canvas; only reached
+// when the job has no crop-scaled static clip (that path keeps sws bilinear),
+// so both GPU branches below are 1:1 region copies, byte-exact in the
+// composite contract.
+render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, slot: ^Render_Blit_Slot, gpu: ^GPU_Composite) {
 	top := max(v.oy, 0)
 	bottom := min(v.oy + v.rh, draw_h)
 	left := max(v.ox, 0)
 	right := min(v.ox + v.rw, draw_w)
 	if bottom <= top || right <= left {
+		return
+	}
+	if gpu != nil {
+		rows := bottom - top
+		cols := right - left
+		srow, scol: int
+		if slot.crop_w > 0 && slot.crop_h > 0 {
+			// Decoder pre-scaled the visible region into the full box at
+			// fit_ox/oy; the clipped dst maps 1:1 back onto it.
+			srow, scol = int(slot.fit_oy), int(slot.fit_ox)
+		} else {
+			srow, scol = int(top - v.oy), int(left - v.ox)
+		}
+		if !gpu_composite_draw(
+
+			gpu,
+			raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
+			scol, srow, int(cols), int(rows),
+			int(left), int(top), int(cols), int(rows),
+		) {
+			return
+		}
 		return
 	}
 	if slot.crop_w > 0 && slot.crop_h > 0 {
@@ -3222,6 +3324,12 @@ render_keyed_frames: int
 render_keyed_gpu_frames: int
 render_keyed_fallbacks: int
 
+// render_gpu_abort latches a mid-composite GPU failure (a draw or readback
+// that fails AFTER the frame began) so the worker stops the export instead of
+// encoding a partially-composited frame. Reset per run; only set from
+// render_gpu.odin failure paths.
+render_gpu_abort := false
+
 // keyed_gpu_enabled is the A/B switch. Default on: the GPU path is the
 // intended default and the CPU kernel is the fallback, not the reverse. Set
 // VYPER_KEYED_GPU=0 to pin the kernel for a controlled comparison.
@@ -3255,6 +3363,7 @@ render_start :: proc() {
 	render_keyed_frames = 0
 	render_keyed_gpu_frames = 0
 	render_keyed_fallbacks = 0
+	render_gpu_abort = false
 	// Read once per run, not per clip: os lookup on a hot path is a needless
 	// string compare per frame per clip.
 	// The VALUE decides, not its presence. Presence-only parsing made

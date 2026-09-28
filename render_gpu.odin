@@ -61,6 +61,16 @@ GPU_Resample :: struct {
 	dst:     ^sdl.GPUTexture,
 	dst_cap: int,
 
+	// canvas is the GPU composite target for video-only exports: one texture
+	// at the job's frame size the whole visual walk draws into in z-order,
+	// holding LOAD between draws and read back once per frame. S1b's per-keyed
+	// readback is dropped with it. Reused across frames (the job size is
+	// fixed); the CPU composite is the drop-in fallback whenever text or a
+	// crop-scaled static clip is present.
+	canvas:    ^sdl.GPUTexture,
+	canvas_w:  int,
+	canvas_h:  int,
+
 	up:        ^sdl.GPUTransferBuffer,
 	up_cap:    int,
 	down:      ^sdl.GPUTransferBuffer,
@@ -223,12 +233,11 @@ gpu_resample_create :: proc(g: ^GPU_Resample) -> bool {
 	return true
 }
 
-// gpu_resample_stage makes sure `src` is resident as a sampled texture. The
-// texture is reused across frames so the hot path never re-creates a driver
-// object; the PIXELS are re-uploaded every call, because the source buffer's
-// contents change every frame even when its address and size do not.
-// Returns false on failure.
-gpu_resample_stage :: proc(g: ^GPU_Resample, src: [^]u8, src_bytes: int, w, h: int) -> bool {
+// gpu_stage_map makes sure `src` is staged in g.up (mapped, copied, unmapped)
+// and the stage texture is shaped for w x h. The caller owns the command
+// buffer: gpu_resample_stage submits a standalone upload, the composite path
+// folds the upload into the frame's own command buffer.
+gpu_stage_map :: proc(g: ^GPU_Resample, src: [^]u8, src_bytes: int, w, h: int) -> bool {
 	if w <= 0 || h <= 0 {
 		return false
 	}
@@ -280,7 +289,14 @@ gpu_resample_stage :: proc(g: ^GPU_Resample, src: [^]u8, src_bytes: int, w, h: i
 	}
 	copy(([^]u8)(staged)[:bytes], src[:bytes])
 	sdl.UnmapGPUTransferBuffer(g.device, g.up)
+	return true
+}
 
+// gpu_resample_stage: standalone upload for the single-resample path.
+gpu_resample_stage :: proc(g: ^GPU_Resample, src: [^]u8, src_bytes: int, w, h: int) -> bool {
+	if !gpu_stage_map(g, src, src_bytes, w, h) {
+		return false
+	}
 	cb := sdl.AcquireGPUCommandBuffer(g.device)
 	cp := sdl.BeginGPUCopyPass(cb)
 	sdl.UploadToGPUTexture(
@@ -460,6 +476,190 @@ gpu_resample_into :: proc(
 	return true
 }
 
+// GPU_Composite is the per-frame state of the GPU canvas composite. One
+// instance on the worker thread's stack per frame; the draws interleave
+// upload passes and z-ordered CLEAR/LOAD render passes in a single command
+// buffer, and the frame end reads the canvas back once.
+//
+// draw is the gpu_composite_probe pattern applied to the exporter: per-clip
+// geometry as bounds/uv/viewport goes through the SAME quad + blit_box
+// pipeline the probe gates, so a 1:1 sub-rect is byte-exact, a box downscale
+// matches the CPU kernel within its agreement bound, and overwrites earlier
+// draws (opaque copy, blend off) -- z-order is the draw order, exactly as the
+// CPU walk paints back-to-front.
+GPU_Composite :: struct {
+	g:     ^GPU_Resample,
+	cb:    ^sdl.GPUCommandBuffer,
+	w:     int,
+	h:     int,
+	draws: int,
+}
+
+// gpu_composite_begin opens the frame: canvas sized to the job, download
+// buffer at least a full frame, command buffer acquired. The job size is
+// fixed, so the canvas is created at most once. FALSE means the caller falls
+// back to the CPU composite for the whole run.
+gpu_composite_begin :: proc(g: ^GPU_Resample, w, h: int) -> (c: GPU_Composite, ok: bool) {
+	if g == nil || gpu_resample_disabled || w <= 0 || h <= 0 {
+		return
+	}
+	if g.canvas == nil || g.canvas_w != w || g.canvas_h != h {
+		if g.canvas != nil {
+			sdl.ReleaseGPUTexture(g.device, g.canvas)
+			g.canvas = nil
+		}
+		g.canvas = sdl.CreateGPUTexture(
+			g.device,
+			sdl.GPUTextureCreateInfo {
+				type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
+				width = u32(w), height = u32(h), layer_count_or_depth = 1,
+				num_levels = 1, sample_count = ._1,
+			},
+		)
+		if g.canvas == nil {
+			return
+		}
+		g.canvas_w, g.canvas_h = w, h
+	}
+	bytes := w * h * 4
+	if g.down_cap < bytes {
+		if g.down != nil {
+			sdl.ReleaseGPUTransferBuffer(g.device, g.down)
+			g.down = nil
+		}
+		g.down = sdl.CreateGPUTransferBuffer(g.device, sdl.GPUTransferBufferCreateInfo {
+			usage = .DOWNLOAD, size = u32(bytes),
+		})
+		if g.down == nil {
+			return
+		}
+		g.down_cap = bytes
+	}
+	c = GPU_Composite{g = g, w = w, h = h}
+	c.cb = sdl.AcquireGPUCommandBuffer(g.device)
+	if c.cb == nil {
+		return
+	}
+	return c, true
+}
+
+// gpu_composite_draw stages one clip's decoded frame and draws its rect into
+// the canvas, in z-order. load_policy: the first draw CLEARs to match the CPU
+// path's per-frame mem.zero, every later draw LOADs so the stack below it
+// stays. Returns false only on a driver-level failure; the caller stops the
+// export rather than composite a partially-drawn frame.
+gpu_composite_draw :: proc(
+	c: ^GPU_Composite,
+	src: [^]u8, src_bytes: int, sw, sh: int,
+	srcx, srcy, srcw, srch: int,
+	ox, oy, rw, rh: int,
+) -> bool {
+	g := c.g
+	if !gpu_stage_map(g, src, src_bytes, sw, sh) {
+		render_gpu_abort = true
+		return false
+	}
+	cp := sdl.BeginGPUCopyPass(c.cb)
+	sdl.UploadToGPUTexture(
+		cp,
+		sdl.GPUTextureTransferInfo {
+			transfer_buffer = g.up, pixels_per_row = u32(sw), rows_per_layer = u32(sh),
+		},
+		sdl.GPUTextureRegion {texture = g.stage, w = u32(sw), h = u32(sh), d = 1},
+		false,
+	)
+	sdl.EndGPUCopyPass(cp)
+
+	// CLEAR on the first draw doubles as the background fill: CPU mem.zero
+	// writes (0,0,0,0) RGBA and the canvas clear matches those bytes, so the
+	// readback is byte-identical there too.
+	load := sdl.GPULoadOp.LOAD
+	if c.draws == 0 {
+		load = .CLEAR
+	}
+	target := sdl.GPUColorTargetInfo {
+		texture = g.canvas, load_op = load, store_op = .STORE,
+		clear_color = {0, 0, 0, 0},
+	}
+	pass := sdl.BeginGPURenderPass(c.cb, &target, 1, nil)
+	if pass == nil {
+		_ = sdl.CancelGPUCommandBuffer(c.cb)
+		render_gpu_abort = true
+		return false
+	}
+	sdl.SetGPUViewport(
+		pass,
+		sdl.GPUViewport{x = 0, y = 0, w = f32(c.w), h = f32(c.h), min_depth = 0.0, max_depth = 1.0},
+	)
+	sdl.BindGPUGraphicsPipeline(pass, g.pipeline)
+	binding := sdl.GPUTextureSamplerBinding{texture = g.stage, sampler = g.sampler}
+	sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
+	u := Quad_Uniforms {
+		bounds   = {f32(ox), f32(oy), f32(rw), f32(rh)},
+		viewport = {f32(c.w), f32(c.h)},
+		uv       = {
+			f32(srcx) / f32(sw),
+			f32(srcy) / f32(sh),
+			(f32(srcx) + f32(srcw)) / f32(sw),
+			(f32(srcy) + f32(srch)) / f32(sh),
+		},
+	}
+	sdl.PushGPUVertexUniformData(c.cb, 0, &u, u32(size_of(u)))
+	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+	sdl.EndGPURenderPass(pass)
+	c.draws += 1
+	return true
+}
+
+// gpu_composite_end finalizes the frame and reads the canvas into `dst` (the
+// encoder slot, w x h RGBA). Reads the whole canvas once, which is the single
+// readback that replaces S1b's upload+readback per keyed clip.
+gpu_composite_end :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
+	g := c.g
+	bytes := c.w * c.h * 4
+	assert(len(dst) >= bytes, "gpu_composite: destination buffer smaller than the canvas")
+	if c.draws == 0 {
+		// Nothing was visible this frame: still clear the canvas so the
+		// readback is an all-background frame like the CPU zero fill.
+		target := sdl.GPUColorTargetInfo {
+			texture = g.canvas, load_op = .CLEAR, store_op = .STORE,
+			clear_color = {0, 0, 0, 0},
+		}
+		pass := sdl.BeginGPURenderPass(c.cb, &target, 1, nil)
+		if pass == nil {
+			_ = sdl.CancelGPUCommandBuffer(c.cb)
+			render_gpu_abort = true
+			return false
+		}
+		sdl.EndGPURenderPass(pass)
+	}
+	cp := sdl.BeginGPUCopyPass(c.cb)
+	sdl.DownloadFromGPUTexture(
+		cp,
+		sdl.GPUTextureRegion {texture = g.canvas, x = 0, y = 0, w = u32(c.w), h = u32(c.h), d = 1},
+		sdl.GPUTextureTransferInfo {
+			transfer_buffer = g.down, pixels_per_row = u32(c.w), rows_per_layer = u32(c.h),
+		},
+	)
+	sdl.EndGPUCopyPass(cp)
+	if !sdl.SubmitGPUCommandBuffer(c.cb) {
+		render_gpu_abort = true
+		return false
+	}
+	if !sdl.WaitForGPUIdle(g.device) {
+		render_gpu_abort = true
+		return false
+	}
+	back := sdl.MapGPUTransferBuffer(g.device, g.down, true)
+	if back == nil {
+		render_gpu_abort = true
+		return false
+	}
+	copy(dst[:bytes], ([^]u8)(back)[:bytes])
+	sdl.UnmapGPUTransferBuffer(g.device, g.down)
+	return true
+}
+
 gpu_resample_destroy :: proc(g: ^GPU_Resample) {
 	if g == nil {
 		return
@@ -470,6 +670,9 @@ gpu_resample_destroy :: proc(g: ^GPU_Resample) {
 		}
 		if g.up != nil {
 			sdl.ReleaseGPUTransferBuffer(g.device, g.up)
+		}
+		if g.canvas != nil {
+			sdl.ReleaseGPUTexture(g.device, g.canvas)
 		}
 		if g.dst != nil {
 			sdl.ReleaseGPUTexture(g.device, g.dst)
