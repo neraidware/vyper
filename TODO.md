@@ -659,6 +659,48 @@ throughput. See the note appended to S2.
       per clip into a GPU canvas. Dropping the readback is what removes the
       upload/download cost that currently caps the win at ~5x rather than the
       probe's 8-10x.
+
+      **MEASURED 2026-09-27, and it reorders this work.** `VYPER_FRAME_TIME=1`
+      on the 1920x1080 keyed fixture, 1:1 and 0.5x:
+
+      | stage | 1:1 | 0.5x |
+      |---|---|---|
+      | composite | 1.34 ms/f | 5.60 ms/f |
+      | **sws (CPU RGBA->NV12)** | **5.07 ms/f** | **5.27 ms/f** |
+      | upload (NV12 into VAAPI surface) | 0.70 ms/f | 0.92 ms/f |
+      | send | 0.23 ms/f | 0.25 ms/f |
+      | drain | 0.03 ms/f | 0.03 ms/f |
+      | decode producer (overlapped) | 1.76 ms/f | 2.07 ms/f |
+
+      The CPU colorspace conversion is the single largest item in BOTH regimes
+      -- 5.07 of 6.04 ms/f of encoder time at 1:1 (84%), and 81% at 0.5x. It is
+      also the only stage that does not scale with the resample ratio, because
+      it is a pure RGBA->NV12 conversion at source size and is not a resample at
+      all. The pipeline's assumed blocker (raw VAAPI interop, possibly a forked
+      FFmpeg) is NOT where the time is: `enc_hw_upload_open` already gets a
+      `hw_frames_ctx` and the "hardware" path still converts on the CPU, because
+      the only missing link is the RGBA->NV12 pass. That pass is ordinary SDL GPU
+      work and needs no interop and no fork. **So GPU RGBA->NV12 is the first
+      step, ahead of the interop question, not after it.**
+
+      **The gate consequence, which is the real constraint on that step.**
+      `keyed_export` is an A/B of two runs of the SAME renderer --
+      `VYPER_KEYED_GPU=1` (default) against `VYPER_KEYED_GPU=0` (the CPU
+      resample kernel) -- PSNR'd against each other, so `1.0x PSNR = inf` means
+      "the two RESAMPLE KERNELS agree byte-for-byte", and the swscale colorspace
+      conversion is common to both sides and cancels out of the comparison.
+      Moving RGBA->NV12 onto the GPU therefore does NOT threaten the `inf`
+      anchor, because both sides would use the new conversion. What it DOES do
+      is blind that gate to the conversion: a bug in the new pass would land
+      identically on both sides and the PSNR would stay `inf` while the file is
+      wrong. So stage one is only shippable alongside a NEW gate that pins the
+      GPU conversion against what it replaces -- `enc_convert_rgba_fast` (the
+      in-tree SIMD kernel) and/or swscale -- headlessly, bit-exactly, the way
+      `gpu_probe` already pins the resample kernel. Exactness is achievable in
+      principle (the matrix coefficients and the chroma siting are fixed) but
+      that is a claim to be MEASURED, not assumed; if the GPU pass cannot be made
+      byte-identical, the decision becomes "accept a changed 1:1 anchor" versus
+      "keep swscale", and that is a user-facing call.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve
