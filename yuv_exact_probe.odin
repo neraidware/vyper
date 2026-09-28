@@ -301,19 +301,49 @@ yuv_probe_hrow :: proc(w, h: c.int) -> int {
 	return 0
 }
 
-yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int) -> int {
+// The impulse COLOR is a parameter, not a constant. The first version hardcoded
+// red, and red alone cannot distinguish "swscale's chroma kernel is genuinely
+// asymmetric" from "this probe is misreading the plane": a red impulse must
+// push U below the neutral 128, so a positive-U sample anywhere in its
+// footprint is already suspicious, and a reader who assumes a bug in swscale
+// rather than in the probe has no way to tell which. Sweeping the primary
+// colors gives the sign pattern a control: if each color's U/V deltas track
+// the matrix row it should perturb, the footprint is real.
+yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int, col: int) -> int {
+	// R, G, B of the single impulse; the plane constants are the YUV
+	// primaries, and white/gray are the neutral controls.
+	imp: [4][3]u8 = {
+		{255, 0, 0},
+		{0, 255, 0},
+		{0, 0, 255},
+		{255, 255, 255},
+	}
+	// col 4..6 selects a whole-frame solid fill of the red/green/blue primary
+	// (col - 4 indexes imp). The solid flag is derived BEFORE the clamp, or the
+	// clamp silently rewrites 4 to 0 and the mode never fires.
+	solid := col >= 4 && col <= 6
+	ci := col
+	if solid {
+		ci = col - 4
+	} else if ci < 0 || ci > 3 {
+		ci = 0
+	}
 	rgba := make([]u8, w * h * 4)
 	defer delete(rgba)
+	bg: [3]u8 = {128, 128, 128}
+	if solid {
+		bg = imp[ci]
+	}
 	for i in 0 ..< w * h {
-		rgba[i * 4 + 0] = 128
-		rgba[i * 4 + 1] = 128
-		rgba[i * 4 + 2] = 128
+		rgba[i * 4 + 0] = bg[0]
+		rgba[i * 4 + 1] = bg[1]
+		rgba[i * 4 + 2] = bg[2]
 		rgba[i * 4 + 3] = 255
 	}
 	off := (py * w + px) * 4
-	rgba[off + 0] = 255
-	rgba[off + 1] = 0
-	rgba[off + 2] = 0
+	rgba[off + 0] = imp[ci][0]
+	rgba[off + 1] = imp[ci][1]
+	rgba[off + 2] = imp[ci][2]
 	y_ls := yuv_probe_linesize(w)
 	buf := make([]u8, y_ls * h * 3 / 2)
 	defer delete(buf)
@@ -326,9 +356,31 @@ yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int) -> int {
 	}
 	defer sws.freeContext(ctx)
 	uv_w := w / 2
-	fmt.println("single red pixel at y =", py, "x =", px, "(chroma", uv_w, "x", h / 2, ")")
+	names := [4]string{"red", "green", "blue", "white"}
+	fmt.println(
+		"single",
+		names[ci],
+		"pixel at y =",
+		py,
+		"x =",
+		px,
+		"(chroma",
+		uv_w,
+		"x",
+		h / 2,
+		")",
+	)
+	// Dump the chroma plane as swscale actually laid it out: full rows of
+	// ls[1] bytes, so the U/V interleave and the row stride are visible
+	// rather than assumed. The previous version printed "U" from offset 0 and
+	// "V" from offset uv_w on the theory that NV12 is [U row][V row]; on that
+	// reading the impulse showed up only under the V label and at a column
+	// nowhere near the one the impulse should touch, which means the theory
+	// was wrong and the offsets, not the kernel, were the thing under test.
+	// Printing the bytes settles the layout in one run.
+	fmt.println("chroma plane rows, ls[1] =", ls[1], "bytes each, uv_w =", uv_w)
 	for r in 0 ..< h / 2 {
-		yuv_probe_hex_row(fmt.tprintf("U%-2d     ", r), data[1][r * ls[1]:], int(uv_w))
+		yuv_probe_hex_row(fmt.tprintf("c%-2d     ", r), data[1][r * ls[1]:], int(ls[1]))
 	}
 	return 0
 }
@@ -398,9 +450,9 @@ yuv_exact_probe_run :: proc() -> int {
 	if strings.has_prefix(mode, "hrow") {
 		return yuv_probe_hrow(n, n)
 	}
-	if strings.has_prefix(mode, "pix:") {
-		// pix:<size>:<py>:<px>
-		// pix:<size>:<py>:<px> -- the size is its own field, so parse the
+		if strings.has_prefix(mode, "pix:") {
+		// pix:<size>:<py>:<px>[:<color>]
+		// pix:<size>:<py>:<px>[:<color>] -- the size is its own field, so parse the
 		// fields rather than slicing the tail after the first colon (which
 		// leaves "32:16:8" and silently falls back to the default size).
 		fields := strings.split(mode, ":")
@@ -420,7 +472,13 @@ yuv_exact_probe_run :: proc() -> int {
 				px = c.int(v)
 			}
 		}
-		return yuv_probe_pixel(n, n, py, px)
+		col: int = 0
+		if len(fields) > 4 {
+			if v, ok := strconv.parse_int(fields[4]); ok {
+				col = int(v)
+			}
+		}
+		return yuv_probe_pixel(n, n, py, px, col)
 	}
 	if strings.has_prefix(mode, "warm") {
 		return yuv_probe_warm(n, n, 4)
