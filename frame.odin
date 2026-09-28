@@ -63,10 +63,12 @@ render_ui_frame :: proc(
 		}
 		// Upload only the slots whose pixels actually changed this frame. The
 		// re-upload is a full-frame GPU transfer (up to ~4MB per slot), and
-		// every upload allocates + maps a transfer buffer — a blanket
-		// "changed" upload dragged all 8 slots through that even when their
-		// frame never moved (background slots holding a stale-but-correct
-		// face). idempotent: tex_dirty is cleared by upload_preview_slot.
+		// every upload maps the transfer buffer, so a blanket "changed" upload
+		// dragged all 8 slots through that even when their frame never moved
+		// (background slots holding a stale-but-correct face). The buffer
+		// itself is cached and grown by gpu_upload_tb, so the cost avoided here
+		// is the map plus the copy, not an allocation.
+		// idempotent: tex_dirty is cleared by upload_preview_slot.
 		if slot.tex_dirty {
 			upload_preview_slot(renderer, command_buffer, slot)
 		}
