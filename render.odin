@@ -2557,9 +2557,20 @@ render_worker_run :: proc() {
 		// placed before a clip's own work cannot contain that work, so
 		// subtracting the resample from it goes negative.
 		render_pipe.comp_blit_ns += time.now()._nsec - t_walk
-		// Composite subtitle-generator clips last (on top of everything else —
-		// the natural subtitle layering; matches the preview, where the topmost
-		// text/bottom-most slot order puts subtitles above the decoded faces).
+		// Composite subtitle-generator clips last. That is SUBTITLE_PIN_KEY
+		// showing up as code: the key is 0, the lowest, and both pipelines draw
+		// the lowest key last, so "pinned on top" is the same statement here as
+		// in preview_draw_key. The rule is in render_order.odin precisely because
+		// it used to be stated twice -- once as this trailing pass, once as the
+		// preview's sort key -- and two statements of one rule is how this pair
+		// drifted before.
+		//
+		// The pass stays separate from the stack walk above rather than merging
+		// into it. Merging would mean one loop with a per-item branch across two
+		// unrelated backends: this one rasterises CPU pixels out of the decode
+		// stage, the preview draws a fractional UV quad on the GPU. Only the
+		// ORDER is shared, and it is now shared by derivation instead of by two
+		// implementations agreeing.
 		for i in 0 ..< len(render_job.subs) {
 			s := &render_job.subs[i]
 			if timeline_frame < s.timeline_start_frame ||

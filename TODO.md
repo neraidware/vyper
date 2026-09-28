@@ -1459,16 +1459,71 @@ later work-stream that plugs into it without reshaping what is here.
 
 ## Active 10 — Preview/export parity cleanup (shared geometry, filter, layering)
 
-**Status:** started 2026-09-27. Goal is to remove the duplicated preview/export
-machinery and fix the bugs that duplication already caused, BEFORE attempting to
-unify the two pipelines. Unification itself is deliberately not started: it
-needs a zero-copy interop spike (Active 1 / S1c) and is a project of its own.
+**Status: COMPLETE as of 2026-09-27** (Step E closed the last duplicated rule;
+the two remaining "open" items were not duplication — see Step E). The goal was
+to remove the duplicated preview/export machinery and fix the bugs that
+duplication already caused. What is deliberately still NOT done is unifying the
+two *pipelines* into a zero-copy path: that needs an interop spike (Active 1 /
+S1c) and is its own project. Sharing the RULES is finished; sharing the
+pipeline is not, and the two should not be conflated.
 
 All three parity bugs are fixed (A1/A2 for the filter, B/B2 for geometry, C for
-layering, D for subtitles) and `all` is green. Still open in this section: the
-preview's UV arithmetic is NOT merged with the export's, on purpose — see the
-note under B2 — and the remaining duplicated machinery is decode/stage sizing
-and preview/export text rasterization.
+layering, D for subtitles) and `all` is green.
+
+**Step E — DONE 2026-09-27: the last duplicated rule is now stated once, and
+the two remaining "still open" items turned out not to be duplication at all.**
+
+The section previously listed three things as still open. Checked against the
+tree rather than against these notes, two of them dissolve:
+
+- *"decode/stage sizing duplication"* — already shared. `source_fit_in_buffer`
+  (decode.odin:1036) is the single implementation and both the preview slot
+  path and the export stage path call it; `open_clip_decoder_ex` is the one
+  stage-sizing entry point. Nothing to merge.
+- *"preview/export text rasterization"* — not duplication but a correct
+  producer/consumer split, and the code says so. The preview's FIRST pass
+  rasterizes at the base font (48px) to produce the scale-independent
+  `clip.source_w/h`; the export's snapshot CONSUMES those dims and only
+  rasterizes at `48*scale` for resolution (preview_state.odin:533-549 spells
+  out why the two notions are decoupled — baking the scale into `source_w/h`
+  would make handle-drag double-count). Collapsing these into one proc would
+  destroy the thing that makes the drag math work.
+- *"the preview's UV arithmetic is not merged with the export's"* — still
+  deliberate, and now stated as a boundary rather than an omission. The
+  preview samples a fractional UV quad into a `PREVIEW_W x PREVIEW_H` buffer;
+  the export blits integer pixels out of the max-scale decode stage. Different
+  output spaces, so the backends stay separate. Only the ORDER is shared.
+
+What genuinely remained was the draw-order rule, which was stated twice: the
+preview sorted by `preview_draw_key`, the export relied on the order
+`render_job.visuals` happened to be built in plus a trailing subtitle pass.
+Both were correct, and correct by coincidence — nothing tied them together, so
+the next layer rule would have been written twice and trusted twice. That is
+the same failure mode that produced all three shipped bugs above.
+
+`render_order.odin` now owns the rule: `SUBTITLE_PIN_KEY` and `draw_key(layer,
+is_subtitle)`, with the meaning of the numbers and the reason subtitles pin
+above everything written down once. `preview_draw_key` is a two-line adapter
+onto a `Preview_Slot`; the export's subtitle pass names `SUBTITLE_PIN_KEY` as
+the reason it runs last. The paint loops are deliberately NOT merged — one
+function spanning a CPU blit and a GPU quad draw is worse than a rule called
+twice, and the backends differ in more than the order.
+
+**Also done: `subtitle_probe` is a gate now.** It was reachable only by setting
+`VYPER_SUB_RENDER_PROBE` by hand, so nothing ran it — and nothing else in the
+gate list covered it: `keyed_ab` and `zorder` use a source with no subtitle
+clip at all, and the ui probe only checks the PREVIEW's order ("preview order
+ok (track order, subtitles pinned on top)"), never the export's. First version
+of the target was a false green — it passed on process exit 0 while the binary
+bailed during startup having asserted nothing, and it also inherited
+`$PROBE_ENV`, whose `VYPER_UI_PROBE` runs the ui probe first and needs a media
+file the target does not have. It now runs standalone and greps for the probe's
+own completion line, so "the probe did not run" is a failure.
+
+Remaining in this section: nothing. Unifying the two *pipelines* (no CPU RGBA
+round trip) is still Active 1 / S1c and is still deferred — but that is a
+different project from sharing the rules, and conflating the two is what left
+this section looking unfinished.
 
 Three SHIPPED bugs were found while mapping the duplication, all of them
 consequences of two systems maintaining the same fact independently:

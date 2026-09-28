@@ -2096,29 +2096,14 @@ draw_image_layer :: proc(
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
 
-// SUBTITLE_PIN_KEY is the draw depth reserved for pinned subtitle slots. It sits
-// below every track-assigned layer (the walk starts at 1), which is what makes
-// "pinned on top" expressible: the preview draws the LOWEST key last.
-SUBTITLE_PIN_KEY :: 0
-
-// preview_draw_key is the depth a preview slot sorts by when compositing. LOWER
-// draws LATER and therefore ends up on top.
-//
-// Track order alone already gets this right for ordinary clips: `layer` is the
-// track-order walk position, the topmost track gets layer 1, and the draw loop
-// walks the sorted list backwards, so the top track paints last. Subtitle slots
-// are the exception -- they are pinned ABOVE every other clip, because a
-// burned-in subtitle that a video covers is unreadable, and a subtitle clip on a
-// low track must still land on top.
-//
-// This is derived at the draw site rather than folded into `layer` because
-// `layer` is also the flash overlay's depth (flash_rec.odin), where it must keep
-// meaning "where this clip sits in the stack" and not "pinned above subtitles".
+// preview_draw_key is the depth a preview slot sorts by when compositing. The
+// rule itself -- what the numbers MEAN, that subtitles pin above everything --
+// lives in render_order.odin, because the export has to obey the same rule and
+// two statements of one rule is how this pair drifted before. This is the
+// preview's adapter onto a Preview_Slot; it exists only to read the two
+// inputs the shared rule takes.
 preview_draw_key :: proc(slot: ^Preview_Slot) -> int {
-	if slot.is_subtitle {
-		return SUBTITLE_PIN_KEY
-	}
-	return int(slot.layer)
+	return draw_key(int(slot.layer), slot.is_subtitle)
 }
 
 // preview_build_draw_order collects every visible slot and returns their indices
@@ -2142,6 +2127,8 @@ preview_build_draw_order :: proc() -> (order: [MAX_PREVIEW_SLOTS]int, n: int) {
 	for a := 1; a < n; a += 1 {
 		key := order[a]
 		b := a
+		// Ascending by the shared key, so order[0] is the topmost item and the
+		// caller's backwards walk paints it last.
 		for b > 0 &&
 		   preview_draw_key(&preview_slots[order[b - 1]]) > preview_draw_key(&preview_slots[key]) {
 			order[b] = order[b - 1]

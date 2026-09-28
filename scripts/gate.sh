@@ -156,6 +156,7 @@ KEYED_DIR=target/keyed_export
 KEYED_SRC="$KEYED_DIR/src.mp4"
 KEYED_MIN_DB=50
 ZORDER_DIR=target/zorder
+SUB_DIR=target/subtitle_probe
 
 keyed_export_run() {
 	require_fresh_binary keyed-export || return 1
@@ -405,6 +406,37 @@ target_valgrind() {
 	valgrind_assert "$log" valgrind
 }
 
+# The burned-in-subtitle render check (subtitle_probe.odin). It was reachable
+# only by setting VYPER_SUB_RENDER_PROBE by hand, so nothing ran it. That
+# mattered: a subtitle that stops compositing ABOVE the video, or drifts off
+# its anchor between cues, is invisible to every other target here -- keyed_ab
+# and zorder use a source with no subtitle clip at all. Draw-order work touches
+# exactly the pass this covers, so it has to be a gate rather than a probe
+# somebody remembers. The probe asserts and exits 0/1 itself.
+target_subtitle_probe() {
+	require_fresh_binary subtitle-probe || return 1
+	mkdir -p "$SUB_DIR"
+	if [ ! -s "$KEYED_SRC" ]; then
+		echo "subtitle-probe: needs \$KEYED_SRC; run keyed_export first" >&2
+		return 1
+	fi
+	# NOT $PROBE_ENV: that adds VYPER_UI_PROBE, which runs the ui probe first
+	# and needs a media file this target does not have. The sub probe is
+	# standalone and builds its own timeline.
+	env VYPER_SUB_RENDER_PROBE="$SUB_DIR/subs.mp4" \
+		timeout 600 ./vyper >"$SUB_DIR/subs.log" 2>&1
+	local rc=$?
+	# Assert the probe REACHED its end, not just that the process exited 0.
+	# Without this the target is a false green: the binary can bail during
+	# startup (no media, no font) and exit 0 having asserted nothing.
+	if ! grep -q '\[sub-probe\] all stages complete' "$SUB_DIR/subs.log"; then
+		echo "subtitle-probe: FAILED (exit $rc) -- probe did not complete" >&2
+		tail -20 "$SUB_DIR/subs.log" >&2
+		return 1
+	fi
+	tail -1 "$SUB_DIR/subs.log"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -412,7 +444,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe gpu_probe keyed_export zorder smoke valgrind render_valgrind; do
+	for t in check build probe transform_probe gpu_probe keyed_export zorder subtitle_probe smoke valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -430,12 +462,12 @@ main() {
 	keyed_export) target_keyed_ab ;;
 	zorder) target_zorder ;;
 	render_valgrind) target_render_valgrind ;;
-	zorder) target_zorder ;;
+	subtitle_probe) target_subtitle_probe ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|gpu_probe|keyed_export|zorder|render_valgrind|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|all]" >&2
 		return 2
 		;;
 	esac
