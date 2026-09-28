@@ -26,6 +26,7 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:time"
 import sdl "vendor:sdl3"
 import yuvconv "vendor/yuv"
 
@@ -354,8 +355,13 @@ gpu_resample_into :: proc(
 	sub_rect_ok := srcx >= 0 && srcy >= 0 && srcw > 0 && srch > 0 \
 		&& srcx + srcw <= sw && srcy + srch <= sh
 	assert(sub_rect_ok, "gpu_resample: crop sub-rect escapes the source")
+	t_stage := time.now()._nsec
 	if !gpu_resample_stage(g, src, src_bytes, sw, sh) {
 		return false
+	}
+	upload_done := time.now()._nsec
+	if render_split_timing {
+		render_pipe.res_upload_ns += upload_done - t_stage
 	}
 	if !gpu_resample_dst(g, rw, rh) {
 		return false
@@ -431,12 +437,22 @@ gpu_resample_into :: proc(
 	if !sdl.WaitForGPUIdle(g.device) {
 		return false
 	}
+	download_done := time.now()._nsec
+	if render_split_timing {
+		// Submit + wait + the map: everything after the copy pass is
+		// recorded, so the readback cost is not understated by putting
+		// the map outside.
+		render_pipe.res_gpu_ns += download_done - upload_done
+	}
 	back := sdl.MapGPUTransferBuffer(g.device, g.down, true)
 	if back == nil {
 		return false
 	}
 	copy(dst[:bytes], ([^]u8)(back)[:bytes])
 	sdl.UnmapGPUTransferBuffer(g.device, g.down)
+	if render_split_timing {
+		render_pipe.res_download_ns += time.now()._nsec - download_done
+	}
 	return true
 }
 

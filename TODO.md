@@ -768,13 +768,104 @@ throughput. See the note appended to S2.
       outside its support and correctly does nothing; at `x = w/4` it moves
       two chroma columns.
 
-      **Note the alternative that got cheaper.** At 0.5x the GPU composite
-      (5.60 ms/f) now costs MORE than the colorspace conversion it would
-      enable (5.27 ms/f), and dropping the resample readback is a far simpler
-      change with none of the exactness risk. If the chroma port stalls, that
-      is the better next move, and the two are additive rather than competing:
-      a canvas path removes the readback, the GPU conversion removes the
-      swscale, and neither blocks the other.
+      **MEASURED 2026-09-27: the "just do the canvas instead" alternative is
+      NET NEGATIVE on its own, and this reverses the earlier note here that
+      called the two work items "additive rather than competing".** The canvas
+      was decomposed with new `VYPER_FRAME_TIME` counters
+      (`comp_zero_ns`/`comp_blit_ns`, and `res_upload_ns`/`res_gpu_ns`/
+      `res_download_ns` inside the resample round trip) on the same 1920x1080
+      fixture at 0.5x, one keyed clip plus a subtitle:
+
+      | composite sub-stage | ms/f |
+      |---|---|
+      | canvas zero (8 MB `mem.zero`) | 0.45 |
+      | visual walk (one span, all clips) | 5.05 |
+      | &nbsp;&nbsp;- resample round trip (total) | 2.99 |
+      | &nbsp;&nbsp;&nbsp;&nbsp;- stage upload (8 MB CPU->GPU) | 0.94 |
+      | &nbsp;&nbsp;&nbsp;&nbsp;- resample pass + submit + wait | 1.12 |
+      | &nbsp;&nbsp;&nbsp;&nbsp;- download + map + memcpy back (2 MB) | 0.92 |
+      | &nbsp;&nbsp;- everything else in the walk (blits, subtitle) | 2.06 |
+
+      The walk is timed as ONE span from before the loop to after it, not
+      accumulated per case. A per-case accumulator placed before a clip's own
+      work cannot contain that work, so the first attempt at this split
+      subtracted the resample from a total that excluded it and printed a
+      negative "blits"; the one-span form is what makes the containment true.
+
+      Three consequences, and the third is the one that matters:
+
+      1. The readback the canvas work removes is only **0.92 ms/f**, not the
+         ~3 ms/f the round trip appears to cost. Attacking the round trip as
+         a unit overstates the win by 3x.
+      2. The non-resample `2.06 ms/f` of the walk is NOT mostly clip copying.
+         `render_blit_region` is a plain row-wise `copy` (no blending), so the
+         2 MB keyed blit is a small part of it and the subtitle rasterization
+         is the rest. A GPU canvas would not remove that.
+      3. A GPU canvas makes the download **larger**, not smaller. Today the
+         readback is the clip's own rect (960x540 = 2 MB at 0.5x). Compositing
+         into a GPU canvas means downloading the whole 1920x1080 (8 MB) once
+         instead -- ~+1 ms/f of transfer -- to save a ~0.2 ms/f memcpy. For
+         this single-clip case that is a clear loss, and it only breaks even
+         when many keyed clips each pay a separate readback today.
+
+      **So the two are COUPLED, not additive: route A is the prerequisite, not
+      a parallel alternative.** The coupling is the real finding. `sws` is
+      5.29 ms/f and it reads the 8 MB canvas on the CPU, so:
+
+      - GPU RGBA->NV12 alone kills the 5.29 ms/f and changes nothing about the
+        transfers -- the canvas is still downloaded to the CPU either way,
+        because the encoder's input is a CPU buffer.
+      - GPU canvas alone, per the table above, is net negative.
+      - GPU canvas **and** GPU RGBA->NV12 together are the only combination
+        that removes BOTH the 5.29 ms/f and the 1.94 ms/f of PCIe transfer,
+        because then the canvas download feeds the conversion directly and the
+        CPU never materializes 8 MB of RGBA at all.
+
+      That ordering is worth more than either item alone, and it is why the
+      chroma port is the blocker rather than merely the bigger item. It also
+      means the remaining ~1.9 ms/f of upload/download is the price of a
+      CPU-decoded stage, not a resample problem: it is only removable by
+      keeping frames on the GPU end to end, which is the interop question
+      (Active 1 / S1c) that the SDL `VkDevice` limitation gates.
+
+      **NEW ANOMALY, measured in-app, not yet explained: on this fixture the GPU
+      resample path is SLOWER than the CPU kernel it replaced.** Same command,
+      same frames, only `VYPER_KEYED_GPU` flipped, 0.5x:
+
+      | composite | GPU resample | CPU kernel |
+      |---|---|---|
+      | total | 5.50 ms/f | 3.05 ms/f |
+      | canvas zero | 0.45 | 0.38 |
+      | visual walk | 5.05 | 2.66 |
+      | resample round trip | 2.99 | (n/a) |
+      | keyed frames / gpu frames / fallbacks | 90 / 90 / 0 | 90 / 0 / 0 |
+
+      The GPU round trip (2.99 ms/f) costs more than the ENTIRE CPU visual
+      walk (2.66 ms/f), so on this fixture `VYPER_KEYED_GPU=1` is a
+      pessimization of the export composite, not the win `gpu_probe` reports.
+      This does NOT contradict `gpu_probe` (which measures the kernel in
+      isolation, back to back, with no decode thread running) -- it is exactly
+      the case that isolation hides:
+
+      - `gpu_probe` in isolation: 1600x900->800x450 GPU 1.35 ms vs CPU 11.05 ms.
+      - In-app, same class of resample with a real decoded stage and the
+        producer thread running concurrently: GPU 2.99 ms vs a CPU walk of
+        2.66 ms total.
+      - `WaitForGPUIdle` is a full pipeline stall every frame, and the isolated
+        probe amortises it over `ITERS`; in-app it is once per frame next to a
+        memory-bandwidth-hungry decode thread. Which of those dominates is not
+        yet established.
+
+      So the honest state is: **the resample is NOT established as a win in the
+      shipping configuration**, and the 8-10x in the probe is optimistic. This
+      does not make the GPU path wrong -- the CPU kernel's 50x pathological
+      case is real and does not reproduce here, which is why both numbers
+      exist -- but "GPU resample is 8x faster" is a probe claim, not a
+      shipping claim, and any future decision that leans on the 8x is leaning
+      on the wrong number. Follow-up: re-run this A/B across the fixture set
+      with the in-app counters before drawing a conclusion, and treat the
+      contention hypothesis (probe vs decode thread) as the first thing to
+      test, not an established cause.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve

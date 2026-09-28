@@ -264,6 +264,43 @@ yuv_probe_warm :: proc(w, h: c.int, calls: int) -> int {
 // One red PIXEL, whole chroma plane dumped. Line impulses give the axis
 // profiles convolved with the other axis's total gain; a single pixel gives
 // the separable 2D kernel itself, which is what the shader has to reproduce.
+// Pattern that varies ONLY along x (every row identical). The vertical filter
+// then sees a constant column signal and collapses to a gain, so a chroma row
+// is the horizontal filter's response to the column pattern directly. That is
+// the axis the pixel impulse could not separate, because its two footprints
+// convolve.
+yuv_probe_hrow :: proc(w, h: c.int) -> int {
+	rgba := make([]u8, w * h * 4)
+	defer delete(rgba)
+	yuv_probe_fill_rgba(rgba, 0xC0FFEE11)
+	for y in 0 ..< h {
+		for x in 0 ..< w {
+			px := (y * w + x) * 4
+			rgba[px + 0] = rgba[x * 4 + 0]
+			rgba[px + 1] = rgba[x * 4 + 1]
+			rgba[px + 2] = rgba[x * 4 + 2]
+			rgba[px + 3] = 255
+		}
+	}
+	y_ls := yuv_probe_linesize(w)
+	buf := make([]u8, y_ls * h * 3 / 2)
+	defer delete(buf)
+	data: [4][^]u8 = {raw_data(buf), raw_data(buf[y_ls * h:]), nil, nil}
+	ls: [4]c.int = {y_ls, y_ls, 0, 0}
+	ctx: ^sws.Context
+	if !yuv_probe_convert(rgba, w, h, &data, &ls, &ctx) {
+		fmt.println("yuv-exact: sws.scale failed")
+		return 1
+	}
+	defer sws.freeContext(ctx)
+	uv_w := w / 2
+	fmt.println("hrow: w", w, "chroma width", uv_w)
+	for r in 0 ..< h / 2 {
+		yuv_probe_hex_row(fmt.tprintf("U%-2d     ", r), data[1][r * ls[1]:], int(uv_w))
+	}
+	return 0
+}
+
 yuv_probe_pixel :: proc(w, h: c.int, py, px: c.int) -> int {
 	rgba := make([]u8, w * h * 4)
 	defer delete(rgba)
@@ -357,6 +394,9 @@ yuv_exact_probe_run :: proc() -> int {
 		if parsed, ok := strconv.parse_int(mode[idx + 1:]); ok {
 			n = c.int(parsed)
 		}
+	}
+	if strings.has_prefix(mode, "hrow") {
+		return yuv_probe_hrow(n, n)
 	}
 	if strings.has_prefix(mode, "pix:") {
 		// pix:<size>:<py>:<px>

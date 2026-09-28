@@ -1745,6 +1745,20 @@ Render_Pipeline :: struct {
 	// Sub-split of enc_video_ns for the hw-upload path probe: how much is CPU
 	// RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
 	// send+drain (encoder wait).
+	// Sub-split of composite_ns, same rationale as the enc_* counters above:
+	// the canvas work is one number today, and the obvious suspect (the GPU
+	// resample round trip) is only worth attacking if it is actually where
+	// the time goes. comp_* are wall time per frame on the worker thread.
+	comp_zero_ns:      i64,
+	comp_resample_ns:  i64,
+	comp_blit_ns:      i64,
+	// Sub-split of comp_resample_ns. The canvas work only removes the
+	// DOWNLOAD, so "how much of the round trip is the readback" is the
+	// number that decides whether that work is worth doing at all -- the
+	// upload and the resample itself are untouched by it.
+	res_upload_ns:     i64,
+	res_gpu_ns:        i64,
+	res_download_ns:   i64,
 	enc_sws_ns:        i64,
 	enc_upload_ns:     i64,
 	enc_send_ns:       i64,
@@ -1960,6 +1974,7 @@ render_worker_run :: proc() {
 	// not wall time); the ratio is the signal. Declared in scope before the
 	// defer so the report can read them on any exit path.
 	split_timing := os.get_env_alloc("VYPER_FRAME_TIME", context.temp_allocator) != ""
+	render_split_timing = split_timing
 	audio_ns, composite_ns, loop_start := i64(0), i64(0), i64(0)
 	defer {
 		// Stop+join the decode producer BEFORE resetting the decoders: the
@@ -2034,6 +2049,22 @@ render_worker_run :: proc() {
 				f64(render_pipe.enc_upload_ns) / 1e6 / f64(frames),
 				f64(render_pipe.enc_send_ns) / 1e6 / f64(frames),
 				f64(render_pipe.enc_drain_ns) / 1e6 / f64(frames),
+			)
+			// comp_blit_ns is the whole visual walk, so the resample is
+			// inside it; print the difference so the two lines are not
+			// mistaken for independent totals.
+			comp_resample := render_pipe.comp_resample_ns
+			fmt.printf(
+				"[frame-time]   composite split: zero=%.2fms/f walk=%.2fms/f (resample inside=%.2fms/f)\n",
+				f64(render_pipe.comp_zero_ns) / 1e6 / f64(frames),
+				f64(render_pipe.comp_blit_ns) / 1e6 / f64(frames),
+				f64(comp_resample) / 1e6 / f64(frames),
+			)
+			fmt.printf(
+				"[frame-time]   resample split: upload=%.2fms/f gpu=%.2fms/f download=%.2fms/f\n",
+				f64(render_pipe.res_upload_ns) / 1e6 / f64(frames),
+				f64(render_pipe.res_gpu_ns) / 1e6 / f64(frames),
+				f64(render_pipe.res_download_ns) / 1e6 / f64(frames),
 			)
 			fmt.printf("[frame-time]   decode(producer)=%.2fms/f (codec=%.2fms/f scale=%.2fms/f)\n",
 				f64(render_pipe.dec_ns) / 1e6 / f64(frames),
@@ -2289,6 +2320,8 @@ render_worker_run :: proc() {
 	render_pipe.enc_stop, render_pipe.enc_produced, render_pipe.enc_consumed = false, 0, 0
 	render_pipe.enc_has_audio = has_audio
 	render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
+	render_pipe.comp_zero_ns, render_pipe.comp_resample_ns, render_pipe.comp_blit_ns = 0, 0, 0
+	render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
 	render_pipe.enc_video_ns, render_pipe.enc_audio_ns = 0, 0
 	render_pipe.enc_sws_ns, render_pipe.enc_upload_ns, render_pipe.enc_send_ns, render_pipe.enc_drain_ns = 0, 0, 0, 0
 	// One-time semaphore priming: counts are self-balancing across renders, so
@@ -2363,14 +2396,18 @@ render_worker_run :: proc() {
 		}
 		slot_idx := int(frame_idx & 1)
 		eslot := &render_pipe.enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
+		t_stage := time.now()._nsec
 		if !skip_canvas_zero {
 			mem.zero(raw_data(eslot.canvas), len(eslot.canvas))
 		}
+		zero_done := time.now()._nsec
+		render_pipe.comp_zero_ns += zero_done - t_stage
 		// One walk over the track-ordered visual stack, back-to-front, so the
 		// bottom track paints first and the top track last. Text and video are in
 		// the SAME list, so a text clip on a lower track composites under the
 		// video above it exactly as the preview does; it is no longer "all video,
 		// then all text".
+		t_walk := time.now()._nsec
 		for i := len(render_job.visuals) - 1; i >= 0; i -= 1 {
 			#partial switch src in render_job.visuals[i] {
 			case ^Render_Video_Src:
@@ -2420,6 +2457,12 @@ render_worker_run :: proc() {
 				)
 			}
 		}
+		// The whole visual walk, so the per-clip resample time is a SUBSET of
+		// this and the printed "blits" is a clean difference. Timing the walk
+		// as one span is what makes the split honest: a per-case accumulator
+		// placed before a clip's own work cannot contain that work, so
+		// subtracting the resample from it goes negative.
+		render_pipe.comp_blit_ns += time.now()._nsec - t_walk
 		// Composite subtitle-generator clips last (on top of everything else —
 		// the natural subtitle layering; matches the preview, where the topmost
 		// text/bottom-most slot order puts subtitles above the decoded faces).
@@ -2715,13 +2758,22 @@ render_eval_keyed_geom :: proc(
 		// having written nothing, so there is no partial frame to unwind.
 		if keyed_gpu_enabled {
 			if g := gpu_resample_get(); g != nil {
-				if gpu_resample_into(
+				t_res := time.now()._nsec
+				gpu_ok := gpu_resample_into(
 					g,
 					raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
 					int(srcx), int(srcy), int(srcw), int(srch),
 					int(rw), int(rh),
 					raw_data(v.kres_scratch), len(v.kres_scratch),
-				) {
+				)
+				if render_split_timing {
+					// The whole round trip: stage upload, resample, and the
+					// download that lands back in kres_scratch. If the
+					// download is not the cost, compositing straight to a
+					// GPU canvas is not the fix.
+					render_pipe.comp_resample_ns += time.now()._nsec - t_res
+				}
+				if gpu_ok {
 					render_keyed_gpu_frames += 1
 					render_keyed_frames += 1
 					render_blit_region(
@@ -2967,6 +3019,11 @@ render_keyed_fallbacks: int
 // intended default and the CPU kernel is the fallback, not the reverse. Set
 // VYPER_KEYED_GPU=0 to pin the kernel for a controlled comparison.
 keyed_gpu_enabled := true
+
+// Set once per run by render_worker_run; the per-clip procs below need it to
+// decide whether to take the two extra timestamps, so the uninstrumented
+// export path pays nothing for the counters.
+render_split_timing := false
 
 render_start :: proc() {
 	if render_is_busy() {
