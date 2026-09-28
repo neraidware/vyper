@@ -759,6 +759,51 @@ throughput. See the note appended to S2.
       a dither add, which is exactly the part a shader cannot approximate
       without changing bytes.
 
+      **SUPERSEDED 2026-09-27 — the whole 6-tap downscale model below does not
+      apply to the exporter, and the reason is a bug in the probe that had been
+      feeding every one of these measurements.** Two separate errors, both
+      worth keeping because either one alone produces confident nonsense:
+
+      1. **NV12's chroma plane is byte-interleaved `U,V,U,V,...`, not
+         `[U row][V row]`.** The probe printed "U" by walking offset 0,1,2,3
+         and "V" from offset `uv_w`, so it was alternating U and V in the U
+         label and reading misaligned in the V label. This is what produced
+         the phantom "asymmetric 2x2 kernel" with deltas -7,+21,-2,+7 --
+         MIXED SIGNS on a plane where a red impulse can only push U one way.
+         Mixed signs are impossible for any positive-weight average, and that
+         impossibility was the tell. It was not read as a tell; it was read as
+         a swscale quirk. The layout is now established by content (a solid
+         red frame reads 90,240 per pair, green 54,34, blue 240,110), which
+         is the only way it could have been established.
+      2. **The exporter's conversion is 1:1, so `initFilter` takes its
+         unscaled branch and there is no `size_factor` filter to fit at all.**
+         `render.odin:1216` is `sws.getContext(w, h, RGBA, w, h, NV12,
+         BILINEAR)` -- same width and height. `chrSrcW == chrDstW`, so
+         `filterSize == 1` and the `size_factor == 2` general branch below is
+         dead code for this pipeline. The `hrow` fixture was a 2:1 downscale,
+         i.e. a geometry the exporter never runs, and every tap count derived
+         from it described that fiction.
+
+      **The kernel that actually ships, measured 2026-09-27.** Impulse
+      response over the whole plane, not a fitted row: a single red luma pixel
+      at `(y, x)` moves exactly ONE chroma column `x>>1`, and exactly TWO
+      chroma rows -- `y>>1` by -7 and the adjacent row by -2 (up when `y` is
+      even, down when odd), touching nothing else. `x=8` and `x=9` give
+      identical results and no other column moves, so the horizontal weights
+      are equal. Solving against a solid red frame, which pins the weights to
+      sum to 1, gives:
+
+      ```
+      horizontal  [1, 1] / 2      over luma cols 2C,   2C+1
+      vertical    [2, 7, 7, 2] / 18  over luma rows 2K-1, 2K, 2K+1, 2K+2
+      ```
+
+      A separable 2x4 bilinear trapezoid. It checks out to the byte: A=7/18
+      and B=1/9 imply a per-column delta of -18 for the impulse, and
+      B*(-18) is exactly the observed -2. This is a shader in a handful of
+      lines, and it is the thing to port -- not the 4-tap model, not the
+      6-tap model.
+
       **The tap-fitting approach was the wrong instrument, and the reason is
       worth recording so nobody picks it up again.** `/tmp/opencode/fith.py`
       fits 4 taps x 2 phases against one row of output chroma
