@@ -741,7 +741,40 @@ throughput. See the note appended to S2.
 
       (B) is the cheap win, (A) is the safe one. This needs an explicit call
       because the difference is a change to shipped output rather than an
-      internal choice.
+      internal choice. **(A) WAS CHOSEN 2026-09-27. Progress on it, measured
+      with `yuv_exact_probe.odin` (`VYPER_YUV_EXACT_PROBE`):**
+
+      **Luma is DONE and exact.** Fitting the coefficient triple and offset
+      against 65536 random pixels pins the offset interval to a single value:
+      `Y = clip((8414*r + 16519*g + 3208*b + 540928) >> 15)`, zero mismatches.
+      The coefficients are exactly the limited-range BT.601 set that utils.c
+      builds, so this is swscale's arithmetic rather than a curve fit to it.
+      A shader can reproduce that with no ambiguity.
+
+      **Chroma is the whole remaining problem, and it is not a box average.**
+      A single red pixel moves a SIGNED 2x2 footprint in the chroma plane
+      (deltas -2, +7 / -7, +21 against a gray baseline), and that footprint is
+      not separable: an outer-product factorisation requires -49 == -42. So
+      the chroma axis is a phased, multi-tap filter in 15-bit fixed point with
+      a dither add, which is exactly the part a shader cannot approximate
+      without changing bytes. The tap set, its phase, and the final shift are
+      still to be pinned down; the probe exists to pin them down rather than
+      guess them.
+
+      Also settled along the way, because it invalidated a first measurement
+      that looked like a broken pipeline: swscale builds chroma at
+      `chrSrcW = w/2` (utils.c `initFilter`), so the chroma plane only reads
+      the LEFT HALF of the source. A horizontal impulse at `x = w/2` is
+      outside its support and correctly does nothing; at `x = w/4` it moves
+      two chroma columns.
+
+      **Note the alternative that got cheaper.** At 0.5x the GPU composite
+      (5.60 ms/f) now costs MORE than the colorspace conversion it would
+      enable (5.27 ms/f), and dropping the resample readback is a far simpler
+      change with none of the exactness risk. If the chroma port stalls, that
+      is the better next move, and the two are additive rather than competing:
+      a canvas path removes the readback, the GPU conversion removes the
+      swscale, and neither blocks the other.
 - [ ] S2. Clip keyed `sws` work to the current canvas intersection. Map the
       visible destination rectangle back to the stage source rectangle, clamp
       rounding at stage bounds, and blit only the visible result. Preserve
