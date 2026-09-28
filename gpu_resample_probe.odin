@@ -675,44 +675,11 @@ GPU_Probe_Case :: struct {
 		cpu_ms := f64(total_d) / 1e6 / f64(ITERS)
 		cpu_ms_last := per_iter[ITERS - 1]
 
-		// Same call, routed through the EXPORTER's call site. Both are in this
-		// binary, so if this is fast where the direct call above is slow, the
-		// difference is the call site (inlining/specialization), not the
-		// process, the buffers, or the kernel.
-		wr := resample_once_ms(
-			raw_data(case_src), c.src_w * 4, 0, 0, c.src_w, c.src_h,
-			raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
-		)
-		wr2 := resample_once_ms(
-			raw_data(case_src), c.src_w * 4, 0, 0, c.src_w, c.src_h,
-			raw_data(want), c.dst_w * 4, c.dst_w, c.dst_h,
-		)
-		fmt.println("gpu-probe: via exporter call site:", wr, "ms then", wr2, "ms")
 		fmt.print("gpu-probe: per-iter ms:")
 		for it in 0 ..< ITERS {
 			fmt.printf(" %.2f", per_iter[it])
 		}
 		fmt.println()
-
-		// Same three-way baseline the exporter runs over the same geometry:
-		// raw byte scan, an inline 2x2 box of the same arithmetic, and the
-		// library call. If the scan and the inline box are ALSO ~10x slower
-		// here, this process's memory is slow and the library call is
-		// innocent. If they are normal and only the library call is slow, the
-		// cost is in that call, not in reaching the bytes.
-		base := resample_baseline(raw_data(case_src), c.src_w, c.src_h, raw_data(want), 4)
-		fmt.println(
-			"gpu-probe: baseline scan=",
-			f64(base.scan_ns) / 1e6,
-			"ms inline-box=",
-			f64(base.box_ns) / 1e6,
-			"ms library=",
-			cpu_ms,
-			"ms  (scan/inline=",
-			f64(base.scan_ns) / f64(max(base.box_ns, 1)),
-			"x)",
-		)
-
 
 		t0 := time.tick_now()
 		for _ in 0 ..< ITERS {
