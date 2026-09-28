@@ -757,9 +757,43 @@ throughput. See the note appended to S2.
       not separable: an outer-product factorisation requires -49 == -42. So
       the chroma axis is a phased, multi-tap filter in 15-bit fixed point with
       a dither add, which is exactly the part a shader cannot approximate
-      without changing bytes. The tap set, its phase, and the final shift are
-      still to be pinned down; the probe exists to pin them down rather than
-      guess them.
+      without changing bytes.
+
+      **The tap-fitting approach was the wrong instrument, and the reason is
+      worth recording so nobody picks it up again.** `/tmp/opencode/fith.py`
+      fits 4 taps x 2 phases against one row of output chroma
+      (`hrow.txt`, 64 samples) and returns `[0.0, 0.0]` for all four phases.
+      The rank deficiency is not noise in the data -- the probe's column
+      pattern is a full-period LCG and every row is copied from row 0, so the
+      vertical stage does collapse to a DC gain and a 1D fit is legitimate in
+      principle. The model is wrong: swscale never builds a 4-tap chroma
+      filter here. The exporter's context is `SWS_BILINEAR`, and in
+      `initFilter` the 2-tap "bilinear" branch is gated on
+      `xInc <= 1<<16 && scaler == SWS_AREA` or `scaler == SWS_FAST_BILINEAR`
+      -- a 2:1 downscale with `SWS_BILINEAR` falls through to the general
+      branch, where `scale_algorithms[SWS_BILINEAR].size_factor == 2` gives
+      `filterSize = 1 + (2*chrSrcW + chrDstW - 1) / chrDstW`, which is ~6 at
+      2:1, not 4. So the fit was solving for a filter that does not exist.
+
+      The exact kernel, now read off the source rather than inferred:
+
+      ```
+      fone    = 1LL << (54 - FFMIN(av_log2(chrSrcW/chrDstW), 8))
+      d       = FFABS((xx << 17) - xDstInSrc) << 13
+                (times dstW/srcW when xInc > 1<<16, i.e. downscaling)
+      coeff   = ((1 << 30) - d), clamped at 0, times (fone >> 30)
+      xx      = (xDstInSrc - (filterSize - 2) * (1 << 16)) / (1 << 17)
+      xDstInSrc += 2 * xInc   per output sample
+      ```
+
+      A symmetric triangular kernel over `filterSize` taps, in 54-bit fixed
+      point, on a position grid that steps by half a source pixel. This is
+      fully determined -- nothing here is left to reverse-engineer empirically.
+      What remains is transcription, not discovery: `filterPos`, the
+      `filter2` src/dst-filter pass, the normaliser, `input.c`'s two-pixel
+      chroma siting, `hscale.c`'s rounding, and `output.c`'s dither+shift.
+      Do that by porting those procs, not by fitting output bytes to a guessed
+      tap count.
 
       Also settled along the way, because it invalidated a first measurement
       that looked like a broken pipeline: swscale builds chroma at
