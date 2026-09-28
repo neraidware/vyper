@@ -1500,34 +1500,13 @@ render_open_output :: proc(
 	return true
 }
 
-rend_enc_video_frame :: proc(
+rend_enc_send_video :: proc(
 	e: ^Render_Enc,
-	rgb: []u8,
+	ydata: ^[4][^]u8,
+	ylinesize: ^[4]c.int,
 	width, height: c.int,
 	frame_index: i64,
 ) -> bool {
-	slice: [1][^]u8 = {raw_data(rgb)}
-	ls: [4]c.int = {width * 4, 0, 0, 0}
-	t_sws := time.now()._nsec
-	converted := false
-	if e.use_fast_yuv {
-		converted = enc_convert_rgba_fast(e, raw_data(rgb), width, height)
-		if !converted {
-			fmt.println("fast-yuv conversion failed; falling back to swscale")
-		}
-	}
-	if !converted {
-		sws.scale(
-			e.sws_rgb_yuv,
-			cast([^][^]u8)&slice[0],
-			cast([^]c.int)&ls[0],
-			0,
-			height,
-			cast([^][^]u8)&e.yuv_data[0],
-			cast([^]c.int)&e.yuv_linesize[0],
-		)
-	}
-	render_pipe.enc_sws_ns += time.now()._nsec - t_sws
 	frame := avutil.frame_alloc()
 	if frame == nil {
 		return false
@@ -1537,8 +1516,8 @@ rend_enc_video_frame :: proc(
 	frame.width = width
 	frame.height = height
 	for i in 0 ..< 4 {
-		frame.data[i] = e.yuv_data[i]
-		frame.linesize[i] = e.yuv_linesize[i]
+		frame.data[i] = ydata[i]
+		frame.linesize[i] = ylinesize[i]
 	}
 	frame.pts = frame_index
 	// The mp4 muxer sizes the final stts sample from the last packet's
@@ -1554,7 +1533,7 @@ rend_enc_video_frame :: proc(
 		// Hardware-surfaces encoder (VAAPI): move the NV12 frame into a hw
 		// surface before sending. The encoder holds its own refs on the
 		// surface buffers when it accepts the frame, but our AVFrame wrapper
-		// must stay alive until the send returns — the proc-scoped defer
+		// must stay alive until the send returns -- the proc-scoped defer
 		// below (to_send != frame) frees it once, after the send.
 		hw_frame := avutil.frame_alloc()
 		if hw_frame == nil {
@@ -1584,6 +1563,63 @@ rend_enc_video_frame :: proc(
 	ok := enc_drain(e, e.vcodec_ctx, e.vstream, e.vpkt)
 	render_pipe.enc_drain_ns += time.now()._nsec - t_drain
 	return ok
+}
+
+// rend_enc_video_frame converts one composited RGBA canvas to the encoder's
+// software pixel format (swscale, or the VYPER_YUV SIMD kernels) and sends it.
+// This is the CPU conversion path: GPU-composited frames that take a CPU
+// convert are read back as RGBA and run through here.
+rend_enc_video_frame :: proc(
+	e: ^Render_Enc,
+	rgb: []u8,
+	width, height: c.int,
+	frame_index: i64,
+) -> bool {
+	slice: [1][^]u8 = {raw_data(rgb)}
+	ls: [4]c.int = {width * 4, 0, 0, 0}
+	t_sws := time.now()._nsec
+	converted := false
+	if e.use_fast_yuv {
+		converted = enc_convert_rgba_fast(e, raw_data(rgb), width, height)
+		if !converted {
+			fmt.println("fast-yuv conversion failed; falling back to swscale")
+		}
+	}
+	if !converted {
+		sws.scale(
+			e.sws_rgb_yuv,
+			cast([^][^]u8)&slice[0],
+			cast([^]c.int)&ls[0],
+			0,
+			height,
+			cast([^][^]u8)&e.yuv_data[0],
+			cast([^]c.int)&e.yuv_linesize[0],
+		)
+	}
+	render_pipe.enc_sws_ns += time.now()._nsec - t_sws
+	return rend_enc_send_video(e, &e.yuv_data, &e.yuv_linesize, width, height, frame_index)
+}
+
+// rend_enc_video_frame_nv12 sends a GPU-converted NV12 frame: the worker
+// already produced the packed NV12 bytes (luma plane, then interleaved UV), so
+// there is no conversion here at all -- the points are wired straight into the
+// AVFrame. Only used when the slot's nv12_ready flag is set, which only happens
+// on the GPU-composite + GPU-NV12 + NV12-encoder path.
+rend_enc_video_frame_nv12 :: proc(
+	e: ^Render_Enc,
+	nv12: []u8,
+	width, height: c.int,
+	frame_index: i64,
+) -> bool {
+	assert(len(nv12) >= int(width) * int(height) * 3 / 2, "nv12 slot smaller than a full frame")
+	data: [4][^]u8 = {
+		raw_data(nv12),
+		raw_data(nv12[int(width) * int(height):]),
+		nil,
+		nil,
+	}
+	ls: [4]c.int = {width, width, 0, 0}
+	return rend_enc_send_video(e, &data, &ls, width, height, frame_index)
 }
 
 // enc_push_audio_stereo stages an interleaved stereo chunk and flushes full AAC
@@ -1688,6 +1724,13 @@ Render_Enc_Slot :: struct {
 	canvas: []u8,
 	mix:    []f32,
 	spf:    int,
+	// nv12 carries the GPU-composited+GPU-converted frame (w*h luma +
+	// w/2*h/2*2 chroma) when the worker's GPU NV12 path is the active convert
+	// for this render; nv12_ready tells the encoder to skip its swscale
+	// conversion and feed these bytes straight into the encoder. Owned by the
+	// same ring slot as canvas, so it lives as long as the consume does.
+	nv12:       []u8,
+	nv12_ready: bool,
 }
 
 // Render_Pipeline is the render's thread + pipeline handoff state: the worker
@@ -1780,6 +1823,7 @@ Render_Pipeline :: struct {
 	cp1_ns, cp1_n:     i64,
 	cpd_ns, cpd_n:     i64,
 	cpu_ns, cpu_n:     i64,
+	comp_nv12_pass_ns, comp_nv12_dl_ns, comp_nv12_wait_ns, comp_nv12_cpy_ns, comp_nv12_pack_ns: i64,
 	rs1_ns, rs1_n:     i64,
 	rsd_ns, rsd_n:     i64,
 	rsu_ns, rsu_n:     i64,
@@ -1802,6 +1846,10 @@ Render_Pipeline :: struct {
 	enc_drain_ns:      i64,
 	enc_slots:         [RENDER_ENC_SLOTS]Render_Enc_Slot,
 	enc_ptr:           ^Render_Enc,
+	// Worker-thread scratch for the GPU-NV12 conversion: the end proc copies
+	// the mapped download out sequentially through this before packing, so the
+	// strided pack never touches device-visible memory directly.
+	gpu_nv12_scratch:  []u8,
 }
 render_pipe: Render_Pipeline
 
@@ -1890,7 +1938,14 @@ render_enc_fail_set :: proc(msg: string) {
 render_enc_encode_slot :: proc(e: ^Render_Enc, fi: i64) {
 	slot := &render_pipe.enc_slots[fi & (RENDER_ENC_SLOTS - 1)]
 	t0 := time.now()._nsec
-	if !rend_enc_video_frame(e, slot.canvas, render_job.width, render_job.height, fi) {
+	if slot.nv12_ready {
+		// GPU composite + GPU NV12: the worker converted this frame on the GPU
+		// and packed slot.nv12, so the encoder skips its swscale conversion.
+		if !rend_enc_video_frame_nv12(e, slot.nv12, render_job.width, render_job.height, fi) {
+			render_enc_fail_set("video encoding failed")
+			return
+		}
+	} else if !rend_enc_video_frame(e, slot.canvas, render_job.width, render_job.height, fi) {
 		render_enc_fail_set("video encoding failed")
 		return
 	}
@@ -2096,6 +2151,18 @@ render_worker_run :: proc() {
 				f64(render_pipe.comp_zero_ns) / 1e6 / f64(frames),
 				f64(render_pipe.comp_blit_ns) / 1e6 / f64(frames),
 				f64(comp_resample) / 1e6 / f64(frames),
+			)
+			fmt.printf(
+				// The GPU-NV12 conversion split. pass is the two render passes,
+				// dl the plane downloads into g.down, wait the GPU idle after
+				// submit, cpy the sequential copy out of the mapped download,
+				// and pack the CPU interleave into the slot's NV12 bytes.
+				"[frame-time]   nv12 pass=%.2fms dl=%.2fms wait=%.2fms cpy=%.2fms pack=%.2fms\n",
+				f64(render_pipe.comp_nv12_pass_ns) / 1e6 / f64(frames),
+				f64(render_pipe.comp_nv12_dl_ns) / 1e6 / f64(frames),
+				f64(render_pipe.comp_nv12_wait_ns) / 1e6 / f64(frames),
+				f64(render_pipe.comp_nv12_cpy_ns) / 1e6 / f64(frames),
+				f64(render_pipe.comp_nv12_pack_ns) / 1e6 / f64(frames),
 			)
 			fmt.printf(
 				// Per geometry, never pooled: the 1:1 class is a memcpy and the
@@ -2395,12 +2462,18 @@ render_worker_run :: proc() {
 	// the thread starts.
 	for i in 0 ..< RENDER_ENC_SLOTS {
 		render_pipe.enc_slots[i].canvas = make([]u8, int(render_job.width) * int(render_job.height) * 4)
+		// Sized for even dimensions (the GPU NV12 path's precondition); odd
+		// jobs never use it -- gpu_nv12_for_run excludes them.
+		render_pipe.enc_slots[i].nv12 = make([]u8, int(render_job.width) * int(render_job.height) * 3 / 2)
 		render_pipe.enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
 	}
+	// Sized for the NV12 path's max (w*h RGBA luma + w/2*h/2 RGBA chroma).
+	render_pipe.gpu_nv12_scratch = make([]u8, int(render_job.width) * int(render_job.height) * 5)
 	render_pipe.enc_stop, render_pipe.enc_produced, render_pipe.enc_consumed = false, 0, 0
 	render_pipe.enc_has_audio = has_audio
 	render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
 	render_pipe.comp_zero_ns, render_pipe.comp_resample_ns, render_pipe.comp_blit_ns = 0, 0, 0
+	render_pipe.comp_nv12_pass_ns, render_pipe.comp_nv12_dl_ns, render_pipe.comp_nv12_wait_ns, render_pipe.comp_nv12_cpy_ns, render_pipe.comp_nv12_pack_ns = 0, 0, 0, 0, 0
 	render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
 	render_pipe.res_submit_ns, render_pipe.res_wait_ns = 0, 0
 	render_pipe.cpu_resample_ns, render_pipe.cpu_resample_n = 0, 0
@@ -2480,6 +2553,18 @@ render_worker_run :: proc() {
 	if gpu_frame_ok && gpu_resample_get() == nil {
 		gpu_frame_ok = false
 	}
+	// GPU RGBA->NV12 (S1c part 2): when the composite is on the GPU AND the
+	// encoder's software pixel format is NV12 (the hw-upload/VAAPI path; the
+	// NV12 software encoders too), the worker converts the canvas to NV12 on
+	// the GPU and the encoder feeds those bytes straight in -- the encoder's
+	// swscale conversion just does not run on those frames. Everything else
+	// keeps the canvas readback + encoder-side conversion: a CPU composite,
+	// a non-NV12 format (libx264's YUV420P), odd dimensions (NV12's half-res
+	// chroma plane needs even), or VYPER_GPU_NV12=0. e.enc_sw_pix_fmt is set
+	// by render_open_output on this same thread, so reading it here is safe.
+	gpu_nv12_for_run :=
+		gpu_frame_ok && gpu_nv12_enabled && e.enc_sw_pix_fmt == .NV12 &&
+		render_job.width % 2 == 0 && render_job.height % 2 == 0
 
 	for frame_idx in 0 ..< render_job.nframes {
 		if poll_cancel() {
@@ -2514,6 +2599,7 @@ render_worker_run :: proc() {
 		}
 		slot_idx := int(frame_idx & 1)
 		eslot := &render_pipe.enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
+		eslot.nv12_ready = false
 		// The GPU composite begins before the zero fill: its first draw's
 		// CLEAR is the background fill, so the mem.zero is the CPU-only path.
 		gpu_canvas: GPU_Composite
@@ -2522,6 +2608,9 @@ render_worker_run :: proc() {
 		if gpu_frame_ok {
 			if gc, gc_ok := gpu_composite_begin(gpu_resample_get(), int(render_job.width), int(render_job.height)); gc_ok {
 				gpu_canvas = gc
+				if gpu_nv12_for_run {
+					gpu_canvas.scratch = render_pipe.gpu_nv12_scratch
+				}
 				gpu_active = true
 			}
 		}
@@ -2595,7 +2684,22 @@ render_worker_run :: proc() {
 		// failure; the remaining video draws were skipped (the guard in the
 		// walk) and the run stops below rather than encode a partial frame.
 		if gpu_active {
-			if !gpu_composite_end(&gpu_canvas, eslot.canvas) {
+			if gpu_nv12_for_run {
+				// GPU NV12: the end proc converts the canvas and reads the two
+				// planes back packed; the encoder consumes slot.nv12 and skips
+				// swscale. The RGBA readback into eslot.canvas does not happen,
+				// and the encoder knows (nv12_ready) not to read that stale
+				// canvas.
+				if gpu_composite_end_nv12(&gpu_canvas, eslot.nv12) {
+					// The full byte-exact chain -- composite AND conversion --
+					// is pinned by keyed_export's 1:1 PSNR=inf, which now
+					// compares GPU-composite+GPU-NV12 against
+					// CPU-composite+swscale.
+					eslot.nv12_ready = true
+				} else {
+					render_gpu_abort = true
+				}
+			} else if !gpu_composite_end(&gpu_canvas, eslot.canvas) {
 				render_gpu_abort = true
 			}
 		}
@@ -3335,6 +3439,15 @@ render_gpu_abort := false
 // VYPER_KEYED_GPU=0 to pin the kernel for a controlled comparison.
 keyed_gpu_enabled := true
 
+// gpu_nv12_enabled is the sibling switch for the GPU RGBA->NV12 conversion
+// (S1c part 2). Default on, like the composite: the worker converts the GPU
+// composite to NV12 on the GPU and the encoder skips swscale. Set
+// VYPER_GPU_NV12=0 to keep the canvas readback + encoder-side swscale path --
+// the CPU conversion stays the fallback for any job the GPU path cannot serve
+// (CPU composite, non-NV12 encoder format), so this knob is a pin, not a
+// switch that pills the feature out.
+gpu_nv12_enabled := true
+
 // Set once per run by render_worker_run; the per-clip procs below need it to
 // decide whether to take the two extra timestamps, so the uninstrumented
 // export path pays nothing for the counters.
@@ -3377,6 +3490,11 @@ render_start :: proc() {
 	keyed_gpu_enabled = !(gpu_found && gpu_setting == "0")
 	if !keyed_gpu_enabled {
 		fmt.println("render: VYPER_KEYED_GPU=0 -- pinned to the CPU resample kernel")
+	}
+	nv12_setting, nv12_found := os.lookup_env_alloc("VYPER_GPU_NV12", context.temp_allocator)
+	gpu_nv12_enabled = !(nv12_found && nv12_setting == "0")
+	if !gpu_nv12_enabled {
+		fmt.println("render: VYPER_GPU_NV12=0 -- pinned to encoder-side swscale")
 	}
 
 	// Render range.

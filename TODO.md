@@ -814,6 +814,36 @@ throughput. See the note appended to S2.
       Remaining under this bullet: run the gated RGBA->NV12 passes on the canvas
       (no readback) and hand NV12 directly to `hw_frames_ctx`.
 
+      **PART 2 LANDED 2026-09-28 — GPU RGBA->NV12 on the canvas; encoder
+      skips swscale.** The worker now converts the composited canvas to NV12 on
+      the GPU inside `gpu_composite_end_nv12` (two passes, luma w*h + chroma
+      w/2*h/2, sequencing the existing gated shaders against the canvas) and
+      packs the two planes into the encoder slot's `nv12` buffer, setting
+      `slot.nv12_ready`. The encoder thread branches on that flag and sends the
+      packed bytes via `rend_enc_video_frame_nv12` -- no swscale, no
+      `frame.data` reshape; `rend_enc_send_video` (the frame-wrap/hw-upload/
+      send/drain tail extracted from the CPU path) is shared by both. Selected
+      when the NV12 encoder + even dimensions + GPU composite are all live;
+      `VYPER_GPU_NV12=0` pins the encoder-side swscale for the A/B. The pack
+      reads RGBA8 planes at 4-byte strides, so `gpu_composite_end_nv12` first
+      copies the mapped download sequentially into a worker-job-arena scratch
+      (`render_pipe.gpu_nv12_scratch`): strided reads straight off the
+      device-visible map measured 12.5 ms/f, the copy-then-pack ~1 ms.
+
+      **Gated by the same `keyed_export` A/B, now the FULL chain:
+      GPU-composite + GPU-NV12 against CPU-composite + swscale:** 1:1 PSNR
+      `inf`, 0.5x 58.71 dB -- unchanged, so the new conversion shipped zero
+      diff against swscale. Proven red: swapping U/V in the pack drops 1:1 off
+      bit-exact and 0.5x to 17.8 dB. `zorder` passes. Debug-build timing
+      (bounds-checked scalar pack, 22 ms/f) is an artifact of the gate's
+      `-debug` binary; the release build measures pass=0.02 dl=0.01 wait=2.31
+      cpy=0.91 pack=0.82 ms/f. Valgrind clean (scratch + slot nv12 are escaped
+      job-arena bytes).
+
+      Remaining under this bullet: hand the surfaced NV12 directly to
+      `hw_frames_ctx` (still needs the SDL-GPU VkDevice visibility to interoperate
+      with a VAAPI surface).
+
       **MEASURED 2026-09-27, and it reorders this work.** `VYPER_FRAME_TIME=1`
       on the 1920x1080 keyed fixture, 1:1 and 0.5x:
 

@@ -66,10 +66,25 @@ GPU_Resample :: struct {
 	// holding LOAD between draws and read back once per frame. S1b's per-keyed
 	// readback is dropped with it. Reused across frames (the job size is
 	// fixed); the CPU composite is the drop-in fallback whenever text or a
-	// crop-scaled static clip is present.
+	// crop-scaled static clip is present. SAMPLER usage lets the RGBA->NV12
+	// passes read the finished composite back as their source.
 	canvas:    ^sdl.GPUTexture,
 	canvas_w:  int,
 	canvas_h:  int,
+
+	// GPU RGBA->NV12 (S1c part 2): the worker converts the composited canvas on
+	// the GPU instead of reading it back as RGBA and letting the encoder's
+	// swscale convert. Two one-color-target fragment passes over the canvas
+	// (sampled) produce luma and interleaved chroma R8G8B8A8 targets -- same
+	// rationale as the probe: R8/RG8 color-attachment support is
+	// driver-optional, and the unorm8 quantization is identical either way.
+	// The packer then reads the R / R,G channels into the NV12 byte layout.
+	// Created lazily on the first converting frame and reused; released in
+	// gpu_resample_destroy.
+	luma_pipe:   ^sdl.GPUGraphicsPipeline,
+	chroma_pipe: ^sdl.GPUGraphicsPipeline,
+	luma_tex:    ^sdl.GPUTexture,
+	chroma_tex:  ^sdl.GPUTexture,
 
 	up:        ^sdl.GPUTransferBuffer,
 	up_cap:    int,
@@ -488,11 +503,12 @@ gpu_resample_into :: proc(
 // draws (opaque copy, blend off) -- z-order is the draw order, exactly as the
 // CPU walk paints back-to-front.
 GPU_Composite :: struct {
-	g:     ^GPU_Resample,
-	cb:    ^sdl.GPUCommandBuffer,
-	w:     int,
-	h:     int,
-	draws: int,
+	g:      ^GPU_Resample,
+	cb:     ^sdl.GPUCommandBuffer,
+	w:      int,
+	h:      int,
+	draws:  int,
+	scratch: []u8,
 }
 
 // gpu_composite_begin opens the frame: canvas sized to the job, download
@@ -511,7 +527,7 @@ gpu_composite_begin :: proc(g: ^GPU_Resample, w, h: int) -> (c: GPU_Composite, o
 		g.canvas = sdl.CreateGPUTexture(
 			g.device,
 			sdl.GPUTextureCreateInfo {
-				type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
+				type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET, .SAMPLER},
 				width = u32(w), height = u32(h), layer_count_or_depth = 1,
 				num_levels = 1, sample_count = ._1,
 			},
@@ -521,19 +537,23 @@ gpu_composite_begin :: proc(g: ^GPU_Resample, w, h: int) -> (c: GPU_Composite, o
 		}
 		g.canvas_w, g.canvas_h = w, h
 	}
+	// The download buffer is shared by the two composite ends: the RGBA canvas
+	// readback (w*h*4) and the GPU-NV12 path, which downloads luma (w*h) plus
+	// chroma (w/2*h/2) as R8G8B8A8 -- together 1.25x the RGBA frame. Size for
+	// the larger, so a mode switch mid-lifetime never recreates the buffer.
 	bytes := w * h * 4
-	if g.down_cap < bytes {
+	if g.down_cap < bytes + (w / 2) * (h / 2) * 4 {
 		if g.down != nil {
 			sdl.ReleaseGPUTransferBuffer(g.device, g.down)
 			g.down = nil
 		}
 		g.down = sdl.CreateGPUTransferBuffer(g.device, sdl.GPUTransferBufferCreateInfo {
-			usage = .DOWNLOAD, size = u32(bytes),
+			usage = .DOWNLOAD, size = u32(bytes + (w / 2) * (h / 2) * 4),
 		})
 		if g.down == nil {
 			return
 		}
-		g.down_cap = bytes
+		g.down_cap = bytes + (w / 2) * (h / 2) * 4
 	}
 	c = GPU_Composite{g = g, w = w, h = h}
 	c.cb = sdl.AcquireGPUCommandBuffer(g.device)
@@ -611,27 +631,40 @@ gpu_composite_draw :: proc(
 	return true
 }
 
+// gpu_composite_clear_if_empty gives a frame with no visible draws the same
+// all-background bytes the CPU path's per-frame mem.zero would: clear the
+// canvas to (0,0,0,0) so whatever reads it next -- the RGBA readback or the
+// NV12 passes -- converts the same background. No-op once anything drew.
+gpu_composite_clear_if_empty :: proc(c: ^GPU_Composite) -> bool {
+	if c.draws != 0 {
+		return true
+	}
+	g := c.g
+	target := sdl.GPUColorTargetInfo {
+		texture = g.canvas, load_op = .CLEAR, store_op = .STORE,
+		clear_color = {0, 0, 0, 0},
+	}
+	pass := sdl.BeginGPURenderPass(c.cb, &target, 1, nil)
+	if pass == nil {
+		_ = sdl.CancelGPUCommandBuffer(c.cb)
+		render_gpu_abort = true
+		return false
+	}
+	sdl.EndGPURenderPass(pass)
+	return true
+}
+
 // gpu_composite_end finalizes the frame and reads the canvas into `dst` (the
 // encoder slot, w x h RGBA). Reads the whole canvas once, which is the single
-// readback that replaces S1b's upload+readback per keyed clip.
+// readback that replaces S1b's upload+readback per keyed clip. The CPU
+// side of the RGBA->encoder conversion (swscale/fast-yuv) consumes this; the
+// NV12 variant below replaces this readback and the conversion both.
 gpu_composite_end :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 	g := c.g
 	bytes := c.w * c.h * 4
 	assert(len(dst) >= bytes, "gpu_composite: destination buffer smaller than the canvas")
-	if c.draws == 0 {
-		// Nothing was visible this frame: still clear the canvas so the
-		// readback is an all-background frame like the CPU zero fill.
-		target := sdl.GPUColorTargetInfo {
-			texture = g.canvas, load_op = .CLEAR, store_op = .STORE,
-			clear_color = {0, 0, 0, 0},
-		}
-		pass := sdl.BeginGPURenderPass(c.cb, &target, 1, nil)
-		if pass == nil {
-			_ = sdl.CancelGPUCommandBuffer(c.cb)
-			render_gpu_abort = true
-			return false
-		}
-		sdl.EndGPURenderPass(pass)
+	if !gpu_composite_clear_if_empty(c) {
+		return false
 	}
 	cp := sdl.BeginGPUCopyPass(c.cb)
 	sdl.DownloadFromGPUTexture(
@@ -660,6 +693,223 @@ gpu_composite_end :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 	return true
 }
 
+// gpu_composite_pipeline boots a quad pipeline around one of the NV12 fragment
+// shaders, mirroring the probe's boot_pipeline -- the same RGBA8 target (see
+// the driver-optional R8/RG8 note on GPU_Resample) and the same single
+// fragment sampler + single vertex uniform buffer layout.
+gpu_composite_pipeline :: proc(device: ^sdl.GPUDevice, frag_spirv: []u8) -> ^sdl.GPUGraphicsPipeline {
+	vs := sdl.CreateGPUShader(device, sdl.GPUShaderCreateInfo {
+		code_size           = uint(len(quad_vertex_spirv)),
+		code                = raw_data(quad_vertex_spirv),
+		entrypoint          = "main",
+		format              = {.SPIRV},
+		stage               = .VERTEX,
+		num_uniform_buffers = 1,
+	})
+	fs := sdl.CreateGPUShader(device, sdl.GPUShaderCreateInfo {
+		code_size       = uint(len(frag_spirv)),
+		code            = raw_data(frag_spirv),
+		entrypoint      = "main",
+		format          = {.SPIRV},
+		stage           = .FRAGMENT,
+		num_samplers    = 1,
+	})
+	defer sdl.ReleaseGPUShader(device, vs)
+	defer sdl.ReleaseGPUShader(device, fs)
+	if vs == nil || fs == nil {
+		return nil
+	}
+	target := sdl.GPUColorTargetDescription {
+		format      = .R8G8B8A8_UNORM,
+		blend_state = {enable_blend = false},
+	}
+	pipe := sdl.CreateGPUGraphicsPipeline(device, sdl.GPUGraphicsPipelineCreateInfo {
+		vertex_shader   = vs,
+		fragment_shader = fs,
+		primitive_type  = .TRIANGLELIST,
+		rasterizer_state = {
+			fill_mode = .FILL, cull_mode = .NONE,
+			front_face = .COUNTER_CLOCKWISE, enable_depth_clip = true,
+		},
+		multisample_state = {sample_count = ._1},
+		target_info = {color_target_descriptions = &target, num_color_targets = 1},
+	})
+	if pipe == nil {
+		fmt.println("gpu-composite: CreateGPUGraphicsPipeline failed:", sdl.GetError())
+	}
+	return pipe
+}
+
+// gpu_composite_nv12_ensure lazily creates the luma/chroma targets and the two
+// converting pipelines on the first frame that actually converts. Intelized
+// once, reused across frames; only incurred on the NV12 path, so an
+// RGBA-readback export never pays for it.
+gpu_composite_nv12_ensure :: proc(c: ^GPU_Composite) -> bool {
+	g := c.g
+	uv_w, uv_h := g.canvas_w / 2, g.canvas_h / 2
+	if g.luma_tex == nil {
+		g.luma_tex = sdl.CreateGPUTexture(g.device, sdl.GPUTextureCreateInfo {
+			type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
+			width = u32(g.canvas_w), height = u32(g.canvas_h), layer_count_or_depth = 1,
+			num_levels = 1, sample_count = ._1,
+		})
+		g.chroma_tex = sdl.CreateGPUTexture(g.device, sdl.GPUTextureCreateInfo {
+			type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
+			width = u32(uv_w), height = u32(uv_h), layer_count_or_depth = 1,
+			num_levels = 1, sample_count = ._1,
+		})
+		if g.luma_tex == nil || g.chroma_tex == nil {
+			return false
+		}
+	}
+	if g.luma_pipe == nil {
+		g.luma_pipe = gpu_composite_pipeline(g.device, nv12_luma_fragment_spirv)
+		g.chroma_pipe = gpu_composite_pipeline(g.device, nv12_chroma_fragment_spirv)
+		if g.luma_pipe == nil || g.chroma_pipe == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// gpu_composite_end_nv12 finalizes the frame and converts the canvas to NV12 on
+// the GPU, writing the packed Y + interleaved UV planes into `dst` (the encoder
+// slot, w*h luma + w/2*h/2*2 chroma). This replaces the RGBA canvas readback
+// AND the encoder's swscale conversion: the encoder's `yuv_data` is pointed
+// straight at the packed bytes, so the 5 ms/f swscale pass never runs. The two
+// fragment passes (luma, then interleaved chroma at half resolution) are the
+// exact shaders the gpu_nv12 probe gates byte-for-byte against swscale, and the
+// pack below mirrors the probe's -- same channel reads, same offsets -- so the
+// chain composite+convert stays byte-identical to the CPU path the A/B pins.
+gpu_composite_end_nv12 :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
+	g := c.g
+	w, h := c.w, c.h
+	assert(w % 2 == 0 && h % 2 == 0, "gpu_composite: NV12 needs even dimensions")
+	uv_w, uv_h := w / 2, h / 2
+	nv12_bytes := w * h * 3 / 2
+	assert(len(dst) >= nv12_bytes, "gpu_composite: NV12 destination buffer too small")
+	if !gpu_composite_nv12_ensure(c) {
+		render_gpu_abort = true
+		return false
+	}
+	if !gpu_composite_clear_if_empty(c) {
+		return false
+	}
+	render_nv12_pass :: proc(
+		c: ^GPU_Composite,
+		pipe: ^sdl.GPUGraphicsPipeline,
+		target_tex: ^sdl.GPUTexture,
+		tw, th: u32,
+	) -> bool {
+		place := sdl.GPUColorTargetInfo {
+			texture = target_tex, load_op = .CLEAR, store_op = .STORE,
+			clear_color = {0, 0, 0, 1},
+		}
+		pass := sdl.BeginGPURenderPass(c.cb, &place, 1, nil)
+		if pass == nil {
+			return false
+		}
+		sdl.SetGPUViewport(
+			pass,
+			sdl.GPUViewport{x = 0, y = 0, w = f32(tw), h = f32(th), min_depth = 0.0, max_depth = 1.0},
+		)
+		sdl.BindGPUGraphicsPipeline(pass, pipe)
+		binding := sdl.GPUTextureSamplerBinding{texture = c.g.canvas, sampler = c.g.sampler}
+		sdl.BindGPUFragmentSamplers(pass, 0, &binding, 1)
+		u := Quad_Uniforms {
+			bounds   = {0, 0, f32(tw), f32(th)},
+			viewport = {f32(tw), f32(th)},
+			uv       = {0, 0, 1, 1},
+		}
+		sdl.PushGPUVertexUniformData(c.cb, 0, &u, u32(size_of(u)))
+		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
+		sdl.EndGPURenderPass(pass)
+		return true
+	}
+	t_p0 := time.now()._nsec
+	if !render_nv12_pass(c, g.luma_pipe, g.luma_tex, u32(w), u32(h)) {
+		_ = sdl.CancelGPUCommandBuffer(c.cb)
+		render_gpu_abort = true
+		return false
+	}
+	if !render_nv12_pass(c, g.chroma_pipe, g.chroma_tex, u32(uv_w), u32(uv_h)) {
+		_ = sdl.CancelGPUCommandBuffer(c.cb)
+		render_gpu_abort = true
+		return false
+	}
+	t_p1 := time.now()._nsec
+	// Downloads are R8G8B8A8, so luma costs w*h*4 bytes in the buffer, chroma
+	// uv_w*uv_h*4 -- NOT the NV12 byte counts. Sized for that in begin.
+	luma_gpu_bytes := w * h * 4
+	cp := sdl.BeginGPUCopyPass(c.cb)
+	sdl.DownloadFromGPUTexture(
+		cp,
+		sdl.GPUTextureRegion {texture = g.luma_tex, w = u32(w), h = u32(h), d = 1},
+		sdl.GPUTextureTransferInfo {
+			transfer_buffer = g.down, offset = 0, pixels_per_row = u32(w), rows_per_layer = u32(h),
+		},
+	)
+	sdl.DownloadFromGPUTexture(
+		cp,
+		sdl.GPUTextureRegion {texture = g.chroma_tex, w = u32(uv_w), h = u32(uv_h), d = 1},
+		sdl.GPUTextureTransferInfo {
+			transfer_buffer = g.down, offset = u32(luma_gpu_bytes), pixels_per_row = u32(uv_w), rows_per_layer = u32(uv_h),
+		},
+	)
+	sdl.EndGPUCopyPass(cp)
+	t_p2 := time.now()._nsec
+	if !sdl.SubmitGPUCommandBuffer(c.cb) {
+		render_gpu_abort = true
+		return false
+	}
+	if !sdl.WaitForGPUIdle(g.device) {
+		render_gpu_abort = true
+		return false
+	}
+	back := sdl.MapGPUTransferBuffer(g.device, g.down, true)
+	if back == nil {
+		render_gpu_abort = true
+		return false
+	}
+	t_p3 := time.now()._nsec
+	// Pack into NV12 while the buffer is still mapped: luma rows from the R
+	// channel of each RGBA8 pixel, chroma U/V from the R,G channels -- the same
+	// channel reads and offsets the gpu_nv12 probe packs with. The mapped
+	// download is device-visible memory; strided reads straight off it measured
+	// 12.5 ms/f on RADV. Copy the planes out SEQUENTIALLY first (the same
+	// wide-copy cost as the RGBA readback path), then pack from the now-cached
+	// scratch.
+	raw_total := luma_gpu_bytes + uv_w * uv_h * 4
+	assert(len(c.scratch) >= raw_total, "gpu_composite: nv12 scratch too small")
+	t_p3b := time.now()._nsec
+	copy(c.scratch[:raw_total], ([^]u8)(back)[:raw_total])
+	t_p3c := time.now()._nsec
+	src := c.scratch
+	for y in 0 ..< h {
+		for x in 0 ..< w {
+			dst[y * w + x] = src[(y * w + x) * 4]
+		}
+	}
+	chroma_src := src[luma_gpu_bytes:]
+	o_base := w * h
+	for k in 0 ..< uv_h {
+		for c2 in 0 ..< uv_w {
+			i := (k * uv_w + c2) * 4
+			o := o_base + (k * uv_w + c2) * 2
+			dst[o + 0] = chroma_src[i + 0]
+			dst[o + 1] = chroma_src[i + 1]
+		}
+	}
+	t_p4 := time.now()._nsec
+	sdl.UnmapGPUTransferBuffer(g.device, g.down)
+	render_pipe.comp_nv12_pass_ns += t_p1 - t_p0
+	render_pipe.comp_nv12_dl_ns += t_p2 - t_p1
+	render_pipe.comp_nv12_wait_ns += t_p3 - t_p2
+	render_pipe.comp_nv12_cpy_ns += t_p3c - t_p3b
+	render_pipe.comp_nv12_pack_ns += t_p4 - t_p3c
+	return true
+}
+
 gpu_resample_destroy :: proc(g: ^GPU_Resample) {
 	if g == nil {
 		return
@@ -676,6 +926,18 @@ gpu_resample_destroy :: proc(g: ^GPU_Resample) {
 		}
 		if g.dst != nil {
 			sdl.ReleaseGPUTexture(g.device, g.dst)
+		}
+		if g.luma_tex != nil {
+			sdl.ReleaseGPUTexture(g.device, g.luma_tex)
+		}
+		if g.chroma_tex != nil {
+			sdl.ReleaseGPUTexture(g.device, g.chroma_tex)
+		}
+		if g.luma_pipe != nil {
+			sdl.ReleaseGPUGraphicsPipeline(g.device, g.luma_pipe)
+		}
+		if g.chroma_pipe != nil {
+			sdl.ReleaseGPUGraphicsPipeline(g.device, g.chroma_pipe)
 		}
 		if g.stage != nil {
 			sdl.ReleaseGPUTexture(g.device, g.stage)
