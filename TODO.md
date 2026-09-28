@@ -704,6 +704,49 @@ throughput. See the note appended to S2.
       measured, 77-7830 mismatches -- so the reference asserts instead of
       returning quietly wrong bytes. That is the one case here that is a stated
       limit rather than a solved one.
+
+      **The GPU half is now byte-exact too (2026-09-28).** The conversion runs
+      on the GPU (shaders/nv12_luma.frag + nv12_chroma.frag) and matches
+      swscale AND the CPU reference on every byte, at every even size
+      8/16/32/64/96/128/160/224/256 -- gpu_nv12 is a gate target in `all` and
+      proven red on drift (RY off by one turns it red). It draws two fragment
+      passes into RGBA8 targets -- one for luma, one for interleaved chroma
+      rendered at size/2 -- then packs the two planes into NV12. RGBA8 targets
+      rather than R8/RG8 because R8/RG8 color-attachment support is
+      driver-optional in Vulkan; the unorm8 quantization is identical either
+      way. Two details are doing real work in the shader math and both are
+      NON-obvious, so they are commented at the source:
+
+      - The whole chain is int32, and the roundings happen at the SAME points
+        swscale's do (input.c rounded luma at 15 bits, chroma P at 10, the
+        vertical stage at 19 with the standing +262144 plus-bias). A plausible
+        float 0.299r+0.587g+0.114b shader that rounds once at the end is wrong
+        on roughly half the samples, because it collapses three different
+        roundings into one.
+      - The chroma reduction is NOT "average pixels then subsample": swscale
+        computes a 15-bit P for each LUMA ROW (that is the P u0..u3 the
+        [1,3,3,1]/8 vertical filter consumes), and P is rounded per row. A
+        separable blur that averages 2x2 after filtering gives different bytes.
+        The shader reproduces the row-P ordering exactly.
+
+      The two measurements inside the probe deserve a note. (1) The download
+      buffer was once sized in NV12 bytes (w*h + uv_w*uv_h) while each plane
+      costs 4 bytes/pixel; the driver wrote past it and the frame read back
+      "right for the top quarter, garbage below" -- hindsight, the buffer
+      exactly fit three luma rows. (2) V came back as 0 at EVERY sample while
+      U stayed exact, from reading the blue channel rather than green in the
+      pack; the signature of a packer bug (one channel dead) is distinguishable
+      from a shader bug (everything dead) by exactness of the surviving
+      channel. Both are per-byte-class failures a single `mismatches = 0`
+      gate had to catch on first brush, and did.
+
+      **What this unblocks:** the conversion is now replaceable end-to-end
+      inside the export path (GPU composite -> shader -> pad/merge into the
+      encoder's w/h NV12 buffers) with a byte-exact contract rather than a
+      quality guess. The remaining S1c work is the *plumbing*: composite the
+      keyed/static z-order into a GPU canvas instead of kres_scratch, call
+      these passes on it, and hand the result to hw_frames_ctx -- each is a
+      structural change with its own gate, not an open correctness question.
 - [ ] S1c. GPU composite straight to canvas, then GPU RGBA->NV12 handed
       directly to `hw_frames_ctx`. S1b still round-trips each keyed resample
       through `kres_scratch` and a CPU `render_blit_region` because keyed and
