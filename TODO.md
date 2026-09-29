@@ -221,6 +221,50 @@ both ways: reverting to the 768x432 cap fails with "proxy is 768x432, expected
 half the source 1920x1080 -> 960x540", and the poisoned-cache path was verified
 end to end (fail -> cache empty -> next run passes).
 
+**Audio: wedge-heal crashed the producer on a full bridge ring (2026-09-29).**
+`audio_device_push: ring could not take a whole block; producer cursor would
+desync`, on a packaged build during a stressed session, right after
+`[skew] d=-43.33s ... rsync=5(+2) prov=1 full=13(+13)`.
+
+Root cause is a contradiction between two mechanisms, not a race. The producer's
+ONLY backpressure signal is `audio_device_queued() >= max_queue`, and
+`audio_device_queued` returns **0 whenever `clear_req` is set** — deliberately,
+so the producer does not stall on audio that is about to be discarded. But
+`audio_device_clear` only sets a flag; the ring is not actually reset until the
+callback honours it, up to one period (~10ms) later. For that window the
+logical queue and the physical room disagree, and the ring is still FULL.
+
+The wedge watchdog is the direct path, inside ONE feed pass: audio.odin:1362
+fires `audio_device_clear()` because the queue is at cap and prod is short of
+target, then audio.odin:1380 — twenty lines later, same function — throttles on
+`audio_device_queued()`, reads 0, and pushes into the ring it just decided was
+overfull. `audio_ring_write` only comes up short when `acquire_write` returns
+`avail == 0`, i.e. genuinely full, so the retry loop cannot save it and the
+assert fires. The resync and stream-not-ready clear sites (1498/1614/1316) have
+the same property.
+
+Fix: enforce the assert's own precondition at the producer, right before the
+push, where the exact block size is known — `if i64(push_frames) >
+audio_device_available() { skip_full++; break }`. `audio_device_available` is
+`ma_pcm_rb_available_write`, was already computed for the health report and
+never used as backpressure, and is NOT subject to the `clear_req` special
+case. Free space can only grow between the check and the write (this thread is
+the only writer, the callback only drains), so one check is enough. Deferring
+costs nothing: `next_frame` advances after the push, so breaking re-mixes the
+frame next pass rather than dropping it. This also repairs the wedge heal,
+which previously could not run to completion.
+
+`audio_device_queued`'s lie is deliberately left in place — removing it would
+retune seek latency, and it is now harmless because nothing trusts it as a
+write-permission signal.
+
+**Not reproduced on demand.** The wedge needs a full ring *and* prod behind
+target, which took a 43s skew under load. Verified instead: 1148 pushes through
+the modified site with 0 assertions (`VYPER_AUDIO_TRACE=1 VYPER_AUTOPLAY=…`),
+and the guard is exactly the condition under which `audio_ring_write` returns
+short. A probe for this would be timing-dependent and flaky; the user's session
+is the real test.
+
 ## Active 2 — Unicode text + GPU glyph cache (full font coverage)
 
 **Status:** implemented — dynamic GPU glyph atlas covers the full font face; UI text

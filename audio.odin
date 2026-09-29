@@ -1424,6 +1424,28 @@ audio_producer_feed :: proc() {
 		}
 		out_bytes := push_frames * AUDIO_BUS_FRAME_BYTES
 		if out_bytes > 0 {
+			// The push below asserts on a short write, so the ring has to be able
+			// to take the WHOLE block before one is attempted. The cushion check at
+			// the top of this loop cannot guarantee that. audio_device_queued()
+			// reports 0 while a clear is pending -- deliberately, so the producer
+			// does not stall on audio that is about to be discarded -- but the
+			// callback has not run yet to honour that clear, so the ring is still
+			// physically full. For that window (one period, ~10ms) the logical
+			// queue and the physical room disagree, and only the physical room
+			// decides whether a write lands. Read it directly instead of inferring
+			// it from a counter that is deliberately lying.
+			//
+			// Free space can only grow between here and the write: this thread is
+			// the only writer and the callback only drains. So a passing check
+			// here stays true through the push, which is what makes checking once
+			// enough rather than re-checking inside the write loop.
+			//
+			// Deferring is free: next_frame advances after the push, so leaving
+			// here re-mixes this frame on the next pass. It is not a drop.
+			if i64(push_frames) > audio_device_available() {
+				audio_rpt.skip_full += 1
+				break
+			}
 			audio_device_push(pcm[:], push_frames)
 			audio_rpt.total_fed_frames += u64(push_frames)
 		}
