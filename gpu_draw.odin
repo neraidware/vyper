@@ -1566,7 +1566,12 @@ draw_preview_hud :: proc(
 		f64(ph) / fps,
 		f64(dev - ph) / fps,
 	)
-	if dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
+	// Audio LAGS the playhead means dev < ph, so the alert fires on a NEGATIVE
+	// delta past the threshold. The comparison used to be `dev - ph < +SEC*fps`
+	// (the negation was missing), which is true for essentially all playback and
+	// dumped the line every second during a perfectly healthy mix -- burying the
+	// one case it exists to report.
+	if dev - ph < -i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
 		rsync := sync.atomic_load(&audio_prod.resync)
 		prod := sync.atomic_load(&audio_prod.prod_frame)
 		holes := sync.atomic_load(&audio_rpt.silence_holes)
