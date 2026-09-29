@@ -18,8 +18,62 @@ PROBE_ENV="VYPER_UI_PROBE=1"
 # propagating a number that is always 99.
 VALGRIND_KNOWN_NOISE="ERROR SUMMARY"
 
+# The vendored FFmpeg bindings in vendor/ffmpeg/ are hand-maintained mirrors of
+# the FFmpeg structs, so they only agree with the FFmpeg actually linked at
+# runtime if the two were written against the same version. When they drift,
+# nothing fails at link time: the app reads fields from the wrong offsets, which
+# surfaces far away as a nonsense swscale dimension or a wild pointer.
+#
+# This has already cost two debugging sessions, so the fallback path below
+# checks the one field that pins the layout rather than trusting a version
+# number (libavformat major 60 exists on both sides of the break, so a version
+# comparison does not discriminate). offsetof(AVFormatContext, chapters) == 80
+# is the exact invariant: it moves as soon as the struct gains or loses a
+# pointer, which is how the bindings fall out of sync.
+FFMPEG_ABI_OFFSET=80
+FFMPEG_ABI_CHECKED=""
+
+require_ffmpeg_abi() {
+	[ -n "$FFMPEG_ABI_CHECKED" ] && return "$FFMPEG_ABI_CHECKED"
+	local dir probe got
+	dir=$(mktemp -d)
+	cat > "$dir/abi.c" <<-'EOF'
+		#include <stdio.h>
+		#include <stddef.h>
+		#include <libavformat/avformat.h>
+		int main(void){ printf("%zu\n", offsetof(AVFormatContext, chapters)); return 0; }
+	EOF
+	probe="$dir/abi"
+	if cc -o "$probe" "$dir/abi.c" -lavformat >/dev/null 2>&1; then
+		got=$("$probe" 2>/dev/null)
+	fi
+	rm -rf "$dir"
+	if [ "${got:-}" != "$FFMPEG_ABI_OFFSET" ]; then
+		echo "gate: host FFmpeg struct layout does not match vendor/ffmpeg bindings" >&2
+		echo "gate:   offsetof(AVFormatContext, chapters) = ${got:-<probe failed>}, bindings require ${FFMPEG_ABI_OFFSET}" >&2
+		echo "gate:   run these through the nix devshell instead" >&2
+		FFMPEG_ABI_CHECKED=1
+		return 1
+	fi
+	FFMPEG_ABI_CHECKED=0
+	return 0
+}
+
+# Runs a command inside the nix devshell when nix is available, and on the host
+# toolchain otherwise. Both branches pass the SAME command and flags, so the
+# flags stay defined in exactly one place; only the provenance of the binaries
+# differs. Without this, a host lacking /nix could not run a single gate.
+dev() {
+	if command -v nix >/dev/null 2>&1; then
+		dev "$@"
+	else
+		require_ffmpeg_abi || return 1
+		"$@"
+	fi
+}
+
 target_check() {
-	nix develop -c odin check . -strict-style -vet-using-param -vet-using-stmt
+	dev odin check . -strict-style -vet-using-param -vet-using-stmt
 }
 
 # Shader compilation is a build step, not a thing you remember to do by hand.
@@ -29,7 +83,7 @@ target_check() {
 # hypothetical: it happened here, and it produced a measurement that was
 # confidently wrong. Anything that builds the binary compiles shaders first.
 target_shaders() {
-	nix develop -c sh -c '
+	dev sh -c '
 		set -e
 		# Every stage the binary #loads, at the same target-env flake.nix uses.
 		# All of them are plain Vulkan 1.0 / SPIR-V 1.0: the resample shaders were
@@ -72,7 +126,7 @@ target_shaders() {
 
 target_build() {
 	target_shaders
-	nix develop -c odin build . -debug -vet-style -vet-semicolon -out:vyper
+	dev odin build . -debug -vet-style -vet-semicolon -out:vyper
 }
 
 # Every target that runs ./vyper must call this first.
@@ -115,7 +169,7 @@ target_bench() {
 	# The script runs without `set -e`, so a failed build would otherwise fall
 	# through to executing the previous binary and reporting stale numbers as
 	# current — which is worse than no benchmark, because it looks like data.
-	if ! nix develop -c odin build swsbench -out:bin_swsbench \
+	if ! dev odin build swsbench -out:bin_swsbench \
 		-microarch:native -o:aggressive -no-bounds-check; then
 		echo "bench: build failed" >&2
 		return 1
@@ -169,7 +223,7 @@ keyed_export_run() {
 	# high-frequency source exposes. Regenerated only when absent because the
 	# content is deterministic, so a cached copy is the same clip.
 	if [ ! -s "$KEYED_SRC" ]; then
-		if ! nix develop -c ffmpeg -y -f lavfi -i \
+		if ! dev ffmpeg -y -f lavfi -i \
 			"testsrc2=size=1920x1080:rate=30:duration=3" \
 			-c:v libx264 -pix_fmt yuv420p -crf 18 "$KEYED_SRC" >/dev/null 2>&1
 		then
@@ -190,7 +244,7 @@ keyed_export_run() {
 
 # Echoes the average PSNR in dB between two clips, or "inf" when identical.
 keyed_psnr() {
-	nix develop -c ffmpeg -hide_banner -i "$1" -i "$2" -lavfi psnr -f null - 2>&1 \
+	dev ffmpeg -hide_banner -i "$1" -i "$2" -lavfi psnr -f null - 2>&1 \
 		| grep -o 'average:[a-z0-9.]*' | tail -1 | cut -d: -f2
 }
 
