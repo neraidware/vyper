@@ -30,7 +30,16 @@ import sdl "vendor:sdl3"
 // "%LOCALAPPDATA%/vyper" (no XDG/dotdir convention there) -- keyed by
 // <basename>-<path-hash>, so they never pollute the source folders, survive any
 // source relocation (re-hash only when the path changes), and same-named sources
-// from different folders stay distinct. The naming scheme is unchanged:
+// from different folders stay distinct. The naming scheme is unchanged.
+//
+// The suffix carries NO settings identity, deliberately. A proxy is a pure
+// function of (source, encoder settings), so the settings belong in the cache
+// KEY rather than in a version number someone has to remember to bump: see
+// proxy_settings_hash, which folds them in automatically. A version string here
+// was the obvious alternative and it is a trap -- it is a bookkeeping rule that
+// is correct only if every future tuning of crf/preset/scale remembers to touch
+// a filename, and the day one does not, every proxy already on disk keeps being
+// served and the change silently does nothing.
 PROXY_SUFFIX := ".vyperproxy.mp4"
 
 // Proxy_Encoder is BOTH halves of the proxy-cache contract in one object: the
@@ -68,16 +77,32 @@ Proxy_Encoder_Choice :: enum u32 {
 }
 proxy_encoder_choice := Proxy_Encoder_Choice.GPU
 
-// PROXY_HW_BITS_PER_PIXEL sizes a proxy's bitrate from its pixel count. A
-// proxy is 768x432 at most and every frame is a keyframe, so the usual
-// "bits per second" intuition is misleading — what matters is bits per pixel
-// per frame. At 0.06 a 768x432/30fps all-intra proxy targets ~600 kbit, which
-// measured (VYPER_PROXY_PROBE, 10s 1080p source) lands a VAAPI artifact at
-// 957 KB against libx264 crf 26 ultrafast's 1.48 MB, with equal or better
-// frame agreement. A proxy only has to be scrubbable, not watchable, so
-// trading a little detail for never blocking the import worker is right — and
-// at this constant the hardware path is also the smaller file.
-PROXY_HW_BITS_PER_PIXEL :: 0.06
+// PROXY_HW_BITS_PER_PIXEL sizes a hardware proxy's bitrate from its pixel
+// count. Every frame is a keyframe (gop=1), so the usual "bits per second"
+// intuition is misleading — what matters is bits per pixel per frame, which is
+// why this is a per-pixel constant and the dimensions are multiplied in.
+//
+// Re-measured at 0.06 (1920x1080 source, half-resolution proxy, VYPER_PROXY_PROBE,
+// 3s, artifact size and mean_abs against the decoded source frame):
+//
+//	0.06 ->  458 KB  mean_abs 1.7   (the old value: the quality complaint)
+//	0.10 ->  740 KB  mean_abs 1.3
+//	0.12 ->  879 KB  mean_abs 1.2
+//	0.15 -> 1084 KB  mean_abs 1.1
+//	0.20 -> 1431 KB  mean_abs 1.0
+//
+// 0.15 is chosen because it is the point where this path reaches the SAME
+// quality as the libx264 fallback the encoder settings are tuned for
+// (veryfast/crf 22 measures 1044 KB at mean_abs 1.0), at the same file size. The
+// two encoders disagreeing on quality is the actual defect — a host that
+// silently falls back to CPU should not get a visibly better picture than one
+// that stays on the GPU. Past 0.15 the curve is flat (0.20 buys 0.1 mean_abs
+// for 32% more bytes), so the extra bits buy nothing you can see while every
+// one of them is paid on the decode side of every scrub.
+//
+// This is the constant that governs quality on any host whose hardware encoder
+// works, which is most of them — preset and crf below only steer the fallback.
+PROXY_HW_BITS_PER_PIXEL :: 0.15
 PROXY_HW_MIN_BITRATE :: 250_000
 
 // proxy_hw_bitrate returns the hardware rate control for a proxy of out_w x
@@ -102,10 +127,24 @@ proxy_encoder_use_hw :: proc() -> bool {
 
 proxy_encoder: Proxy_Encoder = {
 	suffix = PROXY_SUFFIX,
-	preset = "ultrafast",
+	// veryfast, not ultrafast. ultrafast disables most of x264's quality
+	// machinery (no deblocking strength tuning, no adaptive quantizer, coarse
+	// motion search), so it throws away detail much faster than the bitrate
+	// saves — which is the wrong trade once the proxy is also the thing the
+	// user is reading. veryfast costs a modest slice of encode time and
+	// compresses far more efficiently, so at an equal file size the picture is
+	// materially better. The speed that actually matters for playback is below:
+	// tune=fastdecode plus gop=1 is what makes a scrub seek instant.
+	preset = "veryfast",
 	tune   = "fastdecode",
-	crf    = "26",
-	gop    = 1,
+	// 22, down from 26. crf is the single biggest lever on legibility here:
+	// at 26 on all-intra, fine detail and text edges were quantised away
+	// before they were ever scaled into the preview buffer, which is what made
+	// a 1080p source look mushy at 768x432. Paired with veryfast the file
+	// growth is bounded, and half-resolution already cut the pixel count ~4x
+	// so there is headroom for the bits.
+	crf = "22",
+	gop = 1,
 }
 
 // Proxy_State is the proxy subsystem's module state: memoized cache-dir
@@ -174,10 +213,63 @@ proxy_cache_prefix :: proc(buf: []u8) -> (int, bool) {
 	return n, true
 }
 
+// proxy_settings_hash folds every knob that changes the artifact's BYTES into
+// the cache key, chained onto the source-path hash. Returns the same value for
+// identical settings and a different one the moment any of them moves, so the
+// cache cannot outlive the settings that produced it.
+//
+// Why this exists rather than a version number in the filename: a proxy is a
+// pure function of (source, settings), so the settings ARE part of its identity.
+// Spelling that out means the key is correct by construction — tune crf and the
+// next lookup misses and rebuilds, with no separate edit to remember. The
+// failure mode it removes is silent and expensive: without it, every proxy
+// already on disk is still frame-count-valid, so proxy_valid_cache_hit accepts
+// it and a quality change appears to do nothing at all.
+//
+// The encoder CHOICE (GPU vs CPU) is deliberately NOT folded in, continuing the
+// reasoning already recorded on Proxy_Encoder: both produce a valid scrubbable
+// artifact, and keying on the choice would make the CPU fallback re-encode on
+// every launch and would invalidate every existing proxy on upgrade. The
+// settings below only steer the libx264 path; a hardware-encoder host simply
+// rebuilds once when they change and is stable after.
+proxy_settings_hash :: proc(h: u32) -> u32 {
+	// Order and separators matter only in that a change must change the value,
+	// which every field boundary does. Length-prefixing the cstrings keeps
+	// ("crf" = "2") and ("crf" = "22") from colliding.
+	sep: [1]u8 = {0}
+	acc := hash.fnv32a(transmute([]byte)string(proxy_encoder.preset), h)
+	acc = hash.fnv32a(sep[:], acc)
+	acc = hash.fnv32a(transmute([]byte)string(proxy_encoder.tune), acc)
+	acc = hash.fnv32a(sep[:], acc)
+	acc = hash.fnv32a(transmute([]byte)string(proxy_encoder.crf), acc)
+	acc = hash.fnv32a(sep[:], acc)
+	// gop, the scale divisor, and the hardware bitrate constant as three
+	// fixed-width little-endian i32s, hashed rather than formatted: this runs
+	// once per cache lookup and a formatter here would allocate for nothing.
+	// The bitrate constant earns its place in the key by the same argument as
+	// crf — it decides the artifact's bytes, so a host with a working hardware
+	// encoder would otherwise keep serving artifacts encoded at the old rate
+	// after the constant is retuned. Scaling by 1000 keeps the float's
+	// resolution below anything that could be retuned meaningfully.
+	hw_scaled := i32(PROXY_HW_BITS_PER_PIXEL * 1000)
+	ints: [3]i32 = {proxy_encoder.gop, PROXY_SCALE_DIVISOR, hw_scaled}
+	nums: [12]u8
+	for i in 0 ..< 3 {
+		v := ints[i]
+		nums[i * 4 + 0] = u8(v)
+		nums[i * 4 + 1] = u8(v >> 8)
+		nums[i * 4 + 2] = u8(v >> 16)
+		nums[i * 4 + 3] = u8(v >> 24)
+	}
+	return hash.fnv32a(nums[:], acc)
+}
+
 // proxy_stem writes the in-cache naming stem for a source video: its basename
 // minus the final extension, a '-', then the low 32 bits of FNV-1a over the
-// source's (absolute) path in hex, so distinct sources never collide even with
-// identical basenames. Returns the updated offset, or (off, false) on overflow.
+// source's (absolute) path AND the encoder settings, in hex, so distinct
+// sources never collide even with identical basenames, and a settings change
+// lands on a different artifact instead of reusing the previous one. Returns
+// the updated offset, or (off, false) on overflow.
 proxy_stem :: proc(buf: []u8, off: int, src: cstring) -> (int, bool) {
 	base := path_basename(src)
 	no_ext := base
@@ -185,6 +277,7 @@ proxy_stem :: proc(buf: []u8, off: int, src: cstring) -> (int, bool) {
 		no_ext = base[:dot]
 	}
 	h := hash.fnv32a(transmute([]byte)string(src))
+	h = proxy_settings_hash(h)
 	if off + len(no_ext) + 9 > len(buf) {
 		return off, false
 	}
@@ -224,23 +317,54 @@ proxy_path_for :: proc(src: cstring, buf: []u8) -> (cstring, bool) {
 	return cstring(&buf[0]), true
 }
 
-// proxy_scale computes the proxy's pixel size: the source-fit rect of the
-// source's aspect within the PREVIEW bounds, so letterboxing is idempotent
-// (a proxied frame reproduces the same filled preview rectangle as decoding
-// the original). Returns fitted w,h for the proxy encoder's sws scale, or
-// original dims if the source aspect is unknown/invalid.
+// PROXY_SCALE_DIVISOR is the proxy's linear downscale from the source: 2 means
+// half the source width and half its height. A named constant rather than a
+// literal because proxy_scale applies it and proxy_settings_hash folds it into
+// the cache key — a tuning knob that is not a value cannot be part of an
+// identity, and an identity missing it is exactly how a stale proxy gets served.
+PROXY_SCALE_DIVISOR :: 2
+
+// proxy_scale computes the proxy's pixel size: half the source's own
+// resolution, in each axis, snapped to even. Returns the w,h for the proxy
+// encoder's sws scale, or the source dims if the source is unknown/invalid.
+//
+// Half rather than a fixed PREVIEW-sized cap because the cap is the dominant
+// limit on legibility. At 768x432 a 1080p source was being decimated to 1/4.5
+// of its pixels before it was ever seen, and the glyphs and edges that make a
+// frame readable were gone before the preview's own downscale had a chance to
+// be the lossy step. Halving keeps every source pixel that the eye can resolve
+// while still being a real reduction -- a proxy exists so the timeline can
+// scrub without decoding 4K, and halving the pixel count is roughly a quarter
+// of the decode and encode work, which is the win that actually matters.
+//
+// The PREVIEW_W/PREVIEW_H framebuffer still bounds the decoded PREVIEW, so
+// letterboxing stays idempotent: a proxied frame is scaled into the same fixed
+// buffer as the original would be, and the filled rectangle is identical. This
+// only changes how much detail survives to be scaled down into it.
+//
+// Never upscales (a source below the half point keeps its own dims) because
+// interpolating a small source up would inflate the file and the decode cost
+// while adding no information the original did not have.
 proxy_scale :: proc(src_w, src_h: c.int) -> (w, h: c.int) {
 	if src_w <= 0 || src_h <= 0 {
 		return PREVIEW_W, PREVIEW_H
 	}
-	fw, fh, _, _ := source_fit_in_buffer(src_w, src_h, PREVIEW_W, PREVIEW_H)
-	// yuv420p requires even width and height; an odd fitted dim (common for
-	// portrait sources, e.g. fit width 243) would make the encode reject the
-	// buffer and leave a 0-byte proxy. Snap to even so transcoding always
-	// succeeds.
-	fw = c.int((fw / 2) * 2)
-	fh = c.int((fh / 2) * 2)
-	return fw, fh
+	hw := src_w / PROXY_SCALE_DIVISOR
+	hh := src_h / PROXY_SCALE_DIVISOR
+	// yuv420p requires even width and height; an odd half of an odd source
+	// dim (e.g. 243 -> 121) would make the encode reject the buffer and leave
+	// a 0-byte proxy. Snap down to even so transcoding always succeeds.
+	hw = (hw / 2) * 2
+	hh = (hh / 2) * 2
+	// A source only a few pixels across would floor to 0, which the encoder
+	// rejects for the same reason. Hold the minimum at the source's own size.
+	if hw <= 0 {
+		hw = src_w
+	}
+	if hh <= 0 {
+		hh = src_h
+	}
+	return hw, hh
 }
 
 // proxy_probe_frame_count returns the number of frames the proxy's video stream

@@ -59,6 +59,61 @@ proxy_probe_run :: proc(v: string) {
 		os.exit(1)
 	}
 
+	// 1b. The artifact is the size the scale rule asked for. Everything else
+	// here compares proxy pixels to source pixels within a lossy tolerance,
+	// which a proxy that is merely the WRONG SIZE would still pass: decoded
+	// into the same preview buffer, 768x432 and 960x540 are the same
+	// rectangle of slightly different sharpness. Asserting the encoded
+	// dimensions is the only place the scale rule itself is observable, and a
+	// silent fallback to the old cap is exactly the regression worth catching.
+	sw, sh, sok := probe_video_size(proxy)
+	if !sok {
+		fmt.println("[proxy-probe] FAIL: could not read the proxy's video dimensions")
+		os.exit(1)
+	}
+	// Printed unconditionally, on every path, because a failing probe exits via
+	// os.exit and never reaches this file's cleanup at the end -- and a leftover
+	// artifact is not inert. It sits in the cache under a key derived from the
+	// CURRENT settings, so the next run finds it, believes it is a valid hit,
+	// and asserts against the previous run's broken proxy instead of building a
+	// fresh one. The gate target greps this line out of the log and removes the
+	// file whether the probe passed or failed, so one bad run cannot poison the
+	// next.
+	fmt.printf("[proxy-probe] artifact-path: %s\n", string(proxy))
+	src_w, src_h, srcok := probe_video_size(path)
+	if !srcok {
+		fmt.println("[proxy-probe] FAIL: could not read the source's video dimensions")
+		os.exit(1)
+	}
+	// The expectation is computed HERE, not by asking proxy_scale. Asking the
+	// function under test what it ought to return makes the assertion agree
+	// with whatever it does -- mutating proxy_scale back to the old 768x432 cap
+	// passes this check, which is precisely the regression it exists to catch.
+	// Spelling the rule out independently is the whole point: the proxy is half
+	// the source, snapped down to even.
+	half_w := src_w / 2
+	half_h := src_h / 2
+	want_w := half_w - half_w % 2
+	want_h := half_h - half_h % 2
+	if sw != want_w || sh != want_h {
+		fmt.printf(
+			"[proxy-probe] FAIL: proxy is %dx%d, expected half the source %dx%d -> %dx%d\n",
+			sw, sh, src_w, src_h, want_w, want_h,
+		)
+		os.exit(1)
+	}
+	// And it must not be the old fixed cap. Redundant with the rule above for
+	// a 1080p source (960 != 768), but stated directly because that cap is the
+	// specific regression, and a future source size could make the two agree.
+	if sw == 768 && sh == 432 {
+		fmt.println("[proxy-probe] FAIL: proxy is the old fixed 768x432 cap, not scaled from the source")
+		os.exit(1)
+	}
+	// A proxy must never exceed its source: upscaling costs file size and
+	// decode time and adds no information.
+	assert(sw <= src_w && sh <= src_h, "proxy must never be larger than the source it came from")
+	fmt.printf("[proxy-probe] dims: %dx%d (source %dx%d)\n", sw, sh, src_w, src_h)
+
 	// 2. proxy_pick_for_frame resolves frame 0 (whole proxy path, no .idx):
 	// the legacy fast path runs the frame-suffcient check once and latches it.
 	picked, _ := proxy_pick_for_frame(path, frame_count, 0, pbuf[:], false)

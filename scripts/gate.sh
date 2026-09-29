@@ -263,6 +263,8 @@ KEYED_SRC="$KEYED_DIR/src.mp4"
 KEYED_MIN_DB=50
 ZORDER_DIR=target/zorder
 SUB_DIR=target/subtitle_probe
+PROXY_DIR=target/proxy_probe
+PROXY_SRC="$PROXY_DIR/src.mp4"
 
 keyed_export_run() {
 	require_fresh_binary keyed-export || return 1
@@ -759,6 +761,54 @@ target_export_bench() {
 	export_bench_run off_canvas    VYPER_TX="-3000,0,1.0" || return 1
 }
 
+target_proxy_probe() {
+	require_fresh_binary proxy-probe || return 1
+	mkdir -p "$PROXY_DIR"
+	# Its own synthesized source rather than $KEYED_SRC, because this probe
+	# asserts the proxy's ENCODED DIMENSIONS and a 1080p source is what makes
+	# half-resolution distinguishable from the 768x432 cap it replaced (at
+	# smaller sizes both round to the same even number and the check would pass
+	# for the wrong reason). Deterministic, so a cached copy is the same clip.
+	if [ ! -s "$PROXY_SRC" ]; then
+		if ! dev ffmpeg -y -f lavfi -i \
+			"testsrc2=size=1920x1080:rate=30:duration=3" \
+			-c:v libx264 -pix_fmt yuv420p -crf 18 "$PROXY_SRC" >/dev/null 2>&1
+		then
+			echo "proxy-probe: could not synthesize the source clip" >&2
+			return 1
+		fi
+	fi
+	# NOT $PROBE_ENV: that adds VYPER_UI_PROBE, which runs the ui probe first
+	# and needs a media file this target does not have. The proxy probe is
+	# standalone and supplies its own source.
+	env VYPER_PROXY_PROBE="$PROXY_SRC" \
+		timeout 900 ./vyper >"$PROXY_DIR/proxy.log" 2>&1
+	local rc=$?
+	# Remove the artifact the probe built, on EVERY path. A failing probe exits
+	# through os.exit, which never reaches the probe's own cleanup, and a
+	# leftover proxy is not inert: it sits in the cache under a key derived from
+	# the CURRENT settings, so the next run treats it as a valid hit and asserts
+	# against the previous run's broken artifact instead of rebuilding. One
+	# failed run would otherwise poison every run after it.
+	local built
+	built=$(sed -n 's/^\[proxy-probe\] artifact-path: //p' "$PROXY_DIR/proxy.log" | head -1)
+	if [ -n "$built" ] && [ -f "$built" ]; then
+		rm -f "$built"
+	fi
+	tail -4 "$PROXY_DIR/proxy.log"
+	# The probe deletes its artifact on the way out, so its own dimension
+	# assertion is the coverage; this gate exists so the target is reachable
+	# from `all` at all rather than only by hand.
+	if [ $rc -ne 0 ]; then
+		echo "proxy-probe: FAILED (exit $rc)" >&2
+		return 1
+	fi
+	grep -q '^\[proxy-probe\] OK' "$PROXY_DIR/proxy.log" || {
+		echo "proxy-probe: no OK line in log" >&2
+		return 1
+	}
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -766,7 +816,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite gpu_probe keyed_export zorder subtitle_probe smoke valgrind geom_key_valgrind render_valgrind; do
+	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -791,12 +841,13 @@ main() {
 	zorder) target_zorder ;;
 	render_valgrind) target_render_valgrind ;;
 	subtitle_probe) target_subtitle_probe ;;
+	proxy_probe) target_proxy_probe ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|export_bench|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|all]" >&2
 		return 2
 		;;
 	esac

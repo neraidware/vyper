@@ -153,6 +153,74 @@ segments verifying as `-1` (ffprobe code=1 empty stderr) while bg-test passes
 same file — subprocess-post-encode verification fragility; gone with
 in-process encode+verify (probe is now a file handle open, decode-200, close).
 
+**Proxy legibility: half-resolution + retuned encoder (2026-09-29).** The
+proxy was capped at `PREVIEW_W/H` (768x432) regardless of source, so a 1080p
+clip was decimated to 1/4.5 of its pixels before it was ever seen, and the
+glyphs and edges that make a frame readable were gone before the preview's own
+downscale got to be the lossy step. `proxy_scale` now returns half the source
+in each axis, snapped to even for yuv420p and never upscaling a small source.
+The preview framebuffer is unchanged, so letterboxing stays idempotent — this
+only changes how much detail survives to be scaled into it. Encoder moves to
+libx264 `veryfast` (from `ultrafast`, which disables most of x264's quality
+machinery and threw detail away faster than it saved bits) at crf 22 (from 26).
+
+**The setting that actually governs quality on a normal host is the hardware
+bitrate, not crf.** This host logs `[enc] proxy encoder: h264_vaapi`, so preset
+and crf only steer the CPU fallback and the crf 22 request is a no-op here.
+`PROXY_HW_BITS_PER_PIXEL` was the real lever and it was tuned at 768x432.
+Re-measured at half-resolution (`VYPER_PROXY_PROBE`, 3s 1080p source, artifact
+size and mean_abs against the decoded source frame):
+
+| bpp | size | mean_abs |
+|-----|------|----------|
+| 0.06 | 458 KB | 1.7 |
+| 0.10 | 740 KB | 1.3 |
+| 0.12 | 879 KB | 1.2 |
+| 0.15 | 1084 KB | 1.1 |
+| 0.20 | 1431 KB | 1.0 |
+
+0.15 is the point where the hardware path reaches the SAME quality as the
+tuned fallback (libx264 veryfast/crf 22 measures 1044 KB at mean_abs 1.0) at
+the same file size; the two encoders disagreeing on quality is the actual
+defect, since a host that falls back to CPU should not get a better picture
+than one that stays on the GPU. Past 0.15 the curve is flat — 0.20 buys 0.1
+mean_abs for 32% more bytes, and every byte is paid again on the decode side
+of every scrub.
+
+**The cache key is derived from the settings, not versioned.** A proxy is a
+pure function of (source, settings), so preset, tune, crf, gop, the scale
+divisor and the hardware bitrate constant are all folded into the stem hash
+(`proxy_settings_hash`). The first attempt here was a version number in the
+filename, which is a trap: it is correct only if every future tuning of
+crf/preset/scale remembers to touch a filename, and the day one does not, every
+proxy already on disk keeps being served (they are still frame-count-valid, so
+`proxy_valid_cache_hit` accepts them) and the change silently does nothing. The
+encoder CHOICE (GPU vs CPU) is deliberately still excluded, keeping the
+existing reasoning on `Proxy_Encoder`: both produce a valid artifact, and
+keying on the choice would make the CPU fallback re-encode on every launch.
+
+**A failing probe poisons the cache — found by mutation testing, not by
+inspection.** `VYPER_PROXY_PROBE` cleans up its artifact at the end of a
+PASSING run, but failures exit via `os.exit`, which calls `runtime.exit` and
+runs no deferred procedure. The leftover file sits under a key derived from the
+current settings, so the next run finds it, treats it as a valid cache hit, and
+asserts against the previous run's broken proxy instead of building a fresh
+one — a single failed run poisons every run after it. The probe now prints its
+artifact path on every path and the gate target removes it whether the probe
+passed or failed.
+
+**`proxy_probe` had no gate target and is now in `all`.** Nothing ran this
+probe, so the resolution rule had no coverage at all. It synthesizes its own
+1080p source (not `$KEYED_SRC`, because half of 1080p is 960 and the old cap was
+768 — at smaller sizes both round to the same even number and the check would
+pass for the wrong reason) and asserts the ENCODED dimensions. **The first
+version of that assertion was tautological** — it called `proxy_scale` to get
+the expected size, so mutating `proxy_scale` back to the old cap still passed.
+The expectation is now spelled out independently in the probe. Mutation-checked
+both ways: reverting to the 768x432 cap fails with "proxy is 768x432, expected
+half the source 1920x1080 -> 960x540", and the poisoned-cache path was verified
+end to end (fail -> cache empty -> next run passes).
+
 ## Active 2 — Unicode text + GPU glyph cache (full font coverage)
 
 **Status:** implemented — dynamic GPU glyph atlas covers the full font face; UI text
