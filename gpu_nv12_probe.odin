@@ -105,6 +105,7 @@ gpu_nv12_setup :: proc(w, h: c.int) -> (p: GPU_NV12_Probe, ok: bool) {
 	boot_pipeline :: proc(
 		device: ^sdl.GPUDevice,
 		frag_spirv: []u8,
+		format: sdl.GPUTextureFormat,
 	) -> ^sdl.GPUGraphicsPipeline {
 		vs := sdl.CreateGPUShader(device, sdl.GPUShaderCreateInfo {
 			code_size           = uint(len(quad_vertex_spirv)),
@@ -129,7 +130,7 @@ gpu_nv12_setup :: proc(w, h: c.int) -> (p: GPU_NV12_Probe, ok: bool) {
 			return nil
 		}
 		target := sdl.GPUColorTargetDescription {
-			format      = .R8G8B8A8_UNORM,
+			format      = format,
 			blend_state = {enable_blend = false},
 		}
 		pipe := sdl.CreateGPUGraphicsPipeline(device, sdl.GPUGraphicsPipelineCreateInfo {
@@ -148,9 +149,9 @@ gpu_nv12_setup :: proc(w, h: c.int) -> (p: GPU_NV12_Probe, ok: bool) {
 		}
 		return pipe
 	}
-	p.luma_pipe = boot_pipeline(p.device, nv12_luma_fragment_spirv)
+	p.luma_pipe = boot_pipeline(p.device, nv12_luma_fragment_spirv, .R8_UNORM)
 	if p.luma_pipe != nil {
-		p.chroma_pipe = boot_pipeline(p.device, nv12_chroma_fragment_spirv)
+		p.chroma_pipe = boot_pipeline(p.device, nv12_chroma_fragment_spirv, .R8_UNORM)
 	}
 	if p.luma_pipe == nil || p.chroma_pipe == nil {
 		return
@@ -162,13 +163,16 @@ gpu_nv12_setup :: proc(w, h: c.int) -> (p: GPU_NV12_Probe, ok: bool) {
 		num_levels = 1, sample_count = ._1,
 	})
 	p.luma_tex = sdl.CreateGPUTexture(p.device, sdl.GPUTextureCreateInfo {
-		type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
+		type = .D2, format = .R8_UNORM, usage = {.COLOR_TARGET},
 		width = u32(w), height = u32(h), layer_count_or_depth = 1,
 		num_levels = 1, sample_count = ._1,
 	})
+	// 2*uv_w wide, which for even w is just w: the shader writes U and V into
+	// adjacent R8 texels so a single-channel target can carry NV12's
+	// interleaved chroma plane. (uv_w == w/2, so 2*uv_w == w.)
 	p.chroma_tex = sdl.CreateGPUTexture(p.device, sdl.GPUTextureCreateInfo {
-		type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
-		width = u32(w / 2), height = u32(h / 2), layer_count_or_depth = 1,
+		type = .D2, format = .R8_UNORM, usage = {.COLOR_TARGET},
+		width = u32(w), height = u32(h / 2), layer_count_or_depth = 1,
 		num_levels = 1, sample_count = ._1,
 	})
 	if p.src_tex == nil || p.luma_tex == nil || p.chroma_tex == nil {
@@ -212,15 +216,15 @@ gpu_nv12_run :: proc(p: ^GPU_NV12_Probe, rgba: []u8, out: []u8) -> bool {
 	w, h := p.w, p.h
 	uv_w, uv_h := w / 2, h / 2
 	src_bytes := int(w) * int(h) * 4
-	// Downloads are RGBA8, so each plane costs 4 bytes/pixel -- NOT the NV12
-	// byte count. Sizing this on NV12 bytes made the first buffer 96 bytes for
-	// a 256+64-byte transfer; the driver wrote past it, the tail of the frame
-	// read back as garbage, and it printed as "rows below h/4 are wrong" --
-	// hindsight: the write fit exactly three luma rows, which is the rows-that-
-	// matched count at every size.
-	down_bytes := (int(w) * int(h) + int(uv_w) * int(uv_h)) * 4
-	luma_gpu_bytes := int(w) * int(h) * 4
-	chroma_gpu_bytes := int(uv_w) * int(uv_h) * 4
+	down_bytes := int(w) * int(h) * 3 / 2
+	luma_bytes := int(w) * int(h)
+	// The two R8 planes must tile the NV12 frame exactly. Asserted rather than
+	// assumed: a mismatch here silently reads a short chroma plane as garbage
+	// in the last rows, which is exactly how the previous mis-sizing presented.
+	assert(
+		luma_bytes + int(uv_w) * int(uv_h) * 2 == down_bytes,
+		"gpu_nv12: R8 planes must sum to the NV12 frame",
+	)
 
 	up := gpu_nv12_transfer(device, &p.up_tb, src_bytes, .UPLOAD)
 	if up == nil {
@@ -291,7 +295,9 @@ gpu_nv12_run :: proc(p: ^GPU_NV12_Probe, rgba: []u8, out: []u8) -> bool {
 		_ = sdl.CancelGPUCommandBuffer(cb)
 		return false
 	}
-	if !render_one(device, cb, p.chroma_pipe, p.sampler, p.src_tex, p.chroma_tex, u32(uv_w), u32(uv_h)) {
+	// Chroma viewport is the TARGET width (2*uv_w), not the sample count: the
+	// pass writes one texel per U or V byte so the pair lands adjacently.
+	if !render_one(device, cb, p.chroma_pipe, p.sampler, p.src_tex, p.chroma_tex, u32(uv_w * 2), u32(uv_h)) {
 		_ = sdl.CancelGPUCommandBuffer(cb)
 		return false
 	}
@@ -306,9 +312,9 @@ gpu_nv12_run :: proc(p: ^GPU_NV12_Probe, rgba: []u8, out: []u8) -> bool {
 	)
 	sdl.DownloadFromGPUTexture(
 		cp2,
-		sdl.GPUTextureRegion {texture = p.chroma_tex, w = u32(uv_w), h = u32(uv_h), d = 1},
+		sdl.GPUTextureRegion {texture = p.chroma_tex, w = u32(uv_w * 2), h = u32(uv_h), d = 1},
 		sdl.GPUTextureTransferInfo {
-			transfer_buffer = down, offset = u32(luma_gpu_bytes), pixels_per_row = u32(uv_w), rows_per_layer = u32(uv_h),
+			transfer_buffer = down, offset = u32(luma_bytes), pixels_per_row = u32(uv_w * 2), rows_per_layer = u32(uv_h),
 		},
 	)
 	sdl.EndGPUCopyPass(cp2)
@@ -325,34 +331,12 @@ gpu_nv12_run :: proc(p: ^GPU_NV12_Probe, rgba: []u8, out: []u8) -> bool {
 	if back == nil {
 		return false
 	}
-	copy(out, ([^]u8)(back)[:int(w) * int(h) * 3 / 2])
+	// R8 targets: the download is already NV12 -- luma contiguous from 0,
+	// chroma interleaved from w*h -- so it is a straight copy with no unpack.
+	// Anything that needed a pack loop here would mean the passes were not
+	// writing NV12 order, which is the bug this probe exists to catch.
+	copy(out[:down_bytes], ([^]u8)(back)[:down_bytes])
 	sdl.UnmapGPUTransferBuffer(device, down)
-
-	// RGBA8 targets: luma bytes sit at 4-byte strides, chroma at 8-byte
-	// strides on the rows they were rendered to, but with the row order of the
-	// packed NV12 planes (chroma samples progress y-major within a row). Pack
-	// the two planes into NV12 while the buffer is still mapped.
-	packed := out
-	src := ([^]u8)(back)
-	for y in 0 ..< int(h) {
-		for x in 0 ..< int(w) {
-			packed[y * int(w) + x] = src[(y * int(w) + x) * 4]
-		}
-	}
-	chroma_src := src[luma_gpu_bytes:]
-	for k in 0 ..< int(uv_h) {
-		for c in 0 ..< int(uv_w) {
-			// 4 bytes per RGBA8 chroma pixel. U is red (+0), V is green (+1);
-			// the first attempt read +2, which is the blue channel the shader
-			// never writes, so V came back as 0 at every sample while U stayed
-			// exact -- the asymmetric signature that made it look like the
-			// shader, not the packer.
-			i := (k * int(uv_w) + c) * 4
-			o := int(w) * int(h) + (k * int(uv_w) + c) * 2
-			packed[o + 0] = chroma_src[i + 0]
-			packed[o + 1] = chroma_src[i + 1]
-		}
-	}
 	return true
 }
 

@@ -1823,7 +1823,7 @@ Render_Pipeline :: struct {
 	cp1_ns, cp1_n:     i64,
 	cpd_ns, cpd_n:     i64,
 	cpu_ns, cpu_n:     i64,
-	comp_nv12_pass_ns, comp_nv12_dl_ns, comp_nv12_wait_ns, comp_nv12_cpy_ns, comp_nv12_pack_ns: i64,
+	comp_nv12_pass_ns, comp_nv12_dl_ns, comp_nv12_wait_ns, comp_nv12_cpy_ns: i64,
 	rs1_ns, rs1_n:     i64,
 	rsd_ns, rsd_n:     i64,
 	rsu_ns, rsu_n:     i64,
@@ -1846,10 +1846,6 @@ Render_Pipeline :: struct {
 	enc_drain_ns:      i64,
 	enc_slots:         [RENDER_ENC_SLOTS]Render_Enc_Slot,
 	enc_ptr:           ^Render_Enc,
-	// Worker-thread scratch for the GPU-NV12 conversion: the end proc copies
-	// the mapped download out sequentially through this before packing, so the
-	// strided pack never touches device-visible memory directly.
-	gpu_nv12_scratch:  []u8,
 }
 render_pipe: Render_Pipeline
 
@@ -2155,14 +2151,14 @@ render_worker_run :: proc() {
 			fmt.printf(
 				// The GPU-NV12 conversion split. pass is the two render passes,
 				// dl the plane downloads into g.down, wait the GPU idle after
-				// submit, cpy the sequential copy out of the mapped download,
-				// and pack the CPU interleave into the slot's NV12 bytes.
-				"[frame-time]   nv12 pass=%.2fms dl=%.2fms wait=%.2fms cpy=%.2fms pack=%.2fms\n",
+				// submit, and cpy the one sequential copy that lands the already
+				// NV12-ordered bytes in the slot. There is no pack stage: the
+				// passes write NV12 order directly.
+				"[frame-time]   nv12 pass=%.2fms dl=%.2fms wait=%.2fms cpy=%.2fms\n",
 				f64(render_pipe.comp_nv12_pass_ns) / 1e6 / f64(frames),
 				f64(render_pipe.comp_nv12_dl_ns) / 1e6 / f64(frames),
 				f64(render_pipe.comp_nv12_wait_ns) / 1e6 / f64(frames),
 				f64(render_pipe.comp_nv12_cpy_ns) / 1e6 / f64(frames),
-				f64(render_pipe.comp_nv12_pack_ns) / 1e6 / f64(frames),
 			)
 			fmt.printf(
 				// Per geometry, never pooled: the 1:1 class is a memcpy and the
@@ -2467,13 +2463,11 @@ render_worker_run :: proc() {
 		render_pipe.enc_slots[i].nv12 = make([]u8, int(render_job.width) * int(render_job.height) * 3 / 2)
 		render_pipe.enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
 	}
-	// Sized for the NV12 path's max (w*h RGBA luma + w/2*h/2 RGBA chroma).
-	render_pipe.gpu_nv12_scratch = make([]u8, int(render_job.width) * int(render_job.height) * 5)
 	render_pipe.enc_stop, render_pipe.enc_produced, render_pipe.enc_consumed = false, 0, 0
 	render_pipe.enc_has_audio = has_audio
 	render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
 	render_pipe.comp_zero_ns, render_pipe.comp_resample_ns, render_pipe.comp_blit_ns = 0, 0, 0
-	render_pipe.comp_nv12_pass_ns, render_pipe.comp_nv12_dl_ns, render_pipe.comp_nv12_wait_ns, render_pipe.comp_nv12_cpy_ns, render_pipe.comp_nv12_pack_ns = 0, 0, 0, 0, 0
+	render_pipe.comp_nv12_pass_ns, render_pipe.comp_nv12_dl_ns, render_pipe.comp_nv12_wait_ns, render_pipe.comp_nv12_cpy_ns = 0, 0, 0, 0
 	render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
 	render_pipe.res_submit_ns, render_pipe.res_wait_ns = 0, 0
 	render_pipe.cpu_resample_ns, render_pipe.cpu_resample_n = 0, 0
@@ -2608,9 +2602,6 @@ render_worker_run :: proc() {
 		if gpu_frame_ok {
 			if gc, gc_ok := gpu_composite_begin(gpu_resample_get(), int(render_job.width), int(render_job.height)); gc_ok {
 				gpu_canvas = gc
-				if gpu_nv12_for_run {
-					gpu_canvas.scratch = render_pipe.gpu_nv12_scratch
-				}
 				gpu_active = true
 			}
 		}

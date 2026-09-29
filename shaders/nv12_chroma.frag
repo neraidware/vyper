@@ -1,8 +1,14 @@
 #version 450
 
 // Chroma plane of the byte-exact RGBA->NV12 conversion: one pass writing
-// interleaved U,V to an RG8 target, which is bit-for-bit the NV12 chroma plane
-// (w/2 samples wide, h/2 rows, U,V byte-interleaved).
+// interleaved U,V to a single-channel R8 target that is twice the chroma sample
+// width, so U and V land in ADJACENT texels and the downloaded plane is
+// bit-for-bit the NV12 chroma plane (U,V byte-interleaved, h/2 rows).
+//
+// The target is 2*uv_w wide rather than uv_w wide with two channels precisely so
+// that interleaving is a texel-adjacency question. A one-channel target can hold
+// the plane only if the two components are neighbours in memory, and making them
+// neighbours is this shader's job rather than a CPU unpack pass's.
 //
 // This stage is where the 4:4:4 -> 4:2:0 reduction happens, and it is NOT
 // separable into "filter then decimate". swscale's order is: sit each chroma
@@ -75,11 +81,15 @@ void chroma_p(int cx, int row, ivec2 size, out int pu, out int pv) {
 void main() {
     ivec2 size = textureSize(src, 0);
     ivec2 cw = size / 2;
-    ivec2 c = ivec2(texcoord * vec2(cw));
-    // texcoord reaches exactly 1.0 on the last fragment; that would index one
-    // past the last chroma sample, so clamp first. With c <= cw-1 the pixel
+    // Output texel index in the 2*cw.x wide R8 target. Deriving it from the
+    // texcoord (rather than from gl_FragCoord) keeps this identical to the luma
+    // pass's addressing, which is what the yuv_exact probe compares against.
+    int ox = clamp(int(texcoord.x * float(2 * cw.x)), 0, 2 * cw.x - 1);
+    int oy = clamp(int(texcoord.y * float(cw.y)), 0, cw.y - 1);
+    // Chroma sample owning this texel: adjacent texels 2c, 2c+1 are the U,V
+    // pair for sample c. Clamping ox above means c.x <= cw.x-1, so the pixel
     // pair 2c, 2c+1 is always in range and the per-fetch clamps are dead code.
-    c = clamp(c, ivec2(0), cw - 1);
+    ivec2 c = ivec2(ox >> 1, oy);
 
     // Chroma row k filters luma rows 2k-1 .. 2k+2, i.e. it is centred between
     // luma rows 2k and 2k+1. The asymmetric-looking span is what makes the
@@ -97,7 +107,9 @@ void main() {
     u = clamp(u, 0, 255);
     v = clamp(v, 0, 255);
 
-    // RG8 target: .rg is the NV12 chroma byte pair for this sample. Alpha is 1
-    // so the target is fully written if the driver ever widens it.
-    out_color = vec4(float(u) / 255.0, float(v) / 255.0, 0.0, 1.0);
+    // R8 target: this texel holds U or V depending on its parity, and together
+    // the adjacent pair is exactly NV12's interleaved chroma byte order. Alpha
+    // is 1 so the target is fully written if the driver ever widens it.
+    float out_byte = ((ox & 1) == 0) ? float(u) : float(v);
+    out_color = vec4(out_byte / 255.0, 0.0, 0.0, 1.0);
 }

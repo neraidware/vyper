@@ -778,7 +778,7 @@ throughput. See the note appended to S2.
       keyed/static z-order into a GPU canvas instead of kres_scratch, call
       these passes on it, and hand the result to hw_frames_ctx -- each is a
       structural change with its own gate, not an open correctness question.
-- [ ] S1c. GPU composite straight to canvas, then GPU RGBA->NV12 handed
+- [x] S1c. GPU composite straight to canvas, then GPU RGBA->NV12 handed
       directly to `hw_frames_ctx`. S1b still round-trips each keyed resample
       through `kres_scratch` and a CPU `render_blit_region` because keyed and
       static clips interleave in z-order, so compositing on the GPU needs
@@ -840,9 +840,103 @@ throughput. See the note appended to S2.
       cpy=0.91 pack=0.82 ms/f. Valgrind clean (scratch + slot nv12 are escaped
       job-arena bytes).
 
-      Remaining under this bullet: hand the surfaced NV12 directly to
-      `hw_frames_ctx` (still needs the SDL-GPU VkDevice visibility to interoperate
-      with a VAAPI surface).
+      **PART 3 -- the zero-copy premise is FALSE for FFmpeg 9, and that is now
+      measured, not assumed.** The plan this entry used to carry was to export
+      our own `VkImage` as a dmabuf and hand it to the encoder. It cannot be
+      built, and all three legs were checked against the library rather than
+      reasoned about:
+
+      | route | verdict |
+      | --- | --- |
+      | inject a caller-supplied image/fd into FFmpeg | no API at all |
+      | `av_hwframe_transfer_data` VULKAN->VAAPI | `-38` ENOSYS (probe) |
+      | render into FFmpeg's own Vulkan frame | no image handle exposed |
+      | get the `VkImage` out of SDL_GPU | handles are opaque |
+
+      Leg by leg: `av_hwframe_ctx_set_extra_hw_frames` is not exported by
+      `libavutil.so.61` at all, and `extra_hw_frames` is gone from
+      `hwcontext.h`. Worse, `AVHWFramesContext` is now OPAQUE -- only the
+      fields through `height` are public -- so `buf[]` is unreachable even by
+      hand-writing offsets, which also kills the struct-mirror trick. The
+      public hwcontext surface is 18 symbols and none takes a buffer. A Vulkan
+      frames context initialises fine and hands back frames, but
+      `AVVulkanFramesContext` exposes only `format[]`, `usage` and
+      `lock_frame`/`unlock_frame` -- there is no `img[]` or any image handle,
+      so those frames are write-only-to-the-encoder and readable out only via
+      `av_hwframe_map_data`. And a direct transfer probe between a real Vulkan
+      and a real VAAPI frames context returns `-38`, so there is no GPU->GPU
+      path either. On the SDL side, `SDL_GPUTexture` and `SDL_GPUDevice` remain
+      opaque forward declarations (`SDL_gpu.h:473`, `:411`); the
+      `SDL_GPUVulkanOptions` extension list only lets us *require* extensions
+      on SDL's device, which was never the obstacle -- the opacity is.
+
+      **So `av_hwframe_transfer_data` is not an inefficiency to be tuned away.
+      In FFmpeg 9 it is the only supported door, and the CPU round trip is
+      load-bearing.** Every zero-copy design is off the table, and
+      `h264_vulkan` is not a way back either: it is a Vulkan-std SOFTWARE
+      encoder, so trading `h264_vaapi`'s hardware path for it to save a copy is
+      a throughput bet that was never measured and need not be taken.
+
+      **What is left is the part that was actually wasteful, and it is not the
+      transfer -- it is converting the image TWICE.** The chain currently
+      converts on the GPU into `R8G8B8A8` targets (U in `.r`, V in `.g`, luma
+      in `.r`), downloads 8 MB of RGBA per 1080p frame, and then runs two CPU
+      loops that pull the luma from every 4th byte and interleave the chroma
+      pair -- re-deriving on the CPU the very bytes the GPU just computed. That
+      is `cpy=0.91` + `pack=0.82` ms/f, and the 8 MB download exists only to
+      throw 5 of every 8 bytes away.
+
+      **PART 3 LANDED 2026-09-29 — the GPU now emits NV12 memory directly, and
+      the CPU no longer converts anything.** Two `R8` targets: luma `w x h`, and
+      chroma `2*uv_w x uv_h`, where the shader puts U and V in ADJACENT texels
+      (even x -> U, odd x -> V) rather than in the `.r`/`.g` channels of one
+      RGBA pixel. That parity rule is the only new logic in the change, and it
+      is what lets a single-channel target hold an interleaved plane. Both
+      downloads are then already contiguous and in NV12 order, so the transfer
+      buffer receives the finished frame and one sequential copy lands it in the
+      encoder slot. Deleted: the `cpy` scratch, both pack loops, the
+      `comp_nv12_pack_ns` timer, the `GPU_Composite.scratch` field, and the
+      `5*w*h` `gpu_nv12_scratch` arena buffer (the slot's own `nv12` is already
+      exactly `w*h*3/2`, so the scratch was the same bytes twice). The
+      conversion now happens once instead of twice, and nothing on the CPU
+      mirrors the shader's channel layout that could drift out of sync with the
+      probe. `yuv_exact` gates the new R8 layout byte-for-byte against swscale at
+      8..256 and in `flat`/`vgrad` modes; the chroma viewport is the TARGET
+      width (`2*uv_w`), not the sample count, since the pass emits one texel per
+      U or V byte.
+
+      MEASURED, keyed 1920x1080 fixture, same binary type as the numbers above:
+
+      | stage | before | after |
+      | --- | --- | --- |
+      | `cpy` (sequential copy out) | 0.91 ms/f | 0.23-0.25 ms/f |
+      | `pack` (CPU interleave) | 0.82 ms/f | deleted |
+      | bytes moved per frame | 10.4 MB | 3.0 MB |
+
+      The deleted work is stable across runs; it is ~1.5 ms/f of CPU work and it
+      scales with resolution, so it matters more at 4K than at 1080p. NOT yet
+      claimed: `wait` (GPU idle after submit) samples 2.72-3.08 ms/f here against
+      a single 2.31 ms/f sample from before the change. That is one old sample
+      against a live spread, so it is a question, not a finding -- and it is why
+      the perf acceptance below is deferred to S1's fixture rather than settled
+      by these two runs.
+
+      What this did NOT touch: the preview. The composite stays shared -- export
+      and preview run the same `GPU_Composite` over the same canvas -- and the
+      luma/chroma passes were already export-only, so no second renderer appeared
+      and nothing forked. `g.down` keeps its old sizing because it is shared with
+      the RGBA readback path, which still needs `w*h*4`. No FFmpeg API is
+      involved anywhere in this part: no hwcontext, no Vulkan, no encoder swap.
+      `h264_vaapi` stays hardware.
+
+      ACCEPTED: `yuv_exact` byte-exact at 8/16/32/64/96/128/160/256 plus
+      `flat:64` and `vgrad:64`; `gpu_nv12` ok; `keyed_export` 1:1 `inf` and 0.5x
+      58.707992 dB, the committed numbers unchanged; `gpu_composite` byte-exact
+      region; `zorder` `inf`/29.127371; `gpu_probe`, `probe`, `transform_probe`,
+      `timeline_probe`, `subtitle_probe`, `smoke`, `check`, `shaders` all pass;
+      `valgrind` 0 definitely lost / 0 indirectly lost, 11643 errors from the
+      same 22 contexts as before the change, so removing the scratch neither
+      leaked nor corrupted. The remaining perf question (`wait`) is S1's.
 
       **MEASURED 2026-09-27, and it reorders this work.** `VYPER_FRAME_TIME=1`
       on the 1920x1080 keyed fixture, 1:1 and 0.5x:

@@ -503,12 +503,11 @@ gpu_resample_into :: proc(
 // draws (opaque copy, blend off) -- z-order is the draw order, exactly as the
 // CPU walk paints back-to-front.
 GPU_Composite :: struct {
-	g:      ^GPU_Resample,
-	cb:     ^sdl.GPUCommandBuffer,
-	w:      int,
-	h:      int,
-	draws:  int,
-	scratch: []u8,
+	g:     ^GPU_Resample,
+	cb:    ^sdl.GPUCommandBuffer,
+	w:     int,
+	h:     int,
+	draws: int,
 }
 
 // gpu_composite_begin opens the frame: canvas sized to the job, download
@@ -694,10 +693,16 @@ gpu_composite_end :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 }
 
 // gpu_composite_pipeline boots a quad pipeline around one of the NV12 fragment
-// shaders, mirroring the probe's boot_pipeline -- the same RGBA8 target (see
-// the driver-optional R8/RG8 note on GPU_Resample) and the same single
-// fragment sampler + single vertex uniform buffer layout.
-gpu_composite_pipeline :: proc(device: ^sdl.GPUDevice, frag_spirv: []u8) -> ^sdl.GPUGraphicsPipeline {
+// shaders, mirroring the probe's boot_pipeline -- the same single fragment
+// sampler + single vertex uniform buffer layout. `format` is the R8 target the
+// pass writes; both NV12 planes are single-channel now, and the chroma one
+// carries U and V in adjacent texels rather than in two channels, so the
+// downloaded plane is already NV12 memory.
+gpu_composite_pipeline :: proc(
+	device: ^sdl.GPUDevice,
+	frag_spirv: []u8,
+	format: sdl.GPUTextureFormat,
+) -> ^sdl.GPUGraphicsPipeline {
 	vs := sdl.CreateGPUShader(device, sdl.GPUShaderCreateInfo {
 		code_size           = uint(len(quad_vertex_spirv)),
 		code                = raw_data(quad_vertex_spirv),
@@ -720,7 +725,7 @@ gpu_composite_pipeline :: proc(device: ^sdl.GPUDevice, frag_spirv: []u8) -> ^sdl
 		return nil
 	}
 	target := sdl.GPUColorTargetDescription {
-		format      = .R8G8B8A8_UNORM,
+		format      = format,
 		blend_state = {enable_blend = false},
 	}
 	pipe := sdl.CreateGPUGraphicsPipeline(device, sdl.GPUGraphicsPipelineCreateInfo {
@@ -741,21 +746,26 @@ gpu_composite_pipeline :: proc(device: ^sdl.GPUDevice, frag_spirv: []u8) -> ^sdl
 }
 
 // gpu_composite_nv12_ensure lazily creates the luma/chroma targets and the two
-// converting pipelines on the first frame that actually converts. Intelized
+// converting pipelines on the first frame that actually converts. Initialized
 // once, reused across frames; only incurred on the NV12 path, so an
 // RGBA-readback export never pays for it.
+//
+// Both planes are R8 and both are ALREADY NV12 bytes, which is the whole point:
+// the chroma target is 2*uv_w wide because the shader puts U and V in adjacent
+// texels, so a single-channel target can hold an interleaved plane. Nothing
+// downstream has to unpack channels.
 gpu_composite_nv12_ensure :: proc(c: ^GPU_Composite) -> bool {
 	g := c.g
 	uv_w, uv_h := g.canvas_w / 2, g.canvas_h / 2
 	if g.luma_tex == nil {
 		g.luma_tex = sdl.CreateGPUTexture(g.device, sdl.GPUTextureCreateInfo {
-			type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
+			type = .D2, format = .R8_UNORM, usage = {.COLOR_TARGET},
 			width = u32(g.canvas_w), height = u32(g.canvas_h), layer_count_or_depth = 1,
 			num_levels = 1, sample_count = ._1,
 		})
 		g.chroma_tex = sdl.CreateGPUTexture(g.device, sdl.GPUTextureCreateInfo {
-			type = .D2, format = .R8G8B8A8_UNORM, usage = {.COLOR_TARGET},
-			width = u32(uv_w), height = u32(uv_h), layer_count_or_depth = 1,
+			type = .D2, format = .R8_UNORM, usage = {.COLOR_TARGET},
+			width = u32(uv_w * 2), height = u32(uv_h), layer_count_or_depth = 1,
 			num_levels = 1, sample_count = ._1,
 		})
 		if g.luma_tex == nil || g.chroma_tex == nil {
@@ -763,8 +773,8 @@ gpu_composite_nv12_ensure :: proc(c: ^GPU_Composite) -> bool {
 		}
 	}
 	if g.luma_pipe == nil {
-		g.luma_pipe = gpu_composite_pipeline(g.device, nv12_luma_fragment_spirv)
-		g.chroma_pipe = gpu_composite_pipeline(g.device, nv12_chroma_fragment_spirv)
+		g.luma_pipe = gpu_composite_pipeline(g.device, nv12_luma_fragment_spirv, .R8_UNORM)
+		g.chroma_pipe = gpu_composite_pipeline(g.device, nv12_chroma_fragment_spirv, .R8_UNORM)
 		if g.luma_pipe == nil || g.chroma_pipe == nil {
 			return false
 		}
@@ -778,9 +788,10 @@ gpu_composite_nv12_ensure :: proc(c: ^GPU_Composite) -> bool {
 // AND the encoder's swscale conversion: the encoder's `yuv_data` is pointed
 // straight at the packed bytes, so the 5 ms/f swscale pass never runs. The two
 // fragment passes (luma, then interleaved chroma at half resolution) are the
-// exact shaders the gpu_nv12 probe gates byte-for-byte against swscale, and the
-// pack below mirrors the probe's -- same channel reads, same offsets -- so the
-// chain composite+convert stays byte-identical to the CPU path the A/B pins.
+// exact shaders the gpu_nv12 probe gates byte-for-byte against swscale, and they
+// write into R8 targets that ARE NV12 -- chroma by putting U and V in adjacent
+// texels -- so the download is the finished frame and no CPU pack step exists to
+// drift out of sync with the probe.
 gpu_composite_end_nv12 :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 	g := c.g
 	w, h := c.w, c.h
@@ -832,15 +843,25 @@ gpu_composite_end_nv12 :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 		render_gpu_abort = true
 		return false
 	}
-	if !render_nv12_pass(c, g.chroma_pipe, g.chroma_tex, u32(uv_w), u32(uv_h)) {
+	// Viewport is the CHROMA TARGET width (2*uv_w), not the sample count: the
+	// pass covers one texel per U or V byte, so the wider target is what makes
+	// the pair land adjacently.
+	if !render_nv12_pass(c, g.chroma_pipe, g.chroma_tex, u32(uv_w * 2), u32(uv_h)) {
 		_ = sdl.CancelGPUCommandBuffer(c.cb)
 		render_gpu_abort = true
 		return false
 	}
 	t_p1 := time.now()._nsec
-	// Downloads are R8G8B8A8, so luma costs w*h*4 bytes in the buffer, chroma
-	// uv_w*uv_h*4 -- NOT the NV12 byte counts. Sized for that in begin.
-	luma_gpu_bytes := w * h * 4
+	// Both targets are R8, so each download is exactly its NV12 plane: luma is
+	// w*h bytes and chroma is uv_w*uv_h*2, and together they are the whole
+	// frame with nothing to strip. Chroma sits at offset w*h, which is where
+	// NV12 puts it.
+	luma_bytes := w * h
+	chroma_bytes := uv_w * uv_h * 2
+	assert(
+		luma_bytes + chroma_bytes == nv12_bytes,
+		"gpu_composite: plane sizes must sum to the NV12 frame",
+	)
 	cp := sdl.BeginGPUCopyPass(c.cb)
 	sdl.DownloadFromGPUTexture(
 		cp,
@@ -851,9 +872,9 @@ gpu_composite_end_nv12 :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 	)
 	sdl.DownloadFromGPUTexture(
 		cp,
-		sdl.GPUTextureRegion {texture = g.chroma_tex, w = u32(uv_w), h = u32(uv_h), d = 1},
+		sdl.GPUTextureRegion {texture = g.chroma_tex, w = u32(uv_w * 2), h = u32(uv_h), d = 1},
 		sdl.GPUTextureTransferInfo {
-			transfer_buffer = g.down, offset = u32(luma_gpu_bytes), pixels_per_row = u32(uv_w), rows_per_layer = u32(uv_h),
+			transfer_buffer = g.down, offset = u32(luma_bytes), pixels_per_row = u32(uv_w * 2), rows_per_layer = u32(uv_h),
 		},
 	)
 	sdl.EndGPUCopyPass(cp)
@@ -872,41 +893,19 @@ gpu_composite_end_nv12 :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 		return false
 	}
 	t_p3 := time.now()._nsec
-	// Pack into NV12 while the buffer is still mapped: luma rows from the R
-	// channel of each RGBA8 pixel, chroma U/V from the R,G channels -- the same
-	// channel reads and offsets the gpu_nv12 probe packs with. The mapped
-	// download is device-visible memory; strided reads straight off it measured
-	// 12.5 ms/f on RADV. Copy the planes out SEQUENTIALLY first (the same
-	// wide-copy cost as the RGBA readback path), then pack from the now-cached
-	// scratch.
-	raw_total := luma_gpu_bytes + uv_w * uv_h * 4
-	assert(len(c.scratch) >= raw_total, "gpu_composite: nv12 scratch too small")
+	// One sequential copy, and that is the floor. The mapped download is
+	// device-visible memory and strided reads straight off it measured 12.5 ms/f
+	// on RADV, so the bytes have to be moved out in one wide pass rather than
+	// read in place. It is a plain copy now, not a copy plus two unpack loops:
+	// the GPU already wrote NV12 order, so `dst` is filled by the copy alone.
 	t_p3b := time.now()._nsec
-	copy(c.scratch[:raw_total], ([^]u8)(back)[:raw_total])
+	copy(dst[:nv12_bytes], ([^]u8)(back)[:nv12_bytes])
 	t_p3c := time.now()._nsec
-	src := c.scratch
-	for y in 0 ..< h {
-		for x in 0 ..< w {
-			dst[y * w + x] = src[(y * w + x) * 4]
-		}
-	}
-	chroma_src := src[luma_gpu_bytes:]
-	o_base := w * h
-	for k in 0 ..< uv_h {
-		for c2 in 0 ..< uv_w {
-			i := (k * uv_w + c2) * 4
-			o := o_base + (k * uv_w + c2) * 2
-			dst[o + 0] = chroma_src[i + 0]
-			dst[o + 1] = chroma_src[i + 1]
-		}
-	}
-	t_p4 := time.now()._nsec
 	sdl.UnmapGPUTransferBuffer(g.device, g.down)
 	render_pipe.comp_nv12_pass_ns += t_p1 - t_p0
 	render_pipe.comp_nv12_dl_ns += t_p2 - t_p1
 	render_pipe.comp_nv12_wait_ns += t_p3 - t_p2
 	render_pipe.comp_nv12_cpy_ns += t_p3c - t_p3b
-	render_pipe.comp_nv12_pack_ns += t_p4 - t_p3c
 	return true
 }
 
