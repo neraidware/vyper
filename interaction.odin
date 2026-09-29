@@ -311,67 +311,77 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			return false
 		}
 		if clay.PointerOver(clay.ID("KfAddX")) {
-			kf_add_prop(sel, "transform.x", sel.transform_x)
+			clip_geom_add_lane_key(sel, .Trans_X)
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddTrans")) {
-			kf_add_group_prop(sel, "transform", {sel.transform_x, sel.transform_y, 0, 0, 0, 0, 0})
+			clip_geom_add_group_key(sel, "transform")
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddCrop")) {
-			kf_add_group_prop(sel, "crop", {sel.crop_l, sel.crop_r, sel.crop_t, sel.crop_b, 0, 0, 0})
+			clip_geom_add_group_key(sel, "crop")
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddY")) {
-			kf_add_prop(sel, "transform.y", sel.transform_y)
+			clip_geom_add_lane_key(sel, .Trans_Y)
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddS")) {
-			kf_add_prop(sel, "scale", sel.scale)
+			clip_geom_add_lane_key(sel, .Scale)
+			return true
+		}
+		// "Keyframe all modified": every geometry lane edited without a key
+		// gets one, as a single undo node. Guarded on
+		// clip_geom_can_key_all_modified — a pending lane is not enough, the
+		// playhead has to be on the clip, since the keys are written at the
+		// playhead. A click that produces no undo node should not be recorded
+		// as one.
+		if clay.PointerOver(clay.ID(KF_ADD_MODIFIED_ID)) && clip_geom_can_key_all_modified(sel) {
+			clip_geom_key_all_modified(sel)
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddCropL")) {
-			kf_add_prop(sel, "crop.l", sel.crop_l)
+			clip_geom_add_lane_key(sel, .Crop_L)
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddCropR")) {
-			kf_add_prop(sel, "crop.r", sel.crop_r)
+			clip_geom_add_lane_key(sel, .Crop_R)
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddCropT")) {
-			kf_add_prop(sel, "crop.t", sel.crop_t)
+			clip_geom_add_lane_key(sel, .Crop_T)
 			return true
 		}
 		if clay.PointerOver(clay.ID("KfAddCropB")) {
-			kf_add_prop(sel, "crop.b", sel.crop_b)
+			clip_geom_add_lane_key(sel, .Crop_B)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldX")) {
-			edit_begin(.X, sel.transform_x)
+			edit_begin(.X, clip_geom_get(sel, .Trans_X))
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldY")) {
-			edit_begin(.Y, sel.transform_y)
+			edit_begin(.Y, clip_geom_get(sel, .Trans_Y))
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldS")) {
-			edit_begin(.Scale, sel.scale)
+			edit_begin(.Scale, clip_geom_get(sel, .Scale))
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropL")) {
-			edit_begin(.Crop_L, sel.crop_l * 100)
+			edit_begin(.Crop_L, clip_geom_get(sel, .Crop_L) * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropR")) {
-			edit_begin(.Crop_R, sel.crop_r * 100)
+			edit_begin(.Crop_R, clip_geom_get(sel, .Crop_R) * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropT")) {
-			edit_begin(.Crop_T, sel.crop_t * 100)
+			edit_begin(.Crop_T, clip_geom_get(sel, .Crop_T) * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropB")) {
-			edit_begin(.Crop_B, sel.crop_b * 100)
+			edit_begin(.Crop_B, clip_geom_get(sel, .Crop_B) * 100)
 			return true
 		}
 		return false
@@ -1041,17 +1051,21 @@ interaction_post_build :: proc(
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
 				canvas := preview_canvas(pb)
 				update_handle_drag(sel, canvas, inp.x, inp.y, inp.shift)
-				// Auto-keyframe every property this gesture actually moved (the
-				// crop handles reach one or two edges, no more — keying all four
-				// would stamp keys the user never touched).
-				autokey_gesture(sel, handle_drag.start_scale, sel.scale, "scale")
-				autokey_gesture(sel, handle_drag.start_tx, sel.transform_x, "transform.x")
-				autokey_gesture(sel, handle_drag.start_ty, sel.transform_y, "transform.y")
+				// Route every property this gesture actually MOVED to wherever
+				// the clip reads it (the crop handles reach one or two edges, no
+				// more — committing all four would stamp keys the user never
+				// touched). clip_geom_drag keys the playhead when the property is
+				// keyed there, so a keyed clip follows the handle even with
+				// auto-key off; unkeyed, it marks the lane pending for the
+				// inspector's "key all modified" row.
+				clip_geom_drag(sel, .Scale, handle_drag.start_scale)
+				clip_geom_drag(sel, .Trans_X, handle_drag.start_tx)
+				clip_geom_drag(sel, .Trans_Y, handle_drag.start_ty)
 				if handle_drag.kind == .Crop {
-					autokey_gesture(sel, handle_drag.start_crop_l, sel.crop_l, "crop.l")
-					autokey_gesture(sel, handle_drag.start_crop_r, sel.crop_r, "crop.r")
-					autokey_gesture(sel, handle_drag.start_crop_t, sel.crop_t, "crop.t")
-					autokey_gesture(sel, handle_drag.start_crop_b, sel.crop_b, "crop.b")
+					clip_geom_drag(sel, .Crop_L, handle_drag.start_crop_l)
+					clip_geom_drag(sel, .Crop_R, handle_drag.start_crop_r)
+					clip_geom_drag(sel, .Crop_T, handle_drag.start_crop_t)
+					clip_geom_drag(sel, .Crop_B, handle_drag.start_crop_b)
 				}
 			}
 		case .Panel_Resize:
@@ -1085,14 +1099,13 @@ interaction_post_build :: proc(
 					// snap runs regardless, so a centered clip still snaps).
 					snap_center(sel, snap_margin(canvas, SNAP_MARGIN_PX))
 					snap_transform(sel, snap_margin(canvas, SNAP_MARGIN_PX))
-					// Auto-keyframe: a moved axis keys at the playhead (new key,
-					// or update of a key already sitting there) so the motion is
-					// recorded on the timeline, not just the resting transform.
-					// A drag's live write rides the key AND the resting value:
-					// the preview samples keyed regions from the track, so the
-					// on-screen moose must follow the key while it moves.
-					autokey_gesture(sel, handle_drag.start_tx, sel.transform_x, "transform.x")
-					autokey_gesture(sel, handle_drag.start_ty, sel.transform_y, "transform.y")
+					// Route the moved axes to wherever the clip READS them at the
+					// playhead, so the motion lands on the timeline rather than in
+					// a resting field the sampler ignores. Snap reads the resting
+					// writes above, so those stay direct and the commit happens
+					// once, after the snaps have had their say.
+					clip_geom_drag(sel, .Trans_X, handle_drag.start_tx)
+					clip_geom_drag(sel, .Trans_Y, handle_drag.start_ty)
 				}
 			}
 		case .Clip_Resize:

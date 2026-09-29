@@ -58,6 +58,11 @@ UI_Text_Buffers :: struct {
 	kf_name:     [128]u8,
 	kf_frame:    [64]u8,
 	kf_val:      [64]u8,
+	// "keyframe all modified" row: the heading and the pending-lane list.
+	// Seven lanes plus separators is well under this, and a fixed buffer keeps
+	// the row from allocating a string every frame the inspector is drawn.
+	kf_pending:      [64]u8,
+	kf_pending_list: [64]u8,
 	// playhead timecode (HH:MM:SS:FF) scratch; clay keeps it until draw, so it
 	// must outlive build_page and back exactly one clay.Text element per frame.
 	timecode:    [32]u8,
@@ -1094,6 +1099,71 @@ group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
 // project_card is the "Project" inspector card: canvas resolution presets,
 // orientation, frame rate, and the render range. These controls are always
 // reachable (not gated behind an empty timeline).
+// geom_key_all_modified_row is the "keyframe all modified" control: it keys
+// every geometry lane that was edited without a keyframe, in one undo node.
+//
+// It names the pending lanes rather than saying "modified properties" and
+// hoping. A user who panned a clip sees "L, R" and knows exactly which edges
+// the button will commit; a button that keys "whatever changed" is a button
+// nobody trusts enough to press, and the whole point is that they should.
+//
+// The row is laid out unconditionally (a stable inspector does not reflow when
+// a flag flips) but only LIT when something is pending, so its state is
+// readable at a glance without appearing out of nowhere.
+//
+// Layout uses the `if clay.UI(id)(config) { ... }` BLOCK form, not
+// `if !clay.UI(id)(config) { return }`. Both compile and both return true, but
+// the early-return form left the element with a zero-height box: Clay's
+// _CloseElement is deferred to UI_WithId's natural end, and the non-block
+// shape collapsed the row to 0x346 -- laid out but invisible, un-painted, and
+// un-hit-testable, with nothing to say so. draw_kf_add_buttons skips a
+// zero-size box, so the button would have silently not existed. The block form
+// is the shape the rest of this file uses.
+geom_key_all_modified_row :: proc(cl: ^Clip) {
+	any := clip_geom_any_modified(cl)
+	if clay.UI(clay.ID("KfAllModifiedRow"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+				layoutDirection = .LeftToRight,
+				childGap = BUTTON_ROW_GAP,
+				childAlignment = {x = .Left, y = .Center},
+			},
+		},
+	) {
+		// Short labels for the pending lanes, formatted into the fixed ui_text
+		// buffer so the row does not allocate a string every inspector frame.
+		buf := ui_text.kf_pending[:]
+		label := fmt.bprintf(buf[:], "Key %s", geom_key_pending_labels(cl, any))
+		col := any ? TEXT : CMDLINE_PLACEHOLDER
+		clay.Text(label, clay.TextElementConfig{textColor = col, fontSize = FONT_SMALL})
+		kf_add_button(KF_ADD_MODIFIED_ID)
+	}
+}
+
+// geom_key_pending_labels lists the pending lanes as short inspector names
+// ("L, R, Scale"), or "none" when the set is empty. The short names are the
+// same ones the per-row fields use, so the list reads as a summary of the
+// rows above it rather than as track names from the keyframe gutter.
+geom_key_pending_labels :: proc(cl: ^Clip, any: bool) -> string {
+	if !any {
+		return "none"
+	}
+	short := []string{"X", "Y", "Scale", "L", "R", "T", "B"}
+	buf := ui_text.kf_pending_list[:]
+	n := 0
+	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
+		if !clip_geom_key_modified(cl, Render_Geom_Prop(i)) {
+			continue
+		}
+		if n > 0 {
+			n += len(fmt.bprintf(buf[n:], ", "))
+		}
+		n += len(fmt.bprintf(buf[n:], "%s", short[i]))
+	}
+	return string(buf[:n])
+}
+
 project_card :: proc() {
 	if !card_open("ProjectCard", "Project") {
 		return
@@ -1285,20 +1355,20 @@ clip_card :: proc() {
 				clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 			)
 			x_buf := ui_text.x[:]
-			x_val := fmt.bprintf(x_buf[:], "%.0f", cl.transform_x)
+			x_val := fmt.bprintf(x_buf[:], "%.0f", clip_geom_get(cl, .Trans_X))
 			if edit_state.field == .X {
 				x_val = string(edit_state.chars[:edit_state.len])
 			}
 			group_caption_row("TransCaption", "TransCaptionSpacer", "Transform", "KfAddTrans")
 			prop_field_row("PropRowX", "PropFieldX", "X", x_val, edit_state.field == .X, "KfAddX")
 			y_buf := ui_text.y[:]
-			y_val := fmt.bprintf(y_buf[:], "%.0f", cl.transform_y)
+			y_val := fmt.bprintf(y_buf[:], "%.0f", clip_geom_get(cl, .Trans_Y))
 			if edit_state.field == .Y {
 				y_val = string(edit_state.chars[:edit_state.len])
 			}
 			prop_field_row("PropRowY", "PropFieldY", "Y", y_val, edit_state.field == .Y, "KfAddY")
 			s_buf := ui_text.s[:]
-			scl_val := fmt.bprintf(s_buf[:], "%.2f", cl.scale)
+			scl_val := fmt.bprintf(s_buf[:], "%.2f", clip_geom_get(cl, .Scale))
 			if edit_state.field == .Scale {
 				scl_val = string(edit_state.chars[:edit_state.len])
 			}
@@ -1318,22 +1388,22 @@ clip_card :: proc() {
 			}
 			group_caption_row("CropCaption", "CropCaptionSpacer", "Crop (percent of box)", "KfAddCrop")
 			l_buf := ui_text.l[:]
-			l_val := fmt.bprintf(l_buf[:], "%.0f%%", cl.crop_l * 100)
+			l_val := fmt.bprintf(l_buf[:], "%.0f%%", clip_geom_get(cl, .Crop_L) * 100)
 			if edit_state.field == .Crop_L {
 				l_val = string(edit_state.chars[:edit_state.len])
 			}
 			r_buf := ui_text.r[:]
-			r_val := fmt.bprintf(r_buf[:], "%.0f%%", cl.crop_r * 100)
+			r_val := fmt.bprintf(r_buf[:], "%.0f%%", clip_geom_get(cl, .Crop_R) * 100)
 			if edit_state.field == .Crop_R {
 				r_val = string(edit_state.chars[:edit_state.len])
 			}
 			t_buf := ui_text.t[:]
-			t_val := fmt.bprintf(t_buf[:], "%.0f%%", cl.crop_t * 100)
+			t_val := fmt.bprintf(t_buf[:], "%.0f%%", clip_geom_get(cl, .Crop_T) * 100)
 			if edit_state.field == .Crop_T {
 				t_val = string(edit_state.chars[:edit_state.len])
 			}
 			b_buf := ui_text.b[:]
-			b_val := fmt.bprintf(b_buf[:], "%.0f%%", cl.crop_b * 100)
+			b_val := fmt.bprintf(b_buf[:], "%.0f%%", clip_geom_get(cl, .Crop_B) * 100)
 			if edit_state.field == .Crop_B {
 				b_val = string(edit_state.chars[:edit_state.len])
 			}
@@ -1365,6 +1435,7 @@ clip_card :: proc() {
 				prop_field("PropCropB", "B", b_val, edit_state.field == .Crop_B)
 				kf_add_button("KfAddCropB")
 			}
+			geom_key_all_modified_row(cl)
 		} else {
 			// Audio clips get the gain row: a drag-to-set knob (the GainKnob
 			// element the interaction probe hit-tests) plus the dB value field.

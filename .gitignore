@@ -1,5 +1,7 @@
 # Build output
 /vyper
+# baseline-arch build for the valgrind memory gate (see VALGRIND_BIN in gate.sh)
+/vyper-valgrind
 # swsbench binary from `./scripts/gate.sh bench`
 /bin_swsbench
 

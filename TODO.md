@@ -377,6 +377,190 @@ into playback/preview.
       max-scale/full-box resampling path needs the performance follow-up in
       Active 4.
 
+- [x] S6. Geometry writes route to where the clip READS (the Alt-wheel/Alt-drag
+      loss fix + "keyframe all modified"). **Why:** a clip has TWO homes for
+      every geometry property — a resting field and a keyframe track — and
+      `kf_sample_keys` ignores the resting field between the first and last
+      key. So "write the resting field" is silently discarded exactly when the
+      user reaches for a property they want to animate. The routing was a
+      per-call-site discipline (every write had to remember `kf_auto_key`), and
+      the two preview gestures did not remember: Alt+wheel and Alt+middle-drag
+      moved the inspector numbers, moved nothing under the pointer, and made
+      the clip jump when the playhead left the keyed span. The same defect hit
+      the inspector's typed fields (seeded from the sampled value, committed to
+      the resting field), the handle drag's start snapshot (scaled from a
+      position not on screen), and preview-move's grab offset (clip jumped on
+      press).
+
+      **Step — `clip_geom.odin`, the chokepoint.** `clip_geom_get` reads the
+      playhead value; `clip_geom_set` writes wherever the sampler READS, keyed
+      on `clip_geom_keyed_at` (the sampler's own `active` result, not
+      "is this property keyed somewhere"). Three cases: (1) a key is active at
+      the playhead → write a key, **ignoring the auto-key toggle**, because a
+      resting write there would be discarded while the gesture was still under
+      the pointer; (2) keyed but inactive at the playhead (before the first key
+      or past the last, where `base` rules) → auto-key extends the animation,
+      otherwise the resting write is what the sampler reads, so both are
+      non-lossy and the toggle keeps its meaning; (3) unkeyed → resting write
+      plus a pending bit. A `clip_visible_at` guard keeps case 1/2 from minting
+      keys on frames the clip does not cover. `Clip.geom_modified: u8` is a
+      7-lane pending mask, session-only and deliberately not serialized: it is
+      "edited since the last key", which is a UI state, not a project fact.
+      Migrations: both Alt gestures, the crop-pan undo snapshot, `edit_commit`'s
+      geometry fields (its no-op compare also had to move to the sampled value,
+      or a commit of the number already on screen stamped a key), the handle
+      drag's snapshot, `clip_geom_drag` replacing `autokey_gesture` for every
+      geometry lane, and preview-move's grab offset. `autokey_gesture` survives
+      for gain, which is not a geometry lane. Read-side: the inspector's seven
+      readouts, the group/field diamonds' values, and the prop-field focus seed
+      all go through `clip_geom_get`, so the number on screen is the number the
+      preview draws.
+
+      **Step — the button.** `clip_geom_key_all_modified` keys every pending
+      lane at the playhead in ONE undo node, sampling all values BEFORE writing
+      any key (the first `kf_geom_set_lane_key` can unwrap a packed section,
+      which changes what later reads resolve to). Lanes are keyed individually
+      rather than by section: a pending set is routinely a subset, and folding a
+      partial set would convert untouched lanes' scalar tracks for no reason.
+      Returns the lane count so the caller can report a real result. The
+      inspector row names the pending lanes ("Key X, L") instead of saying
+      "modified" and hoping — a button that keys "whatever changed" is a button
+      nobody trusts enough to press. The diamond is drawn dim
+      (`KF_DIAMOND_FILL_DISABLED`) with nothing pending, not a lit no-op.
+
+      **Probe (`geom_key_probe`, in `all`):** Alt+wheel and Alt+drag write where
+      the clip is actually read — sampled inside the keyed span, baseline
+      outside it, resting edit preserved when unkeyed, a neighbouring key reached
+      by the curve, a keyed clip's visible value still responding with auto-key
+      OFF, an un-keyed clip's panned lanes becoming pending, the button keying
+      exactly the pending set (and not `scale`, which a pan never touched), a
+      second press keying nothing, no key minted off-clip while the edit stays
+      visible and pending, the button refusing to act off-clip and becoming
+      actionable again on return, a manual lane key and a manual group key each
+      clearing their own pending bits, and the typed-edit path changing what
+      the preview shows without stamping a key on a no-op commit. Verified it
+      FAILS on the pre-fix gestures, on the pre-fix typed-edit commit, on the
+      unguarded off-clip button, and on a lane key that left its pending bit
+      set, so it is not a probe that merely agrees with the implementation.
+      `ui_probe` additionally
+      pins that the row and its diamond get real layout boxes and that the
+      pending labels read "X, L" / "none".
+
+      **Two guards the button and the diamonds needed.** Both were found by
+      reading the finished code back rather than by a failing test, so the
+      probe cases for them are new and were verified to fail against the
+      pre-fix behavior:
+
+      - **Pending is not the same as actionable.** `clip_geom_key_all_modified`
+        writes keys AT the playhead, and `clip_geom_set`'s `clip_visible_at`
+        guard exists precisely so no edit can mint a key on a frame the clip
+        does not cover — so the button was routing straight around that guard,
+        and a click with the playhead off-clip would mint an off-clip key. New
+        `clip_geom_can_key_all_modified` (pending AND playhead-on-clip) is what
+        the click handler and the dimmed diamond consult; the proc itself
+        asserts, so a caller that skips the guard crashes instead of quietly
+        keying frame 340. Off-clip the pending set **survives** — the edit is
+        real, just not keyable at a frame where the clip has no pixels.
+        (`kf_add_prop` and `kf_add_group_prop` already clamped into the clip, so
+        this was the only unguarded path.)
+      - **Keying a lane and marking it keyed are one action.**
+        `clip_geom_add_lane_key` / `clip_geom_add_group_key` are now the only
+        way the inspector's geometry diamonds key anything: a lane panned and
+        then keyed by hand is no longer pending, and the eight call sites had
+        been leaving the bit set, so "Key X" stayed lit and re-keyed the lane
+        on the next press. The group wrapper takes the section NAME and reads
+        its lane list from `kf_geom_sections` — the same table
+        `kf_geom_set_packed` reads the payload in — instead of the seven values
+        being spelled out positionally at each call site, which was a
+        hand-written parallel copy that a new lane would have silently
+        misplaced. The gain diamond is not a geometry lane and still calls
+        `kf_add_prop`.
+
+      **Accepted by:** `check`; `geom_key_probe`; `transform_probe`; `probe`
+      (ui_probe, incl. the new row-layout asserts); `timeline_probe`;
+      `keyed_export` (1.0x PSNR inf, 0.5x 58.7 dB — the export compositor
+      shares the geometry sampling, so this is the parity guard); `smoke`;
+      `gpu_composite`; `gpu_nv12`; `gpu_probe`; `zorder`; `yuv_exact`;
+      `subtitle_probe`; `geom_key_valgrind`; `valgrind`; `render_valgrind`.
+
+      **Found along the way:** `if !clay.UI(id)(config) { return }` produces an
+      element with a **zero-height box** — Clay defers `_CloseElement` to
+      `UI_WithId`'s natural end, and the non-block shape collapses the row.
+      `draw_kf_add_buttons` skips zero-size boxes, so the button would have
+      silently not existed. Use the `if clay.UI(id)(config) { ... }` block form
+      the rest of `ui.odin` uses. Recorded because nothing reports it.
+
+      **The memory gate was passing while measuring nothing.** Wiring
+      `geom_key_valgrind` was supposed to prove the probe's new frees. Instead
+      the target printed "ok" immediately — and so did the pre-existing
+      `valgrind` and `render_valgrind` targets, for the same reason. Root
+      cause: `-microarch:native` lets LLVM emit AVX-512, and Valgrind's VEX
+      cannot decode it, so `./vyper` died with SIGILL in
+      `math_big::initialize_constants` during `__$startup_runtime` — **before
+      main, having allocated nothing**. Memcheck then dutifully reported
+      "definitely lost: 0 bytes in 0 blocks", and all four invariants hold
+      trivially for a process that never ran. Three fixes, in order of how
+      much they mattered:
+
+      1. **A Valgrind-compatible binary** (`vyper-valgrind`, built by
+         `build.sh` from the same flags via `VYPER_OUT`/`VYPER_MICROARCH`/
+         `VYPER_DEBUG` — §10, no duplicated `odin` invocation), at the baseline
+         x86-64 target. `require_fresh_valgrind_binary` builds it on demand,
+         which `require_fresh_binary` deliberately refuses to do: there, an
+         implicit rebuild would hide "I meant to measure the previous build";
+         here the binary has different flags, so a missing one is not a
+         measurement anybody could have meant to make.
+      2. **A non-vacuity assertion in `valgrind_assert`**, since that is the one
+         place every memcheck target passes through and the place that decided
+         "ok" on a dead process: the probe's own success line must appear, and a
+         log containing "Unrecognised instruction" is a failure. A run that
+         died early satisfies all four leak invariants for free, so this check
+         is what makes the other three mean anything.
+      3. **Frame pointers** (`VYPER_DEBUG=1` → `-debug`) for the gate build.
+         The release build omits them, so every allocation trace came back as
+         `calloc <- runtime::heap_allocator_proc <- ??? <- ???` — no better
+         than no trace. With them, the first real leak named its own source.
+
+      (2) immediately paid for itself: it caught a regression in the very fix
+      below, which the leak counts alone had passed over.
+
+      **A real leak it then caught:** `edit_begin` formatted the field seed with
+      `fmt.aprintf` and copied the result into `edit_state.chars` — a heap
+      string per property focus that nothing owned, so every click on a property
+      field leaked 23 bytes (§1: format into fixed buffers, never
+      `aprintf`). Now `fmt.bprintf(edit_state.chars[:], ...)`, which is
+      allocation-free because the builder is backed by the array with a nil
+      allocator. Note the full slice, **not** `[:0]`: `builder_from_bytes`
+      takes its capacity from `len(backing)`, so `[:0]` hands it zero capacity
+      and every format overflows. That capacity is also why the buffer may be
+      passed un-clamped: 64 bytes covers the worst case (an f32 at two decimals
+      is 43 characters), and the nil allocator panics on overflow rather than
+      truncating — so a truncated field, which would silently show a number the
+      preview is not using, is a crash instead.
+
+      **A passing probe should shut down normally.** The dispatch used
+      `os.exit(geom_key_probe_run())`, which skips the runtime's teardown, so
+      the thread/TLS allocations the runtime frees on a normal exit were still
+      live when memcheck took its census. `main` returns nothing, so a non-zero
+      code needs `os.exit` — but a *passing* probe now `return`s out of `main`
+      and lets the runtime tear down; only a failing probe exits immediately,
+      where the non-zero code is the gate's pass/fail signal anyway.
+
+      Also made `build.sh` skip a shader whose `.spv` is already newer than its
+      source: recompiling unconditionally bumped `.spv` mtimes on every build,
+      and `require_fresh_binary` rightly treats a fresh `.spv` as "the binary
+      is stale" — so building the Valgrind binary knocked `./vyper` out of date
+      even though no shader had changed.
+
+      Measured after the fix, on the baseline binary: `geom_key_valgrind` 0
+      definitely lost / 0 indirectly lost, 61 errors from 32 contexts; `valgrind`
+      0 / 0, 11643 errors from 22 contexts; `render_valgrind` 0 / 0, 478 errors
+      from 128 contexts. The context counts are the noise baseline AGENTS.md
+      §9b asks to watch, and they are now recorded from runs that actually
+      executed. **Known and still open:** `VYPER_TL_PROBE` reports 79 bytes in
+      1 block definitely lost — pre-existing, not reached by any valgrind
+      target in `all`, and the frame-pointer build now makes it diagnosable.
+
 ## Active 4 — Export keyframe compositor performance
 
 **Status:** measured 2026-09-25. Export scale keyframes are functional but

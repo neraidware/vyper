@@ -472,12 +472,26 @@ CROP_MIN_VISIBLE_FRAC :: 0.05
 // apply=false it only reports whether the edit would change anything (the
 // wheel-at-floor no-op guard), so the caller can capture the pre-edit state
 // before mutating.
+//
+// Geometry is read with clip_geom_get and written with clip_geom_set, never off
+// the resting fields directly: on a clip whose crop is keyed the resting fields
+// are not what the preview is showing, so computing from them and writing to
+// them both reads and stores a value the sampler ignores. Reads and writes go
+// through the same accessor for the same reason — the gesture operates on what
+// is on screen.
 crop_viewport_zoom :: proc(clip: ^Clip, zoom: f32, apply: bool) -> bool {
 	if clip.kind == .Text || clip.source_w <= 0 {
 		return false
 	}
-	fx := 1 - clip.crop_l - clip.crop_r
-	fy := 1 - clip.crop_t - clip.crop_b
+	cur_l := clip_geom_get(clip, .Crop_L)
+	cur_r := clip_geom_get(clip, .Crop_R)
+	cur_t := clip_geom_get(clip, .Crop_T)
+	cur_b := clip_geom_get(clip, .Crop_B)
+	cur_s := clip_geom_get(clip, .Scale)
+	cur_x := clip_geom_get(clip, .Trans_X)
+	cur_y := clip_geom_get(clip, .Trans_Y)
+	fx := 1 - cur_l - cur_r
+	fy := 1 - cur_t - cur_b
 	if fx <= 0 || fy <= 0 {
 		return false
 	}
@@ -495,27 +509,41 @@ crop_viewport_zoom :: proc(clip: ^Clip, zoom: f32, apply: bool) -> bool {
 	if !apply {
 		return true
 	}
-	cw0, ch0 := clip_full_box_dims(clip, clip.scale)
+	cw0, ch0 := clip_full_box_dims(clip, cur_s)
 	wx := fx * k
 	wy := fy * k
 	// Place each axis' new window at the current center when an edge still has
 	// room; when the growth step would cross a source border the window slides
 	// off-center instead, so zooming out past a panned pin keeps revealing
 	// (toward the full frame) rather than stopping.
-	hs := clamp((clip.crop_l + 1 - clip.crop_r) * 0.5 - wx * 0.5, 0, 1 - wx)
-	vs := clamp((clip.crop_t + 1 - clip.crop_b) * 0.5 - wy * 0.5, 0, 1 - wy)
-	sl := clip.crop_l - clip.crop_r
-	st := clip.crop_t - clip.crop_b
-	vis_cx := clip.transform_x + sl * cw0 / 2
-	vis_cy := clip.transform_y + st * ch0 / 2
-	clip.crop_l = hs
-	clip.crop_r = 1 - hs - wx
-	clip.crop_t = vs
-	clip.crop_b = 1 - vs - wy
-	clip.scale = clamp(clip.scale / k, 0.05, 100.0)
-	cw1, ch1 := clip_full_box_dims(clip, clip.scale)
-	clip.transform_x = vis_cx - (clip.crop_l - clip.crop_r) * cw1 / 2
-	clip.transform_y = vis_cy - (clip.crop_t - clip.crop_b) * ch1 / 2
+	hs := clamp((cur_l + 1 - cur_r) * 0.5 - wx * 0.5, 0, 1 - wx)
+	vs := clamp((cur_t + 1 - cur_b) * 0.5 - wy * 0.5, 0, 1 - wy)
+	sl := cur_l - cur_r
+	st := cur_t - cur_b
+	vis_cx := cur_x + sl * cw0 / 2
+	vis_cy := cur_y + st * ch0 / 2
+	// The new scale has to be known before the box dims that re-anchor the
+	// transform, so it is computed here rather than written early: a keyed
+	// clip's scale write lands on a keyframe, and reading it back through
+	// clip_geom_get mid-gesture would be correct but indirect.
+	next_s := clamp(cur_s / k, 0.05, 100.0)
+	next_l := hs
+	next_r := 1 - hs - wx
+	next_t := vs
+	next_b := 1 - vs - wy
+	cw1, ch1 := clip_full_box_dims(clip, next_s)
+	next_x := vis_cx - (next_l - next_r) * cw1 / 2
+	next_y := vis_cy - (next_t - next_b) * ch1 / 2
+	// Seven writes, all routed: a keyed clip records the whole gesture as
+	// keys at the playhead, an un-keyed one records resting values and marks
+	// them pending so the inspector can offer to key them.
+	clip_geom_set(clip, .Crop_L, next_l)
+	clip_geom_set(clip, .Crop_R, next_r)
+	clip_geom_set(clip, .Crop_T, next_t)
+	clip_geom_set(clip, .Crop_B, next_b)
+	clip_geom_set(clip, .Scale, next_s)
+	clip_geom_set(clip, .Trans_X, next_x)
+	clip_geom_set(clip, .Trans_Y, next_y)
 	return true
 }
 
@@ -525,73 +553,95 @@ crop_viewport_zoom :: proc(clip: ^Clip, zoom: f32, apply: bool) -> bool {
 // the window edges move opposite the pointer. The window is clamped as a whole
 // (length invariant): once either edge reaches the source border, further pan
 // pins the window there instead of cropping the region smaller.
+//
+// Routed through clip_geom_get / clip_geom_set for the same reason as
+// crop_viewport_zoom above: on a keyed clip the resting fields are not what is
+// on screen, so both the arithmetic and the store have to go through the
+// playhead's value.
 crop_viewport_pan :: proc(clip: ^Clip, dx, dy: f32) {
 	if clip.kind == .Text || clip.source_w <= 0 || (dx == 0 && dy == 0) {
 		return
 	}
-	cw, ch := clip_full_box_dims(clip, clip.scale)
+	cur_l := clip_geom_get(clip, .Crop_L)
+	cur_r := clip_geom_get(clip, .Crop_R)
+	cur_t := clip_geom_get(clip, .Crop_T)
+	cur_b := clip_geom_get(clip, .Crop_B)
+	cur_s := clip_geom_get(clip, .Scale)
+	cur_x := clip_geom_get(clip, .Trans_X)
+	cur_y := clip_geom_get(clip, .Trans_Y)
+	cw, ch := clip_full_box_dims(clip, cur_s)
 	dxn := dx / max(cw, 0.0001)
 	dyn := dy / max(ch, 0.0001)
 	// In normalized source coords the window is [wl, wr] = [l, 1 - r] (and
 	// [wt, wb] = [t, 1 - b]): its length is invariant under translation, so
 	// clamping the leading edge to [0, 1-window] keeps both edges on-frame.
-	wl := clip.crop_l - dxn
-	wr := 1 - clip.crop_r - dxn
+	wl := cur_l - dxn
+	wr := 1 - cur_r - dxn
 	w := wr - wl
 	wl = clamp(wl, 0, 1 - w)
 	wr = wl + w
-	wt := clip.crop_t - dyn
-	wb := 1 - clip.crop_b - dyn
+	wt := cur_t - dyn
+	wb := 1 - cur_b - dyn
 	h := wb - wt
 	wt = clamp(wt, 0, 1 - h)
 	wb = wt + h
 
 	// The visible box is anchored: the transform re-centers under the new crop
 	// asymmetry so the box nobody is dragging never moves.
-	sl := clip.crop_l - clip.crop_r
-	st := clip.crop_t - clip.crop_b
-	vis_cx := clip.transform_x + sl * cw / 2
-	vis_cy := clip.transform_y + st * ch / 2
-	clip.crop_l = wl
-	clip.crop_r = 1 - wr
-	clip.crop_t = wt
-	clip.crop_b = 1 - wb
-	clip.transform_x = vis_cx - (clip.crop_l - clip.crop_r) * cw / 2
-	clip.transform_y = vis_cy - (clip.crop_t - clip.crop_b) * ch / 2
+	sl := cur_l - cur_r
+	st := cur_t - cur_b
+	vis_cx := cur_x + sl * cw / 2
+	vis_cy := cur_y + st * ch / 2
+	next_l := wl
+	next_r := 1 - wr
+	next_t := wt
+	next_b := 1 - wb
+	clip_geom_set(clip, .Crop_L, next_l)
+	clip_geom_set(clip, .Crop_R, next_r)
+	clip_geom_set(clip, .Crop_T, next_t)
+	clip_geom_set(clip, .Crop_B, next_b)
+	clip_geom_set(clip, .Trans_X, vis_cx - (next_l - next_r) * cw / 2)
+	clip_geom_set(clip, .Trans_Y, vis_cy - (next_t - next_b) * ch / 2)
 }
 
 // crop_pan_begin captures the pre-pan transform/crop and opens the undo node
 // for the Alt+Middle crop-pan gesture; the box is anchored so the release step
-// can tell a no-move press from a real pan.
+// can tell a no-move press from a real pan. The snapshot is of the PLAYHEAD
+// values, not the resting fields — on a keyed clip those differ, and comparing
+// against the wrong baseline would make every press look like a move.
 crop_pan_begin :: proc(clip: ^Clip, x, y: f32) {
 	crop_pan.active = true
 	crop_pan.last_x = x
 	crop_pan.last_y = y
-	crop_pan.start_scale = clip.scale
-	crop_pan.start_x = clip.transform_x
-	crop_pan.start_y = clip.transform_y
-	crop_pan.start_l = clip.crop_l
-	crop_pan.start_r = clip.crop_r
-	crop_pan.start_t = clip.crop_t
-	crop_pan.start_b = clip.crop_b
+	crop_pan.start_scale = clip_geom_get(clip, .Scale)
+	crop_pan.start_x = clip_geom_get(clip, .Trans_X)
+	crop_pan.start_y = clip_geom_get(clip, .Trans_Y)
+	crop_pan.start_l = clip_geom_get(clip, .Crop_L)
+	crop_pan.start_r = clip_geom_get(clip, .Crop_R)
+	crop_pan.start_t = clip_geom_get(clip, .Crop_T)
+	crop_pan.start_b = clip_geom_get(clip, .Crop_B)
 	undo_begin()
 }
 
 // crop_pan_end commits the crop pan as one transform node when it moved
-// anything, or discards the pending capture for a no-move press.
+// anything, or discards the pending capture for a no-move press. Compares the
+// playhead values against the snapshot for the same reason crop_pan_begin
+// snapshotted those: the resting fields are not what the gesture wrote on a
+// keyed clip, and a comparison against them would push an undo node for a
+// press that moved nothing.
 crop_pan_end :: proc() {
 	if !crop_pan.active {
 		return
 	}
 	crop_pan.active = false
 	if sel, ok := transformable_selected(); ok && sel.kind != .Text {
-		if sel.scale != crop_pan.start_scale ||
-		   sel.transform_x != crop_pan.start_x ||
-		   sel.transform_y != crop_pan.start_y ||
-		   sel.crop_l != crop_pan.start_l ||
-		   sel.crop_r != crop_pan.start_r ||
-		   sel.crop_t != crop_pan.start_t ||
-		   sel.crop_b != crop_pan.start_b {
+		if clip_geom_get(sel, .Scale) != crop_pan.start_scale ||
+		   clip_geom_get(sel, .Trans_X) != crop_pan.start_x ||
+		   clip_geom_get(sel, .Trans_Y) != crop_pan.start_y ||
+		   clip_geom_get(sel, .Crop_L) != crop_pan.start_l ||
+		   clip_geom_get(sel, .Crop_R) != crop_pan.start_r ||
+		   clip_geom_get(sel, .Crop_T) != crop_pan.start_t ||
+		   clip_geom_get(sel, .Crop_B) != crop_pan.start_b {
 			undo_push(.Transform, "Pan clip")
 			return
 		}
@@ -660,16 +710,21 @@ begin_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, handle: Handle,
 	handle_drag.corner_snapped = false
 	handle_drag.start_mx = mx
 	handle_drag.start_my = my
-	handle_drag.start_scale = clip.scale
-	handle_drag.start_crop_l = clip.crop_l
-	handle_drag.start_crop_r = clip.crop_r
-	handle_drag.start_crop_t = clip.crop_t
-	handle_drag.start_crop_b = clip.crop_b
-	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+	// Snapshot the values the user SEES, not the resting fields: the drag math
+	// scales from this base, so on a keyed clip a resting snapshot scales from
+	// a position that is not on screen and the handle jumps on grab.
+	handle_drag.start_scale = clip_geom_get(clip, .Scale)
+	handle_drag.start_crop_l = clip_geom_get(clip, .Crop_L)
+	handle_drag.start_crop_r = clip_geom_get(clip, .Crop_R)
+	handle_drag.start_crop_t = clip_geom_get(clip, .Crop_T)
+	handle_drag.start_crop_b = clip_geom_get(clip, .Crop_B)
+	tx0 := clip_geom_get(clip, .Trans_X)
+	ty0 := clip_geom_get(clip, .Trans_Y)
+	cx, cy := project_to_pixel(canvas, tx0, ty0)
 	handle_drag.start_center_x = cx
 	handle_drag.start_center_y = cy
-	handle_drag.start_tx = clip.transform_x
-	handle_drag.start_ty = clip.transform_y
+	handle_drag.start_tx = tx0
+	handle_drag.start_ty = ty0
 	ib := clip_image_bounds(canvas, clip)
 	handle_drag.start_box_w = ib.width
 	handle_drag.start_box_h = ib.height

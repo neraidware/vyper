@@ -23,9 +23,21 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 		scaled = value * 100
 	}
-	text := fmt.aprintf("%.*f", prec, scaled)
-	edit_state.len = min(len(text), len(edit_state.chars))
-	copy(edit_state.chars[:edit_state.len], text[:edit_state.len])
+	// Format straight into the fixed field buffer. This used to be
+	// fmt.aprintf followed by a copy into edit_state.chars, which allocated a
+	// heap string that nothing owned -- every property focus leaked it, and the
+	// copy made the allocation pointless.
+	//
+	// bprintf's builder is backed by the buffer with a nil allocator, so it
+	// cannot allocate; it panics on overflow rather than truncating. That is
+	// the behavior we want here: 64 bytes covers the worst case (an f32 at two
+	// decimals is 43 characters), so it is unreachable, and a truncated field
+	// would silently show a number other than the one the preview is using.
+	// bprintf's builder takes its capacity from len(backing) and tracks its own
+	// length, so pass the whole array -- [:0] would hand it a zero-capacity
+	// buffer and every format would overflow.
+	text := fmt.bprintf(edit_state.chars[:], "%.*f", prec, scaled)
+	edit_state.len = len(text)
 }
 
 edit_cancel :: proc() {
@@ -101,12 +113,19 @@ edit_commit :: proc() {
 	if !ok {
 		return
 	}
-	// Resolve the edited field to its storage plus the clamped value and label.
+	// Resolve the edited field to its lane plus the clamped value and label.
 	// A parse that changes nothing (click in, click out) is not an edit and must
-	// not add a node, so the compare gates the commit below. `name` is the
-	// keyframe-track name for the property, so an auto-keyframe commit can write
-	// the same track the inspector's diamond buttons key.
-	field: ^f32
+	// not add a node, so the compare gates the commit below.
+	//
+	// Geometry lanes resolve to a Render_Geom_Prop and are written through
+	// clip_geom_set, which routes the value to wherever the clip READS it at
+	// the playhead. Writing the resting field here (as this did) silently
+	// discarded the edit on any keyed property whenever auto-key was off, and
+	// the field was seeded from the sampled value — so the user typed back the
+	// number they could see and got no change. Gain is not a geometry lane and
+	// keeps the direct write plus kf_auto_key.
+	geom := Render_Geom_Prop._COUNT
+	gain_field: ^f32
 	label := "Edit clip transform"
 	kind := Undo_Kind.Transform
 	name := ""
@@ -115,61 +134,54 @@ edit_commit :: proc() {
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.transform_x
+		geom = .Trans_X
 		label = "Set clip X"
-		name = "transform.x"
 	case .Y:
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.transform_y
+		geom = .Trans_Y
 		label = "Set clip Y"
-		name = "transform.y"
 	case .Scale:
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.scale
+		geom = .Scale
 		val = max(val, 0.01)
 		label = "Set clip scale"
-		name = "scale"
 	case .Crop_L:
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.crop_l
+		geom = .Crop_L
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
-		name = "crop.l"
 	case .Crop_R:
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.crop_r
+		geom = .Crop_R
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
-		name = "crop.r"
 	case .Crop_T:
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.crop_t
+		geom = .Crop_T
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
-		name = "crop.t"
 	case .Crop_B:
 		if cl.kind == .Audio {
 			return
 		}
-		field = &cl.crop_b
+		geom = .Crop_B
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
-		name = "crop.b"
 	case .Gain:
 		// Clamp to the knob range so the typed value and the knob's angle stay
 		// consistent; the knob is the source of truth for what's reachable.
 		val = clamp(val, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
-		field = &cl.gain
+		gain_field = &cl.gain
 		label = "Set clip gain"
 		kind = .Value
 		name = "gain"
@@ -178,7 +190,17 @@ edit_commit :: proc() {
 	case .Kf_Value, .None:
 		return
 	}
-	if field^ == val {
+	// Compare against what the clip READS at the playhead, not the resting
+	// field. On a keyed property the two differ, and the field was seeded from
+	// the sampled value, so comparing the resting field made a no-op commit
+	// look like a change and wrote a key the user never asked for.
+	prev := f32(0)
+	if geom != ._COUNT {
+		prev = clip_geom_get(cl, geom)
+	} else {
+		prev = gain_field^
+	}
+	if prev == val {
 		return
 	}
 	// Only gain edits touch audio; mirror them into the slab and let the
@@ -188,13 +210,17 @@ edit_commit :: proc() {
 	// edits on ANY fresh click, so selecting another clip re-opened all decoders.
 	audio_changed := kind == .Value
 	undo_begin()
-	field^ = val
-	// Auto-keyframing: with the toggle on and a keyed property, the commit
-	// writes the playhead key as well, so the typed value lands on the timeline
-	// (a key already on the frame is updated in place; otherwise a new key
-	// appears). Same undo node as the resting write — the whole field edit is
-	// one step.
-	kf_auto_key(cl, name, val)
+	if geom != ._COUNT {
+		// clip_geom_set routes to the playhead key when the property is keyed
+		// there, so the typed value lands on the timeline (a key already on the
+		// frame is updated in place) instead of vanishing into a field the
+		// sampler ignores. Same undo node as the resting write — the whole
+		// field edit is one step.
+		clip_geom_set(cl, geom, val)
+	} else {
+		gain_field^ = val
+		kf_auto_key(cl, name, val)
+	}
 	undo_push(kind, label)
 	if audio_changed {
 		audio_geometry_commit()

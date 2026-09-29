@@ -162,6 +162,45 @@ require_fresh_binary() {
 	fi
 }
 
+# The memory gate cannot run ./vyper. -microarch:native lets LLVM emit AVX-512,
+# which VEX cannot decode, so the binary dies with SIGILL in
+# math_big::initialize_constants during __$startup_runtime -- before main, having
+# allocated nothing. Memcheck then dutifully reports "definitely lost: 0 bytes in
+# 0 blocks" and the gate passes while measuring nothing.
+#
+# So the memory gate gets its own binary at the baseline x86-64 target, built
+# from the same flags via build.sh (AGENTS.md §10: flags live in the script).
+# Name the output as VYPER_OUT rather than hardcoding a second odin invocation.
+VALGRIND_BIN=./vyper-valgrind
+
+build_valgrind_binary() {
+	VYPER_OUT=vyper-valgrind VYPER_MICROARCH= VYPER_DEBUG=1 ./build.sh
+}
+
+# Same freshness contract as require_fresh_binary, with one deliberate
+# difference: this one BUILDS on demand. require_fresh_binary refuses, because an
+# automatic rebuild of ./vyper would hide "I meant to measure the previous
+# build". Here the opposite is true -- the baseline binary has different flags,
+# so a missing or stale one is not a measurement anybody could have meant to
+# make, and failing would just mean the gate never runs again.
+require_fresh_valgrind_binary() {
+	local target_name=$1
+	if [ ! -x "$VALGRIND_BIN" ]; then
+		echo "$target_name: $VALGRIND_BIN missing -- building baseline binary for memcheck" >&2
+		build_valgrind_binary >/dev/null || return 1
+		return 0
+	fi
+	local stale
+	stale=$(find . -maxdepth 1 -name '*.odin' -newer "$VALGRIND_BIN" -print -quit)
+	if [ -z "$stale" ]; then
+		stale=$(find shaders -name '*.spv' -newer "$VALGRIND_BIN" -print -quit)
+	fi
+	if [ -n "$stale" ]; then
+		echo "$target_name: $VALGRIND_BIN is older than $stale -- rebuilding" >&2
+		build_valgrind_binary >/dev/null || return 1
+	fi
+}
+
 # swscale/resample microbenchmarks. Separate package (swsbench) so it can link
 # the vendored FFmpeg without dragging in the whole app; it exists to keep
 # claims about scaler cost measured rather than remembered.
@@ -317,15 +356,15 @@ target_zorder() {
 # is the run that exercises it hardest: every frame walks the union, dereferences
 # a borrowed source, and rasterizes a text clip.
 target_render_valgrind() {
-	require_fresh_binary render-valgrind || return 1
+	require_fresh_valgrind_binary render-valgrind || return 1
 	mkdir -p "$ZORDER_DIR" target/valgrind
 	local log=target/valgrind/render.log
 	env $PROBE_ENV \
 		VYPER_RENDER_TEST="$KEYED_SRC|$ZORDER_DIR/above_valgrind.mp4" \
 		VYPER_ZORDER=above \
 		timeout 900 valgrind --leak-check=full \
-		--error-exitcode=99 ./vyper >"$log" 2>&1
-	valgrind_assert "$log" render-valgrind
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	valgrind_assert "$log" render-valgrind 'render-test zorder:'
 }
 
 target_keyed_ab() {
@@ -408,6 +447,36 @@ target_probe() {
 target_transform_probe() {
 	require_fresh_binary transform-probe || return 1
 	VYPER_TRANSFORM_PROBE=1 timeout 120 ./vyper
+}
+
+# Gesture-routing check (geom_key_probe.odin): an Alt+wheel / Alt+drag edit on
+# a clip whose geometry is already keyed must land where the clip is READ.
+# The gestures used to write the resting fields directly while every other
+# geometry path funneled through kf_auto_key, so on a keyed clip the edit
+# landed where the sampler never looks — the box did not move under the
+# pointer while the inspector value did, and the clip jumped when the playhead
+# left the keyed span. transform_probe covers the gesture MATHS; this covers
+# where the result goes, which no other target exercised.
+target_geom_key_probe() {
+	require_fresh_binary geom-key-probe || return 1
+	VYPER_GEOM_KEY_PROBE=1 timeout 120 ./vyper
+}
+
+# The memory gate for geom_key_probe. The probe builds and tears down clip
+# keyframe tracks by hand -- dropping packed sections, unwrapping them into
+# per-lane tracks, deleting names and key arrays -- so it is exactly the kind
+# of code the ownership claims in AGENTS.md cannot check by compiling, and it
+# is the one path that exercises kf_geom_unwrap_section from a pending-partial
+# state that no other target reaches. Same four invariants as target_valgrind.
+target_geom_key_valgrind() {
+	require_fresh_valgrind_binary geom-key-valgrind || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/geom_key.log
+	VYPER_GEOM_KEY_PROBE=1 timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	local rc=$?
+	echo "geom-key-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+	valgrind_assert "$log" geom-key-valgrind '\[geom-key-probe\] OK:'
 }
 
 # The timeline geometry/semantics regression check (timeline_probe.odin).
@@ -518,8 +587,25 @@ target_smoke() {
 # program does not own), so the exit code is reported, never gated on; what
 # gates is the claim. Shared by the probe-wide and render-path runs.
 valgrind_assert() {
-	local log=$1 label=$2
+	local log=$1 label=$2 ran_marker=${3:-}
 	local failed=0
+	# Non-vacuity first. A run that died before doing any work satisfies all
+	# four invariants below trivially -- a process that allocated nothing loses
+	# nothing -- so without this check the gate can report "ok" while measuring
+	# nothing, which is the one failure mode that makes every other check
+	# worthless. The probe's own success line is the proof the work happened;
+	# the SIGILL case is named because that is how it happened here.
+	if [ -n "$ran_marker" ] && ! grep -q "$ran_marker" "$log"; then
+		echo "$label: probe never reported success (marker '$ran_marker') -- vacuous pass" >&2
+		echo "$label: tail of log:" >&2
+		tail -20 "$log" >&2
+		failed=1
+	fi
+	if grep -q "Unrecognised instruction" "$log"; then
+		echo "$label: memcheck died on an instruction VEX cannot decode -- vacuous pass" >&2
+		grep -A4 "Unrecognised instruction" "$log" | head -12 >&2
+		failed=1
+	fi
 	if ! grep -q "definitely lost: 0 bytes in 0 blocks" "$log"; then
 		echo "$label: memory was definitely lost" >&2
 		grep -A6 "definitely lost in loss record" "$log" | head -40 >&2
@@ -543,14 +629,14 @@ valgrind_assert() {
 }
 
 target_valgrind() {
-	require_fresh_binary valgrind || return 1
+	require_fresh_valgrind_binary valgrind || return 1
 	mkdir -p target/valgrind
 	local log=target/valgrind/probe.log
 	env $PROBE_ENV timeout 900 valgrind --leak-check=full \
-		--error-exitcode=99 ./vyper >"$log" 2>&1
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
 	local rc=$?
 	echo "valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
-	valgrind_assert "$log" valgrind
+	valgrind_assert "$log" valgrind '\[ui-probe\]'
 }
 
 # The burned-in-subtitle render check (subtitle_probe.odin). It was reachable
@@ -669,7 +755,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe timeline_probe yuv_exact gpu_nv12 gpu_composite gpu_probe keyed_export zorder subtitle_probe smoke valgrind render_valgrind; do
+	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite gpu_probe keyed_export zorder subtitle_probe smoke valgrind geom_key_valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -683,6 +769,8 @@ main() {
 	bench) target_bench ;;
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
+	geom_key_probe) target_geom_key_probe ;;
+	geom_key_valgrind) target_geom_key_valgrind ;;
 	timeline_probe) target_timeline_probe ;;
 	yuv_exact) target_yuv_exact ;;
 	gpu_nv12) target_gpu_nv12 ;;
@@ -697,7 +785,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|export_bench|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|export_bench|all]" >&2
 		return 2
 		;;
 	esac

@@ -1443,6 +1443,22 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if rkp, _ := os.lookup_env_alloc("VYPER_RENDER_KF_PROBE", context.temp_allocator); rkp != "" {
 		os.exit(render_kf_probe_run())
 	}
+	// Headless gesture-routing probe: an Alt+wheel / Alt+drag edit on a keyed
+	// clip must land where the clip is actually read.
+	//
+	// A passing probe returns out of main rather than calling os.exit(0):
+	// os.exit skips the runtime's shutdown, so the thread and TLS allocations
+	// the runtime frees at teardown are still live when memcheck takes its
+	// census -- they show as "definitely lost" and the memory gate fails on
+	// state the program never actually leaked. A failing probe still exits
+	// immediately: the non-zero code IS the gate's pass/fail signal, and its
+	// memory census is meaningless anyway.
+	if _, ok := os.lookup_env_alloc("VYPER_GEOM_KEY_PROBE", context.temp_allocator); ok {
+		if geom_key_probe_run() != 0 {
+			os.exit(1)
+		}
+		return
+	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
 	// Border command + per glyph) without a display or GPU.

@@ -1501,6 +1501,54 @@ ui_probe_layout_asserts :: proc() -> bool {
 		fmt.eprintf("[ui-probe] KfGutterNames height %.1f want %.1f\n", gutter.height, want_gutter)
 		ok = false
 	}
+	// The "keyframe all modified" row must actually LAY OUT for a video clip.
+	// draw_kf_add_buttons skips a zero-size box, so a row that never got laid
+	// out would be silently dead: no diamond painted, no hit test, and the
+	// geometry-edit path with no way to commit it. Assert the box exists, is
+	// inside the inspector, and sits below the crop row it follows.
+	sel_v, ok_v := transformable_selected()
+	if ok_v {
+		row_bb := clay.GetElementData(clay.ID("KfAllModifiedRow")).boundingBox
+		btn_bb := clay.GetElementData(clay.ID(KF_ADD_MODIFIED_ID)).boundingBox
+		if row_bb.width <= 0 || row_bb.height <= 0 {
+			fmt.eprintf("[ui-probe] KfAllModifiedRow never laid out (%.0fx%.0f)\n", row_bb.width, row_bb.height)
+			ok = false
+		}
+		if btn_bb.width <= 0 || btn_bb.height <= 0 {
+			fmt.eprintf("[ui-probe] %s never laid out (%.0fx%.0f)\n", KF_ADD_MODIFIED_ID, btn_bb.width, btn_bb.height)
+			ok = false
+		}
+
+		// Pending lanes must make the row show its real labels, and the
+		// "nothing pending" case must read as such rather than as a live offer.
+		clip_geom_mark_modified(sel_v, .Crop_L)
+		clip_geom_mark_modified(sel_v, .Trans_X)
+		labels := geom_key_pending_labels(sel_v, true)
+		if labels != "X, L" {
+			fmt.eprintf("[ui-probe] pending labels %q want %q\n", labels, "X, L")
+			ok = false
+		}
+		if geom_key_pending_labels(sel_v, false) != "none" {
+			fmt.eprintf("[ui-probe] empty pending set must read %q\n", "none")
+			ok = false
+		}
+		if !clip_geom_any_modified(sel_v) {
+			fmt.eprintf("[ui-probe] marked lanes must report as pending\n")
+			ok = false
+		}
+		sel_v.geom_modified = 0
+		if clip_geom_any_modified(sel_v) {
+			fmt.eprintf("[ui-probe] cleared pending set must report nothing pending\n")
+			ok = false
+		}
+		if ok {
+			fmt.printf("[ui-probe] key-all-modified row ok (%q, %q)\n", labels, "none")
+		}
+	} else {
+		fmt.eprintf("[ui-probe] no transformable clip selected; cannot assert the key-all-modified row\n")
+		ok = false
+	}
+
 	if ok {
 		fmt.printf("[ui-probe] keyframe layout ok\n")
 	}
@@ -1725,7 +1773,7 @@ seed_ui_probe_session :: proc() {
 
 	// Selected clip -> the Inspector property card renders.
 	selection.track = 0
-	selection.index = 1
+	selection.index = 0
 
 	// One live preview slot (the canvas area layout reflects a playing clip).
 	preview_slots[0] = Preview_Slot {

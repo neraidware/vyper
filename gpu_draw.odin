@@ -1230,6 +1230,22 @@ draw_kf_add_buttons :: proc(
 		if bb.width <= 0 || bb.height <= 0 {
 			continue
 		}
+		// The "key all modified" diamond is lit only when a lane is actually
+		// pending. A greyed diamond is the disabled state; a lit one that
+		// silently does nothing is worse than no button at all.
+		enabled := true
+		if id == KF_ADD_MODIFIED_ID {
+			sel, ok := transformable_selected()
+			enabled = ok && clip_geom_can_key_all_modified(sel)
+		}
+		if !enabled {
+			diamond_at(
+				renderer, command_buffer, pass,
+				bb.x + bb.width/2, bb.y + bb.height/2,
+				KF_BTN_R, KF_DIAMOND_FILL_DISABLED, false,
+			)
+			continue
+		}
 		fill := clay.PointerOver(clay.ID(id)) ? KF_DIAMOND_FILL_SELECTED : KF_DIAMOND_FILL
 		if is_group_kf_btn(id) {
 			// Whole-group key button: a 2x2 cluster reads "all lanes at once"

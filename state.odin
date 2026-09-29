@@ -48,6 +48,10 @@ MARKER_COLOR :: clay.Color{219, 188, 127, 255} // yellow — clip markers
 // the plain hollow ring instead.
 KF_DIAMOND_FILL :: clay.Color{79, 88, 94, 255} // bg4 — neutral keyframe diamond fill
 KF_DIAMOND_FILL_SELECTED :: clay.Color{211, 198, 170, 255} // fg — light when selected
+// A control that is present but not currently actionable (e.g. "key all
+// modified" with nothing pending). Dimmer than KF_DIAMOND_FILL so it recedes
+// without vanishing — the row is still part of the inspector's grammar.
+KF_DIAMOND_FILL_DISABLED :: clay.Color{61, 72, 77, 255} // bg2
 KF_DIAMOND_BORDER_COLOR :: clay.Color{167, 192, 128, 255} // green — active accent ring (same as hover)
 TOOLTIP_BG :: clay.Color{61, 72, 77, 255} // bg2 — popup/tooltip surface
 TOOLTIP_TEXT :: clay.Color{211, 198, 170, 255} // fg
@@ -290,6 +294,20 @@ Clip :: struct {
 	// track's name; consumers mint tracks named by their own property path.
 	// Sorted tracks, each sorted by frame_off (clip-relative). nil = no keys.
 	keyframe_tracks:      [dynamic]Kf_Track,
+	// geom_modified: a bitmask over Render_Geom_Prop marking geometry lanes
+	// edited WITHOUT a keyframe, i.e. sitting in the resting field. The
+	// inspector's "keyframe all modified" button keys exactly this set. Set by
+	// clip_geom_set (clip_geom.odin) on the resting-write path, cleared when the
+	// lane is keyed.
+	//
+	// Session-only, and deliberately NOT serialized: it describes the user's
+	// in-flight intent, not the clip. A reload with nothing pending is the
+	// correct state for a project that was saved with its edits already baked
+	// into resting values, and persisting it would report pending keys for
+	// edits the user made long ago and never intended to animate. A clip that
+	// needs keys gets them from the button; the file stays a description of
+	// the timeline, not of the session.
+	geom_modified:        u8,
 }
 
 Track :: struct {
