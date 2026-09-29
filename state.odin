@@ -440,6 +440,15 @@ active_interaction: Interaction
 // last decoded frame stays on-screen between throttled decodes; releasing the
 // drag lifts the throttle so the final position decodes exactly once.
 SCRUB_DECIMATION :: 4
+// Playhead_Scrub_State is the ruler-scrub gesture's payload: whether the drag
+// actually moved the playhead. The scrub itself never touches the audio engine
+// (a seek there is a full re-provision -- see the release case in
+// interaction.odin), so this is what the release commits, and a press with no
+// motion commits nothing.
+Playhead_Scrub_State :: struct {
+	moved: bool,
+}
+playhead_scrub: Playhead_Scrub_State
 // DRAG_LANE_DWELL_FRAMES is how many consecutive frames the pointer must rest
 // in a different lane than the dragged clip's source before a vertical drop is
 // staged (ghost shown, drop committed on release). A fast horizontal flick

@@ -2522,6 +2522,37 @@ Details TBD when Phase 2 reaches maturity.
   baseline (FFmpeg/Odin noise only). Branch `audio/miniaudio`, baseline
   `97f5267`, committed locally (no push).
 
+## Implemented — per-gesture audio commits (scrub/drag re-provision storm, 2026-09-29)
+
+- Symptom: scrubbing the ruler across a long video left audio dead for the
+  rest of the session — hours of A/V skew, every producer telemetry counter
+  frozen (`prov=1`, `rsync` climbing) while `d` diverged to -8895s.
+- Root cause: `.Playhead_Scrub` called `audio_seek(frame)` per UI frame. A seek
+  is not a playhead write — it clears the device and reopens every decoder
+  (tens to hundreds of ms). A drag queued re-provisions faster than the
+  producer could retire them, so it never reached the feed path and the device
+  starved permanently after the drag ended.
+- Fix: continuous gestures apply live but commit the audio engine once, on
+  release, only if the gesture moved:
+  - `.Playhead_Scrub` sets `playhead_scrub.moved` when the frame changes and
+    calls `audio_seek(playhead.frame)` once in the release case; a
+    click-without-drag commits nothing (`state.odin` `Playhead_Scrub_State`).
+  - `.Clip_Move` dropped its per-frame `audio_note_edit()`; the release commits
+    once via `audio_note_edit()` under the existing `moved` predicate.
+  - `.Clip_Resize` dropped its per-frame `audio_note_edit()`; commits once on
+    release via `audio_note_edit()` under `clip_resize.moved`.
+  - Move/resize use `audio_note_edit` (not a bare `audio_seek`) because they
+    change clip geometry, which must reach the producer's slab before it
+    re-provisions; the scrub only moves the playhead, so it seeks directly.
+- Diagnostic: the `[skew]` alert gained `age=%.1fs` (time since the producer
+  last published `playback.dev_at_ns`). A wedged producer previously read as
+  healthy because the HUD extrapolated its frozen counters forward; `age` climbs
+  into the minutes when the producer thread is stuck. Saturates to 0 rather
+  than underflowing when a publish lands between the two clock reads.
+- Not committed yet; `./scripts/gate.sh check build probe smoke valgrind` pass
+  (`smoke: ok (124)`, `ui-probe` all ok; valgrind 0 definitely/indirectly lost,
+  no invalid access).
+
 
 ---
 

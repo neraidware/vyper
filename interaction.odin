@@ -217,7 +217,10 @@ click_cases := []Click_Case{
 	// Clicking the timeline ruler starts a scrub (drag to seek).
 	{ hit = proc(inp: Mouse_Input) -> bool {
 		return len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("Ruler"))
-	}, action = proc(_: Mouse_Input) { active_interaction = .Playhead_Scrub } },
+	}, action = proc(_: Mouse_Input) {
+		active_interaction = .Playhead_Scrub
+		playhead_scrub.moved = false
+	} },
 }
 
 // Apply a resolution preset without losing the current canvas orientation.
@@ -945,6 +948,12 @@ interaction_post_build :: proc(
 				if moved {
 					label := len(clip_move.group_orig) > 1 ? "Move clip(s)" : "Move clip"
 					undo_push(.Move, label)
+					// The drag applied live; this is the one commit the audio
+					// engine gets for it. audio_note_edit (not a bare seek)
+					// because the clip's new geometry must reach the producer's
+					// slab before it re-provisions. See the .Playhead_Scrub
+					// update for why the per-frame commit had to go.
+					audio_note_edit()
 				}
 			}
 		case .Clip_Resize:
@@ -952,6 +961,11 @@ interaction_post_build :: proc(
 			// undo node on release.
 			if clip_resize.moved {
 				undo_push(.Resize, len(clip_move.group_orig) > 1 ? "Resize clip(s)" : "Resize clip")
+				// The drag applied live; this is the one commit the audio engine
+				// gets for it. audio_note_edit (not a bare seek) because the
+				// clip's new geometry must reach the producer's slab before it
+				// re-provisions. See the .Playhead_Scrub update.
+				audio_note_edit()
 			}
 		case .Handle_Drag:
 			// Scale/crop is applied live; commit the gesture as one transform
@@ -987,8 +1001,17 @@ interaction_post_build :: proc(
 			}
 		case .Keyframe_Move:
 			commit_keyframe_drag()
+		case .Playhead_Scrub:
+			// The scrub moved the playhead live and committed nothing to the
+			// audio engine; this is the commit. A press with no drag (the
+			// common "click the ruler to set the position" case) moves nothing
+			// and so re-provisions nothing.
+			if playhead_scrub.moved {
+				audio_seek(playhead.frame)
+			}
 		}
 		active_interaction = .None
+		playhead_scrub.moved = false
 		handle_drag.handle = nil
 		handle_drag.kind = .None
 		handle_drag.corner_snapped = false
@@ -1105,7 +1128,8 @@ interaction_post_build :: proc(
 					}
 				}
 				clip_resize.moved = true
-				audio_note_edit()
+				// No audio_note_edit() here: it is a full re-provision per frame
+				// of the drag. The release commits it once.
 			}
 		case .Gain_Drag:
 			if gain_drag.clip == nil {
@@ -1198,12 +1222,10 @@ interaction_post_build :: proc(
 				// its source lane regardless of which lane the pointer flicked
 				// into, so the drag can never detach under fast motion. When a
 				// vertical drop IS staged this previews the X the ghost follows.
-				// Resync audio only when the clip actually slid this frame: a
-				// plain select arms Clip_Move with the button held, so the update
-				// fires for a no-move click too, and note_edit() below would
-				// reseek the producer and reopen every decoder for a gesture
-				// that changed nothing. Same guard Clip_Resize applies.
-				start_before := clip_move.clip.timeline_start_frame
+				// The audio engine is told nothing per frame: audio_note_edit()
+				// is a full re-provision, and a drag that asked for one per
+				// frame queued re-provisions faster than the producer could
+				// retire them. The release commits the moved clip once.
 				drag_move_in_place(frame)
 				// Stall tracer (VYPER_TRACE): logs the first frame where the
 				// cursor's frame target advanced but the clip's start did not —
@@ -1227,9 +1249,6 @@ interaction_post_build :: proc(
 					}
 					clip_move.trace_last_target = tf
 					clip_move.trace_last_start = clip_move.clip.timeline_start_frame
-				}
-				if clip_move.clip.timeline_start_frame != start_before {
-					audio_note_edit()
 				}
 			}
 		case .Playhead_Scrub:
@@ -1259,11 +1278,17 @@ interaction_post_build :: proc(
 					)
 				}
 			}
+			if playhead.frame != frame {
+				playhead_scrub.moved = true
+			}
 			playhead.frame = frame
-			// A playhead jump must anchor audio to the new position immediately:
-			// otherwise the producer keeps decoding from the pre-scrub position
-			// and the sound lags the video until its far-forward guard trips.
-			audio_seek(frame)
+			// No audio_seek here. A seek is not a playhead write, it is a full
+			// re-provision: the producer clears the device and reopens every
+			// decoder (tens to hundreds of ms). Asking for one on every frame of
+			// a drag queues re-provisions faster than the producer can retire
+			// them -- it never reaches the feed path, the device starves, and
+			// the audio stays dead long after the drag ends. The release
+			// commits the one position the drag landed on.
 			sync.atomic_store(&audio_rpt.ph_src, 1)
 			sync.atomic_store(&audio_rpt.ph_catch, 0)
 			// The preview requests the exact new playhead frame on its next

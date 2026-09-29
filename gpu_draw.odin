@@ -1504,6 +1504,15 @@ draw_icon_in_element_color :: proc(
 // whole reopen), holes + ncov (the producer cannot keep up or finds no covered
 // source — the forward-skip should have fired but may be gated), boost (the
 // jog boost that only the video side honors).
+//
+// age is the one field that separates "behind" from "stopped": how long ago the
+// producer last published its position at all. It reads ~0.002s while the
+// engine feeds, and climbs into the minutes when the producer thread is stuck
+// (inside a provision, or starved of feed passes) — in which case every other
+// field on the line is a frozen value extrapolated forward by this HUD and
+// reads as healthy. Without it, a wedged producer is indistinguishable from a
+// merely-behind one, which is what made the 2026-09 scrub-storm wedge
+// (prov=1 for hours, every counter static) an hours-long investigation.
 AUDIO_DESYNC_ALERT_SEC :: 0.4
 
 // Audio_Skew_Diag is the audio-desync alert's rate limiter: the last tick the
@@ -1557,19 +1566,27 @@ draw_preview_hud :: proc(
 		f64(ph) / fps,
 		f64(dev - ph) / fps,
 	)
-	if now := monotonic_ns(); dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
+	if dev - ph < i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
 		rsync := sync.atomic_load(&audio_prod.resync)
 		prod := sync.atomic_load(&audio_prod.prod_frame)
 		holes := sync.atomic_load(&audio_rpt.silence_holes)
 		anchor := sync.atomic_load(&audio_prod.anchor_frame)
+		// dev_at is sampled after now, so a producer publish landing between the
+		// two reads makes it the NEWER stamp; saturate rather than underflow the
+		// unsigned delta into a nonsense age.
+		age_s := f64(-1.0)
+		if dev_at > 0 {
+			age_s = u64(dev_at) > now ? 0.0 : f64(now-u64(dev_at))/1e9
+		}
 		fmt.printf(
-			"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
+			"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d age=%.1fs holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
 			f64(dev-ph)/fps,
 			f64(prod)/fps,
 			f64(prod-dev)/fps,
 			f64(anchor)/fps,
 			rsync, rsync-audio_skew_diag.prev_rsync,
 			sync.atomic_load(&audio_prod.provisioning) ? 1 : 0,
+			age_s,
 			holes, holes-audio_skew_diag.prev_holes,
 			audio_rpt.skip_nocov, audio_rpt.skip_nocov-audio_skew_diag.prev_ncov,
 			audio_rpt.skip_full, audio_rpt.skip_full-audio_skew_diag.prev_full,
