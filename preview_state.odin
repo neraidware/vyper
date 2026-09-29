@@ -544,7 +544,13 @@ update_preview_slots :: proc() -> bool {
 				slot.crop_b = 0
 				name_hash := text_clip_hash(clip.name)
 				base_changed := slot.text_hash != name_hash
-				font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
+				// slot.scale, not clip.scale: this is the raster RESOLUTION the box
+				// is measured against, so taking the resting value would bake glyphs
+				// at the base scale and then stretch them by the sampled one on a
+				// clip whose scale is keyed — visibly soft, and re-baked only when
+				// the title changes. The two have to come from the same frame or the
+				// raster and the box it fills disagree about what scale means.
+				font_px := f32(TEXT_CLIP_FONT_PIXELS) * slot.scale
 				// The box is ink WIDTH x metric BOX HEIGHT: width is the tight
 				// ink (single line, so it hugs the text); height is the font's
 				// typographic line box at 48 (ascent + descent + TEXT_BOX_PAD

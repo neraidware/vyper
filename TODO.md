@@ -611,6 +611,48 @@ into playback/preview.
       1 block definitely lost — pre-existing, not reached by any valgrind
       target in `all`, and the frame-pointer build now makes it diagnosable.
 
+      **The bounds box was still reading the resting fields.** Every write
+      path was fixed to route through `clip_geom_get`/`clip_geom_set` at the
+      playhead, but `clip_image_bounds` — the rectangle the selection border,
+      the eight handles, and the clip hit-test all measure against — still read
+      `clip.transform_x/y`, `clip.scale`, and `clip.crop_l/r/t/b` directly,
+      while the image *inside* that rectangle is drawn from the sampled preview
+      slot. So on a keyed clip the handles sat on a box the clip was not drawn
+      in: it looked correct until a handle was touched, and the drag then began
+      from a corner nowhere near the visible pixels. Reads now go through
+      `clip_geom_get` on all seven lanes, both the video and the text path,
+      matching the rule `crop_viewport_zoom` already documented two functions
+      below. **A second resting read in the same family:** `preview_state.odin`
+      computed a text clip's raster *resolution* from `clip.scale` while
+      `slot.scale` (sampled three lines earlier) drove the box it was measured
+      against, so a title on a keyed scale animated its box but re-baked its
+      glyphs at the base size — stretched and soft. Both quantities are the same
+      scale at the same frame, so it now reads `slot.scale`. **Uncovered:** the
+      `geom_key_probe` fixture is a `.Video` clip, so no gate exercises this text
+      path — mutating it back to `clip.scale` leaves every gate green. Asserted
+      by inspection (the sampled value is three lines above the use) rather than
+      by test, and a text-clip case in that fixture is the fix if that is not
+      good enough.
+      **Remaining in this family, deliberately not touched:** the subtitle
+      path (`update_subtitle_slot`) still reads `clip.scale` for its raster and
+      then *writes* new `source_w/h` and a re-anchor back onto the clip. That
+      is a different question: a read wants the playhead, but this write is a
+      re-centring of the clip itself, and routing it through `clip_geom_set`
+      would mint keyframes on every cue change. It needs an explicit decision
+      about whether subtitle auto-fit is a keyed property or a resting edit, not
+      a mechanical substitution.
+
+      The regression asserts the *property* rather than a baked rectangle:
+      `geom_key_probe` scrambles all seven resting fields and requires
+      `clip_image_bounds` not to move, then puts a new scale key under the
+      playhead and requires it to. The converse check is what stops a function
+      that ignored both sources and returned a constant from passing. Verified
+      by mutation: reverting `Trans_X` to the resting field and reverting
+      `Crop_L` each fail the probe with the two boxes printed. Re-measured:
+      `geom_key_valgrind` 0 definitely lost / 0 indirectly lost, no invalid
+      access, 76 errors from 43 contexts — the same class as the 45 above, and
+      no new context class.
+
 ## Active 4 — Export keyframe compositor performance
 
 **Status:** measured 2026-09-25. Export scale keyframes are functional but

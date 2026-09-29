@@ -419,6 +419,14 @@ corner_snap_scale :: proc(
 // anchored at its top-left corner and trimmed by the per-edge crop insets. The
 // opposite edge stays fixed when cropping a single edge (crop is per-edge, not
 // centered). The cropped source fills it, so it matches the output.
+//
+// Every input is read with clip_geom_get, never off the resting fields, for the
+// reason crop_viewport_zoom below documents: on a clip whose geometry is keyed
+// the resting fields are not what the preview is drawing. The image itself is
+// drawn from the sampled preview slot, so a bounds box computed from resting
+// state disagrees with the pixels inside it — and this box is what the
+// selection border, the handles, and the hit-test all use, so the visible
+// result is a handle that does not sit on the image it is attached to.
 clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
 	v := preview_view(canvas)
 	// A text clip is not a full-canvas image: its bounds are exactly the text
@@ -428,22 +436,23 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	// squished (an aspect probe through project resolution would scale x and y
 	// differently for any project that isn't 16:9). transform_x/y is the text's
 	// TOP-LEFT in project coords (the drag + scale math below is written for a
-	// top-left anchor), and clip.scale multiplies the text's base pixel size so
-	// resizing via the handles works on the text's own bounding box.
+	// top-left anchor), and the clip's scale multiplies the text's base pixel
+	// size so resizing via the handles works on the text's own bounding box.
 	if clip.kind == .Text && clip.source_w > 0 && clip.source_h > 0 {
 		f := v.width / f32(PREVIEW_W)
-		w := f32(clip.source_w) * f * clip.scale
-		h := f32(clip.source_h) * f * clip.scale
-		tx, ty := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+		scale := clip_geom_get(clip, .Scale)
+		w := f32(clip.source_w) * f * scale
+		h := f32(clip.source_h) * f * scale
+		tx, ty := project_to_pixel(canvas, clip_geom_get(clip, .Trans_X), clip_geom_get(clip, .Trans_Y))
 		return {x = tx, y = ty, width = w, height = h}
 	}
-	cx, cy := project_to_pixel(canvas, clip.transform_x, clip.transform_y)
+	cx, cy := project_to_pixel(canvas, clip_geom_get(clip, .Trans_X), clip_geom_get(clip, .Trans_Y))
 	// The source-sized box is in PROJECT units (scale relative to the source's
 	// own pixels: scale 1 = native size); scale it onto the screen by the
 	// view's pixels-per-project-unit so the drawn quad matches the box the
 	// handle math sees. With an unknown source size (0) the box falls back to
 	// the canvas.
-	cu_w, cu_h := clip_full_box_dims(clip, clip.scale)
+	cu_w, cu_h := clip_full_box_dims(clip, clip_geom_get(clip, .Scale))
 	pu := f32(project.width)
 	if pu <= 0 {
 		pu = f32(PREVIEW_W)
@@ -455,7 +464,16 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	// way. The extent is derived from the edges rather than recomputed as
 	// sw*(1-crop_l-crop_r): the export rounds these edges, and a width formed
 	// any other way can differ from it by a pixel.
-	l, t, r, b := cropped_box_edges(cx, cy, sw, sh, clip.crop_l, clip.crop_r, clip.crop_t, clip.crop_b)
+	l, t, r, b := cropped_box_edges(
+		cx,
+		cy,
+		sw,
+		sh,
+		clip_geom_get(clip, .Crop_L),
+		clip_geom_get(clip, .Crop_R),
+		clip_geom_get(clip, .Crop_T),
+		clip_geom_get(clip, .Crop_B),
+	)
 	return {x = l, y = t, width = r - l, height = b - t}
 }
 

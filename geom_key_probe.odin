@@ -780,11 +780,68 @@ geom_key_probe_run :: proc() -> int {
 		editor_flags.auto_keyframe = false
 	}
 
+	// --- the bounds box follows the playhead. clip_image_bounds is what the
+	// selection border, the handles, and the hit-test all measure against,
+	// while the image inside it is drawn from the SAMPLED preview slot. Reading
+	// the resting fields therefore put the handles on a rectangle the clip is
+	// not drawn in: a keyed clip looked right until you touched a handle, and
+	// the drag then started from a corner that was nowhere near the pixels.
+	{
+		cl := geom_key_fixture()
+		canvas := probe_canvas()
+		// The fixture keys every lane at 960/540/0.5/0.05 against a resting
+		// 500/500/1/0.1, so the two candidates are different rectangles rather
+		// than a near-miss -- a probe that accidentally read the wrong one
+		// cannot agree by coincidence.
+		at_rest_key := clip_image_bounds(canvas, cl)
+
+		// Invariance, not a baked rectangle: scramble every resting field and
+		// require the box not to move. Asserting the property rather than the
+		// output is what keeps this test honest if the geometry model changes
+		// later -- the contract is "the box is the playhead's", and the
+		// particular rectangle is just what that currently evaluates to.
+		cl.transform_x = 5000
+		cl.transform_y = 5000
+		cl.scale = 3
+		cl.crop_l = 0.4
+		cl.crop_r = 0.4
+		cl.crop_t = 0.4
+		cl.crop_b = 0.4
+		scrambled := clip_image_bounds(canvas, cl)
+		geom_key_check(
+			kf_approx(at_rest_key.x, scrambled.x) &&
+			kf_approx(at_rest_key.y, scrambled.y) &&
+			kf_approx(at_rest_key.width, scrambled.width) &&
+			kf_approx(at_rest_key.height, scrambled.height),
+			"clip_image_bounds must read the playhead, not the resting fields — scrambling them moved the box from (%v,%v %vx%v) to (%v,%v %vx%v)",
+			at_rest_key.x, at_rest_key.y, at_rest_key.width, at_rest_key.height,
+			scrambled.x, scrambled.y, scrambled.width, scrambled.height,
+		)
+
+		// The converse, without which a function that ignored BOTH sources and
+		// returned a constant would pass the check above. Put a different scale
+		// under the playhead and the box has to follow it.
+		cl.transform_x = 500
+		cl.transform_y = 500
+		cl.scale = 1
+		cl.crop_l = 0.1
+		cl.crop_r = 0.1
+		cl.crop_t = 0.1
+		cl.crop_b = 0.1
+		kf_geom_set_lane_key(cl, "scale", i32(playhead.frame), 0.25)
+		moved := clip_image_bounds(canvas, cl)
+		geom_key_check(
+			!kf_approx(at_rest_key.width, moved.width),
+			"a new scale key under the playhead must resize the box (was %v, now %v)",
+			at_rest_key.width, moved.width,
+		)
+	}
+
 	if geom_key_fail {
 		return 1
 	}
 	fmt.println(
-		"[geom-key-probe] OK: geometry writes land where the clip reads — Alt+wheel/Alt-drag/typed edit/handle drag route to the playhead key, unkeyed edits stay visible and pending, the playhead guard mints no off-clip key, and key-all-modified keys exactly the pending lanes (including a packed-section migration)",
+		"[geom-key-probe] OK: geometry writes land where the clip reads — Alt+wheel/Alt-drag/typed edit/handle drag route to the playhead key, unkeyed edits stay visible and pending, the playhead guard mints no off-clip key, key-all-modified keys exactly the pending lanes (including a packed-section migration), and the clip bounds box is sampled at the playhead rather than read off the resting fields",
 	)
 	return 0
 }
