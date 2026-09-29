@@ -1,0 +1,51 @@
+# Build toolchain. `mise install` in the repo root provisions everything mise can
+# own; the rest comes from the system package manager. The split is not
+# arbitrary — see the clang note, it was measured rather than assumed.
+#
+#     mise install && ./build.sh
+#
+# On Arch the system half is:
+#
+#     sudo pacman -S glslang valgrind ffmpeg sdl3 glib2
+#
+# WHY the system half stays on the system: mise has no backend for glslang
+# (glslangValidator compiles shaders/*.vert|frag to .spv on every build) or for
+# valgrind (scripts/gate.sh valgrind, the memory gate AGENTS.md 9b requires), so
+# there is nothing to pin. ffmpeg (libavcodec/libavformat/libavutil/libavfilter/
+# libswresample/libswscale), sdl3, and glib2 (libgio-2.0, libglib-2.0) are
+# linked as shared objects; vendoring a second copy of ffmpeg to satisfy a
+# package manager would mean maintaining a parallel FFmpeg and hoping its struct
+# layouts still match vendor/ffmpeg/, which gate.sh's own ABI check exists to
+# catch. The system libraries are the ones the bindings were written against.
+
+[tools]
+# Odin's development line, not a stable tag. 0.12.0 is the newest release while
+# the dev line is at 2026-09, and this project tracks the dev line. Pinned
+# exactly rather than "latest" so the compiler cannot move under a green gate
+# run — a compiler bump changes codegen, so "latest" would make a red gate
+# impossible to reproduce after the fact.
+#
+# Declared here at the project level on purpose: a global "latest" resolves to
+# whatever the host happens to default to, which is how a build ends up passing
+# on one machine and failing to compile on another with no visible cause.
+odin = "dev-2026-09"
+
+# clang is not optional, and not in the "compiled by" sense only — it compiles
+# vendor/nanosvg and vendor/clay.c AND is the driver Odin shells out to when it
+# links the executable. Odin's -linker: flag only selects between its own
+# backends (default/lld/radlink/mold), so there is no $CC-style way to
+# substitute gcc at the link step.
+#
+# mise builds this from conda-forge, which wraps it in a bundled sysroot that
+# knows nothing about this host's shared libraries. build.sh passes --sysroot=/
+# to the link so it resolves the system ffmpeg/SDL3/glib; see the comment on
+# that flag for what happens without it. That is the whole reason the pin is
+# usable — the toolchain is only half the build, and the other half is the
+# libraries it has to be pointed at.
+clang = "21.1.8"
+
+# mold only shortens link time on a binary this size. build.sh detects it and
+# falls back to the default linker when absent, so unlike clang this one is
+# genuinely optional — but pinned anyway so every host gets the fast path
+# instead of one machine being mysteriously slower.
+mold = "2.42.1"

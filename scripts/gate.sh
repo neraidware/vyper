@@ -8,6 +8,10 @@ set -uo pipefail
 # regardless of how it was called or what the cwd is.
 SELF=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")
 
+# Shared toolchain resolution, the same fragment build.sh sources. Sourced, not
+# executed, so it only defines resolve_odin_root.
+. "$(dirname -- "$SELF")/toolchain.sh"
+
 # The probe entry point. Headless: simulates the frame loop and runs the
 # layout/geometry/ownership asserts, then exits.
 PROBE_ENV="VYPER_UI_PROBE=1"
@@ -68,6 +72,13 @@ dev() {
 		dev "$@"
 	else
 		require_ffmpeg_abi || return 1
+		# Every odin invocation in this script goes through here, so this is the
+		# one place the compiler's own tree has to be resolvable. A stale
+		# ODIN_ROOT exported by a previous install otherwise fails every target
+		# with "Invalid ODIN_ROOT, directory does not exist" — an error that
+		# names a missing directory, not the compiler mismatch behind it. Same
+		# function build.sh uses, so the two cannot drift.
+		resolve_odin_root || return 1
 		"$@"
 	fi
 }

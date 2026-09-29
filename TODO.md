@@ -2886,3 +2886,72 @@ everyone to ignore it -- which is right, and is exactly why the two fixes are
 this commit rather than a later one. The leaks it exists to catch were all
 reachable from the export path, which no other target in `all` executes, so
 without it `all` never touches that code's ownership at all.
+
+## Implemented — reproducible toolchain via mise, and the two-linker-path bugs behind it (2026-09-29)
+
+The build had stopped working on this host for two unrelated reasons, both of
+which produced errors that named the wrong thing.
+
+**1. A stale `ODIN_ROOT` broke every target, not just the build.** It was
+exported pointing at `~/.local/lib/Odin`, a hand-installed tree that had since
+been emptied, so the compiler aborted with `Invalid ODIN_ROOT, directory does
+not exist` — an error naming a missing directory and never mentioning that the
+value referred to a compiler that no longer existed. Two scripts needed it and
+each had grown its own copy of the fix, so the fix went into
+`scripts/toolchain.sh` (`resolve_odin_root`, sourced by both): validate the
+value, and if it is not an Odin tree, walk up from the `odin` on PATH to one
+that has `base/`. Detected rather than hardcoded, for the same reason `build.sh`
+detects mold — the install prefix is a per-host fact.
+
+**2. A missing `clang` failed with `Could not spawn subprocess`.** It is not
+optional and not only a "compiled by": it builds `vendor/nanosvg` and
+`vendor/clay.c` AND is the driver Odin shells out to at link time. Odin's
+`-linker:` flag only selects between its own backends
+(`default`/`lld`/`radlink`/`mold`), so there is **no `$CC` override** — gcc
+would compile the two C files and then hand the final link back to a clang that
+is not installed, failing later and further from the cause. Rejected a
+`${CC:-clang}` knob for exactly that reason. `build.sh` now checks for it up
+front and names the package.
+
+**The interesting one: mise's clang is a conda build, and that is now solved
+rather than worked around.** It links through its own bundled sysroot, which
+knows nothing about this host's libraries, so `clang -lavcodec` failed
+outright. Forcing `-L/usr/lib` was worse than failing: the link *succeeded*
+while leaving avformat's transitive deps (`libswresample.so.7`,
+`libavutil.so.61`, `libvpx.so.12`) unresolved — a green build producing a
+binary that dies on the first call into ffmpeg. `build.sh` now passes
+`--sysroot=/` to the link, which names the root the libraries actually live
+under. It is a no-op for a plain system clang and correct for a toolchain
+supplied one, so one binary does not need a different invocation depending on
+who installed the compiler. Verified end to end: `ldd` shows
+`libavcodec.so.63`/`libgio-2.0` from `/usr/lib`, and the headless probe run
+completes.
+
+**New tracked file `.mise.toml`**, so the project provisions its own toolchain
+rather than depending on a global default that resolves to whatever the host
+happens to prefer: `odin` pinned to the exact dev build (a compiler bump changes
+codegen, so `latest` makes a red gate unreproducible afterwards), `clang`
+pinned (the version actually verified), `mold` pinned (optional — `build.sh`
+already falls back — but pinned so every host gets the fast path).
+`glslang` and `valgrind` are **not** in it: mise has no backend for either, so
+the file documents the pacman packages and why they stay on the system, along
+with ffmpeg/sdl3/glib2. Vendoring a second FFmpeg to satisfy a package manager
+would mean maintaining a parallel set of structs from `vendor/ffmpeg/` and
+hoping the layouts still match — which is what `gate.sh`'s own ABI check exists
+to catch.
+
+**Two incidental build fixes.** The C objects now skip when newer than their
+source, mirroring the shader rule directly above them; recompiling two files
+that never change made a worktree with no artifacts look like a build failure.
+And a footgun that only existed because of this work: installing clang through
+mise leaves a shim ahead of `/usr/bin` on `PATH`, so it kept shadowing the real
+compiler *after* the tool was uninstalled and removed from `.mise.toml`, turning
+a correct system clang into `No version is set for shim`. Uninstalling cleared
+the shim.
+
+**Found, not fixed — needs a decision.** `scripts/gate.sh`'s `dev()` runs
+`dev "$@"` in its nix branch, so on any host that *has* nix installed it
+recurses into itself until the stack dies. Unreachable here (`nix` is not
+installed, so the host-toolchain branch runs), and the intended invocation is
+guessing — `nix develop --command` is not obviously right for a repo that is not
+itself a nix package. Left alone rather than half-guessed.
