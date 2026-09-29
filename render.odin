@@ -2244,6 +2244,12 @@ render_worker_run :: proc() {
 			)
 			v.fw = px_extent(scw)
 			v.fh = px_extent(sch)
+			if v.fw > render_max_stage_w {
+				render_max_stage_w = v.fw
+			}
+			if v.fh > render_max_stage_h {
+				render_max_stage_h = v.fh
+			}
 			// Seed the display rect with the resting pose; the composite
 			// recomputes it per frame before every blit.
 			l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
@@ -2289,6 +2295,15 @@ render_worker_run :: proc() {
 			v.fw = 0
 			v.fh = 0
 			continue
+		}
+		// Static clips decode only their visibility-cropped region, so their
+		// stage is small by construction; recording it anyway keeps the
+		// reported max meaningful for a job with no keyed clips at all.
+		if v.fw > render_max_stage_w {
+			render_max_stage_w = v.fw
+		}
+		if v.fh > render_max_stage_h {
+			render_max_stage_h = v.fh
 		}
 		// Visible rect = canvas-clipped display rect. Decode and sws-scale
 		// only this region (render.odin perf brief P3) so resample work tracks
@@ -3419,6 +3434,19 @@ render_keyed_frames: int
 render_keyed_gpu_frames: int
 render_keyed_fallbacks: int
 
+// render_max_stage_w/h is the largest decode stage any clip was set up with,
+// across every clip in the job. The max-keyed-scale stage is what made the
+// reported regression pathological: a clip animating to 3x decodes a 5760x3240
+// stage and then crops it, so the work is set by the PEAK of the animation and
+// not by the frames actually on screen. Reporting only the canvas size hides
+// that entirely, which is why the export benchmark (S1) records it per run
+// instead of inferring cost from ms/frame.
+//
+// Worker-written at job setup, read by the render-test summary after
+// poll_completed_thread has joined the worker -- the same handoff the
+// render_keyed_* counters above already rely on.
+render_max_stage_w, render_max_stage_h: c.int
+
 // render_gpu_abort latches a mid-composite GPU failure (a draw or readback
 // that fails AFTER the frame began) so the worker stops the export instead of
 // encoding a partially-composited frame. Reset per run; only set from
@@ -3925,6 +3953,21 @@ render_test_run :: proc(paths: [2]string) {
 	st := render_status_text()
 	fmt.println("render-test status:", st)
 	fmt.println("render-test keyed frames:", render_keyed_frames)
+	// The stage, not the canvas: a clip animating to 3x decodes a 5760x3240
+	// stage and crops it, so the peak of the animation sets the cost. Printed
+	// as one line so the export benchmark can scrape it per run.
+	fmt.println(
+		"render-test max stage:",
+		render_max_stage_w,
+		"x",
+		render_max_stage_h,
+		"canvas:",
+		render_job.width,
+		"x",
+		render_job.height,
+		"frames:",
+		render_job.nframes,
+	)
 	fmt.println(
 		"render-test gpu stage uploads:",
 		gpu_stage_uploads,

@@ -584,6 +584,84 @@ target_subtitle_probe() {
 	tail -1 "$SUB_DIR/subs.log"
 }
 
+export_bench_dir=target/export_bench
+
+# S1: opt-in export benchmark. NOT a member of `all`, and that is the whole
+# design decision: this measures, it does not gate. A perf target in the suite
+# fails the day the machine is busy, and a benchmark that cries wolf gets
+# ignored, which costs more than having no benchmark. Every OTHER target here
+# answers "is it correct"; this one answers "what does it cost", and those want
+# opposite failure behaviour.
+#
+# The shapes are the ones the reported regression was sensitive to. A keyed
+# animation's cost is set by the PEAK scale, not the frames on screen, so the
+# stage column is reported next to the timings -- without it, ms/frame for
+# 1->2 and 1->3 look like the same kind of number and invite a wrong comparison.
+export_bench_run() {
+	local shape=$1
+	shift
+	local log="$export_bench_dir/$shape.log"
+	local out="$export_bench_dir/$shape.mp4"
+	mkdir -p "$export_bench_dir"
+	local t0 t1
+	t0=$(date +%s%N)
+	env $PROBE_ENV \
+		VYPER_RENDER_TEST="$KEYED_SRC|$out" \
+		VYPER_FRAME_TIME=1 \
+		"$@" \
+		timeout 900 ./vyper >"$log" 2>&1
+	local rc=$?
+	t1=$(date +%s%N)
+	if [ $rc -ne 0 ]; then
+		echo "export-bench: $shape run failed (rc=$rc); see $log" >&2
+		return 1
+	fi
+	# A run that produced no clip is not a fast run, it is a broken one. Read
+	# the numbers out of the log rather than timing the shell: the log is what
+	# the composite actually reported, and a silent field means the shape did
+	# not take the path it claims to.
+	#
+	# There is deliberately no "resample" column. S1c composited keyed frames
+	# straight into the GPU canvas, so render_eval_keyed_geom returns before
+	# the separate resample call and comp_resample_ns stays 0 for every shape
+	# -- the cost moved into the composite walk. A column that is structurally
+	# always zero is a lie with a number in it, so the columns are the ones
+	# that still move: producer total and its stage-scaling component (which is
+	# what grows with the animation peak) plus the composite walk.
+	local wall producer pscale composite stage frames hash
+	wall=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", (b-a)/1e9}')
+	producer=$(sed -n 's/.*decode(producer)=\([0-9.]*\)ms.*/\1/p' "$log" | tail -1)
+	pscale=$(sed -n 's/.*decode(producer)=[0-9.]*ms\/f (codec=[0-9.]*ms\/f scale=\([0-9.]*\)ms.*/\1/p' "$log" | tail -1)
+	composite=$(sed -n 's/.*videoenc=[0-9.]*% ([^,]*, \([0-9.]*\)ms\/f).*/\1/p' "$log" | tail -1)
+	stage=$(sed -n 's/.*render-test max stage: \([0-9]*\) *x *\([0-9]*\).*/\1x\2/p' "$log" | tail -1)
+	frames=$(sed -n 's/.*render-test max stage:.*frames: \([0-9]*\).*/\1/p' "$log" | tail -1)
+	hash=$(md5sum "$out" 2>/dev/null | cut -d' ' -f1)
+	if [ -z "$producer" ] || [ -z "$stage" ] || [ -z "$hash" ] || [ -z "$composite" ]; then
+		echo "export-bench: $shape produced no usable numbers; see $log" >&2
+		return 1
+	fi
+	printf '%-16s wall=%-6s producer=%-6s scale=%-6s composite=%-6s stage=%-11s frames=%-4s %s\n' \
+		"$shape" "$wall" "$producer" "${pscale:-?}" "$composite" "$stage" "$frames" "$hash"
+}
+
+target_export_bench() {
+	require_fresh_binary export-bench || return 1
+	if [ ! -s "$KEYED_SRC" ]; then
+		echo "export-bench: no source clip; run keyed_export once first" >&2
+		return 1
+	fi
+	echo "shape            wall    producer scale   composite stage        frames md5"
+	# 90-frame source; peaks land mid-clip so the constant-scale and
+	# off-canvas arms differ from the animated ones in stage, not just in time.
+	export_bench_run scale_1_to_2   VYPER_KEYED_SCALE="0:1.0,45:2.0,89:2.0" || return 1
+	export_bench_run scale_1_to_3   VYPER_KEYED_SCALE="0:1.0,45:3.0,89:3.0" || return 1
+	export_bench_run scale_reversed VYPER_KEYED_SCALE="0:2.0,45:1.0,89:1.0" || return 1
+	export_bench_run scale_constant VYPER_KEYED_SCALE="0:2.0,45:2.0,89:2.0" || return 1
+	export_bench_run transform_only VYPER_TX="60,40,1.0" || return 1
+	export_bench_run crop_only     VYPER_CROP="0.1,0.1,0.1,0.1" || return 1
+	export_bench_run off_canvas    VYPER_TX="-3000,0,1.0" || return 1
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -616,9 +694,10 @@ main() {
 	subtitle_probe) target_subtitle_probe ;;
 	smoke) target_smoke ;;
 	valgrind) target_valgrind ;;
+	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|render_valgrind|smoke|valgrind|export_bench|all]" >&2
 		return 2
 		;;
 	esac
