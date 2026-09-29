@@ -436,10 +436,57 @@ throughput. See the note appended to S2.
 - [x] S0. In-tree CPU resampler for the keyed path (landed above). This is the
       fallback the GPU path must match or beat, and the correctness gate every
       later step is measured against.
-- [ ] S1. Add an opt-in headless export benchmark fixture for scale `1 -> 2`,
+- [x] S1. Add an opt-in headless export benchmark fixture for scale `1 -> 2`,
       `1 -> 3`, constant scale, transform-only, crop-only, reversed scale, and
       off-canvas motion. Record wall time, producer time, keyed `sws`, stage
       dimensions, output frame count, and a reference-frame hash/PSNR.
+
+      **Status: landed (`de0e1b7`), `scripts/gate.sh export_bench`.** Seven
+      shapes, opt-in and deliberately NOT in `all` -- it measures, it does not
+      gate, and a perf target in the suite fails on a busy machine.
+
+      Two things it does that the old single-shape numbers could not:
+
+      - **The stage is reported next to the timings.** A keyed animation
+        decodes a stage sized from the *peak* scale and then crops it, so
+        `1 -> 2` builds 3840x2160 and `1 -> 3` builds 5760x3240 for the same
+        1920x1080 canvas. `render_max_stage_w/h` records the max across clips at
+        job setup. The canvas size alone hid this completely, and it is what
+        makes ms/frame between the two shapes incomparable. `off_canvas`
+        reporting `stage 0x0` / `producer 0.00` is the correctness check on
+        that accounting: a fully off-canvas clip never decodes.
+      - **The md5 ties each timing to pixels.** Two consecutive runs hashed
+        identically for all seven shapes, so a changed hash now means the render
+        changed and the timing is not comparable.
+      - **There is no `sws`/resample column, on purpose.** S1c composited
+        keyed frames straight into the GPU canvas, so `render_eval_keyed_geom`
+        returns before the separate resample and `comp_resample_ns` is
+        structurally `0` for every shape -- the cost moved into the composite
+        walk. A permanently-zero column is a lie with a number in it, so the
+        columns are the ones that still move.
+
+      **It also settles the `nv12 wait` question that the single-shape numbers
+      left open.** Reverting S1c in place and running the same seven shapes
+      through the same tooling:
+
+      | shape | before `cpy`/`pack`/`wait` | after `cpy`/`wait` | wall before -> after |
+      |---|---|---|---|
+      | `scale_1_to_2` | 0.86 / 22.32 / 3.13 | 0.34 / 3.25 | 2.92 -> 1.92 |
+      | `scale_1_to_3` | 0.86 / 22.44 / 4.19 | 0.34 / 4.52 | 4.02 -> 3.91 |
+      | `scale_reversed` | 0.89 / 22.50 / 3.78 | 0.36 / 3.88 | 2.97 -> 1.91 |
+      | `scale_constant` | 0.84 / 22.57 / 2.88 | 0.21 / 2.83 | 2.92 -> 2.01 |
+      | `transform_only` | 0.75 / 22.20 / 1.63 | 0.24 / 2.87 | 2.56 -> 0.61 |
+
+      All seven md5s are identical before and after, so this is a like-for-like
+      comparison of the same pixels. **`wait` is not a regression**: it is a GPU
+      fence that varies 3.25-3.63 ms run-to-run (11% spread) on identical input
+      *and* identical output hashes, and the matched before/after pairs sit
+      within 0.4 ms on all four keyed shapes. The earlier "2.31 -> 2.72-3.08"
+      reading was one sample against that whole spread. It also tracks GPU work
+      rather than the pack -- the biggest stage (`scale_1_to_3`) has the largest
+      `wait`, and `crop_only`, which takes the CPU fallback and never touches
+      the GPU, has `0.00` on every field. What S1c actually removed is 22 ms/f
+      of pack and half of `cpy`, and `cpy` is the stable number (0.25-0.36).
 - [x] S1b. GPU resample as the DEFAULT, CPU kernel as the fallback. Decode the
       keyed stage once into a texture, then resolve the animated box as a
       filtered textured quad (a hardware bilinear sample per output pixel) with
