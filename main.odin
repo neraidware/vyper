@@ -1463,6 +1463,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if _, ok := os.lookup_env_alloc("VYPER_YUV_EXACT_PROBE", context.temp_allocator); ok {
 		os.exit(yuv_exact_probe_run())
 	}
+	if v, _ := os.lookup_env_alloc("VYPER_CLIPW_PROBE", context.temp_allocator); v != "" {
+		ui_probe_clip_widths(v)
+		return
+	}
 	if v, _ := os.lookup_env_alloc("VYPER_UI_PROBE", context.temp_allocator); v != "" {
 		ui_draw_probe_run()
 	}

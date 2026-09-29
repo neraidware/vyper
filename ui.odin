@@ -828,11 +828,21 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 												{
 													layout = {
 														sizing = {
-															width = clay.SizingGrow({}),
+															// The tile's width is the MODEL's
+															// (frames*zoom), never its content's: a
+															// Grow tile let the label's measured width
+															// plus padding push the tile PAST the
+															// wrap's fixed width, so a short clip drew
+															// wider than it was -- and its hit test,
+															// drag origin and markers inherited that
+															// same wrong box. The label is clipped to
+															// the tile instead.
+															width = clay.SizingFixed(clip_width),
 															height = clay.SizingFixed(CLIP_TILE_HEIGHT),
 														},
 														padding = clay.PaddingAll(CARD_GAP),
 													},
+													clip = {horizontal = true},
 													backgroundColor = clip_color,
 													cornerRadius = clay.CornerRadiusAll(
 														RADIUS_WIDGET,

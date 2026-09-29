@@ -2549,9 +2549,50 @@ Details TBD when Phase 2 reaches maturity.
   healthy because the HUD extrapolated its frozen counters forward; `age` climbs
   into the minutes when the producer thread is stuck. Saturates to 0 rather
   than underflowing when a publish lands between the two clock reads.
-- Not committed yet; `./scripts/gate.sh check build probe smoke valgrind` pass
+- Committed as `e69afb5` ("audio: commit scrub/drag re-provision once on
+  release"); `./scripts/gate.sh check build probe smoke valgrind` pass
   (`smoke: ok (124)`, `ui-probe` all ok; valgrind 0 definitely/indirectly lost,
   no invalid access).
+
+
+---
+
+## Implemented — clip tile width is the model's width, not the label's (2026-09-29)
+
+- Symptom: after a cut, the video and audio clips were both 117 frames, but the
+  audio clip drew visibly longer; zooming in made it correct. Reported against a
+  saved `~/test.vyproj`.
+- The data was never wrong: the CBOR showed both clips with
+  `source_length_frames = 117`, `timeline_start_frame = 0`, one shared
+  `link_id`. So this was a layout defect, not a split defect — worth stating
+  plainly, because the report read like a cut bug.
+- Root cause: the inner `TimelineClip` tile was `SizingGrow` inside the fixed
+  width `TimelineClipWrap`, so the tile took its CONTENT's width — the label at
+  `FONT_HEADING` plus `2*CARD_GAP` — whenever the label outgrew the clip. The
+  audio clip's default label ("Audio") is one glyph wider than the video's
+  ("Clip"), and at a low enough zoom both outgrew the tile. Measured with
+  `FONT_HEADING=18`, `CARD_GAP=8`: "Audio" wants 65.5px, "Clip" wants 55.6px,
+  matching the laid-out widths exactly. Zooming in made the clip outgrow its own
+  label, which is why the size "fixed itself".
+- It was not only cosmetic. The tile's box feeds the pointer hit test
+  (`interaction.odin` `clay.PointerOver("TimelineClip")`), the drag origin, and
+  the marker/waveform pass in `gpu_draw.odin`, so the overflow was clickable and
+  draggable — a short clip could swallow clicks belonging to the gap after it.
+- Fix: the tile is `SizingFixed(clip_width)` (`ui.odin`) with
+  `clip = {horizontal = true}`, so the label is cut to the model width instead of
+  sizing it. Affects every clip kind, not just audio.
+- Repro: `VYPER_CLIPW_PROBE=<project.vyproj> ./vyper` loads a project and prints
+  each clip's laid-out tile width against `frames*zoom` at several zooms. That is
+  what found it; it is a manual tool (it needs a user-supplied project), not a
+  gate.
+- Regression: `ui_probe_clip_tile_width_asserts` runs in `scripts/gate.sh probe`
+  over zooms 0.1/0.5/1/4, where the seeded 300-frame clips are narrow enough
+  that every label outgrows its tile, and requires
+  `tile.width == frames*zoom` for every clip. Confirmed to fail (30px clip laid
+  out at 55.6px) with the fix reverted and to pass with it.
+- `./scripts/gate.sh check build probe smoke valgrind` pass (`smoke: ok (124)`;
+  valgrind 0 definitely/indirectly lost, no invalid access, 22 contexts — the
+  probe's project load + `session_teardown` added none).
 
 
 ---

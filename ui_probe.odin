@@ -40,6 +40,78 @@ measure_probe :: proc "c" (
 clay_probe_error :: proc "c" (data: clay.ErrorData) {
 }
 
+// ui_probe_clip_widths (VYPER_CLIPW_PROBE=<project.vyproj>) measures the laid-out
+// width of every clip tile at a spread of timeline zooms, and prints the tile's
+// own width next to the width the model implies (frames * zoom). A tile wider
+// than the model width is a layout bug, not a data bug: the project file for the
+// reported case had a video and an audio clip of identical length whose tiles
+// disagreed, and the data was provably fine.
+ui_probe_clip_widths :: proc(project_path: string) {
+	CLAY_ARENA_BYTES :: 64 * 1024 * 1024
+	memory := make([^]u8, CLAY_ARENA_BYTES)
+	clay.Initialize(
+		clay.CreateArenaWithCapacityAndMemory(c.size_t(CLAY_ARENA_BYTES), memory),
+		{WINDOW_WIDTH, WINDOW_HEIGHT},
+		{handler = clay_probe_error},
+	)
+	clay.SetMeasureTextFunction(measure_probe, nil)
+
+	// project_file_open reads and decodes the path itself, so the env string
+	// (already on the probe's temp allocator) can be handed over directly.
+	if err := project_file_open(project_path); len(err) > 0 {
+		fmt.eprintf("[clipw-probe] open %s failed: %s\n", project_path, err)
+		delete(err)
+		return
+	}
+	fmt.printf("[clipw-probe] %s: tracks=%d\n", project_path, len(timeline.tracks))
+	for t in 0 ..< len(timeline.tracks) {
+		for i in 0 ..< len(timeline.tracks[t].clips) {
+			cl := timeline.tracks[t].clips[i]
+			fmt.printf(
+				"[clipw-probe]  track %d clip %d kind=%d frames=%d start=%d link=%d\n",
+				t,
+				i,
+				int(cl.kind),
+				cl.source_length_frames,
+				cl.timeline_start_frame,
+				cl.link_id,
+			)
+		}
+	}
+
+	zooms := []f32{0.5, 1, 2, 4, 8, 16}
+	for z in zooms {
+		timeline_view.zoom = z
+		timeline_view.start = 0
+		_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
+		fmt.printf("[clipw-probe] zoom=%.2f\n", z)
+		for t in 0 ..< len(timeline.tracks) {
+			for i in 0 ..< len(timeline.tracks[t].clips) {
+				cl := timeline.tracks[t].clips[i]
+				want := f32(max(cl.source_length_frames, 1)) * z
+				wrap := clay.GetElementData(clay.ID("TimelineClipWrap", u32(t * 1000 + i))).boundingBox
+				tile := clay.GetElementData(clay.ID("TimelineClip", u32(t * 1000 + i))).boundingBox
+				sec := clay.GetElementData(clay.ID("ClipsSection", u32(t))).boundingBox
+				fmt.printf(
+					"[clipw-probe]   t%d c%d want=%.1f wrap=%.1f tile=%.1f x=%.1f (sec x=%.1f w=%.1f)\n",
+					t,
+					i,
+					want,
+					wrap.width,
+					tile.width,
+					tile.x,
+					sec.x,
+					sec.width,
+				)
+			}
+		}
+	}
+	// The probe owns a loaded session; tear it down so valgrind sees no leak.
+	session_teardown()
+	// Fall through to the normal probe asserts so this stays a superset.
+	ui_draw_probe_run()
+}
+
 ui_draw_probe_run :: proc() {
 	CLAY_ARENA_BYTES :: 64 * 1024 * 1024
 	memory := make([^]u8, CLAY_ARENA_BYTES)
@@ -109,6 +181,10 @@ for j := 0; j < len(raw); {
 	// fully (at the measurement size the editor band collapses the timeline
 	// subtree, leaving its boxes zero).
 	if !ui_probe_layout_asserts() {
+		os.exit(1)
+	}
+	// A clip tile is frames*zoom wide; its label must never size it.
+	if !ui_probe_clip_tile_width_asserts() {
 		os.exit(1)
 	}
 	// Track rows: buttons moved to the dedicated menu, and the timeline fits
@@ -1427,6 +1503,54 @@ ui_probe_layout_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] keyframe layout ok\n")
+	}
+	return ok
+}
+
+// ui_probe_clip_tile_width_asserts holds the tile to the model's width. A tile
+// sized by its content (label text + padding) instead of by frames*zoom drew
+// wider than the clip really was, and the same box fed the pointer hit test,
+// the drag origin and the marker pass -- so a short audio clip (label "Audio")
+// came out visibly longer than an equal-length video clip (label "Clip"), with
+// its extra width clickable. Zooming in hid it because the clip outgrew its own
+// label. Zoom 0.1 makes the seeded 300-frame clips narrow enough that every
+// label outgrows its tile, so this bites on each track's audio clip.
+ui_probe_clip_tile_width_asserts :: proc() -> bool {
+	ok := true
+	saved_zoom, saved_start := timeline_view.zoom, timeline_view.start
+	defer {
+		timeline_view.zoom, timeline_view.start = saved_zoom, saved_start
+		build_page(1920, 1600)
+	}
+	zooms := []f32{0.1, 0.5, 1, 4}
+	for zoom in zooms {
+		timeline_view.zoom = zoom
+		timeline_view.start = 0
+		_ = build_page(1920, 1600)
+		for t in 0 ..< len(timeline.tracks) {
+			for i in 0 ..< len(timeline.tracks[t].clips) {
+				cl := timeline.tracks[t].clips[i]
+				want := f32(max(cl.source_length_frames, 1)) * zoom
+				tile := clay.GetElementData(
+					clay.ID("TimelineClip", u32(t * 1000 + i)),
+				).boundingBox
+				if abs(tile.width - want) > 0.5 {
+					fmt.eprintf(
+						"[ui-probe] zoom %.2f t%d c%d (kind %d) tile width %.1f want %.1f\n",
+						zoom,
+						t,
+						i,
+						int(cl.kind),
+						tile.width,
+						want,
+					)
+					ok = false
+				}
+			}
+		}
+	}
+	if ok {
+		fmt.printf("[ui-probe] clip tile width ok\n")
 	}
 	return ok
 }
