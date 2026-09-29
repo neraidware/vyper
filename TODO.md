@@ -475,6 +475,22 @@ into playback/preview.
         hand-written parallel copy that a new lane would have silently
         misplaced. The gain diamond is not a geometry lane and still calls
         `kf_add_prop`.
+      - **The handles were the last un-routed geometry write.** The drag
+        writes the RESTING fields every frame — the gesture is not committed
+        until the pointer is released — and that is precisely the write
+        `kf_sample_keys` discards between the first and last key of a span. So
+        on a keyed clip the handles appeared to work (the inspector numbers
+        moved, the preview redrew) and animated nothing, with auto-key off. The
+        mouse-up path now calls `handle_drag_commit`
+        (`preview_transform.odin`), which runs the same `clip_geom_drag` the
+        other gestures use: a keyed lane is keyed at the playhead, an unkeyed
+        one goes pending for the inspector row. It lives beside
+        `begin_handle_drag`/`update_handle_drag` so the gesture's whole
+        lifetime reads in one place AND the probe can drive the shipped call
+        instead of re-declaring the lane list — a copied list would keep
+        passing if the real call site stopped routing a lane. Crop stays gated
+        on `handle_drag.kind` so a corner handle does not stamp keys on the
+        edges it never reached.
 
       **Accepted by:** `check`; `geom_key_probe`; `transform_probe`; `probe`
       (ui_probe, incl. the new row-layout asserts); `timeline_probe`;
@@ -557,7 +573,16 @@ into playback/preview.
       0 / 0, 11643 errors from 22 contexts; `render_valgrind` 0 / 0, 478 errors
       from 128 contexts. The context counts are the noise baseline AGENTS.md
       §9b asks to watch, and they are now recorded from runs that actually
-      executed. **Known and still open:** `VYPER_TL_PROBE` reports 79 bytes in
+      executed. Re-measured after the handle-drag commit landed: `geom_key_valgrind`
+      0 / 0, 72 errors from 43 contexts. Every frame in that run is `calloc` (39),
+      `malloc` (3), or one `runtime::conditional_mem_zero` reached through
+      `_append_elem` when a key is added — the same Odin/FFmpeg noise class as
+      the 32, not a new source. The delta is the new probe case's own
+      allocations (the Clay arena the handle math needs, plus two more keys),
+      and the probe needed Clay live for the first time: `preview_view` ->
+      `clamp_preview_camera` reads element bounding boxes, and `main.odin`
+      dispatches probes before its own `clay.Initialize`, so the probe now
+      initializes it the way `transform_probe` already did. **Known and still open:** `VYPER_TL_PROBE` reports 79 bytes in
       1 block definitely lost — pre-existing, not reached by any valgrind
       target in `all`, and the frame-pointer build now makes it diagnosable.
 

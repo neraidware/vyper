@@ -1,7 +1,9 @@
 package main
 
+import "core:c"
 import "core:fmt"
 import "core:os"
+import clay "clay-odin"
 
 // VYPER_GEOM_KEY_PROBE — headless check that a geometry edit made through the
 // PREVIEW GESTURES reaches the keyframe track.
@@ -15,6 +17,13 @@ import "core:os"
 // moment the playhead left the keyed span. A drag that visibly does nothing
 // while the numbers move is the whole bug, and nothing else in the suite
 // exercises it — transform_probe covers handle math, not keyframe routing.
+//
+// The same defect reached the scale/crop handles by a different route, and it
+// is the one that survived the first fix because the handles look the most
+// obviously-working: update_handle_drag writes the resting fields every frame
+// (the drag is not committed until release) and nothing routed them. So the
+// handles re-drew the preview, moved the inspector, and recorded nothing. The
+// handle case below drives the real begin/update/commit gesture.
 //
 // What is asserted, per gesture, on a clip that is already keyed:
 //   1. the value the SAMPLER reports at the playhead moved (the edit is visible
@@ -168,6 +177,19 @@ geom_key_resting :: proc(cl: ^Clip, lane: Render_Geom_Prop) -> f32 {
 }
 
 geom_key_probe_run :: proc() -> int {
+	// The handle-drag case below runs the real gesture (begin/update/commit),
+	// and that math reaches preview_view -> clamp_preview_camera, which reads
+	// clay element bounding boxes. So clay must be live before it -- with no
+	// layout built it returns the not-found default and the camera clamp falls
+	// back to the canvas size, which is what transform_probe does too.
+	// (main.odin dispatches probes before its own clay.Initialize.)
+	memory := make([^]u8, clay.MinMemorySize())
+	clay.Initialize(
+		clay.CreateArenaWithCapacityAndMemory(c.size_t(clay.MinMemorySize()), memory),
+		{WINDOW_WIDTH, WINDOW_HEIGHT},
+		{handler = clay_probe_error},
+	)
+
 	// --- Alt+wheel: crop-zoom must move the crop, not just the resting field
 	{
 		cl := geom_key_fixture()
@@ -613,11 +635,73 @@ geom_key_probe_run :: proc() -> int {
 		geom_key_check(clip_geom_key_all_modified(cl) == 0, "a second press must key nothing")
 	}
 
+	// --- keyed handle drag. This is the one gesture that looked correct and
+	// animated nothing. update_handle_drag writes the RESTING fields every
+	// frame, because the drag is not committed until the pointer is released,
+	// and that is exactly the write kf_sample_keys discards between the first
+	// and last key of a span. So the inspector numbers moved and the timeline
+	// did not, with auto-key off. Driven through the same handle_drag_commit
+	// the shipped pointer path calls, not a copy of its lane list -- a copied
+	// list would keep passing if the real call site stopped routing a lane.
+	{
+		cl := geom_key_fixture()
+		editor_flags.auto_keyframe = false
+		playhead.frame = 150
+		canvas := probe_canvas()
+		scale0 := clip_geom_get(cl, .Scale)
+		tx0 := clip_geom_get(cl, .Trans_X)
+		ty0 := clip_geom_get(cl, .Trans_Y)
+		// The .T edge pins the bottom, so only the vertical transform moves.
+		// Its box comes from the SNAPSHOT the drag reads, so the grab point is
+		// the top edge of the SAMPLED position -- the resting field is a
+		// different number on purpose in this fixture, and using it here would
+		// test a clip the user never sees.
+		begin_handle_drag(cl, canvas, .T, 0, 0, false)
+		cx, _ := project_to_pixel(canvas, handle_drag.start_tx, handle_drag.start_ty)
+		_, ch0 := clip_full_box_dims(cl, handle_drag.start_scale)
+		vt0 := handle_drag.start_ty - (0.5 - handle_drag.start_crop_t) * ch0
+		update_handle_drag(cl, canvas, cx, vt0 - 300, false)
+		handle_drag_commit(cl)
+		geom_key_check(
+			!kf_approx(clip_geom_get(cl, .Scale), scale0),
+			"a handle drag on a KEYED clip must move what the clip reads (scale %v, was %v)",
+			clip_geom_get(cl, .Scale), scale0,
+		)
+		// The point of the commit: the drag must land ON the playhead key, not
+		// only on the resting field the preview is already drawing.
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Scale), cl.scale),
+			"the drag must land on the playhead key (sampled %v, resting %v)",
+			clip_geom_get(cl, .Scale), cl.scale,
+		)
+		// .T recomputes the vertical transform and leaves the horizontal one
+		// alone; routing it unconditionally would key translate.x the user
+		// never moved, and that key would show up in the graph.
+		geom_key_check(
+			!kf_approx(clip_geom_get(cl, .Trans_Y), ty0),
+			"a top-edge drag must move the vertical transform (%v, was %v)",
+			clip_geom_get(cl, .Trans_Y), ty0,
+		)
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Trans_X), tx0) && kf_approx(cl.transform_x, tx0),
+			"a top-edge drag must not touch translate.x (sampled %v, resting %v, was %v)",
+			clip_geom_get(cl, .Trans_X), cl.transform_x, tx0,
+		)
+		// A keyed lane is keyed BY the drag, so nothing may be left pending --
+		// a leftover bit would offer "keyframe all modified" for a value that
+		// is already animated.
+		geom_key_check(
+			!clip_geom_any_modified(cl),
+			"a handle drag on keyed lanes must not leave anything pending (mask %d)",
+			cl.geom_modified,
+		)
+	}
+
 	if geom_key_fail {
 		return 1
 	}
 	fmt.println(
-		"[geom-key-probe] OK: geometry writes land where the clip reads — Alt+wheel/Alt-drag/typed edit route to the playhead key, unkeyed edits stay visible and pending, the playhead guard mints no off-clip key, and key-all-modified keys exactly the pending lanes (including a packed-section migration)",
+		"[geom-key-probe] OK: geometry writes land where the clip reads — Alt+wheel/Alt-drag/typed edit/handle drag route to the playhead key, unkeyed edits stay visible and pending, the playhead guard mints no off-clip key, and key-all-modified keys exactly the pending lanes (including a packed-section migration)",
 	)
 	return 0
 }

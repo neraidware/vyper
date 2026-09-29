@@ -1299,3 +1299,32 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		}
 	}
 }
+
+// handle_drag_commit routes everything this gesture just moved to wherever the
+// clip READS it. It lives beside begin/update_handle_drag so the drag's whole
+// lifetime -- snapshot, apply, commit -- reads in one place, and so a probe
+// drives the same call the shipped path does instead of re-declaring which
+// lanes the gesture touches (a probe that copied the list would keep passing
+// if the real call site stopped routing one of them).
+//
+// update_handle_drag writes the RESTING fields, because it runs every frame and
+// the drag is not yet committed. That is exactly the write kf_sample_keys
+// discards between the first and last key, so without this the handles appear to
+// work on an unkeyed clip and silently do nothing on a keyed one. clip_geom_drag
+// keys the playhead when the property is keyed there, so a keyed clip follows
+// the handle with auto-key off; unkeyed, it marks the lane pending for the
+// inspector's "key all modified" row.
+//
+// Crop handles reach one or two edges, no more: routing all four would stamp
+// keys on edges the user never touched, so the kind gates the edge block.
+handle_drag_commit :: proc(clip: ^Clip) {
+	clip_geom_drag(clip, .Scale, handle_drag.start_scale)
+	clip_geom_drag(clip, .Trans_X, handle_drag.start_tx)
+	clip_geom_drag(clip, .Trans_Y, handle_drag.start_ty)
+	if handle_drag.kind == .Crop {
+		clip_geom_drag(clip, .Crop_L, handle_drag.start_crop_l)
+		clip_geom_drag(clip, .Crop_R, handle_drag.start_crop_r)
+		clip_geom_drag(clip, .Crop_T, handle_drag.start_crop_t)
+		clip_geom_drag(clip, .Crop_B, handle_drag.start_crop_b)
+	}
+}

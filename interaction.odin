@@ -1051,22 +1051,7 @@ interaction_post_build :: proc(
 				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
 				canvas := preview_canvas(pb)
 				update_handle_drag(sel, canvas, inp.x, inp.y, inp.shift)
-				// Route every property this gesture actually MOVED to wherever
-				// the clip reads it (the crop handles reach one or two edges, no
-				// more — committing all four would stamp keys the user never
-				// touched). clip_geom_drag keys the playhead when the property is
-				// keyed there, so a keyed clip follows the handle even with
-				// auto-key off; unkeyed, it marks the lane pending for the
-				// inspector's "key all modified" row.
-				clip_geom_drag(sel, .Scale, handle_drag.start_scale)
-				clip_geom_drag(sel, .Trans_X, handle_drag.start_tx)
-				clip_geom_drag(sel, .Trans_Y, handle_drag.start_ty)
-				if handle_drag.kind == .Crop {
-					clip_geom_drag(sel, .Crop_L, handle_drag.start_crop_l)
-					clip_geom_drag(sel, .Crop_R, handle_drag.start_crop_r)
-					clip_geom_drag(sel, .Crop_T, handle_drag.start_crop_t)
-					clip_geom_drag(sel, .Crop_B, handle_drag.start_crop_b)
-				}
+				handle_drag_commit(sel)
 			}
 		case .Panel_Resize:
 			// The divider sits in the root column below the app bar, so the
