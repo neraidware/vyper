@@ -536,6 +536,68 @@ kf_geom_set_packed :: proc(clip: ^Clip, sec: string, frame_off: i32, lanes: [KF_
 	kf_set_packed_key(clip, sec, frame_off, lanes, mask)
 }
 
+// kf_geom_set_packed_lane_key records ONE lane's value at frame_off on the
+// section's PACKED track, leaving the group packed. Returns false when there is
+// no packed section to write into (a non-lane name, or a section that is already
+// unwrapped), so the caller can fall back to kf_geom_set_lane_key and keep the
+// behavior it had.
+//
+// This exists because "extend the animation that is already there" and "give
+// this property its own track" are two different requests that both arrive as a
+// lane write, and only the second one should rewrite the section's shape.
+// Auto-key is the first: the toggle says "record my edits on the timeline", and
+// a user who keyed their crop as one whole-crop section must not find it split
+// into four per-lane tracks because they dragged one edge. The inspector's
+// per-lane Key button and a typed value are the second, and those still unwrap
+// (kf_geom_set_lane_key).
+//
+// mask carries only this lane's bit, which is the form the sampler is built for:
+// kf_sample_packed_lane skips knots that do not cover a lane, so the other lanes
+// keep their own curves and simply interpolate through this frame instead of
+// gaining a breakpoint they were never given.
+//
+// A key already ON the frame is merged into rather than replaced: the
+// same-frame path in kf_set_packed_key overwrites mask and value wholesale, so
+// calling it here would drop the other lanes' values from a full-mask knot the
+// user placed themselves.
+kf_geom_set_packed_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) -> bool {
+	sec_index, li, is_lane := kf_geom_section_for_lane(name)
+	if !is_lane {
+		return false
+	}
+	defs := kf_geom_sections
+	sec := defs[sec_index].name
+	si := kf_track_index(clip^, sec)
+	if si < 0 {
+		return false
+	}
+	tr := &clip.keyframe_tracks[si]
+	bit := u8(1) << uint(li)
+	for &k in tr.keys {
+		if k.frame_off != frame_off {
+			continue
+		}
+		switch &v in k.value {
+		case [KF_PACK_MAX]f32:
+			v[li] = value
+			k.mask |= bit
+			kf_bump_structure()
+			return true
+		case f32:
+			// A scalar key on a section track would mean the two forms
+			// coexist, which kf_geom_sample_lane asserts against. Assert
+			// here rather than rewrite it: a silent conversion would hide
+			// the writer that produced it.
+			assert(false, "kf_geom_set_packed_lane_key: scalar key on a packed section track")
+		}
+	}
+	payload: [KF_PACK_MAX]f32
+	payload[li] = value
+	kf_set_packed_key(clip, sec, frame_off, payload, bit)
+	kf_bump_structure()
+	return true
+}
+
 // kf_geom_set_lane_key records a scalar key on `name` at frame_off for ANY
 // geometry property name. When `name` is a LANE of a section that is currently
 // packed, the group gives way FIRST: fan the section out to per-lane tracks,

@@ -134,7 +134,17 @@ clip_geom_set :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) -> (keyed: bo
 	if clip_geom_keyed_at(clip, prop) ||
 	   (editor_flags.auto_keyframe && kf_geom_prop_keyed(clip, name)) {
 		off := i32(playhead.frame - clip.timeline_start_frame)
-		kf_geom_set_lane_key(clip, name, off, v)
+		// Write into the section's PACKED track when it has one. This branch
+		// overwrites a value the user already keyed — either a key sits on this
+		// frame, or the toggle extends their animation — so unwrapping here
+		// means a drag or a typed value reshapes how their animation is STORED
+		// (their whole-crop section becomes four per-lane tracks they never
+		// asked for). The scalar path remains for the lanes with no packed
+		// section to write into, and for the explicit per-lane Key buttons,
+		// which are the opposite intent and do unwrap.
+		if !kf_geom_set_packed_lane_key(clip, name, off, v) {
+			kf_geom_set_lane_key(clip, name, off, v)
+		}
 		clip.geom_modified &= ~(1 << uint(prop))
 		return true
 	}

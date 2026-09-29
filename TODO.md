@@ -491,6 +491,23 @@ into playback/preview.
         passing if the real call site stopped routing a lane. Crop stays gated
         on `handle_drag.kind` so a corner handle does not stamp keys on the
         edges it never reached.
+      - **Auto-key no longer unwraps a packed section.** "Extend the animation
+        that is already there" and "give this property its own track" both
+        arrive as a lane write, and only the second should rewrite the section's
+        shape — but they shared one proc, so a user who keyed crop as a single
+        whole-crop section found it split into four per-lane tracks because they
+        dragged one edge with the toggle on. `kf_geom_set_packed_lane_key`
+        (render.odin) writes one lane onto the section's packed track under a
+        single-bit mask, which is the form `kf_sample_packed_lane` is built for:
+        a knot that does not cover a lane is not a breakpoint for it, so the
+        other lanes keep their own curves. Both auto-key sites route through it —
+        `kf_auto_key`, and the `clip_geom_set` branch that every shipped
+        geometry write lands on (drag, Alt+wheel, typed field). A key already ON
+        the frame is **merged** into, not replaced: `kf_set_packed_key`'s
+        same-frame path overwrites mask and value wholesale, which would drop
+        the other lanes out of a full-mask knot the user placed themselves.
+        Unwrapping is unchanged where it is the user's actual intent — the
+        inspector's per-lane Key button, and a typed readout value.
 
       **Accepted by:** `check`; `geom_key_probe`; `transform_probe`; `probe`
       (ui_probe, incl. the new row-layout asserts); `timeline_probe`;
@@ -582,7 +599,15 @@ into playback/preview.
       and the probe needed Clay live for the first time: `preview_view` ->
       `clamp_preview_camera` reads element bounding boxes, and `main.odin`
       dispatches probes before its own `clay.Initialize`, so the probe now
-      initializes it the way `transform_probe` already did. **Known and still open:** `VYPER_TL_PROBE` reports 79 bytes in
+      initializes it the way `transform_probe` already did. Re-measured again
+      after the auto-key/packed-section fix: 0 / 0, 78 errors from 45 contexts,
+      every frame still in the same class (41 `calloc`, 3 `malloc`, 1
+      `runtime::conditional_mem_zero` through `_append_elem` when the packed
+      key is inserted). **Found while verifying that fix, still open:**
+      `VYPER_KEYFRAME_PROBE` is dispatched by `main.odin` but has **no target in
+      `scripts/gate.sh`**, so the keyframe system's own regression suite — the
+      right guard for packed-vs-lane writes — never runs in `all`. It passes when
+      invoked by hand, but nothing keeps it that way. **Known and still open:** `VYPER_TL_PROBE` reports 79 bytes in
       1 block definitely lost — pre-existing, not reached by any valgrind
       target in `all`, and the frame-pointer build now makes it diagnosable.
 

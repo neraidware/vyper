@@ -850,6 +850,15 @@ kf_auto_key :: proc(clip: ^Clip, name: string, value: f32) -> bool {
 		return false
 	}
 	off := i32(playhead.frame - clip.timeline_start_frame)
+	// Auto-key EXTENDS the animation the user already built, so a lane of a
+	// packed section is written into the packed track — the section the user
+	// keyed must survive their own toggle. The scalar path here would unwrap it
+	// ("you keyed an individual value"), which is the right rule for the
+	// inspector's per-lane Key button and the wrong one for a background
+	// recording of every edit.
+	if kf_geom_set_packed_lane_key(clip, name, off, value) {
+		return true
+	}
 	kf_geom_set_lane_key(clip, name, off, value)
 	return true
 }

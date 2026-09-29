@@ -697,6 +697,89 @@ geom_key_probe_run :: proc() -> int {
 		)
 	}
 
+	// --- auto-key must not unwrap a packed section. The toggle means "record my
+	// edits on the timeline"; it is not a request to change how the animation is
+	// STORED. But auto-key's write went through kf_geom_set_lane_key, which
+	// unwraps a packed section on any lane write ("you keyed an individual
+	// value, so the array unwraps"). So one auto-keyed crop drag deleted the
+	// user's whole-crop section track and replaced it with four per-lane tracks
+	// they never asked for.
+	{
+		cl := geom_key_fixture()
+		playhead.frame = 150
+		for off in ([]i32{0, 300}) {
+			kf_geom_set_packed(
+				cl,
+				"crop",
+				off,
+				[KF_PACK_MAX]f32{0.05, 0.05, 0.05, 0.05, 0, 0, 0},
+				kf_geom_full_mask("crop"),
+			)
+		}
+		geom_key_check(
+			kf_track_index(cl^, "crop") >= 0 && kf_track_index(cl^, "crop.l") < 0,
+			"fixture: crop must start packed, with no per-lane track",
+		)
+		// Pre-place a FULL-mask knot exactly on the playhead, as a section the
+		// user keyed wholesale would have, so the auto-key has to merge into it.
+		kf_geom_set_packed(
+			cl,
+			"crop",
+			150,
+			[KF_PACK_MAX]f32{0.05, 0.07, 0.05, 0.05, 0, 0, 0},
+			kf_geom_full_mask("crop"),
+		)
+		editor_flags.auto_keyframe = true
+		// One lane moves, toggle on, playhead inside the packed span. Both
+		// auto-key entry points are exercised: kf_auto_key (the gain path and
+		// anything still calling it) and clip_geom_set, which is where every
+		// shipped geometry write -- drag, Alt+wheel, typed field -- lands.
+		geom_key_check(
+			kf_auto_key(cl, kf_lane_name(.Crop_L), 0.4),
+			"auto-key must write a key for a lane that is already keyed",
+		)
+		geom_key_check(
+			kf_geom_set_packed_lane_key(cl, kf_lane_name(.Crop_T), 150, 0.2),
+			"a lane write on a packed section must land in the section",
+		)
+		cl.crop_b = 0.33
+		keyed := clip_geom_set(cl, .Crop_B, 0.33)
+		geom_key_check(keyed, "an auto-keyed drag lane must report as keyed")
+		geom_key_check(
+			kf_track_index(cl^, "crop") >= 0,
+			"auto-key must NOT unwrap a packed section — the 'crop' section track is gone",
+		)
+		geom_key_check(
+			kf_track_index(cl^, "crop.l") < 0,
+			"auto-key must NOT mint per-lane tracks on a packed section",
+		)
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Crop_L), 0.4),
+			"the auto-keyed lane must read back its new value (got %v)",
+			clip_geom_get(cl, .Crop_L),
+		)
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Crop_T), 0.2),
+			"the second auto-keyed lane must read back its new value (got %v)",
+			clip_geom_get(cl, .Crop_T),
+		)
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Crop_B), 0.33),
+			"a drag-routed lane must read back its new value (got %v)",
+			clip_geom_get(cl, .Crop_B),
+		)
+		// The lane nobody wrote must keep the value the same-frame knot
+		// carried -- crop.r is 0.07 there, deliberately different from the
+		// 0.05 everywhere else, so a wholesale replace of that knot (which is
+		// what kf_set_packed_key's same-frame path does) is visible here.
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Crop_R), 0.07),
+			"an untouched lane must keep its value through an auto-key (got %v)",
+			clip_geom_get(cl, .Crop_R),
+		)
+		editor_flags.auto_keyframe = false
+	}
+
 	if geom_key_fail {
 		return 1
 	}
