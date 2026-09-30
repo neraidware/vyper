@@ -583,6 +583,15 @@ target_yuv_exact() {
 		echo "$out" | grep -q 'mismatches = 0' && echo "$out" | tail -1
 	}
 
+# Code footprint: which Odin procs are the biggest, most branchy, deepest.
+# Advisory measurement, not a pass/fail gate (a big function is not a bug), so
+# it is intentionally not a member of `all`. There is no Odin complexity
+# linter in the toolchain, so scripts/footprint.py is the instrument; running
+# it by hand is what AGENTS.md 10 forbids.
+target_footprint() {
+	DIR="$(dirname -- "$SELF")"; python3 "$DIR/footprint.py" --top "${2:-20}"
+}
+
 # The app must still be running when the timeout kills it; 124 is the pass.
 target_smoke() {
 	require_fresh_binary smoke || return 1
@@ -843,11 +852,12 @@ main() {
 	subtitle_probe) target_subtitle_probe ;;
 	proxy_probe) target_proxy_probe ;;
 	smoke) target_smoke ;;
+	footprint) target_footprint "${2:-20}" ;;
 	valgrind) target_valgrind ;;
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac
