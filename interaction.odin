@@ -919,584 +919,634 @@ interaction_post_build :: proc(
 ) -> (
 	was_mouse_down, was_right_down: bool,
 ) {
-	next_left := prev_mouse_down
-	next_right := prev_right_down
-	// Fresh-click chain: the element/probe table runs first, then the pane
-	// divider (press-and-hold drag), then the geometry/loop fallback probes.
-	// All of these either fire a one-shot action or START a gesture backed by
-	// the active_interaction switch below — none of them update live state.
-	if inp.left && !prev_mouse_down {
-		if !dispatch_click_table(inp) {
-			if clay.PointerOver(clay.ID("DividerHandle")) {
-				active_interaction = .Panel_Resize
-			} else {
-				dispatch_click_fallback(inp)
-			}
+	interaction_click_dispatch(inp, prev_mouse_down)
+	if !inp.left {
+		interaction_release(inp)
+	} else {
+		interaction_move(inp, prev_mouse_down, height)
+	}
+	was_click := inp.left && !prev_mouse_down
+	interaction_jog_click(was_click)
+	interaction_rate_click(was_click)
+	interaction_encoder_click(was_click)
+	interaction_interp_click(was_click)
+	interaction_help_click(was_click)
+	interaction_tabs_click(was_click)
+	interaction_preview_fit_click(was_click)
+	interaction_right_click(inp, prev_right_down, was_click)
+	interaction_submenu_update(inp)
+	update_timeline_cursor(inp.x, inp.y)
+	// The returned state is just this frame's button levels: the locals the
+	// previous revision seeded from prev_* were overwritten before use.
+	return inp.left, inp.right
+}
+// Fresh-click chain: the element/probe table runs first, then the pane divider
+// (press-and-hold drag), then the geometry/loop fallback probes. Each either
+// fires a one-shot action or STARTS a gesture; none update live state.
+interaction_click_dispatch :: proc(inp: Mouse_Input, prev_mouse_down: bool) {
+if inp.left && !prev_mouse_down {
+	if !dispatch_click_table(inp) {
+		if clay.PointerOver(clay.ID("DividerHandle")) {
+			active_interaction = .Panel_Resize
+		} else {
+			dispatch_click_fallback(inp)
 		}
 	}
-	if !inp.left {
-		// Button lifted: run the per-gesture commit, then drop the payload.
-		#partial switch active_interaction {
-		case .Media_Bin_Drag:
-			// Releasing a bin drag commits the media (creates tracks as
-			// needed); releasing nowhere cancels it.
-			end_media_drag(inp.x, inp.y)
-		case .Track_Drag:
-			end_track_drag()
-		case .Clip_Move:
-			// Commit a vertical drop if the ghost hovers another track;
-			// horizontal drags already applied their new start live.
-			if clip_move.hover_track != clip_move.source_track &&
-			   clip_move.hover_track >= 0 &&
-			   clip_move.source_track >= 0 {
-				if len(clip_move.group_orig) > 1 {
-					// Vertical drop for a linked group is measured in VISUAL rows:
-					// the group shifts by the number of stack rows between the
-					// anchor's source track and the hovered lane, regardless of
-					// storage order.
-					delta_rows := order_row_of(clip_move.hover_track) - order_row_of(clip_move.source_track)
-					move_linked_group(delta_rows)
-				} else {
-					move_clip_to_track(
-						clip_move.source_track,
-						clip_move.source_index,
-						clip_move.hover_track,
-						clip_move.ghost_start,
-					)
-				}
+}
+}
+
+// Release path: run the per-gesture commit, then drop the gesture payload.
+// #partial because several gestures need no commit on release.
+interaction_release :: proc(inp: Mouse_Input) {
+	// Button lifted: run the per-gesture commit, then drop the payload.
+	#partial switch active_interaction {
+	case .Media_Bin_Drag:
+		// Releasing a bin drag commits the media (creates tracks as
+		// needed); releasing nowhere cancels it.
+		end_media_drag(inp.x, inp.y)
+	case .Track_Drag:
+		end_track_drag()
+	case .Clip_Move:
+		// Commit a vertical drop if the ghost hovers another track;
+		// horizontal drags already applied their new start live.
+		if clip_move.hover_track != clip_move.source_track &&
+		   clip_move.hover_track >= 0 &&
+		   clip_move.source_track >= 0 {
+			if len(clip_move.group_orig) > 1 {
+				// Vertical drop for a linked group is measured in VISUAL rows:
+				// the group shifts by the number of stack rows between the
+				// anchor's source track and the hovered lane, regardless of
+				// storage order.
+				delta_rows := order_row_of(clip_move.hover_track) - order_row_of(clip_move.source_track)
+				move_linked_group(delta_rows)
+			} else {
+				move_clip_to_track(
+					clip_move.source_track,
+					clip_move.source_index,
+					clip_move.hover_track,
+					clip_move.ghost_start,
+				)
 			}
-			// Record the move only if the gesture actually changed something:
-			// same-track drags already applied their start live, so compare
-			// against the capture-time snapshot.
-			{
-				moved := false
-				if len(clip_move.group_orig) > 1 {
-					moved =
-						clip_move.group_delta != 0 ||
-						(clip_move.hover_track >= 0 &&
-							clip_move.hover_track != clip_move.source_track &&
-							order_row_of(clip_move.hover_track) != order_row_of(clip_move.source_track))
-				} else if len(clip_move.group_orig) > 0 && clip_move.clip != nil {
-					moved =
-						clip_move.clip.timeline_start_frame != clip_move.group_orig[0].start ||
-						(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
-				}
-				if moved {
-					label := len(clip_move.group_orig) > 1 ? "Move clip(s)" : "Move clip"
-					undo_push(.Move, label)
-					// The drag applied live; this is the one commit the audio
-					// engine gets for it. audio_note_edit (not a bare seek)
-					// because the clip's new geometry must reach the producer's
-					// slab before it re-provisions. See the .Playhead_Scrub
-					// update for why the per-frame commit had to go.
-					audio_note_edit()
-				}
+		}
+		// Record the move only if the gesture actually changed something:
+		// same-track drags already applied their start live, so compare
+		// against the capture-time snapshot.
+		{
+			moved := false
+			if len(clip_move.group_orig) > 1 {
+				moved =
+					clip_move.group_delta != 0 ||
+					(clip_move.hover_track >= 0 &&
+						clip_move.hover_track != clip_move.source_track &&
+						order_row_of(clip_move.hover_track) != order_row_of(clip_move.source_track))
+			} else if len(clip_move.group_orig) > 0 && clip_move.clip != nil {
+				moved =
+					clip_move.clip.timeline_start_frame != clip_move.group_orig[0].start ||
+					(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
 			}
-		case .Clip_Resize:
-			// Resize is applied live during the drag; capture the gesture as one
-			// undo node on release.
-			if clip_resize.moved {
-				undo_push(.Resize, len(clip_move.group_orig) > 1 ? "Resize clip(s)" : "Resize clip")
-				// The drag applied live; this is the one commit the audio engine
-				// gets for it. audio_note_edit (not a bare seek) because the
-				// clip's new geometry must reach the producer's slab before it
-				// re-provisions. See the .Playhead_Scrub update.
+			if moved {
+				label := len(clip_move.group_orig) > 1 ? "Move clip(s)" : "Move clip"
+				undo_push(.Move, label)
+				// The drag applied live; this is the one commit the audio
+				// engine gets for it. audio_note_edit (not a bare seek)
+				// because the clip's new geometry must reach the producer's
+				// slab before it re-provisions. See the .Playhead_Scrub
+				// update for why the per-frame commit had to go.
 				audio_note_edit()
 			}
-		case .Handle_Drag:
-			// Scale/crop is applied live; commit the gesture as one transform
-			// node only if the box actually changed.
-			if sel, ok := transformable_selected(); ok {
-				if sel.scale != handle_drag.start_scale ||
-				   sel.crop_l != handle_drag.start_crop_l ||
-				   sel.crop_r != handle_drag.start_crop_r ||
-				   sel.crop_t != handle_drag.start_crop_t ||
-				   sel.crop_b != handle_drag.start_crop_b ||
-				   sel.transform_x != handle_drag.start_tx ||
-				   sel.transform_y != handle_drag.start_ty {
-					undo_push(.Transform, handle_drag.kind == .Crop ? "Crop clip" : "Scale clip")
-				}
-			}
-		case .Preview_Move:
-			// A preview move is applied live; commit it as one transform node if
-			// the clip actually moved, against the drag-start capture.
-			if sel, ok := transformable_selected(); ok {
-				if sel.transform_x != handle_drag.start_tx ||
-				   sel.transform_y != handle_drag.start_ty {
-					undo_push(.Transform, "Move transform")
-				}
-			}
-		case .Opacity_Drag:
-			// Opacity is applied live during the drag; one value node on
-			// release, and only if the gesture actually moved it.
-			if opacity_drag.clip != nil &&
-			   opacity_drag.clip.opacity != opacity_drag.start_op {
-				undo_push(.Value, "Set clip opacity")
-			}
-		case .Gain_Drag:
-			// Gain is applied live during the drag; record one value node on
-			// release. No re-provision here: the per-move geometry commit +
-			// the producer's live gain fold already put the final value on the
-			// output, and the old audio_note_edit() on release reopened every
-			// decoder (~100s of ms) -- the audible stutter after a knob drag.
-			if gain_drag.clip != nil && gain_drag.clip.gain != gain_drag.start_db {
-				undo_push(.Value, "Set clip gain")
-			}
-		case .Keyframe_Move:
-			commit_keyframe_drag()
-		case .Playhead_Scrub:
-			// The scrub moved the playhead live and committed nothing to the
-			// audio engine; this is the commit. A press with no drag (the
-			// common "click the ruler to set the position" case) moves nothing
-			// and so re-provisions nothing.
-			if playhead_scrub.moved {
-				audio_seek(playhead.frame)
+		}
+	case .Clip_Resize:
+		// Resize is applied live during the drag; capture the gesture as one
+		// undo node on release.
+		if clip_resize.moved {
+			undo_push(.Resize, len(clip_move.group_orig) > 1 ? "Resize clip(s)" : "Resize clip")
+			// The drag applied live; this is the one commit the audio engine
+			// gets for it. audio_note_edit (not a bare seek) because the
+			// clip's new geometry must reach the producer's slab before it
+			// re-provisions. See the .Playhead_Scrub update.
+			audio_note_edit()
+		}
+	case .Handle_Drag:
+		// Scale/crop is applied live; commit the gesture as one transform
+		// node only if the box actually changed.
+		if sel, ok := transformable_selected(); ok {
+			if sel.scale != handle_drag.start_scale ||
+			   sel.crop_l != handle_drag.start_crop_l ||
+			   sel.crop_r != handle_drag.start_crop_r ||
+			   sel.crop_t != handle_drag.start_crop_t ||
+			   sel.crop_b != handle_drag.start_crop_b ||
+			   sel.transform_x != handle_drag.start_tx ||
+			   sel.transform_y != handle_drag.start_ty {
+				undo_push(.Transform, handle_drag.kind == .Crop ? "Crop clip" : "Scale clip")
 			}
 		}
-		active_interaction = .None
-		playhead_scrub.moved = false
-		handle_drag.handle = nil
-		handle_drag.kind = .None
-		handle_drag.corner_snapped = false
-		clip_move.clip = nil
-		gain_drag.clip = nil
-		opacity_drag.clip = nil
-		kf_move.start_frame = 0
-		kf_move.press_x = 0
-		kf_move.pivot = 0
-		clip_move.source_track = -1
-		clip_move.source_index = -1
-		clip_move.hover_track = -1
-		clip_move.lane_dwell = 0
-		clip_move.group_delta = 0
-		clear(&clip_move.group_orig)
-		clip_resize.edge = -1
-		clip_resize.moved = false
-	} else {
-		switch active_interaction {
-		case .Media_Bin_Drag:
-			// A bin drag in flight: recompute the hovered lane + ghost each frame.
-			update_media_drag_lanes(inp.x, inp.y)
-		case .Track_Drag:
-			// Track reorder in flight: recompute the hovered insert gap each frame.
-			update_track_drag()
-		case .Handle_Drag:
-			if sel, ok := transformable_selected(); ok {
-				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+	case .Preview_Move:
+		// A preview move is applied live; commit it as one transform node if
+		// the clip actually moved, against the drag-start capture.
+		if sel, ok := transformable_selected(); ok {
+			if sel.transform_x != handle_drag.start_tx ||
+			   sel.transform_y != handle_drag.start_ty {
+				undo_push(.Transform, "Move transform")
+			}
+		}
+	case .Opacity_Drag:
+		// Opacity is applied live during the drag; one value node on
+		// release, and only if the gesture actually moved it.
+		if opacity_drag.clip != nil &&
+		   opacity_drag.clip.opacity != opacity_drag.start_op {
+			undo_push(.Value, "Set clip opacity")
+		}
+	case .Gain_Drag:
+		// Gain is applied live during the drag; record one value node on
+		// release. No re-provision here: the per-move geometry commit +
+		// the producer's live gain fold already put the final value on the
+		// output, and the old audio_note_edit() on release reopened every
+		// decoder (~100s of ms) -- the audible stutter after a knob drag.
+		if gain_drag.clip != nil && gain_drag.clip.gain != gain_drag.start_db {
+			undo_push(.Value, "Set clip gain")
+		}
+	case .Keyframe_Move:
+		commit_keyframe_drag()
+	case .Playhead_Scrub:
+		// The scrub moved the playhead live and committed nothing to the
+		// audio engine; this is the commit. A press with no drag (the
+		// common "click the ruler to set the position" case) moves nothing
+		// and so re-provisions nothing.
+		if playhead_scrub.moved {
+			audio_seek(playhead.frame)
+		}
+	}
+	active_interaction = .None
+	playhead_scrub.moved = false
+	handle_drag.handle = nil
+	handle_drag.kind = .None
+	handle_drag.corner_snapped = false
+	clip_move.clip = nil
+	gain_drag.clip = nil
+	opacity_drag.clip = nil
+	kf_move.start_frame = 0
+	kf_move.press_x = 0
+	kf_move.pivot = 0
+	clip_move.source_track = -1
+	clip_move.source_index = -1
+	clip_move.hover_track = -1
+	clip_move.lane_dwell = 0
+	clip_move.group_delta = 0
+	clear(&clip_move.group_orig)
+	clip_resize.edge = -1
+	clip_resize.moved = false
+}
+
+// Live move path, driven every frame while the button is held. Each case
+// updates the in-flight gesture in place; release above is the single commit.
+interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int) {
+	switch active_interaction {
+	case .Media_Bin_Drag:
+		// A bin drag in flight: recompute the hovered lane + ghost each frame.
+		update_media_drag_lanes(inp.x, inp.y)
+	case .Track_Drag:
+		// Track reorder in flight: recompute the hovered insert gap each frame.
+		update_track_drag()
+	case .Handle_Drag:
+		if sel, ok := transformable_selected(); ok {
+			pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+			canvas := preview_canvas(pb)
+			update_handle_drag(sel, canvas, inp.x, inp.y, inp.shift)
+			handle_drag_commit(sel)
+		}
+	case .Panel_Resize:
+		// The divider sits in the root column below the app bar, so the
+		// pointer's y is offset by APP_BAR_H; center the grab strip on the
+		// cursor by subtracting half its height. Without the app-bar term
+		// the handle leads the cursor by exactly that strip's height.
+		panel_layout.upper_area_height = inp.y - APP_BAR_H - EDITOR_DIVIDER_H * 0.5
+		// Keep a lower-bound that scales with the window so a short window
+		// never lets the upper and lower areas collide (the old hardcoded
+		// 460/180 bounds collapsed on windows shorter than ~640px). Same
+		// bounds the automatic track fit uses.
+		min_h, max_h := panel_clamp_bounds(f32(height))
+		panel_layout.upper_area_height = clamp(panel_layout.upper_area_height, min_h, max_h)
+	case .Preview_Move:
+		if sel, ok := transformable_selected(); ok {
+			pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+			// Freeze at the preview widget's edge once the cursor leaves it:
+			// otherwise free-move in unclamped project coords, so a cropped
+			// clip can slide fully off-canvas like an uncropped one.
+			if inp.x >= pb.x &&
+			   inp.x <= pb.x + pb.width &&
+			   inp.y >= pb.y &&
+			   inp.y <= pb.y + pb.height {
 				canvas := preview_canvas(pb)
-				update_handle_drag(sel, canvas, inp.x, inp.y, inp.shift)
-				handle_drag_commit(sel)
+				pcx, pcy := pixel_to_project_unclamped(canvas, inp.x, inp.y)
+				sel.transform_x = pcx - preview_move.start_offset_x
+				sel.transform_y = pcy - preview_move.start_offset_y
+				// 5px snap margin (in rendered preview pixels): to the canvas
+				// center when near it, and/or to the canvas borders (edge
+				// snap runs regardless, so a centered clip still snaps).
+				snap_center(sel, snap_margin(canvas, SNAP_MARGIN_PX))
+				snap_transform(sel, snap_margin(canvas, SNAP_MARGIN_PX))
+				// Route the moved axes to wherever the clip READS them at the
+				// playhead, so the motion lands on the timeline rather than in
+				// a resting field the sampler ignores. Snap reads the resting
+				// writes above, so those stay direct and the commit happens
+				// once, after the snaps have had their say.
+				clip_geom_drag(sel, .Trans_X, handle_drag.start_tx)
+				clip_geom_drag(sel, .Trans_Y, handle_drag.start_ty)
 			}
-		case .Panel_Resize:
-			// The divider sits in the root column below the app bar, so the
-			// pointer's y is offset by APP_BAR_H; center the grab strip on the
-			// cursor by subtracting half its height. Without the app-bar term
-			// the handle leads the cursor by exactly that strip's height.
-			panel_layout.upper_area_height = inp.y - APP_BAR_H - EDITOR_DIVIDER_H * 0.5
-			// Keep a lower-bound that scales with the window so a short window
-			// never lets the upper and lower areas collide (the old hardcoded
-			// 460/180 bounds collapsed on windows shorter than ~640px). Same
-			// bounds the automatic track fit uses.
-			min_h, max_h := panel_clamp_bounds(f32(height))
-			panel_layout.upper_area_height = clamp(panel_layout.upper_area_height, min_h, max_h)
-		case .Preview_Move:
-			if sel, ok := transformable_selected(); ok {
-				pb := clay.GetElementData(clay.ID("Preview")).boundingBox
-				// Freeze at the preview widget's edge once the cursor leaves it:
-				// otherwise free-move in unclamped project coords, so a cropped
-				// clip can slide fully off-canvas like an uncropped one.
-				if inp.x >= pb.x &&
-				   inp.x <= pb.x + pb.width &&
-				   inp.y >= pb.y &&
-				   inp.y <= pb.y + pb.height {
-					canvas := preview_canvas(pb)
-					pcx, pcy := pixel_to_project_unclamped(canvas, inp.x, inp.y)
-					sel.transform_x = pcx - preview_move.start_offset_x
-					sel.transform_y = pcy - preview_move.start_offset_y
-					// 5px snap margin (in rendered preview pixels): to the canvas
-					// center when near it, and/or to the canvas borders (edge
-					// snap runs regardless, so a centered clip still snaps).
-					snap_center(sel, snap_margin(canvas, SNAP_MARGIN_PX))
-					snap_transform(sel, snap_margin(canvas, SNAP_MARGIN_PX))
-					// Route the moved axes to wherever the clip READS them at the
-					// playhead, so the motion lands on the timeline rather than in
-					// a resting field the sampler ignores. Snap reads the resting
-					// writes above, so those stay direct and the commit happens
-					// once, after the snaps have had their say.
-					clip_geom_drag(sel, .Trans_X, handle_drag.start_tx)
-					clip_geom_drag(sel, .Trans_Y, handle_drag.start_ty)
-				}
+		}
+	case .Clip_Resize:
+		if selection.track >= 0 &&
+		   selection.index >= 0 &&
+		   selection.track < len(timeline.tracks) &&
+		   selection.index < len(timeline.tracks[selection.track].clips) {
+			track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
+			frame := max(f32(0), (inp.x - track_start) / timeline_view.zoom + timeline_view.start)
+			// Clip→playhead toggle applies to edge drags too: the dragged edge
+			// (head on clip_resize.edge 0, tail on 1) latches onto the playhead
+			// within the snap margin, like a clip move.
+			if editor_flags.snap_clips_to_playhead {
+				frame = f32(snap_to_playhead(i64(frame)))
 			}
-		case .Clip_Resize:
-			if selection.track >= 0 &&
-			   selection.index >= 0 &&
-			   selection.track < len(timeline.tracks) &&
-			   selection.index < len(timeline.tracks[selection.track].clips) {
-				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-				frame := max(f32(0), (inp.x - track_start) / timeline_view.zoom + timeline_view.start)
-				// Clip→playhead toggle applies to edge drags too: the dragged edge
-				// (head on clip_resize.edge 0, tail on 1) latches onto the playhead
-				// within the snap margin, like a clip move.
-				if editor_flags.snap_clips_to_playhead {
-					frame = f32(snap_to_playhead(i64(frame)))
-				}
-				if clip_resize.edge == 0 {
-					if len(clip_move.group_orig) > 0 {
-						// Linked group: shift every member's head by the same delta.
-						resize_group_left(&timeline.tracks[selection.track], selection.index, i64(frame))
-					} else {
-						resize_clip_left(&timeline.tracks[selection.track], selection.index, i64(frame))
-					}
-				} else if clip_resize.edge == 1 {
-					if len(clip_move.group_orig) > 0 {
-						// Linked group: move every member's tail by the same delta.
-						resize_group_right(
-							&timeline.tracks[selection.track],
-							selection.index,
-							i64(frame),
-						)
-					} else {
-						resize_clip_right(&timeline.tracks[selection.track], selection.index, i64(frame))
-					}
-				}
-				clip_resize.moved = true
-				// No audio_note_edit() here: it is a full re-provision per frame
-				// of the drag. The release commits it once.
-			}
-		case .Opacity_Drag:
-			// Written live against the captured rect, so the preview tracks
-			// the pointer; the release below is the only undo commit.
-			if opacity_drag.clip == nil {
-				break
-			}
-			opacity_drag.clip.opacity = opacity_from_x(inp.x)
-		case .Gain_Drag:
-			if gain_drag.clip == nil {
-				break
-			}
-			dx := inp.x - gain_drag.start_x
-			db := gain_drag.start_db
-			if inp.ctrl {
-				// Fine: continuous 0.1 dB per pixel.
-				db += dx * GAIN_FINE_DB_PER_PX
-			} else {
-				// Coarse: one 1 dB step per full 10 px of travel since the
-				// gesture began (quantized, monotonic per direction).
-				db += math.floor(dx / GAIN_COARSE_PX_PER_STEP) * GAIN_COARSE_DB_PER_10PX
-			}
-			gain_drag.clip.gain = clamp(db, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
-			// Auto-keyframe the running gain at the playhead so the move records
-			// onto a keyed timeline as it happens.
-			autokey_gesture(gain_drag.clip, gain_drag.start_db, gain_drag.clip.gain, "gain")
-			// Publish the running value into the audio slab so a provision mid-
-			// gesture (play pressed while the knob is held) hears it; the release
-			// commits nothing because the producer's live fold already applied it.
-			audio_geometry_commit()
-		case .Keyframe_Move:
-			update_keyframe_drag(inp.x)
-		case .Clip_Move:
-			if clip_move.clip != nil {
-				clip_x := inp.x - clip_move.offset
-				track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-				frame := (clip_x - track_start) / timeline_view.zoom + timeline_view.start
-				frame = max(frame, 0)
-				// Clip→playhead toggle: latch the drag target onto the playhead
-				// once it comes within the pixel snap margin. Applied to the
-				// whole linked group, since every member follows the anchor.
-				// But an all-or-nothing group must never be glued onto a
-				// playhead slot it cannot clear: latch only when every member can
-				// follow, else keep following the cursor and let the feasibility
-				// gate park the unit at the true blocker.
-				if editor_flags.snap_clips_to_playhead {
-					snapped := snap_to_playhead(i64(max(frame, 0)))
-					if len(clip_move.group_orig) > 1 &&
-					   snapped != i64(frame) &&
-					   !group_delta_feasible(snapped - clip_move.group_orig[0].start) {
-						snapped = i64(frame)
-					}
-					frame = f32(snapped)
-				}
-				// Determine which track lane the pointer hovers: that decides
-				// whether this is a horizontal move (same track) or a vertical
-				// drop staged on another track (ghost until release).
-				hover := clip_move.source_track
-				for ti := 0; ti < len(timeline.tracks); ti += 1 {
-					lane := clay.GetElementData(clay.ID("ClipsSection", u32(ti))).boundingBox
-					if lane.width > 0 && inp.y >= lane.y && inp.y <= lane.y + lane.height {
-						hover = ti
-						break
-					}
-				}
-				if hover == clip_move.source_track {
-					clip_move.lane_dwell = 0
-					clip_move.hover_track = hover
+			if clip_resize.edge == 0 {
+				if len(clip_move.group_orig) > 0 {
+					// Linked group: shift every member's head by the same delta.
+					resize_group_left(&timeline.tracks[selection.track], selection.index, i64(frame))
 				} else {
-					// Pointer left the source lane. A vertical drop is staged only
-					// once the pointer has RESTED here for DRAG_LANE_DWELL_FRAMES:
-					// a fast horizontal flick often skitters across a lane
-					// boundary for a frame or two, and staging the ghost instantly
-					// froze the source clip mid-stroke so it detached from the
-					// cursor before touching its neighbor. Until the dwell clears
-					// the clip keeps following the cursor on its own lane (the
-					// drag_move_in_place call below is outside this branch).
-					clip_move.lane_dwell += 1
-					if clip_move.lane_dwell >= DRAG_LANE_DWELL_FRAMES {
-						clip_move.hover_track = hover
-						// Vertical: clamp to nearest valid slot on the hovered
-						// track and show it as a ghost (committed on release).
-						// Linked groups slide the whole unit with the mouse's
-						// horizontal offset (clip_move.group_delta) on every member's lane.
-						clip_move.ghost_start = clip_place_in_track(
-							&timeline.tracks[hover],
-							-1,
-							clip_move.clip.source_length_frames,
-							i64(max(frame, 0)),
-						)
-						if len(clip_move.group_orig) > 1 {
-							clip_move.group_delta = i64(max(frame, 0)) - clip_move.group_orig[0].start
-						}
-					}
+					resize_clip_left(&timeline.tracks[selection.track], selection.index, i64(frame))
 				}
-				// Live horizontal move: keeps the clip glued to the cursor's X on
-				// its source lane regardless of which lane the pointer flicked
-				// into, so the drag can never detach under fast motion. When a
-				// vertical drop IS staged this previews the X the ghost follows.
-				// The audio engine is told nothing per frame: audio_note_edit()
-				// is a full re-provision, and a drag that asked for one per
-				// frame queued re-provisions faster than the producer could
-				// retire them. The release commits the moved clip once.
-				drag_move_in_place(frame)
-				// Stall tracer (VYPER_TRACE): logs the first frame where the
-				// cursor's frame target advanced but the clip's start did not —
-				// the exact moment a drag would be "cut short", with the lane/
-				// pointer context that differs at that frame.
-				if vyper_trace {
-					tf := i64(max(frame, 0))
-					if tf != clip_move.trace_last_target &&
-					   clip_move.trace_last_start == clip_move.clip.timeline_start_frame {
-						fmt.printf(
-							"[drag] STALL target=%d (last=%d) clip=%d hover=%d src=%d y=%.0f x=%.0f snap=%v\n",
-							tf,
-							clip_move.trace_last_target,
-							clip_move.clip.timeline_start_frame,
-							hover,
-							clip_move.source_track,
-							inp.y,
-							inp.x,
-							editor_flags.snap_clips_to_playhead,
-						)
-					}
-					clip_move.trace_last_target = tf
-					clip_move.trace_last_start = clip_move.clip.timeline_start_frame
+			} else if clip_resize.edge == 1 {
+				if len(clip_move.group_orig) > 0 {
+					// Linked group: move every member's tail by the same delta.
+					resize_group_right(
+						&timeline.tracks[selection.track],
+						selection.index,
+						i64(frame),
+					)
+				} else {
+					resize_clip_right(&timeline.tracks[selection.track], selection.index, i64(frame))
 				}
 			}
-		case .Playhead_Scrub:
-			// Scrub the playhead to the pointer's frame along the ruler bar.
-			ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
-			frame := i64((inp.x - ruler.x) / timeline_view.zoom + timeline_view.start)
+			clip_resize.moved = true
+			// No audio_note_edit() here: it is a full re-provision per frame
+			// of the drag. The release commits it once.
+		}
+	case .Opacity_Drag:
+		// Written live against the captured rect, so the preview tracks
+		// the pointer; the release below is the only undo commit.
+		if opacity_drag.clip == nil {
+			break
+		}
+		opacity_drag.clip.opacity = opacity_from_x(inp.x)
+	case .Gain_Drag:
+		if gain_drag.clip == nil {
+			break
+		}
+		dx := inp.x - gain_drag.start_x
+		db := gain_drag.start_db
+		if inp.ctrl {
+			// Fine: continuous 0.1 dB per pixel.
+			db += dx * GAIN_FINE_DB_PER_PX
+		} else {
+			// Coarse: one 1 dB step per full 10 px of travel since the
+			// gesture began (quantized, monotonic per direction).
+			db += math.floor(dx / GAIN_COARSE_PX_PER_STEP) * GAIN_COARSE_DB_PER_10PX
+		}
+		gain_drag.clip.gain = clamp(db, f32(GAIN_MIN_DB), f32(GAIN_MAX_DB))
+		// Auto-keyframe the running gain at the playhead so the move records
+		// onto a keyed timeline as it happens.
+		autokey_gesture(gain_drag.clip, gain_drag.start_db, gain_drag.clip.gain, "gain")
+		// Publish the running value into the audio slab so a provision mid-
+		// gesture (play pressed while the knob is held) hears it; the release
+		// commits nothing because the producer's live fold already applied it.
+		audio_geometry_commit()
+	case .Keyframe_Move:
+		update_keyframe_drag(inp.x)
+	case .Clip_Move:
+		if clip_move.clip != nil {
+			clip_x := inp.x - clip_move.offset
+			track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
+			frame := (clip_x - track_start) / timeline_view.zoom + timeline_view.start
 			frame = max(frame, 0)
-			// Clamp to the last REAL frame of the timeline. timeline_duration()
-			// is the exclusive content end, so frame == timeline_duration() is a
-			// sheet empty slot past every clip; letting the playhead sit there
-			// rendered (and scrubbed) a void after the last clip. The playhead
-			// must stop at the final content frame; dragging further right pins
-			// it there.
-			frame = clamp(frame, 0, max(0, timeline_duration() - 1))
-			// Playhead→clip toggle: when a clip's start or end is within the
-			// snap margin, pin the scrubbed playhead onto that exact edge.
-			if editor_flags.snap_playhead_to_clips {
-				frame = snap_playhead_to_clip_edge(frame)
+			// Clip→playhead toggle: latch the drag target onto the playhead
+			// once it comes within the pixel snap margin. Applied to the
+			// whole linked group, since every member follows the anchor.
+			// But an all-or-nothing group must never be glued onto a
+			// playhead slot it cannot clear: latch only when every member can
+			// follow, else keep following the cursor and let the feasibility
+			// gate park the unit at the true blocker.
+			if editor_flags.snap_clips_to_playhead {
+				snapped := snap_to_playhead(i64(max(frame, 0)))
+				if len(clip_move.group_orig) > 1 &&
+				   snapped != i64(frame) &&
+				   !group_delta_feasible(snapped - clip_move.group_orig[0].start) {
+					snapped = i64(frame)
+				}
+				frame = f32(snapped)
 			}
-			if playhead.frame != frame {
-				if vyper_trace {
+			// Determine which track lane the pointer hovers: that decides
+			// whether this is a horizontal move (same track) or a vertical
+			// drop staged on another track (ghost until release).
+			hover := clip_move.source_track
+			for ti := 0; ti < len(timeline.tracks); ti += 1 {
+				lane := clay.GetElementData(clay.ID("ClipsSection", u32(ti))).boundingBox
+				if lane.width > 0 && inp.y >= lane.y && inp.y <= lane.y + lane.height {
+					hover = ti
+					break
+				}
+			}
+			if hover == clip_move.source_track {
+				clip_move.lane_dwell = 0
+				clip_move.hover_track = hover
+			} else {
+				// Pointer left the source lane. A vertical drop is staged only
+				// once the pointer has RESTED here for DRAG_LANE_DWELL_FRAMES:
+				// a fast horizontal flick often skitters across a lane
+				// boundary for a frame or two, and staging the ghost instantly
+				// froze the source clip mid-stroke so it detached from the
+				// cursor before touching its neighbor. Until the dwell clears
+				// the clip keeps following the cursor on its own lane (the
+				// drag_move_in_place call below is outside this branch).
+				clip_move.lane_dwell += 1
+				if clip_move.lane_dwell >= DRAG_LANE_DWELL_FRAMES {
+					clip_move.hover_track = hover
+					// Vertical: clamp to nearest valid slot on the hovered
+					// track and show it as a ghost (committed on release).
+					// Linked groups slide the whole unit with the mouse's
+					// horizontal offset (clip_move.group_delta) on every member's lane.
+					clip_move.ghost_start = clip_place_in_track(
+						&timeline.tracks[hover],
+						-1,
+						clip_move.clip.source_length_frames,
+						i64(max(frame, 0)),
+					)
+					if len(clip_move.group_orig) > 1 {
+						clip_move.group_delta = i64(max(frame, 0)) - clip_move.group_orig[0].start
+					}
+				}
+			}
+			// Live horizontal move: keeps the clip glued to the cursor's X on
+			// its source lane regardless of which lane the pointer flicked
+			// into, so the drag can never detach under fast motion. When a
+			// vertical drop IS staged this previews the X the ghost follows.
+			// The audio engine is told nothing per frame: audio_note_edit()
+			// is a full re-provision, and a drag that asked for one per
+			// frame queued re-provisions faster than the producer could
+			// retire them. The release commits the moved clip once.
+			drag_move_in_place(frame)
+			// Stall tracer (VYPER_TRACE): logs the first frame where the
+			// cursor's frame target advanced but the clip's start did not —
+			// the exact moment a drag would be "cut short", with the lane/
+			// pointer context that differs at that frame.
+			if vyper_trace {
+				tf := i64(max(frame, 0))
+				if tf != clip_move.trace_last_target &&
+				   clip_move.trace_last_start == clip_move.clip.timeline_start_frame {
 					fmt.printf(
-						"[pb] scrub ph=%d (was %d) playing=%v\n",
-						frame,
-						playhead.frame,
-						playhead.playing,
+						"[drag] STALL target=%d (last=%d) clip=%d hover=%d src=%d y=%.0f x=%.0f snap=%v\n",
+						tf,
+						clip_move.trace_last_target,
+						clip_move.clip.timeline_start_frame,
+						hover,
+						clip_move.source_track,
+						inp.y,
+						inp.x,
+						editor_flags.snap_clips_to_playhead,
 					)
 				}
-			}
-			if playhead.frame != frame {
-				playhead_scrub.moved = true
-			}
-			playhead.frame = frame
-			// No audio_seek here. A seek is not a playhead write, it is a full
-			// re-provision: the producer clears the device and reopens every
-			// decoder (tens to hundreds of ms). Asking for one on every frame of
-			// a drag queues re-provisions faster than the producer can retire
-			// them -- it never reaches the feed path, the device starves, and
-			// the audio stays dead long after the drag ends. The release
-			// commits the one position the drag landed on.
-			sync.atomic_store(&audio_rpt.ph_src, 1)
-			sync.atomic_store(&audio_rpt.ph_catch, 0)
-			// The preview requests the exact new playhead frame on its next
-			// update (there is no frontier to rewind), so it follows the scrub.
-		case .None:
-			if inp.left && !prev_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
-				toggle_playback()
+				clip_move.trace_last_target = tf
+				clip_move.trace_last_start = clip_move.clip.timeline_start_frame
 			}
 		}
-	}
-	// Jog controls: backward/forward around play (and h/l keys), handled
-	// independently of the chain above since they're distinct elements.
-	if inp.left && !prev_mouse_down && clay.PointerOver(clay.ID("PlayBack")) {
-		jog_playback(-1)
-	} else if inp.left && !prev_mouse_down && clay.PointerOver(clay.ID("PlayFwd")) {
-		jog_playback(1)
-	}
-	// Playback-rate dropdown: clicking the rate button toggles the menu;
-	// clicking a menu option selects that rate and closes it. Any other new
-	// click while open dismisses the menu without changing the rate.
-	was_click := inp.left && !prev_mouse_down
-	rate_clicked := was_click && clay.PointerOver(clay.ID("PlayRateButton"))
-	if was_click {
-		handle_playback_rate_click(rate_clicked)
-	}
-	// Export-encoder dropdown: same toggle/select/dismiss shape as the rate
-	// menu. Changing the choice only affects the next render, never a live one.
-	enc_clicked := was_click && clay.PointerOver(clay.ID("RenderEncoderButton"))
-	if was_click {
-		if enc_clicked {
-			render_encoder_ui.menu_open = !render_encoder_ui.menu_open
-		} else if render_encoder_ui.menu_open && clay.PointerOver(clay.ID("RenderEncoderMenu")) {
-			if clay.PointerOver(clay.ID("EncChoiceCPU")) {
-				render_encoder_ui.choice = .CPU
-				render_encoder_ui.menu_open = false
-			} else if clay.PointerOver(clay.ID("EncChoiceGPU")) {
-				render_encoder_ui.choice = .GPU
-				render_encoder_ui.menu_open = false
+	case .Playhead_Scrub:
+		// Scrub the playhead to the pointer's frame along the ruler bar.
+		ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+		frame := i64((inp.x - ruler.x) / timeline_view.zoom + timeline_view.start)
+		frame = max(frame, 0)
+		// Clamp to the last REAL frame of the timeline. timeline_duration()
+		// is the exclusive content end, so frame == timeline_duration() is a
+		// sheet empty slot past every clip; letting the playhead sit there
+		// rendered (and scrubbed) a void after the last clip. The playhead
+		// must stop at the final content frame; dragging further right pins
+		// it there.
+		frame = clamp(frame, 0, max(0, timeline_duration() - 1))
+		// Playhead→clip toggle: when a clip's start or end is within the
+		// snap margin, pin the scrubbed playhead onto that exact edge.
+		if editor_flags.snap_playhead_to_clips {
+			frame = snap_playhead_to_clip_edge(frame)
+		}
+		if playhead.frame != frame {
+			if vyper_trace {
+				fmt.printf(
+					"[pb] scrub ph=%d (was %d) playing=%v\n",
+					frame,
+					playhead.frame,
+					playhead.playing,
+				)
 			}
-		} else if render_encoder_ui.menu_open {
+		}
+		if playhead.frame != frame {
+			playhead_scrub.moved = true
+		}
+		playhead.frame = frame
+		// No audio_seek here. A seek is not a playhead write, it is a full
+		// re-provision: the producer clears the device and reopens every
+		// decoder (tens to hundreds of ms). Asking for one on every frame of
+		// a drag queues re-provisions faster than the producer can retire
+		// them -- it never reaches the feed path, the device starves, and
+		// the audio stays dead long after the drag ends. The release
+		// commits the one position the drag landed on.
+		sync.atomic_store(&audio_rpt.ph_src, 1)
+		sync.atomic_store(&audio_rpt.ph_catch, 0)
+		// The preview requests the exact new playhead frame on its next
+		// update (there is no frontier to rewind), so it follows the scrub.
+	case .None:
+		if inp.left && !prev_mouse_down && clay.PointerOver(clay.ID("PlayPause")) {
+			toggle_playback()
+		}
+	}
+}
+
+
+
+interaction_jog_click :: proc(was_click: bool) {
+// Jog controls: backward/forward around play (and h/l keys), handled
+// independently of the chain above since they're distinct elements.
+if was_click && clay.PointerOver(clay.ID("PlayBack")) {
+	jog_playback(-1)
+} else if was_click && clay.PointerOver(clay.ID("PlayFwd")) {
+	jog_playback(1)
+}
+}
+
+interaction_rate_click :: proc(was_click: bool) {
+// Playback-rate dropdown: clicking the rate button toggles the menu;
+// clicking a menu option selects that rate and closes it. Any other new
+// click while open dismisses the menu without changing the rate.
+rate_clicked := was_click && clay.PointerOver(clay.ID("PlayRateButton"))
+if was_click {
+	handle_playback_rate_click(rate_clicked)
+}
+}
+
+interaction_encoder_click :: proc(was_click: bool) {
+// Export-encoder dropdown: same toggle/select/dismiss shape as the rate
+// menu. Changing the choice only affects the next render, never a live one.
+enc_clicked := was_click && clay.PointerOver(clay.ID("RenderEncoderButton"))
+if was_click {
+	if enc_clicked {
+		render_encoder_ui.menu_open = !render_encoder_ui.menu_open
+	} else if render_encoder_ui.menu_open && clay.PointerOver(clay.ID("RenderEncoderMenu")) {
+		if clay.PointerOver(clay.ID("EncChoiceCPU")) {
+			render_encoder_ui.choice = .CPU
+			render_encoder_ui.menu_open = false
+		} else if clay.PointerOver(clay.ID("EncChoiceGPU")) {
+			render_encoder_ui.choice = .GPU
 			render_encoder_ui.menu_open = false
 		}
+	} else if render_encoder_ui.menu_open {
+		render_encoder_ui.menu_open = false
 	}
-	// Keyframe-interpolation dropdown: same toggle/select/dismiss shape, gated on
-	// a live keyframe selection (S3). Choosing a mode commits it on the selected
-	// key — the segment arriving at that key eases (we ease INTO a breakpoint) —
-	// as one undoable edit; an unchanged re-click only closes the menu.
-	if was_click && kf_sel.active {
-		if clay.PointerOver(clay.ID("KfInterpButton")) {
-			if _, _, _, ok := kf_selected(); ok {
-				kf_view.interp_menu_open = !kf_view.interp_menu_open
-			}
-		} else if kf_view.interp_menu_open && clay.PointerOver(clay.ID("KfInterpMenu")) {
-			_, _, k, ok := kf_selected()
-			choice: Kf_Interp
-			hit := true
-			if clay.PointerOver(clay.ID("KfInterpLinear")) {
-				choice = .Linear
-			} else if clay.PointerOver(clay.ID("KfInterpCubic")) {
-				choice = .Cubic
-			} else if clay.PointerOver(clay.ID("KfInterpEaseIn")) {
-				choice = .Ease_In
-			} else if clay.PointerOver(clay.ID("KfInterpEaseOut")) {
-				choice = .Ease_Out
-			} else if clay.PointerOver(clay.ID("KfInterpEaseInOut")) {
-				choice = .Ease_In_Out
-			} else if clay.PointerOver(clay.ID("KfInterpElastic")) {
-				choice = .Elastic
-			} else {
-				hit = false
-			}
-			if hit {
-				if ok {
-					if k.interp != choice {
-						undo_begin()
-						k.interp = choice
-						undo_push(.Value, "Set keyframe interpolation")
-					}
+}
+}
+
+interaction_interp_click :: proc(was_click: bool) {
+// Keyframe-interpolation dropdown: same toggle/select/dismiss shape, gated on
+// a live keyframe selection (S3). Choosing a mode commits it on the selected
+// key — the segment arriving at that key eases (we ease INTO a breakpoint) —
+// as one undoable edit; an unchanged re-click only closes the menu.
+if was_click && kf_sel.active {
+	if clay.PointerOver(clay.ID("KfInterpButton")) {
+		if _, _, _, ok := kf_selected(); ok {
+			kf_view.interp_menu_open = !kf_view.interp_menu_open
+		}
+	} else if kf_view.interp_menu_open && clay.PointerOver(clay.ID("KfInterpMenu")) {
+		_, _, k, ok := kf_selected()
+		choice: Kf_Interp
+		hit := true
+		if clay.PointerOver(clay.ID("KfInterpLinear")) {
+			choice = .Linear
+		} else if clay.PointerOver(clay.ID("KfInterpCubic")) {
+			choice = .Cubic
+		} else if clay.PointerOver(clay.ID("KfInterpEaseIn")) {
+			choice = .Ease_In
+		} else if clay.PointerOver(clay.ID("KfInterpEaseOut")) {
+			choice = .Ease_Out
+		} else if clay.PointerOver(clay.ID("KfInterpEaseInOut")) {
+			choice = .Ease_In_Out
+		} else if clay.PointerOver(clay.ID("KfInterpElastic")) {
+			choice = .Elastic
+		} else {
+			hit = false
+		}
+		if hit {
+			if ok {
+				if k.interp != choice {
+					undo_begin()
+					k.interp = choice
+					undo_push(.Value, "Set keyframe interpolation")
 				}
-				kf_view.interp_menu_open = false
 			}
-		} else if kf_view.interp_menu_open {
 			kf_view.interp_menu_open = false
 		}
+	} else if kf_view.interp_menu_open {
+		kf_view.interp_menu_open = false
 	}
-	// Help overlay: the "?" button toggles it; any other click outside the
-	// panel dismisses it.
-	if was_click {
-		if clay.PointerOver(clay.ID("HelpButton")) {
-			editor_flags.help_open = !editor_flags.help_open
-		} else if editor_flags.help_open && !clay.PointerOver(clay.ID("HelpPanel")) {
-			editor_flags.help_open = false
-		}
+}
+}
+
+interaction_help_click :: proc(was_click: bool) {
+// Help overlay: the "?" button toggles it; any other click outside the
+// panel dismisses it.
+if was_click {
+	if clay.PointerOver(clay.ID("HelpButton")) {
+		editor_flags.help_open = !editor_flags.help_open
+	} else if editor_flags.help_open && !clay.PointerOver(clay.ID("HelpPanel")) {
+		editor_flags.help_open = false
 	}
-	// View-separator tabs: a click on a bottom-of-panel tab switches that
-	// panel's view. The selected tab is always actionable (re-clicking reselects
-	// the same view, a no-op).
-	if was_click {
-		if clay.PointerOver(clay.ID("MediaTabBin")) {
-			panel_views.media_bin_view = .Bin
-		} else if clay.PointerOver(clay.ID("MediaTabUndo")) {
-			panel_views.media_bin_view = .Undo
-		} else if clay.PointerOver(clay.ID("InspTabClip")) {
-			panel_views.inspector_view = .Clip
-		} else if clay.PointerOver(clay.ID("InspTabProject")) {
-			panel_views.inspector_view = .Project
-		} else if clay.PointerOver(clay.ID("InspTabRender")) {
-			panel_views.inspector_view = .Render
-		}
+}
+}
+
+interaction_tabs_click :: proc(was_click: bool) {
+// View-separator tabs: a click on a bottom-of-panel tab switches that
+// panel's view. The selected tab is always actionable (re-clicking reselects
+// the same view, a no-op).
+if was_click {
+	if clay.PointerOver(clay.ID("MediaTabBin")) {
+		panel_views.media_bin_view = .Bin
+	} else if clay.PointerOver(clay.ID("MediaTabUndo")) {
+		panel_views.media_bin_view = .Undo
+	} else if clay.PointerOver(clay.ID("InspTabClip")) {
+		panel_views.inspector_view = .Clip
+	} else if clay.PointerOver(clay.ID("InspTabProject")) {
+		panel_views.inspector_view = .Project
+	} else if clay.PointerOver(clay.ID("InspTabRender")) {
+		panel_views.inspector_view = .Render
 	}
-	// Preview fit toggle: re-arming it snaps the camera to the contain-fit;
-	// panning/zooming already cleared it (interaction_pre_build / event).
-	if was_click && clay.PointerOver(clay.ID("PreviewFitButton")) {
-		preview_cam.fit_to_window = !preview_cam.fit_to_window
-		if preview_cam.fit_to_window {
-			preview_fit_reset()
-		}
+}
+}
+
+interaction_preview_fit_click :: proc(was_click: bool) {
+// Preview fit toggle: re-arming it snaps the camera to the contain-fit;
+// panning/zooming already cleared it (interaction_pre_build / event).
+if was_click && clay.PointerOver(clay.ID("PreviewFitButton")) {
+	preview_cam.fit_to_window = !preview_cam.fit_to_window
+	if preview_cam.fit_to_window {
+		preview_fit_reset()
 	}
-	// Right-click: the track NAME GUTTER gets the dedicated track menu; the
-	// clip lanes get the timeline menu (a clip gets clip actions, empty space
-	// gets the track "Add" menu). Any fresh left-click, or a new right-click
-	// that lands elsewhere, closes whatever menu was open first.
-	if inp.right && !prev_right_down {
-		if track := track_gutter_hit_test(inp.x, inp.y); track >= 0 {
-			open_track_action_menu(inp.x, inp.y, track)
-		} else if ct, ci := clip_under_pointer(); ct >= 0 {
-			open_clip_context_menu(inp.x, inp.y, ct, ci)
-		} else if track := timeline_track_hit_test(inp.x, inp.y); track >= 0 {
-			open_track_context_menu(inp.x, inp.y, track)
+}
+}
+
+interaction_right_click :: proc(inp: Mouse_Input, prev_right_down, was_click: bool) {
+// Right-click: the track NAME GUTTER gets the dedicated track menu; the
+// clip lanes get the timeline menu (a clip gets clip actions, empty space
+// gets the track "Add" menu). Any fresh left-click, or a new right-click
+// that lands elsewhere, closes whatever menu was open first.
+if inp.right && !prev_right_down {
+	if track := track_gutter_hit_test(inp.x, inp.y); track >= 0 {
+		open_track_action_menu(inp.x, inp.y, track)
+	} else if ct, ci := clip_under_pointer(); ct >= 0 {
+		open_clip_context_menu(inp.x, inp.y, ct, ci)
+	} else if track := timeline_track_hit_test(inp.x, inp.y); track >= 0 {
+		open_track_context_menu(inp.x, inp.y, track)
+	} else {
+		close_context_menu()
+		close_track_action_menu()
+	}
+} else if was_click && (ctx_menu.open || track_ctx.open) {
+	if track_ctx.open {
+		if track_action_menu_hover(inp.x, inp.y) {
+			handle_track_action_option(inp.x, inp.y)
 		} else {
-			close_context_menu()
 			close_track_action_menu()
 		}
-	} else if was_click && (ctx_menu.open || track_ctx.open) {
-		if track_ctx.open {
-			if track_action_menu_hover(inp.x, inp.y) {
-				handle_track_action_option(inp.x, inp.y)
-			} else {
-				close_track_action_menu()
-			}
-		} else if pointer_over_context_menu(inp.x, inp.y) {
-			handle_ctx_option(inp.x, inp.y)
-		} else {
-			close_context_menu()
-		}
+	} else if pointer_over_context_menu(inp.x, inp.y) {
+		handle_ctx_option(inp.x, inp.y)
+	} else {
+		close_context_menu()
 	}
-	// Submenu flyout follows the cursor: show while hovering the "Add >" row,
-	// the flyout, or the seam between them; hide only after the cursor has left
-	// the whole popup for CTX_SUBMENU_GRACE frames. The hover tests are
-	// geometry-based (against last frame's element rects), NOT clay.PointerOver:
-	// clay's hover is resolved during the layout pass, so polling it here (before
-	// this frame's layout) lags one frame and, the frame the flyout mounts, the
-	// element has no prior hover at all — either would make the flyout flap
-	// open/closed mid-transit and the cursor could never reach it.
-	if ctx_menu.open {
-		zone := ctx_add_row_zone()
-		fly_up := ctx_menu.submenu || ctx_menu.submenu_grace > 0
-		over :=
-			ctx_point_in(inp.x, inp.y, zone) ||
-			(fly_up && ctx_point_in(inp.x, inp.y, ctx_flyout_rect()))
-		if over {
-			ctx_menu.submenu_grace = CTX_SUBMENU_GRACE
-		} else if ctx_menu.submenu_grace > 0 {
-			ctx_menu.submenu_grace -= 1
-		}
-		ctx_menu.submenu = over
+}
+}
+
+interaction_submenu_update :: proc(inp: Mouse_Input) {
+// Submenu flyout follows the cursor: show while hovering the "Add >" row,
+// the flyout, or the seam between them; hide only after the cursor has left
+// the whole popup for CTX_SUBMENU_GRACE frames. The hover tests are
+// geometry-based (against last frame's element rects), NOT clay.PointerOver:
+// clay's hover is resolved during the layout pass, so polling it here (before
+// this frame's layout) lags one frame and, the frame the flyout mounts, the
+// element has no prior hover at all — either would make the flyout flap
+// open/closed mid-transit and the cursor could never reach it.
+if ctx_menu.open {
+	zone := ctx_add_row_zone()
+	fly_up := ctx_menu.submenu || ctx_menu.submenu_grace > 0
+	over :=
+		ctx_point_in(inp.x, inp.y, zone) ||
+		(fly_up && ctx_point_in(inp.x, inp.y, ctx_flyout_rect()))
+	if over {
+		ctx_menu.submenu_grace = CTX_SUBMENU_GRACE
+	} else if ctx_menu.submenu_grace > 0 {
+		ctx_menu.submenu_grace -= 1
 	}
-	update_timeline_cursor(inp.x, inp.y)
-	next_left = inp.left
-	next_right = inp.right
-	return next_left, next_right
+	ctx_menu.submenu = over
+}
 }
