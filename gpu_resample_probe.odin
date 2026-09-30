@@ -231,6 +231,10 @@ gpu_resample_setup :: proc(src_w, src_h, dst_w, dst_h: int) -> (p: GPU_Resample_
 		format          = {.SPIRV},
 		stage           = .FRAGMENT,
 		num_samplers    = 1,
+		// blit_box.frag carries the BlitOpacity block (set=3) that the
+		// composite path binds; the probe measures resample exactness, so it
+		// binds it too and draws at full opacity.
+		num_uniform_buffers = 1,
 	}
 	vs := sdl.CreateGPUShader(p.device, vtx)
 	fs := sdl.CreateGPUShader(p.device, frag)
@@ -462,6 +466,8 @@ gpu_blit_run :: proc(p: ^GPU_Resample_Probe, src: []u8, src_stride: int, out: []
 		viewport = {f32(p.dst_w), f32(p.dst_h)},
 	}
 	sdl.PushGPUVertexUniformData(cb, 0, &u, u32(size_of(u)))
+	fo := Blit_Opacity_Uniforms{opacity = 1.0}
+	sdl.PushGPUFragmentUniformData(cb, 0, &fo, u32(size_of(fo)))
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 	sdl.EndGPURenderPass(pass)
 
