@@ -89,6 +89,13 @@ Saved_Clip :: struct {
 	crop_r:               f32,
 	crop_t:               f32,
 	crop_b:               f32,
+	// opacity plus an explicit presence flag. A project written before opacity
+	// existed has no such field, and a missing f32 decodes to 0 -- which would
+	// load every old clip fully transparent. The flag distinguishes "absent"
+	// (default 1) from a legitimately 0% clip. Odin's json decoder rejects
+	// pointer fields, so presence cannot be inferred from a nil ^f32.
+	opacity:              f32,
+	has_opacity:          bool,
 	markers:              [dynamic]Clip_Marker,
 	keyframe_tracks:      [dynamic]Kf_Track,
 }
@@ -216,6 +223,8 @@ project_to_file :: proc() -> Project_File {
 				crop_r               = c.crop_r,
 				crop_t               = c.crop_t,
 				crop_b               = c.crop_b,
+				opacity              = c.opacity,
+				has_opacity          = true,
 				markers              = c.markers,         // live array, aliased
 				keyframe_tracks      = c.keyframe_tracks, // live array, aliased
 			})
@@ -378,6 +387,11 @@ session_rebuild :: proc(pf: ^Project_File) {
 				crop_r               = sc.crop_r,
 				crop_t               = sc.crop_t,
 				crop_b               = sc.crop_b,
+				opacity              = 1.0,
+			}
+			// Absent (pre-opacity project) loads fully opaque; a stored 0% is real.
+			if sc.has_opacity {
+				c.opacity = sc.opacity
 			}
 			if sc.generator == .None {
 				if a := find_asset(sc.asset_id); a != nil {

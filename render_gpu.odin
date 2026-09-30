@@ -206,6 +206,7 @@ gpu_resample_create :: proc(g: ^GPU_Resample) -> bool {
 		format       = {.SPIRV},
 		stage        = .FRAGMENT,
 		num_samplers = 1,
+		num_uniform_buffers = 1,
 	}
 	vshader := sdl.CreateGPUShader(g.device, vs)
 	fshader := sdl.CreateGPUShader(g.device, fs)
@@ -216,12 +217,26 @@ gpu_resample_create :: proc(g: ^GPU_Resample) -> bool {
 		return false
 	}
 
-	// Blending is off because render_blit_region is an opaque copy, not an
-	// alpha blend. Enabling it would be a silent quality change on the seam
-	// this is meant to be interchangeable with.
+	// Straight-alpha "over" blending, the same factors the preview pipeline
+	// uses. Layers composite back-to-front with their per-clip opacity carried
+	// in the Quad_Uniforms block (blit_box.frag scales the sampled alpha), so a
+	// layer at opacity 1 is a bit-exact copy -- src*1 + dst*0 == src -- and the
+	// static path's exactness against the CPU reference is unchanged.
 	target := sdl.GPUColorTargetDescription {
 		format = .R8G8B8A8_UNORM,
-		blend_state = {enable_blend = false},
+		blend_state = {
+			src_color_blendfactor = .SRC_ALPHA,
+			dst_color_blendfactor = .ONE_MINUS_SRC_ALPHA,
+			color_blend_op = .ADD,
+			src_alpha_blendfactor = .ONE,
+			dst_alpha_blendfactor = .ONE_MINUS_SRC_ALPHA,
+			alpha_blend_op = .ADD,
+			// The write mask defaults to zero when blending is enabled; without
+			// it the draw blends into nothing. Mirror the preview's target state.
+			color_write_mask      = {.R, .G, .B, .A},
+			enable_blend          = true,
+			enable_color_write_mask = true,
+		},
 	}
 	pi := sdl.GPUGraphicsPipelineCreateInfo {
 		vertex_shader   = vshader,
@@ -572,6 +587,7 @@ gpu_composite_draw :: proc(
 	src: [^]u8, src_bytes: int, sw, sh: int,
 	srcx, srcy, srcw, srch: int,
 	ox, oy, rw, rh: int,
+	opacity: f32,
 ) -> bool {
 	g := c.g
 	if !gpu_stage_map(g, src, src_bytes, sw, sh) {
@@ -624,6 +640,9 @@ gpu_composite_draw :: proc(
 		},
 	}
 	sdl.PushGPUVertexUniformData(c.cb, 0, &u, u32(size_of(u)))
+	// Fragment stage: per-layer alpha, separate from the vertex transform block.
+	fo := Blit_Opacity_Uniforms{opacity = opacity}
+	sdl.PushGPUFragmentUniformData(c.cb, 0, &fo, u32(size_of(fo)))
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 	sdl.EndGPURenderPass(pass)
 	c.draws += 1

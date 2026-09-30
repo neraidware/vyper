@@ -22,6 +22,9 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 		prec = 1
 	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 		scaled = value * 100
+	case .Opacity:
+		// Stored 0..1, shown and typed as a percentage.
+		scaled = value * 100
 	}
 	// Format straight into the fixed field buffer. This used to be
 	// fmt.aprintf followed by a copy into edit_state.chars, which allocated a
@@ -65,6 +68,8 @@ edit_field_over :: proc() -> bool {
 		return clay.PointerOver(clay.ID("PropCropB"))
 	case .Gain:
 		return clay.PointerOver(clay.ID("PropFieldGain"))
+	case .Opacity:
+		return clay.PointerOver(clay.ID("PropFieldOpacity"))
 	case .Kf_Value:
 		return clay.PointerOver(clay.ID("PropFieldKf"))
 	case .None:
@@ -126,6 +131,7 @@ edit_commit :: proc() {
 	// keeps the direct write plus kf_auto_key.
 	geom := Render_Geom_Prop._COUNT
 	gain_field: ^f32
+	opacity_field: ^f32
 	label := "Edit clip transform"
 	kind := Undo_Kind.Transform
 	name := ""
@@ -177,6 +183,14 @@ edit_commit :: proc() {
 		geom = .Crop_B
 		val = clamp(val / 100, 0, 1)
 		label = "Set clip crop"
+	case .Opacity:
+		// Clamp to the slider's 0..1 so the typed value and the slider fill
+		// stay consistent; the slider is the source of truth for the range.
+		// A plain resting field like scale: direct write, no keyframe track.
+		val = clamp(val / 100, 0, 1)
+		opacity_field = &cl.opacity
+		label = "Set clip opacity"
+		kind = .Value
 	case .Gain:
 		// Clamp to the knob range so the typed value and the knob's angle stay
 		// consistent; the knob is the source of truth for what's reachable.
@@ -197,6 +211,8 @@ edit_commit :: proc() {
 	prev := f32(0)
 	if geom != ._COUNT {
 		prev = clip_geom_get(cl, geom)
+	} else if opacity_field != nil {
+		prev = opacity_field^
 	} else {
 		prev = gain_field^
 	}
@@ -208,7 +224,10 @@ edit_commit :: proc() {
 	// A full note_edit() here re-seeded every decoder mid-playback whenever a
 	// gain commit landed -- and dispatch_click_fallback commits in-flight field
 	// edits on ANY fresh click, so selecting another clip re-opened all decoders.
-	audio_changed := kind == .Value
+	// Only gain edits touch audio; opacity is visual. Keyed on the field the
+	// switch bound, not the undo kind (both are .Value), so a visual opacity
+	// commit never re-provisions the decoders.
+	audio_changed := gain_field != nil
 	undo_begin()
 	if geom != ._COUNT {
 		// clip_geom_set routes to the playhead key when the property is keyed
@@ -217,6 +236,8 @@ edit_commit :: proc() {
 		// sampler ignores. Same undo node as the resting write — the whole
 		// field edit is one step.
 		clip_geom_set(cl, geom, val)
+	} else if opacity_field != nil {
+		opacity_field^ = val
 	} else {
 		gain_field^ = val
 		kf_auto_key(cl, name, val)

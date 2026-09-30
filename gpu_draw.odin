@@ -2123,6 +2123,7 @@ draw_image_layer :: proc(
 	texture: ^sdl.GPUTexture,
 	sampler: ^sdl.GPUSampler,
 	uniforms: Quad_Uniforms,
+	opacity: f32,
 ) {
 	sdl.BindGPUGraphicsPipeline(pass, renderer.preview_pipeline)
 	binding := sdl.GPUTextureSamplerBinding{texture = texture, sampler = sampler}
@@ -2131,6 +2132,10 @@ draw_image_layer :: proc(
 	// copy to a local first.
 	u := uniforms
 	sdl.PushGPUVertexUniformData(command_buffer, 0, &u, sdl.Uint32(size_of(u)))
+	// Fragment stage: the per-layer alpha, separate from the vertex transform
+	// block above. blit_box.frag scales the sampled alpha by it.
+	fo := Blit_Opacity_Uniforms{opacity = opacity}
+	sdl.PushGPUFragmentUniformData(command_buffer, 0, &fo, sdl.Uint32(size_of(fo)))
 	sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 }
 
@@ -2289,6 +2294,7 @@ draw_preview :: proc(
 			slot.texture,
 			renderer.preview_sampler,
 			vertex_uniforms,
+			slot.opacity,
 		)
 	}
 	// Draw a border box around the currently-selected clip's image rect.

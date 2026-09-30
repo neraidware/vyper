@@ -3,6 +3,7 @@ package main
 import clay "clay-odin"
 import "core:c"
 import "core:fmt"
+import "core:math"
 
 // ---------------------------------------------------------------------------
 // Clay UI layout tree for the whole app (build_page), plus small display
@@ -44,6 +45,7 @@ UI_Text_Buffers :: struct {
 	dur:         [128]u8,
 	io:          [128]u8,
 	gain:        [64]u8,
+	opacity:     [64]u8,
 	x:           [64]u8,
 	y:           [64]u8,
 	s:           [64]u8,
@@ -1373,6 +1375,64 @@ clip_card :: proc() {
 				scl_val = string(edit_state.chars[:edit_state.len])
 			}
 			prop_field_row("PropRowS", "PropFieldS", "Scale", scl_val, edit_state.field == .Scale, "KfAddS")
+			// Opacity: a horizontal slider plus a percent field. The track is
+			// clay, not a custom paint pass -- the value is the filled child's
+			// percent width, so it needs no overlay drawing like the gain knob.
+			// The slider container is the hit target (opacity_from_x maps the
+			// pointer across it); the field beside it is the type-in path.
+			op_buf := ui_text.opacity[:]
+			op_val := fmt.bprintf(op_buf[:], "%.0f%%", cl.opacity * 100)
+			if edit_state.field == .Opacity {
+				op_val = string(edit_state.chars[:edit_state.len])
+			}
+			if clay.UI(clay.ID("OpacityRow"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+					layoutDirection = .LeftToRight,
+					childGap = BUTTON_ROW_GAP,
+					childAlignment = {x = .Left, y = .Center},
+				},
+			},
+			) {
+				op_active := active_interaction == .Opacity_Drag
+				if clay.UI(clay.ID("OpacitySlider"))(
+				{
+					layout = {
+						sizing = {width = clay.SizingGrow({}), height = clay.SizingFixed(FIELD_H)},
+						childAlignment = {x = .Left, y = .Center},
+					},
+				},
+				) {
+					if clay.UI(clay.ID("OpacityTrack"))(
+					{
+						layout = {
+							sizing = {
+								width = clay.SizingGrow({}),
+								height = clay.SizingFixed(OPACITY_TRACK_H),
+							},
+						},
+						backgroundColor = BUTTON,
+						cornerRadius = clay.CornerRadiusAll(OPACITY_TRACK_H / 2),
+					},
+					) {
+						clay.UI(clay.ID("OpacityFill"))(
+						{
+							layout = {
+								sizing = {
+									width = clay.SizingPercent(cl.opacity * 100),
+									height = clay.SizingFixed(OPACITY_TRACK_H),
+								},
+							},
+							backgroundColor = BUTTON_BORDER_HOVER,
+							cornerRadius = clay.CornerRadiusAll(OPACITY_TRACK_H / 2),
+						},
+						)
+					}
+				}
+				op_hovered := op_active
+				prop_field("PropFieldOpacity", "Opacity", op_val, edit_state.field == .Opacity || op_hovered)
+			}
 			// Canvas-center snap belongs with the transform settings it governs.
 			if clay.UI(clay.ID("SnapRow"))(
 			{

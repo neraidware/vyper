@@ -41,6 +41,15 @@ TextFragmentUniforms :: struct {
 	color: [4]f32,
 }
 
+// Blit_Opacity_Uniforms is the preview/composite fragment stage's per-layer
+// alpha, matching the BlitOpacity block in shaders/blit_box.frag. It is a
+// separate push from Quad_Uniforms because SDL GPU binds the vertex and
+// fragment uniform buffers independently; a member added to Quad_Uniforms
+// would be invisible to the fragment shader.
+Blit_Opacity_Uniforms :: struct {
+	opacity: f32,
+}
+
 // ---------------------------------------------------------------------------
 // Dynamic glyph atlas: one on-demand cache
 // holding ANY glyph the face provides, rasterized at GLYPH_BAKE_PX (every UI
@@ -401,7 +410,7 @@ create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat
 
 	preview_fragment_info := sdl.GPUShaderCreateInfo{
 		code_size = uint(len(blit_box_fragment_spirv)), code = raw_data(blit_box_fragment_spirv),
-		entrypoint = "main", format = {.SPIRV}, stage = .FRAGMENT, num_samplers = 1,
+		entrypoint = "main", format = {.SPIRV}, stage = .FRAGMENT, num_samplers = 1, num_uniform_buffers = 1,
 	}
 	preview_fragment_shader := sdl.CreateGPUShader(device, preview_fragment_info)
 	if preview_fragment_shader == nil {

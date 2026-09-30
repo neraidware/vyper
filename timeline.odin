@@ -66,6 +66,7 @@ add_text_generator_clip :: proc(track: ^Track, start_frame: i64) -> int {
 		crop_r               = 0,
 		crop_t               = 0,
 		crop_b               = 0,
+		opacity              = 1,
 	}
 	append(&track.clips, clip)
 	// Keep the track's clips sorted ascending by timeline start.
@@ -123,6 +124,7 @@ add_subtitle_generator_clip :: proc(
 		crop_r               = 0,
 		crop_t               = 0,
 		crop_b               = 0,
+		opacity              = 1,
 	}
 	append(&track.clips, clip)
 	// Keep the track's clips sorted ascending by timeline start.
@@ -1795,6 +1797,8 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 		crop_r               = src.crop_r,
 		crop_t               = src.crop_t,
 		crop_b               = src.crop_b,
+		opacity              = src.opacity,
+		gain                 = src.gain,
 	}
 	for m in src.markers {
 		append(

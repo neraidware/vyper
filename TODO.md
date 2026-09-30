@@ -2945,6 +2945,37 @@ Details TBD when Phase 2 reaches maturity.
 
 ---
 
+## Implemented — per-clip opacity / color modulation (2026-09-29)
+
+- Model: `Clip.opacity` (`f32`, `0..1`, default `1.0`) as a resting value —
+  no keyframe track yet. Deliberately NOT a `geom_modified` lane (that `u8`
+  bitmask is already full) and not baked into the layer texture, so a drag
+  does not re-upload.
+- Persistence: `Saved_Clip.opacity` + an explicit `has_opacity` presence flag
+  (Odin JSON pointer fields are unsupported). Old projects load at `1.0`; a
+  stored `0` stays a valid fully transparent clip.
+- UI: inspector `Opacity` slider + percent field (Clay has no slider, so it is
+  `OpacityRow/Track/Fill` with a `SizingPercent` fill). Drag writes live and
+  coalesces into a single undo entry on release.
+- Preview: `Preview_Slot.opacity` is fed to the layer as a fragment-stage
+  uniform; preview already blends `SRC_ALPHA` over the background. The vertex
+  and fragment uniform buffers are separate in SDL GPU — the opacity lives in a
+  fragment `BlitOpacity` block, not in `Quad_Uniforms`.
+- Export: CPU `blend_row` in `render_blit`/`render_blit_region`; GPU
+  `blit_box.frag` multiplies the layer alpha by opacity and the composite
+  pipeline blends it "over". `skip_canvas_zero` now also fires when any layer
+  is translucent (a zeroed canvas would erase what is underneath).
+- Probe (`gate.sh opacity`): checks CPU `blend_row` against an independent
+  reference mix, and the GPU path against the same mix, at 0/0.25/0.5/0.75/1.0
+  — and additionally asserts a fractional opacity actually changes the result.
+  `gpu_composite` still pins the opacity=1 end byte-exact.
+- The two silent-failure classes this invites — a layer that vanishes (alpha
+  reads as 0, so it blends to nothing) and a layer that is ignored (alpha
+  never applied) — both render wrong-but-plausible, so the probe asserts the
+  mix itself, not merely "non-blank".
+
+---
+
 ## Implemented — clip tile width is the model's width, not the label's (2026-09-29)
 
 - Symptom: after a cut, the video and audio clips were both 117 frames, but the

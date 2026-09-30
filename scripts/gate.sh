@@ -592,6 +592,21 @@ target_footprint() {
 	DIR="$(dirname -- "$SELF")"; python3 "$DIR/footprint.py" --top "${2:-20}"
 }
 
+# Fractional opacity must actually composite over the layer below it, on the
+# CPU export path (blend_row) and the GPU one (blit_box alpha + over blend).
+# gpu_composite only pins the opacity=1 end of the same contract.
+target_opacity() {
+	require_fresh_binary opacity || return 1
+	local out
+	out=$(VYPER_RENDER_OPACITY_PROBE=1 timeout 300 ./vyper 2>&1)
+	local code=$?
+	if [ $code -ne 0 ]; then
+		echo "$out" | tail -6 >&2
+		return 1
+	fi
+	echo "$out" | tail -1
+}
+
 # The app must still be running when the timeout kills it; 124 is the pass.
 target_smoke() {
 	require_fresh_binary smoke || return 1
@@ -825,7 +840,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind render_valgrind; do
+	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -845,6 +860,7 @@ main() {
 	yuv_exact) target_yuv_exact ;;
 	gpu_nv12) target_gpu_nv12 ;;
 	gpu_composite) target_gpu_composite ;;
+	opacity) target_opacity ;;
 	gpu_probe) target_gpu_probe ;;
 	keyed_export) target_keyed_ab ;;
 	zorder) target_zorder ;;
@@ -857,7 +873,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

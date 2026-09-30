@@ -30,6 +30,10 @@ GAIN_KNOB_SWEEP_DEG :: 90.0    // pointer half-sweep from 12 o'clock (deg): -90 
 GAIN_KNOB_NEEDLE_LEN :: 0.75   // needle total length as a fraction of the diameter.
 GAIN_KNOB_NEEDLE_W :: 2.5      // capsule thickness (px).
 GAIN_KNOB_HUB_R :: 3.0         // center hub radius (px), anchors the needle.
+// Opacity slider: a horizontal bar in the clip card. The container is the
+// click target (tall, so it's easy to grab); TRACK_H is the visible bar inside
+// it, vertically centered. The filled portion is the value.
+OPACITY_TRACK_H :: f32(6)
 TAB_H :: f32(24)           // Bottom-of-panel view-separator tab height.
 
 // Corner radii (visual hierarchy: container > panel > widget > button).

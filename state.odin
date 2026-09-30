@@ -287,6 +287,10 @@ Clip :: struct {
 	crop_r:               f32,
 	crop_t:               f32,
 	crop_b:               f32,
+	// Opacity: global alpha this clip composites with, 0..1 (1 = fully opaque).
+	// A resting field like scale/gain, not a geometry lane -- it changes how the
+	// clip is blended, not where it sits. Read directly by preview and render.
+	opacity:              f32,
 	// Markers embedded in the clip (chapter markers, etc.), source-relative.
 	markers:              [dynamic]Clip_Marker,
 	// keyframe_tracks: the generic keyframe store (keyframes.odin) — opaque,
@@ -695,6 +699,7 @@ Edit_Field :: enum {
 	Crop_T,
 	Crop_B,
 	Gain,
+	Opacity,  // clip opacity, edited as a percent
 	Kf_Value, // selected keyframe's value (Clip inspector keyframe readout)
 }
 
@@ -785,6 +790,7 @@ Preview_Slot :: struct {
 	crop_r:               f32,
 	crop_t:               f32,
 	crop_b:               f32,
+	opacity:              f32,
 	source_w:             c.int,
 	source_h:             c.int,
 	dec:                  Clip_Decoder,
@@ -1011,6 +1017,7 @@ Interaction :: enum {
 	Handle_Drag,   // dragging a preview resize/crop handle
 	Track_Drag,    // dragging a whole track onto an insert gap (reorder)
 	Gain_Drag,     // dragging an audio clip's gain knob in the inspector
+	Opacity_Drag,  // dragging a clip's opacity slider in the inspector
 	Keyframe_Move, // dragging a keyframe diamond horizontally in its lane
 }
 
@@ -1034,6 +1041,19 @@ Gain_Drag :: struct {
 	start_db: f32,
 }
 gain_drag: Gain_Drag
+
+// Opacity_Drag is the live opacity-slider drag. The slider maps the pointer
+// across its own rect (absolute, not a delta from the press point), so the
+// gesture's rect is captured here at press and reused for every move -- the
+// layout can shift under the pointer, the captured rect cannot. start_op
+// decides at release whether the gesture actually changed anything.
+Opacity_Drag :: struct {
+	clip:     ^Clip,
+	start_op: f32,
+	rect_x:   f32,
+	rect_w:   f32,
+}
+opacity_drag: Opacity_Drag
 
 // Kf_Move is the keyframe-diamond drag. start_frame captures the selected
 // key's frame_off at diamond press, so the release-time compare decides whether

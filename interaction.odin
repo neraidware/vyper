@@ -17,6 +17,17 @@ import sdl "vendor:sdl3"
 // geometry). Runs between the event poll and the playback tick.
 // ---------------------------------------------------------------------------
 
+// opacity_from_x maps a pointer x across the opacity slider's captured rect to
+// 0..1. Absolute, not a delta from the press point: a slider sets the value
+// under the cursor, so clicking the middle jumps to 50%. A zero-width rect
+// (slider not laid out yet) resolves to fully opaque rather than dividing.
+opacity_from_x :: proc(x: f32) -> f32 {
+	if opacity_drag.rect_w <= 0 {
+		return 1.0
+	}
+	return clamp((x - opacity_drag.rect_x) / opacity_drag.rect_w, 0, 1)
+}
+
 // Mouse_Input is the raw pointer state for one frame, read once so the whole
 // frame shares a single snapshot instead of re-polling SDL.
 Mouse_Input :: struct {
@@ -366,6 +377,21 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		if clay.PointerOver(clay.ID("PropFieldS")) {
 			edit_begin(.Scale, clip_geom_get(sel, .Scale))
+			return true
+		}
+		if clay.PointerOver(clay.ID("OpacitySlider")) {
+			undo_begin()
+			opacity_drag.clip = sel
+			opacity_drag.start_op = sel.opacity
+			rect := clay.GetElementData(clay.ID("OpacitySlider")).boundingBox
+			opacity_drag.rect_x = rect.x
+			opacity_drag.rect_w = rect.width
+			sel.opacity = opacity_from_x(inp.x)
+			active_interaction = .Opacity_Drag
+			return true
+		}
+		if clay.PointerOver(clay.ID("PropFieldOpacity")) {
+			edit_begin(.Opacity, sel.opacity * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropL")) {
@@ -1000,6 +1026,13 @@ interaction_post_build :: proc(
 					undo_push(.Transform, "Move transform")
 				}
 			}
+		case .Opacity_Drag:
+			// Opacity is applied live during the drag; one value node on
+			// release, and only if the gesture actually moved it.
+			if opacity_drag.clip != nil &&
+			   opacity_drag.clip.opacity != opacity_drag.start_op {
+				undo_push(.Value, "Set clip opacity")
+			}
 		case .Gain_Drag:
 			// Gain is applied live during the drag; record one value node on
 			// release. No re-provision here: the per-move geometry commit +
@@ -1027,6 +1060,7 @@ interaction_post_build :: proc(
 		handle_drag.corner_snapped = false
 		clip_move.clip = nil
 		gain_drag.clip = nil
+		opacity_drag.clip = nil
 		kf_move.start_frame = 0
 		kf_move.press_x = 0
 		kf_move.pivot = 0
@@ -1129,6 +1163,13 @@ interaction_post_build :: proc(
 				// No audio_note_edit() here: it is a full re-provision per frame
 				// of the drag. The release commits it once.
 			}
+		case .Opacity_Drag:
+			// Written live against the captured rect, so the preview tracks
+			// the pointer; the release below is the only undo commit.
+			if opacity_drag.clip == nil {
+				break
+			}
+			opacity_drag.clip.opacity = opacity_from_x(inp.x)
 		case .Gain_Drag:
 			if gain_drag.clip == nil {
 				break

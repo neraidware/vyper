@@ -538,6 +538,7 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 		}
 		placed := anchor_placed
 		clip := Clip {
+			opacity              = 1,
 			clip_id              = new_clip_id(),
 			link_id              = link,
 			asset_id             = asset.id,

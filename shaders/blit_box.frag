@@ -27,6 +27,14 @@
 // The footprint comes from the same screen-space derivatives the sampler would
 // use for automatic LOD, so this needs no uniform beyond the sampler.
 layout(set = 2, binding = 0) uniform sampler2D image;
+// Per-layer global alpha (0..1) for this draw, scaled into the sampled alpha
+// below. It is a FRAGMENT-stage uniform, not part of the vertex Quad_Uniforms
+// block: SDL GPU keeps the vertex and fragment uniform buffers separate, so a
+// value pushed with PushGPUVertexUniformData is invisible here. set 3 is the
+// fragment slot the text pipeline's per-draw uniform uses.
+layout(std140, set = 3, binding = 0) uniform BlitOpacity {
+    float opacity;
+};
 layout(location = 0) in vec2 texcoord;
 layout(location = 0) out vec4 out_color;
 
@@ -59,6 +67,7 @@ void main() {
     // worse (mean 30.18 -> 44.76) for no benefit.
     if (rho.x < 1.0 && rho.y < 1.0) {
         out_color = texture(image, texcoord);
+        out_color.a *= opacity;
         return;
     }
 
@@ -86,4 +95,5 @@ void main() {
         }
     }
     out_color = sum / float(tx * ty);
+    out_color.a *= opacity;
 }

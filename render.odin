@@ -714,6 +714,9 @@ Render_Video_Src :: struct {
 	crop_b:               f32,
 	source_w:             c.int,
 	source_h:             c.int,
+	// opacity: the clip's global alpha (0..1) at export time, applied when the
+	// frame composites. 1 is fully opaque and reproduces the plain copy.
+	opacity:              f32,
 	// Keyed geometry (S6): when any of the 7 geometry properties is keyed,
 	// geom_keyed routes the worker through per-frame evaluation and stage
 	// sub-rect blitting. kf_geom is the UI-thread snapshot; keys ride with the
@@ -2435,16 +2438,24 @@ render_worker_run :: proc() {
 	// behind, which is exactly why the zero exists. A geometry-keyed clip
 	// ALSO defeats it: its rect moves every frame, so a stale pose could
 	// leak where it was.
+	// A translucent clip is the same class of problem: it does not overwrite
+	// what is below, so the canvas must start zeroed for the blend to composite
+	// against. Checked statically from the snapshot (opacity is captured at
+	// render_start), same shape as any_keyed.
 	any_keyed := false
+	any_translucent := false
 	for &v in render_job.videos {
 		if v.geom_keyed {
 			any_keyed = true
-			break
+		}
+		if v.opacity < 1.0 {
+			any_translucent = true
 		}
 	}
 	skip_canvas_zero :=
 		len(render_job.videos) > 0 &&
 		!any_keyed &&
+		!any_translucent &&
 		render_span_cover_canvas(
 			render_job.videos,
 			render_job.start,
@@ -3015,7 +3026,7 @@ render_span_cover_canvas :: proc(
 // render_blit_region copies a w x h sub-rect from a flat RGBA framebuffer
 // (src_stride = row pixel width) into the canvas at (ox, oy), clipping both
 // sides. Pure memcpy rows — used by the keyed geometry path.
-render_blit_region :: proc(canvas: []u8, draw_w, draw_h: c.int, src_buf: []u8, src_stride, srcx, srcy, ox, oy, rw, rh: c.int) {
+render_blit_region :: proc(canvas: []u8, draw_w, draw_h: c.int, src_buf: []u8, src_stride, srcx, srcy, ox, oy, rw, rh: c.int, opacity: f32) {
 	top := max(oy, 0)
 	bottom := min(oy + rh, draw_h)
 	left := max(ox, 0)
@@ -3030,7 +3041,7 @@ render_blit_region :: proc(canvas: []u8, draw_w, draw_h: c.int, src_buf: []u8, s
 	for row in 0 ..< rows {
 		src := src_buf[uint(srow + row) * uint(src_stride) * 4 + uint(scol) * 4:][:uint(cols) * 4]
 		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-		copy(dst, src)
+		blend_row(dst, src, int(cols), opacity)
 	}
 }
 
@@ -3074,6 +3085,7 @@ render_eval_keyed_geom :: proc(
 			raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
 			int(srcx), int(srcy), int(srcw), int(srch),
 			int(ox), int(oy), int(rw), int(rh),
+			v.opacity,
 		) {
 			return false
 		}
@@ -3104,7 +3116,7 @@ render_eval_keyed_geom :: proc(
 		render_keyed_frames += 1
 		render_blit_region(
 			canvas, render_job.width, render_job.height,
-			slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh,
+			slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh, v.opacity,
 		)
 		return true
 	}
@@ -3163,7 +3175,7 @@ render_eval_keyed_geom :: proc(
 					render_keyed_frames += 1
 					render_blit_region(
 						canvas, render_job.width, render_job.height,
-						v.kres_scratch, rw, 0, 0, ox, oy, rw, rh,
+						v.kres_scratch, rw, 0, 0, ox, oy, rw, rh, v.opacity,
 					)
 					return true
 				}
@@ -3249,12 +3261,12 @@ render_eval_keyed_geom :: proc(
 			}
 		}
 		render_keyed_frames += 1
-		render_blit_region(canvas, render_job.width, render_job.height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh)
+		render_blit_region(canvas, render_job.width, render_job.height, v.kres_scratch, rw, 0, 0, ox, oy, rw, rh, v.opacity)
 		return true
 	}
 	// Scale fixed: the stage is already the box, so the crop sub-rect pixels
 	// equal the display pixels — one lossless region copy.
-	render_blit_region(canvas, render_job.width, render_job.height, slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh)
+	render_blit_region(canvas, render_job.width, render_job.height, slot.blit, v.fw, srcx, srcy, ox, oy, rw, rh, v.opacity)
 	return true
 }
 
@@ -3266,6 +3278,37 @@ render_eval_keyed_geom :: proc(
 // when the job has no crop-scaled static clip (that path keeps sws bilinear),
 // so both GPU branches below are 1:1 region copies, byte-exact in the
 // composite contract.
+// blend_row composites one RGBA row of a layer over the canvas with the layer's
+// global opacity. Straight alpha, matching the GPU path's SRC_ALPHA /
+// ONE_MINUS_SRC_ALPHA: out = src*a + dst*(1-a) with a = (src_alpha/255)*opacity.
+// The float blend rounds like the GPU does, so preview and export agree rather
+// than the CPU truncating a step lower than the hardware.
+//
+// opacity >= 1 stays a raw copy -- every fully-opaque layer takes this path, and
+// at a == 1 the blend is exactly src, so the opaque case is untouched.
+blend_row :: proc(dst, src: []u8, cols: int, opacity: f32) {
+	op := clamp(opacity, 0.0, 1.0)
+	if op >= 1.0 {
+		copy(dst, src)
+		return
+	}
+	if op <= 0.0 {
+		return
+	}
+	for col in 0 ..< cols {
+		s := src[uint(col) * 4:]
+		d := dst[uint(col) * 4:]
+		a := f32(s[3]) / 255.0 * op
+		if a <= 0.0 {
+			continue
+		}
+		ia := 1.0 - a
+		for ch in 0 ..< 4 {
+			d[ch] = u8(math.round(clamp(f32(s[ch]) * a + f32(d[ch]) * ia, 0.0, 255.0)))
+		}
+	}
+}
+
 render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, slot: ^Render_Blit_Slot, gpu: ^GPU_Composite) {
 	top := max(v.oy, 0)
 	bottom := min(v.oy + v.rh, draw_h)
@@ -3291,6 +3334,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 			raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
 			scol, srow, int(cols), int(rows),
 			int(left), int(top), int(cols), int(rows),
+			v.opacity,
 		) {
 			return
 		}
@@ -3308,7 +3352,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		for row in 0 ..< rows {
 			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
 			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-			copy(dst, src)
+			blend_row(dst, src, int(cols), v.opacity)
 		}
 		return
 	}
@@ -3320,7 +3364,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		for row in 0 ..< rows {
 			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
 			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-			copy(dst, src)
+			blend_row(dst, src, int(cols), v.opacity)
 		}
 		return
 	}
@@ -3358,7 +3402,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 	for row in 0 ..< rows {
 		src := v.crop_scratch[uint(srow + row) * uint(v.rw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
 		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-		copy(dst, src)
+		blend_row(dst, src, int(cols), v.opacity)
 	}
 }
 
@@ -3636,6 +3680,7 @@ render_start :: proc() {
 						crop_r = clip.crop_r,
 						crop_t = clip.crop_t,
 						crop_b = clip.crop_b,
+						opacity = clip.opacity,
 						source_w = clip.source_w,
 						source_h = clip.source_h,
 					},
@@ -3991,6 +4036,7 @@ render_test_run :: proc(paths: [2]string) {
 				transform_x = z_place_x,
 				transform_y = z_place_y,
 				scale = 1,
+				opacity = 1,
 			},
 		)
 		fmt.println("render-test zorder:", zv, "text row", pos)

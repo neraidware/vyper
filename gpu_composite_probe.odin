@@ -118,7 +118,7 @@ gpu_composite_setup :: proc() -> (p: GPU_Composite_Probe, ok: bool) {
 	})
 	fs := sdl.CreateGPUShader(p.device, sdl.GPUShaderCreateInfo {
 		code_size = uint(len(blit_box_fragment_spirv)), code = raw_data(blit_box_fragment_spirv),
-		entrypoint = "main", format = {.SPIRV}, stage = .FRAGMENT, num_samplers = 1,
+		entrypoint = "main", format = {.SPIRV}, stage = .FRAGMENT, num_samplers = 1, num_uniform_buffers = 1,
 	})
 	defer sdl.ReleaseGPUShader(p.device, vs)
 	defer sdl.ReleaseGPUShader(p.device, fs)
@@ -247,6 +247,11 @@ gpu_composite_run :: proc(p: ^GPU_Composite_Probe, stage: []u8, out: []u8) -> bo
 			},
 		}
 		sdl.PushGPUVertexUniformData(cb, 0, &u, u32(size_of(u)))
+		// Fragment stage: the composite pipeline blends, so the layer alpha
+		// must be pushed for every draw. This probe measures the resample seam
+		// at full opacity.
+		fo := Blit_Opacity_Uniforms{opacity = 1.0}
+		sdl.PushGPUFragmentUniformData(cb, 0, &fo, u32(size_of(fo)))
 		sdl.DrawGPUPrimitives(pass, 6, 1, 0, 0)
 		sdl.EndGPURenderPass(pass)
 	}
@@ -349,7 +354,7 @@ gpu_composite_probe_run :: proc() -> int {
 		switch op.kind {
 		case .COPY1:
 			render_blit_region(cpu, c.int(w), c.int(h), stage, c.int(w),
-				c.int(op.sx), c.int(op.sy), c.int(op.ox), c.int(op.oy), c.int(op.rw), c.int(op.rh))
+				c.int(op.sx), c.int(op.sy), c.int(op.ox), c.int(op.oy), c.int(op.rw), c.int(op.rh), 1.0)
 		case .DOWN:
 			if !yuvconv.rgba_resample(
 				raw_data(stage), w * 4,
@@ -361,7 +366,7 @@ gpu_composite_probe_run :: proc() -> int {
 				return 1
 			}
 			render_blit_region(cpu, c.int(w), c.int(h), kres, c.int(op.rw),
-				0, 0, c.int(op.ox), c.int(op.oy), c.int(op.rw), c.int(op.rh))
+				0, 0, c.int(op.ox), c.int(op.oy), c.int(op.rw), c.int(op.rh), 1.0)
 		}
 	}
 
