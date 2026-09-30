@@ -49,116 +49,7 @@ handle_sdl_events :: proc(running: ^bool) {
 				}
 			}
 		case .MOUSE_WHEEL:
-			// Wheel over the file finder moves its selection (like the cmdline
-			// match list): up = earlier rows, down = later.
-			fc := clay.GetElementData(clay.ID("FinderColumn")).boundingBox
-			if fc.width > 0 && event.wheel.mouse_x >= fc.x && event.wheel.mouse_x <= fc.x + fc.width &&
-				event.wheel.mouse_y >= fc.y && event.wheel.mouse_y <= fc.y + fc.height {
-				if event.wheel.y != 0 {
-					finder_navigate(-int(event.wheel.y))
-					break
-				}
-			}
-			// Scroll over the media bin scrolls its active view: the thumbnail
-			// grid in the Media Bin view, the undo tree in the Undo Tree view.
-			mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
-			if mb.width > 0 && event.wheel.mouse_x >= mb.x && event.wheel.mouse_x <= mb.x + mb.width &&
-				event.wheel.mouse_y >= mb.y && event.wheel.mouse_y <= mb.y + mb.height {
-				if event.wheel.y != 0 {
-					if panel_views.media_bin_view == .Undo {
-						undo_hist.view_scroll = clamp(
-							undo_hist.view_scroll - f32(event.wheel.y) * TIMELINE_SCROLL_STEP,
-							0,
-							undo_view_max_scroll(),
-						)
-					} else if len(media_bin.assets) > 0 {
-						panel_views.media_bin_scroll = clamp(panel_views.media_bin_scroll - f32(event.wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
-					}
-					break
-				}
-			}
-			// Scroll over the inspector column scrolls its card stack when
-			// the cards outgrow the viewport.
-			ic := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
-			if ic.height > 0 && event.wheel.mouse_x >= ic.x && event.wheel.mouse_x <= ic.x + ic.width &&
-				event.wheel.mouse_y >= ic.y && event.wheel.mouse_y <= ic.y + ic.height {
-				if event.wheel.y != 0 {
-					scrollbars.inspector.offset = clamp(scrollbars.inspector.offset - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
-					break
-				}
-			}
-			// Vertical wheel over the track LANES (and the scrollbar strip
-			// beside them) scrolls the track list, exactly like the media
-			// bin. The ruler strip above still zooms on wheel.
-			ta := clay.GetElementData(clay.ID("TrackArea")).boundingBox
-			if ta.height > 0 && event.wheel.mouse_x >= ta.x && event.wheel.mouse_x <= ta.x + ta.width &&
-				event.wheel.mouse_y >= ta.y && event.wheel.mouse_y <= ta.y + ta.height {
-				if event.wheel.y != 0 {
-					timeline_view.top = clamp(timeline_view.top - f32(event.wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
-					break
-				}
-			}
-			// Scroll over the timeline zooms horizontally, anchored at the playhead.
-			tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
-			if len(timeline.tracks) > 0 && event.wheel.mouse_x >= tlb.x && event.wheel.mouse_x <= tlb.x + tlb.width &&
-				event.wheel.mouse_y >= tlb.y && event.wheel.mouse_y <= tlb.y + tlb.height {
-				if event.wheel.y != 0 {
-					ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
-					anchor := f32(playhead.frame - i64(timeline_view.start)) * timeline_view.zoom
-					anchor_frame := timeline_view.start + anchor / timeline_view.zoom
-					new_zoom := clamp(timeline_view.zoom * (1 + 0.1 * event.wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
-					if new_zoom != timeline_view.zoom {
-						timeline_view.start = anchor_frame - anchor / new_zoom
-						timeline_view.start = clamp(timeline_view.start, 0, f32(timeline_duration()))
-						timeline_view.zoom = new_zoom
-					}
-				}
-				break
-			}
-			// Alt+Scroll over the preview crop-zooms the selected clip: the clip's
-			// source window magnifies about the box center while the visible box
-			// stays put, committed as one "Zoom clip" undo node per wheel event.
-			pb := clay.GetElementData(clay.ID("Preview")).boundingBox
-			if event.wheel.mouse_x >= pb.x && event.wheel.mouse_x <= pb.x + pb.width &&
-				event.wheel.mouse_y >= pb.y && event.wheel.mouse_y <= pb.y + pb.height {
-				if event.wheel.y != 0 {
-					// The one deliberate exception to "modifiers off the
-					// event": SDL's MouseWheelEvent carries no `mod` field at
-					// all (see vendor:sdl3 KeyboardEvent, which has one, and
-					// MouseWheelEvent, which does not), so there is nothing to
-					// read but the live state. Do not "fix" this to match the
-					// key handlers — it is not the same situation.
-					mods := sdl.GetModState()
-					if sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods {
-						if sel, ok := transformable_selected(); ok && sel.kind != .Text {
-							factor := 1 + 0.1 * event.wheel.y
-							if crop_viewport_zoom(sel, factor, false) {
-								undo_begin()
-								crop_viewport_zoom(sel, factor, true)
-								undo_push(.Transform, "Zoom clip")
-							}
-							break
-						}
-					}
-					// Scroll over the preview zooms the camera, keeping the point under
-					// the cursor fixed.
-					canvas := preview_canvas(pb)
-					mx_c := event.wheel.mouse_x - (canvas.x + canvas.width / 2)
-					my_c := event.wheel.mouse_y - (canvas.y + canvas.height / 2)
-					old_zoom := preview_cam.zoom
-					new_zoom := clamp(old_zoom * (1 + 0.1 * event.wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
-					if new_zoom != old_zoom {
-						// Zooming steers the camera, so the fit toggle releases.
-						preview_cam.fit_to_window = false
-						// NOTE: cursor-anchored zoom -- the point under the cursor
-					// stays put, so pan (preview_cam.ox|oy) scales by the zoom
-					// ratio here and only gets clamped later at render time.
-					preview_cam.ox = mx_c - (mx_c - preview_cam.ox) * (new_zoom / old_zoom)
-						preview_cam.oy = my_c - (my_c - preview_cam.oy) * (new_zoom / old_zoom)
-						preview_cam.zoom = new_zoom
-					}
-				}
-			}
+			handle_mouse_wheel(event.wheel)
 		}
 	}
 	// Between drains, never inside one. SDL documents that activating an IME
@@ -400,5 +291,124 @@ dispatch_action :: proc(act: Action) {
 			project.end_frame = -1
 		}
 	case .None:
+	}
+}
+
+
+// MOUSE_WHEEL routes by what is under the cursor: the file finder, the media
+// bin, the inspector stack, the track list, the timeline, the crop box, or the
+// preview camera. The target tests are mutually exclusive, so the first hit
+// returns and the rest fall away -- one wheel event steers exactly one view.
+// The `break`s here used to leave the switch; a return is the same exit.
+handle_mouse_wheel :: proc(wheel: sdl.MouseWheelEvent) {
+	// Wheel over the file finder moves its selection (like the cmdline
+	// match list): up = earlier rows, down = later.
+	fc := clay.GetElementData(clay.ID("FinderColumn")).boundingBox
+	if fc.width > 0 && wheel.mouse_x >= fc.x && wheel.mouse_x <= fc.x + fc.width &&
+		wheel.mouse_y >= fc.y && wheel.mouse_y <= fc.y + fc.height {
+		if wheel.y != 0 {
+			finder_navigate(-int(wheel.y))
+			return
+		}
+	}
+	// Scroll over the media bin scrolls its active view: the thumbnail
+	// grid in the Media Bin view, the undo tree in the Undo Tree view.
+	mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
+	if mb.width > 0 && wheel.mouse_x >= mb.x && wheel.mouse_x <= mb.x + mb.width &&
+		wheel.mouse_y >= mb.y && wheel.mouse_y <= mb.y + mb.height {
+		if wheel.y != 0 {
+			if panel_views.media_bin_view == .Undo {
+				undo_hist.view_scroll = clamp(
+					undo_hist.view_scroll - f32(wheel.y) * TIMELINE_SCROLL_STEP,
+					0,
+					undo_view_max_scroll(),
+				)
+			} else if len(media_bin.assets) > 0 {
+				panel_views.media_bin_scroll = clamp(panel_views.media_bin_scroll - f32(wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
+			}
+			return
+		}
+	}
+	// Scroll over the inspector column scrolls its card stack when
+	// the cards outgrow the viewport.
+	ic := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
+	if ic.height > 0 && wheel.mouse_x >= ic.x && wheel.mouse_x <= ic.x + ic.width &&
+		wheel.mouse_y >= ic.y && wheel.mouse_y <= ic.y + ic.height {
+		if wheel.y != 0 {
+			scrollbars.inspector.offset = clamp(scrollbars.inspector.offset - f32(wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
+			return
+		}
+	}
+	// Vertical wheel over the track LANES (and the scrollbar strip
+	// beside them) scrolls the track list, exactly like the media
+	// bin. The ruler strip above still zooms on wheel.
+	ta := clay.GetElementData(clay.ID("TrackArea")).boundingBox
+	if ta.height > 0 && wheel.mouse_x >= ta.x && wheel.mouse_x <= ta.x + ta.width &&
+		wheel.mouse_y >= ta.y && wheel.mouse_y <= ta.y + ta.height {
+		if wheel.y != 0 {
+			timeline_view.top = clamp(timeline_view.top - f32(wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
+			return
+		}
+	}
+	// Scroll over the timeline zooms horizontally, anchored at the playhead.
+	tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
+	if len(timeline.tracks) > 0 && wheel.mouse_x >= tlb.x && wheel.mouse_x <= tlb.x + tlb.width &&
+		wheel.mouse_y >= tlb.y && wheel.mouse_y <= tlb.y + tlb.height {
+		if wheel.y != 0 {
+			ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+			anchor := f32(playhead.frame - i64(timeline_view.start)) * timeline_view.zoom
+			anchor_frame := timeline_view.start + anchor / timeline_view.zoom
+			new_zoom := clamp(timeline_view.zoom * (1 + 0.1 * wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+			if new_zoom != timeline_view.zoom {
+				timeline_view.start = anchor_frame - anchor / new_zoom
+				timeline_view.start = clamp(timeline_view.start, 0, f32(timeline_duration()))
+				timeline_view.zoom = new_zoom
+			}
+		}
+		return
+	}
+	// Alt+Scroll over the preview crop-zooms the selected clip: the clip's
+	// source window magnifies about the box center while the visible box
+	// stays put, committed as one "Zoom clip" undo node per wheel event.
+	pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+	if wheel.mouse_x >= pb.x && wheel.mouse_x <= pb.x + pb.width &&
+		wheel.mouse_y >= pb.y && wheel.mouse_y <= pb.y + pb.height {
+		if wheel.y != 0 {
+			// The one deliberate exception to "modifiers off the
+			// event": SDL's MouseWheelEvent carries no `mod` field at
+			// all (see vendor:sdl3 KeyboardEvent, which has one, and
+			// MouseWheelEvent, which does not), so there is nothing to
+			// read but the live state. Do not "fix" this to match the
+			// key handlers — it is not the same situation.
+			mods := sdl.GetModState()
+			if sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods {
+				if sel, ok := transformable_selected(); ok && sel.kind != .Text {
+					factor := 1 + 0.1 * wheel.y
+					if crop_viewport_zoom(sel, factor, false) {
+						undo_begin()
+						crop_viewport_zoom(sel, factor, true)
+						undo_push(.Transform, "Zoom clip")
+					}
+					return
+				}
+			}
+			// Scroll over the preview zooms the camera, keeping the point under
+			// the cursor fixed.
+			canvas := preview_canvas(pb)
+			mx_c := wheel.mouse_x - (canvas.x + canvas.width / 2)
+			my_c := wheel.mouse_y - (canvas.y + canvas.height / 2)
+			old_zoom := preview_cam.zoom
+			new_zoom := clamp(old_zoom * (1 + 0.1 * wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
+			if new_zoom != old_zoom {
+				// Zooming steers the camera, so the fit toggle releases.
+				preview_cam.fit_to_window = false
+				// NOTE: cursor-anchored zoom -- the point under the cursor
+			// stays put, so pan (preview_cam.ox|oy) scales by the zoom
+			// ratio here and only gets clamped later at render time.
+			preview_cam.ox = mx_c - (mx_c - preview_cam.ox) * (new_zoom / old_zoom)
+				preview_cam.oy = my_c - (my_c - preview_cam.oy) * (new_zoom / old_zoom)
+				preview_cam.zoom = new_zoom
+			}
+		}
 	}
 }
