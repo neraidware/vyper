@@ -445,493 +445,7 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 			cornerRadius = clay.CornerRadiusAll(RADIUS_CONTAINER),
 		},
 		) {
-			if len(timeline.tracks) == 0 {
-				// Empty timeline: the import entry point plus its alternatives.
-				if clay.UI(clay.ID("EmptyTimeline"))(
-				{
-					layout = {
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-						layoutDirection = .TopToBottom,
-						childGap = CARD_GAP,
-						childAlignment = {x = .Center, y = .Center},
-					},
-				},
-				) {
-					if clay.UI(clay.ID("OpenFileButton"))(
-					{
-						layout = {
-							sizing = {
-								width = clay.SizingFixed(220),
-								height = clay.SizingFixed(56),
-							},
-							padding = clay.PaddingAll(TIMELINE_PADDING),
-							childAlignment = {x = .Center, y = .Center},
-						},
-						backgroundColor = BUTTON,
-						cornerRadius = clay.CornerRadiusAll(RADIUS_CONTAINER),
-						border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-					},
-					) {
-						clay.Text(
-							"Open file",
-							clay.TextElementConfig {
-								textColor = TEXT,
-								fontSize = FONT_HEADING,
-								textAlignment = .Center,
-							},
-						)
-					}
-				}
-			} else {
-				if clay.UI(clay.ID("ClipTimeline"))(
-				{
-					layout = {
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-						padding = clay.PaddingAll(TIMELINE_PADDING),
-						layoutDirection = .TopToBottom,
-						childGap = CARD_GAP,
-					},
-					backgroundColor = BUTTON,
-					cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
-					border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-				},
-				) {
-					// Timing ruler bar: mirrors the track rows' left gutter so its
-					// x-origin (frame 0) aligns exactly with the clip lanes.
-					if clay.UI(clay.ID("RulerRow"))(
-					{
-						layout = {
-							sizing = {
-								width = clay.SizingGrow({}),
-								height = clay.SizingFixed(RULER_HEIGHT),
-							},
-							layoutDirection = .LeftToRight,
-							childGap = SECTION_GAP,
-						},
-					},
-					) {
-						if clay.UI(clay.ID("RulerGutter"))(
-						{
-							layout = {
-								sizing = {
-									width = clay.SizingFixed(GUTTER_WIDTH),
-									height = clay.SizingGrow({}),
-								},
-							},
-							backgroundColor = TRACK_GUTTER_BG,
-						},
-						) {
-							// Playhead time viewer: the timecode badge sits in the
-							// empty top-left corner above the track-name gutters and
-							// before the ruler. Clicking it opens numeric navigation
-							// (begin_playhead_time_edit) to jump the playhead.
-							if clay.UI(clay.ID("PlayheadTime"))(
-							{
-								layout = {
-									sizing = {
-										width = clay.SizingGrow({}),
-										height = clay.SizingGrow({}),
-									},
-									childAlignment = {x = .Center, y = .Center},
-								},
-								backgroundColor = clay.Hovered() ? BUTTON_HOVER : TRACK_GUTTER_BG,
-							},
-							) {
-								clay.Text(
-									playhead_timecode(),
-									clay.TextElementConfig {
-										textColor = TEXT,
-										fontSize = FONT_SMALL,
-										textAlignment = .Center,
-									},
-								)
-							}
-						}
-						if clay.UI(clay.ID("Ruler"))(
-						{
-							layout = {
-								sizing = {
-									width = clay.SizingGrow({}),
-									height = clay.SizingGrow({}),
-								},
-							},
-							backgroundColor = EDITOR_BG,
-							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-							cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-						},
-						) {}
-					}
-					// The track list lives in its own scroll viewport. TrackArea
-					// holds the scrollable lanes (TracksSection) plus the vertical
-					// scrollbar strip, so the scroll geometry is one clean unit
-					// beside the fixed ruler strip above it.
-					if clay.UI(clay.ID("TrackArea"))(
-					{
-						layout = {
-							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-							layoutDirection = .LeftToRight,
-							childGap = 0,
-						},
-					},
-					) {
-						if clay.UI(clay.ID("TracksSection"))(
-						{
-							layout = {
-								sizing = {
-									width = clay.SizingGrow({}),
-									height = clay.SizingGrow({}),
-								},
-								layoutDirection = .TopToBottom,
-								childGap = 0,
-							},
-							clip = {vertical = true, childOffset = {0, -timeline_view.top}},
-						},
-						) {
-							sync_track_order()
-							for r := 0; r <= len(timeline.track_order); r += 1 {
-								// Insert gap above each track: the "Add track"
-								// button is limited to the gutter column, and the
-								// strip's remaining space carries the track's
-								// point-marker triangles (drawn by
-								// draw_clip_markers). gap/add-track IDs are
-								// keyed by ORDER position r (insert_track uses
-								// the position to place the new row).
-								gap_id := clay.ID("TrackGap", u32(r))
-								button_id := clay.ID("AddTrack", u32(r))
-								button_hovered := clay.PointerOver(button_id)
-								if clay.UI(gap_id)(
-								{
-									layout = {
-										sizing = {
-											width = clay.SizingGrow({}),
-											height = clay.SizingFixed(TRACK_GAP_H),
-										},
-										layoutDirection = .LeftToRight,
-										childGap = 0,
-									},
-								},
-								) {
-									if clay.UI(button_id)(
-									{
-										layout = {
-											sizing = {
-												width = clay.SizingFixed(GUTTER_WIDTH),
-												height = clay.SizingGrow({}),
-											},
-											childAlignment = {x = .Center, y = .Center},
-										},
-										backgroundColor = button_hovered ? clay.Color{58, 81, 93, 255} : EDITOR_BG,
-										cornerRadius = clay.CornerRadiusAll(3),
-									},
-									) {
-										if button_hovered {
-											clay.Text(
-												"+ Add track",
-												clay.TextElementConfig {
-													textColor = BUTTON_BORDER_HOVER,
-													fontSize = FONT_NORMAL,
-												},
-											)
-										}
-									}
-								}
-							if r >= len(timeline.track_order) {
-								break
-							}
-							ti := timeline.track_order[r]
-							track := &timeline.tracks[ti]
-							kf_rows := kf_rows_for(track)
-							if clay.UI(clay.ID("TrackRow", u32(ti)))(
-							{
-								layout = {
-									sizing = {
-										width = clay.SizingGrow({}),
-										height = clay.SizingFixed(TRACK_ROW_H + f32(kf_rows) * KF_ROW_H),
-									},
-									layoutDirection = .LeftToRight,
-									childGap = SECTION_GAP,
-								},
-							},
-							) {
-								if clay.UI(clay.ID("TrackName", u32(ti)))(
-								{
-									layout = {
-										sizing = {
-											width = clay.SizingFixed(GUTTER_WIDTH),
-											height = clay.SizingGrow({}),
-										},
-										layoutDirection = .TopToBottom,
-										childGap = 4,
-										childAlignment = {x = .Left, y = .Top},
-									},
-									backgroundColor = TRACK_GUTTER_BG,
-								},
-								) {
-									clay.Text(
-										track.name,
-										clay.TextElementConfig {
-											textColor = TEXT,
-											fontSize = FONT_HEADING,
-										},
-									)
-									// No per-track buttons here: duplicate/delete moved
-									// to the track menu (right-click the gutter), which
-									// keeps the row short enough to fit more tracks.
-									if kf_rows > 0 {
-										// Keyframe property labels: one KF_ROW_H line per
-										// visible lane, stacked under the buttons so they
-										// line up with the diamond lanes beside them.
-										kf_names: [32]string
-										kf_count := kf_gutter_names(track, kf_rows, kf_names[:])
-										if clay.UI(clay.ID("KfGutterNames", u32(ti)))(
-										{
-											layout = {
-												sizing = {
-													width = clay.SizingGrow({}),
-													height = clay.SizingFit({}),
-												},
-												layoutDirection = .TopToBottom,
-											},
-										},
-										) {
-											for i in 0 ..< kf_count {
-												if clay.UI(clay.ID("KfGutterName", u32(ti * 1000 + i)))(
-												{
-													layout = {
-														sizing = {
-															width = clay.SizingGrow({}),
-															height = clay.SizingFixed(KF_ROW_H),
-														},
-														childAlignment = {x = .Left, y = .Center},
-													},
-												},
-												) {
-													clay.Text(
-														kf_names[i],
-														clay.TextElementConfig {
-															textColor = RULER_LABEL_COLOR,
-															fontSize = FONT_SMALL,
-														},
-													)
-												}
-											}
-										}
-									}
-								}
-								if clay.UI(clay.ID("ClipsSection", u32(ti)))(
-								{
-									layout = {
-										sizing = {
-											width = clay.SizingGrow({}),
-											height = clay.SizingGrow({}),
-										},
-										layoutDirection = .LeftToRight,
-									},
-									backgroundColor = EDITOR_BG,
-									clip = {
-										horizontal = true,
-										vertical = true,
-										childOffset = {
-											-timeline_view.start * timeline_view.zoom,
-											0,
-										},
-									},
-								},
-								) {
-									clips_content_x: f32 = 0
-									for timeline_clip, index in track.clips {
-										target_x :=
-											f32(timeline_clip.timeline_start_frame) *
-											timeline_view.zoom
-										if target_x > clips_content_x {
-											spacer_w := target_x - clips_content_x
-											clips_content_x = target_x
-											clay.UI(
-												clay.ID(
-													"ClipOffset",
-													u32(ti * 1000 + index),
-												),
-											)(
-												{
-													layout = {
-														sizing = {
-															width = clay.SizingFixed(spacer_w),
-															height = clay.SizingGrow({}),
-														},
-													},
-												},
-											)
-										}
-										clip_width :=
-											f32(max(timeline_clip.source_length_frames, 1)) *
-											timeline_view.zoom
-										clip_color := BUTTON
-										clip_border := BUTTON_BORDER
-										clip_border_w: u16 = 2
-										clip_label := timeline_clip.name
-										if timeline_clip.kind == .Audio {
-											clip_color = AUDIO_CLIP
-											if clip_label == "" {
-												clip_label = "Audio"
-											}
-										} else if clip_label == "" {
-											clip_label = "Clip"
-										}
-										if ti == selection.track &&
-										   index == selection.index {
-											clip_border = SELECT_BORDER
-											clip_border_w = 3
-										} else if is_clip_selected(ti, index) {
-											if timeline_clip.link_id != 0 {
-												clip_border = MARKER_COLOR
-											} else {
-												clip_border = SELECT_BORDER
-											}
-											clip_border_w = 3
-										}
-										next_touches :=
-											index + 1 < len(track.clips) &&
-											track.clips[index + 1].timeline_start_frame ==
-												clip_timeline_end(timeline_clip)
-										bw := clip_border_w
-										border := clay.BorderWidth {
-											left   = bw,
-											top    = bw,
-											bottom = bw,
-										}
-										border.right = next_touches ? 0 : bw
-										// The tile is wrapped so a keyframed clip grows
-										// DOWNWARD: a fixed-height tile (markers, selection,
-										// hit tests all key off it) plus one KF_ROW_H lane per
-										// keyframe track. The lane elements reserve the space
-										// the diamond overlay (draw_keyframes) paints into and
-										// give the interaction slice click targets; a hairline
-										// on each lane's top makes the stack read as a strip.
-										kf_n := len(timeline_clip.keyframe_tracks)
-										if clay.UI(
-											clay.ID(
-												"TimelineClipWrap",
-												u32(ti * 1000 + index),
-											),
-										)(
-											{
-												layout = {
-													sizing = {
-														width = clay.SizingFixed(clip_width),
-														height = clay.SizingFixed(
-															CLIP_TILE_HEIGHT + f32(kf_n) * KF_ROW_H,
-														),
-													},
-													layoutDirection = .TopToBottom,
-												},
-											},
-										) {
-											if clay.UI(
-												clay.ID(
-													"TimelineClip",
-													u32(ti * 1000 + index),
-												),
-											)(
-												{
-													layout = {
-														sizing = {
-															// The tile's width is the MODEL's
-															// (frames*zoom), never its content's: a
-															// Grow tile let the label's measured width
-															// plus padding push the tile PAST the
-															// wrap's fixed width, so a short clip drew
-															// wider than it was -- and its hit test,
-															// drag origin and markers inherited that
-															// same wrong box. The label is clipped to
-															// the tile instead.
-															width = clay.SizingFixed(clip_width),
-															height = clay.SizingFixed(CLIP_TILE_HEIGHT),
-														},
-														padding = clay.PaddingAll(CARD_GAP),
-													},
-													clip = {horizontal = true},
-													backgroundColor = clip_color,
-													cornerRadius = clay.CornerRadiusAll(
-														RADIUS_WIDGET,
-													),
-													border = {color = clip_border, width = border},
-												},
-											) {
-												clay.Text(
-													clip_label,
-													clay.TextElementConfig {
-														textColor = TEXT,
-														fontSize = FONT_HEADING,
-													},
-												)
-											}
-											for tr in 0 ..< kf_n {
-												if clay.UI(
-													clay.ID(
-														"KeyframeLane",
-														u32((ti * 1000 + index) * 1000 + tr),
-													),
-												)(
-													{
-														layout = {
-															sizing = {
-																width = clay.SizingGrow({}),
-																height = clay.SizingFixed(KF_ROW_H),
-															},
-														},
-														border = {
-															color = RULER_TICK_COLOR,
-															width = clay.BorderWidth{top = 1},
-														},
-													},
-												) {}
-											}
-										}
-										clips_content_x += clip_width
-									}
-								}
-							}
-						}
-						}
-					}
-					// Bottom bar: the snap toggles on the left, the zoom controls
-					// on the right, all under the tracks so the timeline is
-					// controllable without a separate top toolbar.
-					if clay.UI(clay.ID("TimelineBottomBar"))(
-					{
-						layout = {
-							sizing = {
-								width = clay.SizingGrow({}),
-								height = clay.SizingFixed(TIMELINE_BAR_H),
-							},
-							layoutDirection = .LeftToRight,
-							childGap = BUTTON_ROW_GAP,
-							childAlignment = {x = .Left, y = .Center},
-						},
-					},
-					) {
-						settings_icon_button("SnapClipToPh", editor_flags.snap_clips_to_playhead)
-						settings_icon_button("SnapPhToClip", editor_flags.snap_playhead_to_clips)
-						settings_icon_button("AutoKf", editor_flags.auto_keyframe)
-						// Grow spacer pushes the zoom group to the right edge,
-						// keeping the snap toggles pinned left.
-						if clay.UI(clay.ID("TimelineBottomSpacer"))(
-						{
-							layout = {
-								sizing = {
-									width = clay.SizingGrow({}),
-									height = clay.SizingGrow({}),
-								},
-							},
-						},
-						) {}
-						bar_caption("Zoom:")
-						tool_button("TimelineZoomOut", "−")
-						tool_button("TimelineZoomFit", "Fit")
-						tool_button("TimelineZoomIn", "+")
-					}
-				}
-			}
+			build_timeline(DEFAULT_BORDER)
 		}
 	}
 	draw_context_menu()
@@ -3256,5 +2770,499 @@ media_bin_item :: proc(index: int) {
 			path_basename(asset.path),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
+	}
+}
+
+
+// Timeline panel body: the empty-state import entry point when there are no
+// tracks, otherwise the ruler + track lanes + bottom snap/zoom bar. Clay keeps
+// appending to the layout build_page began, so this is a straight code move.
+build_timeline :: proc(default_border: clay.BorderWidth) {
+	if len(timeline.tracks) == 0 {
+		// Empty timeline: the import entry point plus its alternatives.
+		if clay.UI(clay.ID("EmptyTimeline"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				layoutDirection = .TopToBottom,
+				childGap = CARD_GAP,
+				childAlignment = {x = .Center, y = .Center},
+			},
+		},
+		) {
+			if clay.UI(clay.ID("OpenFileButton"))(
+			{
+				layout = {
+					sizing = {
+						width = clay.SizingFixed(220),
+						height = clay.SizingFixed(56),
+					},
+					padding = clay.PaddingAll(TIMELINE_PADDING),
+					childAlignment = {x = .Center, y = .Center},
+				},
+				backgroundColor = BUTTON,
+				cornerRadius = clay.CornerRadiusAll(RADIUS_CONTAINER),
+				border = {color = BUTTON_BORDER, width = default_border},
+			},
+			) {
+				clay.Text(
+					"Open file",
+					clay.TextElementConfig {
+						textColor = TEXT,
+						fontSize = FONT_HEADING,
+						textAlignment = .Center,
+					},
+				)
+			}
+		}
+	} else {
+		if clay.UI(clay.ID("ClipTimeline"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				padding = clay.PaddingAll(TIMELINE_PADDING),
+				layoutDirection = .TopToBottom,
+				childGap = CARD_GAP,
+			},
+			backgroundColor = BUTTON,
+			cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
+			border = {color = BUTTON_BORDER, width = default_border},
+		},
+		) {
+			// Timing ruler bar: mirrors the track rows' left gutter so its
+			// x-origin (frame 0) aligns exactly with the clip lanes.
+			if clay.UI(clay.ID("RulerRow"))(
+			{
+				layout = {
+					sizing = {
+						width = clay.SizingGrow({}),
+						height = clay.SizingFixed(RULER_HEIGHT),
+					},
+					layoutDirection = .LeftToRight,
+					childGap = SECTION_GAP,
+				},
+			},
+			) {
+				if clay.UI(clay.ID("RulerGutter"))(
+				{
+					layout = {
+						sizing = {
+							width = clay.SizingFixed(GUTTER_WIDTH),
+							height = clay.SizingGrow({}),
+						},
+					},
+					backgroundColor = TRACK_GUTTER_BG,
+				},
+				) {
+					// Playhead time viewer: the timecode badge sits in the
+					// empty top-left corner above the track-name gutters and
+					// before the ruler. Clicking it opens numeric navigation
+					// (begin_playhead_time_edit) to jump the playhead.
+					if clay.UI(clay.ID("PlayheadTime"))(
+					{
+						layout = {
+							sizing = {
+								width = clay.SizingGrow({}),
+								height = clay.SizingGrow({}),
+							},
+							childAlignment = {x = .Center, y = .Center},
+						},
+						backgroundColor = clay.Hovered() ? BUTTON_HOVER : TRACK_GUTTER_BG,
+					},
+					) {
+						clay.Text(
+							playhead_timecode(),
+							clay.TextElementConfig {
+								textColor = TEXT,
+								fontSize = FONT_SMALL,
+								textAlignment = .Center,
+							},
+						)
+					}
+				}
+				if clay.UI(clay.ID("Ruler"))(
+				{
+					layout = {
+						sizing = {
+							width = clay.SizingGrow({}),
+							height = clay.SizingGrow({}),
+						},
+					},
+					backgroundColor = EDITOR_BG,
+					border = {color = BUTTON_BORDER, width = default_border},
+					cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+				},
+				) {}
+			}
+			// The track list lives in its own scroll viewport. TrackArea
+			// holds the scrollable lanes (TracksSection) plus the vertical
+			// scrollbar strip, so the scroll geometry is one clean unit
+			// beside the fixed ruler strip above it.
+			if clay.UI(clay.ID("TrackArea"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+					layoutDirection = .LeftToRight,
+					childGap = 0,
+				},
+			},
+			) {
+				if clay.UI(clay.ID("TracksSection"))(
+				{
+					layout = {
+						sizing = {
+							width = clay.SizingGrow({}),
+							height = clay.SizingGrow({}),
+						},
+						layoutDirection = .TopToBottom,
+						childGap = 0,
+					},
+					clip = {vertical = true, childOffset = {0, -timeline_view.top}},
+				},
+				) {
+					sync_track_order()
+					for r := 0; r <= len(timeline.track_order); r += 1 {
+						// Insert gap above each track: the "Add track"
+						// button is limited to the gutter column, and the
+						// strip's remaining space carries the track's
+						// point-marker triangles (drawn by
+						// draw_clip_markers). gap/add-track IDs are
+						// keyed by ORDER position r (insert_track uses
+						// the position to place the new row).
+						gap_id := clay.ID("TrackGap", u32(r))
+						button_id := clay.ID("AddTrack", u32(r))
+						button_hovered := clay.PointerOver(button_id)
+						if clay.UI(gap_id)(
+						{
+							layout = {
+								sizing = {
+									width = clay.SizingGrow({}),
+									height = clay.SizingFixed(TRACK_GAP_H),
+								},
+								layoutDirection = .LeftToRight,
+								childGap = 0,
+							},
+						},
+						) {
+							if clay.UI(button_id)(
+							{
+								layout = {
+									sizing = {
+										width = clay.SizingFixed(GUTTER_WIDTH),
+										height = clay.SizingGrow({}),
+									},
+									childAlignment = {x = .Center, y = .Center},
+								},
+								backgroundColor = button_hovered ? clay.Color{58, 81, 93, 255} : EDITOR_BG,
+								cornerRadius = clay.CornerRadiusAll(3),
+							},
+							) {
+								if button_hovered {
+									clay.Text(
+										"+ Add track",
+										clay.TextElementConfig {
+											textColor = BUTTON_BORDER_HOVER,
+											fontSize = FONT_NORMAL,
+										},
+									)
+								}
+							}
+						}
+					if r >= len(timeline.track_order) {
+						break
+					}
+					ti := timeline.track_order[r]
+					track := &timeline.tracks[ti]
+					kf_rows := kf_rows_for(track)
+					if clay.UI(clay.ID("TrackRow", u32(ti)))(
+					{
+						layout = {
+							sizing = {
+								width = clay.SizingGrow({}),
+								height = clay.SizingFixed(TRACK_ROW_H + f32(kf_rows) * KF_ROW_H),
+							},
+							layoutDirection = .LeftToRight,
+							childGap = SECTION_GAP,
+						},
+					},
+					) {
+						if clay.UI(clay.ID("TrackName", u32(ti)))(
+						{
+							layout = {
+								sizing = {
+									width = clay.SizingFixed(GUTTER_WIDTH),
+									height = clay.SizingGrow({}),
+								},
+								layoutDirection = .TopToBottom,
+								childGap = 4,
+								childAlignment = {x = .Left, y = .Top},
+							},
+							backgroundColor = TRACK_GUTTER_BG,
+						},
+						) {
+							clay.Text(
+								track.name,
+								clay.TextElementConfig {
+									textColor = TEXT,
+									fontSize = FONT_HEADING,
+								},
+							)
+							// No per-track buttons here: duplicate/delete moved
+							// to the track menu (right-click the gutter), which
+							// keeps the row short enough to fit more tracks.
+							if kf_rows > 0 {
+								// Keyframe property labels: one KF_ROW_H line per
+								// visible lane, stacked under the buttons so they
+								// line up with the diamond lanes beside them.
+								kf_names: [32]string
+								kf_count := kf_gutter_names(track, kf_rows, kf_names[:])
+								if clay.UI(clay.ID("KfGutterNames", u32(ti)))(
+								{
+									layout = {
+										sizing = {
+											width = clay.SizingGrow({}),
+											height = clay.SizingFit({}),
+										},
+										layoutDirection = .TopToBottom,
+									},
+								},
+								) {
+									for i in 0 ..< kf_count {
+										if clay.UI(clay.ID("KfGutterName", u32(ti * 1000 + i)))(
+										{
+											layout = {
+												sizing = {
+													width = clay.SizingGrow({}),
+													height = clay.SizingFixed(KF_ROW_H),
+												},
+												childAlignment = {x = .Left, y = .Center},
+											},
+										},
+										) {
+											clay.Text(
+												kf_names[i],
+												clay.TextElementConfig {
+													textColor = RULER_LABEL_COLOR,
+													fontSize = FONT_SMALL,
+												},
+											)
+										}
+									}
+								}
+							}
+						}
+						if clay.UI(clay.ID("ClipsSection", u32(ti)))(
+						{
+							layout = {
+								sizing = {
+									width = clay.SizingGrow({}),
+									height = clay.SizingGrow({}),
+								},
+								layoutDirection = .LeftToRight,
+							},
+							backgroundColor = EDITOR_BG,
+							clip = {
+								horizontal = true,
+								vertical = true,
+								childOffset = {
+									-timeline_view.start * timeline_view.zoom,
+									0,
+								},
+							},
+						},
+						) {
+							clips_content_x: f32 = 0
+							for timeline_clip, index in track.clips {
+								target_x :=
+									f32(timeline_clip.timeline_start_frame) *
+									timeline_view.zoom
+								if target_x > clips_content_x {
+									spacer_w := target_x - clips_content_x
+									clips_content_x = target_x
+									clay.UI(
+										clay.ID(
+											"ClipOffset",
+											u32(ti * 1000 + index),
+										),
+									)(
+										{
+											layout = {
+												sizing = {
+													width = clay.SizingFixed(spacer_w),
+													height = clay.SizingGrow({}),
+												},
+											},
+										},
+									)
+								}
+								clip_width :=
+									f32(max(timeline_clip.source_length_frames, 1)) *
+									timeline_view.zoom
+								clip_color := BUTTON
+								clip_border := BUTTON_BORDER
+								clip_border_w: u16 = 2
+								clip_label := timeline_clip.name
+								if timeline_clip.kind == .Audio {
+									clip_color = AUDIO_CLIP
+									if clip_label == "" {
+										clip_label = "Audio"
+									}
+								} else if clip_label == "" {
+									clip_label = "Clip"
+								}
+								if ti == selection.track &&
+								   index == selection.index {
+									clip_border = SELECT_BORDER
+									clip_border_w = 3
+								} else if is_clip_selected(ti, index) {
+									if timeline_clip.link_id != 0 {
+										clip_border = MARKER_COLOR
+									} else {
+										clip_border = SELECT_BORDER
+									}
+									clip_border_w = 3
+								}
+								next_touches :=
+									index + 1 < len(track.clips) &&
+									track.clips[index + 1].timeline_start_frame ==
+										clip_timeline_end(timeline_clip)
+								bw := clip_border_w
+								border := clay.BorderWidth {
+									left   = bw,
+									top    = bw,
+									bottom = bw,
+								}
+								border.right = next_touches ? 0 : bw
+								// The tile is wrapped so a keyframed clip grows
+								// DOWNWARD: a fixed-height tile (markers, selection,
+								// hit tests all key off it) plus one KF_ROW_H lane per
+								// keyframe track. The lane elements reserve the space
+								// the diamond overlay (draw_keyframes) paints into and
+								// give the interaction slice click targets; a hairline
+								// on each lane's top makes the stack read as a strip.
+								kf_n := len(timeline_clip.keyframe_tracks)
+								if clay.UI(
+									clay.ID(
+										"TimelineClipWrap",
+										u32(ti * 1000 + index),
+									),
+								)(
+									{
+										layout = {
+											sizing = {
+												width = clay.SizingFixed(clip_width),
+												height = clay.SizingFixed(
+													CLIP_TILE_HEIGHT + f32(kf_n) * KF_ROW_H,
+												),
+											},
+											layoutDirection = .TopToBottom,
+										},
+									},
+								) {
+									if clay.UI(
+										clay.ID(
+											"TimelineClip",
+											u32(ti * 1000 + index),
+										),
+									)(
+										{
+											layout = {
+												sizing = {
+													// The tile's width is the MODEL's
+													// (frames*zoom), never its content's: a
+													// Grow tile let the label's measured width
+													// plus padding push the tile PAST the
+													// wrap's fixed width, so a short clip drew
+													// wider than it was -- and its hit test,
+													// drag origin and markers inherited that
+													// same wrong box. The label is clipped to
+													// the tile instead.
+													width = clay.SizingFixed(clip_width),
+													height = clay.SizingFixed(CLIP_TILE_HEIGHT),
+												},
+												padding = clay.PaddingAll(CARD_GAP),
+											},
+											clip = {horizontal = true},
+											backgroundColor = clip_color,
+											cornerRadius = clay.CornerRadiusAll(
+												RADIUS_WIDGET,
+											),
+											border = {color = clip_border, width = border},
+										},
+									) {
+										clay.Text(
+											clip_label,
+											clay.TextElementConfig {
+												textColor = TEXT,
+												fontSize = FONT_HEADING,
+											},
+										)
+									}
+									for tr in 0 ..< kf_n {
+										if clay.UI(
+											clay.ID(
+												"KeyframeLane",
+												u32((ti * 1000 + index) * 1000 + tr),
+											),
+										)(
+											{
+												layout = {
+													sizing = {
+														width = clay.SizingGrow({}),
+														height = clay.SizingFixed(KF_ROW_H),
+													},
+												},
+												border = {
+													color = RULER_TICK_COLOR,
+													width = clay.BorderWidth{top = 1},
+												},
+											},
+										) {}
+									}
+								}
+								clips_content_x += clip_width
+							}
+						}
+					}
+				}
+				}
+			}
+			// Bottom bar: the snap toggles on the left, the zoom controls
+			// on the right, all under the tracks so the timeline is
+			// controllable without a separate top toolbar.
+			if clay.UI(clay.ID("TimelineBottomBar"))(
+			{
+				layout = {
+					sizing = {
+						width = clay.SizingGrow({}),
+						height = clay.SizingFixed(TIMELINE_BAR_H),
+					},
+					layoutDirection = .LeftToRight,
+					childGap = BUTTON_ROW_GAP,
+					childAlignment = {x = .Left, y = .Center},
+				},
+			},
+			) {
+				settings_icon_button("SnapClipToPh", editor_flags.snap_clips_to_playhead)
+				settings_icon_button("SnapPhToClip", editor_flags.snap_playhead_to_clips)
+				settings_icon_button("AutoKf", editor_flags.auto_keyframe)
+				// Grow spacer pushes the zoom group to the right edge,
+				// keeping the snap toggles pinned left.
+				if clay.UI(clay.ID("TimelineBottomSpacer"))(
+				{
+					layout = {
+						sizing = {
+							width = clay.SizingGrow({}),
+							height = clay.SizingGrow({}),
+						},
+					},
+				},
+				) {}
+				bar_caption("Zoom:")
+				tool_button("TimelineZoomOut", "−")
+				tool_button("TimelineZoomFit", "Fit")
+				tool_button("TimelineZoomIn", "+")
+			}
+		}
 	}
 }
