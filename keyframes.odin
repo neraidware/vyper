@@ -221,8 +221,19 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 		}
 	}
 	if len(track.keys) == 0 {
+		// The track owns BOTH its cloned name and its key array, and the
+		// deletion above only POPPED the key array: pop shortens without
+		// releasing the buffer, so track.keys still holds a live allocation
+		// here. Dropping the row with ordered_remove then shifted the tracks
+		// over it, orphaning that buffer for the life of the process — one
+		// leaked key array per track that ever lost its last key, which the
+		// memory gate reports from the undo probe (it is the only gate that
+		// runs a path deleting keys down to empty). kf_free_tracks covers both
+		// fields, and the two deletes here are the mirror of it.
+		delete(track.keys)
 		delete(track.name)
 		track.name = ""
+		track.keys = nil
 		ordered_remove(&clip.keyframe_tracks, ti)
 	}
 }

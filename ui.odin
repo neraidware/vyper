@@ -552,11 +552,12 @@ clip_card :: proc() {
 	}
 	tr, cl, ok := selected_clip()
 	if !ok {
-		// A selected keyframe substitutes for the clip in this card: the
-		// keyframe readout (property, frame, editable value). The clip fields
-		// below are skipped because the two selections never coexist (S3).
-		if kcl, klane, kf, kok := kf_selected(); kok {
-			keyframe_readout(kcl, klane, kf)
+		// Selected keyframes substitute for the clip in this card: the keyframe
+		// readout (property, frame, editable value — or, for a multi-selection,
+		// the properties the whole set shares). The clip fields below are
+		// skipped because the two selections never coexist (S3).
+		if kf_sel_active() {
+			keyframe_readout()
 			return
 		}
 		clay.Text(
@@ -873,12 +874,23 @@ clip_card :: proc() {
 }
 
 // keyframe_readout is the "Clip" inspector's keyframe slot, shown in place of
-// the clip fields while a diamond is selected (S3): the property lane's name,
-// the absolute timeline frame the key sits on, and the value field. Fields
-// click-to-edit like the clip properties and commit a kf value edit through
-// edit_commit (S3 already wires the store side; S4 adds drag-move/delete).
-keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
+// the clip fields while keyframes are selected (S3, S7). With exactly one
+// selected it is the property lane's name, the absolute timeline frame the key
+// sits on, the value field, and the interpolation dropdown.
+//
+// With more than one selected it is keyframes_readout, which offers the
+// properties a set of keys genuinely SHARES rather than a var identity.
+keyframe_readout :: proc() {
 	panel_caption("Keyframe")
+	// Dispatch on whether the selection resolves as EXACTLY one key, not on the
+	// count: kf_selected already carries that contract, and a sole selection
+	// whose ref no longer resolves has no clip to name a lane from, so it reads
+	// as the set readout too.
+	cl, lane, kf, one := kf_selected()
+	if !one {
+		keyframes_readout()
+		return
+	}
 	name_buf := ui_text.kf_name[:]
 	clay.Text(
 		fmt.bprintf(name_buf[:], "%s", cl.keyframe_tracks[lane].name),
@@ -951,7 +963,79 @@ keyframe_readout :: proc(cl: ^Clip, lane: int, kf: ^Keyframe) {
 			"Interp",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
-		kf_interp_dropdown(kf)
+		interp, mixed, _ := kf_sel_interp()
+		kf_interp_dropdown(interp, mixed)
+	}
+}
+
+// keyframes_readout is the keyframe slot for a selection of two or more: what
+// the set is, where it spans, and the properties the whole set SHARES.
+//
+// The line between "shared" and "not" is the point of this function, so it is
+// worth stating: a property is shared when one value means the same thing on
+// every selected key. Interpolation qualifies — it eases the segment arriving at
+// a key, so it is a property of the key wherever it sits, and the dropdown
+// writes all of them (kf_set_interp_all). The VALUE does not: it is one key's
+// number for one lane, so with keys on different lanes there is no value that
+// means anything, and with keys on the same lane the only "set them all" is
+// flattening the animation. So the value field is not offered here at all — a
+// "-"-looking field that silently edits keyframes[0] is worse than no field, and
+// neither is a field whose "set all" would flatten a ramp the user just
+// selected. Same rule for the track NAME, which is a var identity and not a
+// property: shown when the whole selection is on one lane (where it is true of
+// every key) and replaced by the count otherwise.
+keyframes_readout :: proc() {
+	count := kf_sel_count()
+	name_buf := ui_text.kf_name[:]
+	// The name is only meaningful as a header when it names EVERY selected key,
+	// which is exactly the shared-property test: one lane, or many.
+	if name, ok := kf_sel_same_lane(); ok {
+		clay.Text(
+			fmt.bprintf(name_buf[:], "%s", name),
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
+		)
+	} else {
+		clay.Text(
+			fmt.bprintf(name_buf[:], "%d keyframes", count),
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
+		)
+	}
+	// The absolute frame span, which is the one frame-shaped fact true of the
+	// whole set. Clips start at different points, so each key's absolute frame
+	// is its own clip's start plus its clip-relative offset.
+	frame_buf := ui_text.kf_frame[:]
+	lo, hi := kf_sel_frame_span()
+	if lo == hi {
+		clay.Text(
+			fmt.bprintf(frame_buf[:], "frame %d", lo),
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
+		)
+	} else {
+		clay.Text(
+			fmt.bprintf(frame_buf[:], "frames %d-%d", lo, hi),
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
+		)
+	}
+	// The shared property. No row at all when not one ref resolved: a dropdown
+	// naming a mode belongs to no selected key then, and an empty label would be
+	// the only honest thing to draw.
+	interp, mixed, seen := kf_sel_interp()
+	if seen &&
+	   clay.UI(clay.ID("KfInterpRow"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+				layoutDirection = .LeftToRight,
+				childGap = BUTTON_ROW_GAP,
+				childAlignment = {x = .Left, y = .Center},
+			},
+		},
+		) {
+		clay.Text(
+			"Interp",
+			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+		)
+		kf_interp_dropdown(interp, mixed)
 	}
 }
 
@@ -974,12 +1058,23 @@ kf_interp_label :: proc(interp: Kf_Interp) -> string {
 	return "Linear"
 }
 
-// kf_interp_dropdown renders the selected keyframe's interpolation selector as
-// a collapsed button toggling a floating menu, the same toggle/select/dismiss
-// shape as the export-encoder dropdown. Picking a mode sets how the segment
-// ARRIVING at the key eases (we ease into a breakpoint, so the key you're
-// heading to owns the curve); an undoable edit, like the value field.
-kf_interp_dropdown :: proc(kf: ^Keyframe) {
+// kf_interp_mixed_label is what a multi-selection's interpolation dropdown shows
+// when the selected keys do NOT agree: no single mode is current, so naming one
+// would be a lie about the set. A named constant because the literal and the
+// reasoning travel together — the menu still offers every mode, and picking one
+// writes the whole selection (kf_set_interp_all).
+KF_INTERP_MIXED_LABEL :: "-"
+
+// kf_interp_dropdown renders the interpolation selector as a collapsed button
+// toggling a floating menu, the same toggle/select/dismiss shape as the
+// export-encoder dropdown. Picking a mode sets how the segment ARRIVING at the
+// key eases (we ease into a breakpoint, so the key you're heading to owns the
+// curve); an undoable edit, like the value field.
+//
+// `mixed` is the multi-selection case: the keys disagree, so the button shows "-"
+// and no menu entry is marked current, but the menu is the full list and any pick
+// applies to the whole set.
+kf_interp_dropdown :: proc(interp: Kf_Interp, mixed: bool) {
 	if clay.UI(clay.ID("KfInterpButton"))(
 	{
 		layout = {
@@ -996,7 +1091,7 @@ kf_interp_dropdown :: proc(kf: ^Keyframe) {
 	},
 	) {
 		clay.Text(
-			kf_interp_label(kf.interp),
+			mixed ? KF_INTERP_MIXED_LABEL : kf_interp_label(interp),
 			clay.TextElementConfig {
 				textColor = kf_view.interp_menu_open ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_SMALL,
@@ -1026,35 +1121,42 @@ kf_interp_dropdown :: proc(kf: ^Keyframe) {
 			},
 		},
 		) {
-			settings_button("KfInterpLinear", kf_interp_label(.Linear), kf.interp == .Linear, fill_width = true)
+			// No entry is marked current when the selection is mixed: the whole
+			// list is offered, and a pick writes every selected key.
+			settings_button(
+				"KfInterpLinear",
+				kf_interp_label(.Linear),
+				!mixed && interp == .Linear,
+				fill_width = true,
+			)
 			settings_button(
 				"KfInterpCubic",
 				kf_interp_label(.Cubic),
-				kf.interp == .Cubic,
+				!mixed && interp == .Cubic,
 				fill_width = true,
 			)
 			settings_button(
 				"KfInterpEaseIn",
 				kf_interp_label(.Ease_In),
-				kf.interp == .Ease_In,
+				!mixed && interp == .Ease_In,
 				fill_width = true,
 			)
 			settings_button(
 				"KfInterpEaseOut",
 				kf_interp_label(.Ease_Out),
-				kf.interp == .Ease_Out,
+				!mixed && interp == .Ease_Out,
 				fill_width = true,
 			)
 			settings_button(
 				"KfInterpEaseInOut",
 				kf_interp_label(.Ease_In_Out),
-				kf.interp == .Ease_In_Out,
+				!mixed && interp == .Ease_In_Out,
 				fill_width = true,
 			)
 			settings_button(
 				"KfInterpElastic",
 				kf_interp_label(.Elastic),
-				kf.interp == .Elastic,
+				!mixed && interp == .Elastic,
 				fill_width = true,
 			)
 		}

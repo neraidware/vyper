@@ -757,13 +757,17 @@ draw_keyframes :: proc(
 			}
 			for tr in 0 ..< rows {
 				for k, k_idx in clip.keyframe_tracks[tr].keys {
-					cx, cy := kf_key_center(box, tr, k.frame_off)
+					// kf_sel_frame answers both questions the paint asks of
+					// every diamond — is this key selected, and where should it
+					// be — in one scan. During a drag the frame it returns is the
+					// previewed destination, not k.frame_off: the gesture writes
+					// nothing until its release, so the store still holds where
+					// the key will be normalized FROM (see Kf_Move).
+					frame, selected :=
+						kf_sel_frame(Kf_Ref{track_idx, index, tr, k_idx}, k.frame_off)
+					cx, cy := kf_key_center(box, tr, frame)
 					fill := KF_DIAMOND_FILL
-					if kf_sel.active &&
-					   kf_sel.track_idx == track_idx &&
-					   kf_sel.clip_index == index &&
-					   kf_sel.lane == tr &&
-					   kf_sel.key == k_idx {
+					if selected {
 						fill = KF_DIAMOND_FILL_SELECTED
 					}
 					// Two-layer diamond: a full-size accent ring under a fill

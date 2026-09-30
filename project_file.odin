@@ -290,7 +290,7 @@ session_teardown :: proc() {
 	selection.asset_id = 0
 	selection.track = -1
 	selection.index = -1
-	kf_sel = {}
+	kf_selection_free()
 }
 
 // session_rebuild makes the decoded DTO the live session. Every string and

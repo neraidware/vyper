@@ -765,6 +765,93 @@ into playback/preview.
       access, 76 errors from 43 contexts — the same class as the 45 above, and
       no new context class.
 
+- [x] S7. Multiple keyframe selection. **Why:** moving keyframes was a
+      one-at-a-time ritual — arm a press on a diamond, slide it, re-press the
+      next one. Anything longer than two or three keys (the usual case: a run of
+      keys to retime, a whole ramp to re-ease) was a per-key click-drag, and
+      every key it touched had to be slid the same distance by hand.
+      `Keyframe_Selection` becomes a grow-only list of `Kf_Ref` (track/clip/
+      lane/key) under ONE `structure_gen`, so the set invalidates together — one
+      set/del can slide any key, and a per-key gen would let a half-stale
+      selection resolve. It is a `[dynamic]`, not a bounded array: a cap would
+      silently drop refs past it, and "the key I shift-clicked is not selected"
+      is a bug with no visible cause. Cleared with `clear` (which KEEPS the
+      backing buffer) so growing it never reaches the allocator again.
+      **Shift+click adds every diamond under the pointer** (`kf_keys_at`, the
+      same `kf_key_center` geometry the paint and hit-test share) — adding is a
+      union, not a toggle, because toggling a SET has no honest answer (which way
+      does a press flip two keys when one is already in?). A plain click replaces
+      the set, so over-selecting recovers in one click. No drag-select box yet.
+      **The drag became a preview instead of a live write.** It used to assign
+      `k.frame_off` in place every tick, which left the key arrays unsorted for
+      the whole gesture and made the release's del+set a REPAIR of a scrambled
+      array — it only landed right because `kf_set_key`'s same-frame replace
+      happened to find the key it had just failed to delete. That is why two
+      selected keys could not move together: the release could no longer tell
+      which element was which. `Kf_Move` now records only the frame delta
+      (`kf_move.delta`, recomputed from the press frame every tick, never
+      accumulated) plus one `Kf_Snap` per selected key captured at press, and
+      `draw_keyframes` paints each at `start + delta` via `kf_sel_frame`. The
+      store is untouched until the release, so the arrays stay sorted and unique
+      and del+set is a real normalization. The dragged curve also can no longer
+      flicker in the preview, which re-reads the keys at the playhead.
+      **The release runs ALL deletes before ANY set.** Two keys on one lane can
+      trade frames; a set landing on a frame another key has not vacated yet is
+      swallowed by the same-frame replace, and that key vanishes instead of
+      moving.
+      **A move now preserves `interp`.** `kf_set_key`/`kf_set_packed_key` insert
+      with a zeroed `Kf_Interp`, so sliding a key silently straightened its
+      easing to the `.Cubic` default — the release re-stamps the captured mode on
+      the landed key.
+      Operations on the whole selection: move (above), `Delete` (one `.Value`
+      node), and the shared-property editor. **The inspector shows the
+      genuinely-shared properties of a multi-selection, not a var identity:**
+      interpolation is a property of a key wherever it sits, so the dropdown is
+      offered whenever N keys are selected — showing the shared mode when they
+      all agree and `-` when they do not, and writing all of them on a pick.
+      The VALUE field is not offered for a multi-selection: it is a property of
+      one key on one lane, so with keys on different lanes there is no number
+      that means anything, and with keys on one lane the only "set all" would
+      flatten the animation. The header shows the track name when the whole
+      selection is on one lane and `N keyframes` otherwise, and the frame line
+      the span. `kf_selected` now reports ok only for a selection of EXACTLY
+      one key, so a multi-selection can never half-resolve into the first ref
+      and then be edited as if it were the only one — the single-key callers
+      (the value field and its click handler) get that for free.
+      **Four defects the probe found, all fixed here rather than worked around.**
+      (1) `kf_set_interp_all` opened the undo seam AFTER writing, so the pick was
+      untracked: `undo_push` snapshots the POST-edit tree and folds the pending
+      PRE-edit capture into the cursor's action, which is the only way the edit
+      becomes undoable. Undo landed back on a state that already had the new
+      interp — an undo that appears to work and redoes nothing. (2) The drag read
+      its frame mapping from `snaps[0]`, which a Shift+click union can leave
+      naming a DIFFERENT clip than the one under the cursor (the set is ordered by
+      the older selection), so the delta was taken through another clip's box;
+      `Kf_Move.anchor` is the grabbed key now. (3) The release and re-arm paths
+      `clear`ed the capture list, but each `Kf_Snap` owns a cloned track name —
+      one leaked string per selected key per drag; `kf_snaps_drop` frees the names
+      and keeps the buffer. (4) `undo_free_all` freed every snapshot but not
+      `Undo_Node.label`, and `undo_init` seeded a LITERAL `"start"`, so a session
+      leaked one label clone per recorded edit and the literal was the reason the
+      delete was missing. Also fixed while under the memory gate:
+      `kf_del_key` dropped an emptied track with `ordered_remove` after `pop`,
+      which shortens without releasing, orphaning that track's key array for the
+      life of the process; and the probe seeded a live session it never tore down
+      (the ui probe has called `session_teardown` all along — the undo probe did
+      not, which is why the tree read as lost).
+      **The undo probe now has a memory gate of its own**
+      (`scripts/gate.sh undo_valgrind`, in `all`). `target_valgrind` runs the UI
+      probe, and the undo probe is where the keyframe-capture lifecycle lives
+      (a cloned name per key per gesture, re-armed every press), so no existing
+      target measured any of it. Baseline on the pre-S7 tree: 372 bytes in 13
+      blocks definitely lost. After the four fixes: 0 in 0.
+      Gates green: `check`, `build`, `probe`, `transform_probe`, `geom_key_probe`,
+      `timeline_probe`, `geom_key_valgrind`, `valgrind`, `undo_valgrind`, plus
+      `VYPER_KEYFRAME_PROBE` and `VYPER_RENDER_KF_PROBE`. `scripts/gate.sh build`
+      now delegates to `./build.sh` instead of re-declaring the link flags — it
+      had lost the `--sysroot`/`-l` list and failed at the LINK step, a long way
+      from the cause (§10).
+
 ## Active 4 — Export keyframe compositor performance
 
 **Status:** measured 2026-09-25. Export scale keyframes are functional but

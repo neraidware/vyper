@@ -135,9 +135,15 @@ target_shaders() {
 	'
 }
 
+# The flags live in build.sh and ONLY in build.sh: the sysroot and the extra
+# -l list are what make the binary link against the SYSTEM ffmpeg/SDL3/glib
+# rather than a toolchain's own bundled sysroot. Re-declaring them here is
+# exactly the "type the flags by hand instead of fixing the script" failure
+# AGENTS.md §10 exists to prevent, and it fails at the LINK step, a long way
+# from the cause. build.sh also compiles the vendored C and the SPIR-V, so
+# delegating is the one place that can be right.
 target_build() {
-	target_shaders
-	dev odin build . -debug -vet-style -vet-semicolon -out:vyper
+	./build.sh
 }
 
 # Every target that runs ./vyper must call this first.
@@ -492,6 +498,26 @@ target_geom_key_valgrind() {
 	valgrind_assert "$log" geom-key-valgrind '\[geom-key-probe\] OK:'
 }
 
+# The undo probe's memory gate. Same argument as geom_key_valgrind above, and
+# it is the ONLY gate that measures the undo probe's heap traffic: target_valgrind
+# runs the UI probe, and the undo probe is where the keyframe-capture lifecycle
+# lives (cloned track names per selected key, re-armed every press, released on
+# release). The drag path there allocates a name per key per gesture and is
+# SUPPOSED to drop them while keeping the list's buffer -- kf_snaps_drop vs a bare
+# clear. A bare clear is invisible to the UI probe (which never multi-drags) and
+# would have shown up here as one lost track-name string per key per drag, so this
+# target is the only thing standing between that and a slow per-drag leak.
+target_undo_valgrind() {
+	require_fresh_valgrind_binary undo-valgrind || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/undo.log
+	VYPER_UNDO_PROBE=1 timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	local rc=$?
+	echo "undo-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+	valgrind_assert "$log" undo-valgrind '\[undo-probe\] ok:'
+}
+
 # The timeline geometry/semantics regression check (timeline_probe.odin).
 # Same problem transform_probe above had: it was reachable only by setting
 # VYPER_TL_PROBE by hand, so nothing ran it. It covers cut resolution, drag
@@ -840,7 +866,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind render_valgrind; do
+	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -856,6 +882,7 @@ main() {
 	transform_probe) target_transform_probe ;;
 	geom_key_probe) target_geom_key_probe ;;
 	geom_key_valgrind) target_geom_key_valgrind ;;
+	undo_valgrind) target_undo_valgrind ;;
 	timeline_probe) target_timeline_probe ;;
 	yuv_exact) target_yuv_exact ;;
 	gpu_nv12) target_gpu_nv12 ;;
@@ -873,7 +900,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac
