@@ -2544,34 +2544,8 @@ render_worker_run :: proc() {
 	// the encoder thread; the worker touches no encoder/muxer field after this
 	// point (only e.enc_name after the join). Slots + header must exist before
 	// the thread starts.
-	for i in 0 ..< RENDER_ENC_SLOTS {
-		render_pipe.enc_slots[i].canvas = make([]u8, int(render_job.width) * int(render_job.height) * 4)
-		// Sized for even dimensions (the GPU NV12 path's precondition); odd
-		// jobs never use it -- gpu_nv12_for_run excludes them.
-		render_pipe.enc_slots[i].nv12 = make([]u8, int(render_job.width) * int(render_job.height) * 3 / 2)
-		render_pipe.enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
-	}
-	render_pipe.enc_stop, render_pipe.enc_produced, render_pipe.enc_consumed = false, 0, 0
-	render_pipe.enc_has_audio = has_audio
-	render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
-	render_pipe.comp_zero_ns, render_pipe.comp_resample_ns, render_pipe.comp_blit_ns = 0, 0, 0
-	render_pipe.comp_nv12_pass_ns, render_pipe.comp_nv12_dl_ns, render_pipe.comp_nv12_wait_ns, render_pipe.comp_nv12_cpy_ns = 0, 0, 0, 0
-	render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
-	render_pipe.res_submit_ns, render_pipe.res_wait_ns = 0, 0
-	render_pipe.cpu_resample_ns, render_pipe.cpu_resample_n = 0, 0
-	render_pipe.cp1_ns, render_pipe.cp1_n = 0, 0
-	render_pipe.cpd_ns, render_pipe.cpd_n = 0, 0
-	render_pipe.cpu_ns, render_pipe.cpu_n = 0, 0
-	render_pipe.rs1_ns, render_pipe.rs1_n = 0, 0
-	render_pipe.rsd_ns, render_pipe.rsd_n = 0, 0
-	render_pipe.rsu_ns, render_pipe.rsu_n = 0, 0
-	render_pipe.gpu1_ns, render_pipe.gpu1_n = 0, 0
-	render_pipe.gpud_ns, render_pipe.gpud_n = 0, 0
-	render_pipe.rect_n, render_pipe.rect_w_min, render_pipe.rect_w_max = 0, 1 << 30, 0
-	render_pipe.out_min_w, render_pipe.out_max_w = 1 << 30, 0
-	render_pipe.out_min_h, render_pipe.out_max_h = 1 << 30, 0
-	render_pipe.enc_video_ns, render_pipe.enc_audio_ns = 0, 0
-	render_pipe.enc_sws_ns, render_pipe.enc_upload_ns, render_pipe.enc_send_ns, render_pipe.enc_drain_ns = 0, 0, 0, 0
+	render_alloc_enc_slots()
+	render_reset_pipe_timings(has_audio)
 	// One-time semaphore priming: counts are self-balancing across renders, so
 	// only the very first job needs the initial SLOTS free tokens.
 	if !render_pipe.enc_sema_init {
@@ -4721,4 +4695,45 @@ preview_framecheck_run :: proc(v: string) {
 		bad > 40 ? " (rest suppressed)" : "",
 	)
 	os.exit(bad == 0 ? 0 : 1)
+}
+
+
+// P6 encode ring: one canvas + one audio-mix buffer per slot, carved from the
+// job arena (freed wholesale when the worker unwinds).
+render_alloc_enc_slots :: proc() {
+for i in 0 ..< RENDER_ENC_SLOTS {
+	render_pipe.enc_slots[i].canvas = make([]u8, int(render_job.width) * int(render_job.height) * 4)
+	// Sized for even dimensions (the GPU NV12 path's precondition); odd
+	// jobs never use it -- gpu_nv12_for_run excludes them.
+	render_pipe.enc_slots[i].nv12 = make([]u8, int(render_job.width) * int(render_job.height) * 3 / 2)
+	render_pipe.enc_slots[i].mix = make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
+}
+}
+
+// Zero every per-run counter and timing accumulator on render_pipe. These are
+// pure resets of the global pipeline state, read back by the render-test
+// summary after the job, so they are grouped rather than interleaved with the
+// encoder hand-off below. has_audio is latched here for the encoder thread.
+render_reset_pipe_timings :: proc(has_audio: bool) {
+render_pipe.enc_stop, render_pipe.enc_produced, render_pipe.enc_consumed = false, 0, 0
+render_pipe.enc_has_audio = has_audio
+render_pipe.enc_fail, render_pipe.enc_err_len = false, 0
+render_pipe.comp_zero_ns, render_pipe.comp_resample_ns, render_pipe.comp_blit_ns = 0, 0, 0
+render_pipe.comp_nv12_pass_ns, render_pipe.comp_nv12_dl_ns, render_pipe.comp_nv12_wait_ns, render_pipe.comp_nv12_cpy_ns = 0, 0, 0, 0
+render_pipe.res_upload_ns, render_pipe.res_gpu_ns, render_pipe.res_download_ns = 0, 0, 0
+render_pipe.res_submit_ns, render_pipe.res_wait_ns = 0, 0
+render_pipe.cpu_resample_ns, render_pipe.cpu_resample_n = 0, 0
+render_pipe.cp1_ns, render_pipe.cp1_n = 0, 0
+render_pipe.cpd_ns, render_pipe.cpd_n = 0, 0
+render_pipe.cpu_ns, render_pipe.cpu_n = 0, 0
+render_pipe.rs1_ns, render_pipe.rs1_n = 0, 0
+render_pipe.rsd_ns, render_pipe.rsd_n = 0, 0
+render_pipe.rsu_ns, render_pipe.rsu_n = 0, 0
+render_pipe.gpu1_ns, render_pipe.gpu1_n = 0, 0
+render_pipe.gpud_ns, render_pipe.gpud_n = 0, 0
+render_pipe.rect_n, render_pipe.rect_w_min, render_pipe.rect_w_max = 0, 1 << 30, 0
+render_pipe.out_min_w, render_pipe.out_max_w = 1 << 30, 0
+render_pipe.out_min_h, render_pipe.out_max_h = 1 << 30, 0
+render_pipe.enc_video_ns, render_pipe.enc_audio_ns = 0, 0
+render_pipe.enc_sws_ns, render_pipe.enc_upload_ns, render_pipe.enc_send_ns, render_pipe.enc_drain_ns = 0, 0, 0, 0
 }
