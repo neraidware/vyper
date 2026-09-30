@@ -94,9 +94,10 @@ KF_BTN_PAD :: f32(3)       // Transparent click padding around the button diamon
 // Inspector add-keyframe buttons, one per keyable property in row order: the
 // element ids are hit-tested in interaction.odin and painted as diamonds in
 // gpu_draw.odin, so they live here as the single source of truth.
-KF_ADD_BTN_IDS :: [11]string{
+KF_ADD_BTN_IDS :: [12]string{
 	"KfAddX", "KfAddY", "KfAddS",
 	"KfAddCropL", "KfAddCropR", "KfAddCropT", "KfAddCropB",
+	"KfAddOpacity",
 	"KfAddGain",
 	"KfAddTrans", "KfAddCrop",
 	"KfAddModified",

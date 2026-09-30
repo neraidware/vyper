@@ -445,7 +445,7 @@ geom_key_pending_labels :: proc(cl: ^Clip, any: bool) -> string {
 	if !any {
 		return "none"
 	}
-	short := []string{"X", "Y", "Scale", "L", "R", "T", "B"}
+	short := []string{"X", "Y", "Scale", "L", "R", "T", "B", "Opac"}
 	buf := ui_text.kf_pending_list[:]
 	n := 0
 	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
@@ -674,8 +674,13 @@ clip_card :: proc() {
 			// percent width, so it needs no overlay drawing like the gain knob.
 			// The slider container is the hit target (opacity_from_x maps the
 			// pointer across it); the field beside it is the type-in path.
+			//
+			// Read at the PLAYHEAD (clip_geom_get), like every other lane in this
+			// inspector. Reading the resting field would show 100% while the clip
+			// visibly faded, and the fill below would disagree with the canvas.
+			op_shown := clip_geom_get(cl, .Opacity)
 			op_buf := ui_text.opacity[:]
-			op_val := fmt.bprintf(op_buf[:], "%.0f%%", cl.opacity * 100)
+			op_val := fmt.bprintf(op_buf[:], "%.0f%%", op_shown * 100)
 			if edit_state.field == .Opacity {
 				op_val = string(edit_state.chars[:edit_state.len])
 			}
@@ -714,7 +719,18 @@ clip_card :: proc() {
 						{
 							layout = {
 								sizing = {
-									width = clay.SizingPercent(cl.opacity * 100),
+									// clay.SizingPercent is 0-1, NOT 0-100: the fill
+									// width is (trackWidth - padding) * this
+									// value, and passing opacity*100 made every
+									// non-zero opacity overflow the track
+									// ~opacity*100x. It also tripped clay's
+									// PERCENTAGE_OVER_1 error every frame,
+									// which clay_error swallows.
+									//
+									// op_shown, not cl.opacity: the fill has to
+									// agree with the canvas, which composites
+									// the playhead-sampled value.
+									width = clay.SizingPercent(op_shown),
 									height = clay.SizingFixed(OPACITY_TRACK_H),
 								},
 							},
@@ -725,6 +741,7 @@ clip_card :: proc() {
 					}
 				}
 				op_hovered := op_active
+				kf_add_button("KfAddOpacity")
 				prop_field("PropFieldOpacity", "Opacity", op_val, edit_state.field == .Opacity || op_hovered)
 			}
 			// Canvas-center snap belongs with the transform settings it governs.

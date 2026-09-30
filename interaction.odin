@@ -341,6 +341,13 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			clip_geom_add_lane_key(sel, .Scale)
 			return true
 		}
+		// Opacity has its own key button rather than riding a section caption
+		// like transform/crop: it groups with nothing (kf_geom_sections has no
+		// "opacity" section), so there is no group key to hang it on.
+		if clay.PointerOver(clay.ID("KfAddOpacity")) {
+			clip_geom_add_lane_key(sel, .Opacity)
+			return true
+		}
 		// "Keyframe all modified": every geometry lane edited without a key
 		// gets one, as a single undo node. Guarded on
 		// clip_geom_can_key_all_modified — a pending lane is not enough, the
@@ -382,16 +389,22 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		if clay.PointerOver(clay.ID("OpacitySlider")) {
 			undo_begin()
 			opacity_drag.clip = sel
-			opacity_drag.start_op = sel.opacity
+			// Capture the PLAYHEAD value, not the resting field: on a keyed
+			// clip those differ, and both the start-of-gesture comparison (for
+			// the release-time undo push) and the first drag sample must be
+			// measured against what the user actually saw.
+			opacity_drag.start_op = clip_geom_get(sel, .Opacity)
 			rect := clay.GetElementData(clay.ID("OpacitySlider")).boundingBox
 			opacity_drag.rect_x = rect.x
 			opacity_drag.rect_w = rect.width
-			sel.opacity = opacity_from_x(inp.x)
+			// Routed, not assigned: a keyed opacity writes a key at the
+			// playhead, so the edit survives auto-key being off.
+			clip_geom_set(sel, .Opacity, opacity_from_x(inp.x))
 			active_interaction = .Opacity_Drag
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropFieldOpacity")) {
-			edit_begin(.Opacity, sel.opacity * 100)
+			edit_begin(.Opacity, clip_geom_get(sel, .Opacity) * 100)
 			return true
 		}
 		if clay.PointerOver(clay.ID("PropCropL")) {
@@ -1051,9 +1064,11 @@ interaction_release :: proc(inp: Mouse_Input) {
 		}
 	case .Opacity_Drag:
 		// Opacity is applied live during the drag; one value node on
-		// release, and only if the gesture actually moved it.
+		// release, and only if the gesture actually moved it. Compared at the
+		// playhead, matching the value captured at gesture start — on a keyed
+		// clip the resting field can sit still while the visible value moved.
 		if opacity_drag.clip != nil &&
-		   opacity_drag.clip.opacity != opacity_drag.start_op {
+		   clip_geom_get(opacity_drag.clip, .Opacity) != opacity_drag.start_op {
 			undo_push(.Value, "Set clip opacity")
 		}
 	case .Gain_Drag:
@@ -1196,7 +1211,10 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		if opacity_drag.clip == nil {
 			break
 		}
-		opacity_drag.clip.opacity = opacity_from_x(inp.x)
+		// clip_geom_set every move, like the geometry drag: on a keyed clip
+		// this updates the key at the playhead in place, so the slider stays
+		// live instead of writing a resting field the sampler ignores.
+		clip_geom_set(opacity_drag.clip, .Opacity, opacity_from_x(inp.x))
 	case .Gain_Drag:
 		if gain_drag.clip == nil {
 			break

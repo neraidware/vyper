@@ -271,6 +271,15 @@ Render_Geom_Prop :: enum u8 {
 	Crop_R,
 	Crop_T,
 	Crop_B,
+	// Opacity rides the same lane machinery as the geometry props even though
+	// it is not geometry: it has a resting field plus an optional keyframe
+	// track, so it needs the same "a write goes wherever the sampler reads"
+	// routing (clip_geom.odin), the same pending-bit bookkeeping, and the same
+	// per-lane Key button. It groups with no section, exactly like Scale.
+	//
+	// This is the last lane that fits geom_modified's u8 bitmask; a ninth
+	// property needs that field widened before it can be added.
+	Opacity,
 	_COUNT,
 }
 
@@ -290,6 +299,8 @@ render_geom_name :: proc(p: Render_Geom_Prop) -> string {
 		return "crop.t"
 	case .Crop_B:
 		return "crop.b"
+	case .Opacity:
+		return "opacity"
 	case ._COUNT:
 		unreachable()
 	}
@@ -714,10 +725,13 @@ Render_Video_Src :: struct {
 	crop_b:               f32,
 	source_w:             c.int,
 	source_h:             c.int,
-	// opacity: the clip's global alpha (0..1) at export time, applied when the
-	// frame composites. 1 is fully opaque and reproduces the plain copy.
+	// opacity: the clip's global alpha (0..1) applied when the frame
+	// composites. 1 is fully opaque and reproduces the plain copy. This is the
+	// RESTING value as snapshotted at render_start, and the per-frame value
+	// whenever the opacity lane is keyed -- render_eval_keyed_geom overwrites
+	// it each composite frame, the same way it rewrites rw/rh/ox/oy.
 	opacity:              f32,
-	// Keyed geometry (S6): when any of the 7 geometry properties is keyed,
+	// Keyed geometry (S6): when any of the lane properties is keyed,
 	// geom_keyed routes the worker through per-frame evaluation and stage
 	// sub-rect blitting. kf_geom is the UI-thread snapshot; keys ride with the
 	// job (fixed arrays, no extra ownership). blit_sx/sy are the per-frame src
@@ -725,6 +739,12 @@ Render_Video_Src :: struct {
 	// composite frame (worker-owned; the producer ignores them).
 	geom_keyed:          bool,
 	scale_keyed:         bool,
+	// opacity_keyed: the opacity lane has keys, so the RESTING opacity above
+	// is not the whole story and a frame can be translucent where render_start
+	// saw 1.0. Canvas-zeroing is a job-wide decision made once from the
+	// snapshot, so this has to be conservative: a keyed lane is treated as
+	// translucent even if every key currently reads 1.0.
+	opacity_keyed:       bool,
 	stage_scale:         f32,
 	kf_geom:             [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
 	kres_scratch:        []u8,
@@ -1021,13 +1041,18 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 render_kf_geom_rect :: proc(
 	geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
 	off: i32,
-	base_tx, base_ty, base_s, base_cl, base_cr, base_ct, base_cb: f32,
+	base_tx, base_ty, base_s, base_cl, base_cr, base_ct, base_cb, base_op: f32,
 	draw_w, draw_h: c.int,
 	source_w, source_h, stage_w, stage_h: c.int,
 ) -> (
-	tx, ty, s, cl, cr, ct, cb: f32,
+	tx, ty, s, cl, cr, ct, cb, opacity: f32,
 	ox, oy, rw, rh, srcx, srcy, srcw, srch: c.int,
 ) {
+	// Opacity samples here too, not in a separate pass, so the per-frame alpha
+	// is resolved in exactly one place alongside the rect it composites into.
+	// Returning it (rather than writing through a pointer) keeps this proc
+	// free of side effects on the job.
+	opacity, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Opacity)].keys[:geom[int(Render_Geom_Prop.Opacity)].n], off, base_op)
 	tx, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_X)].keys[:geom[int(Render_Geom_Prop.Trans_X)].n], off, base_tx)
 	ty, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_Y)].keys[:geom[int(Render_Geom_Prop.Trans_Y)].n], off, base_ty)
 	s, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Scale)].keys[:geom[int(Render_Geom_Prop.Scale)].n], off, base_s)
@@ -2441,14 +2466,17 @@ render_worker_run :: proc() {
 	// A translucent clip is the same class of problem: it does not overwrite
 	// what is below, so the canvas must start zeroed for the blend to composite
 	// against. Checked statically from the snapshot (opacity is captured at
-	// render_start), same shape as any_keyed.
+	// render_start), same shape as any_keyed -- which is why a KEYED opacity
+	// lane counts as translucent here: a frame 40 keys in can be translucent
+	// even though the resting value snapshotted above reads 1.0, and the zero
+	// decision is made once for the whole job, before any frame is evaluated.
 	any_keyed := false
 	any_translucent := false
 	for &v in render_job.videos {
 		if v.geom_keyed {
 			any_keyed = true
 		}
-		if v.opacity < 1.0 {
+		if v.opacity < 1.0 || v.opacity_keyed {
 			any_translucent = true
 		}
 	}
@@ -3035,16 +3063,20 @@ render_eval_keyed_geom :: proc(
 	gpu: ^GPU_Composite,
 ) -> bool {
 	off := i32(timeline_frame - v.timeline_start_frame)
-	_, _, _, _, _, _, _, ox, oy, rw, rh, srcx, srcy, srcw, srch :=
+	_, _, _, _, _, _, _, opacity, ox, oy, rw, rh, srcx, srcy, srcw, srch :=
 		render_kf_geom_rect(
 			&v.kf_geom,
 			off,
 			v.transform_x, v.transform_y, v.scale,
-			v.crop_l, v.crop_r, v.crop_t, v.crop_b,
+			v.crop_l, v.crop_r, v.crop_t, v.crop_b, v.opacity,
 			render_job.width, render_job.height,
 			v.source_w, v.source_h, v.fw, v.fh,
 		)
+	// Worker-owned, rewritten every composite frame exactly like the rect
+	// above. Clamped here: a key can be dragged past 0..1, and the blend and
+	// blit paths below treat the value as a direct alpha multiplier.
 	v.rw, v.rh, v.ox, v.oy = rw, rh, ox, oy
+	v.opacity = clamp(opacity, 0.0, 1.0)
 	if ox >= render_job.width || oy >= render_job.height ||
 	   ox + rw <= 0 || oy + rh <= 0 {
 		return false
@@ -3671,6 +3703,9 @@ render_start :: proc() {
 						src.geom_keyed = true
 						if p == Render_Geom_Prop.Scale {
 							src.scale_keyed = true
+						}
+						if p == Render_Geom_Prop.Opacity {
+							src.opacity_keyed = true
 						}
 					}
 				}

@@ -140,6 +140,7 @@ geom_key_lanes :: [int(Render_Geom_Prop._COUNT)]struct{lane: Render_Geom_Prop, b
 	{Render_Geom_Prop.Crop_R, 0.05},
 	{Render_Geom_Prop.Crop_T, 0.05},
 	{Render_Geom_Prop.Crop_B, 0.05},
+	{Render_Geom_Prop.Opacity, 1.0},
 }
 
 // geom_key_sample reads the value the USER SEES at the playhead. It mirrors
@@ -170,6 +171,8 @@ geom_key_resting :: proc(cl: ^Clip, lane: Render_Geom_Prop) -> f32 {
 		return cl.crop_t
 	case .Crop_B:
 		return cl.crop_b
+	case .Opacity:
+		return cl.opacity
 	case ._COUNT:
 		unreachable()
 	}

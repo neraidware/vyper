@@ -187,6 +187,12 @@ for j := 0; j < len(raw); {
 	if !ui_probe_clip_tile_width_asserts() {
 		os.exit(1)
 	}
+	// The opacity fill's painted width is opacity * the track's laid-out width.
+	// SizingPercent is a 0-1 fraction; a 0-100 value still "looks" plausible in
+	// a screenshot but overflows the track for every non-zero opacity.
+	if !ui_probe_opacity_slider_asserts() {
+		os.exit(1)
+	}
 	// Track rows: buttons moved to the dedicated menu, and the timeline fits
 	// TRACKS_FIT_TARGET rows on import/load.
 	if !ui_probe_track_menu_asserts() {
@@ -1599,6 +1605,58 @@ ui_probe_clip_tile_width_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] clip tile width ok\n")
+	}
+	return ok
+}
+
+// ui_probe_opacity_slider_asserts pins the opacity slider's painted fill to the
+// clip's value. The fill is a child of the track sized with clay.SizingPercent,
+// which clay defines as a 0-1 FRACTION of the track width ("i.e. 20% is 0.2"),
+// not a 0-100 percentage. Passing opacity*100 made every non-zero opacity size
+// the fill at (track width * opacity * 100), overflowing the track; it also
+// tripped clay's CLAY_ERROR_TYPE_PERCENTAGE_OVER_1 every frame, which
+// clay_error() drops silently. Reading the value back cannot catch that -- only
+// the laid-out fill width can -- so this measures the real boxes.
+ui_probe_opacity_slider_asserts :: proc() -> bool {
+	cl, ok := transformable_selected()
+	if !ok {
+		fmt.eprintf("[ui-probe] no transformable clip selected; cannot assert the opacity fill\n")
+		return false
+	}
+	saved := cl.opacity
+	defer cl.opacity = saved
+	ok = true
+	for v in ([]f32{0, 0.25, 0.5, 0.75, 1}) {
+		cl.opacity = v
+		_ = build_page(1920, 1600)
+		track := clay.GetElementData(clay.ID("OpacityTrack")).boundingBox
+		fill := clay.GetElementData(clay.ID("OpacityFill")).boundingBox
+		if track.width <= 0 {
+			fmt.eprintf("[ui-probe] opacity %.2f: track has no width (%.1f)\n", v, track.width)
+			ok = false
+			continue
+		}
+		// The track declares no padding and one child, so clay's
+		// (parentSize - padding - childGaps) * percent reduces to
+		// track.width * opacity.
+		want := track.width * v
+		if abs(fill.width - want) > 0.5 {
+			fmt.eprintf(
+				"[ui-probe] opacity %.2f: fill width %.1f want %.1f (track %.1f)\n",
+				v, fill.width, want, track.width,
+			)
+			ok = false
+		}
+		if fill.width > track.width + 0.5 {
+			fmt.eprintf(
+				"[ui-probe] opacity %.2f: fill %.1f overflows track %.1f\n",
+				v, fill.width, track.width,
+			)
+			ok = false
+		}
+	}
+	if ok {
+		fmt.printf("[ui-probe] opacity slider fill ok\n")
 	}
 	return ok
 }

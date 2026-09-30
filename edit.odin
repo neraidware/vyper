@@ -131,7 +131,6 @@ edit_commit :: proc() {
 	// keeps the direct write plus kf_auto_key.
 	geom := Render_Geom_Prop._COUNT
 	gain_field: ^f32
-	opacity_field: ^f32
 	label := "Edit clip transform"
 	kind := Undo_Kind.Transform
 	name := ""
@@ -186,9 +185,11 @@ edit_commit :: proc() {
 	case .Opacity:
 		// Clamp to the slider's 0..1 so the typed value and the slider fill
 		// stay consistent; the slider is the source of truth for the range.
-		// A plain resting field like scale: direct write, no keyframe track.
+		// Opacity is a lane like Scale, so it goes through clip_geom_set rather
+		// than a direct field write: on a keyed clip the sampler reads the key
+		// at the playhead, and a resting write there would be discarded.
 		val = clamp(val / 100, 0, 1)
-		opacity_field = &cl.opacity
+		geom = .Opacity
 		label = "Set clip opacity"
 		kind = .Value
 	case .Gain:
@@ -211,8 +212,6 @@ edit_commit :: proc() {
 	prev := f32(0)
 	if geom != ._COUNT {
 		prev = clip_geom_get(cl, geom)
-	} else if opacity_field != nil {
-		prev = opacity_field^
 	} else {
 		prev = gain_field^
 	}
@@ -227,7 +226,7 @@ edit_commit :: proc() {
 	// Only gain edits touch audio; opacity is visual. Keyed on the field the
 	// switch bound, not the undo kind (both are .Value), so a visual opacity
 	// commit never re-provisions the decoders.
-	audio_changed := gain_field != nil
+	audio_changed := gain_field != nil && geom == ._COUNT
 	undo_begin()
 	if geom != ._COUNT {
 		// clip_geom_set routes to the playhead key when the property is keyed
@@ -236,8 +235,6 @@ edit_commit :: proc() {
 		// sampler ignores. Same undo node as the resting write — the whole
 		// field edit is one step.
 		clip_geom_set(cl, geom, val)
-	} else if opacity_field != nil {
-		opacity_field^ = val
 	} else {
 		gain_field^ = val
 		kf_auto_key(cl, name, val)

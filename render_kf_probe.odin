@@ -47,16 +47,16 @@ render_kf_probe_run :: proc() -> int {
 	geomA[int(Render_Geom_Prop.Crop_T)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Crop_T)
 	geomA[int(Render_Geom_Prop.Crop_B)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Crop_B)
 
-	tx_a, _, s_a, _, _, _, _, ox_a, _, rw_a, _, _, _, _, _ :=
-		render_kf_geom_rect(&geomA, 1, 0, 0, 1, 0, 0, 0, 0,
+	tx_a, _, s_a, _, _, _, _, _, ox_a, _, rw_a, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomA, 1, 0, 0, 1, 0, 0, 0, 0, 1,
 			100, 100, 100, 100, 100, 100)
 	// off=1 is exactly the frame of the first key (tx=0), scale rests at 1,
 	// so the box is the full stage centered on the resting tx (=0, base tx).
 	render_kf_probe_check(ox_a == -50 && rw_a == 100,
 		"A at first key: got ox=%d rw=%d want -50 100", ox_a, rw_a)
 
-	txA, _, sA, _, _, _, _, oxA, _, rwA, _, _, _, _, _ :=
-		render_kf_geom_rect(&geomA, 9, 0, 0, 1, 0, 0, 0, 0,
+	txA, _, sA, _, _, _, _, _, oxA, _, rwA, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomA, 9, 0, 0, 1, 0, 0, 0, 0, 1,
 			100, 100, 100, 100, 100, 100)
 
 	// Scale rests at 1 -> cw = draw_w * s = 100, ox centered on sampled tx.
@@ -76,8 +76,8 @@ render_kf_probe_run :: proc() -> int {
 		p := Render_Geom_Prop(pi)
 		geomB[int(p)] = render_kf_fill_flat(&clipB, p)
 	}
-	_, _, _, clB, _, _, _, oxB, _, rwB, _, _, _, _, _ :=
-		render_kf_geom_rect(&geomB, 1, 0, 0, 1, 0, 0, 0, 0,
+	_, _, _, clB, _, _, _, _, oxB, _, rwB, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomB, 1, 0, 0, 1, 0, 0, 0, 0, 1,
 			100, 100, 100, 100, 100, 100)
 	render_kf_probe_check_near(clB, 0.25, 0.0001, "B crop-l sampled: cl=%f want 0.25")
 	render_kf_probe_check(oxB == -25 && rwB == 75,
@@ -107,8 +107,8 @@ render_kf_probe_run :: proc() -> int {
 			geomC[int(Render_Geom_Prop.Trans_X)].keys[1].interp == .Ease_In,
 		"worker seam copy carries each key's interpolation mode",
 	)
-	txC, _, _, _, _, _, _, oxC, _, rwC, _, _, _, _, _ :=
-		render_kf_geom_rect(&geomC, 11, 0, 0, 1, 0, 0, 0, 0,
+	txC, _, _, _, _, _, _, _, oxC, _, rwC, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomC, 11, 0, 0, 1, 0, 0, 0, 0, 1,
 			100, 100, 100, 100, 100, 100)
 	render_kf_probe_check_near(txC, 12.5, 0.001, "C eased tx: tx=%f want 12.5")
 	render_kf_probe_check(oxC == -38 && rwC == 100,
@@ -131,8 +131,8 @@ render_kf_probe_run :: proc() -> int {
 		p := Render_Geom_Prop(pi)
 		geomD[int(p)] = render_kf_fill_flat(&clipD, p)
 	}
-	txD, _, _, _, _, _, _, oxD, _, rwD, _, _, _, _, _ :=
-		render_kf_geom_rect(&geomD, 16, 0, 0, 1, 0, 0, 0, 0,
+	txD, _, _, _, _, _, _, _, oxD, _, rwD, _, _, _, _, _ :=
+		render_kf_geom_rect(&geomD, 16, 0, 0, 1, 0, 0, 0, 0, 1,
 			100, 100, 100, 100, 100, 100)
 	render_kf_probe_check_near(txD, 175.0, 0.001, "D spline tx: tx=%f want 175")
 	render_kf_probe_check(oxD == 125 && rwD == 100,
@@ -159,6 +159,61 @@ render_kf_probe_run :: proc() -> int {
 	clipE2.keyframe_tracks[0].keys[1].interp = .Ease_In
 	pe2, _ := kf_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 	render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview packed lane eased: got %f want 12.5")
+
+	// Case F — a KEYED opacity lane sampled through the worker's own rect call.
+	// This is the end-to-end shape of the feature: the opacity keyframe has to
+	// reach the compositor as a per-frame value, not stay a resting field on
+	// the clip. It goes through render_geom_name + render_kf_geom_rect (the
+	// same two steps render_eval_keyed_geom takes) rather than reading the
+	// track directly, so a lane that stops being sampled by the worker is
+	// caught here instead of producing a clip that ignores its own fade.
+	//
+	// The resting value is deliberately 1.0 and the keys fade to 0.25: an
+	// un-sampled lane would return that 1.0 base and the check would fail,
+	// which is exactly the silent failure -- "keyed, but every frame renders
+	// fully opaque" -- that no md5 or static check would notice.
+	{
+		clipF := Clip{}
+		kf_geom_set_lane_key(&clipF, render_geom_name(Render_Geom_Prop.Opacity), 1, 1.0)
+		kf_geom_set_lane_key(&clipF, render_geom_name(Render_Geom_Prop.Opacity), 21, 0.25)
+		geomF: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
+		geomF[int(Render_Geom_Prop.Opacity)] =
+			render_kf_fill_flat(&clipF, Render_Geom_Prop.Opacity)
+		render_kf_probe_check(
+			geomF[int(Render_Geom_Prop.Opacity)].n == 2,
+			"F fixture: the opacity lane snapshot must carry 2 keys, got %d",
+			geomF[int(Render_Geom_Prop.Opacity)].n,
+		)
+		// off 1 (first key), 11 (midpoint), 21 (last key), 40 (past the end).
+		_, _, _, _, _, _, _, op1, _, _, _, _, _, _, _, _ :=
+			render_kf_geom_rect(&geomF, 1, 0, 0, 1, 0, 0, 0, 0, 1,
+				100, 100, 100, 100, 100, 100)
+		_, _, _, _, _, _, _, op11, _, _, _, _, _, _, _, _ :=
+			render_kf_geom_rect(&geomF, 11, 0, 0, 1, 0, 0, 0, 0, 1,
+				100, 100, 100, 100, 100, 100)
+		_, _, _, _, _, _, _, op21, _, _, _, _, _, _, _, _ :=
+			render_kf_geom_rect(&geomF, 21, 0, 0, 1, 0, 0, 0, 0, 1,
+				100, 100, 100, 100, 100, 100)
+		render_kf_probe_check_near(op1, 1.0, 0.001, "F opacity at first key: got %f want 1.0")
+		render_kf_probe_check_near(op11, 0.625, 0.001, "F opacity interpolated: got %f want 0.625")
+		render_kf_probe_check_near(op21, 0.25, 0.001, "F opacity at last key: got %f want 0.25")
+		// Past the last key the lane is INACTIVE and the resting base rules
+		// (kf_sample_keys returns base past the final key), so a fade that
+		// only covers part of the clip returns to the clip's own opacity
+		// rather than sticking at the last key's value. This is the existing
+		// sampler contract, shared with every geometry lane.
+		_, _, _, _, _, _, _, op40, _, _, _, _, _, _, _, _ :=
+			render_kf_geom_rect(&geomF, 40, 0, 0, 1, 0, 0, 0, 0, 0.8,
+				100, 100, 100, 100, 100, 100)
+		render_kf_probe_check_near(op40, 0.8, 0.001, "F opacity past last key falls back to base: got %f want 0.8")
+		// An UNKEYED lane must fall back to the resting base: the base is
+		// threaded through render_eval_keyed_geom as v.opacity, and this is
+		// what keeps every un-keyed export byte-identical to before.
+		_, _, _, _, _, _, _, opBase, _, _, _, _, _, _, _, _ :=
+			render_kf_geom_rect(&geomA, 11, 0, 0, 1, 0, 0, 0, 0, 0.375,
+				100, 100, 100, 100, 100, 100)
+		render_kf_probe_check_near(opBase, 0.375, 0.001, "F un-keyed opacity falls back to base: got %f want 0.375")
+	}
 
 	if render_kf_probe_fail {
 		fmt.println("[render-kf-probe] failed")

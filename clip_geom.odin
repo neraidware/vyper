@@ -43,6 +43,8 @@ clip_geom_resting :: proc(clip: ^Clip, prop: Render_Geom_Prop) -> f32 {
 		return clip.crop_t
 	case .Crop_B:
 		return clip.crop_b
+	case .Opacity:
+		return clip.opacity
 	case ._COUNT:
 		unreachable()
 	}
@@ -68,6 +70,8 @@ clip_geom_set_resting :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) {
 		clip.crop_t = v
 	case .Crop_B:
 		clip.crop_b = v
+	case .Opacity:
+		clip.opacity = v
 	case ._COUNT:
 		unreachable()
 	}

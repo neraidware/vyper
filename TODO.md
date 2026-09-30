@@ -2947,10 +2947,11 @@ Details TBD when Phase 2 reaches maturity.
 
 ## Implemented — per-clip opacity / color modulation (2026-09-29)
 
-- Model: `Clip.opacity` (`f32`, `0..1`, default `1.0`) as a resting value —
-  no keyframe track yet. Deliberately NOT a `geom_modified` lane (that `u8`
-  bitmask is already full) and not baked into the layer texture, so a drag
-  does not re-upload.
+- Model: `Clip.opacity` (`f32`, `0..1`, default `1.0`) as a resting value.
+  NOT baked into the layer texture, so a drag does not re-upload. Superseded as
+  a non-lane on 2026-09-30: it is now a keyframable lane (see "keyframable
+  opacity" below) and the `geom_modified` `u8` bitmask this section called full
+  is now exactly full at 8 lanes.
 - Persistence: `Saved_Clip.opacity` + an explicit `has_opacity` presence flag
   (Odin JSON pointer fields are unsupported). Old projects load at `1.0`; a
   stored `0` stays a valid fully transparent clip.
@@ -2978,6 +2979,62 @@ Details TBD when Phase 2 reaches maturity.
   the block. The gpu resample probe missed it and the unbound descriptor
   faulted the driver into `VK_ERROR_DEVICE_LOST` on the 4K mip path — a fault,
   not a wrong pixel, which is why it is easy to misread as environmental.
+
+---
+
+## Implemented — keyframable per-clip opacity (2026-09-30)
+
+- Problem: `Clip.opacity` was a resting field only. Every read/write of it
+  bypassed the keyframe routing, so a clip that had an opacity track (or that
+  auto-key would want one) would show, fill, composite, and persist the wrong
+  value depending on which path touched it.
+- Model: `.Opacity` is the 8th `Render_Geom_Prop`, named `"opacity"`, grouping
+  with no section exactly like `Scale`. It gets a resting field, an optional
+  scalar track, the pending bit, and a per-lane Key button from the existing
+  machinery instead of a parallel keyframing path. `geom_modified: u8` is now
+  exactly full (8 lanes, bit 7 is the high bit) — a 9th property needs the
+  field widened to `u16` first.
+- One read path, one write path (the invariant clip_geom.odin exists to hold):
+  - preview: `slot.opacity` is sampled at the playhead, not read off the field.
+  - inspector: reads `clip_geom_get(cl, .Opacity)`, and the slider FILL uses
+    that same value, so the fill cannot disagree with the canvas.
+  - typed field: goes through `clip_geom_set` (`opacity_field` pointer deleted
+    from edit.odin). A direct write there was discarded on any keyed clip.
+  - slider drag: `clip_geom_set` on begin and on every move, matching the
+    geometry drag; start value and the release-time undo compare both use the
+    playhead value.
+  - "Key all modified" picks opacity up through the pending bit, and its short
+    label is "Opac".
+- Export: `render_kf_geom_rect` samples the opacity lane alongside the rect and
+  returns it; `render_eval_keyed_geom` writes it into the worker-owned
+  `v.opacity` each composite frame, which is the field every blit/blend path
+  already reads — so one write covers the CPU blend, the GPU resample, and the
+  static-copy path. Clamped 0..1 there, since a key can be dragged out of range.
+- Export subtlety: `skip_canvas_zero` is a job-wide decision taken once from
+  the render_start snapshot, but a keyed clip can be translucent on a frame
+  where the snapshotted resting value read 1.0. So a KEYED opacity lane counts
+  as translucent (`opacity_keyed`) — conservative in the safe direction, since
+  zeroing the canvas when it was not needed only costs a memset.
+- Persistence needed no change: `keyframe_tracks` is a live array on
+  `Saved_Clip`, so the opacity track round-trips with the same code as every
+  other lane.
+- Probe: `render_kf_probe` case F drives a keyed opacity lane through the
+  worker's own two steps (`render_geom_name` → `render_kf_geom_rect`) with a
+  resting 1.0 and keys fading to 0.25, asserting 1.0 / 0.625 / 0.25 at the
+  first/mid/last key. The base is 1.0 precisely so that a lane the worker
+  stopped sampling returns 1.0 and fails — that is the silent failure ("keyed,
+  but every frame fully opaque") no md5 would catch. Verified by mutation:
+  stubbing the sampler to `opacity = base_op` fails F on two checks.
+  Also asserts the un-keyed lane falls back to base, which is what keeps
+  un-keyed exports byte-identical.
+- Note the sampler contract: past a lane's LAST key it is inactive and the
+  resting base rules again, so a partial fade returns to the clip's own opacity
+  rather than sticking at the last key. Shared with every geometry lane.
+- Gates: all 15 functional, all 3 Valgrind (0 definitely/indirectly lost), and
+  all 7 export md5s match the pre-change baseline. `geom_key_probe`'s lane
+  table is `[int(Render_Geom_Prop._COUNT)]`-sized, so adding a lane is a
+  COMPILE error there until its resting value is stated — the enum cannot grow
+  a lane the fixtures silently skip.
 
 ---
 

@@ -506,7 +506,7 @@ update_preview_slots :: proc() -> bool {
 		slot.crop_r, _ = kf_geom_sample_lane(clip, "crop.r", frame, clip.crop_r)
 		slot.crop_t, _ = kf_geom_sample_lane(clip, "crop.t", frame, clip.crop_t)
 		slot.crop_b, _ = kf_geom_sample_lane(clip, "crop.b", frame, clip.crop_b)
-		slot.opacity = clip.opacity
+		slot.opacity, _ = kf_geom_sample_lane(clip, "opacity", frame, clip.opacity)
 			slot.source_w = clip.source_w
 			slot.source_h = clip.source_h
 			// Text clips have no decoder or source frame: the buffer is the
