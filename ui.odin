@@ -190,234 +190,14 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 		},
 		) {
 			// Column 1: Media Bin.
-			if clay.UI(clay.ID("MediaBin"))(
-			{
-				layout = {
-					sizing = {
-						width = clay.SizingGrow({min = MEDIA_BIN_MIN_W, max = MEDIA_BIN_MAX_W}),
-						height = clay.SizingGrow({}),
-					},
-					padding = clay.PaddingAll(PANEL_PADDING),
-					childGap = CARD_GAP,
-					layoutDirection = .TopToBottom,
-				},
-				backgroundColor = BUTTON,
-				border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-				cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
-			},
-			) {
-				// The view body grows to fill the panel so the tab row stays
-				// pinned to the panel's bottom edge regardless of how much
-				// content the active view has (an empty bin must not pull the
-				// tabs up under the header).
-				if clay.UI(clay.ID("MediaBinBody"))(
-				{
-					layout = {
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-						layoutDirection = .TopToBottom,
-						childGap = CARD_GAP,
-					},
-				},
-				) {
-					switch panel_views.media_bin_view {
-					case .Bin:
-						media_bin_header()
-						media_bin_grid()
-					case .Undo:
-						undo_view_header()
-						undo_view_content()
-					}
-				}
-				media_bin_tabs()
-			}
+			build_media_bin_column(DEFAULT_BORDER)
 			// Column 2: Preview with the transport strip beneath it.
-			if clay.UI(clay.ID("PreviewColumn"))(
-			{
-				layout = {
-					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-					layoutDirection = .TopToBottom,
-					childGap = CARD_GAP,
-					padding = clay.PaddingAll(CARD_GAP),
-				},
-				border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-				cornerRadius = clay.CornerRadiusAll(RADIUS_WIDGET),
-			},
-			) {
-				// The preview grows to fill the column (bounded below); the
-				// decoded image scales to fit whatever the widget becomes, and
-				// preview_canvas derives the on-screen canvas from the widget
-				// bounds, so this is responsive on resize.
-				if clay.UI(clay.ID("Preview"))(
-				{
-					layout = {
-						sizing = {
-							width = clay.SizingGrow({}),
-							height = clay.SizingGrow({min = 216}),
-						},
-					},
-					image = {imageData = nil},
-				},
-				) {
-					preview_fit_button()
-				}
-				// Transport strip: jog / play / rate, then the frame counter.
-				if clay.UI(clay.ID("ActionsArea"))(
-				{
-					layout = {
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-						layoutDirection = .LeftToRight,
-						childGap = BUTTON_ROW_GAP,
-						childAlignment = {x = .Center, y = .Center},
-					},
-				},
-				) {
-					// Empty balance spacer. Paired with TransportRight
-					// (equal SizingGrow), it splits the strip's free width
-					// evenly so PlayRow lands centered under the preview
-					// instead of hugging the left edge.
-					if clay.UI(clay.ID("TransportSpacerL"))(
-					{
-						layout = {
-							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-						},
-					},
-					) {}
-					if clay.UI(clay.ID("PlayRow"))(
-					{
-						layout = {
-							sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})},
-							layoutDirection = .LeftToRight,
-							childAlignment = {x = .Center, y = .Center},
-							childGap = BUTTON_ROW_GAP,
-						},
-					},
-					) {
-						jog_button("PlayBack", -1)
-						if clay.UI(clay.ID("PlayPause"))(
-						{
-							layout = {
-								sizing = {
-									width = clay.SizingFixed(96),
-									height = clay.SizingFixed(BUTTON_HEIGHT),
-								},
-								childAlignment = {x = .Center, y = .Center},
-							},
-							backgroundColor = BUTTON,
-							border = {color = BUTTON_BORDER, width = DEFAULT_BORDER},
-							cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
-						},
-						) {
-							if playhead.playing {
-								clay.Text(
-									"Pause",
-									clay.TextElementConfig {
-										textColor = TEXT,
-										fontSize = FONT_NORMAL,
-									},
-								)
-							} else {
-								clay.Text(
-									"Play",
-									clay.TextElementConfig {
-										textColor = TEXT,
-										fontSize = FONT_NORMAL,
-									},
-								)
-							}
-						}
-						jog_button("PlayFwd", 1)
-						playback_rate_dropdown()
-					}
-					// TopToBottom so childAlignment.x = .Right is honored
-					// (Clay ignores .Right on a LeftToRight main axis); the
-					// equal-grow pairing with TransportSpacerL keeps the
-					// counter flush right while PlayRow stays centered.
-					if clay.UI(clay.ID("TransportRight"))(
-					{
-						layout = {
-							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-							layoutDirection = .TopToBottom,
-							childAlignment = {x = .Right, y = .Center},
-						},
-					},
-					) {
-						clay.Text(
-							fmt.bprintf(
-								ui_text.state[:],
-								"%d / %d  ·  %gfps",
-								playhead.frame,
-								max(0, timeline_duration() - 1),
-								timeline_fps(),
-							),
-							clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
-						)
-					}
-				}
-			}
+			build_preview_column(DEFAULT_BORDER)
 			// Column 3: Inspector -- Clip / Project / Render view. The bottom
 			// tab row picks which card the scrollport shows; the active card
 			// scrolls in its own scrollport (InspectorContent) with a draggable
 			// vertical strip when it outgrows the column.
-			if clay.UI(clay.ID("InspectorColumn"))(
-			{
-				layout = {
-					sizing = {
-						width = clay.SizingGrow({min = INSPECTOR_MIN_W, max = INSPECTOR_MAX_W}),
-						height = clay.SizingGrow({}),
-					},
-					layoutDirection = .TopToBottom,
-					childGap = 0,
-				},
-				backgroundColor = EDITOR_BG,
-			},
-			) {
-				if clay.UI(clay.ID("InspectorArea"))(
-				{
-					layout = {
-						sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-						layoutDirection = .LeftToRight,
-						childGap = 0,
-					},
-				},
-				) {
-					if clay.UI(clay.ID("Inspector"))(
-					{
-						layout = {
-							sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
-							layoutDirection = .TopToBottom,
-							childGap = 0,
-						},
-						clip = {vertical = true, childOffset = {0, -scrollbars.inspector.offset}},
-					},
-					) {
-						if clay.UI(clay.ID("InspectorContent"))(
-						{
-							layout = {
-								sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-								layoutDirection = .TopToBottom,
-								childGap = SECTION_GAP,
-							},
-						},
-						) {
-							switch panel_views.inspector_view {
-							case .Clip:
-								clip_card()
-							case .Project:
-								project_card()
-							case .Render:
-								render_card()
-							}
-						}
-					}
-					v_scrollbar(
-						"InspectorV",
-						scrollbars.inspector.offset,
-						inspector_content_height(),
-						inspector_view_height(),
-					)
-				}
-				inspector_tabs()
-			}
+			build_inspector_column()
 		}
 		if clay.UI(clay.ID("EditorDivider"))(
 		{
@@ -3264,5 +3044,243 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 				tool_button("TimelineZoomIn", "+")
 			}
 		}
+	}
+}
+
+// Column 1: Media Bin.
+build_media_bin_column :: proc(default_border: clay.BorderWidth) {
+	if clay.UI(clay.ID("MediaBin"))(
+	{
+		layout = {
+			sizing = {
+				width = clay.SizingGrow({min = MEDIA_BIN_MIN_W, max = MEDIA_BIN_MAX_W}),
+				height = clay.SizingGrow({}),
+			},
+			padding = clay.PaddingAll(PANEL_PADDING),
+			childGap = CARD_GAP,
+			layoutDirection = .TopToBottom,
+		},
+		backgroundColor = BUTTON,
+		border = {color = BUTTON_BORDER, width = default_border},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
+	},
+	) {
+		// The view body grows to fill the panel so the tab row stays
+		// pinned to the panel's bottom edge regardless of how much
+		// content the active view has (an empty bin must not pull the
+		// tabs up under the header).
+		if clay.UI(clay.ID("MediaBinBody"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				layoutDirection = .TopToBottom,
+				childGap = CARD_GAP,
+			},
+		},
+		) {
+			switch panel_views.media_bin_view {
+			case .Bin:
+				media_bin_header()
+				media_bin_grid()
+			case .Undo:
+				undo_view_header()
+				undo_view_content()
+			}
+		}
+		media_bin_tabs()
+	}
+}
+
+// Column 2: Preview with the transport strip beneath it.
+build_preview_column :: proc(default_border: clay.BorderWidth) {
+	if clay.UI(clay.ID("PreviewColumn"))(
+	{
+		layout = {
+			sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+			layoutDirection = .TopToBottom,
+			childGap = CARD_GAP,
+			padding = clay.PaddingAll(CARD_GAP),
+		},
+		border = {color = BUTTON_BORDER, width = default_border},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_WIDGET),
+	},
+	) {
+		// The preview grows to fill the column (bounded below); the
+		// decoded image scales to fit whatever the widget becomes, and
+		// preview_canvas derives the on-screen canvas from the widget
+		// bounds, so this is responsive on resize.
+		if clay.UI(clay.ID("Preview"))(
+		{
+			layout = {
+				sizing = {
+					width = clay.SizingGrow({}),
+					height = clay.SizingGrow({min = 216}),
+				},
+			},
+			image = {imageData = nil},
+		},
+		) {
+			preview_fit_button()
+		}
+		// Transport strip: jog / play / rate, then the frame counter.
+		if clay.UI(clay.ID("ActionsArea"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+				layoutDirection = .LeftToRight,
+				childGap = BUTTON_ROW_GAP,
+				childAlignment = {x = .Center, y = .Center},
+			},
+		},
+		) {
+			// Empty balance spacer. Paired with TransportRight
+			// (equal SizingGrow), it splits the strip's free width
+			// evenly so PlayRow lands centered under the preview
+			// instead of hugging the left edge.
+			if clay.UI(clay.ID("TransportSpacerL"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				},
+			},
+			) {}
+			if clay.UI(clay.ID("PlayRow"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingFit({}), height = clay.SizingFit({})},
+					layoutDirection = .LeftToRight,
+					childAlignment = {x = .Center, y = .Center},
+					childGap = BUTTON_ROW_GAP,
+				},
+			},
+			) {
+				jog_button("PlayBack", -1)
+				if clay.UI(clay.ID("PlayPause"))(
+				{
+					layout = {
+						sizing = {
+							width = clay.SizingFixed(96),
+							height = clay.SizingFixed(BUTTON_HEIGHT),
+						},
+						childAlignment = {x = .Center, y = .Center},
+					},
+					backgroundColor = BUTTON,
+					border = {color = BUTTON_BORDER, width = default_border},
+					cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+				},
+				) {
+					if playhead.playing {
+						clay.Text(
+							"Pause",
+							clay.TextElementConfig {
+								textColor = TEXT,
+								fontSize = FONT_NORMAL,
+							},
+						)
+					} else {
+						clay.Text(
+							"Play",
+							clay.TextElementConfig {
+								textColor = TEXT,
+								fontSize = FONT_NORMAL,
+							},
+						)
+					}
+				}
+				jog_button("PlayFwd", 1)
+				playback_rate_dropdown()
+			}
+			// TopToBottom so childAlignment.x = .Right is honored
+			// (Clay ignores .Right on a LeftToRight main axis); the
+			// equal-grow pairing with TransportSpacerL keeps the
+			// counter flush right while PlayRow stays centered.
+			if clay.UI(clay.ID("TransportRight"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+					layoutDirection = .TopToBottom,
+					childAlignment = {x = .Right, y = .Center},
+				},
+			},
+			) {
+				clay.Text(
+					fmt.bprintf(
+						ui_text.state[:],
+						"%d / %d  ·  %gfps",
+						playhead.frame,
+						max(0, timeline_duration() - 1),
+						timeline_fps(),
+					),
+					clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+				)
+			}
+		}
+	}
+}
+
+// Column 3: Inspector -- Clip / Project / Render view. The bottom
+// tab row picks which card the scrollport shows; the active card
+// scrolls in its own scrollport (InspectorContent) with a vertical
+// strip when it outgrows the column.
+build_inspector_column :: proc() {
+	if clay.UI(clay.ID("InspectorColumn"))(
+	{
+		layout = {
+			sizing = {
+				width = clay.SizingGrow({min = INSPECTOR_MIN_W, max = INSPECTOR_MAX_W}),
+				height = clay.SizingGrow({}),
+			},
+			layoutDirection = .TopToBottom,
+			childGap = 0,
+		},
+		backgroundColor = EDITOR_BG,
+	},
+	) {
+		if clay.UI(clay.ID("InspectorArea"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+				layoutDirection = .LeftToRight,
+				childGap = 0,
+			},
+		},
+		) {
+			if clay.UI(clay.ID("Inspector"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})},
+					layoutDirection = .TopToBottom,
+					childGap = 0,
+				},
+				clip = {vertical = true, childOffset = {0, -scrollbars.inspector.offset}},
+			},
+			) {
+				if clay.UI(clay.ID("InspectorContent"))(
+				{
+					layout = {
+						sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+						layoutDirection = .TopToBottom,
+						childGap = SECTION_GAP,
+					},
+				},
+				) {
+					switch panel_views.inspector_view {
+					case .Clip:
+						clip_card()
+					case .Project:
+						project_card()
+					case .Render:
+						render_card()
+					}
+				}
+			}
+			v_scrollbar(
+				"InspectorV",
+				scrollbars.inspector.offset,
+				inspector_content_height(),
+				inspector_view_height(),
+			)
+		}
+		inspector_tabs()
 	}
 }
