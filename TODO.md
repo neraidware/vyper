@@ -2973,6 +2973,11 @@ Details TBD when Phase 2 reaches maturity.
   reads as 0, so it blends to nothing) and a layer that is ignored (alpha
   never applied) — both render wrong-but-plausible, so the probe asserts the
   mix itself, not merely "non-blank".
+- Coupling: `blit_box.frag` now requires a fragment uniform, so every consumer
+  that builds the shader itself must pass `num_uniform_buffers = 1` AND push
+  the block. The gpu resample probe missed it and the unbound descriptor
+  faulted the driver into `VK_ERROR_DEVICE_LOST` on the 4K mip path — a fault,
+  not a wrong pixel, which is why it is easy to misread as environmental.
 
 ---
 
