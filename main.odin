@@ -761,29 +761,368 @@ select_clip :: proc(track_idx, index: int) {
 	if index < 0 || index >= len(timeline.tracks[track_idx].clips) {
 		return
 	}
-	kf_sel = {}
+	kf_clear()
 	selection.track = track_idx
 	selection.index = index
 	clear(&selection.extra_set)
 	selection.extra_set[timeline.tracks[track_idx].clips[index].clip_id] = true
 }
 
-// kf_select makes (track_idx,clip_index,lane,key) the sole keyframe selection,
-// which deselects the clip selection (the two never coexist, S3).
-kf_select :: proc(track_idx, clip_index, lane, key: int) {
-	kf_sel.active = true
-	kf_sel.track_idx = track_idx
-	kf_sel.clip_index = clip_index
-	kf_sel.lane = lane
-	kf_sel.key = key
-	kf_sel.gen = kf_view.structure_gen
+// kf_drop_clip_selection is the half of the S3 exclusivity rule every
+// keyframe-selection entry point owes: keyframe selected, clip not.
+kf_drop_clip_selection :: proc() {
 	selection.track = -1
 	selection.index = -1
 	clear(&selection.extra_set)
 }
 
+// kf_clear drops the keyframe selection. clear, not `kf_sel = {}`: Odin's clear
+// KEEPS the backing buffer, so growing the list back to this size later never
+// reaches the allocator again, while a struct-literal assign would drop it on
+// every deselect.
 kf_clear :: proc() {
+	clear(&kf_sel.items)
+}
+
+// kf_selection_free releases the two grow-only keyframe-selection scratch
+// buffers for real. It exists because kf_clear's whole reason for being clear
+// rather than assign is that it RETAINS the buffer -- which is right for a
+// deselect and wrong at session teardown, where retaining it is the leak. A
+// `kf_sel = {}` in the teardown would zero the header and hand back the
+// selection's memory, and kf_hits (the hit-test output, filled on every press)
+// has no teardown at all, so both survive a full session teardown as live
+// allocations. Session heap, so: freed here and nowhere else.
+kf_selection_free :: proc() {
+	delete(kf_sel.items)
+	delete(kf_hits)
 	kf_sel = {}
+	kf_hits = nil
+}
+
+// kf_select makes (track_idx,clip_index,lane,key) the SOLE keyframe selection,
+// which deselects the clip selection (the two never coexist, S3).
+kf_select :: proc(track_idx, clip_index, lane, key: int) {
+	clear(&kf_sel.items)
+	append(&kf_sel.items, Kf_Ref{track_idx, clip_index, lane, key})
+	kf_sel.gen = kf_view.structure_gen
+	kf_drop_clip_selection()
+}
+
+// kf_select_add grows the selection by every ref in `refs` that is not already
+// in it — the Shift+click path, where `refs` is the set of diamonds under the
+// pointer.
+//
+// Adding is a union, NOT a toggle: toggling a set has no honest answer (which
+// way does a press flip two hovered keys when one of them is already in?), and
+// a press whose whole point is "select these" must not silently drop half of
+// them. Recovery from over-selecting is one plain click, which replaces the set.
+kf_select_add :: proc(refs: []Kf_Ref) {
+	if kf_sel.gen != kf_view.structure_gen {
+		// Stale refs would become VISIBLE again the moment we re-stamp the gen
+		// below, aliasing keys that have since slid. The new refs are the whole
+		// selection.
+		clear(&kf_sel.items)
+	}
+	kf_sel.gen = kf_view.structure_gen
+	for r in refs {
+		if !kf_sel_contains(r) {
+			append(&kf_sel.items, r)
+		}
+	}
+	kf_drop_clip_selection()
+}
+
+// kf_sel_active reports whether a live keyframe selection exists. A selection
+// made before the last structure shift reads as empty: one set/del can slide any
+// key into a different index, so the whole set invalidates at once.
+kf_sel_active :: proc() -> bool {
+	return len(kf_sel.items) > 0 && kf_sel.gen == kf_view.structure_gen
+}
+
+// kf_sel_count is the number of LIVE selected keyframes — zero for a stale
+// selection. Every site that iterates the selection goes through this rather
+// than len(kf_sel.items), so a stale set can never be read as live.
+kf_sel_count :: proc() -> int {
+	return kf_sel_active() ? len(kf_sel.items) : 0
+}
+
+// kf_clip_at resolves (track_idx, clip_index) against the live tree, or
+// reports false when it is out of bounds. A keyframe edit never reorders
+// tracks or clips, so this half of a Kf_Ref stays valid across store ops — which
+// is what lets a captured snapshot find its clip again after the first del.
+kf_clip_at :: proc(track_idx, clip_index: int) -> (cl: ^Clip, ok: bool) {
+	if track_idx < 0 || track_idx >= len(timeline.tracks) {
+		return nil, false
+	}
+	trn := &timeline.tracks[track_idx]
+	if clip_index < 0 || clip_index >= len(trn.clips) {
+		return nil, false
+	}
+	return &trn.clips[clip_index], true
+}
+
+// kf_resolve bounds-checks one ref against the LIVE tree, so a stale index
+// reads as "gone" rather than aliasing whatever now lives there.
+kf_resolve :: proc(r: Kf_Ref) -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
+	clip, found := kf_clip_at(r.track_idx, r.clip_index)
+	if !found {
+		return nil, -1, nil, false
+	}
+	if r.lane < 0 || r.lane >= len(clip.keyframe_tracks) {
+		return nil, -1, nil, false
+	}
+	trk := &clip.keyframe_tracks[r.lane]
+	if r.key < 0 || r.key >= len(trk.keys) {
+		return nil, -1, nil, false
+	}
+	return clip, r.lane, &trk.keys[r.key], true
+}
+
+// kf_selected resolves the selection when it is EXACTLY ONE keyframe, and
+// reports false for an empty or a multi selection. The single-key callers (the
+// inspector's value field and its click handler) use it so a multi-selection can
+// never half-resolve into the first ref and then be edited as though it were
+// the only one.
+kf_selected :: proc() -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
+	if kf_sel_count() != 1 {
+		return nil, -1, nil, false
+	}
+	return kf_resolve(kf_sel.items[0])
+}
+
+// kf_sel_contains reports whether `r` is in the LIVE selection. Short scan over
+// a short list, touching no allocator — which is what a per-painted-diamond
+// membership test has to be.
+kf_sel_contains :: proc(r: Kf_Ref) -> bool {
+	if !kf_sel_active() {
+		return false
+	}
+	for item in kf_sel.items {
+		if item == r {
+			return true
+		}
+	}
+	return false
+}
+
+// kf_sel_same_lane returns the track NAME of the selection's lane when EVERY
+// selected key sits on that one lane, and false otherwise. The inspector shows
+// it as a multi-selection's header only in that case: a track name is a var
+// identity, not a property, so naming one lane while the selection spans several
+// would be a claim about the set that isn't true.
+//
+// Both halves of the location are compared, not just the name: two clips on
+// different tracks can each have a lane 0 with the same name, and two lanes of
+// one clip can be distinct tracks that happen to agree on nothing — matching on
+// the name alone would report those as one shared lane.
+//
+// The returned string is BORROWED from the live track and is valid for the
+// current frame — the caller renders it immediately, and a layout pass mutates
+// nothing. Clone it if it must outlive the call.
+kf_sel_same_lane :: proc() -> (name: string, ok: bool) {
+	first: Kf_Ref
+	for item in kf_sel.items {
+		cl, lane, _, resolved := kf_resolve(item)
+		if !resolved {
+			continue
+		}
+		if !ok {
+			first = item
+			name = cl.keyframe_tracks[lane].name
+			ok = true
+			continue
+		}
+		if item.track_idx != first.track_idx ||
+		   item.clip_index != first.clip_index ||
+		   cl.keyframe_tracks[lane].name != name {
+			return "", false
+		}
+	}
+	return name, ok
+}
+
+// kf_sel_frame_span is the inclusive range of ABSOLUTE timeline frames the live
+// selection covers, as the one frame-shaped fact true of the whole set. Absolute
+// because each key is its own clip's start plus its clip-relative offset, and a
+// selection can span clips. A selection that resolves to nothing reports
+// (0,0) rather than an inverted range.
+kf_sel_frame_span :: proc() -> (lo, hi: i64) {
+	seen := false
+	for item in kf_sel.items {
+		cl, _, k, ok := kf_resolve(item)
+		if !ok {
+			continue
+		}
+		f := cl.timeline_start_frame + i64(k.frame_off)
+		if !seen {
+			lo, hi = f, f
+			seen = true
+			continue
+		}
+		lo = min(lo, f)
+		hi = max(hi, f)
+	}
+	return lo, hi
+}
+
+// kf_sel_interp aggregates the interpolation mode across the whole live
+// selection: `mixed` is true when two or more of the selected keys disagree (and
+// the returned mode is then meaningless — the UI shows "-"), and `seen` is false
+// when not one ref resolved, so the caller renders no dropdown at all rather than
+// naming a mode that belongs to no key. Interpolation is a property of a KEY —
+// it eases the segment arriving at that key — so unlike the value there is
+// nothing lane-specific about it and this aggregate is honest for a selection
+// spanning any number of tracks, lanes and clips.
+kf_sel_interp :: proc() -> (interp: Kf_Interp, mixed, seen: bool) {
+	n := 0
+	out: Kf_Interp
+	for item in kf_sel.items {
+		_, _, k, ok := kf_resolve(item)
+		if !ok {
+			continue
+		}
+		if n == 0 {
+			out = k.interp
+		} else if k.interp != out {
+			return out, true, true
+		}
+		n += 1
+	}
+	return out, false, n > 0
+}
+
+// kf_set_interp_all writes one interpolation mode onto EVERY selected key as a
+// single undoable edit, returning whether any key actually changed (a re-click
+// on the mode already in use is a no-op, not a node). It is a plain in-place
+// field write per key — interp lives in the key itself and nothing reallocates
+// — so all the keys are resolved before the first write without any of them
+// dangling.
+kf_set_interp_all :: proc(choice: Kf_Interp) -> bool {
+	keys: [dynamic]^Keyframe
+	defer delete(keys)
+	// Decide `changed` from the scan rather than from the write loop, so the
+	// no-op case is known before any undo seam opens.
+	changed := false
+	for item in kf_sel.items {
+		_, _, k, ok := kf_resolve(item)
+		if !ok {
+			continue
+		}
+		append(&keys, k)
+		changed = changed || k.interp != choice
+	}
+	if !changed {
+		return false
+	}
+	// undo_begin BEFORE the first write. undo_push snapshots the POST-edit tree
+	// as the new node and folds the pending PRE-edit snapshot into the cursor's
+	// own action, which is how the edit becomes undoable. Opened after the write
+	// instead, the pending snapshot is the already-mutated tree: the node records
+	// nothing, and undo_undo lands back on the state that still has the new
+	// interp — an undo that appears to work and redoes nothing. kf_add_prop and
+	// delete_selected_keyframe are the other two writers, and both open the seam
+	// before touching the store.
+	undo_begin()
+	for k in keys {
+		k.interp = choice
+	}
+	undo_push(.Value, "Set keyframe interpolation")
+	return true
+}
+
+// kf_sel_frame reports whether `r` is in the live keyframe selection and, when it
+// is, the frame its diamond should PAINT. Normally that is the key's own
+// frame_off; during a Keyframe_Move drag it is the captured start plus the
+// gesture's delta (the drag previews, it never writes — see Kf_Move), clamped
+// into the clip's own extent, since a selection can span clips and each has its
+// own length.
+//
+// One scan answers both questions, so the draw pass — which asks about every
+// diamond it paints — pays for one lookup, not two. The dragged branch reads the
+// captures and the idle branch the selection, because a drag is always armed by
+// a press that just set the selection: the captures ARE the selection.
+kf_sel_frame :: proc(r: Kf_Ref, live: i32) -> (frame: i32, selected: bool) {
+	if len(kf_move.snaps) == 0 {
+		return live, kf_sel_contains(r)
+	}
+	for s in kf_move.snaps {
+		if s.ref == r {
+			return kf_moved_frame(s, kf_move.delta), true
+		}
+	}
+	return live, false
+}
+
+// kf_moved_frame is where one captured keyframe sits DURING a drag (and, with
+// the same delta, where it will land): its start plus the delta, clamped into its
+// own clip's extent. The draw pass and the drag release both go through it, so
+// a key always lands exactly where it was drawn.
+kf_moved_frame :: proc(s: Kf_Snap, delta: i32) -> i32 {
+	cl, ok := kf_clip_at(s.ref.track_idx, s.ref.clip_index)
+	if !ok {
+		return s.start
+	}
+	return clamp(s.start + delta, 0, i32(cl.source_length_frames))
+}
+
+// kf_capture_sel snapshots every LIVE selected keyframe into `dst` (appending)
+// and returns how many it wrote. The caller passes a [dynamic]Kf_Snap it
+// releases with kf_snap_free (caller heap, buffer included) or kf_snaps_drop (names
+// only, keeping the buffer for a re-armed gesture). `dst` is emptied through
+// kf_snaps_drop first, so a re-armed gesture cannot inherit the previous one's
+// captures — and cannot orphan their names either.
+//
+// A ref that no longer resolves is SKIPPED, not fatal: the selection is already
+// gen-gated, so a miss means a lane was dropped by something the gen does not
+// cover, and the honest answer is to operate on the keys that are still there.
+kf_capture_sel :: proc(dst: ^[dynamic]Kf_Snap) -> int {
+	kf_snaps_drop(dst)
+	n := 0
+	for item in kf_sel.items {
+		cl, lane, k, ok := kf_resolve(item)
+		if !ok {
+			continue
+		}
+		s: Kf_Snap
+		s.ref = item
+		s.name = strings.clone(cl.keyframe_tracks[lane].name)
+		s.start = k.frame_off
+		s.final = k.frame_off
+		s.mask = k.mask
+		s.interp = k.interp
+		if k.mask != 0 {
+			s.value = k.value.([KF_PACK_MAX]f32)
+		} else {
+			s.value[0] = k.value.(f32)
+		}
+		append(dst, s)
+		n += 1
+	}
+	return n
+}
+
+// kf_snaps_drop releases the names a capture owns but KEEPS the list's backing
+// buffer, for a caller that re-arms the same list every gesture. That is the
+// drag path: kf_move.snaps is filled at press and re-filled at the next press,
+// so keeping the buffer saves a realloc per drag while a bare clear() would hand
+// back one track-name string per selected key. kf_snap_free is the counterpart
+// for a caller that owns the list outright and wants the buffer back too.
+kf_snaps_drop :: proc(snaps: ^[dynamic]Kf_Snap) {
+	for s in snaps^ {
+		delete(s.name)
+	}
+	// clear takes the pointer to the dynamic array directly, not a deref.
+	clear(snaps)
+}
+
+// kf_snap_free releases a kf_capture_sel result: every cloned name, then the
+// buffer. A result that captured nothing still owns its (empty) buffer, so this
+// is safe on it.
+kf_snap_free :: proc(snaps: ^[dynamic]Kf_Snap) {
+	for s in snaps^ {
+		delete(s.name)
+	}
+	delete(snaps^)
 }
 
 // kf_add_prop records a new key on `clip` for track-name `name` at the playhead
@@ -876,57 +1215,36 @@ autokey_gesture :: proc(clip: ^Clip, start, current: f32, name: string) -> bool 
 	return kf_auto_key(clip, name, current)
 }
 
-// delete_selected_keyframe removes the selected keyframe as one undoable
-// discrete edit; returns false when no keyframe is selected so callers fall
-// through to their clip-delete path. A stale selection (structure gen drifted)
-// resolves to "gone" and is just dropped, never aliased.
+// delete_selected_keyframe removes EVERY selected keyframe as one undoable
+// discrete edit; returns false when nothing is selected so callers fall through
+// to their clip-delete path.
+//
+// The whole selection is captured before the first delete (kf_capture_sel),
+// because deleting one key slides the key array of every other selected key on
+// that lane — and can free a track name a later delete still has to address by.
+// A stale selection (structure gen drifted) reads as "gone" and is just dropped,
+// never aliased.
 delete_selected_keyframe :: proc() -> bool {
-	if !kf_sel.active {
+	if !kf_sel_active() {
 		return false
 	}
-	cl, lane, k, ok := kf_selected()
-	if !ok {
+	snaps := make([dynamic]Kf_Snap)
+	defer kf_snap_free(&snaps)
+	if kf_capture_sel(&snaps) == 0 {
 		kf_clear()
 		return true
 	}
-	name := cl.keyframe_tracks[lane].name
-	frame := k.frame_off
 	undo_begin()
-	kf_del_key(cl, name, frame)
-	kf_sel = {}
+	for s in snaps {
+		cl, ok := kf_clip_at(s.ref.track_idx, s.ref.clip_index)
+		if !ok {
+			continue
+		}
+		kf_del_key(cl, s.name, s.start)
+	}
+	kf_clear()
 	undo_push(.Value, "Delete keyframe")
 	return true
-}
-
-// kf_selected resolves the keyframe selection against the LIVE timeline, or
-// reports false when nothing is selected or the indices have gone stale (clip
-// deleted, track removed, lane dropped). The stale case must read as "no
-// selection" — never alias what now lives at the old indices.
-kf_selected :: proc() -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
-	if !kf_sel.active {
-		return nil, -1, nil, false
-	}
-	// A keyframe sequence shift (kf_view.structure_gen bumped by set/del/split/trim)
-	// invalidates the whole index selection: slots may have been reused.
-	if kf_sel.gen != kf_view.structure_gen {
-		return nil, -1, nil, false
-	}
-	if kf_sel.track_idx < 0 || kf_sel.track_idx >= len(timeline.tracks) {
-		return nil, -1, nil, false
-	}
-	trn := &timeline.tracks[kf_sel.track_idx]
-	if kf_sel.clip_index < 0 || kf_sel.clip_index >= len(trn.clips) {
-		return nil, -1, nil, false
-	}
-	clip := &trn.clips[kf_sel.clip_index]
-	if kf_sel.lane < 0 || kf_sel.lane >= len(clip.keyframe_tracks) {
-		return nil, -1, nil, false
-	}
-	trk := &clip.keyframe_tracks[kf_sel.lane]
-	if kf_sel.key < 0 || kf_sel.key >= len(trk.keys) {
-		return nil, -1, nil, false
-	}
-	return clip, kf_sel.lane, &trk.keys[kf_sel.key], true
 }
 
 // clip_under_pointer returns the (track_idx, index) of the clip currently under
@@ -942,14 +1260,22 @@ clip_under_pointer :: proc() -> (int, int) {
 	return -1, -1
 }
 
-// kf_key_at hit-tests the pointer against every keyframe diamond on the live
-// timeline (geometry, not clay: the diamonds paint in the post-layout overlay
-// pass, so no element exists under them to PointerOver-test). Returns the
-// reselect target (track, clip, lane, key indices) for the FIRST hit, or
-// ok=false. Uses the same kf_key_center geometry draw_keyframes paints with,
-// so the pickable spot IS the painted diamond — a key clamped at a trimmed
-// edge stays pickable exactly where it paints.
-kf_key_at :: proc(mx, my: f32) -> (track_idx, clip_index, lane, key: int, ok: bool) {
+// kf_keys_at appends EVERY keyframe diamond under the pointer to `dst`, in
+// timeline order (track, then clip, then lane, then key). A Shift+click needs
+// the whole hovered set, not just the first hit, so this replaces the old
+// first-hit-only kf_key_at: one traversal answers both questions the press
+// handler asks (which diamond did I grab, and what else is under the pointer).
+//
+// Geometry, not clay: the diamonds paint in the post-layout overlay pass, so no
+// element exists under them to PointerOver-test. Uses the same kf_key_center
+// geometry draw_keyframes paints with, so the pickable spot IS the painted
+// diamond — a key clamped at a trimmed edge stays pickable exactly where it
+// paints.
+//
+// The list is usually one entry: lanes sit KF_ROW_H apart and the pick radius is
+// KF_HIT_MARGIN, so only vertically stacked keys overlap it, and only coincident
+// frames do that horizontally.
+kf_keys_at :: proc(mx, my: f32, dst: ^[dynamic]Kf_Ref) {
 	for track, ti in timeline.tracks {
 		for clip, ci in track.clips {
 			if len(clip.keyframe_tracks) == 0 {
@@ -964,13 +1290,12 @@ kf_key_at :: proc(mx, my: f32) -> (track_idx, clip_index, lane, key: int, ok: bo
 				for k, ki in clip.keyframe_tracks[tr].keys {
 					cx, cy := kf_key_center(box, tr, k.frame_off)
 					if abs(mx - cx) <= KF_HIT_MARGIN && abs(my - cy) <= KF_HIT_MARGIN {
-						return ti, ci, tr, ki, true
+						append(dst, Kf_Ref{ti, ci, tr, ki})
 					}
 				}
 			}
 		}
 	}
-	return -1, -1, -1, -1, false
 }
 
 // open_clip_context_menu opens the right-click menu anchored at (mx,my) for the

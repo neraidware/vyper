@@ -16,6 +16,11 @@
 # nix build result symlink
 /result
 
+# Local git worktrees. Each is a FULL checkout with its own build output, so
+# without this `git add -A` in the primary checkout commits a nested repo
+# (build artifacts, its own .git file, and every in-progress change inside it).
+/.worktrees/
+
 # Compile-time outputs (nanosvg C TU), produced by flake.nix / CI / local build
 /vendor/nanosvg/*.o
 /vendor/nanosvg/*.obj

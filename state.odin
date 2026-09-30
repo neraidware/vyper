@@ -637,27 +637,46 @@ Selection :: struct {
 }
 selection: Selection
 
-// Keyframe selection (S3): one keyframe on the live timeline, resolved by
-// indices (not pointers) so dynamic-array reallocations can't dangle it. It is
-// MUTUALLY EXCLUSIVE with the clip selection above — selecting a keyframe
-// clears selection.track/.index/.extra_set, and every clip-selection path
-// clears this. Indices go stale the moment the structure moves, so every
-// resolve re-bounds-checks against the live tree; a stale selection reads as
-// "nothing selected" (kf_selected) rather than aliasing a burned slot.
+// Kf_Ref names one keyframe by its path through the live tree: the storage
+// track, the clip within that track, the clip's keyframe track (lane), and the
+// key's index in that lane's key array. Indices, never a stored ^Keyframe — a
+// dynamic-array realloc anywhere in the tree must not be able to dangle a
+// selection. Resolving is bounds-checked against the live tree (kf_resolve), so
+// a ref that has gone stale reads as "gone" rather than aliasing whatever now
+// occupies the slot.
+Kf_Ref :: struct {
+	track_idx:  int,
+	clip_index: int,
+	lane:       int,
+	key:        int,
+}
+
+// Keyframe selection (S3, S7): the SET of selected keyframes. It is MUTUALLY
+// EXCLUSIVE with the clip selection above — selecting a keyframe clears
+// selection.track/.index/.extra_set, and every clip-selection path clears this.
+//
+// items is a grow-only list, not a bounded array: a cap would silently drop
+// refs past it, and "the key I shift-clicked is not selected" is a bug with no
+// visible cause. Every read is gen-gated (kf_sel_count), so a selection made
+// before a keyframe sequence shifted reads as EMPTY rather than aliasing
+// slots that may have been reused — the whole set invalidates at once, which is
+// the correct granularity, since one set/del can slide any key.
+//
+// The zero value is a valid empty selection, and kf_clear uses clear() — which
+// KEEPS the backing buffer — so growing the list never reaches the allocator
+// again after the first few clicks. Assigning `kf_sel = {}` would drop that
+// buffer, which is why every clear site goes through kf_clear.
 Keyframe_Selection :: struct {
-	active:     bool,
-	track_idx:  int, // storage track index
-	clip_index: int, // clip within that track
-	lane:       int, // into the clip's keyframe_tracks
-	key:        int, // into the lane's keys
-	gen:        u32, // kf_view.structure_gen when the selection was made
+	items: [dynamic]Kf_Ref,
+	gen:   u32, // kf_view.structure_gen the whole set was made under
 }
 kf_sel: Keyframe_Selection // zero value = nothing selected
 
 // Kf_View is the keyframe selection's UI companion state: the interpolation
-// dropdown toggle (one flag — a single key is selected at a time, same
-// toggle/select/dismiss shape as the export-encoder dropdown) and the
-// structure generation counter below.
+// dropdown toggle (one flag — there is ONE dropdown however many keys are
+// selected, so it offers the shared property across the set, same
+// toggle/select/dismiss shape as the export-encoder dropdown) and the structure
+// generation counter below.
 Kf_View :: struct {
 	interp_menu_open: bool,
 	// structure_gen increments whenever a keyframe SEQUENCE can shift: a key
@@ -666,9 +685,9 @@ Kf_View :: struct {
 	// made under and refuse to resolve once it drifts — a deleted key's slot
 	// can silently be reused by the next key, so without the gen a stale
 	// selection would alias a key that slid into the old index (AGENTS: never
-	// let an old handle alias a reused slot). On gen mismatch kf_selected
-	// reports "nothing selected", and the user re-picks the diamond.
-	structure_gen:   u32,
+	// let an old handle alias a reused slot). On gen mismatch kf_sel_count
+	// reports zero, and the user re-picks the diamonds.
+	structure_gen: u32,
 }
 kf_view: Kf_View
 
@@ -1055,19 +1074,74 @@ Opacity_Drag :: struct {
 }
 opacity_drag: Opacity_Drag
 
-// Kf_Move is the keyframe-diamond drag. start_frame captures the selected
-// key's frame_off at diamond press, so the release-time compare decides whether
-// the gesture actually moved it (a no-move click commits nothing — the
-// clip-stutter rule). press_x is the pointer x at press (the drag only engages
-// once the cursor travels KF_DRAG_THRESHOLD_PX from it, so a click never moves
-// the key); pivot is the frame-space offset between the grabbed key and the
-// cursor at press (key_frame - cursor_frame), so grabbing a diamond off-center
-// keeps that pivot instead of snapping the key's center to the cursor. All
-// meaningful only while active_interaction == .Keyframe_Move.
+// Kf_Snap is one selected keyframe captured BEFORE any store op, which is what
+// makes an operation on a whole selection possible at all: the ref path is valid
+// only until the first kf_del_key/kf_set_key (which slides the key array and
+// bumps structure_gen, invalidating the whole selection), and a delete that
+// empties a track frees that track's name string while a later snap on the same
+// track still has to address it.
+//
+// Ownership: caller heap (AGENTS §1). kf_capture_sel fills one of these per
+// selected key and the caller releases every cloned name and the buffer itself
+// (kf_snap_free) — the callee never frees.
+Kf_Snap :: struct {
+	// ref identifies the key in the LIVE tree. All four fields are valid for
+	// the whole gesture, and ref.track_idx / ref.clip_index stay valid past it
+	// too — a keyframe edit never reorders tracks or clips. ref.lane and
+	// ref.key do NOT survive the first store op, which is why the release
+	// addresses the key by name + frame instead.
+	ref: Kf_Ref,
+	// name is the CLONED track name and start the frame_off the key sat on at
+	// capture: the pair that still addresses the key once the indices went
+	// stale. The name is cloned for the reason above — a delete that empties a
+	// track frees the live string.
+	name:  string,
+	start: i32,
+	// final is where a move lands the key (== start until the release computes
+	// it). mask + value keep a packed (section) key packed across the
+	// delete + reinsert instead of silently unwrapping it to a scalar, and
+	// interp is carried because the insert path zero-initializes it — sliding a
+	// key must not quietly straighten the easing the user set.
+	final:  i32,
+	mask:   u8,
+	interp: Kf_Interp,
+	value:  [KF_PACK_MAX]f32,
+}
+
+// Kf_Move is the keyframe-diamond drag, for a selection of ANY size: a press on
+// one diamond arms a slide of every selected key by the same frame delta, which
+// is what makes retiming a run of keys one gesture instead of one per key.
+//
+// The gesture is a PREVIEW, never a write. It records how far the cursor has
+// travelled (delta) and draw_keyframes paints each selected key at
+// start + delta (kf_sel_frame), so the key arrays stay sorted and unique for
+// the whole drag and the release's del + set is a real normalization rather than
+// a repair of an array the drag had scrambled. It also means the dragged curve
+// cannot flicker in the preview, which re-reads the keys at the playhead.
+//
+// press_x is the pointer x at press (the drag only engages once the cursor
+// travels KF_DRAG_THRESHOLD_PX from it, so a click never nudges a key);
+// press_frame is the clip-relative frame under the cursor at press, so delta is
+// a pure delta from a fixed reference and cannot accumulate. An off-center grab
+// keeps its pivot because every key translates by the cursor's own travel.
+//
+// snaps holds the pre-gesture capture (one entry per selected key, see
+// Kf_Snap) and is dropped on release, keeping capacity. All meaningful only
+// while active_interaction == .Keyframe_Move.
+//
+// anchor is the key the pointer actually grabbed, and it is NOT snaps[0]: a
+// Shift+click unions the hovered keys into whatever was already selected, so a
+// set spanning two clips has snapshots ordered by the OLDER selection, and
+// element zero can name a different clip than the one under the cursor. The
+// press_x/press_frame pair is resolved through the anchor's own wrap box, so
+// deriving the delta from snaps[0] would drag a key by another clip's zoom and
+// pan. An invalid anchor (no grab) reads as index 0, which kf_resolve rejects.
 Kf_Move :: struct {
-	start_frame: i32,
-	press_x:     f32,
-	pivot:       f32,
+	snaps:   [dynamic]Kf_Snap,
+	anchor:  Kf_Ref,
+	press_x: f32,
+	press_frame: f32,
+	delta:   i32,
 }
 kf_move: Kf_Move
 
@@ -1083,6 +1157,15 @@ Kf_Dbl_Click :: struct {
 	frame: i32,
 }
 kf_dbl_click: Kf_Dbl_Click
+
+// kf_hits is the diamond hit-test's output buffer: kf_keys_at appends every
+// diamond under the pointer to it, and a press reads the first as the grabbed
+// key and the whole as the Shift+click set. A grow-only scratch, clear()ed on
+// every press (which KEEPS the buffer), so a hit-test never allocates after the
+// first one — a per-press make/delete pair is exactly the churn the ownership
+// rules forbid, and this list is touched on a user click rather than in a hot
+// loop anyway.
+kf_hits: [dynamic]Kf_Ref
 
 // Handle_Drag is the preview resize/crop-handle drag. handle is the dragged
 // corner (Maybe(nil) = none); kind is Scale vs Crop. Every handle_start_* field

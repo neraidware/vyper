@@ -142,6 +142,13 @@ free_timeline :: proc(t: ^Timeline) {
 undo_free_all :: proc() {
 	for &n in undo_hist.slots {
 		free_timeline(&n.snap)
+		// The label is a session-heap clone, owned exactly like the snapshot.
+		// Leaving it behind leaked one string per undo_push for the life of the
+		// process: the tree grows without bound, so an editing session
+		// accumulated them indefinitely, and the memory gate saw one 17-41 byte
+		// block per recorded edit. Nothing in the running app noticed, because
+		// the process never exits and reclaims anyway.
+		delete(n.label)
 	}
 	if undo_hist.pending_valid {
 		free_timeline(&undo_hist.pending)
@@ -162,7 +169,10 @@ undo_init :: proc() {
 			last_child   = -1,
 			next_sibling = -1,
 			kind         = .None,
-			label        = "start",
+			// Cloned, not a literal: undo_free_all frees every label, so the
+			// root node has to own its string too. A literal here would be a
+			// free of non-heap memory on the next undo_init.
+			label        = strings.clone("start"),
 			snap         = clone_timeline(timeline),
 		},
 	)
@@ -279,7 +289,7 @@ undo_restore :: proc(idx: i32) {
 	// restore has replaced it wholesale, and a keyframe has no stable id to
 	// re-resolve the way clips do — so drop it rather than alias whatever now
 	// sits at the old indices (same rule any delete follows).
-	kf_sel = {}
+	kf_clear()
 	if has_sel {
 		if tr, c, ok := find_clip_by_id(sel_id); ok {
 			selection.track = track_index_of(tr)
