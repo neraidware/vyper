@@ -1,5 +1,6 @@
 package main
 
+import "core:sys/windows"
 import "core:fmt"
 import "core:os"
 import "core:sort"
@@ -484,7 +485,13 @@ finder_open :: proc(mode: Finder_Commit_Mode) {
 	if file_finder.active {
 		finder_close()
 	}
-	cwd := os.get_working_directory(context.temp_allocator) or_else ""
+
+	cwd, err := os.user_home_dir(context.temp_allocator)
+
+    if err != nil {
+        cwd = os.get_working_directory(context.temp_allocator) or_else ""
+    }
+
 	file_finder.mode = mode
 	file_finder.active = true
 	file_finder.cwd = strings.clone(cwd)
