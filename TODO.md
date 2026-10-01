@@ -2732,6 +2732,135 @@ is S1c, not a refactor, and is tracked there.
 **Evidence (behavior-preserving):** full `all` green, including `valgrind` and
 `render_valgrind` at 0 definitely / 0 indirectly lost.
 
+## Active 11 — Unified render engine: one evaluation, multiple sinks, minimal state
+
+**Status: planned 2026-10-01.** Branch `render-engine`, base `639d20a`.
+Nothing implemented yet; this section is the agreement before code.
+
+**Why.** Preview and export are two *drivers* over two *copies* of the same
+derived facts, and every copied fact is a drift site. The keyed-gain bug shipped
+this month is the proof: the fact "clip gain" lived in `clip.gain` (canonical),
+`Audio_Geom_Chip.gain_dB` (playback copy) and was supposed to live in
+`Render_Audio_Src` (export copy) — the export copy was never wired, so rendered
+files ignored the slider and its automation. Active 10 shared the *rules* between
+preview and export and explicitly left the *pipelines* separate (`TODO.md:2310`,
+deferred as S1c because a zero-copy *visual* pipeline needs GPU interop). That
+deferral conflated two separable things — sharing the **evaluation** vs sharing
+the **buffer** — and audio, which needs no interop at all, was swept along and
+left as two whole parallel systems. This work-stream shares the system and the
+data source. Guiding principle (user, 2026-10-01): **"Multiple state is the
+devil's home — reduce state as much as possible."**
+
+**Findings (verified against the tree, not from memory).**
+
+Two *audio* systems today:
+
+| | playback (audio preview) | export |
+|---|---|---|
+| snapshot | `audio_geometry_commit` (`audio.odin:755`) → `Audio_Geom_Slot` chip | `render_audio_src_from_clip` (`render.odin:999`) → `Render_Audio_Src` |
+| provision | `audio_provision` (`audio.odin:907`) → `Play_Src`/`Play_Seg` | `render_audio_open` (`render.odin:1810`) |
+| decode | `audio_src_pull` / `audio_src_seek_anchor` | `render_audio_pull` (a reimplementation; it even dropped the seek preroll) |
+| mix | `audio_mix_frame` (`audio.odin:1130`) | inline loop (`render.odin:2957`) |
+| grouping | one decoder per *source stream* (`audio_provision_find_group`) | one decoder per *clip* (re-opens the same file per split) |
+
+`audio_mix_frame`'s own comment says it is "exactly like the render loop
+(render.odin render_worker_run)" — the author knew it was a copy.
+
+Two *video evaluation* drivers:
+
+| | preview | export |
+|---|---|---|
+| driver | `update_preview_slots` (`frame.odin:35`) | `render_worker_run` (`render.odin:2155`) |
+| geometry/opacity sample | `kf_geom_sample_lane` (`preview_state.odin:502,509`) | `render_eval_keyed_geom` / `render_kf_geom_rect` |
+| source | `proxy_pick_for_frame` (`preview_state.odin:700`), fallback original | original `clip.path` (`render.odin:1001`) |
+| resolution | `PREVIEW_W×PREVIEW_H` | per-clip max-scale stage |
+| output | GPU texture → widget | GPU canvas → NV12 → encoder |
+
+Duplicated-*derived* state (all pure functions of the document + frame):
+
+- evaluated geometry/opacity: `Preview_Slot` **and** `Render_Video_Src.{transform_*,crop_*,scale,opacity,kf_geom}`.
+- gain + gain keys: `Audio_Geom_Chip` **and** `Play_Seg` **and** (was) `Render_Audio_Src`.
+- draw order: preview's `preview_draw_key` call sites **and** the order of
+  `Render_Job.visuals` (Active 10 collapsed the *rule* into `render_order.odin`
+  but each side still materializes its own ordering).
+
+Already in our favor (do not rebuild): proxy-vs-original is *already* a per-call
+source policy (`proxy_pick_for_frame`), and preview vs export already composite
+through shared shaders (`quad.vert`, `blit_box.frag`, `Quad_Uniforms`). What is
+missing is the single driver, not the GPU half.
+
+Absent entirely: a live (locked) preview of frames as they render
+(`render_progress` is a text counter; the preview keeps showing the timeline), and
+any export chunk cache for incremental re-export.
+
+**Model (target).**
+
+- **Canonical document** — `timeline` + `project`. One source of truth. The gain
+  bug cannot exist when a fact has one home.
+- **Evaluation is a pure function**, never a stored value: a proc over
+  `(document, frame, resolution, source_policy)` returning what the sink needs.
+  No intermediate "plan" object — a plan is derived state, i.e. the thing we are
+  removing.
+- **Sinks** = preview display, export encoder, audio device, audio encoder. A
+  sink holds only runtime resources (decoders, GPU textures, rings, encoder) —
+  distinct objects, not copies of a fact.
+- **Cross-thread handoff is a committed version + generation, not a deep copy of
+  derived facts.** This is the seam AGENTS §1 already names ("the commit bumps a
+  generation, and caches keyed on it drop stale entries free"); `kf_structure_gen`
+  and `gain_epoch` are its existing instances. The worker reads the immutable
+  committed document; architecture-specific snapshots (`Render_Job`,
+  `Audio_Geom_Slot` chip copies) collapse onto it.
+
+**Consequence for the active asks** (why this is the right foundation, not a
+detour):
+
+- Single engine = the pure evaluators with one input, the committed document.
+- Live preview during render = the worker already composites into
+  `Render_Enc_Slot.canvas` (`render.odin:1848`); the preview sink displays that
+  buffer and the input gate freezes. Zero new state.
+- Incremental export = a chunk keyed by `(document generation, frame range,
+  source policy)`. Only possible once evaluation is deterministic from one
+  document — the same property removing the copies buys.
+
+**Steps** (each lands + probe + vet before the next; expect probe-first, and
+mutation-test every new assertion):
+
+- [ ] **S1 — Define the committed-version read model.** Name every cross-thread
+      reader that currently receives a deep copy (`Render_Job`, the audio chip
+      slab) and specify the minimal shared read interface over the canonical
+      document. This is the seam everything else hangs on; no behavior change
+      beyond *how* the copy is obtained. Probe: a worker sees a snapshot that is
+      internally consistent and unaffected by a concurrent edit.
+- [ ] **S2 — Collapse the audio copies (first concrete reduction).** Delete
+      `Audio_Geom_Chip.gain_dB`/`kf_keys` and `Play_Seg`'s copied keys; both the
+      playback mixer and the export mixer sample gain through one pure accessor
+      over the committed document. `kf_gain_linear` stays as the shared evaluator.
+      Probe: playback mix == export mix for the same frame; readout sampled; both
+      mutations from the 2026-09-30 gain fix still caught.
+- [ ] **S3 — One video frame evaluator.** Geometry, opacity, source policy and
+      draw order become one proc parameterized by `(resolution, source_policy)`,
+      consumed by both preview and export. Delete the preview/export sampling
+      duplication (`kf_geom_sample_lane` call sites vs `render_eval_keyed_geom`).
+      Probe: preview evaluation == export evaluation for a frame across
+      proxy/original and resolutions.
+- [ ] **S4 — Sink split.** Preview and export consume S3's output through their
+      own resource-holding sinks; `Render_Video_Src`'s derived geometry fields and
+      the preview slot's sampled copies go away.
+- [ ] **S5 — Live locked preview during render.** Preview sink displays the
+      export worker's current composed frame; editing/playhead gated while
+      `render_is_busy()`. Probe: frame shown == frame encoded; input rejected.
+- [ ] **S6 — Incremental (chunked) export.** Chunk cache keyed by
+      `(document generation, frame range, source policy)`; re-export only chunks
+      whose key changed. Depends on S1–S4 being deterministic.
+
+**Out of scope / dependencies.** The zero-copy GPU pipeline (Active 1 / S1c) is
+orthogonal — this shares evaluation, not buffers, so it does not wait on GPU
+interop. Active 1 already covers hw decode and "preview the original when the host
+keeps up"; the source policy here builds on that rather than replacing it.
+
+**Decision pending.** Where the committed-version read model lives (extend the
+existing generation/epoch pattern vs a deeper persistent document). S1 settles it.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the
