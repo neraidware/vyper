@@ -423,7 +423,7 @@ geom_key_probe_run :: proc() -> int {
 		// Inside the span the packed section owns the value, so a resting edit
 		// there is invisible by design and clip_geom_set would have written a
 		// key instead of a pending resting value. Past the last key `base`
-		// rules, so the edit is visible and pending — and the button is what
+		// rules, so the edit is visible and pending — and the A shortcut is what
 		// turns it into a key.
 		playhead.frame = 150
 		for off in ([]i32{0, 100}) {
@@ -464,23 +464,69 @@ geom_key_probe_run :: proc() -> int {
 		)
 		geom_key_check(
 			kf_approx(clip_geom_get(cl, .Crop_R), before_r),
-			"an untouched lane must keep its value after the button (got %v)",
+			"an untouched lane must keep its value after the shortcut (got %v)",
 			clip_geom_get(cl, .Crop_R),
 		)
+		// The point of the grouping: a pending SUBSET of a section becomes one
+		// knot on the section itself, and the section STAYS packed. Writing the
+		// lane as a track of its own would fan the user's whole-crop animation
+		// out to four per-lane tracks, a storage they did not ask for, as a
+		// side effect of asking to key one edge.
+		geom_key_check(
+			kf_track_index(cl^, "crop") >= 0,
+			"keying one lane of a packed section must leave the section packed",
+		)
+		geom_key_check(
+			kf_track_index(cl^, "crop.l") < 0,
+			"the section must not have been unwrapped into a 'crop.l' track",
+		)
 		// The section and its lanes must never both exist: that coexistence is
-		// what kf_geom_sample_lane asserts against, so a button press that
+		// what kf_geom_sample_lane asserts against, so a shortcut press that
 		// left both would crash the next preview frame rather than this probe.
 		geom_key_check(
 			!(kf_track_index(cl^, "crop") >= 0 && kf_track_index(cl^, "crop.l") >= 0),
-			"the packed section and its lane must not coexist after the button",
+			"the packed section and its lane must not coexist after the shortcut",
 		)
+		// The new knot carries ONLY the lane that was pending. A full-mask knot
+		// here would key breakpoints on three edges the user never panned, and
+		// would pin them to whatever the sampler happened to read — the exact
+		// "stamps keys nobody asked for" failure clip_geom_drag exists to avoid.
+		crop_ti := kf_track_index(cl^, "crop")
+		if crop_ti >= 0 {
+			keys := cl.keyframe_tracks[crop_ti].keys
+			off_new := i32(playhead.frame - cl.timeline_start_frame)
+			found := false
+			for &k in keys {
+				if k.frame_off != off_new {
+					continue
+				}
+				found = true
+				if v, is_pack := k.value.([KF_PACK_MAX]f32); is_pack {
+					geom_key_check(
+						k.mask == 0b0001,
+						"the new knot must key the pending lane alone (mask %d)",
+						k.mask,
+					)
+					geom_key_check(
+						kf_approx(v[0], 0.4),
+						"the knot must carry the pending lane's on-screen value (got %v)",
+						v[0],
+					)
+				}
+			}
+			geom_key_check(
+				found,
+				"the packed section must have gained a knot on the playhead (off %d)",
+				off_new,
+			)
+		}
 		// Every lane must still sample without tripping an assert: this is the
 		// check the preview draw makes on the next frame.
 		for i in 0 ..< int(Render_Geom_Prop._COUNT) {
 			prop := Render_Geom_Prop(i)
 			_ = clip_geom_get(cl, prop)
 		}
-		geom_key_check(true, "sampling every lane after the packed->lane migration did not assert")
+		geom_key_check(true, "sampling every lane after the grouped key did not assert")
 	}
 
 	// --- the playhead guard. kf_sample_keys holds from the first key onward, so
@@ -609,33 +655,137 @@ geom_key_probe_run :: proc() -> int {
 		// and nothing else, so a later "keyframe all" cannot silently animate
 		// a property the user never moved.
 		n := clip_geom_key_all_modified(cl)
-		geom_key_check(n > 0, "the button must report how many lanes it keyed, got %d", n)
+		geom_key_check(n > 0, "the shortcut must report how many lanes it keyed, got %d", n)
 		geom_key_check(
 			!clip_geom_any_modified(cl),
 			"keying every pending lane must clear the pending set",
 		)
-		ti := kf_track_index(cl^, "crop.l")
-		geom_key_check(ti >= 0, "the button must create a 'crop.l' track")
-		if ti >= 0 {
+		// One crop pan writes all four crop edges and both transform lanes
+		// (preview_transform.odin), and clip_geom_set marks a lane pending
+		// whenever it is written, so the pending set is all six. Grouped, that
+		// is TWO section keys, not six lane tracks: the pan touched whole
+		// structs, so the animation reads back as the whole structs it came
+		// from.
+		geom_key_check(
+			n == 6,
+			"a crop pan leaves six lanes pending, so six lanes must be keyed (got %d)",
+			n,
+		)
+		for name in ([]string{
+			"crop.l", "crop.r", "crop.t", "crop.b", "transform.x", "transform.y",
+		}) {
+			geom_key_check(
+				kf_track_index(cl^, name) < 0,
+				"a grouped key must not mint a per-lane track (%q exists)",
+				name,
+			)
+		}
+		// The expected mask and lane 0 come from kf_geom_sections, the same
+		// table the writer reads, so this case cannot drift into asserting a
+		// hand-copied lane list.
+		defs := kf_geom_sections
+		for name in ([]string{"crop", "transform"}) {
+			sec_index, is_sec := kf_geom_section_index(name)
+			geom_key_check(is_sec, "probe: %q must be a real section", name)
+			if !is_sec {
+				continue
+			}
+			ti := kf_track_index(cl^, name)
+			geom_key_check(
+				ti >= 0,
+				"a grouped key must create the %q section track, not per-lane tracks",
+				name,
+			)
+			if ti < 0 {
+				continue
+			}
 			keys := cl.keyframe_tracks[ti].keys
-			geom_key_check(len(keys) == 1, "one gesture at one playhead => one key, got %d", len(keys))
+			geom_key_check(
+				len(keys) == 1,
+				"one gesture at one playhead => one key on the section (got %d)",
+				len(keys),
+			)
 			if len(keys) == 1 {
-				geom_key_check(
-					kf_approx(keys[0].value.(f32), cl.crop_l),
-					"the key must hold the value ON SCREEN (crop.l %v), not a stale resting field",
-					keys[0].value.(f32),
-				)
+				if v, is_pack := keys[0].value.([KF_PACK_MAX]f32); is_pack {
+					geom_key_check(
+						keys[0].mask == kf_geom_full_mask(name),
+						"the %q knot must key every lane the pan wrote (mask %d)",
+						name,
+						keys[0].mask,
+					)
+					geom_key_check(
+						kf_approx(v[0], clip_geom_get(cl, defs[sec_index].lanes[0])),
+						"the %q knot must hold lane 0's value ON SCREEN, not a stale slot",
+						name,
+					)
+				} else {
+					geom_key_check(false, "the %q section key must be packed, not scalar", name)
+				}
 			}
 		}
-		// Scale was never touched by a pan, so the button must not have keyed
-		// it — keying it would start animating a property the user left alone.
+		// Scale and opacity were never touched by a pan, so the shortcut must
+		// not have keyed them — keying either would start animating a property
+		// the user left alone.
 		geom_key_check(
 			kf_track_index(cl^, "scale") < 0,
-			"the button must key only the pending lanes — 'scale' was never panned",
+			"the shortcut must key only the pending lanes — 'scale' was never panned",
+		)
+		geom_key_check(
+			kf_track_index(cl^, "opacity") < 0,
+			"the shortcut must key only the pending lanes — 'opacity' was never panned",
 		)
 		// Pressing it again with nothing pending must be a no-op, not a second
 		// undo node full of redundant keys.
 		geom_key_check(clip_geom_key_all_modified(cl) == 0, "a second press must key nothing")
+	}
+
+	// --- an ALREADY UNWRAPPED section stays unwrapped. Grouping is for a section
+	// the user never split up. Once a lane carries its own track, that shape is
+	// already on the clip — the user keyed or edited that lane individually, and
+	// kf_geom_set_lane_key is what unwrapped it — so re-packing on the next
+	// grouped press would delete a real track and rewrite an animation the user
+	// built, as a side effect of asking to key a DIFFERENT edge.
+	{
+		cl := geom_key_unkeyed_fixture()
+		playhead.frame = 150
+		// Key one crop edge on its own. This is the unwrap.
+		clip_geom_add_lane_key(cl, .Crop_L)
+		geom_key_check(
+			kf_track_index(cl^, "crop") < 0,
+			"fixture: keying one crop lane on its own must not make a section track",
+		)
+		geom_key_check(
+			kf_track_index(cl^, "crop.l") >= 0,
+			"fixture: the individual lane key must own a 'crop.l' track",
+		)
+		// A different edge is panned, so it is pending.
+		clip_geom_mark_modified(cl, .Crop_T)
+		n := clip_geom_key_all_modified(cl)
+		geom_key_check(n == 1, "one pending lane must key exactly one lane, got %d", n)
+		geom_key_check(
+			kf_track_index(cl^, "crop") < 0,
+			"an already-unwrapped section must NOT be re-packed into a section track",
+		)
+		geom_key_check(
+			kf_track_index(cl^, "crop.t") >= 0,
+			"the pending lane of an unwrapped section must be keyed on its own track",
+		)
+		geom_key_check(
+			kf_track_index(cl^, "crop.l") >= 0,
+			"the per-lane key already on the clip must survive a write to a sibling lane",
+		)
+		for name in ([]string{"crop.r", "crop.b"}) {
+			geom_key_check(
+				kf_track_index(cl^, name) < 0,
+				"keying one lane of an unwrapped section must not mint %q",
+				name,
+			)
+		}
+		geom_key_check(
+			!clip_geom_any_modified(cl),
+			"the shortcut must clear the pending set it consumed (mask %d)",
+			cl.geom_modified,
+		)
 	}
 
 	// --- keyed handle drag. This is the one gesture that looked correct and
@@ -844,7 +994,7 @@ geom_key_probe_run :: proc() -> int {
 		return 1
 	}
 	fmt.println(
-		"[geom-key-probe] OK: geometry writes land where the clip reads — Alt+wheel/Alt-drag/typed edit/handle drag route to the playhead key, unkeyed edits stay visible and pending, the playhead guard mints no off-clip key, key-all-modified keys exactly the pending lanes (including a packed-section migration), and the clip bounds box is sampled at the playhead rather than read off the resting fields",
+		"[geom-key-probe] OK: geometry writes land where the clip reads — Alt+wheel/Alt-drag/typed edit/handle drag route to the playhead key, unkeyed edits stay visible and pending, the playhead guard mints no off-clip key, key-all-modified keys exactly the pending lanes as whole sections (packed when the section is not already unwrapped), and the clip bounds box is sampled at the playhead rather than read off the resting fields",
 	)
 	return 0
 }

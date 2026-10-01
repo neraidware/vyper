@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 
 // Keyframe probe (VYPER_KEYFRAME_PROBE): headless regression checks for the
 // generic keyframe store — sorted insert/replace, the linear sample (a key
@@ -857,6 +858,124 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	playhead.frame = 20
 	ak_ok = !kf_auto_key(&ak, "gain", 4.0)
 	kf_probe_check(ak_ok, "auto-key declines when the toggle is off")
+
+	// --- keyed gain reaches BOTH mixers in the RIGHT UNIT -----------------
+	// The gain track is authored in dB (kf_add_prop keys cl.gain, which the
+	// inspector shows as "%.1f dB"), but a mixer multiplies PCM by a LINEAR
+	// amplitude. The two used to be conflated: a -40 dB key was applied as a
+	// -40x multiplier, so playback opened with an inverted blast instead of
+	// near-silence. Playback and export now share kf_gain_linear; this pins the
+	// conversion and the two seams that use it.
+	{
+		db_keys := [2]Keyframe {
+			{frame_off = 0, value = f32(-40.0), interp = .Linear},
+			{frame_off = 41, value = f32(0.0), interp = .Linear},
+		}
+		g0 := kf_gain_linear(db_keys[:], 0, 0)
+		kf_probe_check(
+			kf_approx(g0, db_to_linear(-40)),
+			"keyed gain at frame 0: want linear(-40dB)=%.5f, got %.5f (raw dB applied as a multiplier would be -40)",
+			db_to_linear(-40),
+			g0,
+		)
+		kf_probe_check(kf_approx(kf_gain_linear(db_keys[:], 41, 0), 1.0), "keyed gain lands at unity on the 0 dB key")
+		// Past the last key the track is inactive: the STATIC base rules. Here
+		// that base is 0 dB, so the value is unity again (not silence, and not
+		// the raw last key value either).
+		kf_probe_check(
+			kf_approx(kf_gain_linear(db_keys[:], 50, 0), 1.0),
+			"past the last gain key the static gain rules",
+		)
+		// A keyed midpoint sits between the endpoints in amplitude, not at the
+		// raw dB number.
+		mid := kf_gain_linear(db_keys[:], 20, 0)
+		kf_probe_check(
+			mid > g0 && mid < 1.0,
+			"a keyed segment interpolates in amplitude: mid=%.5f must be inside (%.5f, 1)",
+			mid,
+			g0,
+		)
+		// Empty track: the static base, converted. This is the unkeyed clip.
+		kf_probe_check(
+			kf_approx(kf_gain_linear(db_keys[:0], 3, -20), db_to_linear(-20)),
+			"unkeyed gain returns the static dB base, converted",
+		)
+
+		// Playback seam: Play_Seg.gain_dB + its copied keys.
+		kg := Play_Seg {
+			start_a = 0,
+			start_s = 0,
+			len_a   = 100,
+			gain    = db_to_linear(0),
+			gain_dB = 0,
+			kf_n    = 2,
+		}
+		kg.kf_keys[0] = db_keys[0]
+		kg.kf_keys[1] = db_keys[1]
+		kf_probe_check(
+			kf_approx(play_seg_gain_linear(&kg, 0), g0),
+			"playback seam must agree with kf_gain_linear",
+		)
+
+		// Export seam: Render_Audio_Src.gain_dB + its snapshot. Same track,
+		// same answer — the export used to apply NO gain at all, so a rendered
+		// file ignored the slider and its automation entirely.
+		xg := Render_Audio_Src{gain_dB = 0, kf_n = 2}
+		xg.kf_keys[0] = db_keys[0]
+		xg.kf_keys[1] = db_keys[1]
+		kf_probe_check(
+			kf_approx(kf_gain_linear(xg.kf_keys[:xg.kf_n], 0, xg.gain_dB), g0),
+			"export seam must agree with kf_gain_linear",
+		)
+		kf_probe_check(
+			kf_approx(kf_gain_linear(xg.kf_keys[:xg.kf_n], 20, xg.gain_dB), mid),
+			"export seam must interpolate like playback",
+		)
+
+		// Wiring: the job build must carry the static dB AND a copy of the
+		// track. A src that dropped either is exactly how the export ignored
+		// the slider and its automation entirely.
+		xc := Clip {timeline_start_frame = 100, source_length_frames = 50, gain = -3}
+		xc.path = "foo.aac"
+		kf_set_key(&xc, "gain", 0, -40.0)
+		kf_set_key(&xc, "gain", 41, 0.0)
+		xs := render_audio_src_from_clip(&xc)
+		kf_probe_check(xs.gain_dB == -3, "export src must carry the static clip gain (got %v)", xs.gain_dB)
+		kf_probe_check(xs.kf_n == 2, "export src must snapshot the gain track (got %d keys)", xs.kf_n)
+		kf_probe_check(
+			kf_approx(kf_gain_linear(xs.kf_keys[:xs.kf_n], 0, xs.gain_dB), db_to_linear(-40)),
+			"export src at frame 0 must render the keyed gain",
+		)
+		mem.delete_cstring(xs.path)
+	}
+
+	// --- inspector gain readout follows the playhead ----------------------
+	// The gain row was the only property whose readout showed the resting field
+	// instead of the value at the playhead, so on a keyed clip it disagreed
+	// with what playback was doing. clip_gain_db_at_playhead owns the rule.
+	{
+		gc := Clip {timeline_start_frame = 100, source_length_frames = 50, gain = 0}
+		kf_set_key(&gc, "gain", 0, -40.0)
+		kf_set_key(&gc, "gain", 41, 0.0)
+		playhead.frame = 100 // rel 0, on the first key
+		kf_probe_check(
+			kf_approx(clip_gain_db_at_playhead(&gc), -40.0),
+			"gain readout on the first key must show the keyed dB, got %v",
+			clip_gain_db_at_playhead(&gc),
+		)
+		playhead.frame = 141 // rel 41, on the second key
+		kf_probe_check(
+			kf_approx(clip_gain_db_at_playhead(&gc), 0.0),
+			"gain readout on the last key must show the keyed dB",
+		)
+		// No gain track: the static value is shown.
+		uc := Clip {gain = -6.5}
+		playhead.frame = 0
+		kf_probe_check(
+			clip_gain_db_at_playhead(&uc) == -6.5,
+			"gain readout on an unkeyed clip shows the static gain",
+		)
+	}
 
 	if kf_probe_fail {
 		fmt.println("[kf-probe] summary: FAIL")

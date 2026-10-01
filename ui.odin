@@ -4,6 +4,7 @@ import clay "clay-odin"
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:unicode/utf8"
 
 // ---------------------------------------------------------------------------
 // Clay UI layout tree for the whole app (build_page), plus small display
@@ -65,6 +66,10 @@ UI_Text_Buffers :: struct {
 	// the row from allocating a string every frame the inspector is drawn.
 	kf_pending:      [64]u8,
 	kf_pending_list: [64]u8,
+	// The inspector's clip-name label, cut to fit the name field. A display
+	// name is a file name, so PATH_MAX is the honest bound; 256 covers every
+	// path an editor meets and keeps the buffer off the heap.
+	clip_name: [256]u8,
 	// playhead timecode (HH:MM:SS:FF) scratch; clay keeps it until draw, so it
 	// must outlive build_page and back exactly one clay.Text element per frame.
 	timecode:    [32]u8,
@@ -269,22 +274,143 @@ kf_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 // Inspector cards (column 3).
 // ---------------------------------------------------------------------------
 
+// text_px is the width clay's measure_text reports for `text` at `font_size`,
+// computed with the same metric so a label cut to a pixel budget is cut exactly
+// where clay would have overflowed.
+text_px :: proc(text: string, font_size: int) -> f32 {
+	n := 0
+	for i := 0; i < len(text); {
+		_, size := utf8.decode_rune(text[i:])
+		n += 1
+		i += size
+	}
+	return f32(n) * f32(font_size) * FONT_ADVANCE_RATIO
+}
+
+// INSPECTOR_CARD_MAX_W is the width a card may take inside the inspector: the
+// column's own maximum, less the vertical scrollbar that shares the row with it.
+// A card is sized by its CONTENT, and a Text child's measured width is that
+// content -- so an unbounded card adopted the width of the longest label in it.
+// A file name is exactly that label ("A012_C003_20260314_184522_take07.mov"
+// measures ~430px in a 346px card), and clay has no max-width on a text element
+// to stop it: the name was the widest thing in the panel, so the panel became
+// as wide as the name and painted its background over the preview.
+//
+// The bound and label_truncate_fmt fix that from different sides, and each one
+// alone still leaves a bug: with the bound but no cut, the card holds its width
+// and the text spills out of the field over the preview instead; with the cut
+// but no bound, the next label wider than this one resizes the panel again.
+INSPECTOR_CARD_MAX_W :: f32(INSPECTOR_MAX_W - TSCROLLBAR_W)
+
+// label_truncate_fmt writes `text` into `dst` as a NUL-terminated string, cut to
+// `max_px` at `font_size` with a trailing ellipsis when it does not fit, and
+// returns what it wrote. `text` is written whole when it already fits.
+//
+// It fills a CALLER's buffer rather than returning a fresh string because this
+// runs on the inspector's layout path, once per frame, and an allocated string
+// per frame is exactly what the ownership rules forbid — as is a truncation that
+// is only approximately right, since the one glyph it overflows by is the glyph
+// that makes the panel jump.
+//
+// The cut lands on a RUNE boundary and the ellipsis is reserved before the
+// budget is spent, so the result never exceeds `max_px`. Cutting the string
+// rather than leaning on the card's width bound is what keeps the tail legible:
+// clay has no max-width on a text element, so an uncut label is not clipped at
+// the field — it is laid out at its full measured width and painted over the
+// panel next door. It also drops the end of a file name silently, and the end is
+// what tells two takes of the same clip apart.
+label_truncate_fmt :: proc(dst: []u8, text: string, font_size: int, max_px: f32) -> string {
+	if text_px(text, font_size) <= max_px {
+		written := copy(dst, text)
+		assert(written < len(dst), "clip name display buffer too small for a name that fits the field")
+		dst[written] = 0
+		return string(dst[:written])
+	}
+	ellipsis := "..."
+	adv := f32(font_size) * FONT_ADVANCE_RATIO
+	// Every rune is the same width under this metric, so the budget converts to
+	// a rune count directly rather than needing a measuring walk per candidate.
+	keep := int((max_px - text_px(ellipsis, font_size)) / adv)
+	if keep < 0 {
+		keep = 0
+	}
+	// Walk to the end of the keep-th rune: cutting mid-rune would split a UTF-8
+	// sequence and leave a replacement glyph in the label.
+	cut := 0
+	n := 0
+	for i := 0; i < len(text); {
+		_, size := utf8.decode_rune(text[i:])
+		n += 1
+		if n > keep {
+			break
+		}
+		cut = i + size
+		i += size
+	}
+	cut = min(cut, len(text))
+	written := copy(dst, text[:cut])
+	written += copy(dst[written:], ellipsis)
+	// dst is sized off the pixel budget (see ui_text.clip_name), so this can only
+	// fire if the budget or the font moved without the buffer following — which
+	// is silent corruption of the neighbouring field otherwise, so it asserts
+	// rather than clamping.
+	assert(written < len(dst), "clip name display buffer too small for its pixel budget")
+	dst[written] = 0
+	return string(dst[:written])
+}
+
+// clip_name_display is the clip's name as the inspector's name row draws it: cut
+// to the field and written into the fixed ui_text buffer, because clay holds the
+// string until the draw pass and the inspector lays out every frame.
+clip_name_display :: proc(cl: Clip) -> string {
+	return label_truncate_fmt(
+		ui_text.clip_name[:],
+		clip_label_text(cl),
+		FONT_NORMAL,
+		clip_name_max_px(),
+	)
+}
+
+// clip_name_max_px is the width the clip name may occupy in the name row: the
+// card's inner width, less the Rename button beside it, the row's child gap, and
+// the name field's own padding.
+//
+// Derived from the WIDEST column rather than the resolved one on purpose. The
+// resolved width is only known after layout, and layout is what this text is
+// feeding — reading last frame's box back would make the label's length depend
+// on the label's length. It is an upper bound on the widest layout, so at a
+// narrower window the name is cut a little early rather than late.
+clip_name_max_px :: proc() -> f32 {
+	pad := f32(FIELD_PAD_H)
+	rename_px := text_px("Rename", FONT_SMALL) + 2 * pad
+	inner := INSPECTOR_CARD_MAX_W - 2 * PANEL_PADDING
+	return inner - rename_px - BUTTON_ROW_GAP - 2 * pad
+}
+
 // card_open opens a shared card chrome: a titled panel that returns whether its
 // body should be drawn. Title stays the same size/color across all cards so
 // the inspector reads consistently.
+//
+// The width bound is load-bearing, not defensive: it is what makes a label
+// unable to resize the panel that shows it (see INSPECTOR_CARD_MAX_W). Every
+// card shares this, so the bound is one edit rather than one per card, and no
+// card can grow into the scrollbar beside it.
 card_open :: proc(id_name: string, title: string) -> bool {
 	if clay.UI(clay.ID(id_name))(
-	{
-		layout = {
-			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
-			padding = clay.PaddingAll(PANEL_PADDING),
-			childGap = CARD_GAP,
-			layoutDirection = .TopToBottom,
+		{
+			layout = {
+				sizing = {
+					width  = clay.SizingGrow({max = INSPECTOR_CARD_MAX_W}),
+					height = clay.SizingFit({}),
+				},
+				padding = clay.PaddingAll(PANEL_PADDING),
+				childGap = CARD_GAP,
+				layoutDirection = .TopToBottom,
+			},
+			backgroundColor = BUTTON,
+			border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
+			cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
 		},
-		backgroundColor = BUTTON,
-		border = {color = BUTTON_BORDER, width = clay.BorderOutside(1)},
-		cornerRadius = clay.CornerRadiusAll(RADIUS_PANEL),
-	},
 	) {
 		clay.Text(
 			title,
@@ -395,13 +521,19 @@ group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
 // project_card is the "Project" inspector card: canvas resolution presets,
 // orientation, frame rate, and the render range. These controls are always
 // reachable (not gated behind an empty timeline).
-// geom_key_all_modified_row is the "keyframe all modified" control: it keys
-// every geometry lane that was edited without a keyframe, in one undo node.
+// geom_key_all_modified_row is the "keyframe all modified" summary: it names the
+// geometry lanes that were edited without a keyframe, which the A shortcut keys
+// in one undo node.
 //
 // It names the pending lanes rather than saying "modified properties" and
-// hoping. A user who panned a clip sees "L, R" and knows exactly which edges
-// the button will commit; a button that keys "whatever changed" is a button
-// nobody trusts enough to press, and the whole point is that they should.
+// hoping. A user who panned a clip sees "L, R" and knows exactly which edges A
+// will commit; an action that keys "whatever changed" is one nobody trusts
+// enough to press, and the whole point is that they should.
+//
+// The shortcut is named here because there is no button to hover: without the
+// row, a pending set is invisible in the inspector and the only hint is a tint
+// on the timeline gutter. With the button gone this row is the whole of it, so
+// it carries the key as well as the state.
 //
 // The row is laid out unconditionally (a stable inspector does not reflow when
 // a flag flips) but only LIT when something is pending, so its state is
@@ -412,9 +544,8 @@ group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
 // the early-return form left the element with a zero-height box: Clay's
 // _CloseElement is deferred to UI_WithId's natural end, and the non-block
 // shape collapsed the row to 0x346 -- laid out but invisible, un-painted, and
-// un-hit-testable, with nothing to say so. draw_kf_add_buttons skips a
-// zero-size box, so the button would have silently not existed. The block form
-// is the shape the rest of this file uses.
+// un-hit-testable, with nothing to say so. The block form is the shape the rest
+// of this file uses.
 geom_key_all_modified_row :: proc(cl: ^Clip) {
 	any := clip_geom_any_modified(cl)
 	if clay.UI(clay.ID("KfAllModifiedRow"))(
@@ -430,10 +561,9 @@ geom_key_all_modified_row :: proc(cl: ^Clip) {
 		// Short labels for the pending lanes, formatted into the fixed ui_text
 		// buffer so the row does not allocate a string every inspector frame.
 		buf := ui_text.kf_pending[:]
-		label := fmt.bprintf(buf[:], "Key %s", geom_key_pending_labels(cl, any))
+		label := fmt.bprintf(buf[:], "A  Key %s", geom_key_pending_labels(cl, any))
 		col := any ? TEXT : CMDLINE_PLACEHOLDER
 		clay.Text(label, clay.TextElementConfig{textColor = col, fontSize = FONT_SMALL})
-		kf_add_button(KF_ADD_MODIFIED_ID)
 	}
 }
 
@@ -584,7 +714,7 @@ clip_card :: proc() {
 							width = clay.SizingGrow({}),
 							height = clay.SizingFixed(BUTTON_HEIGHT),
 						},
-						padding = clay.Padding{left = 8, right = 8},
+						padding = clay.Padding{left = FIELD_PAD_H, right = FIELD_PAD_H},
 						childAlignment = {x = .Left, y = .Center},
 					},
 					backgroundColor = EDITOR_BG,
@@ -592,7 +722,7 @@ clip_card :: proc() {
 				},
 				) {
 					clay.Text(
-						clip_label_text(cl^),
+						clip_name_display(cl^),
 						clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
 					)
 				}
@@ -603,7 +733,7 @@ clip_card :: proc() {
 							width = clay.SizingFit({}),
 							height = clay.SizingFixed(BUTTON_HEIGHT),
 						},
-						padding = clay.Padding{left = 8, right = 8},
+						padding = clay.Padding{left = FIELD_PAD_H, right = FIELD_PAD_H},
 						childAlignment = {x = .Center, y = .Center},
 					},
 					backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
@@ -843,7 +973,12 @@ clip_card :: proc() {
 					clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 				)
 				g_buf := ui_text.gain[:]
-				g_val := fmt.bprintf(g_buf[:], "%.1f dB", cl.gain)
+				// Follow the playhead when gain is keyed, like every geometry
+				// lane above (clip_geom_get): the readout should show the level
+				// playback is actually using, not the static cl.gain that the
+				// keyed curve overrides. clip_gain_db_at_playhead owns that rule.
+				g_shown := clip_gain_db_at_playhead(cl)
+				g_val := fmt.bprintf(g_buf[:], "%.1f dB", g_shown)
 				if edit_state.field == .Gain {
 					g_val = string(edit_state.chars[:edit_state.len])
 				}
@@ -2076,6 +2211,7 @@ HELP_SHORTCUTS :: []Help_Shortcut {
 	{"H / L", "Jog backward / forward"},
 	{"I / O", "Set render-range start / end at the playhead"},
 	{"S", "Split clip at playhead"},
+	{"A", "Keyframe every modified property on the selected clip"},
 	{"Ctrl+R", "Rename selected clip"},
 	{":", "Command line (:open <file>)"},
 	{"U", "Link / unlink selection"},

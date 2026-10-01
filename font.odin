@@ -63,6 +63,14 @@ n := copy(sys[:], strings.trim_space(out))
 	}
 }
 
+// FONT_ADVANCE_RATIO is the width of one rune as a fraction of the font size.
+// It is the whole of clay's text measurement, and text_px (ui.odin) multiplies
+// by the same number to decide where a label has to be cut — so a truncation
+// lands exactly where clay would have laid the text out. Two copies of this
+// constant would be a number that drifts: the cut would land in the wrong place
+// the moment one of them moved.
+FONT_ADVANCE_RATIO :: f32(0.55)
+
 measure_text :: proc "c" (
 	text: clay.StringSlice,
 	config: ^clay.TextElementConfig,
@@ -78,7 +86,7 @@ measure_text :: proc "c" (
 		runes += 1
 		i += size
 	}
-	return {width = f32(runes) * f32(config.fontSize) * 0.55, height = f32(config.fontSize)}
+	return {width = f32(runes) * f32(config.fontSize) * FONT_ADVANCE_RATIO, height = f32(config.fontSize)}
 }
 
 clay_error :: proc "c" (data: clay.ErrorData) {

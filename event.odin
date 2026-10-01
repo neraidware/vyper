@@ -276,6 +276,15 @@ dispatch_action :: proc(act: Action) {
 			// Delete the clip raw, nothing else.
 			delete_selected_clip_raw()
 		}
+	case .Key_All_Modified:
+		// Keys every geometry lane that was edited without a keyframe, as one
+		// undo node, grouped into packed sections wherever the section has not
+		// already been unwrapped into per-lane tracks. Guarded on
+		// clip_geom_can_key_all_modified: pending alone is not enough, the
+		// playhead has to be on the clip, since the keys are written there.
+		if sel, ok := transformable_selected(); ok && clip_geom_can_key_all_modified(sel) {
+			clip_geom_key_all_modified(sel)
+		}
 	case .Set_In_Point:
 		// Set the render-range start at the playhead; collapsing the range to
 		// a single frame clears it.

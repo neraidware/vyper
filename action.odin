@@ -35,6 +35,7 @@ Action :: enum {
 	Toggle_Links,
 	Delete_At_Playhead,
 	Delete_Selection,
+	Key_All_Modified,
 	Set_In_Point,
 	Set_Out_Point,
 }
@@ -91,6 +92,7 @@ BINDINGS := [?]Binding {
 	{ .Toggle_Playback, sdl.K_SPACE, {} },
 	{ .Begin_Rename, sdl.K_R, sdl.KMOD_CTRL },
 	{ .Split_At_Playhead, sdl.K_S, {} },
+	{ .Key_All_Modified, sdl.K_A, {} },
 	{ .Toggle_Links, sdl.K_U, {} },
 	{ .Delete_At_Playhead, sdl.K_BACKSPACE, {} },
 	{ .Delete_Selection, sdl.K_DELETE, {} },

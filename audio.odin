@@ -494,6 +494,13 @@ Play_Seg :: struct {
 	// per-source) because a split makes adjacent segments of one source
 	// independently adjustable.
 	gain:    f32,
+	// gain_dB is the same level in the gain track's own unit (dB). The keyed
+	// curve is authored in dB — the inspector shows and edits cl.gain in dB —
+	// so it is sampled with THIS as the resting base and only then converted to
+	// linear; sampling with the linear gain above would treat a key's dB value
+	// as a multiplier (a -40 dB key becomes a -40x inverted blast). Kept beside
+	// gain instead of derived back from it so a fold never round-trips a log.
+	gain_dB: f32,
 	// kf_* is the segment's copied "gain" keyframe track (kf_n = 0 = static);
 	// the mix re-evaluates the keyed gain per timeline frame so automation
 	// animates live. Copied at provision from the chip (see GAIN_KF_MAX_KEYS).
@@ -831,6 +838,7 @@ audio_gain_fold :: proc(slot: ^Audio_Geom_Slot) {
 				seg := &s.seg[si]
 				if seg.start_a == chip.timeline_start && seg.start_s == chip.source_start && seg.len_a == chip.source_len {
 					seg.gain = db_to_linear(chip.gain_dB)
+					seg.gain_dB = chip.gain_dB
 					break
 				}
 			}
@@ -944,6 +952,7 @@ audio_provision :: proc(play_frame: i64) {
 			start_s = chip.source_start,
 			len_a   = chip.source_len,
 			gain    = db_to_linear(chip.gain_dB),
+			gain_dB = chip.gain_dB,
 		}
 		if chip.kf_n > 0 {
 			g.seg[g.seg_count].kf_n = chip.kf_n
@@ -1068,6 +1077,40 @@ db_to_linear :: proc(db: f32) -> f32 {
 	return math.pow(10, db / 20)
 }
 
+// kf_gain_linear evaluates a gain keyframe track — authored in dB, the unit the
+// inspector shows — to a LINEAR amplitude multiplier at clip-relative frame
+// `rel`. `base_dB` is the clip's static level (also dB) and rules wherever the
+// track has no key (empty, before the first, past the last). Both the playback
+// mixer and the export mixer go through here, so a key's dB value can never
+// again be mistaken for the multiplier itself (a -40 dB key is 0.01, not -40).
+kf_gain_linear :: proc(keys: []Keyframe, rel: i32, base_dB: f32) -> f32 {
+	if len(keys) == 0 {
+		return db_to_linear(base_dB)
+	}
+	db, _ := kf_sample_keys(keys, rel, base_dB)
+	return db_to_linear(db)
+}
+
+// play_seg_gain_linear is a segment's linear amplitude multiplier at its
+// clip-relative frame `rel`. Thin wrapper over kf_gain_linear so the mix loop
+// stays readable; extracted so the unit conversion is testable off the decode
+// path (keyframe_probe), not just observable as "playback starts loud".
+play_seg_gain_linear :: proc(seg: ^Play_Seg, rel: i32) -> f32 {
+	return kf_gain_linear(seg.kf_keys[:seg.kf_n], rel, seg.gain_dB)
+}
+
+// clip_gain_db_at_playhead is the gain the inspector should DISPLAY for `clip`:
+// the keyed dB value where its gain track is active at the playhead, else the
+// static cl.gain. It mirrors every geometry lane, whose readout samples the
+// keyed curve (clip_geom_get) rather than showing the resting field — the gain
+// row was the one holdout and so disagreed with what playback was doing.
+clip_gain_db_at_playhead :: proc(clip: ^Clip) -> f32 {
+	if v, active := kf_sample_for(clip, "gain", playhead.frame, clip.gain); active {
+		return v
+	}
+	return clip.gain
+}
+
 // audio_frame_boundary48 returns the exact (fractional, floor-truncated) 48kHz
 // sample index at which timeline frame `frame` begins, relative to the start
 // of the timeline (frame 0). Used to derive the true per-frame sample count
@@ -1122,16 +1165,12 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 			continue
 		}
 		base := int(start48 - s.first48)
-		// Per-segment constant gain folded in as one multiply per sample; the
-		// ring already covers this frame (checked above), so gain is the only
-		// new term here. A segment carrying a gain keyframe track instead
-		// re-evaluates the keyed gain at its frame-relative position each
-		// frame (kf_sample_keys on the segment's own snapshot — the producer
+		// Per-segment gain folded in as one multiply per sample; the ring
+		// already covers this frame (checked above), so gain is the only new
+		// term here. A keyed segment re-evaluates its curve at the frame-
+		// relative position each frame (from its own snapshot — the producer
 		// never reads the live timeline), so automation animates audibly.
-		g := seg.gain
-		if seg.kf_n > 0 {
-			g, _ = kf_sample_keys(seg.kf_keys[:seg.kf_n], i32(frame - seg.start_a), seg.gain)
-		}
+		g := play_seg_gain_linear(seg, i32(frame - seg.start_a))
 		for f in 0 ..< spf {
 			l, r := ring_at(&s.fifo, base + f)
 			mix[f * 2 + 0] += l * g

@@ -463,6 +463,9 @@ handle_track_action_option :: proc(mx, my: f32) {
 // playback-rate dropdown, the help overlay). Called on ESC while not editing a
 // text field.
 escape_dismiss :: proc() {
+	// Esc is the universal cancel, and the keyframe brush is a mode a user can
+	// walk away from without noticing they armed it — so it ends here.
+	kf_brush_disarm()
 	close_context_menu()
 	close_track_action_menu()
 	playback.rate_open = false
@@ -789,14 +792,19 @@ kf_clear :: proc() {
 // rather than assign is that it RETAINS the buffer -- which is right for a
 // deselect and wrong at session teardown, where retaining it is the leak. A
 // `kf_sel = {}` in the teardown would zero the header and hand back the
-// selection's memory, and kf_hits (the hit-test output, filled on every press)
-// has no teardown at all, so both survive a full session teardown as live
-// allocations. Session heap, so: freed here and nowhere else.
+// selection's memory, and the two grow-only scratches the keyframe hit tests fill
+// (kf_hits, and the brush's record of what it has already painted) are the same
+// shape: retained across a deselect, so they survive a full session teardown as
+// live allocations unless they are handed back here. Session heap, so: freed
+// here and nowhere else.
 kf_selection_free :: proc() {
 	delete(kf_sel.items)
 	delete(kf_hits)
+	delete(kf_brush_hovered)
 	kf_sel = {}
 	kf_hits = nil
+	kf_brush_hovered = nil
+	kf_brush_armed = false
 }
 
 // kf_select makes (track_idx,clip_index,lane,key) the SOLE keyframe selection,
@@ -830,6 +838,69 @@ kf_select_add :: proc(refs: []Kf_Ref) {
 		}
 	}
 	kf_drop_clip_selection()
+}
+
+// kf_brush_arm enters hover-select. The arming click lands on empty timeline
+// space, so there is no key under the pointer to record: the hovered set starts
+// empty and the first key the pointer reaches is a genuine crossing.
+//
+// A brush session ACCUMULATES onto whatever is already selected. Clearing here
+// would make "build a set in two passes across the timeline" impossible, and the
+// user asking for a persistent mode is asking for exactly that.
+kf_brush_arm :: proc() {
+	kf_brush_armed = true
+	clear(&kf_brush_hovered)
+}
+
+// kf_brush_disarm leaves hover-select. The SELECTION is untouched: a selection
+// is not an edit, and the set the user painted out is the result of the mode, not
+// part of it. Only the memory of where the pointer was goes, so re-arming cannot
+// inherit a stale compare.
+kf_brush_disarm :: proc() {
+	kf_brush_armed = false
+	clear(&kf_brush_hovered)
+}
+
+// kf_brush_paint adds every keyframe now under the pointer to the selection. It
+// is called from the pointer-move path on every move while the mode is armed,
+// with no button requirement — that is the whole difference from a drag.
+//
+// The hovered-set compare makes it a no-op unless the pointer has crossed onto a
+// DIFFERENT set, which is what lets the mode survive a resting pointer. A
+// brushed key is added, never substituted: the pointer reaches keys one at a
+// time, so replacing would leave only the last one crossed.
+kf_brush_paint :: proc(x, y: f32) {
+	if !kf_brush_armed {
+		return
+	}
+	clear(&kf_hits)
+	kf_keys_at(x, y, &kf_hits)
+	if len(kf_hits) == 0 || kf_brush_already_painted(kf_hits[:]) {
+		return
+	}
+	// Record the set BEFORE selecting, so a later compare settles even if the
+	// write below is invalidated by a structure bump.
+	clear(&kf_brush_hovered)
+	for r in kf_hits {
+		append(&kf_brush_hovered, r)
+	}
+	kf_select_add(kf_hits[:])
+}
+
+// kf_brush_already_painted reports whether `refs` is exactly the set the last
+// paint applied. Element-wise is enough: kf_keys_at walks tracks, then clips,
+// then lanes, then keys in fixed order, so the same pointer position always
+// produces the same refs in the same order.
+kf_brush_already_painted :: proc(refs: []Kf_Ref) -> bool {
+	if len(refs) != len(kf_brush_hovered) {
+		return false
+	}
+	for r, i in refs {
+		if r != kf_brush_hovered[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // kf_sel_active reports whether a live keyframe selection exists. A selection

@@ -348,16 +348,6 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			clip_geom_add_lane_key(sel, .Opacity)
 			return true
 		}
-		// "Keyframe all modified": every geometry lane edited without a key
-		// gets one, as a single undo node. Guarded on
-		// clip_geom_can_key_all_modified — a pending lane is not enough, the
-		// playhead has to be on the clip, since the keys are written at the
-		// playhead. A click that produces no undo node should not be recorded
-		// as one.
-		if clay.PointerOver(clay.ID(KF_ADD_MODIFIED_ID)) && clip_geom_can_key_all_modified(sel) {
-			clip_geom_key_all_modified(sel)
-			return true
-		}
 		if clay.PointerOver(clay.ID("KfAddCropL")) {
 			clip_geom_add_lane_key(sel, .Crop_L)
 			return true
@@ -610,18 +600,49 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 	// Selecting a keyframe diamond: geometry hit (the diamonds paint in the
 	// post-layout overlay, so no clay element sits under them). Runs before the
 	// clip press below so a diamond can never fall through to a tile drag.
-	// Shift+click grows the selection by every diamond under the pointer; a
-	// plain click makes the grabbed one the sole selection. Both drop any clip
-	// set (kf_select/kf_select_add own the S3 exclusivity).
+	// A plain click makes the grabbed one the sole selection — unless it was
+	// already part of a run, in which case the press preserves the run for a
+	// drag and the narrowing waits for the release (see below). Shift+click is
+	// always a plain selection of the clicked key: it arms no move and no
+	// hover-select (that is entered from empty space). Both drop any clip set
+	// (kf_select owns the S3 exclusivity).
 	proc(inp: Mouse_Input) -> bool {
 		clear(&kf_hits)
 		kf_keys_at(inp.x, inp.y, &kf_hits)
 		if len(kf_hits) > 0 {
 			grab := kf_hits[0]
-			if inp.shift {
-				kf_select_add(kf_hits[:])
-			} else {
+			// A press cannot tell a click from a drag, so it may not collapse a
+			// selection that the press might have been the start of DRAGGING. When
+			// the grabbed key is already part of a run, the run is the payload: the
+			// capture below takes all of it and the narrowing is deferred to the
+			// release, which is the first frame that knows no drag happened. A press
+			// on a key outside the selection has nothing to preserve — the user is
+			// starting a fresh selection either way — so it narrows immediately, and
+			// a drag from it moves the key it grabbed rather than the old run.
+			narrow_click := kf_sel_contains(grab)
+			if !narrow_click {
 				kf_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+			}
+			if inp.shift {
+				// A Shift+click ON a keyframe is just a selection: it narrows to
+				// the key clicked and arms NOTHING. Hover-select is entered from
+				// empty space (see the TrackArea fallback), because a press on a
+				// key is a statement about that key, and letting the pointer then
+				// paint the rest of the timeline would run the selection backwards
+				// from what was just clicked.
+				//
+				// It narrows unconditionally, including for a key that was already
+				// selected — the deferred narrow above is for the PLAIN press,
+				// whose drag has to carry the run, and there is no run to carry here.
+				kf_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+				kf_brush_disarm()
+				// The go-to-keyframe double-click is deliberately not reachable
+				// with Shift held: a Shift+click is a selection, and pairing it
+				// with the plain press next to it into a seek the user never asked
+				// for would make that plain press fire instead. Parking the record
+				// keeps a press on either side from pairing across this one.
+				kf_dbl_click.ns = 0
+				return true
 			}
 			gcl, _, k, kok := kf_resolve(grab)
 			// A stale hit (the key vanished between the hit-test and the resolve)
@@ -640,6 +661,13 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			   grab.clip_index == kf_dbl_click.clip &&
 			   grab.lane == kf_dbl_click.lane &&
 			   kf_frame == kf_dbl_click.frame {
+				// This press is a seek, not a selection, and it arms no move — so
+				// the deferred narrow will never be reached. Settle it here or a
+				// double-click on a key inside a run would leave the whole run
+				// selected, which is the one case the deferral above changed.
+				if narrow_click {
+					kf_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+				}
 				f := clamp(
 					gcl.timeline_start_frame + i64(kf_frame),
 					0,
@@ -665,22 +693,31 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			// (undo_begin) for the live drag.
 			//
 			// The capture is the WHOLE selection, not just the grabbed key, so a
-			// Shift+click-then-drag slides every key it selected in one gesture —
-			// which is the whole point of the multi-select. The gesture itself
-			// only records how far the cursor travels from press_frame; the keys
-			// themselves are never written until the release (update_keyframe_drag
-			// paints the preview, kf_move holds the only record of where they
-			// started). An off-center grab therefore keeps its pivot for free:
-			// every key translates by the cursor's own travel.
+			// drag that starts on any key of a multi-key set slides every key in
+			// it — which is the whole point of the multi-select (built by the
+			// brush or by a Shift+click pair). The gesture itself only records
+			// how far the cursor travels from press_frame; the keys themselves
+			// are never written until the release (update_keyframe_drag paints
+			// the preview, kf_move holds the only record of where they started).
+			// An off-center grab therefore keeps its pivot for free: every key
+			// translates by the cursor's own travel.
+			//
+			// So the capture has to happen whatever the press did to the selection
+			// — when the grab was already selected, the run it captured IS the
+			// payload, and narrowing it here is precisely the bug.
 			if kok {
 				kf_capture_sel(&kf_move.snaps)
 				kf_move.delta = 0
+				kf_move.engaged = false
+				kf_move.narrow_click = narrow_click
 				kf_move.press_x = inp.x
 				// The anchor is the key the pointer is ON, not the first
-				// captured one. Shift+click unions the hovered keys into the
-				// existing selection, so a set spanning two clips is ordered by
-				// the older selection and snaps[0] can name a different clip
-				// than the one under the cursor.
+				// captured one: a capture is ordered by the selection, and the
+				// key the cursor grabbed is the one whose pivot the drag
+				// expresses. The two differ whenever the press preserved a run
+				// (the deferral above) or a brush built a set spanning two
+				// clips — in both cases element zero can name a different clip than
+				// the cursor, whose wrap box would then be the wrong zoom and pan.
 				kf_move.anchor = grab
 				box :=
 					clay.GetElementData(clay.ID("TimelineClipWrap", u32(grab.track_idx * 1000 + grab.clip_index))).boundingBox
@@ -739,6 +776,23 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			}
 		}
 		return false
+	},
+	// Shift+press on timeline area that holds no clip ARMS the keyframe brush:
+	// from here, every keyframe the pointer passes over joins the selection, with
+	// no button involved. This is the only way in, because a Shift+click on a
+	// keyframe itself is a plain selection of that key.
+	//
+	// It sits AFTER the clip press on purpose. A press on a clip body is
+	// Shift+click-to-add-a-clip-to-the-link-selection, and claiming it here
+	// would break that; "no clip under the pointer" is what is left once every
+	// earlier probe has declined. TrackArea excludes the ruler and the name
+	// gutter, both of which have their own presses.
+	proc(inp: Mouse_Input) -> bool {
+		if !inp.shift || !clay.PointerOver(clay.ID("TrackArea")) {
+			return false
+		}
+		kf_brush_arm()
+		return true
 	},
 }
 
@@ -868,6 +922,11 @@ update_keyframe_drag :: proc(mx: f32) {
 	if abs(mx - kf_move.press_x) < KF_DRAG_THRESHOLD_PX {
 		return
 	}
+	// Latch the moment the gesture becomes a drag. The release needs this to tell
+	// a click (narrow the selection) from a drag (move it), and delta alone can't:
+	// a drag that ends where it started, or one that only pushes keys into a
+	// clamp, leaves delta at or near zero.
+	kf_move.engaged = true
 	// The frame mapping comes from the GRABBED key's clip — the only one whose
 	// box the press measured, and the one whose wrap the cursor is over. Read
 	// kf_move.anchor, not snaps[0]: a Shift-union set spanning two clips is
@@ -905,6 +964,18 @@ update_keyframe_drag :: proc(mx: f32) {
 // a drifted store).
 commit_keyframe_drag :: proc() {
 	if len(kf_move.snaps) == 0 {
+		return
+	}
+	// A press that never slid is a CLICK, and the whole point of the deferral at
+	// press is that this is the first frame that knows so: narrow to the key the
+	// pointer actually grabbed, leaving a run alone until the user commits to
+	// clicking. Resolved through the anchor rather than the capture, so a stale
+	// or empty selection cannot make this a no-op that looks like it worked.
+	if !kf_move.engaged {
+		if kf_move.narrow_click {
+			a := kf_move.anchor
+			kf_select(a.track_idx, a.clip_index, a.lane, a.key)
+		}
 		return
 	}
 	// Resolve every destination BEFORE the first store op, both because the ops
@@ -1027,6 +1098,14 @@ interaction_post_build :: proc(
 // fires a one-shot action or STARTS a gesture; none update live state.
 interaction_click_dispatch :: proc(inp: Mouse_Input, prev_mouse_down: bool) {
 if inp.left && !prev_mouse_down {
+	// A press without Shift is the user saying something else, so it ends
+	// hover-select. Central rather than per-handler because the brush is a mode,
+	// not a gesture: every one of these presses would otherwise have to remember
+	// to disarm it, and the one that forgot would leave the timeline silently
+	// painting selections for the rest of the session.
+	if !inp.shift {
+		kf_brush_disarm()
+	}
 	if !dispatch_click_table(inp) {
 		if clay.PointerOver(clay.ID("DividerHandle")) {
 			active_interaction = .Panel_Resize
@@ -1192,6 +1271,12 @@ interaction_release :: proc(inp: Mouse_Input) {
 // Live move path, driven every frame while the button is held. Each case
 // updates the in-flight gesture in place; release above is the single commit.
 interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int) {
+	// The keyframe brush runs BEFORE the gesture switch, not as one of its
+	// cases: it has no button to hold and no active_interaction to own, and it
+	// keeps working across the presses that would otherwise replace that state.
+	if kf_brush_armed {
+		kf_brush_paint(inp.x, inp.y)
+	}
 	switch active_interaction {
 	case .Media_Bin_Drag:
 		// A bin drag in flight: recompute the hovered lane + ghost each frame.

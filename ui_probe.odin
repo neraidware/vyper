@@ -187,6 +187,20 @@ for j := 0; j < len(raw); {
 	if !ui_probe_clip_tile_width_asserts() {
 		os.exit(1)
 	}
+	// A label must never size the panel that shows it.
+	if !ui_probe_inspector_width_asserts() {
+		os.exit(1)
+	}
+	// The keyframe brush (hover-select): armed from empty timeline space, paints
+	// on hover with no button held, accumulates, and survives the release.
+	if !ui_probe_kf_brush_asserts() {
+		os.exit(1)
+	}
+	// Click vs drag on a keyframe diamond: the press must not collapse a run the
+	// user may be about to retime, and the narrowing belongs on mouse-up.
+	if !ui_probe_kf_click_vs_drag_asserts() {
+		os.exit(1)
+	}
 	// The opacity fill's painted width is opacity * the track's laid-out width.
 	// SizingPercent is a 0-1 fraction; a 0-100 value still "looks" plausible in
 	// a screenshot but overflows the track for every non-zero opacity.
@@ -451,6 +465,14 @@ ui_probe_action_table_asserts :: proc() -> bool {
 		// reachable as a one-shot action.
 		{ sdl.K_H, {}, .None, "jog is a repeat-driven rate, not a bound action" },
 		{ sdl.K_L, {}, .None, "jog is a repeat-driven rate, not a bound action" },
+		{ sdl.K_A, {}, .Key_All_Modified, "bare A keys every modified property (the removed button's job)" },
+		// The row is deliberately modifier-insensitive, so the extra modifiers a
+		// user is already holding must not change what A means. Pinned because the
+		// most-specific-first walk is where a bare row silently loses to a
+		// Ctrl/Alt row added later, and "A stopped keying" is not a crash anyone
+		// would notice.
+		{ sdl.K_A, shift, .Key_All_Modified, "Shift+A keys the same set as bare A" },
+		{ sdl.K_A, ctrl, .Key_All_Modified, "Ctrl+A keys the same set as bare A" },
 	}
 
 	for c in cases {
@@ -1508,20 +1530,16 @@ ui_probe_layout_asserts :: proc() -> bool {
 		ok = false
 	}
 	// The "keyframe all modified" row must actually LAY OUT for a video clip.
-	// draw_kf_add_buttons skips a zero-size box, so a row that never got laid
-	// out would be silently dead: no diamond painted, no hit test, and the
-	// geometry-edit path with no way to commit it. Assert the box exists, is
-	// inside the inspector, and sits below the crop row it follows.
+	// It carries the A shortcut's pending set and nothing else — there is no
+	// button, so the row is the only place the inspector says what A will key.
+	// A row that never got laid out would be silently dead: no text painted and
+	// the geometry-edit path with no way to see what it has pending. Assert the
+	// box exists and is inside the inspector.
 	sel_v, ok_v := transformable_selected()
 	if ok_v {
 		row_bb := clay.GetElementData(clay.ID("KfAllModifiedRow")).boundingBox
-		btn_bb := clay.GetElementData(clay.ID(KF_ADD_MODIFIED_ID)).boundingBox
 		if row_bb.width <= 0 || row_bb.height <= 0 {
 			fmt.eprintf("[ui-probe] KfAllModifiedRow never laid out (%.0fx%.0f)\n", row_bb.width, row_bb.height)
-			ok = false
-		}
-		if btn_bb.width <= 0 || btn_bb.height <= 0 {
-			fmt.eprintf("[ui-probe] %s never laid out (%.0fx%.0f)\n", KF_ADD_MODIFIED_ID, btn_bb.width, btn_bb.height)
 			ok = false
 		}
 
@@ -1561,6 +1579,469 @@ ui_probe_layout_asserts :: proc() -> bool {
 	return ok
 }
 
+// ui_probe_inspector_width_asserts holds the clip properties panel to the
+// inspector's own width. The name row is a Grow element whose only child is a
+// Text, so the text's MEASURED width became the card's minimum: a long file name
+// pushed the Clip card to 427px inside a 356px column, so its background and
+// border were painted over the neighbouring panel. A label must not be able to
+// resize the panel that shows it.
+//
+// Two separate guarantees, both asserted here because either alone leaves a bug:
+// the card is structurally bounded (card_open's max width), and the label is cut
+// to the field (clip_name_display) so what the user reads ends in an ellipsis
+// instead of being sliced off at the panel edge by the clip.
+//
+// The name used here has no spaces on purpose. clay wraps on word boundaries by
+// default, so a name WITH spaces folds onto a second line and never widens
+// anything; it is the single unbreakable token — "IMG_4821_take3.mov" — that has
+// no wrap point and therefore reports its full width as the minimum.
+ui_probe_inspector_width_asserts :: proc() -> bool {
+	ok := true
+	cl, has_clip := transformable_selected()
+	if !has_clip {
+		fmt.eprintf("[ui-probe] no transformable clip selected; cannot assert the inspector width\n")
+		return false
+	}
+	saved_name := cl.name
+	defer {
+		cl.name = saved_name
+		build_page(1920, 1600)
+	}
+	long := "A012_C003_20260314_184522_take07_final_v3.mov"
+	for name in ([]string{saved_name, long}) {
+		cl.name = name
+		_ = build_page(1920, 1600)
+		col := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
+		card := clay.GetElementData(clay.ID("ClipCard")).boundingBox
+		value := clay.GetElementData(clay.ID("NameValue")).boundingBox
+		label := clip_name_display(cl^)
+		fmt.printf(
+			"[ui-probe] name %d chars: column %.1f card %.1f namevalue %.1f label %q\n",
+			len(name),
+			col.width,
+			card.width,
+			value.width,
+			label,
+		)
+		if col.width > INSPECTOR_MAX_W + 0.5 {
+			fmt.eprintf(
+				"[ui-probe] inspector column %.1f exceeds INSPECTOR_MAX_W %v (name %d chars)\n",
+				col.width,
+				INSPECTOR_MAX_W,
+				len(name),
+			)
+			ok = false
+		}
+		if card.width > col.width + 0.5 {
+			fmt.eprintf(
+				"[ui-probe] clip card %.1f overflows the inspector column %.1f (name %d chars)\n",
+				card.width,
+				col.width,
+				len(name),
+			)
+			ok = false
+		}
+		if value.width > card.width + 0.5 {
+			fmt.eprintf(
+				"[ui-probe] name field %.1f overflows the clip card %.1f (name %d chars)\n",
+				value.width,
+				card.width,
+				len(name),
+			)
+			ok = false
+		}
+		// The cut has to FIT, not merely be short: label_truncate_fmt reserves
+		// the ellipsis before spending the budget, so a label wider than the
+		// field means the metric and the layout disagree — and that disagreement
+		// is what puts the card back over its neighbour.
+		budget := clip_name_max_px()
+		if w := text_px(label, FONT_NORMAL); w > budget + 0.5 {
+			fmt.eprintf(
+				"[ui-probe] truncated label %.1fpx exceeds the name field budget %.1fpx: %q\n",
+				w,
+				budget,
+				label,
+			)
+			ok = false
+		}
+		if name == long {
+			// An untruncated label would be silently clipped at the panel edge,
+			// dropping the tail of the file name with nothing to show it was cut.
+			if label == name || !strings.contains(label, "...") {
+				fmt.eprintf("[ui-probe] long name was not ellipsized: %q\n", label)
+				ok = false
+			}
+		} else if label != name {
+			// A name that already fits must survive whole; truncating it would
+			// hide a short file's name for no reason.
+			fmt.eprintf("[ui-probe] short name was truncated: %q -> %q\n", name, label)
+			ok = false
+		}
+	}
+	if ok {
+		fmt.printf("[ui-probe] inspector width ok (long name does not resize the panel)\n")
+	}
+	return ok
+}
+
+// The keyframe brush (hover-select) is a MODE, not a drag: Shift+click on empty
+// timeline space arms it, and afterwards the pointer alone — no button held —
+// paints every keyframe it passes over into the selection, accumulating across
+// passes. A Shift+click ON a keyframe is the opposite: it selects that key and
+// arms nothing.
+//
+// This drives the real interaction entry points (interaction_click_dispatch /
+// interaction_move / interaction_release), because the arming is a property of
+// WHICH press handler claims the click, not of the paint call — a probe that
+// called kf_brush_paint directly would pass against code where nothing arms it.
+ui_probe_kf_brush_asserts :: proc() -> bool {
+	ok := true
+	// The go-to-keyframe double-click record is a global on a wall-clock timer.
+	// Two probes that press the same diamond in the same process run inside that
+	// window, so without this the second press is read as a double-click seek and
+	// never reaches the gesture under test.
+	kf_dbl_click = {}
+	build_page(1920, 1600)
+	cl := &timeline.tracks[0].clips[0]
+	// The lane is FOUND, not assumed at index 0: the geometry layer owns lane
+	// naming and order (a seeded "scale" track comes back normalized), so an
+	// index-based fixture would be testing the normalization, not the brush.
+	lane, k_first, k_second := -1, -1, -1
+	for li in 0 ..< len(cl.keyframe_tracks) {
+		n := len(cl.keyframe_tracks[li].keys)
+		if n >= 2 && (lane < 0 || n > len(cl.keyframe_tracks[lane].keys)) {
+			lane, k_first, k_second = li, 0, 1
+		}
+	}
+	if lane < 0 {
+		fmt.eprintf("[ui-probe] brush fixture wants a lane with 2+ keys\n")
+		return false
+	}
+	box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
+	f_a := cl.keyframe_tracks[lane].keys[k_first].frame_off
+	f_b := cl.keyframe_tracks[lane].keys[k_second].frame_off
+	x_a, y_a := kf_key_center(box, lane, f_a)
+	x_b, y_b := kf_key_center(box, lane, f_b)
+	// An empty spot to arm the brush on. It has to be past the clip's RIGHT EDGE,
+	// not merely past its last key: the clip press handler runs before the brush
+	// fallback and claims any press on a clip body, so a point still over the clip
+	// selects the clip instead of arming.
+	x_empty := box.x + box.width + 20
+	y_empty := y_a
+
+	defer {
+		kf_brush_disarm()
+		kf_clear()
+		selection = {}
+		build_page(1920, 1600)
+	}
+
+	// Both helpers set clay's pointer state first, exactly as the frame loop does
+	// after layout. Without it PointerOver reads whatever position the last real
+	// frame left behind, so every clay-gated handler in the chain (the clip press,
+	// the TrackArea fallback that arms the brush) would be testing nothing.
+	press :: proc(x, y: f32, shift: bool) {
+		clay.SetPointerState({x, y}, true)
+		interaction_click_dispatch(Mouse_Input{x, y, true, false, false, false, shift, false}, false)
+	}
+	hover :: proc(x, y: f32) {
+		// prev_mouse_down = true and left = false: this is a pointer move with NO
+		// button held, which is the case a button-gated implementation would miss.
+		clay.SetPointerState({x, y}, false)
+		interaction_move(Mouse_Input{x, y, false, false, false, false, false, false}, true, 1600)
+	}
+
+	// The premise, asserted rather than assumed: a Shift+click on a keyframe must
+	// NOT arm the brush. If this passes trivially because the click armed nothing,
+	// the rest of the probe would still look right while testing the wrong thing.
+	kf_clear()
+	press(x_a, y_a, true)
+	if kf_brush_armed {
+		fmt.eprintf("[ui-probe] a shift+click on a keyframe must not arm the brush\n")
+		ok = false
+	}
+	if kf_sel_count() != 1 {
+		fmt.eprintf(
+			"[ui-probe] shift+click on a keyframe selected %d keys, want just that one\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+	// And nothing may be painted while it is unarmed.
+	hover(x_b, y_b)
+	if kf_sel_count() != 1 {
+		fmt.eprintf(
+			"[ui-probe] hovering painted %d keys with the brush unarmed, want the selection untouched\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+
+	// 1. Shift+click on EMPTY timeline space arms the brush, and does NOT clear
+	// the selection: A is still selected, because a brush session accumulates and
+	// the arming click is not a reselect.
+	press(x_empty, y_empty, true)
+	if !kf_brush_armed {
+		fmt.eprintf("[ui-probe] shift+click on empty timeline space must arm the brush\n")
+		return false
+	}
+	if kf_sel_count() != 1 || !kf_sel_contains(Kf_Ref{0, 0, lane, k_first}) {
+		fmt.eprintf(
+			"[ui-probe] arming the brush left %d keys selected, want the previous selection kept\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+
+	// 2. Hovering the OTHER key adds it to what was already there — the mode does
+	// not start fresh, which is the whole difference from a reselect.
+	hover(x_b, y_b)
+	if kf_sel_count() != 2 ||
+	   !kf_sel_contains(Kf_Ref{0, 0, lane, k_first}) ||
+	   !kf_sel_contains(Kf_Ref{0, 0, lane, k_second}) {
+		fmt.eprintf(
+			"[ui-probe] hovering a key in brush mode left %d selected, want both accumulated\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+
+	// 3. Resting on it changes nothing (the edge trigger), so the mode survives a
+	// stationary pointer instead of oscillating.
+	hover(x_b, y_b)
+	if kf_sel_count() != 2 {
+		fmt.eprintf(
+			"[ui-probe] resting on a painted key changed the count to %d, want 2\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+
+	// 4. The mode outlives the button AND the release: painting continues with no
+	// button, which is the behaviour a held-drag implementation cannot express.
+	interaction_release(Mouse_Input{x_b, y_b, false, false, false, false, false, false})
+	if !kf_brush_armed {
+		fmt.eprintf("[ui-probe] releasing the button must not disarm the brush\n")
+		ok = false
+	}
+	kf_clear()
+	hover(x_a, y_a)
+	if kf_sel_count() != 1 || !kf_sel_contains(Kf_Ref{0, 0, lane, k_first}) {
+		fmt.eprintf("[ui-probe] the brush stopped painting after release (count %d)\n", kf_sel_count())
+		ok = false
+	}
+
+	// 6. Esc cancels the mode without touching the selection.
+	kf_clear()
+	escape_dismiss()
+	if kf_brush_armed {
+		fmt.eprintf("[ui-probe] Esc must cancel the brush\n")
+		ok = false
+	}
+	if kf_sel_count() != 0 {
+		fmt.eprintf("[ui-probe] Esc changed the selection to %d keys\n", kf_sel_count())
+		ok = false
+	}
+
+	// 7. A plain press cancels the mode too — central in the click dispatch, so it
+	// cannot be forgotten by an individual handler.
+	press(x_empty, y_empty, true)
+	if !kf_brush_armed {
+		fmt.eprintf("[ui-probe] fixture failed to re-arm the brush\n")
+		return false
+	}
+	press(x_b, y_b, false)
+	if kf_brush_armed {
+		fmt.eprintf("[ui-probe] a plain press must cancel the brush\n")
+		ok = false
+	}
+
+	if ok {
+		fmt.printf("[ui-probe] keyframe brush ok (arm from empty, hover paints, accumulates, persists)\n")
+	}
+	return ok
+}// A press on a keyframe cannot tell a click from a drag, so it must not collapse
+// a selection the press might have been the start of dragging. The run is the
+// payload of a retime; the narrowing belongs to the release, which is the first
+// frame that knows no drag happened.
+//
+// This drives the clip the probe seed already built rather than hand-seeding a
+// lane: the geometry layer owns lane naming (a seeded "scale" track comes back
+// normalized), so a fixture that writes keys under a name the app then rewrites
+// tests the normalization, not the gesture.
+ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
+	ok := true
+	// See the brush probe: a leaked double-click record would turn this probe's
+	// press into a seek before it can test the click/drag split.
+	kf_dbl_click = {}
+	build_page(1920, 1600)
+	cl := &timeline.tracks[0].clips[0]
+	// Find the lane, do not assume index 0: the geometry layer renames and
+	// reorders lanes during build, so a fixture pinned to (lane 0, key 0/1)
+	// tests that normalization instead of the gesture.
+	lane := -1
+	for li in 0 ..< len(cl.keyframe_tracks) {
+		if len(cl.keyframe_tracks[li].keys) >= 2 {
+			lane = li
+			break
+		}
+	}
+	if lane < 0 {
+		fmt.eprintf(
+			"[ui-probe] click/drag fixture wants a lane with 2+ keys, got %d lanes\n",
+			len(cl.keyframe_tracks),
+		)
+		return false
+	}
+	defer {
+		undo_cancel()
+		kf_clear()
+		selection = {}
+		build_page(1920, 1600)
+	}
+	// The lane's first two keys, in store order (the store keeps them sorted,
+	// which is what makes frame A < frame B). The NAME is what the probe carries
+	// across the move below — the index is not stable.
+	lane_name := strings.clone(cl.keyframe_tracks[lane].name)
+	defer delete(lane_name)
+	f_a := cl.keyframe_tracks[lane].keys[0].frame_off
+	f_b := cl.keyframe_tracks[lane].keys[1].frame_off
+	box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
+	x_a, y := kf_key_center(box, lane, f_a)
+	x_b, _ := kf_key_center(box, lane, f_b)
+	if x_b - x_a < KF_DRAG_THRESHOLD_PX * 2 {
+		fmt.eprintf(
+			"[ui-probe] click/drag fixture keys are %v px apart, too close to grab one\n",
+			x_b - x_a,
+		)
+		return false
+	}
+
+	press :: proc(x, y: f32) {
+		interaction_click_dispatch(Mouse_Input{x, y, true, false, false, false, false, false}, false)
+	}
+	drag :: proc(x, y: f32) {
+		interaction_move(Mouse_Input{x, y, true, false, false, false, false, false}, true, 1600)
+	}
+	ref_a, ref_b := Kf_Ref{0, 0, lane, 0}, Kf_Ref{0, 0, lane, 1}
+	run := [?]Kf_Ref{ref_a, ref_b}
+
+	// The run under test: both keys selected, the state a brush leaves behind.
+	kf_clear()
+	kf_select_add(run[:])
+	if kf_sel_count() != 2 {
+		fmt.eprintf("[ui-probe] click/drag fixture wants a 2-key run, got %d\n", kf_sel_count())
+		return false
+	}
+
+	// 1. The regression: pressing a key that is ALREADY selected must leave the
+	// run intact. It used to narrow on mouse-down, so grabbing one key of a run to
+	// retime it silently deselected the rest before the drag even started.
+	press(x_b, y)
+	if kf_sel_count() != 2 {
+		fmt.eprintf(
+			"[ui-probe] pressing a selected key collapsed the run to %d keys on mouse-down\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+	if active_interaction != .Keyframe_Move {
+		fmt.eprintf("[ui-probe] a plain press on a key must arm the move, got %v\n", active_interaction)
+		ok = false
+	}
+
+	// 2. Dragging it moves the WHOLE run by the same delta — the point of
+	// deferring the narrow.
+	drag_frames :: i32(12)
+	want_a, want_b := f_a + drag_frames, f_b + drag_frames
+	drag(x_b + f32(drag_frames) * timeline_view.zoom, y)
+	interaction_release(Mouse_Input{x_b, y, false, false, false, false, false, false})
+	got := kf_frames_by_name(cl^, lane_name)
+	want := [2]i32{want_a, want_b}
+	if got != want {
+		fmt.eprintf(
+			"[ui-probe] dragging one key of the run moved the frames to %v, want %v\n",
+			got,
+			want,
+		)
+		ok = false
+	}
+	if kf_sel_count() != 2 {
+		fmt.eprintf(
+			"[ui-probe] the drag left %d keys selected, want the whole run\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+
+	// 3. The other half: a press with NO drag narrows on mouse-up, and moves
+	// nothing. This is the click that replaces the run, now decided at release.
+	box = clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
+	moved_lane, found := kf_lane_by_name(cl^, lane_name)
+	if !found {
+		fmt.eprintf("[ui-probe] the dragged lane vanished from the store\n")
+		return false
+	}
+	ref_a_moved := Kf_Ref{0, 0, moved_lane, 0}
+	cx, cy := kf_key_center(box, moved_lane, want_a)
+	press(cx, cy)
+	interaction_release(Mouse_Input{cx, cy, false, false, false, false, false, false})
+	if kf_sel_count() != 1 || !kf_sel_contains(ref_a_moved) {
+		fmt.eprintf(
+			"[ui-probe] clicking a selected key without dragging left %d keys selected, want 1\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+	if got := kf_frames_by_name(cl^, lane_name); got != want {
+		fmt.eprintf("[ui-probe] the click-without-drag moved the frames to %v\n", got)
+		ok = false
+	}
+
+	// 4. A press on a key OUTSIDE the selection narrows immediately, so dragging
+	// it moves the key that was grabbed rather than the run that was selected.
+	bx, by := kf_key_center(box, moved_lane, want_b)
+	one := [?]Kf_Ref{ref_a_moved}
+	kf_clear()
+	kf_select_add(one[:])
+	press(bx, by)
+	if kf_sel_count() != 1 || kf_sel_contains(ref_a_moved) {
+		fmt.eprintf(
+			"[ui-probe] pressing an UNselected key left %d selected, want just the grabbed one\n",
+			kf_sel_count(),
+		)
+		ok = false
+	}
+	interaction_release(Mouse_Input{bx, by, false, false, false, false, false, false})
+
+	if ok {
+		fmt.printf("[ui-probe] keyframe click-vs-drag ok (press keeps the run, release narrows)\n")
+	}
+	return ok
+}
+
+// kf_lane_by_name finds a lane by its track name, at an index that is only valid
+// for the current build. A probe must not cache a lane INDEX across a store op:
+// the geometry layer can mint or retire lanes while re-landing keys, which slides
+// every index after it.
+kf_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
+	for i in 0 ..< len(cl.keyframe_tracks) {
+		if cl.keyframe_tracks[i].name == name {
+			return i, true
+		}
+	}
+	return -1, false
+}
+
+// kf_frames_by_name is the frame list of the named lane, as a fixed pair so a
+// probe can compare it with == and get one readable failure instead of two.
+kf_frames_by_name :: proc(cl: Clip, name: string) -> [2]i32 {
+	li, ok := kf_lane_by_name(cl, name)
+	assert(ok, "kf_frames_by_name: the probe's lane vanished from the store")
+	keys := cl.keyframe_tracks[li].keys
+	assert(len(keys) == 2, "kf_frames_by_name wants exactly the 2 keys its fixture selected")
+	return [2]i32{keys[0].frame_off, keys[1].frame_off}
+}
 // ui_probe_clip_tile_width_asserts holds the tile to the model's width. A tile
 // sized by its content (label text + padding) instead of by frames*zoom drew
 // wider than the clip really was, and the same box fed the pointer hit test,

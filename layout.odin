@@ -10,6 +10,7 @@ package main
 
 // Spacing.
 PANEL_PADDING :: 16   // PaddingAll on every card/panel.
+FIELD_PAD_H :: u16(8) // Horizontal padding inside a value/label field. Named because the clip name's pixel budget (clip_name_max_px) has to subtract the same number the field's layout adds, and two literals for one padding is a number that drifts.
 TIMELINE_PADDING :: 12 // PaddingAll on the timeline container + open-file button.
 CARD_GAP :: 8         // childGap inside every card/panel.
 BUTTON_ROW_GAP :: 6   // childGap between sibling controls in a row.
@@ -94,13 +95,12 @@ KF_BTN_PAD :: f32(3)       // Transparent click padding around the button diamon
 // Inspector add-keyframe buttons, one per keyable property in row order: the
 // element ids are hit-tested in interaction.odin and painted as diamonds in
 // gpu_draw.odin, so they live here as the single source of truth.
-KF_ADD_BTN_IDS :: [12]string{
+KF_ADD_BTN_IDS :: [11]string{
 	"KfAddX", "KfAddY", "KfAddS",
 	"KfAddCropL", "KfAddCropR", "KfAddCropT", "KfAddCropB",
 	"KfAddOpacity",
 	"KfAddGain",
 	"KfAddTrans", "KfAddCrop",
-	"KfAddModified",
 }
 // The whole-GROUP add-keyframe buttons: key every lane of a property section
 // at once (transform = x+y, crop = l+r+t+b) instead of one lane. Drawn as a
@@ -108,14 +108,6 @@ KF_ADD_BTN_IDS :: [12]string{
 // single per-lane diamond.
 KF_GROUP_BTN_IDS :: []string{"KfAddTrans", "KfAddCrop"}
 
-// KfAddModified keys EVERY geometry lane that was edited without a keyframe
-// (Clip.geom_modified, set by clip_geom.odin) in one undo node. It is the
-// answer to the question the per-lane diamonds create: a user who pans a plain
-// clip with Alt+drag and then wants to animate it would otherwise have to
-// click seven diamonds, and the reasonable assumption is that the gesture
-// already recorded something. Disabled (not merely inert) when nothing is
-// pending, so it is lit exactly when pressing it would do something.
-KF_ADD_MODIFIED_ID :: "KfAddModified"
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 TSCROLLBAR_W :: f32(10)    // Width of the timeline's vertical scrollbar strip.
 TSCROLLBAR_MIN_H :: f32(28) // Smallest rendered scrollbar thumb.

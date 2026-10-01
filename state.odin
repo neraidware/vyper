@@ -1136,12 +1136,27 @@ Kf_Snap :: struct {
 // press_x/press_frame pair is resolved through the anchor's own wrap box, so
 // deriving the delta from snaps[0] would drag a key by another clip's zoom and
 // pan. An invalid anchor (no grab) reads as index 0, which kf_resolve rejects.
+//
+// engaged latches when the cursor first passes KF_DRAG_THRESHOLD_PX from
+// press_x. It is deliberately NOT the same test as commit's "did any key move":
+// a drag that slides a key and then slides it back, or one that only pushes the
+// outermost keys into the clip's clamped edge, moves nothing yet is still a
+// drag, and must not be read as a click.
+//
+// narrow_click is the deferred half of "click selects, drag moves". A press on
+// a key that is ALREADY selected cannot decide between the two, so it arms this
+// instead of collapsing the selection: the capture above takes the whole run,
+// and if the release finds engaged == false the selection narrows to anchor
+// then. Without it, grabbing one key of a selected run to retime it silently
+// deselected the rest of the run on mouse-down.
 Kf_Move :: struct {
 	snaps:   [dynamic]Kf_Snap,
 	anchor:  Kf_Ref,
 	press_x: f32,
 	press_frame: f32,
 	delta:   i32,
+	engaged: bool,
+	narrow_click: bool,
 }
 kf_move: Kf_Move
 
@@ -1160,12 +1175,36 @@ kf_dbl_click: Kf_Dbl_Click
 
 // kf_hits is the diamond hit-test's output buffer: kf_keys_at appends every
 // diamond under the pointer to it, and a press reads the first as the grabbed
-// key and the whole as the Shift+click set. A grow-only scratch, clear()ed on
-// every press (which KEEPS the buffer), so a hit-test never allocates after the
-// first one — a per-press make/delete pair is exactly the churn the ownership
-// rules forbid, and this list is touched on a user click rather than in a hot
-// loop anyway.
+// key while the brush reads the whole as the set it just crossed. A grow-only
+// scratch, clear()ed on every press (which KEEPS the buffer), so a hit-test never
+// allocates after the first one — a per-press make/delete pair is exactly the
+// churn the ownership rules forbid, and this list is touched on a user click
+// rather than in a hot loop anyway.
 kf_hits: [dynamic]Kf_Ref
+
+// kf_brush_armed is the keyframe "brush" — a hover-select MODE, not a
+// button-held gesture. Shift+click on EMPTY keyframe-timeline space arms it,
+// and from then on every keyframe the pointer passes over is added to the
+// selection. It deliberately outlives the mouse button: the arming click is a
+// mode change, not the start of a drag, which is what distinguishes it from a
+// Shift+click ON a keyframe (that one selects the key and arms nothing — there
+// is no hover behaviour to a plain selection).
+//
+// It is not an active_interaction because that switch is about a held button:
+// one gesture runs at a time and ends on release, whereas this keeps running
+// across unrelated presses until something cancels it.
+kf_brush_armed: bool
+
+// kf_brush_hovered is the set of keys under the pointer as of the last brush
+// frame that CHANGED it, which is what makes the brush edge-triggered rather
+// than per-frame. Not an optimization: the pointer rests on whatever key it
+// last crossed, so a per-frame version would re-add it forever, and the mode
+// would be unable to end without also clearing the selection.
+//
+// Element-wise compare is enough because kf_keys_at walks tracks, then clips,
+// then lanes, then keys in fixed order, so one position always yields one order.
+// A grow-only scratch like kf_hits: cleared per call, which KEEPS the buffer.
+kf_brush_hovered: [dynamic]Kf_Ref
 
 // Handle_Drag is the preview resize/crop-handle drag. handle is the dragged
 // corner (Maybe(nil) = none); kind is Scale vs Crop. Every handle_start_* field

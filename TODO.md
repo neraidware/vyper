@@ -3289,3 +3289,206 @@ recurses into itself until the stack dies. Unreachable here (`nix` is not
 installed, so the host-toolchain branch runs), and the intended invocation is
 guessing — `nix develop --command` is not obviously right for a repo that is not
 itself a nix package. Left alone rather than half-guessed.
+
+---
+
+## Implemented — key-all-modified as one binding, bounded clip names, Shift keyframe sweep (2026-09-30)
+
+Three inspector/timeline UX changes that share one probe run.
+
+### Key-all-modified: grouped button out, bare `A` in
+
+- Problem: the per-lane `KfAddModified` diamond (`KF_ADD_MODIFIED_ID`) answered
+  a real question — a user who pans a plain clip with Alt+drag and then wants to
+  animate it would otherwise click seven diamonds — but it sat in a row of
+  per-lane diamonds, was the only id outside the `KF_ADD_BTN_IDS` table, and
+  cost seven hit tests and a paint for one action.
+- `A` is a bare binding (extra modifiers ignored, like the other bare rows), so
+  it is a keyboard action, not a 12th inspector element: the button, its id, and
+  its hit test are gone, `KF_ADD_BTN_IDS` is `[11]string`, and the
+  `KfAllModifiedRow` summary plus its help-overlay entry stay.
+- Model: `clip_geom_key_all_modified` samples every on-screen value FIRST, then
+  writes. The pending mask is per LANE, not per section, because the honest
+  unit of "modified" is one edited property. Packed sections merge same-frame
+  lane bits through `kf_geom_set_packed_lane_key`, so a 7-lane pending crop
+  becomes 4 keys (l+r, t+b) rather than 7 or 1, all inside ONE undo node.
+  Already-unwrapped sections stay unwrapped, and Scale/Opacity stay scalar.
+- Probe: `geom_key_probe` grew partial packed masks, cross-section packing, and
+  the already-unwrapped case. `ui_probe_action_table_asserts` is 27 cases and
+  pins bare `A` plus `Shift+A` and `Ctrl+A` to the same action — the
+  most-specific-first walk is where a bare row silently loses to a Ctrl row added
+  later, and "A stopped keying" is not a crash anyone would notice.
+- Mutation: making the `A` row require Ctrl fails two of the three.
+
+### Bounded clip names in the inspector
+
+- Problem: clay's text element has no maxWidth and no ellipsis option, so a long
+  clip name sized its parent and painted the inspector card over the panel
+  border. The fix needs two halves because they fail independently.
+- Structural half: `INSPECTOR_CARD_MAX_W :: f32(INSPECTOR_MAX_W -
+  TSCROLLBAR_W)` caps `card_open`'s grow. Without it, truncation alone leaves the
+  card at 346 but `NameValue` still reaches 362.5.
+- Textual half: `label_truncate_fmt` cuts to a caller-owned fixed buffer with a
+  trailing `...`, reserving the ellipsis first, cutting only on rune
+  boundaries (`utf8.Rune_Start`), and asserting the write before the terminator —
+  a `[N]u8` copy that silently clips is a wrong label nothing downstream can
+  report. No per-frame allocation: `ui_text.clip_name` is `[256]u8`.
+- The metric is shared, not duplicated: `FONT_ADVANCE_RATIO :: f32(0.55)` in
+  font.odin is the whole of clay's `measure_text`, and `text_px` multiplies by
+  it, so the cut lands where clay would have laid the text out.
+- `FIELD_PAD_H :: u16(8)` exists because `clip_name_max_px` has to subtract the
+  same padding the field's layout adds; two literals for one padding is a
+  number that drifts.
+- Probe: `ui_probe_inspector_width_asserts` grew a long-name arm on the existing
+  45-char fixture. Final geometry — short and long identical at column 356.0,
+  card 346.0, `NameValue` 281.1 — and `"A012_C003_20260314_184522_t..."`.
+- Mutation: removing the max fails the column check; keeping the max and
+  disabling truncation fails the `NameValue` check. Both halves are load-bearing.
+
+### Keyframe select: click-vs-drag, and the hover brush
+
+Two changes to how keyframes are selected, both driven by the same complaint:
+the press was doing selection work that only the release can decide.
+
+**Click vs drag on a selected key.** Pressing a key that is already part of a
+run used to narrow the selection to that key ON MOUSE-DOWN, so grabbing one key
+of a selected run to retime it silently deselected the rest before the drag even
+started. A press cannot tell a click from a drag, so it no longer tries:
+`narrow_click := kf_sel_contains(grab)` — if the grabbed key is already in the
+run, the press preserves the run, captures all of it for the move, and defers the
+narrowing to the release. A press on a key OUTSIDE the selection still narrows
+immediately (nothing to preserve, and a drag from it must move the key grabbed,
+not the old run).
+
+- `Kf_Move` grew `engaged` and `narrow_click`. `engaged` is latched in
+  `update_keyframe_drag` the moment the cursor passes `KF_DRAG_THRESHOLD_PX`. It
+  is deliberately NOT "did any key move": a drag that returns to its origin, or
+  one that only pushes the outermost keys into the clip's clamped edge, moves
+  nothing yet is still a drag and must not be read as a click.
+- `commit_keyframe_drag` now narrows first when `!engaged`, then runs the move.
+- Probe `ui_probe_kf_click_vs_drag_asserts` drives the real press/move/release:
+  press keeps the run at 2, drag moves BOTH keys by the same delta and keeps both
+  selected, a press+release with no motion narrows to 1 and moves nothing, and a
+  press on an unselected key narrows at once.
+- Two mutations, both caught: narrowing at press again ("collapsed the run to 1
+  keys on mouse-down"), and never narrowing on release ("clicking a selected key
+  without dragging left 2 keys selected, want 1").
+
+**The hover brush.** Shift+click on EMPTY keyframe-timeline space arms a
+hover-select mode: from then on every keyframe the pointer passes over is ADDED
+to the selection, with no button held, and the mode persists after release.
+Shift+click ON a keyframe is the opposite — it selects that key and arms
+nothing. This is the correction of an earlier implementation that had the two
+backwards (sweep armed from a keyframe press, gated on the button being held).
+
+- The brush is a MODE, not an `active_interaction`: that switch is about a held
+  button where one gesture runs at a time and ends on release, whereas the brush
+  keeps running across unrelated presses. So `Kf_Sweep` was deleted rather than
+  adapted, and `kf_brush_armed` / `kf_brush_hovered` are plain globals.
+- `kf_brush_paint` runs from `interaction_move` BEFORE the gesture switch, so it
+  needs no button and no interaction state. `kf_brush_hovered` is the same
+  edge-trigger as before: the pointer rests on whatever key it last crossed, so
+  a per-frame version would re-add it forever and the mode could never end
+  without also clearing the selection.
+- A brush session ACCUMULATES onto the existing selection; arming does not
+  clear it. Cancel is Esc or any press without Shift, both central
+  (`escape_dismiss`, and the top of `interaction_click_dispatch`) so no
+  individual handler has to remember.
+- Probe `ui_probe_kf_brush_asserts` asserts the premises too: a Shift+click on a
+  keyframe must NOT arm, and hovering must paint nothing while unarmed — else
+  the rest would pass while testing the wrong thing. It sets
+  `clay.SetPointerState` in its press/hover helpers, exactly as the frame loop
+  does, because every clay-gated handler in the chain (`PointerOver(TrackArea)`)
+  otherwise reads a stale position and the arming press tests nothing.
+- Mutations, all caught: arming from a keyframe click, gating paint on the
+  button, clearing the selection on arm, and disarming on release.
+- Behavior retained: S7's Shift-drag keyframe MOVE stays unreachable. A
+  Shift+click on a keyframe is a plain selection (it does not even arm the
+  move), and the brush is entered only from empty space. No replacement gesture
+  was invented for it.
+- Memory: `kf_brush_hovered` is the same grow-only scratch shape as `kf_hits`;
+  `kf_selection_free` hands both back at session teardown.
+
+Both probes fault-inject the same way on purpose: the go-to-keyframe
+double-click record is a global on a wall-clock timer, and two probes that press
+the same diamond in one process run inside that window, so each probe resets
+`kf_dbl_click = {}` on entry. Without it the second press is read as a seek and
+never reaches the gesture under test.
+
+Gates: all 10 (`check build geom_key_probe probe transform_probe timeline_probe
+valgrind geom_key_valgrind undo_valgrind keyed_export`) pass.
+
+### Unrelated working-tree change
+
+`.mise.toml` also shows `ols` added with `version = "latest"`. Not part of this
+work and not reviewed here — flagged because the file's own documented policy
+pins `odin`/`clang`/`mold` exactly, on the grounds that `latest` makes a red
+gate unreproducible afterwards.
+
+## Implemented — keyed audio gain was applied in the wrong unit (2026-09-30)
+
+- Problem: `~/test.vyproj` opens with an inverted audio blast instead of fading
+  in. The clip's gain track holds `-40` at frame 0 and `0` at frame 41 — the
+  values the inspector shows and edits in dB — but `audio_mix_frame` took the
+  sampled value straight from `kf_sample_keys` and multiplied PCM by it as if it
+  were a linear amplitude. `-40` as a multiplier is a −40× inverted signal; the
+  static path (`db_to_linear(chip.gain_dB)`) had always converted, so only the
+  keyed path disagreed with it.
+- Model: the gain track is authored in dB (the inspector's unit — `kf_add_prop`
+  keys `cl.gain`), so the CONSUMER converts, exactly as it converts the static
+  base. `Play_Seg` gained `gain_dB` (the folded level in the track's unit)
+  beside the existing linear `gain`; the mix now samples the curve against
+  `gain_dB` and runs it through `db_to_linear`. Both are set wherever `gain` is
+  (provision and `audio_gain_fold`). The new `play_seg_gain_linear` holds the
+  one conversion so it is unit-testable off the decode path.
+- The resting base for a keyed segment is now dB too. Before the first key and
+  past the last, `kf_sample_keys` returns the base unchanged; feeding it the
+  linear `seg.gain` and then converting would have applied `db_to_linear` twice.
+  With `gain_dB` the base is already in the track's unit, so the outside-span
+  value converts back to exactly the static `gain` it folded from.
+- Probe: `keyframe_probe` builds `db_keys` (the `-40 → 0` dB track from the real
+  project) and pins `kf_gain_linear` at frame 0 (`0.01`, not `-40`), on the 0 dB
+  key (`1.0`), past the last key (static base), at a keyed midpoint (inside
+  `(0.01, 1.0)`, interpolated in amplitude not at the raw dB number), and with
+  an empty track (static base, converted). It then routes the SAME track through
+  both consumer seams — a `Play_Seg` and a `Render_Audio_Src` — and checks each
+  agrees with `kf_gain_linear`, so playback and export cannot silently diverge
+  again.
+- Mutation: returning the sampled dB value directly (the shipped bug) fails the
+  three keyed checks, led by `want linear(-40dB)=0.01000, got -40.00000`.
+
+### Adjacent gap 1 — export mixer applied no per-clip gain (fixed)
+
+- Problem: the export mix loop (`render.odin`, was ~line 2902) added each source's
+  PCM into the bus with no multiply at all — neither the static gain nor its
+  automation — so a rendered file ignored the gain slider entirely. Found while
+  fixing the unit bug above.
+- Model: `Render_Audio_Src` gained `gain_dB` plus a copied `kf_keys`/`kf_n`
+  snapshot, and the mix evaluates `kf_gain_linear` once per source per timeline
+  frame (constant across that frame's samples). Same helper as playback, so the
+  two paths share the dB→linear conversion by construction rather than by
+  convention. `GAIN_KF_MAX_KEYS` caps the copy; an over-long track warns and
+  keeps the first N.
+- Testability: the snapshot wiring was pulled out of the job-build switch into
+  `render_audio_src_from_clip`, so the part the bug hinged on (the track being
+  copied, the static dB being carried) is a unit, not buried in a worker switch.
+- Probe: `keyframe_probe` builds a keyed `Clip` and asserts
+  `render_audio_src_from_clip` carries `gain_dB`, snapshots all keys, and renders
+  the frame-0 keyed gain. Mutations — dropping `gain_dB = clip.gain` ("must carry
+  the static clip gain (got 0)") and dropping the `kf_fill_snapshot` block ("must
+  snapshot the gain track (got 0 keys)") — are both caught.
+
+### Adjacent gap 2 — inspector gain readout ignored the playhead (fixed)
+
+- Problem: the gain row (`ui.odin`) printed the raw `cl.gain`, while every
+  geometry lane prints the playhead-sampled value via `clip_geom_get`. On a keyed
+  clip the readout therefore disagreed with what playback was doing.
+- Model: new `clip_gain_db_at_playhead` samples the clip's gain track at the
+  playhead and falls back to `cl.gain` where the track is inactive (no key,
+  before the first, past the last) — the same rule the geometry lanes use.
+- Probe: `keyframe_probe` sets the playhead onto the first and last gain keys and
+  checks the keyed dB is returned, plus the static value for an unkeyed clip.
+  Mutation — returning `clip.gain` unconditionally (the shipped bug) — fails with
+  "gain readout on the first key must show the keyed dB, got 0".
+- Gates: all 10 (`check build geom_key_probe probe transform_probe timeline_probe
+  valgrind geom_key_valgrind undo_valgrind keyed_export`) pass.
