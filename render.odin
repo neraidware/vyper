@@ -976,46 +976,32 @@ Render_Audio_Src :: struct {
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
 	source_length_frames: i64,
-	// gain_dB is the clip's static level in dB; kf_* is its copied "gain"
-	// keyframe track (kf_n = 0 = static). The export mix evaluates these through
-	// kf_gain_linear per frame, exactly like playback (audio_mix_frame) — the
-	// export used to apply NO gain at all, so a rendered file ignored the
-	// slider and its automation entirely.
-	gain_dB:              f32,
-	kf_keys:              [GAIN_KF_MAX_KEYS]Keyframe,
-	kf_n:                 int,
+	// gain is the render's FROZEN copy of the clip's committed gain snapshot,
+	// taken at render start from the same geometry slab the playback producer
+	// reads. Both mixers evaluate this shape through audio_gain_linear, so the
+	// export cannot drift from playback (it previously applied no gain at all,
+	// so a rendered file ignored the slider and its automation entirely).
+	gain:                 Audio_Gain_Snapshot,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
 	fifo:                 Audio_Ring, // converted stereo f32, content-relative
 	first48:              i64, // content 48 kHz frame of fifo's head
 	have48:               i64, // content frames produced so far (next un-produced)
 }
 
-// render_audio_src_from_clip snapshots an audio clip into the job's
-// Render_Audio_Src: identity fields plus the static gain and a COPY of its
-// "gain" keyframe track. Extracted from the job-build switch so the wiring that
-// the gain bug hinged on (the track actually being captured, the static dB
-// carried in gain_dB) is unit-testable in keyframe_probe, not only visible as
-// "the export ignored my slider". Clones path; caller frees the src.
-render_audio_src_from_clip :: proc(clip: ^Clip) -> Render_Audio_Src {
-	src := Render_Audio_Src {
-		path                 = strings.clone_to_cstring(string(clip.path)),
-		stream_index         = clip.stream_index,
-		timeline_start_frame = clip.timeline_start_frame,
-		source_start_frame   = clip.source_start_frame,
-		source_length_frames = clip.source_length_frames,
-		gain_dB              = clip.gain,
+// render_audio_src_from_chip copies one committed geometry chip into the job's
+// Render_Audio_Src: identity fields plus the chip's gain snapshot. The export
+// reads the SAME committed source playback does (audio_geometry_commit's slab),
+// rather than re-deriving gain from the live clip, so a fact the user edits has
+// exactly one committed home. Clones path; caller frees the src.
+render_audio_src_from_chip :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chip) -> Render_Audio_Src {
+	return Render_Audio_Src {
+		path = strings.clone_to_cstring(audio_chip_path(slot, chip)),
+		stream_index = chip.stream_index,
+		timeline_start_frame = chip.timeline_start,
+		source_start_frame = chip.source_start,
+		source_length_frames = chip.source_len,
+		gain = chip.gain,
 	}
-	if n, total := kf_fill_snapshot(clip, "gain", src.kf_keys[:]); n > 0 {
-		src.kf_n = n
-		if total > GAIN_KF_MAX_KEYS {
-			fmt.printf(
-				"[render] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n",
-				GAIN_KF_MAX_KEYS,
-				n,
-			)
-		}
-	}
-	return src
 }
 
 // Render_Job is the timeline snapshot taken on the main thread when a render
@@ -2955,10 +2941,10 @@ render_worker_run :: proc() {
 				base := int(start48 - a.first48)
 				// Per-clip gain re-evaluated at this timeline frame, so a keyed
 				// gain track automates the export exactly as it does playback
-				// (one kf_gain_linear call per source per frame; the value is
-				// constant across the frame's samples). kf_gain_linear carries
+				// (one audio_gain_linear call per source per frame; the value is
+				// constant across the frame's samples). audio_gain_linear carries
 				// the dB→linear conversion, so the slider is in dB here too.
-				g := kf_gain_linear(a.kf_keys[:a.kf_n], i32(timeline_frame - a.timeline_start_frame), a.gain_dB)
+				g := audio_gain_linear(&a.gain, i32(timeline_frame - a.timeline_start_frame))
 				for s in 0 ..< cur_spf {
 					l, r := ring_at(&a.fifo, base + s)
 					mix[s * 2 + 0] += l * g
@@ -3756,7 +3742,9 @@ render_start :: proc() {
 				visual: Render_Visual = &cls[len(cls) - 1]
 				append(&vis, visual)
 			case .Audio:
-				append(&auds, render_audio_src_from_clip(clip))
+			// audio is read from the committed geometry slab after the walk,
+			// not from the live clips: the same source the playback producer
+			// consumes, so playback and export evaluate one gain snapshot.
 			case .Other:
 			// no renderable content in this clip
 			case .Empty:
@@ -3818,6 +3806,15 @@ render_start :: proc() {
 				}
 			}
 		}
+	}
+	// Audio is snapshotted from the committed geometry slab — the same source
+	// the playback producer reads — so export and playback evaluate one gain
+	// snapshot. Commit first: a video-only edit since the last audio commit
+	// must not leave a stale audio set in the render.
+	audio_geometry_commit()
+	audio_slot := &audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)]
+	for ai in 0 ..< audio_slot.n {
+		append(&auds, render_audio_src_from_chip(audio_slot, &audio_slot.chip[ai]))
 	}
 	render_job.visuals = vis[:]
 	render_job.videos = cls[:]

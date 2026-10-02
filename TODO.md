@@ -2734,8 +2734,8 @@ is S1c, not a refactor, and is tracked there.
 
 ## Active 11 — Unified render engine: one evaluation, multiple sinks, minimal state
 
-**Status: planned 2026-10-01.** Branch `render-engine`, base `639d20a`.
-Nothing implemented yet; this section is the agreement before code.
+**Status: S1 (+audio half of S2) landed 2026-10-01.** Branch `render-engine`,
+base `639d20a`. S3–S6 planned. (This section travels in the S1 commit.)
 
 **Why.** Preview and export are two *drivers* over two *copies* of the same
 derived facts, and every copied fact is a drift site. The keyed-gain bug shipped
@@ -2757,7 +2757,7 @@ Two *audio* systems today:
 
 | | playback (audio preview) | export |
 |---|---|---|
-| snapshot | `audio_geometry_commit` (`audio.odin:755`) → `Audio_Geom_Slot` chip | `render_audio_src_from_clip` (`render.odin:999`) → `Render_Audio_Src` |
+| snapshot | `audio_geometry_commit` → `Audio_Geom_Slot` chip (gain as `Audio_Gain_Snapshot`) | `render_audio_src_from_chip` reads the **same** slab chip → `Render_Audio_Src` (S1: no longer re-derived from the live clip) |
 | provision | `audio_provision` (`audio.odin:907`) → `Play_Src`/`Play_Seg` | `render_audio_open` (`render.odin:1810`) |
 | decode | `audio_src_pull` / `audio_src_seek_anchor` | `render_audio_pull` (a reimplementation; it even dropped the seek preroll) |
 | mix | `audio_mix_frame` (`audio.odin:1130`) | inline loop (`render.odin:2957`) |
@@ -2825,18 +2825,44 @@ detour):
 **Steps** (each lands + probe + vet before the next; expect probe-first, and
 mutation-test every new assertion):
 
-- [ ] **S1 — Define the committed-version read model.** Name every cross-thread
-      reader that currently receives a deep copy (`Render_Job`, the audio chip
-      slab) and specify the minimal shared read interface over the canonical
-      document. This is the seam everything else hangs on; no behavior change
-      beyond *how* the copy is obtained. Probe: a worker sees a snapshot that is
-      internally consistent and unaffected by a concurrent edit.
-- [ ] **S2 — Collapse the audio copies (first concrete reduction).** Delete
-      `Audio_Geom_Chip.gain_dB`/`kf_keys` and `Play_Seg`'s copied keys; both the
-      playback mixer and the export mixer sample gain through one pure accessor
-      over the committed document. `kf_gain_linear` stays as the shared evaluator.
-      Probe: playback mix == export mix for the same frame; readout sampled; both
-      mutations from the 2026-09-30 gain fix still caught.
+- [x] **S1 — Define the committed-version read model.** Landed 2026-10-01.
+      Named the cross-thread readers (playback producer ← `Audio_Geom_Slot`
+      double-buffered slab + `gain_epoch`; render worker ← `render_job` deep
+      copy built in `render_start`; `vdecode` ← per-request descriptor;
+      `import_bg` ← a path, no timeline). **Key finding: the per-sink copies
+      (`Play_Seg`, `Audio_Geom_Chip`, `Render_Audio_Src`) are load-bearing** —
+      each thread latches a stable view across the double-buffer swap / render
+      lifetime, so the copies cannot simply be deleted; what must be shared is
+      the *definition*, the *derivation*, and the *evaluator*, not the physical
+      storage. That coupling merged the audio half of S2 into S1.
+- [x] **S2 (audio) — Collapse the audio copies.** Landed with S1. New committed
+      shape `Audio_Gain_Snapshot {db, keys[GAIN_KF_MAX_KEYS], n}` (`audio.odin`),
+      built only by `audio_gain_snapshot_from_clip` and evaluated only by
+      `audio_gain_linear` (wrapping `kf_gain_linear`, which stays the shared
+      evaluator). `Audio_Geom_Chip`, `Play_Seg` and `Render_Audio_Src` all embed
+      it; the dead `Play_Seg.gain` (linear, written but never read) and the
+      parallel `gain_dB`/`kf_keys`/`kf_n` fields are gone. `audio_gain_fold`
+      copies only `db` (the keyed curve is unchanged by a gain-knob drag). The
+      export no longer re-derives gain from the live clip: `render_start` calls
+      `audio_geometry_commit()` and builds every `Render_Audio_Src` from the
+      active slab via `render_audio_src_from_chip`, so **export and playback
+      read the same committed source**. Probe (`keyframe_probe`): snapshot
+      evaluates like `kf_gain_linear` at a key and a midpoint; playback seam ==
+      export seam; commit captures static dB + track; `render_audio_src_from_chip`
+      copies the chip's gain + identity verbatim. Gates: check/build/probe/
+      `VYPER_KEYFRAME_PROBE`/geom_key_probe/transform_probe/timeline_probe/
+      keyed_export/valgrind/geom_key_valgrind/undo_valgrind all green.
+      **Consequence (accept + watch):** the export now inherits the committed
+      slab's bounds — `AUDIO_GEOM_MAX_CLIPS :: 4096` clips and
+      `AUDIO_GEOM_PATH_ARENA :: 1<<20` path bytes per slot (previously export
+      used uncapped dynamic arrays). Past the cap the commit logs once and mutes
+      the overflow clips for **both** playback and export; this is now a single
+      ceiling instead of two disagreeing ones. Export source order is slab
+      (track/clip) order.
+- [ ] **S2 (video) — Collapse the video/frame copies.** Remaining: preview and
+      export sample geometry/opacity/source-policy through one evaluator (this
+      is S3/S4 below). `Render_Video_Src`'s derived geometry fields and the
+      preview slot's sampled copies still duplicate the fact.
 - [ ] **S3 — One video frame evaluator.** Geometry, opacity, source policy and
       draw order become one proc parameterized by `(resolution, source_policy)`,
       consumed by both preview and export. Delete the preview/export sampling
@@ -2858,8 +2884,15 @@ orthogonal — this shares evaluation, not buffers, so it does not wait on GPU
 interop. Active 1 already covers hw decode and "preview the original when the host
 keeps up"; the source policy here builds on that rather than replacing it.
 
-**Decision pending.** Where the committed-version read model lives (extend the
-existing generation/epoch pattern vs a deeper persistent document). S1 settles it.
+**Decision (settled in S1).** Extend the existing committed-slab pattern, not a
+new persistent document. The committed source of truth for audio gain is the
+`Audio_Geom_Slot` chip (via `Audio_Gain_Snapshot`); both sinks read it. Per-thread
+latches stay (they are load-bearing for the swap), but they carry the shared shape
+and share the evaluator, so a fact has one committed home and one meaning.
+
+**Decision pending.** Whether S4's sink split keeps `Audio_Geom_Slot` as the
+committed read model or folds it into the broader generation scheme (S3/S4 will
+show whether the video committed view wants the same double-buffer shape).
 
 ## Queued — Performance / Cleanup
 

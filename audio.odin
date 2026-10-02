@@ -489,23 +489,13 @@ Play_Seg :: struct {
 	start_a: i64, // timeline_start_frame
 	start_s: i64, // source_start_frame
 	len_a:   i64, // source_length_frames
-	// gain is the segment's linear amplitude multiplier, derived once at
-	// provision from the clip's dB value. Rides the per-segment snapshot (not
-	// per-source) because a split makes adjacent segments of one source
-	// independently adjustable.
-	gain:    f32,
-	// gain_dB is the same level in the gain track's own unit (dB). The keyed
-	// curve is authored in dB — the inspector shows and edits cl.gain in dB —
-	// so it is sampled with THIS as the resting base and only then converted to
-	// linear; sampling with the linear gain above would treat a key's dB value
-	// as a multiplier (a -40 dB key becomes a -40x inverted blast). Kept beside
-	// gain instead of derived back from it so a fold never round-trips a log.
-	gain_dB: f32,
-	// kf_* is the segment's copied "gain" keyframe track (kf_n = 0 = static);
-	// the mix re-evaluates the keyed gain per timeline frame so automation
-	// animates live. Copied at provision from the chip (see GAIN_KF_MAX_KEYS).
-	kf_keys: [GAIN_KF_MAX_KEYS]Keyframe,
-	kf_n:    int,
+	// gain is the segment's latched copy of the committed gain snapshot (static
+	// dB + keyed curve), taken once at provision from the geometry slab. Rides
+	// the per-segment snapshot (not per-source) because a split makes adjacent
+	// segments of one source independently adjustable. The mix re-evaluates it
+	// per frame through audio_gain_linear, so automation animates live without
+	// the producer ever reading live timeline state.
+	gain: Audio_Gain_Snapshot,
 }
 
 // Play_Src is one source stream's 48 kHz stereo S16 decoder + content-relative
@@ -673,21 +663,45 @@ AUDIO_GEOM_PATH_ARENA :: 1 << 20 // bytes of packed path data per slot
 // keys and logs once — truncation is silent data loss otherwise.
 GAIN_KF_MAX_KEYS :: 64
 
+// Audio_Gain_Snapshot is the ONE committed form of a clip's gain: the static
+// level in dB plus a flat copy of its "gain" keyframe track (n = 0 = static).
+// The committed geometry slab stores it, the playback producer latches a copy
+// of it when it provisions a segment, and the export job carries a copy of it
+// for the render's frozen view. All three read the same shape and evaluate it
+// through audio_gain_linear, so a key's dB value can never again be mistaken
+// for a linear multiplier on one path but not the other — the duplication that
+// let playback honor a keyed gain while the export applied none.
+Audio_Gain_Snapshot :: struct {
+	db:   f32,
+	keys: [GAIN_KF_MAX_KEYS]Keyframe,
+	n:    int,
+}
+
+// audio_gain_snapshot_from_clip snapshots a clip's gain track into the shared
+// shape. `total` is the track's real key count (may exceed the cap); callers
+// log truncation when total > GAIN_KF_MAX_KEYS. UI-thread only (reads the live
+// clip); the snapshot is what crosses to the worker threads.
+audio_gain_snapshot_from_clip :: proc(clip: ^Clip) -> (g: Audio_Gain_Snapshot, total: int) {
+	g.db = clip.gain
+	g.n, total = kf_fill_snapshot(clip, "gain", g.keys[:])
+	return
+}
+
+// audio_gain_linear evaluates a committed gain snapshot to a LINEAR amplitude
+// multiplier at clip-relative frame `rel`. Thin wrapper over kf_gain_linear so
+// both mixers evaluate the same shape the same way.
+audio_gain_linear :: proc(g: ^Audio_Gain_Snapshot, rel: i32) -> f32 {
+	return kf_gain_linear(g.keys[:g.n], rel, g.db)
+}
+
 Audio_Geom_Chip :: struct {
 	timeline_start: i64,
 	source_start:   i64,
 	source_len:     i64,
 	stream_index:   c.int,
-	// gain_dB is the clip's output level. Stored in dB (a stable, human-
-	// readable value); converted to the linear multiplier once at provision.
-	gain_dB:        f32,
+	gain:           Audio_Gain_Snapshot,
 	path_off:       int, // offset into Audio_Geom_Slot.paths
 	path_len:       int,
-	// kf_* is the clip's "gain" keyframe track snapshot (kf_n = 0 = static),
-	// copied flat so the producer can re-evaluate the keyed gain per timeline
-	// frame without touching live state.
-	kf_keys:       [GAIN_KF_MAX_KEYS]Keyframe,
-	kf_n:          int,
 }
 
 Audio_Geom_Slot :: struct {
@@ -780,7 +794,7 @@ audio_geometry_commit :: proc() {
 			// (the gain knob drag case) the indexes correspond exactly; when a
 			// structural edit shifts them, the producer's audio_seek re-provision
 			// re-reads gains afresh anyway, so a false missed bump is harmless.
-			if !gains_moved && slot.n < audio_geom_state.slots[read].n && audio_geom_state.slots[read].chip[slot.n].gain_dB != clip.gain {
+			if !gains_moved && slot.n < audio_geom_state.slots[read].n && audio_geom_state.slots[read].chip[slot.n].gain.db != clip.gain {
 				gains_moved = true
 			}
 			chip := &slot.chip[slot.n]
@@ -788,18 +802,14 @@ audio_geometry_commit :: proc() {
 			chip.source_start = clip.source_start_frame
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
-			chip.gain_dB = clip.gain
-			// Snapshot the clip's "gain" keyframe track flat so the producer can
-			// evaluate keyed gain per frame. kf_fill_snapshot renders the name;
-			// the geometry commit is UI-thread so reading the live clip is safe.
-			if n, total := kf_fill_snapshot(clip, "gain", chip.kf_keys[:]); n > 0 {
-				chip.kf_n = n
-				if total > GAIN_KF_MAX_KEYS {
-					if !audio_geom_state.kf_trunc_logged {
-						fmt.printf("[audio] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, n)
-						audio_geom_state.kf_trunc_logged = true
-					}
-				}
+			// Snapshot the clip's gain (static dB + its keyframe track) into the
+			// shared committed shape. kf_fill_snapshot renders the name; the
+			// geometry commit is UI-thread so reading the live clip is safe.
+			g, total := audio_gain_snapshot_from_clip(clip)
+			chip.gain = g
+			if g.n > 0 && total > GAIN_KF_MAX_KEYS && !audio_geom_state.kf_trunc_logged {
+				fmt.printf("[audio] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, g.n)
+				audio_geom_state.kf_trunc_logged = true
 			}
 			chip.path_off = slot.path_used
 			chip.path_len = len(path)
@@ -837,8 +847,10 @@ audio_gain_fold :: proc(slot: ^Audio_Geom_Slot) {
 			for si in 0 ..< s.seg_count {
 				seg := &s.seg[si]
 				if seg.start_a == chip.timeline_start && seg.start_s == chip.source_start && seg.len_a == chip.source_len {
-					seg.gain = db_to_linear(chip.gain_dB)
-					seg.gain_dB = chip.gain_dB
+					// Fold the new static level in place. The keyed curve is
+					// unchanged by a gain-knob drag, so only the base moves here;
+					// a structural/keyed change routes through re-provision.
+					seg.gain.db = chip.gain.db
 					break
 				}
 			}
@@ -951,16 +963,7 @@ audio_provision :: proc(play_frame: i64) {
 			start_a = chip.timeline_start,
 			start_s = chip.source_start,
 			len_a   = chip.source_len,
-			gain    = db_to_linear(chip.gain_dB),
-			gain_dB = chip.gain_dB,
-		}
-		if chip.kf_n > 0 {
-			g.seg[g.seg_count].kf_n = chip.kf_n
-			mem.copy(
-				raw_data(g.seg[g.seg_count].kf_keys[:]),
-				raw_data(chip.kf_keys[:]),
-				chip.kf_n * size_of(Keyframe),
-			)
+			gain    = chip.gain,
 		}
 		g.seg_count += 1
 	}
@@ -1092,11 +1095,12 @@ kf_gain_linear :: proc(keys: []Keyframe, rel: i32, base_dB: f32) -> f32 {
 }
 
 // play_seg_gain_linear is a segment's linear amplitude multiplier at its
-// clip-relative frame `rel`. Thin wrapper over kf_gain_linear so the mix loop
-// stays readable; extracted so the unit conversion is testable off the decode
-// path (keyframe_probe), not just observable as "playback starts loud".
+// clip-relative frame `rel`. Thin wrapper over the shared snapshot evaluator so
+// playback and export resolve the same committed shape identically; extracted
+// so the unit conversion is testable off the decode path (keyframe_probe), not
+// just observable as "playback starts loud".
 play_seg_gain_linear :: proc(seg: ^Play_Seg, rel: i32) -> f32 {
-	return kf_gain_linear(seg.kf_keys[:seg.kf_n], rel, seg.gain_dB)
+	return audio_gain_linear(&seg.gain, rel)
 }
 
 // clip_gain_db_at_playhead is the gain the inspector should DISPLAY for `clip`:
