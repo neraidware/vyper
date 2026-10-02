@@ -2735,7 +2735,18 @@ is S1c, not a refactor, and is tracked there.
 ## Active 11 — Unified render engine: one evaluation, multiple sinks, minimal state
 
 **Status: S1 + S2(audio) + S3(geometry/opacity) + reduced S4 + S5 landed
-2026-10-02.** Branch `render-engine`, base `639d20a`. S6 next.
+2026-10-02; S6 deferred by decision.** Branch `render-engine` (base `639d20a`),
+merged into `main`. **The work-stream stops here** — S6 (incremental export) is
+not being built now, and the state below is what the next session inherits.
+
+**What is done, in one paragraph.** Preview and export no longer keep their own
+copy of a derived fact: audio gain has one committed home (`Audio_Geom_Slot` →
+`Audio_Gain_Snapshot`, read by both sinks), and clip geometry/opacity has one
+evaluator (`Geom_Sample`) sampled by both. The two per-thread latches that remain
+are load-bearing for the ownership swap, and both carry the *shared shape* and
+call the *shared evaluator*, so there is one meaning per fact. The export's
+preview sink now shows the frame the export is actually producing, and the
+document is locked while it does.
 
 **Why.** Preview and export are two *drivers* over two *copies* of the same
 derived facts, and every copied fact is a drift site. The keyed-gain bug shipped
@@ -2978,9 +2989,15 @@ mutation-test every new assertion):
       keyed_export, yuv_exact, gpu_nv12, gpu_composite, opacity, gpu_probe,
       zorder, subtitle_probe, proxy_probe, smoke, valgrind, geom_key_valgrind,
       undo_valgrind, render_valgrind, render_live_valgrind.
-- [ ] **S6 — Incremental (chunked) export.** Chunk cache keyed by
-      `(document generation, frame range, source policy)`; re-export only chunks
-      whose key changed. Depends on S1–S4 being deterministic.
+- [ ] **S6 — Incremental (chunked) export. DEFERRED 2026-10-02, not started.**
+      Chunk cache keyed by `(document generation, frame range, source policy)`;
+      re-export only chunks whose key changed. The S1–S4 determinism it depends
+      on has landed, so this is unblocked whenever it is wanted — but note what
+      it will cost before picking it up: it needs a *document generation* counter
+      that does not exist yet, and every mutator that can change a frame's output
+      has to bump it. A cache key that misses a mutation returns stale video,
+      which is worse than a slow export, so the generation counter is the whole
+      design and cannot be sprinkled on later.
 
 **Out of scope / dependencies.** The zero-copy GPU pipeline (Active 1 / S1c) is
 orthogonal — this shares evaluation, not buffers, so it does not wait on GPU
@@ -2993,9 +3010,21 @@ new persistent document. The committed source of truth for audio gain is the
 latches stay (they are load-bearing for the swap), but they carry the shared shape
 and share the evaluator, so a fact has one committed home and one meaning.
 
-**Decision pending.** Whether S4's sink split keeps `Audio_Geom_Slot` as the
-committed read model or folds it into the broader generation scheme (S3/S4 will
-show whether the video committed view wants the same double-buffer shape).
+**Decision (settled in reduced S4).** Keep `Audio_Geom_Slot` as the committed
+read model; the broader generation scheme is *not* being adopted, and that is
+what S6 above is now waiting on. The video side did not want a double-buffer
+committed view — it wants one immutable per-job snapshot instead, which is what
+`Render_Video_Src.geom_base` is (taken once in the setup loop, read by the worker,
+never re-derived from a live `Clip`). Two sinks, one snapshot discipline:
+whatever a sink needs to stay consistent for the length of a run is captured when
+the run starts, not recomputed from a document that can move under it.
+
+**Why the stream stops here.** S1–S5 each removed duplicated *state*, which is
+where the drift bugs came from. S6 would add a *cache*, which is the one thing
+this work-stream has been arguing against: it introduces a second copy of a
+derived fact that can disagree with the first, and the failure is a video file
+that looks right. Not worth it until an incremental export is actually needed
+rather than anticipated.
 
 ## Queued — Performance / Cleanup
 
