@@ -2732,6 +2732,300 @@ is S1c, not a refactor, and is tracked there.
 **Evidence (behavior-preserving):** full `all` green, including `valgrind` and
 `render_valgrind` at 0 definitely / 0 indirectly lost.
 
+## Active 11 — Unified render engine: one evaluation, multiple sinks, minimal state
+
+**Status: S1 + S2(audio) + S3(geometry/opacity) + reduced S4 + S5 landed
+2026-10-02; S6 deferred by decision.** Branch `render-engine` (base `639d20a`),
+merged into `main`. **The work-stream stops here** — S6 (incremental export) is
+not being built now, and the state below is what the next session inherits.
+
+**What is done, in one paragraph.** Preview and export no longer keep their own
+copy of a derived fact: audio gain has one committed home (`Audio_Geom_Slot` →
+`Audio_Gain_Snapshot`, read by both sinks), and clip geometry/opacity has one
+evaluator (`Geom_Sample`) sampled by both. The two per-thread latches that remain
+are load-bearing for the ownership swap, and both carry the *shared shape* and
+call the *shared evaluator*, so there is one meaning per fact. The export's
+preview sink now shows the frame the export is actually producing, and the
+document is locked while it does.
+
+**Why.** Preview and export are two *drivers* over two *copies* of the same
+derived facts, and every copied fact is a drift site. The keyed-gain bug shipped
+this month is the proof: the fact "clip gain" lived in `clip.gain` (canonical),
+`Audio_Geom_Chip.gain_dB` (playback copy) and was supposed to live in
+`Render_Audio_Src` (export copy) — the export copy was never wired, so rendered
+files ignored the slider and its automation. Active 10 shared the *rules* between
+preview and export and explicitly left the *pipelines* separate (`TODO.md:2310`,
+deferred as S1c because a zero-copy *visual* pipeline needs GPU interop). That
+deferral conflated two separable things — sharing the **evaluation** vs sharing
+the **buffer** — and audio, which needs no interop at all, was swept along and
+left as two whole parallel systems. This work-stream shares the system and the
+data source. Guiding principle (user, 2026-10-01): **"Multiple state is the
+devil's home — reduce state as much as possible."**
+
+**Findings (verified against the tree, not from memory).**
+
+Two *audio* systems today:
+
+| | playback (audio preview) | export |
+|---|---|---|
+| snapshot | `audio_geometry_commit` → `Audio_Geom_Slot` chip (gain as `Audio_Gain_Snapshot`) | `render_audio_src_from_chip` reads the **same** slab chip → `Render_Audio_Src` (S1: no longer re-derived from the live clip) |
+| provision | `audio_provision` (`audio.odin:907`) → `Play_Src`/`Play_Seg` | `render_audio_open` (`render.odin:1810`) |
+| decode | `audio_src_pull` / `audio_src_seek_anchor` | `render_audio_pull` (a reimplementation; it even dropped the seek preroll) |
+| mix | `audio_mix_frame` (`audio.odin:1130`) | inline loop (`render.odin:2957`) |
+| grouping | one decoder per *source stream* (`audio_provision_find_group`) | one decoder per *clip* (re-opens the same file per split) |
+
+`audio_mix_frame`'s own comment says it is "exactly like the render loop
+(render.odin render_worker_run)" — the author knew it was a copy.
+
+Two *video evaluation* drivers:
+
+| | preview | export |
+|---|---|---|
+| driver | `update_preview_slots` (`frame.odin:35`) | `render_worker_run` (`render.odin:2155`) |
+| geometry/opacity sample | `kf_geom_sample_lane` (`preview_state.odin:502,509`) | `render_eval_keyed_geom` / `render_kf_geom_rect` |
+| source | `proxy_pick_for_frame` (`preview_state.odin:700`), fallback original | original `clip.path` (`render.odin:1001`) |
+| resolution | `PREVIEW_W×PREVIEW_H` | per-clip max-scale stage |
+| output | GPU texture → widget | GPU canvas → NV12 → encoder |
+
+Duplicated-*derived* state (all pure functions of the document + frame):
+
+- evaluated geometry/opacity: `Preview_Slot` **and** `Render_Video_Src.{transform_*,crop_*,scale,opacity,kf_geom}`.
+- gain + gain keys: `Audio_Geom_Chip` **and** `Play_Seg` **and** (was) `Render_Audio_Src`.
+- draw order: preview's `preview_draw_key` call sites **and** the order of
+  `Render_Job.visuals` (Active 10 collapsed the *rule* into `render_order.odin`
+  but each side still materializes its own ordering).
+
+Already in our favor (do not rebuild): proxy-vs-original is *already* a per-call
+source policy (`proxy_pick_for_frame`), and preview vs export already composite
+through shared shaders (`quad.vert`, `blit_box.frag`, `Quad_Uniforms`). What is
+missing is the single driver, not the GPU half.
+
+Absent entirely: a live (locked) preview of frames as they render
+(`render_progress` is a text counter; the preview keeps showing the timeline), and
+any export chunk cache for incremental re-export.
+
+**Model (target).**
+
+- **Canonical document** — `timeline` + `project`. One source of truth. The gain
+  bug cannot exist when a fact has one home.
+- **Evaluation is a pure function**, never a stored value: a proc over
+  `(document, frame, resolution, source_policy)` returning what the sink needs.
+  No intermediate "plan" object — a plan is derived state, i.e. the thing we are
+  removing.
+- **Sinks** = preview display, export encoder, audio device, audio encoder. A
+  sink holds only runtime resources (decoders, GPU textures, rings, encoder) —
+  distinct objects, not copies of a fact.
+- **Cross-thread handoff is a committed version + generation, not a deep copy of
+  derived facts.** This is the seam AGENTS §1 already names ("the commit bumps a
+  generation, and caches keyed on it drop stale entries free"); `kf_structure_gen`
+  and `gain_epoch` are its existing instances. The worker reads the immutable
+  committed document; architecture-specific snapshots (`Render_Job`,
+  `Audio_Geom_Slot` chip copies) collapse onto it.
+
+**Consequence for the active asks** (why this is the right foundation, not a
+detour):
+
+- Single engine = the pure evaluators with one input, the committed document.
+- Live preview during render = the worker already composites into
+  `Render_Enc_Slot.canvas` (`render.odin:1848`); the preview sink displays that
+  buffer and the input gate freezes. Zero new state.
+- Incremental export = a chunk keyed by `(document generation, frame range,
+  source policy)`. Only possible once evaluation is deterministic from one
+  document — the same property removing the copies buys.
+
+**Steps** (each lands + probe + vet before the next; expect probe-first, and
+mutation-test every new assertion):
+
+- [x] **S1 — Define the committed-version read model.** Landed 2026-10-01.
+      Named the cross-thread readers (playback producer ← `Audio_Geom_Slot`
+      double-buffered slab + `gain_epoch`; render worker ← `render_job` deep
+      copy built in `render_start`; `vdecode` ← per-request descriptor;
+      `import_bg` ← a path, no timeline). **Key finding: the per-sink copies
+      (`Play_Seg`, `Audio_Geom_Chip`, `Render_Audio_Src`) are load-bearing** —
+      each thread latches a stable view across the double-buffer swap / render
+      lifetime, so the copies cannot simply be deleted; what must be shared is
+      the *definition*, the *derivation*, and the *evaluator*, not the physical
+      storage. That coupling merged the audio half of S2 into S1.
+- [x] **S2 (audio) — Collapse the audio copies.** Landed with S1. New committed
+      shape `Audio_Gain_Snapshot {db, keys[GAIN_KF_MAX_KEYS], n}` (`audio.odin`),
+      built only by `audio_gain_snapshot_from_clip` and evaluated only by
+      `audio_gain_linear` (wrapping `kf_gain_linear`, which stays the shared
+      evaluator). `Audio_Geom_Chip`, `Play_Seg` and `Render_Audio_Src` all embed
+      it; the dead `Play_Seg.gain` (linear, written but never read) and the
+      parallel `gain_dB`/`kf_keys`/`kf_n` fields are gone. `audio_gain_fold`
+      copies only `db` (the keyed curve is unchanged by a gain-knob drag). The
+      export no longer re-derives gain from the live clip: `render_start` calls
+      `audio_geometry_commit()` and builds every `Render_Audio_Src` from the
+      active slab via `render_audio_src_from_chip`, so **export and playback
+      read the same committed source**. Probe (`keyframe_probe`): snapshot
+      evaluates like `kf_gain_linear` at a key and a midpoint; playback seam ==
+      export seam; commit captures static dB + track; `render_audio_src_from_chip`
+      copies the chip's gain + identity verbatim. Gates: check/build/probe/
+      `VYPER_KEYFRAME_PROBE`/geom_key_probe/transform_probe/timeline_probe/
+      keyed_export/valgrind/geom_key_valgrind/undo_valgrind all green.
+      **Consequence (accept + watch):** the export now inherits the committed
+      slab's bounds — `AUDIO_GEOM_MAX_CLIPS :: 4096` clips and
+      `AUDIO_GEOM_PATH_ARENA :: 1<<20` path bytes per slot (previously export
+      used uncapped dynamic arrays). Past the cap the commit logs once and mutes
+      the overflow clips for **both** playback and export; this is now a single
+      ceiling instead of two disagreeing ones. Export source order is slab
+      (track/clip) order.
+- [x] **S2 (video) / S3 — One video-frame evaluator (geometry + opacity).**
+      Landed 2026-10-01. `Geom_Sample` (indexed by `Render_Geom_Prop`, so a
+      property added to the enum is present with no second list) is the single
+      evaluated shape. `geom_sample_clip` is THE live evaluator (preview calls
+      it; `preview_state.odin` no longer hand-lists the eight lane names), and
+      `geom_sample_flat` is its frozen counterpart that `render_kf_geom_rect`
+      now samples through — so the export's per-frame values come from the same
+      enum-driven loop, not eight hand-inlined `kf_sample_keys` calls. Both read
+      the same resting base (`geom_resting_value`). The per-thread latches
+      (`Preview_Slot` fields, `Render_Video_Src` resting fields) stay and are
+      load-bearing, exactly as S1 found for audio. Probe (`render_kf_probe`
+      case G): live vs flat agree on EVERY lane at four offsets, for a clip
+      keying every lane including a PACKED crop section; mutation-tested by
+      dropping a lane from the flat sampler (fails). Gates green.
+      **Remaining in S3:** source policy (proxy vs original) is already a
+      per-call policy (`proxy_pick_for_frame`), not a duplication; draw order
+      was collapsed by Active 10's `render_order.odin`. The residual is the
+      *pipeline* (GPU quad uniforms vs CPU rect), which is the S1c interop
+      boundary, not a duplicated fact.
+- [x] **S4 — Sink split (reduced; the storage half was the wrong target).**
+      Landed 2026-10-01. S1's latch finding makes the *storage* half of the
+      original step impossible, not merely inconvenient: `Preview_Slot` latches
+      the sampled geometry across the frame because the draw pass runs after
+      `update_preview_slots` and the live clip may have been edited since, and
+      `Render_Video_Src.geom_base` exists because the worker may never read a
+      live `Clip`. Deleting either is a correctness regression, not a state
+      reduction. What remained reducible was the latch *SHAPE* and the
+      hand-copied property lists around it, and that is done:
+      - `Preview_Slot` carries one `geom: Geom_Sample` instead of eight named
+        f32s; `update_preview_slots` is `slot.geom = geom_sample_clip(clip,
+        frame)` — no property list at all — and the text paths clear crop via
+        `geom_clear_crop`. A `Render_Geom_Prop` added to the enum now needs no
+        edit in the preview state or the draw path.
+      - `Render_Video_Src` carries `geom_base: Geom_Sample` (filled once at
+        `render_start` by the new `geom_sample_resting`) instead of eight
+        resting fields, and `render_kf_geom_rect` takes that base as one
+        argument instead of eight named floats (10 probe call sites updated).
+      - `gpu_draw` no longer rebuilds a throwaway `Clip` from the slot latch
+        just to call `clip_image_bounds`; the new `clip_image_bounds_geom`
+        takes evaluated geometry, and `clip_image_bounds` is the thin
+        `clip_geom_get` wrapper the editor's border/handles/hit-test keep using.
+      **Bug found and fixed by the collapse.** `Render_Video_Src.opacity` was
+      both the resting base AND the per-frame alpha, so a keyed fade overwrote
+      the base with the previous frame's sample: every frame past the last key
+      blended at the last keyed value instead of the clip's own opacity, and
+      re-rendering the same frame produced a different result. The resting value
+      now lives in `geom_base[Opacity]` (immutable for the job) and `opacity`
+      is only this frame's alpha, seeded from the base in the setup loop. Pinned
+      by `render_kf_probe` case H, which drives the real
+      `render_eval_keyed_geom` across a keyed frame and a post-key frame;
+      mutation-tested by restoring the old read (fails). `render_kf_probe_check_near`
+      now appends got/want/eps itself, so a failure line has no `%!(EXTRA)`.
+      Gates green: check, build, probe, `VYPER_RENDER_KF_PROBE`,
+      `VYPER_KEYFRAME_PROBE`, geom_key_probe, transform_probe, timeline_probe,
+      keyed_export, valgrind, geom_key_valgrind, undo_valgrind.
+- [x] **S5 — Live locked preview during render.** The preview sink displays the
+      export worker's current composed frame, and editing/playhead input is gated
+      while `render_is_busy()`.
+
+      **Why a mailbox and not the encode slot.** `Render_Enc_Slot.canvas` is
+      owned by the composite worker and refilled by the encoder, so reading it
+      from the UI is a race with both. The live frame is published through
+      `Render_Live` (`render.odin`): one session-heap RGBA buffer sized to the
+      job canvas, allocated in `render_live_begin` on the UI thread BEFORE the
+      worker starts (the job arena dies with the worker; this buffer must
+      outlive it) and reused across runs at the same size. `ready` is the only
+      shared word: the worker copies bytes, writes `frame`, then release-stores
+      `ready`; `render_live_drain` acquire-loads, and the claim is **held for
+      the whole copy out**. The first version cleared the flag before handing
+      back a pointer, which let the composite refill the buffer mid-read — a
+      torn frame, and one with no tell in the pixels.
+
+      **Overflow policy: DROP.** If the UI has not drained, the composite skips
+      publishing and keeps encoding; the UI keeps showing the older COMPLETE
+      frame. The producer is never stalled by the consumer (AGENTS §1), which is
+      the whole point — a progress view must never be what slows an export.
+
+      **Rate: 100 ms** (`RENDER_LIVE_PUBLISH_NS`). The preview during an export
+      is a progress display, not the 60 fps editing surface; publishing every
+      composite frame would pay a full-canvas conversion for pixels nobody sees
+      at that rate. The window runs from the last ACCEPTED publish, so a burst
+      of skipped attempts does not push the next real frame out.
+
+      **The GPU path is the one that matters.** With `gpu_nv12_enabled` (the
+      default) the encoder consumes the packed NV12 canvas and `eslot.canvas`
+      holds the ring slot's PREVIOUS frame, so publishing it would show a real
+      but stale image. `render_live_publish` therefore takes whichever canvas is
+      real and converts NV12→RGBA through one `sws.Context` per run.
+
+      **The NV12 plane layout is a trap, and it cost a segfault.** NV12 is TWO
+      planes — full-res luma, then byte-interleaved U,V at offset `w*h` with a
+      row pitch of `w` — and swscale reads `srcSlice[1]` unconditionally. A
+      one-element source array hands it whatever followed it on the stack. The
+      layout is pinned by `render_live_probe` case 5 against the same swscale
+      call, not a copy of the comment.
+
+      **Gating is two seams, not every call site.** `interaction_post_build`
+      skips the editing dispatch while busy (still running `interaction_release`,
+      so a gesture started before the export commits and unwinds instead of
+      sticking in `.Drag` forever), and `app_claims_key` refuses app shortcuts so
+      playback/playhead keys cannot move the playhead out from under the render.
+      The Cancel button and ESC stay live.
+
+      Probe: `render_live_probe` (gates `render_live_probe` +
+      `render_live_valgrind`) — pins that the drained frame is the frame that
+      was published (bytes and timeline frame), the DROP policy, the usability
+      gate, the publish interval, the end-of-run/reuse/teardown ownership, and
+      the NV12 conversion. Four mutations fail it: drop→overwrite, gate removal,
+      interval removal, chroma pitch `w`→`w/2`; a fifth (one source plane)
+      fails by segfault, which is the crash the layout bug actually was.
+      The end-to-end render test now stands in for the UI — it drains the
+      mailbox in its wait loop and fails if nothing was published or if every
+      published frame was black — so the publish path is exercised headlessly by
+      `keyed_export` and `render_valgrind`, not only by the probe. Gates green:
+      check, build, probe, `VYPER_RENDER_KF_PROBE`, `VYPER_KEYFRAME_PROBE`,
+      geom_key_probe, render_live_probe, transform_probe, timeline_probe,
+      keyed_export, yuv_exact, gpu_nv12, gpu_composite, opacity, gpu_probe,
+      zorder, subtitle_probe, proxy_probe, smoke, valgrind, geom_key_valgrind,
+      undo_valgrind, render_valgrind, render_live_valgrind.
+- [ ] **S6 — Incremental (chunked) export. DEFERRED 2026-10-02, not started.**
+      Chunk cache keyed by `(document generation, frame range, source policy)`;
+      re-export only chunks whose key changed. The S1–S4 determinism it depends
+      on has landed, so this is unblocked whenever it is wanted — but note what
+      it will cost before picking it up: it needs a *document generation* counter
+      that does not exist yet, and every mutator that can change a frame's output
+      has to bump it. A cache key that misses a mutation returns stale video,
+      which is worse than a slow export, so the generation counter is the whole
+      design and cannot be sprinkled on later.
+
+**Out of scope / dependencies.** The zero-copy GPU pipeline (Active 1 / S1c) is
+orthogonal — this shares evaluation, not buffers, so it does not wait on GPU
+interop. Active 1 already covers hw decode and "preview the original when the host
+keeps up"; the source policy here builds on that rather than replacing it.
+
+**Decision (settled in S1).** Extend the existing committed-slab pattern, not a
+new persistent document. The committed source of truth for audio gain is the
+`Audio_Geom_Slot` chip (via `Audio_Gain_Snapshot`); both sinks read it. Per-thread
+latches stay (they are load-bearing for the swap), but they carry the shared shape
+and share the evaluator, so a fact has one committed home and one meaning.
+
+**Decision (settled in reduced S4).** Keep `Audio_Geom_Slot` as the committed
+read model; the broader generation scheme is *not* being adopted, and that is
+what S6 above is now waiting on. The video side did not want a double-buffer
+committed view — it wants one immutable per-job snapshot instead, which is what
+`Render_Video_Src.geom_base` is (taken once in the setup loop, read by the worker,
+never re-derived from a live `Clip`). Two sinks, one snapshot discipline:
+whatever a sink needs to stay consistent for the length of a run is captured when
+the run starts, not recomputed from a document that can move under it.
+
+**Why the stream stops here.** S1–S5 each removed duplicated *state*, which is
+where the drift bugs came from. S6 would add a *cache*, which is the one thing
+this work-stream has been arguing against: it introduces a second copy of a
+derived fact that can disagree with the first, and the failure is a video file
+that looks right. Not worth it until an incremental export is actually needed
+rather than anticipated.
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

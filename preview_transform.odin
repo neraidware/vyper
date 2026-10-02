@@ -1,6 +1,7 @@
 package main
 
 import clay "clay-odin"
+import "core:c"
 
 // ---------------------------------------------------------------------------
 // Preview camera and clip transform math: project<->pixel conversions, camera
@@ -428,6 +429,25 @@ corner_snap_scale :: proc(
 // selection border, the handles, and the hit-test all use, so the visible
 // result is a handle that does not sit on the image it is attached to.
 clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.BoundingBox {
+	geom: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		geom[pi] = clip_geom_get(clip, Render_Geom_Prop(pi))
+	}
+	return clip_image_bounds_geom(canvas, clip.kind, geom, clip.source_w, clip.source_h)
+}
+
+// clip_image_bounds_geom is clip_image_bounds over already-EVALUATED geometry.
+// The preview draw pass has the values in its slot latch (the live clip may
+// have been edited since), and taking them directly is what lets it draw the
+// box for the pixels it is drawing; the alternative was rebuilding a
+// throwaway Clip from the latch, a hand-copied property list that a new
+// Render_Geom_Prop would have to be added to separately.
+clip_image_bounds_geom :: proc(
+	canvas: clay.BoundingBox,
+	kind: Media_Kind,
+	geom: Geom_Sample,
+	source_w, source_h: c.int,
+) -> clay.BoundingBox {
 	v := preview_view(canvas)
 	// A text clip is not a full-canvas image: its bounds are exactly the text
 	// extent. The text was rasterized into a buffer at tight text-pixel
@@ -438,21 +458,37 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 	// TOP-LEFT in project coords (the drag + scale math below is written for a
 	// top-left anchor), and the clip's scale multiplies the text's base pixel
 	// size so resizing via the handles works on the text's own bounding box.
-	if clip.kind == .Text && clip.source_w > 0 && clip.source_h > 0 {
+	if kind == .Text && source_w > 0 && source_h > 0 {
 		f := v.width / f32(PREVIEW_W)
-		scale := clip_geom_get(clip, .Scale)
-		w := f32(clip.source_w) * f * scale
-		h := f32(clip.source_h) * f * scale
-		tx, ty := project_to_pixel(canvas, clip_geom_get(clip, .Trans_X), clip_geom_get(clip, .Trans_Y))
+		scale := geom[int(Render_Geom_Prop.Scale)]
+		w := f32(source_w) * f * scale
+		h := f32(source_h) * f * scale
+		tx, ty := project_to_pixel(
+			canvas,
+			geom[int(Render_Geom_Prop.Trans_X)],
+			geom[int(Render_Geom_Prop.Trans_Y)],
+		)
 		return {x = tx, y = ty, width = w, height = h}
 	}
-	cx, cy := project_to_pixel(canvas, clip_geom_get(clip, .Trans_X), clip_geom_get(clip, .Trans_Y))
+	cx, cy := project_to_pixel(
+		canvas,
+		geom[int(Render_Geom_Prop.Trans_X)],
+		geom[int(Render_Geom_Prop.Trans_Y)],
+	)
 	// The source-sized box is in PROJECT units (scale relative to the source's
 	// own pixels: scale 1 = native size); scale it onto the screen by the
 	// view's pixels-per-project-unit so the drawn quad matches the box the
 	// handle math sees. With an unknown source size (0) the box falls back to
 	// the canvas.
-	cu_w, cu_h := clip_full_box_dims(clip, clip_geom_get(clip, .Scale))
+	// clip_full_box_dims is full_box_dims over the live canvas size; spelled
+	// out here because the caller has source dims, not a clip.
+	cu_w, cu_h := full_box_dims(
+		source_w,
+		source_h,
+		geom[int(Render_Geom_Prop.Scale)],
+		f32(project.width),
+		f32(project.height),
+	)
 	pu := f32(project.width)
 	if pu <= 0 {
 		pu = f32(PREVIEW_W)
@@ -469,10 +505,10 @@ clip_image_bounds :: proc(canvas: clay.BoundingBox, clip: ^Clip) -> clay.Boundin
 		cy,
 		sw,
 		sh,
-		clip_geom_get(clip, .Crop_L),
-		clip_geom_get(clip, .Crop_R),
-		clip_geom_get(clip, .Crop_T),
-		clip_geom_get(clip, .Crop_B),
+		geom[int(Render_Geom_Prop.Crop_L)],
+		geom[int(Render_Geom_Prop.Crop_R)],
+		geom[int(Render_Geom_Prop.Crop_T)],
+		geom[int(Render_Geom_Prop.Crop_B)],
 	)
 	return {x = l, y = t, width = r - l, height = b - t}
 }

@@ -1926,6 +1926,121 @@ release_slot_owned_texture :: proc(device: ^sdl.GPUDevice, slot: ^Preview_Slot) 
 // cycle=true so a still-in-flight upload of the previous frame is preserved
 // (SDL cycles the internal resource); creating/releasing one per upload was a
 // driver allocation on every dirty preview slot, every frame.
+// live_tex is the preview sink's texture for the composed export frame (see
+// render_live in render.odin). Sink-owned runtime resource, created lazily at
+// the job's canvas size and released at shutdown -- it holds PIXELS, not a fact
+// about the document, which is exactly the split Active 11 asks for: the
+// evaluation is shared, the resources are per-sink.
+live_tex: ^sdl.GPUTexture
+live_tex_w, live_tex_h: c.int
+live_tex_failed: bool
+
+// ensure_live_texture returns the live texture at w x h, (re)creating it when the
+// job canvas size changed. `failed` latches so a device that refuses one
+// creation is not asked again every frame (SDL would keep failing, and the retry
+// per frame is a per-frame driver call on the UI thread).
+ensure_live_texture :: proc(device: ^sdl.GPUDevice, w, h: c.int) -> ^sdl.GPUTexture {
+	if live_tex_failed {
+		return nil
+	}
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+	if live_tex != nil && live_tex_w == w && live_tex_h == h {
+		return live_tex
+	}
+	if live_tex != nil {
+		sdl.ReleaseGPUTexture(device, live_tex)
+		live_tex = nil
+	}
+	live_tex =
+		sdl.CreateGPUTexture(
+			device,
+			sdl.GPUTextureCreateInfo {
+				type = .D2,
+				format = .R8G8B8A8_UNORM,
+				usage = {.SAMPLER},
+				width = u32(w),
+				height = u32(h),
+				layer_count_or_depth = 1,
+				num_levels = 1,
+				sample_count = ._1,
+			},
+		)
+	if live_tex == nil {
+		live_tex_failed = true
+		fmt.println("live preview texture creation failed:", sdl.GetError())
+		return nil
+	}
+	live_tex_w, live_tex_h = w, h
+	return live_tex
+}
+
+// release_live_preview_texture frees the live texture at shutdown.
+release_live_preview_texture :: proc(device: ^sdl.GPUDevice) {
+	if live_tex != nil {
+		sdl.ReleaseGPUTexture(device, live_tex)
+		live_tex = nil
+	}
+	live_tex_w, live_tex_h = 0, 0
+}
+
+// draw_live_preview draws the export's current composed frame over the canvas
+// and reports whether it drew (in which case the clip stack must be skipped:
+// the composed frame already contains every clip, so drawing them again would
+// double-composite the whole timeline on top of the finished output).
+//
+// Runs BEFORE any render pass is open, like the slot uploads: the transfer has
+// to be recorded into the command buffer first.
+draw_live_preview :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuffer) -> bool {
+	// render_live.w/h is this thread's own write from render_live_begin and is
+	// immutable for the run, so sizing the transfer off it before the claim is
+	// safe -- and it has to be, because the canvas size only becomes known from
+	// the drained frame itself.
+	if render_live.buf == nil || render_live.w <= 0 || render_live.h <= 0 {
+		return false
+	}
+	n := int(render_live.w) * int(render_live.h) * 4
+	transfer :=
+		gpu_upload_tb(renderer.device, &renderer.preview_upload_tb, &renderer.preview_upload_capacity, n)
+	if transfer == nil {
+		return false
+	}
+	mapped := sdl.MapGPUTransferBuffer(renderer.device, transfer, true)
+	if mapped == nil {
+		return false
+	}
+	// Straight from the mailbox into the transfer buffer: no second full-canvas
+	// copy of the frame, and the claim is released as this copy finishes.
+	_, w, h, ok := render_live_drain(([^]u8)(mapped)[:n])
+	sdl.UnmapGPUTransferBuffer(renderer.device, transfer)
+	if !ok {
+		return false
+	}
+	tex := ensure_live_texture(renderer.device, w, h)
+	if tex == nil {
+		return false
+	}
+	copy_pass := sdl.BeginGPUCopyPass(command_buffer)
+	sdl.UploadToGPUTexture(
+		copy_pass,
+		sdl.GPUTextureTransferInfo {
+			transfer_buffer = transfer,
+			pixels_per_row  = u32(w),
+			rows_per_layer  = u32(h),
+		},
+		sdl.GPUTextureRegion{texture = tex, w = u32(w), h = u32(h), d = 1},
+		false,
+	)
+	sdl.EndGPUCopyPass(copy_pass)
+	// The mailbox has been drained and uploaded, so the composite may refill it
+	// from here on. One frame consumed is enough for the composite to start
+	// publishing (render_live_publish's usability gate), and it stops the
+	// preview sitting on the render's opening frame with no visible progress.
+	sync.atomic_store(&render_live.shown, true)
+	return true
+}
+
 gpu_upload_tb :: proc(
 	device: ^sdl.GPUDevice,
 	tb: ^^sdl.GPUTransferBuffer,
@@ -2172,11 +2287,19 @@ preview_build_draw_order :: proc() -> (order: [MAX_PREVIEW_SLOTS]int, n: int) {
 	return
 }
 
+// draw_preview paints the preview canvas: the export's live composed frame when
+// one is being shown (S5), otherwise the clip stack under the playhead.
+//
+// show_live means the live export frame covers the whole canvas, so the clip
+// stack is skipped rather than drawn under it -- the composed frame already
+// holds every clip, video, text and subtitle, and painting the slots over it
+// would double-composite the timeline on top of the finished output.
 draw_preview :: proc(
 	renderer: ^GPU_Renderer,
 	command_buffer: ^sdl.GPUCommandBuffer,
 	pass: ^sdl.GPURenderPass,
 	bounds: clay.BoundingBox,
+	show_live: bool = false,
 ) {
 	if renderer.preview_pipeline == nil {
 		return
@@ -2212,6 +2335,27 @@ draw_preview :: proc(
 		sdl.SetGPUScissor(pass, sdl.Rect{c.int(ix), c.int(iy), c.int(ix2 - ix), c.int(iy2 - iy)})
 	}
 
+	// The composed export frame fills the canvas rect exactly: it IS the
+	// project at output resolution, and `view` is the project's letterboxed
+	// pixel rect, so this is a 1:1 blit with no letterbox math of its own.
+	if show_live && live_tex != nil {
+		draw_image_layer(
+			renderer,
+			pass,
+			command_buffer,
+			live_tex,
+			renderer.preview_sampler,
+			Quad_Uniforms {
+				bounds   = {view.x, view.y, view.width, view.height},
+				viewport = renderer.viewport,
+				_padding = {},
+				uv       = {0, 0, 1, 1},
+			},
+			1.0,
+		)
+		return
+	}
+
 	// Paint every clip covering the playhead with the top track on top. Slots
 	// keep a STABLE index per clip identity (update_preview_slots), so index
 	// order no longer means depth: sort the visible slots by draw key and draw the
@@ -2222,20 +2366,12 @@ draw_preview :: proc(
 	for k := n - 1; k >= 0; k -= 1 {
 		slot := &preview_slots[order[k]]
 		is_text := slot.text_w > 0 && slot.text_h > 0
-		cb := clip_image_bounds(
+		cb := clip_image_bounds_geom(
 			canvas,
-			&Clip {
-				kind = is_text ? Media_Kind.Text : .Video,
-				transform_x = slot.transform_x,
-				transform_y = slot.transform_y,
-				scale = slot.scale,
-				crop_l = slot.crop_l,
-				crop_r = slot.crop_r,
-				crop_t = slot.crop_t,
-				crop_b = slot.crop_b,
-				source_w = slot.source_w,
-				source_h = slot.source_h,
-			},
+			is_text ? Media_Kind.Text : Media_Kind.Video,
+			slot.geom,
+			slot.source_w,
+			slot.source_h,
 		)
 		// The decoded texture holds the source fit (letterboxed) inside the
 		// fixed PREVIEW_W x PREVIEW_H buffer. Start the quad from that fit
@@ -2266,10 +2402,14 @@ draw_preview :: proc(
 			v_base := f32(foy) / f32(PREVIEW_H)
 			u_span := f32(fw) / f32(PREVIEW_W)
 			v_span := f32(fh) / f32(PREVIEW_H)
-			u0 = u_base + slot.crop_l * u_span
-			u1 = u_base + (1 - slot.crop_r) * u_span
-			v0 = v_base + slot.crop_t * v_span
-			v1 = v_base + (1 - slot.crop_b) * v_span
+			ins_l := slot.geom[int(Render_Geom_Prop.Crop_L)]
+			ins_r := slot.geom[int(Render_Geom_Prop.Crop_R)]
+			ins_t := slot.geom[int(Render_Geom_Prop.Crop_T)]
+			ins_b := slot.geom[int(Render_Geom_Prop.Crop_B)]
+			u0 = u_base + ins_l * u_span
+			u1 = u_base + (1 - ins_r) * u_span
+			v0 = v_base + ins_t * v_span
+			v1 = v_base + (1 - ins_b) * v_span
 		}
 		vertex_uniforms := Quad_Uniforms {
 			bounds   = {cb.x, cb.y, cb.width, cb.height},
@@ -2284,7 +2424,7 @@ draw_preview :: proc(
 			slot.texture,
 			renderer.preview_sampler,
 			vertex_uniforms,
-			slot.opacity,
+			slot.geom[int(Render_Geom_Prop.Opacity)],
 		)
 	}
 	// Draw a border box around the currently-selected clip's image rect.

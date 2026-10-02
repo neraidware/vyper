@@ -1848,6 +1848,17 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if rkp, _ := os.lookup_env_alloc("VYPER_RENDER_KF_PROBE", context.temp_allocator); rkp != "" {
 		os.exit(render_kf_probe_run())
 	}
+	// Headless live-preview mailbox probe: the worker/UI handoff for the export's
+	// composed-frame sink (Active 11 S5). Returns out of main on success so the
+	// runtime's own teardown allocations are still freed when memcheck takes
+	// its census -- the session buffer this probe allocates is exactly the kind
+	// of claim the compiler cannot check.
+	if render_live_probe_env() {
+		if render_live_probe_run() != 0 {
+			os.exit(1)
+		}
+		return
+	}
 	// Headless gesture-routing probe: an Alt+wheel / Alt+drag edit on a keyed
 	// clip must land where the clip is actually read.
 	//
@@ -1966,6 +1977,11 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	defer sdl.ReleaseGPUSampler(device, renderer.font.sampler)
 	defer glyph_atlas_destroy(&renderer.font)
 	defer release_preview_textures(device, renderer.preview_textures[:])
+	// The live-preview mailbox is session heap -- it is sized per job canvas and
+	// reused across runs, so freeing it per run would be churn -- and its texture
+	// is sink-owned. Both are released here, and only here.
+	defer render_live_teardown()
+	defer release_live_preview_texture(device)
 	defer if renderer.preview_upload_tb != nil {
 		sdl.ReleaseGPUTransferBuffer(device, renderer.preview_upload_tb)
 	}

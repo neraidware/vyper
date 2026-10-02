@@ -802,14 +802,13 @@ Preview_Slot :: struct {
 	path:                 cstring,
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
-	transform_x:          f32,
-	transform_y:          f32,
-	scale:                f32,
-	crop_l:               f32,
-	crop_r:               f32,
-	crop_t:               f32,
-	crop_b:               f32,
-	opacity:              f32,
+	// geom is the clip's geometry and opacity EVALUATED at this slot's
+	// displayed frame, latched here because the draw pass runs later than
+	// update_preview_slots and must not re-read the (by then mutated) live
+	// clip. It is the shared Geom_Sample shape, not eight named fields, so a
+	// Render_Geom_Prop added to the enum needs no edit here or at the draw
+	// site — and the values come from the one evaluator, geom_sample_clip.
+	geom:                 Geom_Sample,
 	source_w:             c.int,
 	source_h:             c.int,
 	dec:                  Clip_Decoder,

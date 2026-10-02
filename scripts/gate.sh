@@ -518,6 +518,33 @@ target_undo_valgrind() {
 	valgrind_assert "$log" undo-valgrind '\[undo-probe\] ok:'
 }
 
+# The live-preview handoff check (render_live_probe.odin). The composed-frame
+# mailbox is the one place where the export's worker thread and the UI thread
+# write the same bytes, so a mistake there is a data race rather than a wrong
+# pixel -- which is exactly the class the pixel-comparing gates cannot see. It
+# pins the frame actually handed over, the DROP overflow policy (an undrained
+# mailbox must not be overwritten), the usability gate, and the publish
+# interval.
+target_render_live_probe() {
+	require_fresh_binary render-live-probe || return 1
+	VYPER_RENDER_LIVE_PROBE=1 timeout 120 ./vyper
+}
+
+# The memory gate for render_live_probe. Same argument as geom_key_valgrind
+# above: the mailbox buffer is session heap that OUTLIVES the run and is reused
+# across runs, so a resize or a teardown that dropped it is invisible to the
+# compiler and only shows up here. Same four invariants as target_valgrind.
+target_render_live_valgrind() {
+	require_fresh_valgrind_binary render-live-valgrind || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/render_live.log
+	VYPER_RENDER_LIVE_PROBE=1 timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	local rc=$?
+	echo "render-live-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+	valgrind_assert "$log" render-live-valgrind '\[render-live-probe\] ok'
+}
+
 # The timeline geometry/semantics regression check (timeline_probe.odin).
 # Same problem transform_probe above had: it was reachable only by setting
 # VYPER_TL_PROBE by hand, so nothing ran it. It covers cut resolution, drag
@@ -866,7 +893,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe timeline_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -882,6 +909,8 @@ main() {
 	transform_probe) target_transform_probe ;;
 	geom_key_probe) target_geom_key_probe ;;
 	geom_key_valgrind) target_geom_key_valgrind ;;
+	render_live_probe) target_render_live_probe ;;
+	render_live_valgrind) target_render_live_valgrind ;;
 	undo_valgrind) target_undo_valgrind ;;
 	timeline_probe) target_timeline_probe ;;
 	yuv_exact) target_yuv_exact ;;

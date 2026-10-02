@@ -901,52 +901,77 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 			"unkeyed gain returns the static dB base, converted",
 		)
 
-		// Playback seam: Play_Seg.gain_dB + its copied keys.
-		kg := Play_Seg {
-			start_a = 0,
-			start_s = 0,
-			len_a   = 100,
-			gain    = db_to_linear(0),
-			gain_dB = 0,
-			kf_n    = 2,
-		}
-		kg.kf_keys[0] = db_keys[0]
-		kg.kf_keys[1] = db_keys[1]
+		// Both mixers read the SAME committed snapshot shape and evaluate it
+		// through audio_gain_linear, so a key's dB value can never be treated
+		// as a multiplier on one path but not the other.
+		snap := Audio_Gain_Snapshot{db = 0, n = 2}
+		snap.keys[0] = db_keys[0]
+		snap.keys[1] = db_keys[1]
 		kf_probe_check(
-			kf_approx(play_seg_gain_linear(&kg, 0), g0),
-			"playback seam must agree with kf_gain_linear",
+			kf_approx(audio_gain_linear(&snap, 0), g0),
+			"committed gain snapshot must agree with kf_gain_linear",
+		)
+		kf_probe_check(
+			kf_approx(audio_gain_linear(&snap, 20), mid),
+			"committed gain snapshot must interpolate in amplitude",
 		)
 
-		// Export seam: Render_Audio_Src.gain_dB + its snapshot. Same track,
-		// same answer — the export used to apply NO gain at all, so a rendered
-		// file ignored the slider and its automation entirely.
-		xg := Render_Audio_Src{gain_dB = 0, kf_n = 2}
-		xg.kf_keys[0] = db_keys[0]
-		xg.kf_keys[1] = db_keys[1]
+		// Playback seam: Play_Seg latches the committed snapshot; the mix path
+		// resolves it through audio_gain_linear.
+		kg := Play_Seg{start_a = 0, start_s = 0, len_a = 100, gain = snap}
 		kf_probe_check(
-			kf_approx(kf_gain_linear(xg.kf_keys[:xg.kf_n], 0, xg.gain_dB), g0),
-			"export seam must agree with kf_gain_linear",
+			kf_approx(play_seg_gain_linear(&kg, 0), g0),
+			"playback seam must agree with audio_gain_linear",
+		)
+
+		// Export seam: Render_Audio_Src carries the same snapshot type. The
+		// export used to apply NO gain at all, so a rendered file ignored the
+		// slider and its automation entirely.
+		xg := Render_Audio_Src{gain = snap}
+		kf_probe_check(
+			kf_approx(audio_gain_linear(&xg.gain, 0), g0),
+			"export seam must agree with audio_gain_linear",
 		)
 		kf_probe_check(
-			kf_approx(kf_gain_linear(xg.kf_keys[:xg.kf_n], 20, xg.gain_dB), mid),
+			kf_approx(audio_gain_linear(&xg.gain, 20), mid),
 			"export seam must interpolate like playback",
 		)
 
-		// Wiring: the job build must carry the static dB AND a copy of the
-		// track. A src that dropped either is exactly how the export ignored
-		// the slider and its automation entirely.
-		xc := Clip {timeline_start_frame = 100, source_length_frames = 50, gain = -3}
-		xc.path = "foo.aac"
+		// Wiring: committing a clip must capture the static dB AND the track;
+		// the export job must copy that committed snapshot, not re-derive it.
+		// A src that dropped either is exactly how export and playback drifted.
+		xc := Clip{timeline_start_frame = 100, source_length_frames = 50, gain = -3}
 		kf_set_key(&xc, "gain", 0, -40.0)
 		kf_set_key(&xc, "gain", 41, 0.0)
-		xs := render_audio_src_from_clip(&xc)
-		kf_probe_check(xs.gain_dB == -3, "export src must carry the static clip gain (got %v)", xs.gain_dB)
-		kf_probe_check(xs.kf_n == 2, "export src must snapshot the gain track (got %d keys)", xs.kf_n)
+		gs, gtotal := audio_gain_snapshot_from_clip(&xc)
+		kf_probe_check(gs.db == -3, "committed gain must carry the static clip gain (got %v)", gs.db)
+		kf_probe_check(gs.n == 2, "committed gain must snapshot the track (got %d keys)", gs.n)
+		kf_probe_check(gtotal == 2, "committed gain must report the real key count")
 		kf_probe_check(
-			kf_approx(kf_gain_linear(xs.kf_keys[:xs.kf_n], 0, xs.gain_dB), db_to_linear(-40)),
-			"export src at frame 0 must render the keyed gain",
+			kf_approx(audio_gain_linear(&gs, 0), db_to_linear(-40)),
+			"committed gain at frame 0 must render the keyed gain",
 		)
-		mem.delete_cstring(xs.path)
+
+		// render_audio_src_from_chip copies the committed chip verbatim. One
+		// heap slot stands in for the committed slab; path_len 0 keeps this
+		// off the path arena.
+		slot := new(Audio_Geom_Slot)
+		defer free(slot)
+		slot.chip[0] = Audio_Geom_Chip {
+			timeline_start = 5,
+			stream_index   = 2,
+			gain           = gs,
+		}
+		rs := render_audio_src_from_chip(slot, &slot.chip[0])
+		kf_probe_check(
+			rs.gain.db == gs.db && rs.gain.n == gs.n,
+			"export src must copy the committed gain snapshot",
+		)
+		kf_probe_check(
+			rs.stream_index == 2 && rs.timeline_start_frame == 5,
+			"export src must copy the committed chip identity",
+		)
+		mem.delete_cstring(rs.path)
 	}
 
 	// --- inspector gain readout follows the playhead ----------------------

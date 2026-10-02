@@ -163,6 +163,210 @@ Render_Progress :: struct {
 }
 render_progress: Render_Progress
 
+// RENDER_LIVE_PUBLISH_NS is how often the composite hands a frame to the live
+// preview sink. The preview during an export is a PROGRESS display, not the
+// 60 fps editing surface: publishing every composite frame would pay a
+// full-canvas conversion (NV12->RGBA at 1080p is ~2 ms) for pixels nobody sees
+// at that rate. 100 ms puts ~10 frames a second on screen for ~2% of the
+// composite thread, which is the point of a progress view.
+RENDER_LIVE_PUBLISH_NS :: 100 * time.Millisecond
+
+// Render_Live is the preview sink's window onto the export in progress: the
+// composed frame the worker just finished, for the UI to display instead of
+// the timeline preview.
+//
+// One buffer, not a ring, and that is a decision rather than an oversight. A
+// second writer-side buffer would need a reader handshake to stay race-free
+// (the composite would have to know the UI had finished with it), and with a
+// publish interval the composite never waits on the UI anyway -- so the
+// handshake would buy nothing. Overflow policy: DROP. When the UI has not
+// drained the previous frame the composite skips publishing and keeps
+// encoding; the UI goes on showing the older COMPLETE frame. The producer is
+// never stalled by the consumer (AGENTS §1), which is the whole reason the
+// preview cannot become the thing that slows an export down.
+//
+// Handoff: `ready` is the only shared word. The composite copies bytes, writes
+// `frame`, then release-stores ready=true; the consumer's acquire-load pairs with
+// that store, so every byte in buf is settled before it reads them. The
+// consumer's clear is the CLAIM and it is held for the whole copy out
+// (render_live_drain): clearing before the copy would let the composite refill
+// buf in the middle of it, which is a torn frame rather than a stale one.
+Render_Live :: struct {
+	// buf is SESSION HEAP (AGENTS §1), sized to the job canvas and reused across
+	// runs, which is why it is not carved from the job arena with the encode
+	// ring: that arena dies with the worker, and this buffer is the one piece of
+	// the preview that outlives it.
+	buf:       []u8,
+	ready:     bool, // atomic: buf holds a frame the UI has not taken yet
+	frame:     i64,  // timeline frame in buf; written before ready is published
+	w, h:      c.int,
+	// nv12_rgba converts the GPU path's NV12 canvas into buf. The CPU path hands
+	// the composite's RGBA canvas straight across; the GPU path (default, since
+	// gpu_nv12_enabled) leaves eslot.canvas untouched for this frame, so without
+	// this the preview would show the ring slot's previous use of it -- a real
+	// but stale frame. Worker-only: created by render_live_begin before the
+	// worker starts, freed when the run ends. A context is freed by whoever made
+	// it, and nobody else here has one.
+	nv12_rgba: ^sws.Context,
+	last_ns:   i64, // worker-only: last publish instant
+	// shown says the UI has drawn at least one frame from this mailbox, which
+	// is what lets the composite start publishing (see render_live_publish).
+	// Atomic like ready: written by the UI thread, read by the worker.
+	shown:     bool, // atomic
+}
+render_live: Render_Live
+
+// render_live_begin sizes the mailbox for a job. UI thread, before the worker
+// starts: the buffer outlives the run, so it is allocated from the app
+// allocator here rather than from the job arena inside the worker. Allocates
+// only when the dimensions change, so a re-render at the same size reuses it.
+render_live_begin :: proc(w, h: c.int) {
+	if w <= 0 || h <= 0 {
+		return
+	}
+	n := int(w) * int(h) * 4
+	if render_live.buf == nil || len(render_live.buf) != n {
+		if render_live.buf != nil {
+			delete(render_live.buf)
+		}
+		render_live.buf = make([]u8, n)
+	}
+	if render_live.w != w || render_live.h != h {
+		render_live_destroy_ctx()
+		render_live.nv12_rgba = sws.getContext(
+			w,
+			h,
+			avutil.PixelFormat.NV12,
+			w,
+			h,
+			avutil.PixelFormat.RGBA,
+			sws.Flags{.Bilinear},
+			nil,
+			nil,
+			nil,
+		)
+		render_live.w, render_live.h = w, h
+	}
+	// Reset the handoff. `shown` matters here: it gates publishing until the UI
+	// has drawn one frame, so a fresh run must earn that again -- a run must not
+	// inherit the previous run's "already on screen" state, or it publishes into
+	// a mailbox nobody is draining.
+	sync.atomic_store(&render_live.ready, false)
+	sync.atomic_store(&render_live.shown, false)
+	render_live.last_ns = 0
+}
+
+render_live_destroy_ctx :: proc() {
+	if render_live.nv12_rgba != nil {
+		sws.freeContext(render_live.nv12_rgba)
+		render_live.nv12_rgba = nil
+	}
+}
+
+// render_live_end closes the mailbox when the run reaches a terminal state. The
+// preview goes back to the timeline rather than freezing on the last export
+// frame: the run is over, the user is editing again, and a stale finished render
+// sitting where the clips should be is worse than none. The texture is kept --
+// it is the sink's resource, and recreating it per run would be churn.
+render_live_end :: proc() {
+	sync.atomic_store(&render_live.ready, false)
+	render_live_destroy_ctx()
+}
+
+// render_live_teardown frees the session-heap buffer at shutdown.
+render_live_teardown :: proc() {
+	render_live_destroy_ctx()
+	if render_live.buf != nil {
+		delete(render_live.buf)
+		render_live.buf = nil
+	}
+}
+
+// render_live_publish offers the composite's finished frame to the UI. Worker
+// thread. `nv12` is the packed NV12 canvas when the GPU conversion produced one
+// (the encoder consumes that instead of the RGBA canvas, which is then stale
+// for this frame); nil means the RGBA canvas is the real one.
+//
+// Returns without touching buf when the mailbox still holds an undrained frame,
+// when the publish interval has not elapsed, or when no frame has been consumed
+// to draw yet. That last one is a usability gate, not a memory one: a mailbox
+// filled before the UI's first draw would be shown as the render's opening
+// frame with no visible progress, which reads as a hung export.
+render_live_publish :: proc(rgba: []u8, nv12: []u8, frame: i64) {
+	live := &render_live
+	if live.buf == nil || live.w <= 0 || live.h <= 0 {
+		return
+	}
+	if !sync.atomic_load(&live.shown) {
+		return
+	}
+	if sync.atomic_load(&live.ready) {
+		return  // drop: the UI still has the previous frame
+	}
+	now := time.now()._nsec
+	if live.last_ns != 0 && now - live.last_ns < i64(RENDER_LIVE_PUBLISH_NS) {
+		return
+	}
+	if nv12 != nil {
+		if live.nv12_rgba == nil {
+			return
+		}
+		// NV12 is TWO planes, not one packed image: full-resolution luma, then
+		// byte-interleaved U,V starting at w*h with a row pitch of w (the whole
+		// width, because the chroma samples share each row). swscale reads
+		// srcSlice[1] unconditionally, so a one-entry array hands it whatever
+		// followed it on the stack -- which is a segfault, not wrong pixels.
+		// Layout matches yuv_ref_rgba_to_nv12, the byte-exact reference.
+		src: [2][^]u8 = {raw_data(nv12), raw_data(nv12[int(live.w) * int(live.h):])}
+		src_ls: [4]c.int = {live.w, live.w, 0, 0}
+		dst: [1][^]u8 = {raw_data(live.buf)}
+		dst_ls: [4]c.int = {live.w * 4, 0, 0, 0}
+		if sws.scale(
+			live.nv12_rgba,
+			cast([^][^]u8)&src,
+			cast([^]c.int)&src_ls,
+			0,
+			live.h,
+			cast([^][^]u8)&dst,
+			cast([^]c.int)&dst_ls,
+		) <= 0 {
+			return  // refuse to publish rather than show a half-converted frame
+		}
+	} else {
+		copy(live.buf, rgba)
+	}
+	live.last_ns = now
+	live.frame = frame
+	// Release: everything written above is visible to the UI's acquire load.
+	sync.atomic_store(&live.ready, true)
+}
+
+// render_live_drain copies the mailbox into the caller's buffer for this UI tick
+// and returns the frame it copied, or ok=false when nothing was published.
+//
+// The claim is HELD for the copy. Claim-then-return-the-pointer would let the
+// composite refill buf while the caller is still reading it -- a torn frame,
+// which is worse than a stale one because nothing in the pixels says which half
+// is from when. The caller owns `dst` and nothing writes it after this returns,
+// so releasing the claim as the last step is the whole synchronization.
+render_live_drain :: proc(dst: []u8) -> (frame: i64, w, h: c.int, ok: bool) {
+	live := &render_live
+	if live.buf == nil {
+		return 0, 0, 0, false
+	}
+	// Exchange, not load-then-store: the clear IS the claim, and load-then-store
+	// lets two consumers both see the frame set and both copy it out.
+	if !sync.atomic_exchange(&live.ready, false) {
+		return 0, 0, 0, false
+	}
+	// Read the descriptor BEFORE the copy: it is stable only while the claim is
+	// held, and holding it is this proc's whole job.
+	frame, w, h = live.frame, live.w, live.h
+	n := min(len(dst), len(live.buf))
+	copy(dst[:n], live.buf[:n])
+	return frame, w, h, true
+}
+
 // Render_Meter is the render-status UI readout: the status line scratch, the
 // FPS meter's EWMA window (the worker writes frames_done atomically; the UI
 // samples from render_progress here each tick; a bare instant per UI tick
@@ -707,6 +911,93 @@ Render_Kf_Flat :: struct {
 	n:    int,
 }
 
+// Geom_Sample is the evaluated value of every animated geometry property at ONE
+// frame — the single shape both sinks consume, indexed by Render_Geom_Prop so a
+// property added to the enum is present here without a second hand-written
+// list to drift. Preview fills it live from the clip (geom_sample_clip); export
+// fills it from the job's flat keyframe snapshot (geom_sample_flat). Both read
+// the SAME resting base (geom_resting_value / the exported resting fields) and
+// the SAME evaluator per source, so "preview shows the animation, export
+// ignores it" (or vice versa) cannot happen for one lane without the probe's
+// per-lane equals check failing.
+Geom_Sample :: [int(Render_Geom_Prop._COUNT)]f32
+
+// geom_resting_value is a clip's resting (un-keyed) value for one geometry
+// property — the base a lane samples against when it has no covering key.
+geom_resting_value :: proc(clip: ^Clip, p: Render_Geom_Prop) -> f32 {
+	switch p {
+	case .Trans_X:
+		return clip.transform_x
+	case .Trans_Y:
+		return clip.transform_y
+	case .Scale:
+		return clip.scale
+	case .Crop_L:
+		return clip.crop_l
+	case .Crop_R:
+		return clip.crop_r
+	case .Crop_T:
+		return clip.crop_t
+	case .Crop_B:
+		return clip.crop_b
+	case .Opacity:
+		return clip.opacity
+	case ._COUNT:
+		unreachable()
+	}
+	return 0
+}
+
+// geom_sample_clip evaluates every animated geometry property of a LIVE clip at
+// a timeline frame. UI-thread only (reads the clip's tracks); this is the one
+// evaluator the preview uses, and the flat export sampler mirrors it key for
+// key via kf_geom_fill_snapshot.
+geom_sample_clip :: proc(clip: ^Clip, timeline_frame: i64) -> Geom_Sample {
+	s: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		p := Render_Geom_Prop(pi)
+		s[pi], _ = kf_geom_sample_lane(clip, render_geom_name(p), timeline_frame, geom_resting_value(clip, p))
+	}
+	return s
+}
+
+// geom_clear_crop zeroes the four crop lanes of a sample in place. A text clip
+// has no source frame to crop (its raster is already sized to the ink), so its
+// crop must read 0 even if the clip carries crop keys.
+geom_clear_crop :: proc(s: ^Geom_Sample) {
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		switch Render_Geom_Prop(pi) {
+		case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
+			s[pi] = 0
+		case .Trans_X, .Trans_Y, .Scale, .Opacity, ._COUNT:
+		}
+	}
+}
+
+// geom_sample_resting returns a clip's UNKEYED geometry — the base every lane
+// samples against outside its keys, and the base the export snapshots onto the
+// job. One proc so the resting set is defined once, next to the evaluators that
+// consume it.
+geom_sample_resting :: proc(clip: ^Clip) -> Geom_Sample {
+	s: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		s[pi] = geom_resting_value(clip, Render_Geom_Prop(pi))
+	}
+	return s
+}
+
+// geom_sample_flat evaluates a geometry snapshot copied flat onto the job (the
+// cross-thread form) — the export's counterpart to geom_sample_clip. `base` is
+// the clip's resting values for the keys that do not cover `off`; both sides
+// therefore rest at the same value. Worker thread.
+geom_sample_flat :: proc(base: Geom_Sample, geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat, off: i32) -> Geom_Sample {
+	s: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		s[pi], _ = kf_sample_keys(geom[pi].keys[:geom[pi].n], off, base[pi])
+	}
+	return s
+}
+
 Render_Video_Src :: struct {
 	path:                 cstring, // owned copy, freed by the worker
 	stream_index:         c.int,
@@ -716,20 +1007,24 @@ Render_Video_Src :: struct {
 	// source_start_frame (see media_is_image / Clip.is_still).
 	is_still:             bool,
 	timeline_start_frame: i64,
-	transform_x:          f32,
-	transform_y:          f32,
-	scale:                f32,
-	crop_l:               f32,
-	crop_r:               f32,
-	crop_t:               f32,
-	crop_b:               f32,
+	// geom_base is the clip's RESTING geometry and opacity, snapshotted flat at
+	// render_start by geom_sample_resting — the same shape the preview latch
+	// holds, and the base every lane samples against outside its keys. It is
+	// immutable for the life of the job: the worker must never read the live
+	// clip, and a base that changed under it would make the same frame evaluate
+	// differently on the second call.
+	geom_base:            Geom_Sample,
 	source_w:             c.int,
 	source_h:             c.int,
-	// opacity: the clip's global alpha (0..1) applied when the frame
-	// composites. 1 is fully opaque and reproduces the plain copy. This is the
-	// RESTING value as snapshotted at render_start, and the per-frame value
-	// whenever the opacity lane is keyed -- render_eval_keyed_geom overwrites
-	// it each composite frame, the same way it rewrites rw/rh/ox/oy.
+	// opacity is the alpha THIS FRAME composites with. Seeded from
+	// geom_base[Opacity] at setup (the static path never changes it) and
+	// rewritten every composite frame by render_eval_keyed_geom when the
+	// opacity lane is keyed — the same way it rewrites rw/rh/ox/oy. It is
+	// deliberately NOT where the resting value lives: the old field served as
+	// both base and per-frame value, so a keyed clip's resting alpha was
+	// overwritten with the previous frame's sample and any frame outside the
+	// key range blended against the last keyed value instead of the resting
+	// one (pinned by render_kf_probe case H).
 	opacity:              f32,
 	// Keyed geometry (S6): when any of the lane properties is keyed,
 	// geom_keyed routes the worker through per-frame evaluation and stage
@@ -976,46 +1271,32 @@ Render_Audio_Src :: struct {
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
 	source_length_frames: i64,
-	// gain_dB is the clip's static level in dB; kf_* is its copied "gain"
-	// keyframe track (kf_n = 0 = static). The export mix evaluates these through
-	// kf_gain_linear per frame, exactly like playback (audio_mix_frame) — the
-	// export used to apply NO gain at all, so a rendered file ignored the
-	// slider and its automation entirely.
-	gain_dB:              f32,
-	kf_keys:              [GAIN_KF_MAX_KEYS]Keyframe,
-	kf_n:                 int,
+	// gain is the render's FROZEN copy of the clip's committed gain snapshot,
+	// taken at render start from the same geometry slab the playback producer
+	// reads. Both mixers evaluate this shape through audio_gain_linear, so the
+	// export cannot drift from playback (it previously applied no gain at all,
+	// so a rendered file ignored the slider and its automation entirely).
+	gain:                 Audio_Gain_Snapshot,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
 	fifo:                 Audio_Ring, // converted stereo f32, content-relative
 	first48:              i64, // content 48 kHz frame of fifo's head
 	have48:               i64, // content frames produced so far (next un-produced)
 }
 
-// render_audio_src_from_clip snapshots an audio clip into the job's
-// Render_Audio_Src: identity fields plus the static gain and a COPY of its
-// "gain" keyframe track. Extracted from the job-build switch so the wiring that
-// the gain bug hinged on (the track actually being captured, the static dB
-// carried in gain_dB) is unit-testable in keyframe_probe, not only visible as
-// "the export ignored my slider". Clones path; caller frees the src.
-render_audio_src_from_clip :: proc(clip: ^Clip) -> Render_Audio_Src {
-	src := Render_Audio_Src {
-		path                 = strings.clone_to_cstring(string(clip.path)),
-		stream_index         = clip.stream_index,
-		timeline_start_frame = clip.timeline_start_frame,
-		source_start_frame   = clip.source_start_frame,
-		source_length_frames = clip.source_length_frames,
-		gain_dB              = clip.gain,
+// render_audio_src_from_chip copies one committed geometry chip into the job's
+// Render_Audio_Src: identity fields plus the chip's gain snapshot. The export
+// reads the SAME committed source playback does (audio_geometry_commit's slab),
+// rather than re-deriving gain from the live clip, so a fact the user edits has
+// exactly one committed home. Clones path; caller frees the src.
+render_audio_src_from_chip :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chip) -> Render_Audio_Src {
+	return Render_Audio_Src {
+		path = strings.clone_to_cstring(audio_chip_path(slot, chip)),
+		stream_index = chip.stream_index,
+		timeline_start_frame = chip.timeline_start,
+		source_start_frame = chip.source_start,
+		source_length_frames = chip.source_len,
+		gain = chip.gain,
 	}
-	if n, total := kf_fill_snapshot(clip, "gain", src.kf_keys[:]); n > 0 {
-		src.kf_n = n
-		if total > GAIN_KF_MAX_KEYS {
-			fmt.printf(
-				"[render] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n",
-				GAIN_KF_MAX_KEYS,
-				n,
-			)
-		}
-	}
-	return src
 }
 
 // Render_Job is the timeline snapshot taken on the main thread when a render
@@ -1044,7 +1325,7 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	cw, ch := full_box_dims(
 		src.source_w,
 		src.source_h,
-		src.scale,
+		src.geom_base[int(Render_Geom_Prop.Scale)],
 		f32(PW),
 		f32(PH),
 	)
@@ -1055,14 +1336,14 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	// precisely the drift B existed to stop. render_kf_geom_rect below was
 	// already migrated; this is the static path.
 	return cropped_box_edges(
-		src.transform_x,
-		src.transform_y,
+		src.geom_base[int(Render_Geom_Prop.Trans_X)],
+		src.geom_base[int(Render_Geom_Prop.Trans_Y)],
 		cw,
 		ch,
-		src.crop_l,
-		src.crop_r,
-		src.crop_t,
-		src.crop_b,
+		src.geom_base[int(Render_Geom_Prop.Crop_L)],
+		src.geom_base[int(Render_Geom_Prop.Crop_R)],
+		src.geom_base[int(Render_Geom_Prop.Crop_T)],
+		src.geom_base[int(Render_Geom_Prop.Crop_B)],
 	)
 }
 
@@ -1077,25 +1358,29 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 render_kf_geom_rect :: proc(
 	geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
 	off: i32,
-	base_tx, base_ty, base_s, base_cl, base_cr, base_ct, base_cb, base_op: f32,
+	base: Geom_Sample,
 	draw_w, draw_h: c.int,
 	source_w, source_h, stage_w, stage_h: c.int,
 ) -> (
 	tx, ty, s, cl, cr, ct, cb, opacity: f32,
 	ox, oy, rw, rh, srcx, srcy, srcw, srch: c.int,
 ) {
-	// Opacity samples here too, not in a separate pass, so the per-frame alpha
+	// Sampling every lane through the shared evaluator, so the export's per-frame
+	// property values come from the same loop the preview's geom_sample_clip
+	// uses — no hand-listed property that can fall out of sync with the enum.
+	// Opacity rides the same pass (not a separate one), so the per-frame alpha
 	// is resolved in exactly one place alongside the rect it composites into.
-	// Returning it (rather than writing through a pointer) keeps this proc
-	// free of side effects on the job.
-	opacity, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Opacity)].keys[:geom[int(Render_Geom_Prop.Opacity)].n], off, base_op)
-	tx, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_X)].keys[:geom[int(Render_Geom_Prop.Trans_X)].n], off, base_tx)
-	ty, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_Y)].keys[:geom[int(Render_Geom_Prop.Trans_Y)].n], off, base_ty)
-	s, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Scale)].keys[:geom[int(Render_Geom_Prop.Scale)].n], off, base_s)
-	cl, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_L)].keys[:geom[int(Render_Geom_Prop.Crop_L)].n], off, base_cl)
-	cr, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_R)].keys[:geom[int(Render_Geom_Prop.Crop_R)].n], off, base_cr)
-	ct, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_T)].keys[:geom[int(Render_Geom_Prop.Crop_T)].n], off, base_ct)
-	cb, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_B)].keys[:geom[int(Render_Geom_Prop.Crop_B)].n], off, base_cb)
+	// Returning the values (rather than writing through pointers) keeps this
+	// proc free of side effects on the job.
+	sampled := geom_sample_flat(base, geom, off)
+	tx = sampled[int(Render_Geom_Prop.Trans_X)]
+	ty = sampled[int(Render_Geom_Prop.Trans_Y)]
+	s = sampled[int(Render_Geom_Prop.Scale)]
+	cl = sampled[int(Render_Geom_Prop.Crop_L)]
+	cr = sampled[int(Render_Geom_Prop.Crop_R)]
+	ct = sampled[int(Render_Geom_Prop.Crop_T)]
+	cb = sampled[int(Render_Geom_Prop.Crop_B)]
+	opacity = sampled[int(Render_Geom_Prop.Opacity)]
 	cw, ch := full_box_dims(source_w, source_h, s, f32(draw_w), f32(draw_h))
 	// The shared geometry (project_geom.odin), so a crop lands identically in
 	// the export and in the preview.
@@ -2345,6 +2630,9 @@ render_worker_run :: proc() {
 	// Prepare compositing state for each video source.
 	for i in 0 ..< len(render_job.videos) {
 		v := &render_job.videos[i]
+		// The static path never rewrites opacity, so seed this frame's alpha
+		// from the resting base here; the keyed path overwrites it per frame.
+		v.opacity = v.geom_base[int(Render_Geom_Prop.Opacity)]
 		if v.geom_keyed {
 			// S6 animated path: decode ONCE at a stage sized to the max scale
 			// this clip reaches (resting or keyed), then per frame the
@@ -2354,7 +2642,7 @@ render_worker_run :: proc() {
 			// A keyed clip can move anywhere on the canvas, so it is never
 			// fw-zeroed, and neither the visibility crop (the WHOLE stage must
 			// be present every frame) nor the static crop resampler is built.
-			stage_scale := v.scale
+			stage_scale := v.geom_base[int(Render_Geom_Prop.Scale)]
 			for k in v.kf_geom[int(Render_Geom_Prop.Scale)].keys[:v.kf_geom[int(Render_Geom_Prop.Scale)].n] {
 				if k.value.(f32) > stage_scale {
 					stage_scale = k.value.(f32)
@@ -2408,7 +2696,7 @@ render_worker_run :: proc() {
 		cw, ch := full_box_dims(
 			v.source_w,
 			v.source_h,
-			v.scale,
+			v.geom_base[int(Render_Geom_Prop.Scale)],
 			f32(render_job.width),
 			f32(render_job.height),
 		)
@@ -2442,8 +2730,8 @@ render_worker_run :: proc() {
 		vis_top := max(0, c.int(t + 0.5))
 		vis_right := min(render_job.width, c.int(r + 0.5))
 		vis_bottom := min(render_job.height, c.int(b + 0.5))
-		box_left := v.transform_x - cw / 2
-		box_top := v.transform_y - ch / 2
+		box_left := v.geom_base[int(Render_Geom_Prop.Trans_X)] - cw / 2
+		box_top := v.geom_base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
 		box_ox := c.int(box_left + 0.5)
 		box_oy := c.int(box_top + 0.5)
 		visible_covers_box := vis_left <= box_ox && vis_top <= box_oy &&
@@ -2469,12 +2757,16 @@ render_worker_run :: proc() {
 		// scratch, replacing the old per-pixel nearest-neighbor loop. Source
 		// rect is quantized to whole blit pixels; bilinear filtering makes the
 		// sub-pixel remainder a quality improvement, not a bug.
-		if v.crop_l != 0 || v.crop_r != 0 || v.crop_t != 0 || v.crop_b != 0 {
+		crop_l := v.geom_base[int(Render_Geom_Prop.Crop_L)]
+		crop_r := v.geom_base[int(Render_Geom_Prop.Crop_R)]
+		crop_t := v.geom_base[int(Render_Geom_Prop.Crop_T)]
+		crop_b := v.geom_base[int(Render_Geom_Prop.Crop_B)]
+		if crop_l != 0 || crop_r != 0 || crop_t != 0 || crop_b != 0 {
 			// The same crop_src_rect the GPU staging path uses, over the full-box
 			// blit (which holds the same pixels the stage does). keyed_export
 			// scores the GPU result against this path, so "same crop" has to mean
 			// the same rect here, not merely a similar one.
-			csr := crop_src_rect(int(v.fw), int(v.fh), v.crop_l, v.crop_r, v.crop_t, v.crop_b)
+			csr := crop_src_rect(int(v.fw), int(v.fh), crop_l, crop_r, crop_t, crop_b)
 			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(csr.x), c.int(csr.y), c.int(csr.w), c.int(csr.h)
 			v.crop_ctx = sws.getContext(
 				c.int(csr.w), c.int(csr.h), avutil.PixelFormat.RGBA,
@@ -2512,7 +2804,7 @@ render_worker_run :: proc() {
 		if v.geom_keyed {
 			any_keyed = true
 		}
-		if v.opacity < 1.0 || v.opacity_keyed {
+		if v.geom_base[int(Render_Geom_Prop.Opacity)] < 1.0 || v.opacity_keyed {
 			any_translucent = true
 		}
 	}
@@ -2955,10 +3247,10 @@ render_worker_run :: proc() {
 				base := int(start48 - a.first48)
 				// Per-clip gain re-evaluated at this timeline frame, so a keyed
 				// gain track automates the export exactly as it does playback
-				// (one kf_gain_linear call per source per frame; the value is
-				// constant across the frame's samples). kf_gain_linear carries
+				// (one audio_gain_linear call per source per frame; the value is
+				// constant across the frame's samples). audio_gain_linear carries
 				// the dB→linear conversion, so the slider is in dB here too.
-				g := kf_gain_linear(a.kf_keys[:a.kf_n], i32(timeline_frame - a.timeline_start_frame), a.gain_dB)
+				g := audio_gain_linear(&a.gain, i32(timeline_frame - a.timeline_start_frame))
 				for s in 0 ..< cur_spf {
 					l, r := ring_at(&a.fifo, base + s)
 					mix[s * 2 + 0] += l * g
@@ -2981,6 +3273,14 @@ render_worker_run :: proc() {
 		if split_timing {
 			audio_ns += time.now()._nsec - loop_start
 		}
+
+		// Offer the finished frame to the live preview sink. After the
+		// composite is complete (so the bytes are final) and before the encoder
+		// handoff, so the copy never sits on the encoder's wake-up path. Which
+		// canvas is real depends on the run: the GPU NV12 path leaves
+		// eslot.canvas holding this ring slot's PREVIOUS frame, so publishing
+		// that would show a real but stale image.
+		render_live_publish(eslot.canvas, eslot.nv12_ready ? eslot.nv12 : nil, timeline_frame)
 
 		// Release: the canvas + mix writes above are visible to the encoder's
 		// acquire load of produced before it encodes frame frame_idx. The ready
@@ -3109,8 +3409,7 @@ render_eval_keyed_geom :: proc(
 		render_kf_geom_rect(
 			&v.kf_geom,
 			off,
-			v.transform_x, v.transform_y, v.scale,
-			v.crop_l, v.crop_r, v.crop_t, v.crop_b, v.opacity,
+			v.geom_base,
 			render_job.width, render_job.height,
 			v.source_w, v.source_h, v.fw, v.fh,
 		)
@@ -3404,7 +3703,12 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		}
 		return
 	}
-	if v.crop_l == 0 && v.crop_r == 0 && v.crop_t == 0 && v.crop_b == 0 {
+	crop_any :=
+		v.geom_base[int(Render_Geom_Prop.Crop_L)] != 0 ||
+		v.geom_base[int(Render_Geom_Prop.Crop_R)] != 0 ||
+		v.geom_base[int(Render_Geom_Prop.Crop_T)] != 0 ||
+		v.geom_base[int(Render_Geom_Prop.Crop_B)] != 0
+	if !crop_any {
 		scol := left - v.ox
 		srow := top - v.oy
 		rows := bottom - top
@@ -3721,14 +4025,7 @@ render_start :: proc() {
 						source_length_frames = clip.source_length_frames,
 						is_still = clip.is_still,
 						timeline_start_frame = clip.timeline_start_frame,
-						transform_x = clip.transform_x,
-						transform_y = clip.transform_y,
-						scale = clip.scale,
-						crop_l = clip.crop_l,
-						crop_r = clip.crop_r,
-						crop_t = clip.crop_t,
-						crop_b = clip.crop_b,
-						opacity = clip.opacity,
+						geom_base = geom_sample_resting(clip),
 						source_w = clip.source_w,
 						source_h = clip.source_h,
 					},
@@ -3756,7 +4053,9 @@ render_start :: proc() {
 				visual: Render_Visual = &cls[len(cls) - 1]
 				append(&vis, visual)
 			case .Audio:
-				append(&auds, render_audio_src_from_clip(clip))
+			// audio is read from the committed geometry slab after the walk,
+			// not from the live clips: the same source the playback producer
+			// consumes, so playback and export evaluate one gain snapshot.
 			case .Other:
 			// no renderable content in this clip
 			case .Empty:
@@ -3819,6 +4118,15 @@ render_start :: proc() {
 			}
 		}
 	}
+	// Audio is snapshotted from the committed geometry slab — the same source
+	// the playback producer reads — so export and playback evaluate one gain
+	// snapshot. Commit first: a video-only edit since the last audio commit
+	// must not leave a stale audio set in the render.
+	audio_geometry_commit()
+	audio_slot := &audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)]
+	for ai in 0 ..< audio_slot.n {
+		append(&auds, render_audio_src_from_chip(audio_slot, &audio_slot.chip[ai]))
+	}
 	render_job.visuals = vis[:]
 	render_job.videos = cls[:]
 	render_job.audios = auds[:]
@@ -3838,6 +4146,11 @@ render_start :: proc() {
 	if render_job.height % 2 != 0 {
 		render_job.height += 1
 	}
+
+	// Size the live-preview mailbox to the job canvas BEFORE the worker starts:
+	// the buffer is session heap, so it is allocated here on the app allocator
+	// rather than from the job arena the worker swaps in.
+	render_live_begin(render_job.width, render_job.height)
 
 	// Publish job bounds, then status: the release store on status orders the
 	// counter stores, so the worker's reader can never see .Rendering with stale
@@ -3860,6 +4173,10 @@ render_start :: proc() {
 // frame, but only does work on the finish transition.
 poll_completed_thread :: proc() {
 	if !render_is_busy() && render_pipe.worker != nil {
+		// Close the live mailbox before freeing the workbook: the worker is gone
+		// (destroy joins it), so nothing can publish again, and the buffer stays
+		// alive for the next run.
+		render_live_end()
 		thread.destroy(render_pipe.worker)
 		render_pipe.worker = nil
 		render_free_workbook()
@@ -4096,13 +4413,52 @@ render_test_run :: proc(paths: [2]string) {
 	}
 	render_output.overwrite = true // the test must write exactly the requested path
 	render_start()
+	// Stand in for the UI thread, and only AFTER render_start: render_live_begin
+	// clears the "UI has drawn a frame" gate that publishing waits on, exactly as
+	// it does for a real run. Without this the publish path never executes
+	// headlessly -- including the NV12->RGBA conversion, which is the branch the
+	// GPU export actually takes. The first publish always lands (the interval gate
+	// is bypassed while last_ns == 0), so the checks below cannot fail merely
+	// because the render was shorter than one publish interval.
+	sync.atomic_store(&render_live.shown, true)
+	// Draining the mailbox here is the other half of standing in for the UI.
+	// Without a consumer the first publish fills it and the DROP policy refuses
+	// every later frame, so a run would exercise exactly one conversion; with
+	// one, the whole publish/take/drop loop runs against the real composite, and
+	// the sampled pixels tell us the conversion produced image content rather
+	// than a zeroed or mis-strided buffer.
+	live_nonblack := false
+	live_takes := 0
+	// The consumer's own buffer, standing in for the GPU transfer buffer the UI
+	// drains into. One allocation for the whole run: a per-frame make is exactly
+	// the hot-path allocation AGENTS §1 forbids.
+	live_readback := make([]u8, int(render_job.width) * int(render_job.height) * 4)
 	for render_is_busy() {
+		if _, _, _, live_ok := render_live_drain(live_readback); live_ok {
+			live_takes += 1
+			for v in live_readback {
+				if v != 0 {
+					live_nonblack = true
+					break
+				}
+			}
+		}
 		time.sleep(50 * time.Millisecond)
 	}
+	delete(live_readback)
 	poll_completed_thread()
 	st := render_status_text()
 	fmt.println("render-test status:", st)
 	fmt.println("render-test keyed frames:", render_keyed_frames)
+	fmt.println("render-test live preview frames taken:", live_takes)
+	if live_takes == 0 {
+		fmt.println("render-test FAIL: the live preview sink published no frame")
+		os.exit(3)
+	}
+	if !live_nonblack {
+		fmt.println("render-test FAIL: the live preview sink published only black frames")
+		os.exit(3)
+	}
 	// The stage, not the canvas: a clip animating to 3x decodes a 5760x3240
 	// stage and crops it, so the peak of the animation sets the cost. Printed
 	// as one line so the export benchmark can scrape it per run.

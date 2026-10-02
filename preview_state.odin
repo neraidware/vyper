@@ -495,20 +495,15 @@ update_preview_slots :: proc() -> bool {
 		// evaluated at the playhead and taken into the slot in place of the
 		// clip's resting transform, so animating rows move on the canvas
 		// live (and the clip's own fields keep their resting base value).
-		// kf_geom_sample_lane returns the caller base when the property has no
-		// track (or the playhead sits before its first key), so un-keyed
-		// clips render their exact current values; it also resolves a lane
-		// whose section currently lives in packed form.
-		slot.transform_x, _ = kf_geom_sample_lane(clip, "transform.x", frame, clip.transform_x)
-		slot.transform_y, _ = kf_geom_sample_lane(clip, "transform.y", frame, clip.transform_y)
-		slot.scale, _ = kf_geom_sample_lane(clip, "scale", frame, clip.scale)
-		slot.crop_l, _ = kf_geom_sample_lane(clip, "crop.l", frame, clip.crop_l)
-		slot.crop_r, _ = kf_geom_sample_lane(clip, "crop.r", frame, clip.crop_r)
-		slot.crop_t, _ = kf_geom_sample_lane(clip, "crop.t", frame, clip.crop_t)
-		slot.crop_b, _ = kf_geom_sample_lane(clip, "crop.b", frame, clip.crop_b)
-		slot.opacity, _ = kf_geom_sample_lane(clip, "opacity", frame, clip.opacity)
-			slot.source_w = clip.source_w
-			slot.source_h = clip.source_h
+		// geom_sample_clip is the ONE evaluator: it resolves every
+		// Render_Geom_Prop lane at the playhead (scalar or packed section)
+		// against the clip's resting value, so the preview and the export
+		// sample the same property set through the same shape. The slot keeps
+		// the result — a per-thread latch across the draw pass — but as the
+		// shared Geom_Sample, not a hand-listed copy of the property set.
+		slot.geom = geom_sample_clip(clip, frame)
+		slot.source_w = clip.source_w
+		slot.source_h = clip.source_h
 			// Text clips have no decoder or source frame: the buffer is the
 			// whole preview canvas with the title rasterized at its top-left by
 			// textclip.odin. Re-render only when the title (its hash) changes so
@@ -519,12 +514,9 @@ update_preview_slots :: proc() -> bool {
 					// Subtitle generator: the output is the active .srt cue's
 					// text, not the clip's name. update_subtitle_slot owns the
 					// whole raster + re-center lifecycle (see above).
-					slot.is_text = true
-					slot.crop_l = 0
-					slot.crop_r = 0
-					slot.crop_t = 0
-					slot.crop_b = 0
-					if update_subtitle_slot(slot, clip, frame) {
+slot.is_text = true
+				geom_clear_crop(&slot.geom)
+				if update_subtitle_slot(slot, clip, frame) {
 						changed = true
 					}
 					continue
@@ -539,19 +531,16 @@ update_preview_slots :: proc() -> bool {
 				// handle-drag math compute an absolute new scale from a fixed base —
 				// if source_w/h carried the baked size, the drag would double-count.
 				slot.is_text = true
-				slot.crop_l = 0
-				slot.crop_r = 0
-				slot.crop_t = 0
-				slot.crop_b = 0
+				geom_clear_crop(&slot.geom)
 				name_hash := text_clip_hash(clip.name)
 				base_changed := slot.text_hash != name_hash
-				// slot.scale, not clip.scale: this is the raster RESOLUTION the box
+				// the slot's SAMPLED scale, not clip.scale: this is the raster RESOLUTION the box
 				// is measured against, so taking the resting value would bake glyphs
 				// at the base scale and then stretch them by the sampled one on a
 				// clip whose scale is keyed — visibly soft, and re-baked only when
 				// the title changes. The two have to come from the same frame or the
 				// raster and the box it fills disagree about what scale means.
-				font_px := f32(TEXT_CLIP_FONT_PIXELS) * slot.scale
+				font_px := f32(TEXT_CLIP_FONT_PIXELS) * slot.geom[int(Render_Geom_Prop.Scale)]
 				// The box is ink WIDTH x metric BOX HEIGHT: width is the tight
 				// ink (single line, so it hugs the text); height is the font's
 				// typographic line box at 48 (ascent + descent + TEXT_BOX_PAD
@@ -1079,10 +1068,13 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		changed = true
 	}
 
-	// The box may have been re-centered; keep slot transform in sync.
-	slot.transform_x = clip.transform_x
-	slot.transform_y = clip.transform_y
-	slot.scale = clip.scale
+	// The box may have been re-centered; keep the slot's latched geometry in
+	// sync. Resting values, not a re-sample: this whole proc places the box in
+	// resting terms (it re-centers the clip itself), so re-sampling keyed lanes
+	// here would disagree with the box it just measured.
+	slot.geom[int(Render_Geom_Prop.Trans_X)] = clip.transform_x
+	slot.geom[int(Render_Geom_Prop.Trans_Y)] = clip.transform_y
+	slot.geom[int(Render_Geom_Prop.Scale)] = clip.scale
 	return changed
 }
 

@@ -247,6 +247,29 @@ Split the question in two:
   surface, same renderer, per-surface input routing. The main loop fans out per
   surface; per-frame buffer and probe structure largely survive.
 
+## Later: single render engine — live preview during render + incremental export
+
+Tracked concretely as `TODO.md` Active 11. The direction, kept here so the
+long-term asks are not lost in the step list:
+
+- **One engine, several sinks.** Preview and export today are two drivers over
+  copies of the same derived facts (two audio systems; two keyframe-evaluation
+  call sites), and each copy is a drift site — the keyed-gain bug was one of them.
+  The end state is one pure evaluator over the canonical `timeline`+`project`
+  document, with preview display, export encoder, audio device and audio encoder
+  as *sinks* holding only runtime resources. Rule (user): **reduce state to the
+  minimum; multiple state is the devil's home.**
+- **Live locked preview during render.** The export worker already composites the
+  current frame into `Render_Enc_Slot.canvas` before encoding. Display that buffer
+  in the preview while `render_is_busy()` and gate editing/playhead — you watch
+  the render at the resolution being rendered, locked so the viewed frame is the
+  encoded frame. Preview keeps the proxy, export keeps the original; that split
+  is already a source policy, not a separate engine.
+- **Incremental export.** Cache exported chunks keyed by
+  `(document generation, frame range, source policy)` and re-encode only chunks
+  whose key changed. Falls out of the evaluator being deterministic from one
+  document; impossible while the two pipelines each own their own copy.
+
 ## Idea: keyboard-first quick editing
 
 **Desire:** make vyper mostly keyboard-drivable for quick edits — split, trim,
