@@ -495,18 +495,20 @@ update_preview_slots :: proc() -> bool {
 		// evaluated at the playhead and taken into the slot in place of the
 		// clip's resting transform, so animating rows move on the canvas
 		// live (and the clip's own fields keep their resting base value).
-		// kf_geom_sample_lane returns the caller base when the property has no
-		// track (or the playhead sits before its first key), so un-keyed
-		// clips render their exact current values; it also resolves a lane
-		// whose section currently lives in packed form.
-		slot.transform_x, _ = kf_geom_sample_lane(clip, "transform.x", frame, clip.transform_x)
-		slot.transform_y, _ = kf_geom_sample_lane(clip, "transform.y", frame, clip.transform_y)
-		slot.scale, _ = kf_geom_sample_lane(clip, "scale", frame, clip.scale)
-		slot.crop_l, _ = kf_geom_sample_lane(clip, "crop.l", frame, clip.crop_l)
-		slot.crop_r, _ = kf_geom_sample_lane(clip, "crop.r", frame, clip.crop_r)
-		slot.crop_t, _ = kf_geom_sample_lane(clip, "crop.t", frame, clip.crop_t)
-		slot.crop_b, _ = kf_geom_sample_lane(clip, "crop.b", frame, clip.crop_b)
-		slot.opacity, _ = kf_geom_sample_lane(clip, "opacity", frame, clip.opacity)
+		// geom_sample_clip is the ONE evaluator: it resolves every
+		// Render_Geom_Prop lane at the playhead (scalar or packed section)
+		// against the clip's resting value, so the preview and the export
+		// sample the same property set through the same shape. The slot keeps
+		// named fields — a per-thread latch — but the values are shared.
+		gs := geom_sample_clip(clip, frame)
+		slot.transform_x = gs[int(Render_Geom_Prop.Trans_X)]
+		slot.transform_y = gs[int(Render_Geom_Prop.Trans_Y)]
+		slot.scale       = gs[int(Render_Geom_Prop.Scale)]
+		slot.crop_l      = gs[int(Render_Geom_Prop.Crop_L)]
+		slot.crop_r      = gs[int(Render_Geom_Prop.Crop_R)]
+		slot.crop_t      = gs[int(Render_Geom_Prop.Crop_T)]
+		slot.crop_b      = gs[int(Render_Geom_Prop.Crop_B)]
+		slot.opacity     = gs[int(Render_Geom_Prop.Opacity)]
 			slot.source_w = clip.source_w
 			slot.source_h = clip.source_h
 			// Text clips have no decoder or source frame: the buffer is the

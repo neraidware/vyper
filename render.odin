@@ -707,6 +707,68 @@ Render_Kf_Flat :: struct {
 	n:    int,
 }
 
+// Geom_Sample is the evaluated value of every animated geometry property at ONE
+// frame — the single shape both sinks consume, indexed by Render_Geom_Prop so a
+// property added to the enum is present here without a second hand-written
+// list to drift. Preview fills it live from the clip (geom_sample_clip); export
+// fills it from the job's flat keyframe snapshot (geom_sample_flat). Both read
+// the SAME resting base (geom_resting_value / the exported resting fields) and
+// the SAME evaluator per source, so "preview shows the animation, export
+// ignores it" (or vice versa) cannot happen for one lane without the probe's
+// per-lane equals check failing.
+Geom_Sample :: [int(Render_Geom_Prop._COUNT)]f32
+
+// geom_resting_value is a clip's resting (un-keyed) value for one geometry
+// property — the base a lane samples against when it has no covering key.
+geom_resting_value :: proc(clip: ^Clip, p: Render_Geom_Prop) -> f32 {
+	switch p {
+	case .Trans_X:
+		return clip.transform_x
+	case .Trans_Y:
+		return clip.transform_y
+	case .Scale:
+		return clip.scale
+	case .Crop_L:
+		return clip.crop_l
+	case .Crop_R:
+		return clip.crop_r
+	case .Crop_T:
+		return clip.crop_t
+	case .Crop_B:
+		return clip.crop_b
+	case .Opacity:
+		return clip.opacity
+	case ._COUNT:
+		unreachable()
+	}
+	return 0
+}
+
+// geom_sample_clip evaluates every animated geometry property of a LIVE clip at
+// a timeline frame. UI-thread only (reads the clip's tracks); this is the one
+// evaluator the preview uses, and the flat export sampler mirrors it key for
+// key via kf_geom_fill_snapshot.
+geom_sample_clip :: proc(clip: ^Clip, timeline_frame: i64) -> Geom_Sample {
+	s: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		p := Render_Geom_Prop(pi)
+		s[pi], _ = kf_geom_sample_lane(clip, render_geom_name(p), timeline_frame, geom_resting_value(clip, p))
+	}
+	return s
+}
+
+// geom_sample_flat evaluates a geometry snapshot copied flat onto the job (the
+// cross-thread form) — the export's counterpart to geom_sample_clip. `base` is
+// the clip's resting values for the keys that do not cover `off`; both sides
+// therefore rest at the same value. Worker thread.
+geom_sample_flat :: proc(base: Geom_Sample, geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat, off: i32) -> Geom_Sample {
+	s: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		s[pi], _ = kf_sample_keys(geom[pi].keys[:geom[pi].n], off, base[pi])
+	}
+	return s
+}
+
 Render_Video_Src :: struct {
 	path:                 cstring, // owned copy, freed by the worker
 	stream_index:         c.int,
@@ -1070,18 +1132,31 @@ render_kf_geom_rect :: proc(
 	tx, ty, s, cl, cr, ct, cb, opacity: f32,
 	ox, oy, rw, rh, srcx, srcy, srcw, srch: c.int,
 ) {
-	// Opacity samples here too, not in a separate pass, so the per-frame alpha
+	// Sample every lane through the shared evaluator, so the export's per-frame
+	// property values come from the same loop the preview's geom_sample_clip
+	// uses — no hand-listed property that can fall out of sync with the enum.
+	// Opacity rides the same pass (not a separate one), so the per-frame alpha
 	// is resolved in exactly one place alongside the rect it composites into.
-	// Returning it (rather than writing through a pointer) keeps this proc
-	// free of side effects on the job.
-	opacity, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Opacity)].keys[:geom[int(Render_Geom_Prop.Opacity)].n], off, base_op)
-	tx, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_X)].keys[:geom[int(Render_Geom_Prop.Trans_X)].n], off, base_tx)
-	ty, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Trans_Y)].keys[:geom[int(Render_Geom_Prop.Trans_Y)].n], off, base_ty)
-	s, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Scale)].keys[:geom[int(Render_Geom_Prop.Scale)].n], off, base_s)
-	cl, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_L)].keys[:geom[int(Render_Geom_Prop.Crop_L)].n], off, base_cl)
-	cr, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_R)].keys[:geom[int(Render_Geom_Prop.Crop_R)].n], off, base_cr)
-	ct, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_T)].keys[:geom[int(Render_Geom_Prop.Crop_T)].n], off, base_ct)
-	cb, _ = kf_sample_keys(geom[int(Render_Geom_Prop.Crop_B)].keys[:geom[int(Render_Geom_Prop.Crop_B)].n], off, base_cb)
+	// Returning the values (rather than writing through pointers) keeps this
+	// proc free of side effects on the job.
+	base: Geom_Sample
+	base[int(Render_Geom_Prop.Trans_X)] = base_tx
+	base[int(Render_Geom_Prop.Trans_Y)] = base_ty
+	base[int(Render_Geom_Prop.Scale)] = base_s
+	base[int(Render_Geom_Prop.Crop_L)] = base_cl
+	base[int(Render_Geom_Prop.Crop_R)] = base_cr
+	base[int(Render_Geom_Prop.Crop_T)] = base_ct
+	base[int(Render_Geom_Prop.Crop_B)] = base_cb
+	base[int(Render_Geom_Prop.Opacity)] = base_op
+	sampled := geom_sample_flat(base, geom, off)
+	tx = sampled[int(Render_Geom_Prop.Trans_X)]
+	ty = sampled[int(Render_Geom_Prop.Trans_Y)]
+	s = sampled[int(Render_Geom_Prop.Scale)]
+	cl = sampled[int(Render_Geom_Prop.Crop_L)]
+	cr = sampled[int(Render_Geom_Prop.Crop_R)]
+	ct = sampled[int(Render_Geom_Prop.Crop_T)]
+	cb = sampled[int(Render_Geom_Prop.Crop_B)]
+	opacity = sampled[int(Render_Geom_Prop.Opacity)]
 	cw, ch := full_box_dims(source_w, source_h, s, f32(draw_w), f32(draw_h))
 	// The shared geometry (project_geom.odin), so a crop lands identically in
 	// the export and in the preview.

@@ -215,6 +215,70 @@ render_kf_probe_run :: proc() -> int {
 		render_kf_probe_check_near(opBase, 0.375, 0.001, "F un-keyed opacity falls back to base: got %f want 0.375")
 	}
 
+	// Case G — one evaluator, two sources. geom_sample_clip (preview, live) and
+	// geom_sample_flat (export, the job's flat snapshot) must agree on EVERY
+	// Render_Geom_Prop lane, for a clip that keys every lane — including a crop
+	// that lives in a PACKED section (the grouped form the flat snapshot has to
+	// unpack). A property added to the enum but sampled on only one side, or a
+	// packed lane the flat path drops, trips here. This is the drift class S3
+	// exists to remove; the two sinks still keep their own per-thread latch, but
+	// the values they latch are proven identical.
+	{
+		clipG := Clip {
+			transform_x = 7,
+			transform_y = -7,
+			scale       = 1.5,
+			crop_l      = 0.01,
+			crop_r      = 0.02,
+			crop_t      = 0.03,
+			crop_b      = 0.04,
+			opacity     = 0.9,
+		}
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_X), 0, 3)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_X), 10, 30)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_Y), 0, -4)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_Y), 20, 8)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 0, 1)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 20, 2)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 5, 1)
+		kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 15, 0.25)
+		lanes0: [KF_PACK_MAX]f32
+		lanes0[0] = 0.1
+		lanes0[1] = 0.2
+		lanes0[2] = 0.05
+		lanes0[3] = 0.15
+		lanes1: [KF_PACK_MAX]f32
+		lanes1[0] = 0.3
+		lanes1[1] = 0.4
+		lanes1[2] = 0.25
+		lanes1[3] = 0.35
+		kf_geom_set_packed(&clipG, "crop", 0, lanes0, 0xF)
+		kf_geom_set_packed(&clipG, "crop", 20, lanes1, 0xF)
+
+		flatG: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
+		baseG: Geom_Sample
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			p := Render_Geom_Prop(pi)
+			flatG[pi] = render_kf_fill_flat(&clipG, p)
+			baseG[pi] = geom_resting_value(&clipG, p)
+		}
+		// off 0 (first keys), 10 (between), 20 (last keys), 30 (past the end,
+		// so both fall back to the shared resting base).
+		for off in ([]i32{0, 10, 20, 30}) {
+			live := geom_sample_clip(&clipG, i64(off))
+			flat := geom_sample_flat(baseG, &flatG, off)
+			for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+				render_kf_probe_check(
+					math.abs(flat[pi] - live[pi]) <= 0.0001,
+					"G lane %s: flat export %.4f != live preview %.4f",
+					render_geom_name(Render_Geom_Prop(pi)),
+					flat[pi],
+					live[pi],
+				)
+			}
+		}
+	}
+
 	if render_kf_probe_fail {
 		fmt.println("[render-kf-probe] failed")
 		return 1

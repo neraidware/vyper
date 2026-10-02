@@ -2734,8 +2734,8 @@ is S1c, not a refactor, and is tracked there.
 
 ## Active 11 — Unified render engine: one evaluation, multiple sinks, minimal state
 
-**Status: S1 (+audio half of S2) landed 2026-10-01.** Branch `render-engine`,
-base `639d20a`. S3–S6 planned. (This section travels in the S1 commit.)
+**Status: S1 + S2(audio) + S3(geometry/opacity) landed 2026-10-01.**
+Branch `render-engine`, base `639d20a`. S4–S6 planned.
 
 **Why.** Preview and export are two *drivers* over two *copies* of the same
 derived facts, and every copied fact is a drift site. The keyed-gain bug shipped
@@ -2859,16 +2859,25 @@ mutation-test every new assertion):
       the overflow clips for **both** playback and export; this is now a single
       ceiling instead of two disagreeing ones. Export source order is slab
       (track/clip) order.
-- [ ] **S2 (video) — Collapse the video/frame copies.** Remaining: preview and
-      export sample geometry/opacity/source-policy through one evaluator (this
-      is S3/S4 below). `Render_Video_Src`'s derived geometry fields and the
-      preview slot's sampled copies still duplicate the fact.
-- [ ] **S3 — One video frame evaluator.** Geometry, opacity, source policy and
-      draw order become one proc parameterized by `(resolution, source_policy)`,
-      consumed by both preview and export. Delete the preview/export sampling
-      duplication (`kf_geom_sample_lane` call sites vs `render_eval_keyed_geom`).
-      Probe: preview evaluation == export evaluation for a frame across
-      proxy/original and resolutions.
+- [x] **S2 (video) / S3 — One video-frame evaluator (geometry + opacity).**
+      Landed 2026-10-01. `Geom_Sample` (indexed by `Render_Geom_Prop`, so a
+      property added to the enum is present with no second list) is the single
+      evaluated shape. `geom_sample_clip` is THE live evaluator (preview calls
+      it; `preview_state.odin` no longer hand-lists the eight lane names), and
+      `geom_sample_flat` is its frozen counterpart that `render_kf_geom_rect`
+      now samples through — so the export's per-frame values come from the same
+      enum-driven loop, not eight hand-inlined `kf_sample_keys` calls. Both read
+      the same resting base (`geom_resting_value`). The per-thread latches
+      (`Preview_Slot` fields, `Render_Video_Src` resting fields) stay and are
+      load-bearing, exactly as S1 found for audio. Probe (`render_kf_probe`
+      case G): live vs flat agree on EVERY lane at four offsets, for a clip
+      keying every lane including a PACKED crop section; mutation-tested by
+      dropping a lane from the flat sampler (fails). Gates green.
+      **Remaining in S3:** source policy (proxy vs original) is already a
+      per-call policy (`proxy_pick_for_frame`), not a duplication; draw order
+      was collapsed by Active 10's `render_order.odin`. The residual is the
+      *pipeline* (GPU quad uniforms vs CPU rect), which is the S1c interop
+      boundary, not a duplicated fact.
 - [ ] **S4 — Sink split.** Preview and export consume S3's output through their
       own resource-holding sinks; `Render_Video_Src`'s derived geometry fields and
       the preview slot's sampled copies go away.
