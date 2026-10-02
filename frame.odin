@@ -86,6 +86,13 @@ render_ui_frame :: proc(
 	// this frame (they have no device in the preview state, so they wait
 	// here where the device is).
 	drain_pending_text_releases(device)
+	// Drain the export's live preview mailbox into its texture (S5). Also here,
+	// for the same reason as the slot uploads: the transfer must be recorded
+	// before any render pass opens. Skip it while a render is running -- the
+	// mailbox is empty then anyway, and this is the one call in the frame that
+	// exists only for that state.
+	live_active := render_is_busy()
+	live_drawn := live_active && draw_live_preview(renderer, command_buffer)
 	// Upload decoded media-bin thumbnails (once per asset, after import).
 	for &a in media_bin.assets {
 		upload_asset_thumbnail(renderer, command_buffer, &a)
@@ -133,7 +140,7 @@ render_ui_frame :: proc(
 		// per-clip content inside draw_preview self-gates on each slot's
 		// has_frame/texture.
 		preview_bounds := clay.GetElementData(clay.ID("Preview")).boundingBox
-		draw_preview(renderer, command_buffer, pass, preview_bounds)
+		draw_preview(renderer, command_buffer, pass, preview_bounds, live_active && live_drawn)
 		draw_preview_hud(renderer, command_buffer, pass, preview_bounds)
 		render_clay(renderer, command_buffer, pass, commands, OVERLAY_ABOVE_PREVIEW_Z, max(i16))
 		draw_text_input_caret(renderer, command_buffer, pass)

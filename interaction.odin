@@ -1072,11 +1072,21 @@ interaction_post_build :: proc(
 ) -> (
 	was_mouse_down, was_right_down: bool,
 ) {
-	interaction_click_dispatch(inp, prev_mouse_down)
+	// Locked while an export runs: the file on disk is being written from the
+	// snapshot render_start committed, so an edit made now cannot reach it, and
+	// the preview is showing that render's composed frame rather than the
+	// timeline. Refusing at this one seam covers every editing entry point
+	// without each one having to remember. interaction_release still runs, so a
+	// gesture that started before the render commits and unwinds instead of
+	// sticking in the .Drag state forever.
+	if !render_is_busy() {
+		interaction_click_dispatch(inp, prev_mouse_down)
+		if inp.left {
+			interaction_move(inp, prev_mouse_down, height)
+		}
+	}
 	if !inp.left {
 		interaction_release(inp)
-	} else {
-		interaction_move(inp, prev_mouse_down, height)
 	}
 	was_click := inp.left && !prev_mouse_down
 	interaction_jog_click(was_click)

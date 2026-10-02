@@ -201,6 +201,14 @@ app_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool
 		escape_dismiss()
 		return true
 	}
+	// Locked while an export runs (the same reason the mouse editing entry
+	// points are gated in interaction_post_build): the render is writing the
+	// snapshot it committed at render_start, so a playhead move or an edit now
+	// would change neither the file nor the preview. ESC above still dismisses,
+	// and the Cancel button is a live mouse target.
+	if render_is_busy() {
+		return true
+	}
 	claimed := false
 	// Continuous actions run on the initial press AND on auto-repeat, which is
 	// what makes shuttle work: a tap nudges one step, holding it keeps

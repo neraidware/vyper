@@ -2734,8 +2734,8 @@ is S1c, not a refactor, and is tracked there.
 
 ## Active 11 — Unified render engine: one evaluation, multiple sinks, minimal state
 
-**Status: S1 + S2(audio) + S3(geometry/opacity) landed 2026-10-01.**
-Branch `render-engine`, base `639d20a`. S4–S6 planned.
+**Status: S1 + S2(audio) + S3(geometry/opacity) + reduced S4 + S5 landed
+2026-10-02.** Branch `render-engine`, base `639d20a`. S6 next.
 
 **Why.** Preview and export are two *drivers* over two *copies* of the same
 derived facts, and every copied fact is a drift site. The keyed-gain bug shipped
@@ -2914,9 +2914,70 @@ mutation-test every new assertion):
       Gates green: check, build, probe, `VYPER_RENDER_KF_PROBE`,
       `VYPER_KEYFRAME_PROBE`, geom_key_probe, transform_probe, timeline_probe,
       keyed_export, valgrind, geom_key_valgrind, undo_valgrind.
-- [ ] **S5 — Live locked preview during render.** Preview sink displays the
-      export worker's current composed frame; editing/playhead gated while
-      `render_is_busy()`. Probe: frame shown == frame encoded; input rejected.
+- [x] **S5 — Live locked preview during render.** The preview sink displays the
+      export worker's current composed frame, and editing/playhead input is gated
+      while `render_is_busy()`.
+
+      **Why a mailbox and not the encode slot.** `Render_Enc_Slot.canvas` is
+      owned by the composite worker and refilled by the encoder, so reading it
+      from the UI is a race with both. The live frame is published through
+      `Render_Live` (`render.odin`): one session-heap RGBA buffer sized to the
+      job canvas, allocated in `render_live_begin` on the UI thread BEFORE the
+      worker starts (the job arena dies with the worker; this buffer must
+      outlive it) and reused across runs at the same size. `ready` is the only
+      shared word: the worker copies bytes, writes `frame`, then release-stores
+      `ready`; `render_live_drain` acquire-loads, and the claim is **held for
+      the whole copy out**. The first version cleared the flag before handing
+      back a pointer, which let the composite refill the buffer mid-read — a
+      torn frame, and one with no tell in the pixels.
+
+      **Overflow policy: DROP.** If the UI has not drained, the composite skips
+      publishing and keeps encoding; the UI keeps showing the older COMPLETE
+      frame. The producer is never stalled by the consumer (AGENTS §1), which is
+      the whole point — a progress view must never be what slows an export.
+
+      **Rate: 100 ms** (`RENDER_LIVE_PUBLISH_NS`). The preview during an export
+      is a progress display, not the 60 fps editing surface; publishing every
+      composite frame would pay a full-canvas conversion for pixels nobody sees
+      at that rate. The window runs from the last ACCEPTED publish, so a burst
+      of skipped attempts does not push the next real frame out.
+
+      **The GPU path is the one that matters.** With `gpu_nv12_enabled` (the
+      default) the encoder consumes the packed NV12 canvas and `eslot.canvas`
+      holds the ring slot's PREVIOUS frame, so publishing it would show a real
+      but stale image. `render_live_publish` therefore takes whichever canvas is
+      real and converts NV12→RGBA through one `sws.Context` per run.
+
+      **The NV12 plane layout is a trap, and it cost a segfault.** NV12 is TWO
+      planes — full-res luma, then byte-interleaved U,V at offset `w*h` with a
+      row pitch of `w` — and swscale reads `srcSlice[1]` unconditionally. A
+      one-element source array hands it whatever followed it on the stack. The
+      layout is pinned by `render_live_probe` case 5 against the same swscale
+      call, not a copy of the comment.
+
+      **Gating is two seams, not every call site.** `interaction_post_build`
+      skips the editing dispatch while busy (still running `interaction_release`,
+      so a gesture started before the export commits and unwinds instead of
+      sticking in `.Drag` forever), and `app_claims_key` refuses app shortcuts so
+      playback/playhead keys cannot move the playhead out from under the render.
+      The Cancel button and ESC stay live.
+
+      Probe: `render_live_probe` (gates `render_live_probe` +
+      `render_live_valgrind`) — pins that the drained frame is the frame that
+      was published (bytes and timeline frame), the DROP policy, the usability
+      gate, the publish interval, the end-of-run/reuse/teardown ownership, and
+      the NV12 conversion. Four mutations fail it: drop→overwrite, gate removal,
+      interval removal, chroma pitch `w`→`w/2`; a fifth (one source plane)
+      fails by segfault, which is the crash the layout bug actually was.
+      The end-to-end render test now stands in for the UI — it drains the
+      mailbox in its wait loop and fails if nothing was published or if every
+      published frame was black — so the publish path is exercised headlessly by
+      `keyed_export` and `render_valgrind`, not only by the probe. Gates green:
+      check, build, probe, `VYPER_RENDER_KF_PROBE`, `VYPER_KEYFRAME_PROBE`,
+      geom_key_probe, render_live_probe, transform_probe, timeline_probe,
+      keyed_export, yuv_exact, gpu_nv12, gpu_composite, opacity, gpu_probe,
+      zorder, subtitle_probe, proxy_probe, smoke, valgrind, geom_key_valgrind,
+      undo_valgrind, render_valgrind, render_live_valgrind.
 - [ ] **S6 — Incremental (chunked) export.** Chunk cache keyed by
       `(document generation, frame range, source policy)`; re-export only chunks
       whose key changed. Depends on S1–S4 being deterministic.

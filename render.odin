@@ -163,6 +163,210 @@ Render_Progress :: struct {
 }
 render_progress: Render_Progress
 
+// RENDER_LIVE_PUBLISH_NS is how often the composite hands a frame to the live
+// preview sink. The preview during an export is a PROGRESS display, not the
+// 60 fps editing surface: publishing every composite frame would pay a
+// full-canvas conversion (NV12->RGBA at 1080p is ~2 ms) for pixels nobody sees
+// at that rate. 100 ms puts ~10 frames a second on screen for ~2% of the
+// composite thread, which is the point of a progress view.
+RENDER_LIVE_PUBLISH_NS :: 100 * time.Millisecond
+
+// Render_Live is the preview sink's window onto the export in progress: the
+// composed frame the worker just finished, for the UI to display instead of
+// the timeline preview.
+//
+// One buffer, not a ring, and that is a decision rather than an oversight. A
+// second writer-side buffer would need a reader handshake to stay race-free
+// (the composite would have to know the UI had finished with it), and with a
+// publish interval the composite never waits on the UI anyway -- so the
+// handshake would buy nothing. Overflow policy: DROP. When the UI has not
+// drained the previous frame the composite skips publishing and keeps
+// encoding; the UI goes on showing the older COMPLETE frame. The producer is
+// never stalled by the consumer (AGENTS §1), which is the whole reason the
+// preview cannot become the thing that slows an export down.
+//
+// Handoff: `ready` is the only shared word. The composite copies bytes, writes
+// `frame`, then release-stores ready=true; the consumer's acquire-load pairs with
+// that store, so every byte in buf is settled before it reads them. The
+// consumer's clear is the CLAIM and it is held for the whole copy out
+// (render_live_drain): clearing before the copy would let the composite refill
+// buf in the middle of it, which is a torn frame rather than a stale one.
+Render_Live :: struct {
+	// buf is SESSION HEAP (AGENTS §1), sized to the job canvas and reused across
+	// runs, which is why it is not carved from the job arena with the encode
+	// ring: that arena dies with the worker, and this buffer is the one piece of
+	// the preview that outlives it.
+	buf:       []u8,
+	ready:     bool, // atomic: buf holds a frame the UI has not taken yet
+	frame:     i64,  // timeline frame in buf; written before ready is published
+	w, h:      c.int,
+	// nv12_rgba converts the GPU path's NV12 canvas into buf. The CPU path hands
+	// the composite's RGBA canvas straight across; the GPU path (default, since
+	// gpu_nv12_enabled) leaves eslot.canvas untouched for this frame, so without
+	// this the preview would show the ring slot's previous use of it -- a real
+	// but stale frame. Worker-only: created by render_live_begin before the
+	// worker starts, freed when the run ends. A context is freed by whoever made
+	// it, and nobody else here has one.
+	nv12_rgba: ^sws.Context,
+	last_ns:   i64, // worker-only: last publish instant
+	// shown says the UI has drawn at least one frame from this mailbox, which
+	// is what lets the composite start publishing (see render_live_publish).
+	// Atomic like ready: written by the UI thread, read by the worker.
+	shown:     bool, // atomic
+}
+render_live: Render_Live
+
+// render_live_begin sizes the mailbox for a job. UI thread, before the worker
+// starts: the buffer outlives the run, so it is allocated from the app
+// allocator here rather than from the job arena inside the worker. Allocates
+// only when the dimensions change, so a re-render at the same size reuses it.
+render_live_begin :: proc(w, h: c.int) {
+	if w <= 0 || h <= 0 {
+		return
+	}
+	n := int(w) * int(h) * 4
+	if render_live.buf == nil || len(render_live.buf) != n {
+		if render_live.buf != nil {
+			delete(render_live.buf)
+		}
+		render_live.buf = make([]u8, n)
+	}
+	if render_live.w != w || render_live.h != h {
+		render_live_destroy_ctx()
+		render_live.nv12_rgba = sws.getContext(
+			w,
+			h,
+			avutil.PixelFormat.NV12,
+			w,
+			h,
+			avutil.PixelFormat.RGBA,
+			sws.Flags{.Bilinear},
+			nil,
+			nil,
+			nil,
+		)
+		render_live.w, render_live.h = w, h
+	}
+	// Reset the handoff. `shown` matters here: it gates publishing until the UI
+	// has drawn one frame, so a fresh run must earn that again -- a run must not
+	// inherit the previous run's "already on screen" state, or it publishes into
+	// a mailbox nobody is draining.
+	sync.atomic_store(&render_live.ready, false)
+	sync.atomic_store(&render_live.shown, false)
+	render_live.last_ns = 0
+}
+
+render_live_destroy_ctx :: proc() {
+	if render_live.nv12_rgba != nil {
+		sws.freeContext(render_live.nv12_rgba)
+		render_live.nv12_rgba = nil
+	}
+}
+
+// render_live_end closes the mailbox when the run reaches a terminal state. The
+// preview goes back to the timeline rather than freezing on the last export
+// frame: the run is over, the user is editing again, and a stale finished render
+// sitting where the clips should be is worse than none. The texture is kept --
+// it is the sink's resource, and recreating it per run would be churn.
+render_live_end :: proc() {
+	sync.atomic_store(&render_live.ready, false)
+	render_live_destroy_ctx()
+}
+
+// render_live_teardown frees the session-heap buffer at shutdown.
+render_live_teardown :: proc() {
+	render_live_destroy_ctx()
+	if render_live.buf != nil {
+		delete(render_live.buf)
+		render_live.buf = nil
+	}
+}
+
+// render_live_publish offers the composite's finished frame to the UI. Worker
+// thread. `nv12` is the packed NV12 canvas when the GPU conversion produced one
+// (the encoder consumes that instead of the RGBA canvas, which is then stale
+// for this frame); nil means the RGBA canvas is the real one.
+//
+// Returns without touching buf when the mailbox still holds an undrained frame,
+// when the publish interval has not elapsed, or when no frame has been consumed
+// to draw yet. That last one is a usability gate, not a memory one: a mailbox
+// filled before the UI's first draw would be shown as the render's opening
+// frame with no visible progress, which reads as a hung export.
+render_live_publish :: proc(rgba: []u8, nv12: []u8, frame: i64) {
+	live := &render_live
+	if live.buf == nil || live.w <= 0 || live.h <= 0 {
+		return
+	}
+	if !sync.atomic_load(&live.shown) {
+		return
+	}
+	if sync.atomic_load(&live.ready) {
+		return  // drop: the UI still has the previous frame
+	}
+	now := time.now()._nsec
+	if live.last_ns != 0 && now - live.last_ns < i64(RENDER_LIVE_PUBLISH_NS) {
+		return
+	}
+	if nv12 != nil {
+		if live.nv12_rgba == nil {
+			return
+		}
+		// NV12 is TWO planes, not one packed image: full-resolution luma, then
+		// byte-interleaved U,V starting at w*h with a row pitch of w (the whole
+		// width, because the chroma samples share each row). swscale reads
+		// srcSlice[1] unconditionally, so a one-entry array hands it whatever
+		// followed it on the stack -- which is a segfault, not wrong pixels.
+		// Layout matches yuv_ref_rgba_to_nv12, the byte-exact reference.
+		src: [2][^]u8 = {raw_data(nv12), raw_data(nv12[int(live.w) * int(live.h):])}
+		src_ls: [4]c.int = {live.w, live.w, 0, 0}
+		dst: [1][^]u8 = {raw_data(live.buf)}
+		dst_ls: [4]c.int = {live.w * 4, 0, 0, 0}
+		if sws.scale(
+			live.nv12_rgba,
+			cast([^][^]u8)&src,
+			cast([^]c.int)&src_ls,
+			0,
+			live.h,
+			cast([^][^]u8)&dst,
+			cast([^]c.int)&dst_ls,
+		) <= 0 {
+			return  // refuse to publish rather than show a half-converted frame
+		}
+	} else {
+		copy(live.buf, rgba)
+	}
+	live.last_ns = now
+	live.frame = frame
+	// Release: everything written above is visible to the UI's acquire load.
+	sync.atomic_store(&live.ready, true)
+}
+
+// render_live_drain copies the mailbox into the caller's buffer for this UI tick
+// and returns the frame it copied, or ok=false when nothing was published.
+//
+// The claim is HELD for the copy. Claim-then-return-the-pointer would let the
+// composite refill buf while the caller is still reading it -- a torn frame,
+// which is worse than a stale one because nothing in the pixels says which half
+// is from when. The caller owns `dst` and nothing writes it after this returns,
+// so releasing the claim as the last step is the whole synchronization.
+render_live_drain :: proc(dst: []u8) -> (frame: i64, w, h: c.int, ok: bool) {
+	live := &render_live
+	if live.buf == nil {
+		return 0, 0, 0, false
+	}
+	// Exchange, not load-then-store: the clear IS the claim, and load-then-store
+	// lets two consumers both see the frame set and both copy it out.
+	if !sync.atomic_exchange(&live.ready, false) {
+		return 0, 0, 0, false
+	}
+	// Read the descriptor BEFORE the copy: it is stable only while the claim is
+	// held, and holding it is this proc's whole job.
+	frame, w, h = live.frame, live.w, live.h
+	n := min(len(dst), len(live.buf))
+	copy(dst[:n], live.buf[:n])
+	return frame, w, h, true
+}
+
 // Render_Meter is the render-status UI readout: the status line scratch, the
 // FPS meter's EWMA window (the worker writes frames_done atomically; the UI
 // samples from render_progress here each tick; a bare instant per UI tick
@@ -3070,6 +3274,14 @@ render_worker_run :: proc() {
 			audio_ns += time.now()._nsec - loop_start
 		}
 
+		// Offer the finished frame to the live preview sink. After the
+		// composite is complete (so the bytes are final) and before the encoder
+		// handoff, so the copy never sits on the encoder's wake-up path. Which
+		// canvas is real depends on the run: the GPU NV12 path leaves
+		// eslot.canvas holding this ring slot's PREVIOUS frame, so publishing
+		// that would show a real but stale image.
+		render_live_publish(eslot.canvas, eslot.nv12_ready ? eslot.nv12 : nil, timeline_frame)
+
 		// Release: the canvas + mix writes above are visible to the encoder's
 		// acquire load of produced before it encodes frame frame_idx. The ready
 		// post wakes it; posting after the store orders the slot writes first.
@@ -3935,6 +4147,11 @@ render_start :: proc() {
 		render_job.height += 1
 	}
 
+	// Size the live-preview mailbox to the job canvas BEFORE the worker starts:
+	// the buffer is session heap, so it is allocated here on the app allocator
+	// rather than from the job arena the worker swaps in.
+	render_live_begin(render_job.width, render_job.height)
+
 	// Publish job bounds, then status: the release store on status orders the
 	// counter stores, so the worker's reader can never see .Rendering with stale
 	// frames_total.
@@ -3956,6 +4173,10 @@ render_start :: proc() {
 // frame, but only does work on the finish transition.
 poll_completed_thread :: proc() {
 	if !render_is_busy() && render_pipe.worker != nil {
+		// Close the live mailbox before freeing the workbook: the worker is gone
+		// (destroy joins it), so nothing can publish again, and the buffer stays
+		// alive for the next run.
+		render_live_end()
 		thread.destroy(render_pipe.worker)
 		render_pipe.worker = nil
 		render_free_workbook()
@@ -4192,13 +4413,52 @@ render_test_run :: proc(paths: [2]string) {
 	}
 	render_output.overwrite = true // the test must write exactly the requested path
 	render_start()
+	// Stand in for the UI thread, and only AFTER render_start: render_live_begin
+	// clears the "UI has drawn a frame" gate that publishing waits on, exactly as
+	// it does for a real run. Without this the publish path never executes
+	// headlessly -- including the NV12->RGBA conversion, which is the branch the
+	// GPU export actually takes. The first publish always lands (the interval gate
+	// is bypassed while last_ns == 0), so the checks below cannot fail merely
+	// because the render was shorter than one publish interval.
+	sync.atomic_store(&render_live.shown, true)
+	// Draining the mailbox here is the other half of standing in for the UI.
+	// Without a consumer the first publish fills it and the DROP policy refuses
+	// every later frame, so a run would exercise exactly one conversion; with
+	// one, the whole publish/take/drop loop runs against the real composite, and
+	// the sampled pixels tell us the conversion produced image content rather
+	// than a zeroed or mis-strided buffer.
+	live_nonblack := false
+	live_takes := 0
+	// The consumer's own buffer, standing in for the GPU transfer buffer the UI
+	// drains into. One allocation for the whole run: a per-frame make is exactly
+	// the hot-path allocation AGENTS §1 forbids.
+	live_readback := make([]u8, int(render_job.width) * int(render_job.height) * 4)
 	for render_is_busy() {
+		if _, _, _, live_ok := render_live_drain(live_readback); live_ok {
+			live_takes += 1
+			for v in live_readback {
+				if v != 0 {
+					live_nonblack = true
+					break
+				}
+			}
+		}
 		time.sleep(50 * time.Millisecond)
 	}
+	delete(live_readback)
 	poll_completed_thread()
 	st := render_status_text()
 	fmt.println("render-test status:", st)
 	fmt.println("render-test keyed frames:", render_keyed_frames)
+	fmt.println("render-test live preview frames taken:", live_takes)
+	if live_takes == 0 {
+		fmt.println("render-test FAIL: the live preview sink published no frame")
+		os.exit(3)
+	}
+	if !live_nonblack {
+		fmt.println("render-test FAIL: the live preview sink published only black frames")
+		os.exit(3)
+	}
 	// The stage, not the canvas: a clip animating to 3x decodes a 5760x3240
 	// stage and crops it, so the peak of the animation sets the cost. Printed
 	// as one line so the export benchmark can scrape it per run.
