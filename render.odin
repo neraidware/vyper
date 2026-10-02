@@ -757,6 +757,31 @@ geom_sample_clip :: proc(clip: ^Clip, timeline_frame: i64) -> Geom_Sample {
 	return s
 }
 
+// geom_clear_crop zeroes the four crop lanes of a sample in place. A text clip
+// has no source frame to crop (its raster is already sized to the ink), so its
+// crop must read 0 even if the clip carries crop keys.
+geom_clear_crop :: proc(s: ^Geom_Sample) {
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		switch Render_Geom_Prop(pi) {
+		case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
+			s[pi] = 0
+		case .Trans_X, .Trans_Y, .Scale, .Opacity, ._COUNT:
+		}
+	}
+}
+
+// geom_sample_resting returns a clip's UNKEYED geometry — the base every lane
+// samples against outside its keys, and the base the export snapshots onto the
+// job. One proc so the resting set is defined once, next to the evaluators that
+// consume it.
+geom_sample_resting :: proc(clip: ^Clip) -> Geom_Sample {
+	s: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		s[pi] = geom_resting_value(clip, Render_Geom_Prop(pi))
+	}
+	return s
+}
+
 // geom_sample_flat evaluates a geometry snapshot copied flat onto the job (the
 // cross-thread form) — the export's counterpart to geom_sample_clip. `base` is
 // the clip's resting values for the keys that do not cover `off`; both sides
@@ -778,20 +803,24 @@ Render_Video_Src :: struct {
 	// source_start_frame (see media_is_image / Clip.is_still).
 	is_still:             bool,
 	timeline_start_frame: i64,
-	transform_x:          f32,
-	transform_y:          f32,
-	scale:                f32,
-	crop_l:               f32,
-	crop_r:               f32,
-	crop_t:               f32,
-	crop_b:               f32,
+	// geom_base is the clip's RESTING geometry and opacity, snapshotted flat at
+	// render_start by geom_sample_resting — the same shape the preview latch
+	// holds, and the base every lane samples against outside its keys. It is
+	// immutable for the life of the job: the worker must never read the live
+	// clip, and a base that changed under it would make the same frame evaluate
+	// differently on the second call.
+	geom_base:            Geom_Sample,
 	source_w:             c.int,
 	source_h:             c.int,
-	// opacity: the clip's global alpha (0..1) applied when the frame
-	// composites. 1 is fully opaque and reproduces the plain copy. This is the
-	// RESTING value as snapshotted at render_start, and the per-frame value
-	// whenever the opacity lane is keyed -- render_eval_keyed_geom overwrites
-	// it each composite frame, the same way it rewrites rw/rh/ox/oy.
+	// opacity is the alpha THIS FRAME composites with. Seeded from
+	// geom_base[Opacity] at setup (the static path never changes it) and
+	// rewritten every composite frame by render_eval_keyed_geom when the
+	// opacity lane is keyed — the same way it rewrites rw/rh/ox/oy. It is
+	// deliberately NOT where the resting value lives: the old field served as
+	// both base and per-frame value, so a keyed clip's resting alpha was
+	// overwritten with the previous frame's sample and any frame outside the
+	// key range blended against the last keyed value instead of the resting
+	// one (pinned by render_kf_probe case H).
 	opacity:              f32,
 	// Keyed geometry (S6): when any of the lane properties is keyed,
 	// geom_keyed routes the worker through per-frame evaluation and stage
@@ -1092,7 +1121,7 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	cw, ch := full_box_dims(
 		src.source_w,
 		src.source_h,
-		src.scale,
+		src.geom_base[int(Render_Geom_Prop.Scale)],
 		f32(PW),
 		f32(PH),
 	)
@@ -1103,14 +1132,14 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	// precisely the drift B existed to stop. render_kf_geom_rect below was
 	// already migrated; this is the static path.
 	return cropped_box_edges(
-		src.transform_x,
-		src.transform_y,
+		src.geom_base[int(Render_Geom_Prop.Trans_X)],
+		src.geom_base[int(Render_Geom_Prop.Trans_Y)],
 		cw,
 		ch,
-		src.crop_l,
-		src.crop_r,
-		src.crop_t,
-		src.crop_b,
+		src.geom_base[int(Render_Geom_Prop.Crop_L)],
+		src.geom_base[int(Render_Geom_Prop.Crop_R)],
+		src.geom_base[int(Render_Geom_Prop.Crop_T)],
+		src.geom_base[int(Render_Geom_Prop.Crop_B)],
 	)
 }
 
@@ -1125,29 +1154,20 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 render_kf_geom_rect :: proc(
 	geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
 	off: i32,
-	base_tx, base_ty, base_s, base_cl, base_cr, base_ct, base_cb, base_op: f32,
+	base: Geom_Sample,
 	draw_w, draw_h: c.int,
 	source_w, source_h, stage_w, stage_h: c.int,
 ) -> (
 	tx, ty, s, cl, cr, ct, cb, opacity: f32,
 	ox, oy, rw, rh, srcx, srcy, srcw, srch: c.int,
 ) {
-	// Sample every lane through the shared evaluator, so the export's per-frame
+	// Sampling every lane through the shared evaluator, so the export's per-frame
 	// property values come from the same loop the preview's geom_sample_clip
 	// uses — no hand-listed property that can fall out of sync with the enum.
 	// Opacity rides the same pass (not a separate one), so the per-frame alpha
 	// is resolved in exactly one place alongside the rect it composites into.
 	// Returning the values (rather than writing through pointers) keeps this
 	// proc free of side effects on the job.
-	base: Geom_Sample
-	base[int(Render_Geom_Prop.Trans_X)] = base_tx
-	base[int(Render_Geom_Prop.Trans_Y)] = base_ty
-	base[int(Render_Geom_Prop.Scale)] = base_s
-	base[int(Render_Geom_Prop.Crop_L)] = base_cl
-	base[int(Render_Geom_Prop.Crop_R)] = base_cr
-	base[int(Render_Geom_Prop.Crop_T)] = base_ct
-	base[int(Render_Geom_Prop.Crop_B)] = base_cb
-	base[int(Render_Geom_Prop.Opacity)] = base_op
 	sampled := geom_sample_flat(base, geom, off)
 	tx = sampled[int(Render_Geom_Prop.Trans_X)]
 	ty = sampled[int(Render_Geom_Prop.Trans_Y)]
@@ -2406,6 +2426,9 @@ render_worker_run :: proc() {
 	// Prepare compositing state for each video source.
 	for i in 0 ..< len(render_job.videos) {
 		v := &render_job.videos[i]
+		// The static path never rewrites opacity, so seed this frame's alpha
+		// from the resting base here; the keyed path overwrites it per frame.
+		v.opacity = v.geom_base[int(Render_Geom_Prop.Opacity)]
 		if v.geom_keyed {
 			// S6 animated path: decode ONCE at a stage sized to the max scale
 			// this clip reaches (resting or keyed), then per frame the
@@ -2415,7 +2438,7 @@ render_worker_run :: proc() {
 			// A keyed clip can move anywhere on the canvas, so it is never
 			// fw-zeroed, and neither the visibility crop (the WHOLE stage must
 			// be present every frame) nor the static crop resampler is built.
-			stage_scale := v.scale
+			stage_scale := v.geom_base[int(Render_Geom_Prop.Scale)]
 			for k in v.kf_geom[int(Render_Geom_Prop.Scale)].keys[:v.kf_geom[int(Render_Geom_Prop.Scale)].n] {
 				if k.value.(f32) > stage_scale {
 					stage_scale = k.value.(f32)
@@ -2469,7 +2492,7 @@ render_worker_run :: proc() {
 		cw, ch := full_box_dims(
 			v.source_w,
 			v.source_h,
-			v.scale,
+			v.geom_base[int(Render_Geom_Prop.Scale)],
 			f32(render_job.width),
 			f32(render_job.height),
 		)
@@ -2503,8 +2526,8 @@ render_worker_run :: proc() {
 		vis_top := max(0, c.int(t + 0.5))
 		vis_right := min(render_job.width, c.int(r + 0.5))
 		vis_bottom := min(render_job.height, c.int(b + 0.5))
-		box_left := v.transform_x - cw / 2
-		box_top := v.transform_y - ch / 2
+		box_left := v.geom_base[int(Render_Geom_Prop.Trans_X)] - cw / 2
+		box_top := v.geom_base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
 		box_ox := c.int(box_left + 0.5)
 		box_oy := c.int(box_top + 0.5)
 		visible_covers_box := vis_left <= box_ox && vis_top <= box_oy &&
@@ -2530,12 +2553,16 @@ render_worker_run :: proc() {
 		// scratch, replacing the old per-pixel nearest-neighbor loop. Source
 		// rect is quantized to whole blit pixels; bilinear filtering makes the
 		// sub-pixel remainder a quality improvement, not a bug.
-		if v.crop_l != 0 || v.crop_r != 0 || v.crop_t != 0 || v.crop_b != 0 {
+		crop_l := v.geom_base[int(Render_Geom_Prop.Crop_L)]
+		crop_r := v.geom_base[int(Render_Geom_Prop.Crop_R)]
+		crop_t := v.geom_base[int(Render_Geom_Prop.Crop_T)]
+		crop_b := v.geom_base[int(Render_Geom_Prop.Crop_B)]
+		if crop_l != 0 || crop_r != 0 || crop_t != 0 || crop_b != 0 {
 			// The same crop_src_rect the GPU staging path uses, over the full-box
 			// blit (which holds the same pixels the stage does). keyed_export
 			// scores the GPU result against this path, so "same crop" has to mean
 			// the same rect here, not merely a similar one.
-			csr := crop_src_rect(int(v.fw), int(v.fh), v.crop_l, v.crop_r, v.crop_t, v.crop_b)
+			csr := crop_src_rect(int(v.fw), int(v.fh), crop_l, crop_r, crop_t, crop_b)
 			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(csr.x), c.int(csr.y), c.int(csr.w), c.int(csr.h)
 			v.crop_ctx = sws.getContext(
 				c.int(csr.w), c.int(csr.h), avutil.PixelFormat.RGBA,
@@ -2573,7 +2600,7 @@ render_worker_run :: proc() {
 		if v.geom_keyed {
 			any_keyed = true
 		}
-		if v.opacity < 1.0 || v.opacity_keyed {
+		if v.geom_base[int(Render_Geom_Prop.Opacity)] < 1.0 || v.opacity_keyed {
 			any_translucent = true
 		}
 	}
@@ -3170,8 +3197,7 @@ render_eval_keyed_geom :: proc(
 		render_kf_geom_rect(
 			&v.kf_geom,
 			off,
-			v.transform_x, v.transform_y, v.scale,
-			v.crop_l, v.crop_r, v.crop_t, v.crop_b, v.opacity,
+			v.geom_base,
 			render_job.width, render_job.height,
 			v.source_w, v.source_h, v.fw, v.fh,
 		)
@@ -3465,7 +3491,12 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		}
 		return
 	}
-	if v.crop_l == 0 && v.crop_r == 0 && v.crop_t == 0 && v.crop_b == 0 {
+	crop_any :=
+		v.geom_base[int(Render_Geom_Prop.Crop_L)] != 0 ||
+		v.geom_base[int(Render_Geom_Prop.Crop_R)] != 0 ||
+		v.geom_base[int(Render_Geom_Prop.Crop_T)] != 0 ||
+		v.geom_base[int(Render_Geom_Prop.Crop_B)] != 0
+	if !crop_any {
 		scol := left - v.ox
 		srow := top - v.oy
 		rows := bottom - top
@@ -3782,14 +3813,7 @@ render_start :: proc() {
 						source_length_frames = clip.source_length_frames,
 						is_still = clip.is_still,
 						timeline_start_frame = clip.timeline_start_frame,
-						transform_x = clip.transform_x,
-						transform_y = clip.transform_y,
-						scale = clip.scale,
-						crop_l = clip.crop_l,
-						crop_r = clip.crop_r,
-						crop_t = clip.crop_t,
-						crop_b = clip.crop_b,
-						opacity = clip.opacity,
+						geom_base = geom_sample_resting(clip),
 						source_w = clip.source_w,
 						source_h = clip.source_h,
 					},

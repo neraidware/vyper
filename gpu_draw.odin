@@ -2222,20 +2222,12 @@ draw_preview :: proc(
 	for k := n - 1; k >= 0; k -= 1 {
 		slot := &preview_slots[order[k]]
 		is_text := slot.text_w > 0 && slot.text_h > 0
-		cb := clip_image_bounds(
+		cb := clip_image_bounds_geom(
 			canvas,
-			&Clip {
-				kind = is_text ? Media_Kind.Text : .Video,
-				transform_x = slot.transform_x,
-				transform_y = slot.transform_y,
-				scale = slot.scale,
-				crop_l = slot.crop_l,
-				crop_r = slot.crop_r,
-				crop_t = slot.crop_t,
-				crop_b = slot.crop_b,
-				source_w = slot.source_w,
-				source_h = slot.source_h,
-			},
+			is_text ? Media_Kind.Text : Media_Kind.Video,
+			slot.geom,
+			slot.source_w,
+			slot.source_h,
 		)
 		// The decoded texture holds the source fit (letterboxed) inside the
 		// fixed PREVIEW_W x PREVIEW_H buffer. Start the quad from that fit
@@ -2266,10 +2258,14 @@ draw_preview :: proc(
 			v_base := f32(foy) / f32(PREVIEW_H)
 			u_span := f32(fw) / f32(PREVIEW_W)
 			v_span := f32(fh) / f32(PREVIEW_H)
-			u0 = u_base + slot.crop_l * u_span
-			u1 = u_base + (1 - slot.crop_r) * u_span
-			v0 = v_base + slot.crop_t * v_span
-			v1 = v_base + (1 - slot.crop_b) * v_span
+			ins_l := slot.geom[int(Render_Geom_Prop.Crop_L)]
+			ins_r := slot.geom[int(Render_Geom_Prop.Crop_R)]
+			ins_t := slot.geom[int(Render_Geom_Prop.Crop_T)]
+			ins_b := slot.geom[int(Render_Geom_Prop.Crop_B)]
+			u0 = u_base + ins_l * u_span
+			u1 = u_base + (1 - ins_r) * u_span
+			v0 = v_base + ins_t * v_span
+			v1 = v_base + (1 - ins_b) * v_span
 		}
 		vertex_uniforms := Quad_Uniforms {
 			bounds   = {cb.x, cb.y, cb.width, cb.height},
@@ -2284,7 +2280,7 @@ draw_preview :: proc(
 			slot.texture,
 			renderer.preview_sampler,
 			vertex_uniforms,
-			slot.opacity,
+			slot.geom[int(Render_Geom_Prop.Opacity)],
 		)
 	}
 	// Draw a border box around the currently-selected clip's image rect.

@@ -2878,9 +2878,42 @@ mutation-test every new assertion):
       was collapsed by Active 10's `render_order.odin`. The residual is the
       *pipeline* (GPU quad uniforms vs CPU rect), which is the S1c interop
       boundary, not a duplicated fact.
-- [ ] **S4 — Sink split.** Preview and export consume S3's output through their
-      own resource-holding sinks; `Render_Video_Src`'s derived geometry fields and
-      the preview slot's sampled copies go away.
+- [x] **S4 — Sink split (reduced; the storage half was the wrong target).**
+      Landed 2026-10-01. S1's latch finding makes the *storage* half of the
+      original step impossible, not merely inconvenient: `Preview_Slot` latches
+      the sampled geometry across the frame because the draw pass runs after
+      `update_preview_slots` and the live clip may have been edited since, and
+      `Render_Video_Src.geom_base` exists because the worker may never read a
+      live `Clip`. Deleting either is a correctness regression, not a state
+      reduction. What remained reducible was the latch *SHAPE* and the
+      hand-copied property lists around it, and that is done:
+      - `Preview_Slot` carries one `geom: Geom_Sample` instead of eight named
+        f32s; `update_preview_slots` is `slot.geom = geom_sample_clip(clip,
+        frame)` — no property list at all — and the text paths clear crop via
+        `geom_clear_crop`. A `Render_Geom_Prop` added to the enum now needs no
+        edit in the preview state or the draw path.
+      - `Render_Video_Src` carries `geom_base: Geom_Sample` (filled once at
+        `render_start` by the new `geom_sample_resting`) instead of eight
+        resting fields, and `render_kf_geom_rect` takes that base as one
+        argument instead of eight named floats (10 probe call sites updated).
+      - `gpu_draw` no longer rebuilds a throwaway `Clip` from the slot latch
+        just to call `clip_image_bounds`; the new `clip_image_bounds_geom`
+        takes evaluated geometry, and `clip_image_bounds` is the thin
+        `clip_geom_get` wrapper the editor's border/handles/hit-test keep using.
+      **Bug found and fixed by the collapse.** `Render_Video_Src.opacity` was
+      both the resting base AND the per-frame alpha, so a keyed fade overwrote
+      the base with the previous frame's sample: every frame past the last key
+      blended at the last keyed value instead of the clip's own opacity, and
+      re-rendering the same frame produced a different result. The resting value
+      now lives in `geom_base[Opacity]` (immutable for the job) and `opacity`
+      is only this frame's alpha, seeded from the base in the setup loop. Pinned
+      by `render_kf_probe` case H, which drives the real
+      `render_eval_keyed_geom` across a keyed frame and a post-key frame;
+      mutation-tested by restoring the old read (fails). `render_kf_probe_check_near`
+      now appends got/want/eps itself, so a failure line has no `%!(EXTRA)`.
+      Gates green: check, build, probe, `VYPER_RENDER_KF_PROBE`,
+      `VYPER_KEYFRAME_PROBE`, geom_key_probe, transform_probe, timeline_probe,
+      keyed_export, valgrind, geom_key_valgrind, undo_valgrind.
 - [ ] **S5 — Live locked preview during render.** Preview sink displays the
       export worker's current composed frame; editing/playhead gated while
       `render_is_busy()`. Probe: frame shown == frame encoded; input rejected.
