@@ -627,7 +627,7 @@ kf_geom_unwrap_section :: proc(clip: ^Clip, sec: string) {
 			kf_track_index(clip^, lane_name) < 0,
 			fmt.tprintf("lane %q coexists with its packed section %q", lane_name, sec),
 		)
-		append(&clip.keyframe_tracks, Kf_Track {name = strings.clone(lane_name)})
+		append(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(lane_name)})
 		lane := &clip.keyframe_tracks[len(clip.keyframe_tracks) - 1]
 		lane.keys = make([dynamic]Keyframe, 0, len(src_keys))
 		for k in src_keys {
@@ -638,9 +638,9 @@ kf_geom_unwrap_section :: proc(clip: ^Clip, sec: string) {
 		li += 1
 	}
 	// The section track is freed only after all fans read src_keys.
-	name := clip.keyframe_tracks[si].name
+	// The section track's NAME is a pool handle: nothing to free. Its keys are
+	// still an owned array at this step, so those are released.
 	keys := clip.keyframe_tracks[si].keys
-	delete(name)
 	if keys != nil {
 		delete(keys)
 	}
@@ -723,7 +723,7 @@ kf_geom_fold_lanes :: proc(
 		if ti := kf_track_index(clip^, kf_lane_name(lane_prop)); ti >= 0 {
 			tr := &clip.keyframe_tracks[ti]
 			assert(len(tr.keys) > 0, "folding dropped a keyed lane")
-			delete(tr.name)
+			// name is a pool handle; only the keys array is owned.
 			delete(tr.keys)
 			ordered_remove(&clip.keyframe_tracks, ti)
 		}

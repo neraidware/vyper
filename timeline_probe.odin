@@ -164,7 +164,7 @@ tl_split_scene :: proc() {
 	cl.source_start_frame = 100
 	cl.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
 	append(&cl.keyframe_tracks, Kf_Track {
-		name = strings.clone("transform.x"),
+		name = session_str_intern("transform.x"),
 		keys = make([dynamic]Keyframe, 0, 4),
 	})
 	append(

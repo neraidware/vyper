@@ -111,7 +111,18 @@ Saved_Clip :: struct {
 	opacity:              f32,
 	has_opacity:          bool,
 	markers:              [dynamic]Saved_Marker,
-	keyframe_tracks:      [dynamic]Kf_Track,
+	keyframe_tracks:      [dynamic]Saved_Kf_Track,
+}
+
+// Saved_Kf_Track is a keyframe track as stored in the file, for the same reason
+// Saved_Marker exists: the live Kf_Track.name is a session-pool HANDLE
+// (TODO.md Active 19), so reusing the live type would write two i32s where the
+// file stores a name. Its `keys` field reuses the live [dynamic]Keyframe, which
+// IS still cbor-safe (scalars plus a fixed-array union variant) -- that stops
+// being true when the keys move into a session store.
+Saved_Kf_Track :: struct {
+	name: string,
+	keys: [dynamic]Keyframe,
 }
 
 // Saved_Track is one storage track: its name and its clips in order.
@@ -242,7 +253,7 @@ project_to_file :: proc() -> Project_File {
 				opacity              = c.opacity,
 				has_opacity          = true,
 				markers              = saved_markers(&c),
-				keyframe_tracks      = c.keyframe_tracks, // live array, aliased
+				keyframe_tracks      = saved_kf_tracks(&c),
 			})
 		}
 		append(&pf.tracks, st)
@@ -266,6 +277,12 @@ project_to_file :: proc() -> Project_File {
 project_file_free_containers :: proc(pf: ^Project_File) {
 	for &st in pf.tracks {
 		for &sc in st.clips {
+			for &kt in sc.keyframe_tracks {
+				// The DTO's keys array is THIS save's (built by
+				// saved_kf_tracks); its name is a borrowed pool view.
+				delete(kt.keys)
+			}
+			delete(sc.keyframe_tracks)
 			delete(sc.markers)
 		}
 		delete(st.clips)
@@ -444,8 +461,19 @@ session_rebuild :: proc(pf: ^Project_File) {
 					idx += 1
 				}
 			}
-			// Deep-copy the keyframe tracks (names + keys) off the DTO.
-			kf_clone_mut(&c, Clip{keyframe_tracks = sc.keyframe_tracks})
+			// Keyframe tracks off the DTO: the lane NAME is interned into the
+			// session pool (so it owns nothing), and the keys are deep-copied
+			// because they are still a per-track owned array at this step.
+			if len(sc.keyframe_tracks) > 0 {
+				c.keyframe_tracks = make([dynamic]Kf_Track, len(sc.keyframe_tracks))
+				for kt, i in sc.keyframe_tracks {
+					c.keyframe_tracks[i] = Kf_Track {
+						name = session_str_intern(kt.name),
+						keys = make([dynamic]Keyframe, len(kt.keys)),
+					}
+					copy(c.keyframe_tracks[i].keys[:], kt.keys[:])
+				}
+			}
 			append(&tr.clips, c)
 		}
 		append(&timeline.tracks, tr)
@@ -560,6 +588,21 @@ saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
 			source_frame = m.source_frame,
 			label        = marker_label(&m),
 		}
+	}
+	return out
+}
+
+// saved_kf_tracks renders a clip's keyframe tracks as the file DTO. The lane
+// names are borrowed views of the session pool, valid for the whole save; the
+// key arrays are copies, because the live ones are freed by kf_free_tracks and
+// the encode must not depend on the session staying put. The arrays are freed by
+// project_file_free_containers.
+saved_kf_tracks :: proc(c: ^Clip) -> [dynamic]Saved_Kf_Track {
+	out := make([dynamic]Saved_Kf_Track, len(c.keyframe_tracks))
+	for &t, i in c.keyframe_tracks {
+		keys := make([dynamic]Keyframe, len(t.keys))
+		copy(keys[:], t.keys[:])
+		out[i] = Saved_Kf_Track {name = kf_track_name(&t), keys = keys}
 	}
 	return out
 }

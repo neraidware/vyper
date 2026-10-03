@@ -4409,7 +4409,7 @@ for a bug that was not found is noise.
 
 ## Active 19 — `Clip` as POD: session pools for names, labels, keyframe keys
 
-**Status: S0 + S1 landed.** S2 (keyframe keys) is next. Numbered 19 rather than
+**Status: S0, S1 and S2a landed.** S2b (the key array store) is next. Numbered 19 rather than
 16 because main took 16 (export rate), 17 (audio rate) and 18 (forward jump)
 while this plan sat on its own branch.
 
@@ -4491,17 +4491,58 @@ must load byte-identically after this work.
       i.e. "the halves must NOT share". Sharing is now the point, so that check
       became the stronger isolation test: rename the left half, assert the right
       still reads the original name.
-- [ ] S2. Keyframe keys into the session arena: `Kf_Track.keys` becomes
-      `(off, len)` into one grow-only `[dynamic]Keyframe` store per session,
-      with `Kf_Track.name` interned by offset. This is the risky step — it lands
-      right after the Active 14 split/trim/undo work, which is the code most
-      likely to regress — so it goes in alone, behind the existing
-      `keyframe_probe`. **Carry S1's two lessons in:** (a) `Saved_Clip.keyframe_tracks`
-      is still typed `[dynamic]Kf_Track` for the same reason the marker DTO had to
-      change, so S2 MUST introduce an explicit track DTO with plain strings or it
-      will corrupt the file the same way; (b) a `[dynamic]Keyframe` store is safe
-      to reallocate ONLY because a track's handle is an INDEX, not a pointer into
-      it — do not add an accessor that hands out a borrowed `[]Keyframe`.
+- [x] S2a. **Landed.** `Kf_Track.name` is a `Session_Str_Handle` like `Clip.name`
+      (`keyframes.odin`), read via `kf_track_name`, written via
+      `kf_track_set_name`/`session_str_intern`. `Kf_Track.keys` is STILL an owned
+      `[dynamic]Keyframe` — the store is S2b. The `delete(track.name)` pairs are
+      gone from `kf_free_tracks`, `kf_del_key`, the render fold/expand paths and
+      the geometry/undo probes; the key arrays they used to free alongside are
+      untouched.
+
+      **The second DTO landmine was real, and it is now pinned.** As predicted
+      under S1, `Saved_Clip.keyframe_tracks` was typed `[dynamic]Kf_Track` — a
+      handle where the file stores a name. Fixed with an explicit
+      `Saved_Kf_Track{name: string, keys: [dynamic]Keyframe}` (identical CBOR
+      shape), `saved_kf_tracks`, interning on load, and a free of the DTO arrays
+      at the save boundary. Only `name` needed the DTO: `[dynamic]Keyframe` is
+      still cbor-safe (scalars plus a fixed-array union variant), and that stops
+      being true in S2b. Mutation-confirmed twice over: aliasing the live
+      `Kf_Track` and keeping the handle raw fails the project round-trip
+      (`scalar kf track mismatch`, probe rc=1), and the probe now greps the
+      written file for the lane name the way it already did for the marker label.
+
+      **`kf_track_index` compares TEXT, deliberately not interned handles.**
+      The obvious conversion — `session_str_intern(name)` then compare handles —
+      is wrong: callers pass compile-time constant section names and one of them
+      (`render.odin`) asserts a track is ABSENT before minting it, so interning
+      would grow the session pool from a lookup. `clip_geom` evaluates this per
+      frame: a write on a read path, and pool bytes leaked per distinct
+      never-present name. Comparing the borrowed view against the argument is
+      side-effect-free and costs one compare over a handful of lanes. Handle
+      equality is only faster for a caller that ALREADY holds a handle, and no
+      such caller exists yet — `Kf_Snap.name` is the one place a lane name
+      crosses into a still-owned heap string, and it keeps its clone.
+- [ ] S2b. Keyframe keys into the session arena: `Kf_Track.keys` becomes
+      `(off, len)` into one `[dynamic]Keyframe` store per session. This is the
+      risky step — it lands right after the Active 14 split/trim/undo work, which
+      is the code most likely to regress — so it goes in alone, behind the
+      existing `keyframe_probe`, and ~200 `.keys` sites move.
+
+      **Carry S1's lesson in:** a `[dynamic]Keyframe` store is safe to reallocate
+      ONLY because a track's handle is an INDEX, not a pointer into it. Do not
+      add an accessor that hands out a borrowed `[]Keyframe` — several current
+      callers read `track.keys` as a slice and a realloc mid-read would dangle
+      exactly like S1's view. Index instead, or read through a guard that
+      re-resolves after any mutation.
+
+      **Two things this must answer, both unresolved:** (a) the store is
+      per-session and shared, so two `Clip`s that copied a track now share one
+      range — a write to one must not be visible in the other, which means
+      copy-on-write with an explicit shared flag (no refcount: the owner is the
+      session, the mutator is decided by the write path); (b) `Clip` is not POD
+      until `clip.keyframe_tracks` itself stops being an owned `[dynamic]`, and
+      that array is the same COW question one level up. S3's "collapse to
+      `c := src^`" is not reachable until both are, so do not start S3 first.
 - [ ] S3. Delete `clip_deep_copy` and `clip_payload_free`, collapse every copy
       site to `c := src^`, and delete the now-empty free paths. A `Clip` copy
       must become a plain struct copy with no proc in between; if a site still

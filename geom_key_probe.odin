@@ -104,9 +104,7 @@ geom_key_drop_track :: proc(cl: ^Clip, name: string) {
 		return
 	}
 	tr := &cl.keyframe_tracks[ti]
-	if tr.name != "" {
-		delete(tr.name)
-	}
+	// name is a pool handle: nothing to free. keys are still owned.
 	if tr.keys != nil {
 		delete(tr.keys)
 	}
@@ -121,7 +119,7 @@ geom_key_drop_track :: proc(cl: ^Clip, name: string) {
 geom_key_unkeyed_fixture :: proc() -> (cl: ^Clip) {
 	cl = geom_key_fixture()
 	for ti := len(cl.keyframe_tracks) - 1; ti >= 0; ti -= 1 {
-		name := cl.keyframe_tracks[ti].name
+		name := kf_track_name(&cl.keyframe_tracks[ti])
 		if name == "" {
 			continue
 		}
@@ -280,9 +278,7 @@ geom_key_probe_run :: proc() -> int {
 		// Strip every geometry track: same clip, nothing keyed.
 		for ti := len(cl.keyframe_tracks) - 1; ti >= 0; ti -= 1 {
 			tr := &cl.keyframe_tracks[ti]
-			if tr.name != "" {
-				delete(tr.name)
-			}
+			// name is a pool handle: nothing to free here.
 			if tr.keys != nil {
 				delete(tr.keys)
 			}
@@ -400,12 +396,9 @@ geom_key_probe_run :: proc() -> int {
 		// Replace the per-lane tracks with one packed crop section.
 		for ti := len(cl.keyframe_tracks) - 1; ti >= 0; ti -= 1 {
 			tr := &cl.keyframe_tracks[ti]
-			if tr.name == "crop" {
+			if kf_track_name(tr) == "crop" {
 				if tr.keys != nil {
 					delete(tr.keys)
-				}
-				if tr.name != "" {
-					delete(tr.name)
 				}
 				ordered_remove(&cl.keyframe_tracks, ti)
 			}

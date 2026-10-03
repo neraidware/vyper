@@ -1375,13 +1375,13 @@ seed_roundtrip_session :: proc() {
 	}
 	append(&vclip.markers, Clip_Marker {source_frame = 12, label = session_str_intern("chapter")})
 	vclip.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
-	append(&vclip.keyframe_tracks, Kf_Track {name = strings.clone("scale"), keys = make([dynamic]Keyframe, 0, 2)})
+	append(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("scale"), keys = make([dynamic]Keyframe, 0, 2)})
 	append(
 		&vclip.keyframe_tracks[0].keys,
 		Keyframe {frame_off = 0, value = 1.0},
 		Keyframe {frame_off = 60, value = 2.0, interp = .Elastic},
 	)
-	append(&vclip.keyframe_tracks, Kf_Track {name = strings.clone("crop"), keys = make([dynamic]Keyframe, 0, 1)})
+	append(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("crop"), keys = make([dynamic]Keyframe, 0, 1)})
 	// A packed key: mask != 0, value carries the [KF_PACK_MAX]f32 payload.
 	append(
 		&vclip.keyframe_tracks[1].keys,
@@ -1456,8 +1456,17 @@ ui_probe_project_file_asserts :: proc() -> bool {
 	// string is stored as a length prefix plus the raw bytes, so the literal text
 	// has to be findable in the file; a struct of two i32s cannot contain it.
 	if data, rerr := os.read_entire_file(path, context.allocator); rerr == nil {
-		if !strings.contains(string(data), "chapter") {
+		text := string(data)
+		if !strings.contains(text, "chapter") {
 			fmt.eprintf("[ui-probe] marker label is not a cbor string in the saved file\n")
+			ok = false
+		}
+		// Same trap for lane names: Kf_Track.name became a pool handle too, and
+		// Saved_Clip.keyframe_tracks was typed [dynamic]Kf_Track for the same
+		// reason the marker DTO had to change. A handle encodes as two i32s and
+		// cannot contain the text.
+		if !strings.contains(text, "scale") {
+			fmt.eprintf("[ui-probe] keyframe lane name is not a cbor string in the saved file\n")
 			ok = false
 		}
 		delete(data)
@@ -1586,7 +1595,7 @@ project_roundtrip_asserts :: proc(second_pass: bool) -> bool {
 		ok = false
 	} else {
 		sk := c.keyframe_tracks[0]
-		if sk.name != "scale" || len(sk.keys) != 2 {
+		if kf_track_name(&sk) != "scale" || len(sk.keys) != 2 {
 			fmt.eprintf("[ui-probe] scalar kf track mismatch\n")
 			ok = false
 		} else if sk.keys[1].value != 2.0 || sk.keys[1].interp != .Elastic {
@@ -2141,8 +2150,11 @@ ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
 	// The lane's first two keys, in store order (the store keeps them sorted,
 	// which is what makes frame A < frame B). The NAME is what the probe carries
 	// across the move below — the index is not stable.
-	lane_name := strings.clone(cl.keyframe_tracks[lane].name)
-	defer delete(lane_name)
+	// Carried as a borrowed pool view with no clone: the move below reorders
+	// tracks, which invalidates the INDEX but not the view -- the pool block is
+	// fixed, so published bytes never move. This is the property the clone used
+	// to be protecting against, now gone at the source.
+	lane_name := kf_track_name(&cl.keyframe_tracks[lane])
 	f_a := cl.keyframe_tracks[lane].keys[0].frame_off
 	f_b := cl.keyframe_tracks[lane].keys[1].frame_off
 	box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
@@ -2265,7 +2277,7 @@ ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
 // every index after it.
 kf_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
 	for i in 0 ..< len(cl.keyframe_tracks) {
-		if cl.keyframe_tracks[i].name == name {
+		if kf_track_name(&cl.keyframe_tracks[i]) == name {
 			return i, true
 		}
 	}
@@ -2703,9 +2715,9 @@ seed_ui_probe_session :: proc() {
 	// names, exactly as a real session's are freed.
 	kf0 := &timeline.tracks[0].clips[0]
 	kf0.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
-	append(&kf0.keyframe_tracks, Kf_Track {name = strings.clone("transform.x"), keys = make([dynamic]Keyframe, 0, 4)})
+	append(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("transform.x"), keys = make([dynamic]Keyframe, 0, 4)})
 	append(&kf0.keyframe_tracks[0].keys, Keyframe {frame_off = 0, value = 0}, Keyframe {frame_off = 120, value = 1})
-	append(&kf0.keyframe_tracks, Kf_Track {name = strings.clone("zoom"), keys = make([dynamic]Keyframe, 0, 4)})
+	append(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("zoom"), keys = make([dynamic]Keyframe, 0, 4)})
 	append(&kf0.keyframe_tracks[1].keys, Keyframe {frame_off = 30, value = 1})
 
 	sync_track_order()

@@ -996,13 +996,13 @@ kf_sel_same_lane :: proc() -> (name: string, ok: bool) {
 		}
 		if !ok {
 			first = item
-			name = cl.keyframe_tracks[lane].name
+			name = kf_track_name(&cl.keyframe_tracks[lane])
 			ok = true
 			continue
 		}
 		if item.track_idx != first.track_idx ||
 		   item.clip_index != first.clip_index ||
-		   cl.keyframe_tracks[lane].name != name {
+		   kf_track_name(&cl.keyframe_tracks[lane]) != name {
 			return "", false
 		}
 	}
@@ -1153,7 +1153,10 @@ kf_capture_sel :: proc(dst: ^[dynamic]Kf_Snap) -> int {
 		}
 		s: Kf_Snap
 		s.ref = item
-		s.name = strings.clone(cl.keyframe_tracks[lane].name)
+		// Kf_Snap.name is still an owned heap string (it is a UI-side selection
+		// snapshot, freed by the caller), so it keeps its clone -- reading the
+		// lane name through the accessor is the only borrow here.
+		s.name = strings.clone(kf_track_name(&cl.keyframe_tracks[lane]))
 		s.start = k.frame_off
 		s.final = k.frame_off
 		s.mask = k.mask

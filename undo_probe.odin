@@ -349,12 +349,12 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 		// buffer, while delete frees the rows and leaves a header that append
 		// then re-reserves from (segfaulting on the second base_fixture call).
 		for tr in &cl.keyframe_tracks {
+			// Lane names are pool handles (TODO.md Active 19); only keys are owned.
 			delete(tr.keys)
-			delete(tr.name)
 		}
 		clear(&cl.keyframe_tracks)
-		append(&cl.keyframe_tracks, Kf_Track{name = strings.clone("transform.x")})
-		append(&cl.keyframe_tracks, Kf_Track{name = strings.clone("scale")})
+		append(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("transform.x")})
+		append(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("scale")})
 		kf_geom_set_lane_key(cl, "transform.x", 10, 1.0)
 		kf_geom_set_lane_key(cl, "transform.x", 20, 2.0)
 		kf_geom_set_lane_key(cl, "scale", 5, 1.0)

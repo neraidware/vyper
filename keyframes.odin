@@ -18,10 +18,12 @@ import "core:strings"
 // frame_off is clip-relative (timeline frame - clip.timeline_start_frame), so
 // a track travels with its clip: drag and undo snapshots need zero remapping.
 //
-// Ownership: track names are cloned at creation and deep-cloned at every copy
-// site (clone_timeline, duplicate_track/clip); split/trim remaps and
-// free_timeline free what they replace. A clip that is merely carried along
-// (drag, slide) keeps its track arrays shared, the marker-style convention.
+// Ownership: lane NAMES are session-pool handles (TODO.md Active 19) -- interned
+// once, owned by the session, copied by a struct copy, never freed per track.
+// Key ARRAYS are still owned per track at this step: deep-copied at every copy
+// site (clone_timeline, duplicate_track/clip) and freed by split/trim remaps and
+// free_timeline. A clip that is merely carried along (drag, slide) keeps its
+// track arrays shared, the marker-style convention.
 // ---------------------------------------------------------------------------
 
 // KF_MAX_OFFSET bounds "no upper limit" remap filters; 2^28 frames at 60fps is
@@ -83,9 +85,25 @@ Keyframe :: struct {
 
 Kf_Track :: struct {
 	// name: opaque id + gutter label. Consumer-defined; the store only matches.
-	name: string,
-	// keys: sorted ascending by frame_off.
+	// A session-pool handle (TODO.md Active 19): the bytes are immutable and
+	// owned by the session, so a track copy is a struct copy. Read through
+	// kf_track_name, match through kf_track_index.
+	name: Session_Str_Handle,
+	// keys: sorted ascending by frame_off. STILL a per-track owned array at this
+	// step; keys move into a session store once the copy-on-write story for them
+	// is settled (TODO.md Active 19, S2).
 	keys: [dynamic]Keyframe,
+}
+
+// kf_track_name is the track's name. The result borrows the pool. Note this is
+// the KEYFRAME lane name, not a timeline Track's name -- both are called `name`
+// and both are plain strings, so read the right one at each site.
+kf_track_name :: proc(t: ^Kf_Track) -> string {
+	return session_str_view(t.name)
+}
+
+kf_track_set_name :: proc(t: ^Kf_Track, s: string) {
+	t.name = session_str_intern(s)
 }
 
 // ---------------------------------------------------------------------------
@@ -117,9 +135,16 @@ kf_lane_value :: proc(k: Keyframe, idx: int) -> (value: f32, covered: bool) {
 // --- lookups --------------------------------------------------------------
 
 // kf_track_index returns the index of `name`'s track, or -1.
+// The name is compared as TEXT against the track's borrowed view, deliberately
+// not by interning the argument and comparing handles. Callers pass section
+// names that are compile-time constants, and several of them look up a track
+// that does not exist (render.odin asserts one is absent before minting it), so
+// interning here would grow the session pool from a lookup -- a write on a read
+// path, on a predicate clip_geom evaluates per frame. Borrowing costs a compare
+// over a handful of lanes and allocates nothing.
 kf_track_index :: proc(clip: Clip, name: string) -> int {
 	for i in 0 ..< len(clip.keyframe_tracks) {
-		if clip.keyframe_tracks[i].name == name {
+		if kf_track_name(&clip.keyframe_tracks[i]) == name {
 			return i
 		}
 	}
@@ -152,10 +177,10 @@ kf_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, tota
 
 // kf_set_key records `value` on `name`'s track at frame_off (clip-relative),
 // replacing any key already on that frame. Creates the track on first key; a
-// second property mints its own track. The name is cloned here so the live
-// clip owns the string (free_timeline deletes track names; a literal would
-// crash the delete). Writes a SCALAR key on `name`'s own track; a consumer that
-// groups names into packed tracks unwraps first (kf_geom_set_lane_key).
+// second property mints its own track. The name is interned into the session
+// pool, so the track owns no string and free_timeline has nothing to delete.
+// Writes a SCALAR key on `name`'s own track; a consumer that groups names into
+// packed tracks unwraps first (kf_geom_set_lane_key).
 // kf_bump_structure flags that a keyframe sequence has shifted, invalidating
 // any live index-based selection (see kf_view.structure_gen). Wrap to skip 0 so a
 // full-cycle wrap can't accidentally match a selection made at gen 0.
@@ -170,7 +195,7 @@ kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
 	kf_bump_structure()
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
-		append(&clip.keyframe_tracks, Kf_Track {name = strings.clone(name)})
+		append(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(name)})
 		ti = len(clip.keyframe_tracks) - 1
 	}
 	track := &clip.keyframe_tracks[ti]
@@ -221,18 +246,18 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 		}
 	}
 	if len(track.keys) == 0 {
-		// The track owns BOTH its cloned name and its key array, and the
-		// deletion above only POPPED the key array: pop shortens without
-		// releasing the buffer, so track.keys still holds a live allocation
-		// here. Dropping the row with ordered_remove then shifted the tracks
-		// over it, orphaning that buffer for the life of the process — one
-		// leaked key array per track that ever lost its last key, which the
-		// memory gate reports from the undo probe (it is the only gate that
-		// runs a path deleting keys down to empty). kf_free_tracks covers both
-		// fields, and the two deletes here are the mirror of it.
+		// The track owns its key array, and the deletion above only POPPED it:
+		// pop shortens without releasing the buffer, so track.keys still holds a
+		// live allocation here. Dropping the row with ordered_remove then shifted
+		// the tracks over it, orphaning that buffer for the life of the process —
+		// one leaked key array per track that ever lost its last key, which the
+		// memory gate reports from the undo probe (it is the only gate that runs
+		// a path deleting keys down to empty). So the keys array is deleted here;
+		// the name used to be deleted alongside it and no longer needs to be,
+		// because it is a pool handle (TODO.md Active 19).
 		delete(track.keys)
-		delete(track.name)
-		track.name = ""
+		// name is a pool handle: no delete, and nothing to blank either -- the row
+		// leaves the array on the next line.
 		track.keys = nil
 		ordered_remove(&clip.keyframe_tracks, ti)
 	}
@@ -248,7 +273,7 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 kf_set_packed_key :: proc(clip: ^Clip, name: string, frame_off: i32, lanes: [KF_PACK_MAX]f32, mask: u8) {
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
-		append(&clip.keyframe_tracks, Kf_Track {name = strings.clone(name)})
+		append(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(name)})
 		ti = len(clip.keyframe_tracks) - 1
 	}
 	track := &clip.keyframe_tracks[ti]
@@ -527,7 +552,7 @@ kf_clone_mut :: proc(dst: ^Clip, src: Clip) {
 	dst.keyframe_tracks = make([dynamic]Kf_Track, len(src.keyframe_tracks))
 	for i in 0 ..< len(src.keyframe_tracks) {
 		st := src.keyframe_tracks[i]
-		nt := Kf_Track {name = strings.clone(st.name)}
+		nt := Kf_Track {name = st.name} // pool handle: copying it is the copy
 		if len(st.keys) > 0 {
 			nt.keys = make([dynamic]Keyframe, len(st.keys))
 			copy(nt.keys[:], st.keys[:])
@@ -541,9 +566,7 @@ kf_clone_mut :: proc(dst: ^Clip, src: Clip) {
 // solely owns (teardown, delete paths).
 kf_free_tracks :: proc(tracks: [dynamic]Kf_Track) {
 	for &t in tracks {
-		if t.name != "" {
-			delete(t.name)
-		}
+		// name is a pool handle and owns nothing; only keys need a free.
 		if t.keys != nil {
 			delete(t.keys)
 		}
@@ -552,10 +575,10 @@ kf_free_tracks :: proc(tracks: [dynamic]Kf_Track) {
 }
 
 // kf_rebuild_tracks builds a fresh track array from src by filtering each
-// track's keys to clip-relative [lo, hi), re-relativizing survivors by -lo and
-// cloning the track name. Tracks left with no keys are dropped. src is
-// untouched (its owner frees it after the halves are built), so the output
-// shares no owned memory with it.
+// track's keys to clip-relative [lo, hi) and re-relativizing survivors by -lo.
+// Tracks left with no keys are dropped. src is untouched (its owner frees it
+// after the halves are built), so the output shares no owned memory with it --
+// the name, being a pool handle, is shared by design and needs no copy.
 kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Track {
 	out := make([dynamic]Kf_Track, 0, len(src))
 	for st in src {
@@ -571,7 +594,7 @@ kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Tr
 			}
 		}
 		if len(keys) > 0 {
-			append(&out, Kf_Track {name = strings.clone(st.name), keys = keys})
+			append(&out, Kf_Track {name = st.name, keys = keys}) // pool handle
 		} else {
 			delete(keys)
 		}

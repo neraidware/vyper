@@ -251,8 +251,9 @@ kf_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 	for &c in track.clips {
 		for &t in c.keyframe_tracks {
 			dup := false
+			lane := kf_track_name(&t)
 			for i in 0 ..< n {
-				if out[i] == t.name {
+				if out[i] == lane {
 					dup = true
 					break
 				}
@@ -263,7 +264,7 @@ kf_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 			if n >= rows || n >= len(out) {
 				return n
 			}
-			out[n] = t.name
+			out[n] = lane
 			n += 1
 		}
 	}
