@@ -556,6 +556,34 @@ target_timeline_probe() {
 	VYPER_TL_PROBE=1 timeout 120 ./vyper
 }
 
+# The OS file-drag-and-drop probe (dnd_probe.odin). Dragging a file in from the
+# desktop used to do NOTHING at all: the app polled SDL events and handled six
+# of them, none of them the five drop kinds, so the feature was absent on every
+# platform and nothing failed. Ignoring events is not a crash, which is why the
+# probe covers the decisions a drop makes -- zone routing, the import gate, and
+# the gesture state -- rather than the delivery a headless run cannot perform.
+target_dnd_probe() {
+	require_fresh_binary dnd-probe || return 1
+	VYPER_DND_PROBE=1 timeout 120 ./vyper
+}
+
+# The memory gate for dnd_probe: the drop path takes an SDL-owned C string for
+# each dropped file and hands it to the bin, which clones what it keeps. The
+# clone is the whole reason sdl.free on the event buffer is safe, and this is
+# the only gate that exercises that handoff (import_path_to_bin's refusal branch
+# plus the refusal of a path SDL would have delivered). Same four invariants as
+# target_valgrind.
+target_dnd_valgrind() {
+	require_fresh_valgrind_binary dnd-valgrind || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/dnd.log
+	VYPER_DND_PROBE=1 timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	local rc=$?
+	echo "dnd-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+	valgrind_assert "$log" dnd-valgrind '\[dnd-probe\] all checks passed'
+}
+
 # The byte-exact RGBA->NV12 ground truth (yuv_exact.odin) against swscale.
 #
 # This is the gate S1c's GPU shader cannot exist without. keyed_export's 1.0x
@@ -893,7 +921,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -913,6 +941,8 @@ main() {
 	render_live_valgrind) target_render_live_valgrind ;;
 	undo_valgrind) target_undo_valgrind ;;
 	timeline_probe) target_timeline_probe ;;
+	dnd_probe) target_dnd_probe ;;
+	dnd_valgrind) target_dnd_valgrind ;;
 	yuv_exact) target_yuv_exact ;;
 	gpu_nv12) target_gpu_nv12 ;;
 	gpu_composite) target_gpu_composite ;;
@@ -929,7 +959,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

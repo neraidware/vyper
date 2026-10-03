@@ -10,9 +10,9 @@ import sdl "vendor:sdl3"
 // ---------------------------------------------------------------------------
 
 // handle_sdl_events drains the SDL event queue: window close, keyboard (text
-// fields, then app shortcuts), text input, and wheel scrolling per widget.
-// Sets *running = false on a quit/close event. Nothing here depends on the
-// current mouse position.
+// fields, then app shortcuts), text input, wheel scrolling per widget, and OS
+// file drops. Sets *running = false on a quit/close event. Nothing here depends
+// on the current mouse position.
 //
 // This is the app's ONLY SDL poll site, which is what makes kbd.drain a
 // meaningful scope: one call empties the queue, so anything that needs to know
@@ -50,6 +50,8 @@ handle_sdl_events :: proc(running: ^bool) {
 			}
 		case .MOUSE_WHEEL:
 			handle_mouse_wheel(event.wheel)
+		case .DROP_BEGIN, .DROP_POSITION, .DROP_FILE, .DROP_COMPLETE, .DROP_TEXT:
+			handle_file_drop_event(event)
 		}
 	}
 	// Between drains, never inside one. SDL documents that activating an IME

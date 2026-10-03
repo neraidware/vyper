@@ -155,6 +155,7 @@ render_ui_frame :: proc(
 		draw_gain_knob(renderer, command_buffer, pass)
 		draw_kf_add_buttons(renderer, command_buffer, pass)
 		draw_media_drag_ghost(renderer, command_buffer, pass)
+		draw_file_drag_highlight(renderer, command_buffer, pass)
 		if len(timeline.tracks) > 0 {
 			draw_timeline_ruler(renderer, command_buffer, pass)
 			draw_render_range(renderer, command_buffer, pass)

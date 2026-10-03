@@ -40,6 +40,12 @@ BUTTON_BORDER_HOVER :: clay.Color{167, 192, 128, 255} // green — active accent
 SWITCH_TRACK_ON :: clay.Color{66, 80, 71, 255} // bg_green — muted green switch track when active
 AUDIO_CLIP :: clay.Color{84, 58, 72, 255} // bg_visual — muted purple clip fill
 SELECT_BORDER :: clay.Color{127, 187, 179, 255} // blue — selection
+// OS file-drag drop zone: the tint fills the panel that would take the files
+// and SELECT_BORDER rings it -- the same blue as a selection, because the
+// gesture means the same thing: this region is where the payload goes.
+DROP_ZONE_TINT :: clay.Color{127, 187, 179, 48}
+DROP_ZONE_EDGE_W :: 2
+DROP_ZONE_LABEL_W :: 220
 MARKER_COLOR :: clay.Color{219, 188, 127, 255} // yellow — clip markers
 // Keyframe diamond fills: neutral by default, light (fg) when selected. The
 // selected state lands with the keyframe selection slice. Timeline diamonds

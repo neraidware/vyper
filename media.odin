@@ -648,6 +648,28 @@ import_media :: proc(path: cstring) {
 	}
 }
 
+// import_path_to_bin routes one path into the media bin and nothing else: a
+// subtitle file loads as a subtitle asset, anything ffprobe reports a stream
+// for (video, audio, or an image) imports as media, and anything else -- a
+// text file, a nonexistent path -- is refused with a notice. Returns the bin
+// asset id, or 0 when the bin cannot hold the file.
+//
+// This is the single "is this something the bin can hold" decision, shared by
+// the Open-File flow and by OS file drops. It was inline in open_file_at until
+// a second caller needed the same answer; two copies of a decodability rule
+// are two places for it to be wrong.
+import_path_to_bin :: proc(path: cstring) -> u64 {
+	if is_srt_pick(path) {
+		return import_srt_to_bin(path)
+	}
+	probe := probe_streams(path)
+	if !probe.has_video && !probe.has_audio && !media_is_image(path) {
+		show_ui_noticef(4000, "Could not open '%s': not decodable media", path_basename(path))
+		return 0
+	}
+	return import_media_to_bin(path)
+}
+
 // open_file_at opens a media/subtitle file through the Open-File flow: subtitle
 // files load into the bin only (the user drags them onto a track), decodable
 // media imports to the bin AND is placed on the timeline (appended at the end).
@@ -656,20 +678,14 @@ import_media :: proc(path: cstring) {
 // read -- the bin clones it (import_media_to_bin/import_srt_to_bin), so the
 // caller owns and may free its buffer as soon as this returns.
 open_file_at :: proc(path: cstring) -> (opened: bool) {
-	if is_srt_pick(path) {
-		opened = import_srt_to_bin(path) != 0
-		return
-	}
-	probe := probe_streams(path)
-	if !probe.has_video && !probe.has_audio && !media_is_image(path) {
-		show_ui_noticef(4000, "Could not open '%s': not decodable media", path_basename(path))
+	asset_id := import_path_to_bin(path)
+	if asset_id == 0 {
 		return false
 	}
-	if asset_id := import_media_to_bin(path); asset_id != 0 {
+	if !is_srt_pick(path) {
 		add_asset_to_timeline(asset_id, 0, timeline_duration())
-		return true
 	}
-	return false
+	return true
 }
 
 open_file_picker :: proc() -> cstring {
