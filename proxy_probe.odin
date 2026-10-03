@@ -211,11 +211,17 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 	}
 	// Light content check through the segments: decode frame 0 and the last
 	// reachable frame via their picked files and compare to the source (lossy,
-	// so tolerate per-channel error). The last reachable frame is frame_count-3,
-	// not -1: the duration*fps estimate overshoots the real end-of-stream on
-	// exact-duration synthetic media (see proxy_probe_run's scrub test), so the
-	// tail frames do not reliably decode as ground truth.
-	check_frames := []i64{0, frame_count - 3, frame_count - 1}
+	// so tolerate per-channel error). The final frame is the most valuable
+	// check -- a zero-duration last stts sample makes exactly it unaddressable
+	// -- but the duration*fps estimate can overshoot the real end-of-stream on
+	// exact-duration synthetic media (see proxy_probe_run's scrub test), in
+	// which case the SOURCE also has no frame there. That is an estimator
+	// artifact, not a proxy defect, so frame_count-1 is skipped when the source
+	// ground truth will not decode.
+	check_frames := []i64{0, frame_count - 1}
+	if frame_count >= 3 {
+		check_frames = []i64{0, frame_count - 3, frame_count - 1}
+	}
 	check_fbuf: [4096]u8
 	for f, i in check_frames {
 		pick, pick_base := proxy_pick_for_frame(path, frame_count, f, check_fbuf[:], false)
@@ -226,7 +232,12 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 		gt, px: Clip_Decoder
 		defer clip_decoder_reset(&gt)
 		defer clip_decoder_reset(&px)
-		if !decode_clip_frame_sync(&gt, path, f, gts[i][:]) {
+		gt_ok := decode_clip_frame_sync(&gt, path, f, gts[i][:])
+		if !gt_ok {
+			if f == frame_count - 1 {
+				fmt.printf("[proxy-bg-test] note: frame %d past end-of-stream (est. overshoot), skipping\n", f)
+				continue
+			}
 			fmt.printf("[proxy-bg-test] FAIL: source decode frame %d\n", f)
 			os.exit(1)
 		}

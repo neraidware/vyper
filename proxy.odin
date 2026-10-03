@@ -508,6 +508,15 @@ proxy_valid_cache_hit :: proc(proxy: cstring, src_frames: i64) -> bool {
 // and index churn; smaller ones make the head of the timeline usable sooner.
 PROXY_SEG_FRAMES :: i64(900)
 
+// PROXY_ENCODER_VERSION is stamped into proxy .idx files by proxy_idx_store and
+// required by proxy_segments_complete, so a proxy built by an older encoder is
+// treated as incomplete and rebuilt on the next import instead of serving
+// segments with the old behavior. Bump this whenever the encoder settings, the
+// muxer path, or the segment layout change in a way that invalidates previously
+// written segments. Only the current version is ever served; un-stamped indices
+// (written before the stamp existed) read as version 0 and are stale.
+PROXY_ENCODER_VERSION :: 1
+
 // proxy_segment_path_for writes the segment-<k> proxy path into buf (NUL
 // terminated) and returns a cstring into it, or ("", false) on overflow.
 proxy_segment_path_for :: proc(src: cstring, k: int, buf: []u8) -> (cstring, bool) {
@@ -761,7 +770,12 @@ proxy_front_video_under_playhead :: proc() -> ^Clip {
 // segments 0..len(segs)-1 exist; segment k covers [k*seg_frames, ...).
 Proxy_Idx :: struct {
 	seg_frames: i64,
-	segs:       [dynamic]i64,
+	// enc_ver is the PROXY_ENCODER_VERSION the segments were built with; a
+	// mismatch fails proxy_segments_complete and forces a rebuild. 0 when the
+	// idx predates the stamp (the parser leaves this untouched and the caller
+	// sees 0 != PROXY_ENCODER_VERSION).
+	enc_ver: i64,
+	segs:    [dynamic]i64,
 }
 
 // proxy_idx_load parses a source's .idx file into `idx`. Returns false when no
@@ -777,14 +791,21 @@ proxy_idx_load :: proc(src: cstring, idx: ^Proxy_Idx) -> bool {
 		return false
 	}
 	idx^ = {}
-	sf: i64
-	got_header := false
+	got_seg_frames := false
 	for line in strings.split_lines(string(data), context.temp_allocator) {
-		if !got_header {
+		// Header lines may appear in any order before the first entry; enc_ver
+		// defaults to 0 when absent (pre-stamp idx) so the caller sees a stale
+		// index rather than a usable one.
+		if strings.has_prefix(line, "enc_ver ") {
+			if v, pok := strconv.parse_i64(line[len("enc_ver "):]); pok && v >= 0 {
+				idx.enc_ver = v
+			}
+			continue
+		}
+		if !got_seg_frames {
 			if strings.has_prefix(line, "seg_frames ") {
 				if v, pok := strconv.parse_i64(line[len("seg_frames "):]); pok && v > 0 {
-					sf = v
-					got_header = true
+					got_seg_frames = true
 					idx.seg_frames = v
 				}
 			}
@@ -805,7 +826,7 @@ proxy_idx_load :: proc(src: cstring, idx: ^Proxy_Idx) -> bool {
 		}
 		idx.segs[ki] = ci
 	}
-	if !got_header {
+	if !got_seg_frames {
 		return false
 	}
 	return true
@@ -827,6 +848,12 @@ proxy_segments_complete :: proc(src: cstring, src_frames: i64) -> bool {
 	}
 	defer delete(idx.segs)
 	if idx.seg_frames != PROXY_SEG_FRAMES {
+		return false
+	}
+	// A proxy stamped by an older encoder (or before the stamp existed) is not
+	// a cache hit: its segments can carry the old encoder's defects (e.g. a
+	// zero-duration last-sample tail). Force a rebuild instead of serving it.
+	if idx.enc_ver != PROXY_ENCODER_VERSION {
 		return false
 	}
 	// Enough segments must be LISTED to cover the source (with the same
@@ -857,6 +884,7 @@ proxy_idx_store :: proc(src: cstring, idx: ^Proxy_Idx) {
 	sb := strings.builder_make()
 	defer strings.builder_destroy(&sb)
 	fmt.sbprintf(&sb, "seg_frames %d\n", idx.seg_frames)
+	fmt.sbprintf(&sb, "enc_ver %d\n", PROXY_ENCODER_VERSION)
 	for k in 0 ..< len(idx.segs) {
 		fmt.sbprintf(&sb, "%d %d\n", k, idx.segs[k])
 	}

@@ -643,6 +643,15 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		}
 	}
 
+	// Stamp the index even when every segment was reused (no encode ran): the
+	// per-segment store above only fires for freshly encoded segments, and a
+	// reused-only window would otherwise leave the on-disk idx with whatever
+	// PROXY_ENCODER_VERSION (or pre-stamp version, 0) built it. proxy_segments_complete
+	// rejects a version mismatch, so a re-import would rebuild forever. This
+	// store also re-publishes reused segments that were previously enrolled in
+	// a cancelled window.
+	proxy_idx_store(src, &idx)
+
 	import_bg_set_phase(ib, .Verifying)
 	phase: Build_Phase = .Done_Ok
 	// Window-relative completion: a mid-source window must cover ITS window
