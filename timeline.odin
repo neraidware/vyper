@@ -518,7 +518,11 @@ split_clip_at_playhead :: proc() {
 		if left_len <= 0 || right_len <= 0 {
 			continue
 		}
-		right := c^
+		// The right half is an independent clip, not a value copy: a copy would
+		// alias the name (freed twice by free_timeline) and the keyframe backs
+		// (mutated by both halves). Everything after this point edits the copy's
+		// own allocations.
+		right := clip_deep_copy(c)
 		// The new half is a distinct clip instance: re-mint its identity instead
 		// of inheriting the left half's id (two clips sharing one clip_id breaks
 		// every clip_id-keyed path -- preview slot identity, find_preview_slot,
@@ -533,19 +537,24 @@ split_clip_at_playhead :: proc() {
 		}
 		right.source_length_frames = right_len
 		right.timeline_start_frame = frame
-		old_markers := c.markers
-		c.markers = filter_markers_in_range(old_markers[:], c.source_start_frame, left_len)
+		c.markers = filter_markers_in_range(
+			c.markers[:],
+			c.source_start_frame,
+			left_len,
+		)
 		c.source_length_frames = left_len
 		right.markers = filter_markers_in_range(
-			old_markers[:],
+			right.markers[:],
 			right.source_start_frame,
 			right_len,
 		)
-		free_markers(&old_markers)
 		// Split remap (slice-1 rule): left keeps keys < left_len, right gets
 		// keys >= left_len re-relativized by -left_len; values preserved. The
-		// old shared backing is freed; each half owns fresh clones.
-		kf_split_parts(c, &right, i32(left_len))
+		// halves own separate backings (the right's came from clip_deep_copy), so
+		// each trims its own -- kf_split_parts, which rebuilt both from one
+		// shared backing, is for copies that still alias.
+		kf_trim_tail(c, i32(left_len))
+		kf_trim_head(&right, i32(left_len))
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
 	if vyper_trace {
@@ -688,6 +697,72 @@ clone_marker :: proc(m: ^Clip_Marker) -> Clip_Marker {
 	return Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)}
 }
 
+// ---------------------------------------------------------------------------
+// Clip ownership: the whole copy/free contract, in two procs.
+//
+// A Clip is a VALUE struct with three hidden owning fields: `name` (heap
+// string), `markers` (an array whose entries each own a `label`), and
+// `keyframe_tracks` (an array whose entries own a name and a keys backing). A
+// value copy of a Clip therefore SILENTLY ALIASES all three, and every site that
+// built or dropped a Clip had to remember all three by hand.
+//
+// That list was written out five times for free and three times for copy, and
+// the two lists disagreed: the ripple delete (timeline.odin) and the raw delete
+// each freed markers and keyframe tracks but NOT the name, so every deleted clip
+// leaked its name; and the two split paths copied the struct instead of deep
+// copying, so both halves held ONE name pointer that free_timeline then freed
+// twice. A list a site has to remember is a list a site will get wrong — twice
+// already, in the two most-used edit verbs in the app.
+//
+// So: clip_deep_copy is the only way to build a Clip from another Clip, and
+// clip_payload_free is the only way to drop one. A site that copies or drops a
+// clip calls these and does nothing else.
+//
+// The audit is therefore: no site outside this pair frees a CLIP's fields by
+// hand. `free_markers(&old_markers)` in the ripple's trim branches is NOT a
+// violation — those replace one clip's marker array with a filtered one and must
+// release the old array, which is a field edit, not a clip drop; the same goes
+// for kf_trim_* rebuilding a keys backing in keyframes.odin.
+// ---------------------------------------------------------------------------
+
+// clip_deep_copy returns a fully independent copy of src: every value the same,
+// every owned field freshly allocated. Callers re-mint identity (clip_id,
+// link_id) and adjust geometry on the copy afterwards; that is value editing,
+// which needs no ownership care. Anything else a copy needs to own differently
+// is a sign the call wants clip_payload_free on the original instead.
+clip_deep_copy :: proc(src: ^Clip) -> Clip {
+	c := src^
+	c.name = strings.clone(src.name)
+	if len(src.markers) > 0 {
+		c.markers = make([dynamic]Clip_Marker, len(src.markers))
+		for i in 0 ..< len(src.markers) {
+			c.markers[i] = clone_marker(&src.markers[i])
+		}
+	} else {
+		c.markers = nil
+	}
+	// The copy's tracks ALIAS src's right now (c := src^ copied the pointer);
+	// kf_clone_mut replaces the pointer without freeing, which is exactly right
+	// here — freeing would hit src's memory.
+	kf_clone_mut(&c, src^)
+	return c
+}
+
+// clip_payload_free releases everything the clip OWNS and clears the pointers,
+// so a second call is a no-op. Every drop path calls this; nothing else frees a
+// clip's fields.
+clip_payload_free :: proc(c: ^Clip) {
+	free_markers(&c.markers)
+	if c.keyframe_tracks != nil {
+		kf_free_tracks(c.keyframe_tracks)
+		c.keyframe_tracks = nil
+	}
+	if c.name != "" {
+		delete(c.name)
+		c.name = ""
+	}
+}
+
 free_markers :: proc(markers: ^[dynamic]Clip_Marker) {
 	if markers^ == nil {
 		return
@@ -768,8 +843,7 @@ delete_selected_clip_raw :: proc() {
 		}
 		removed := tt.clips[target.index]
 		ordered_remove(&tt.clips, target.index)
-		free_markers(&removed.markers)
-		kf_free_tracks(removed.keyframe_tracks)
+		clip_payload_free(&removed)
 		if vyper_trace {
 			fmt.printf(
 				"[tl] deleted clip raw src=%s start=%d len=%d\n",
@@ -834,6 +908,21 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			append(&new_clips, c)
 		case cs < start && ce > end:
 			// Straddles the whole region: split into left + right pieces.
+			//
+			// The right half is an independent deep copy, taken FIRST and from
+			// the pristine `c`: the left half edits below free the marker array
+			// and keys backing that `c` still points at, so a copy made after
+			// them would clone freed memory.
+			//
+			// Both halves must be separate instances, not two value copies of one
+			// struct: sharing the name is a double free at teardown, sharing a
+			// keys backing lets either half's edits strand the other, and
+			// sharing a clip_id breaks every clip_id-keyed path (preview slot
+			// identity, find_preview_slot, the prewarm decoder handoff). This
+			// branch did all three, and appended `left` twice.
+			right := clip_deep_copy(&c)
+			right.clip_id = new_clip_id()
+
 			left := c
 			left.source_length_frames = start - cs
 			left.markers = filter_markers_in_range(
@@ -841,8 +930,10 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 				left.source_start_frame,
 				left.source_length_frames,
 			)
+			// Keyframe remap (slice-1 rule): left keeps keys < (start-cs).
+			kf_trim_tail(&left, i32(start - cs))
 			append(&new_clips, left)
-			right := c
+
 			if !right.is_still {
 				right.source_start_frame += end - cs
 			}
@@ -853,11 +944,8 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 				right.source_start_frame,
 				right.source_length_frames,
 			)
-			// Keyframe split remap: left keeps keys < (start-cs), right gets
-			// the rest re-relativized by - (start-cs) (slice-1 rule). Frees
-			// the shared backing; each half owns fresh clones.
-			kf_split_parts(&left, &right, i32(start - cs))
-			append(&new_clips, left)
+			// right keeps the rest, re-relativized by -(start-cs).
+			kf_trim_head(&right, i32(start - cs))
 			append(&new_clips, right)
 			// Original markers array no longer referenced by any copy.
 			free_markers(&c.markers)
@@ -899,8 +987,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			free_markers(&old_markers)
 		case cs >= start && ce <= end:
 			// Otherwise the clip is entirely inside the region: dropped.
-			free_markers(&c.markers)
-			kf_free_tracks(c.keyframe_tracks)
+			clip_payload_free(&c)
 		}
 	}
 	delete(track.clips)
@@ -1723,36 +1810,22 @@ duplicate_track :: proc(index: int) {
 		// Deep copy array persists on the inserted track: context.allocator.
 		clips = make([dynamic]Clip, 0, len(src.clips)),
 	}
-	// Copy each clip by VALUE: mutations below land on the duplicate, never on
-	// the original track's clip. (A `for &c` loop would alias src.clips[i] and
-	// sever the ORIGINAL's link group.)
+	// A duplicated clip is a NEW clip instance: mint a fresh identity so
+	// update_preview_slots claims its own slot instead of collapsing into the
+	// original's (same clip_id = same slot = the original's transform/layer
+	// wins and the copy's content never paints). Sever the link group too, so
+	// selecting a duplicate never drags the original's partner tracks along.
+	//
+	// Deep copy rather than value copy: the duplicate must own its name,
+	// markers and keyframe backing outright — deleting this track frees them,
+	// and a keyframe edit here must not strand the original on a reallocated
+	// backing. clip_deep_copy is the same rule split_clip_at_playhead and the
+	// ripple straddle follow, so it cannot be honoured there and forgotten
+	// here.
 	for i in 0 ..< len(src.clips) {
-		c := src.clips[i]
-		// A duplicated clip is a NEW clip instance: mint a fresh identity so
-		// update_preview_slots claims its own slot instead of collapsing into
-		// the original's (same clip_id = same slot = the original's transform/
-		// layer wins and the copy's content never paints). Duplicated clips
-		// are independent copies: sever its link group so selecting it never
-		// drags the original's partner tracks along.
+		c := clip_deep_copy(&src.clips[i])
 		c.clip_id = new_clip_id()
 		c.link_id = 0
-		// Clone the name so the two tracks never share one owned string:
-		// rename frees the old name, and the undo snapshot reader frees titles
-		// per clip, so a shared pointer would dangle/double-free.
-		c.name = strings.clone(c.name)
-		if len(c.markers) > 0 {
-			// Clone the markers array so the two tracks share no owned memory:
-			// deleting one track (remove_track frees per-clip markers) must not
-			// leave the other track's copy dangling.
-			c.markers = filter_markers_in_range(
-				c.markers[:],
-				c.source_start_frame,
-				c.source_length_frames,
-			)
-		}
-		// Deep-clone keyframe tracks: a later key edit on either copy would
-		// reallocate a shared keys backing and strand the other clip on it.
-		kf_clone_mut(&c, src.clips[i])
 		append(&new_track.clips, c)
 	}
 	append(&timeline.tracks, new_track)
@@ -1774,41 +1847,13 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 	undo_begin()
 	track := &timeline.tracks[track_idx]
 	src := &track.clips[index]
-	c := Clip {
-		clip_id              = new_clip_id(),
-		asset_id             = src.asset_id,
-		link_id              = 0,
-		path                 = src.path,
-		name                 = strings.clone(src.name),
-		kind                 = src.kind,
-		is_still             = src.is_still,
-		generator            = src.generator,
-		srt_id               = src.srt_id,
-		stream_index         = src.stream_index,
-		source_start_frame   = src.source_start_frame,
-		source_length_frames = src.source_length_frames,
-		timeline_start_frame = src.timeline_start_frame,
-		source_w             = src.source_w,
-		source_h             = src.source_h,
-		transform_x          = src.transform_x,
-		transform_y          = src.transform_y,
-		scale                = src.scale,
-		crop_l               = src.crop_l,
-		crop_r               = src.crop_r,
-		crop_t               = src.crop_t,
-		crop_b               = src.crop_b,
-		opacity              = src.opacity,
-		gain                 = src.gain,
-	}
-	for m in src.markers {
-		append(
-			&c.markers,
-			Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)},
-		)
-	}
-	// Independent copy: deep-clone keyframe tracks, never alias src's (same
-	// rule as markers/name above — a shared keys backing strands one copy).
-	kf_clone_mut(&c, src^)
+	// A fresh instance of the same clip: clip_deep_copy carries every value
+	// (including ones added to Clip since this was written by hand — the field
+	// list was the bug: a new field silently defaulted to zero on the copy),
+	// and re-minting identity below is the only difference.
+	c := clip_deep_copy(src)
+	c.clip_id = new_clip_id()
+	c.link_id = 0
 	place := clip_timeline_end(src^)
 	c.timeline_start_frame = clip_place_in_track(track, index, c.source_length_frames, place)
 	insert_at := index + 1
@@ -1834,8 +1879,7 @@ remove_track :: proc(index: int) {
 	undo_begin()
 	removed := timeline.tracks[index]
 	for &c in removed.clips {
-		free_markers(&c.markers)
-		kf_free_tracks(c.keyframe_tracks)
+		clip_payload_free(&c)
 	}
 	delete(removed.clips)
 	name_buf: [128]u8

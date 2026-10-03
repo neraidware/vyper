@@ -3856,7 +3856,7 @@ gate unreproducible afterwards.
 
 ---
 
-## Active 12 — Keyframe/marker overlay culled to the visible lane
+## Active 13 — Keyframe/marker overlay culled to the visible lane
 
 **Why:** keyframe diamonds and clip markers painted over other panels. They are
 drawn by `draw_keyframes` / `draw_clip_markers` (gpu_draw.odin), which run as an
@@ -3918,3 +3918,110 @@ Clay scissor. That is correct today only because `render_clay` also restores to
 full (`defer` at gpu_draw.odin:232) and every overlay runs after it. Left as is:
 the enclosing scissor is always full at these points, so saving it would be
 indirection with no invariant to protect.
+
+---
+
+## Active 14 — Backspace ripple delete + Clip ownership in two procs
+
+**Status: landed 2026-10-03 on `ripple-delete` (base `8c01a84`).**
+Numbered 14 on the merge, not 13: `file-dnd` took Active 12 on `main` and
+overlay culling took 13, so the three fix branches carry 13/14/15 and no two
+headings collide.
+
+**Problem.** Backspace did nothing. `route_key_down` asked
+`edit_field_claims_key` before the app action layer, and that proc claimed
+Backspace, Return and Escape **unconditionally** — the guard it needed was a
+comment saying "the router checks the field state", but the router never did.
+So with no field open, an edit field still ate every key a user would use to
+delete a clip, dismiss the help overlay, or close a menu. The action table was
+fine; the key never got there.
+
+Investigating it turned up the reason it was worth more than one line of
+router: **`Clip` is a value struct with three hidden owning fields** — `name`
+(heap string), `markers` (entries own a `label`) and `keyframe_tracks` (entries
+own a name and a keys backing). So a plain `Clip` copy silently aliases all
+three, and the list of things to free on drop had been written out **five**
+times for free and **three** times for copy. The two lists already disagreed,
+in the two most-used edit verbs in the app:
+
+| Site | Was | Cost |
+|---|---|---|
+| `delete_selected_clip_raw` | freed markers + keyframes, not `name` | leaked name per raw delete |
+| ripple delete, contained-clip case | freed markers + keyframes, not `name` | leaked name per ripple |
+| `split_clip_at_playhead` | `right := c^` (value copy) | both halves shared **one** name |
+| ripple straddle case | `right := c` **and appended `left` twice** | duplicated clip; shared name/keyframe backing |
+| `duplicate_clip` | 25-line hand-written field list | a field added later silently defaulted to zero on the copy |
+
+The name leaks were invisible to the compiler and to every probe; the split
+aliasing was a latent double free that the leak was *hiding* (only one free ever
+happened). Both are the same defect: a site has to remember a list, and it
+already had.
+
+**Steps** (each lands + probe + vet before the next):
+- [x] S1. Key routing: `edit_field_claims_key` returns false when
+      `edit_state.field == .None`, so Backspace/Return/Escape fall through to
+      the app layer. With no field open the router reaches `app_claims_key`; with
+      one open the field still owns its three keys.
+- [x] S2. Ownership: `clip_deep_copy(src: ^Clip) -> Clip` and
+      `clip_payload_free(c: ^Clip)` in `timeline.odin` are now the only way to
+      build a Clip from another Clip and the only way to drop one. `clone_timeline`,
+      `free_timeline`, `remove_track`, both delete paths, both split paths and
+      both duplicate paths call them; the hand-written lists are gone
+      (`duplicate_clip` lost 25 lines and can no longer forget a field).
+      `clip_payload_free` clears what it frees, so a second call is a no-op.
+- [x] S3. Ripple straddle correctness: the right half is deep-copied from the
+      **pristine** clip before the left half's edits free the shared backing, it
+      re-mints `clip_id`, and `left` is appended exactly once. The old branch
+      did all three wrong.
+- [x] S4. Keyframe trims: `kf_trim_tail`/`kf_trim_head` replace
+      `kf_split_parts` at both split sites. They were needed because the two
+      halves no longer share one backing — a helper whose contract is "these two
+      clips alias one keys array" has no remaining caller, and keeping it would
+      be an invitation to reintroduce the aliasing. The slice-1 remap rule (left
+      keeps keys `< F`, right re-relativizes by `-F`, values preserved) is
+      unchanged and still probed.
+
+**Probe.**
+- `ui_probe_backspace_ripple_asserts`: clicks clip 1 on track 0, presses real
+  `sdl.K_BACKSPACE`, asserts the clip is gone, the clip before the cut did not
+  move, and the tail slid left by exactly the removed span (the gap closing — the
+  actual bug). Also asserts Escape reaches `escape_dismiss` with no field open,
+  and that Backspace still edits an **open** number field ("073" → "07"), which
+  is the reason the field owns keys at all.
+- `ui_probe_key_routing_asserts`: a closed number field claims no key; an open
+  one claims exactly Escape, Return, Keypad-Enter and Backspace.
+- `timeline_probe` `test_ripple_dispatch_closes_gap`: the same gap-closing
+  invariant through `dispatch_action(.Delete_At_Playhead)`, without the mouse.
+- `timeline_probe` `test_ripple_straddle_splits_once`: a region strictly inside a
+  clip leaves exactly **2** clips (the old branch left 3), with different
+  `clip_id`s and the right piece reading the source after the removed span.
+- `timeline_probe` `test_split_halves_own_their_payload`: after a split the halves
+  have distinct name pointers, one keyframe lane each with one key, distinct
+  marker-label pointers, and a keyframe edit on one half does not appear in the
+  other.
+- Mutations, all caught: restoring the double `append` in the straddle branch
+  fails with "a straddle ripple must leave 2 clips (got 3)"; restoring
+  `right := c^` in the split segfaults inside the probe (the shared keys backing
+  freed by the left half's trim is read by the right half); reverting the S1
+  router guard fails the ripple probe with "the gap did NOT close".
+
+**Accept.**
+- Gates: `check build probe keyframe_probe timeline_probe transform_probe
+  geom_key_probe opacity undo_valgrind valgrind` pass. Valgrind is back to the pre-work baseline exactly —
+  `11720 errors from 23 contexts` (FFmpeg/Odin noise), `definitely lost: 0`,
+  `indirectly lost: 0`, no invalid free/read/write. `zorder`/`keyed_export` are
+  unrunnable here (missing `target/keyed_export/src.mp4`).
+- One defect was found *by* the memory gate rather than by a probe: the ripple
+  probe snapshotted track 0 with a shallow `Clip` copy to restore it afterwards,
+  which aliased payloads the ripple then freed, so the restore handed teardown an
+  already-freed name (`free(): invalid size`). The backup is now a
+  `clip_deep_copy` and the rebuilt clips are released with `clip_payload_free`.
+  Worth recording because the shallow backup looked correct and passed every
+  assertion — the probe was green and the process aborted at exit.
+
+**Not done here (deliberately).** `Clip` stays a value struct with owned fields.
+The follow-up is to move `name`, marker labels, keyframe track names and keys
+into session-owned pools so `Clip` becomes POD data, `clip_deep_copy` becomes a
+struct copy, and `clone_timeline` stops allocating. That is a separate
+work-stream (it touches project-file load/save, undo snapshots, the renderer and
+the ripple rebuild) and should not be smuggled in behind a bug fix.

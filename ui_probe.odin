@@ -207,6 +207,13 @@ for j := 0; j < len(raw); {
 	if !ui_probe_kf_click_vs_drag_asserts() {
 		os.exit(1)
 	}
+	// Backspace ripple-deletes the selected clip and closes the gap. Driven from
+	// a real clip press through the real key router, because the report was
+	// "Backspace doesn't ripple" and every layer of that chain (which element the
+	// press selects, the router, the action, the ripple) is a place it can break.
+	if !ui_probe_backspace_ripple_asserts() {
+		os.exit(1)
+	}
 	// The opacity fill's painted width is opacity * the track's laid-out width.
 	// SizingPercent is a 0-1 fraction; a 0-100 value still "looks" plausible in
 	// a screenshot but overflows the track for every non-zero opacity.
@@ -742,16 +749,46 @@ ui_probe_key_routing_asserts :: proc() -> bool {
 		want:  bool,
 		which: string,
 	}
-	claims := [?]Claim {
+	// CLOSED: every one of these has to fall through. Backspace ripple-deletes
+	// the selection and Esc dismisses overlays, so a closed field claiming them
+	// silently kills both -- which is exactly what shipped (see
+	// ui_probe_backspace_ripple_asserts).
+	closed := [?]Claim {
+		{ sdl.K_U, false, "an unbound key reaches the app" },
+		{ sdl.K_ESCAPE, false, "Esc reaches escape_dismiss" },
+		{ sdl.K_RETURN, false, "Enter reaches the app" },
+		{ sdl.K_RETURN2, false, "the keypad Enter reaches the app" },
+		{ sdl.K_BACKSPACE, false, "Backspace reaches the ripple delete" },
+		{ sdl.K_DELETE, false, "Delete is not the number field's: it deletes a clip" },
+		{ sdl.K_F1, false, "F1 stays a global shortcut" },
+	}
+	for c in closed {
+		if got := edit_field_claims_key(c.key); got != c.want {
+			fmt.eprintf(
+				"[ui-probe] closed edit_field_claims_key(K_%v) = %v, want %v (%s)\n",
+				c.key, got, c.want, c.which,
+			)
+			ok = false
+		}
+	}
+	// OPEN: the field takes exactly its three keys and passes the rest through.
+	open_claims := [?]Claim {
 		{ sdl.K_U, false, "an unbound key reaches the app" },
 		{ sdl.K_ESCAPE, true, "Esc cancels the field" },
 		{ sdl.K_RETURN, true, "Enter commits the field" },
 		{ sdl.K_RETURN2, true, "the keypad Enter commits too" },
 		{ sdl.K_BACKSPACE, true, "Backspace edits the field" },
-		{ sdl.K_DELETE, false, "Delete is NOT the number field's: it deletes a clip" },
+		{ sdl.K_DELETE, false, "Delete is not the number field's: it deletes a clip" },
 		{ sdl.K_F1, false, "F1 stays a global shortcut" },
 	}
-	for c in claims {
+	defer edit_cancel()
+	for c in open_claims {
+		// Esc and Return CLOSE the field as a side effect of claiming, so the
+		// field has to be re-opened for every case or the rest are measured
+		// against a closed field.
+		if edit_state.field == .None {
+			edit_begin(.X, 0)
+		}
 		if got := edit_field_claims_key(c.key); got != c.want {
 			fmt.eprintf(
 				"[ui-probe] edit_field_claims_key(K_%v) = %v, want %v (%s)\n",
@@ -2264,6 +2301,167 @@ ui_probe_clip_tile_width_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] clip tile width ok\n")
+	}
+	return ok
+}
+
+// ui_probe_backspace_ripple_asserts: press the body of clip 1 on track 0, then
+// route a real Backspace keydown. Asserts the clip is gone AND that its tail
+// neighbour slid left by the removed span — the gap closing is the ripple, and
+// a delete that merely removed the clip (or silently did nothing) is the bug.
+ui_probe_backspace_ripple_asserts :: proc() -> bool {
+	ok := true
+	kf_dbl_click = {}
+	kf_clear()
+	kf_brush_disarm()
+	build_page(1920, 1600)
+	if len(timeline.tracks) == 0 || len(timeline.tracks[0].clips) < 3 {
+		fmt.eprintf("[ui-probe] backspace ripple fixture wants 3+ clips on track 0\n")
+		return false
+	}
+	track := &timeline.tracks[0]
+	// The ripple rebuilds the track's clip array (delete + reassign) and drops a
+	// clip, so keep a copy: the probes after this one lay out the same seeded
+	// session and would otherwise see a short track 0.
+	//
+	// DEEP, not a value copy. A shallow backup aliases the payloads the ripple
+	// is about to free, so restoring it hands a later teardown a name that was
+	// already freed — an invalid free that only shows under valgrind, long
+	// after the probe that caused it has printed "ok".
+	saved_clips := make([dynamic]Clip, 0, len(track.clips), context.temp_allocator)
+	for &c in track.clips {
+		append(&saved_clips, clip_deep_copy(&c))
+	}
+	target := track.clips[1]
+	span := target.source_length_frames
+	tail_id := track.clips[2].clip_id
+	tail_start := track.clips[2].timeline_start_frame
+	head_start := track.clips[0].timeline_start_frame
+	// The clip's own tile box, exactly as the frame loop would find it: the
+	// press has to land on the element the renderer painted.
+	box := clay.GetElementData(clay.ID("TimelineClip", 1)).boundingBox
+	if box.width <= 0 || box.height <= 0 {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: clip 1 never laid out (%.1fx%.1f)\n",
+			box.width,
+			box.height,
+		)
+		return false
+	}
+	defer {
+		kf_clear()
+		kf_brush_disarm()
+		// Release the rebuilt clips before restoring the backup: the moved
+		// clips alias the SEED payloads (which only the backup used to share,
+		// and it no longer does) and the straddle's right half owns fresh
+		// ones. Freeing them here is what makes the restore leak-free as well
+		// as free-of-double-frees.
+		for &c in track.clips {
+			clip_payload_free(&c)
+		}
+		delete(track.clips)
+		track.clips = saved_clips
+		selection.track, selection.index = 0, 0
+		// The ripple pushed a real undo node (a cloned timeline plus its
+		// label). Nothing downstream reads the tree, and the probe exits
+		// without the app teardown, so drop it here instead of leaking a
+		// snapshot of the seed.
+		undo_free_all()
+		undo_init()
+		build_page(1920, 1600)
+	}
+
+	x, y := box.x + box.width * 0.5, box.y + box.height * 0.5
+	clay.SetPointerState({x, y}, true)
+	interaction_click_dispatch(Mouse_Input{x, y, true, false, false, false, false, false}, false)
+	clay.SetPointerState({x, y}, false)
+	interaction_release(Mouse_Input{x, y, false, false, false, false, false, false})
+
+	// The premise: a plain press on the tile must have SELECTED it. Without
+	// this the rest of the probe could report a broken ripple for what is
+	// really a broken click.
+	if selection.track != 0 || selection.index != 1 {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: press on clip 1 selected %d/%d, want 0/1\n",
+			selection.track,
+			selection.index,
+		)
+		return false
+	}
+
+	if !route_key_down(sdl.K_BACKSPACE, {}, false) {
+		fmt.eprintf("[ui-probe] backspace ripple: the key router dropped Backspace\n")
+		return false
+	}
+
+	if len(track.clips) != ui_probe_clips_per_track - 1 {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: clip count %d, want %d (nothing was deleted)\n",
+			len(track.clips),
+			ui_probe_clips_per_track - 1,
+		)
+		return false
+	}
+	tail_after: i64 = -1
+	for &c in track.clips {
+		if c.clip_id == target.clip_id {
+			fmt.eprintf("[ui-probe] backspace ripple: the selected clip is still there\n")
+			ok = false
+		}
+		if c.clip_id == tail_id {
+			tail_after = c.timeline_start_frame
+		}
+	}
+	if track.clips[0].timeline_start_frame != head_start {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: the clip before the cut moved to %d, want %d\n",
+			track.clips[0].timeline_start_frame,
+			head_start,
+		)
+		ok = false
+	}
+	// The tail must have slid left by exactly the removed span, closing the gap.
+	if tail_after != tail_start - span {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: tail clip at %d, want %d (slid left by the %d-frame cut) — the gap did NOT close\n",
+			tail_after,
+			tail_start - span,
+			span,
+		)
+		ok = false
+	}
+	// Escape took the same path and was equally dead: the help overlay and the
+	// context menus could only be dismissed with the mouse.
+	editor_flags.help_open = true
+	defer editor_flags.help_open = false
+	route_key_down(sdl.K_ESCAPE, {}, false)
+	if editor_flags.help_open {
+		fmt.eprintf("[ui-probe] Escape with no field open must reach escape_dismiss\n")
+		ok = false
+	}
+	// ...and the number field must STILL get its three keys, which is the whole
+	// reason it is a separate owner: Backspace has to edit the digits there.
+	// edit_begin laid down "0"; the two appends made "073"; one Backspace must
+	// leave "07" — proving the key reached the FIELD, not the app layer.
+	edit_begin(.X, 0)
+	edit_append('7')
+	edit_append('3')
+	route_key_down(sdl.K_BACKSPACE, {}, false)
+	if edit_state.len != 2 || edit_state.chars[0] != '0' || edit_state.chars[1] != '7' {
+		fmt.eprintf(
+			"[ui-probe] Backspace must still edit an open number field (got %d chars, first %q)\n",
+			edit_state.len,
+			edit_state.chars[:max(edit_state.len, 1)],
+		)
+		ok = false
+	}
+	edit_cancel()
+	if edit_state.field != .None {
+		fmt.eprintf("[ui-probe] the number field must be closed after cancel\n")
+		ok = false
+	}
+	if ok {
+		fmt.printf("[ui-probe] backspace ripple-deletes and closes the gap ok\n")
 	}
 	return ok
 }

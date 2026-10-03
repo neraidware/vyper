@@ -178,7 +178,19 @@ field_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod) -> bool {
 // the rest down to the app, so a shortcut still works while the playhead is
 // being typed into. That asymmetry is pre-existing and intentional — a number
 // field is a single digit you nudge, not a document you type into.
+//
+// It also claims ONLY while a field is actually open. Two of the three keys it
+// takes are bound globally too, so without this guard both died in here:
+// Backspace ran edit_backspace against a zero-length buffer, did nothing
+// visible, and returned true — the ripple delete never fired. Escape never
+// reached escape_dismiss, so no menu or dialog could be dismissed from the
+// keyboard. The old `case:` comment claimed the router checked first;
+// route_key_down checks the TEXT field (ti.active) and nothing else, because the
+// number field was never expected to be reachable while closed.
 edit_field_claims_key :: proc(key: sdl.Keycode) -> bool {
+	if edit_state.field == .None {
+		return false
+	}
 	switch key {
 	case sdl.K_BACKSPACE:
 		edit_backspace()
@@ -187,10 +199,9 @@ edit_field_claims_key :: proc(key: sdl.Keycode) -> bool {
 	case sdl.K_ESCAPE:
 		edit_cancel()
 	case:
-		// A bare `case:` is Odin's default clause in a value switch. This one
-		// is reachable only when no field is open (the router checks first),
-		// so the fallbacks are inert — it exists so the switch can REPORT that
-		// it did not match instead of falling out silently.
+		// A bare `case:` is Odin's default clause in a value switch. Reached
+		// when a field IS open and the key is not one of its three, so the
+		// fallback is live: it lets the key travel on to the app layer.
 		return false
 	}
 	return true

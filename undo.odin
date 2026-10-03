@@ -92,18 +92,7 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 			clips = make([dynamic]Clip, len(st.clips)),
 		}
 		for j in 0 ..< len(st.clips) {
-			c := st.clips[j]
-			c.name = strings.clone(c.name)
-			if len(c.markers) > 0 {
-				c.markers = make([dynamic]Clip_Marker, len(c.markers))
-				for k in 0 ..< len(st.clips[j].markers) {
-					c.markers[k] = clone_marker(&st.clips[j].markers[k])
-				}
-			} else {
-				c.markers = nil
-			}
-			kf_clone_mut(&c, st.clips[j])
-			nt.clips[j] = c
+			nt.clips[j] = clip_deep_copy(&st.clips[j])
 		}
 		out.tracks[i] = nt
 	}
@@ -114,14 +103,7 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 free_timeline :: proc(t: ^Timeline) {
 	for &tr in t.tracks {
 		for &c in tr.clips {
-			free_markers(&c.markers)
-			if c.keyframe_tracks != nil {
-				kf_free_tracks(c.keyframe_tracks)
-				c.keyframe_tracks = nil
-			}
-			if c.name != "" {
-				delete(c.name)
-			}
+			clip_payload_free(&c)
 		}
 		if tr.clips != nil {
 			delete(tr.clips)
