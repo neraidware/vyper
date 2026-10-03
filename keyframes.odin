@@ -579,22 +579,6 @@ kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Tr
 	return out
 }
 
-// kf_split_parts remaps one clip's tracks across a clip split into two halves
-// at the clip-relative boundary `cut` (== the left half's new length). LEFT
-// keeps keys < cut untouched; RIGHT keeps keys >= cut, re-relativized by -cut;
-// values preserved (the slice-1 split rule). The source backing both halves
-// alias is freed; each half owns fresh clones.
-kf_split_parts :: proc(left, right: ^Clip, cut: i32) {
-	if len(left.keyframe_tracks) == 0 {
-		return
-	}
-	kf_bump_structure()
-	old := left.keyframe_tracks
-	left.keyframe_tracks = kf_rebuild_tracks(old, 0, cut)
-	right.keyframe_tracks = kf_rebuild_tracks(old, cut, KF_MAX_OFFSET)
-	kf_free_tracks(old)
-}
-
 // kf_trim_head drops keys on the trimmed head and re-relativizes the rest
 // (a clip whose head was cut off and which shifted left by `cut`).
 kf_trim_head :: proc(clip: ^Clip, cut: i32) {

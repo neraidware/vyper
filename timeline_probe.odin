@@ -2,6 +2,8 @@ package main
 
 import "core:fmt"
 import "core:os"
+import sdl "vendor:sdl3"
+import "core:strings"
 
 // Timeline probe (VYPER_TL_PROBE): headless regression checks for the clip-edit
 // paths — the playhead-coverage split (cut the clip UNDER the playhead), the
@@ -23,6 +25,230 @@ tl_probe_check :: proc(cond: bool, msg: string, args: ..any) {
 // used `>=`, so the auto-keyframe gate accepted the playhead one frame past the
 // clip end -- and nothing caught it, because this test lived inline in eleven
 // places that were free to disagree with each other.
+// tl_ripple_dispatch_scene: three abutting UNLINKED clips on one track, the
+// middle one selected, playhead parked at 200 (past the cut). Everything the
+// Backspace path touches is in play here: the selection, the keyframe-selection
+// gate in front of it, and the ripple itself.
+tl_ripple_dispatch_scene :: proc() {
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(7101, 0, 0, 100, 0, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(7102, 0, 100, 100, 100, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(7103, 0, 200, 100, 200, .Video))
+	selection.track = 0
+	selection.index = 1
+	playhead.frame = 250
+	timeline_view.start = 0
+	active_interaction = .None
+	kf_clear()
+}
+
+// test_ripple_dispatch_closes_gap drives the ACTUAL Backspace action, not
+// ripple_delete_region, because the report was "Backspace ripple delete is not
+// working" and the region helper is not where that can break: the action is a
+// two-step gate (keyframes first, then selection) around it, and the key
+// binding is a third.
+test_ripple_dispatch_closes_gap :: proc() {
+	tl_probe_check(
+		action_for(sdl.K_BACKSPACE, {}) == .Delete_At_Playhead,
+		"Backspace must map to Delete_At_Playhead (got %v)",
+		action_for(sdl.K_BACKSPACE, {}),
+	)
+	dispatch_action(.Delete_At_Playhead)
+
+	clips := timeline.tracks[0].clips
+	tl_probe_check(
+		len(clips) == 2,
+		"Backspace on the selected clip must remove exactly one clip (got %d)",
+		len(clips),
+	)
+	if len(clips) != 2 {
+		return
+	}
+	tl_probe_check(
+		clips[0].clip_id == 7101 && clips[0].timeline_start_frame == 0,
+		"the clip BEFORE the cut must be untouched (got id %d start %d)",
+		clips[0].clip_id,
+		clips[0].timeline_start_frame,
+	)
+	// This is the ripple: the tail clip slides left by the removed span. A raw
+	// delete would leave it at 200.
+	tl_probe_check(
+		clips[1].clip_id == 7103 && clips[1].timeline_start_frame == 100,
+		"the clip AFTER the cut must slide left to 100 (got id %d start %d)",
+		clips[1].clip_id,
+		clips[1].timeline_start_frame,
+	)
+	tl_probe_check(
+		playhead.frame == 150,
+		"playhead at 250 must follow the ripple to 150 (got %d)",
+		playhead.frame,
+	)
+	tl_probe_check(
+		selection.track == -1 && selection.index == -1,
+		"the deleted selection must be cleared (got %d/%d)",
+		selection.track,
+		selection.index,
+	)
+}
+
+// tl_straddle_scene: one clip spanning the whole ripple region, so the ripple
+// has to split it instead of dropping it. Named clips and keyframes, because
+// what this test is really about is which half OWNS what afterwards.
+tl_straddle_scene :: proc() {
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+	append(
+		&timeline.tracks[0].clips,
+		mk_tl_clip(7201, 0, 0, 400, 0, .Video),
+	)
+	timeline.tracks[0].clips[0].name = strings.clone("straddle")
+	timeline.tracks[0].name = strings.clone("t")
+	selection.track = -1
+	selection.index = -1
+	timeline_view.start = 0
+}
+
+// test_ripple_straddle_splits_once: a region strictly inside a clip must leave
+// exactly TWO clips — left [0,cut) and right [cut,400) — with different ids.
+// The straddle branch appended `left` twice, so the ripple duplicated the left
+// half; two clips sharing one clip_id also breaks every clip_id-keyed path.
+test_ripple_straddle_splits_once :: proc() {
+	tl_straddle_scene()
+	ripple_delete_region(100, 50)
+	clips := timeline.tracks[0].clips
+	tl_probe_check(
+		len(clips) == 2,
+		"a straddle ripple must leave 2 clips (got %d — the left half was duplicated)",
+		len(clips),
+	)
+	if len(clips) != 2 {
+		return
+	}
+	tl_probe_check(
+		clips[0].timeline_start_frame == 0 &&
+		clips[0].source_length_frames == 100 &&
+		clips[1].timeline_start_frame == 100 &&
+		// 400 frames of clip minus the 50 removed leaves 350; the right piece
+		// starts at 100, so it is 250 long.
+		clips[1].source_length_frames == 250,
+		"straddle halves wrong: [%d+%d] [%d+%d], want [0+100] [100+250]",
+		clips[0].timeline_start_frame,
+		clips[0].source_length_frames,
+		clips[1].timeline_start_frame,
+		clips[1].source_length_frames,
+	)
+	tl_probe_check(
+		clips[0].clip_id != clips[1].clip_id,
+		"the two halves must not share a clip_id (%d == %d)",
+		clips[0].clip_id,
+		clips[1].clip_id,
+	)
+	// The right half reads the source after the removed span.
+	tl_probe_check(
+		clips[1].source_start_frame == 150,
+		"right half must start at source frame 150 (got %d)",
+		clips[1].source_start_frame,
+	)
+}
+
+// tl_split_scene: one clip, two keyframe tracks and two markers, so the split
+// has something to divide.
+tl_split_scene :: proc() {
+	tl_straddle_scene()
+	cl := &timeline.tracks[0].clips[0]
+	cl.source_start_frame = 100
+	cl.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
+	append(&cl.keyframe_tracks, Kf_Track {
+		name = strings.clone("transform.x"),
+		keys = make([dynamic]Keyframe, 0, 4),
+	})
+	append(
+		&cl.keyframe_tracks[0].keys,
+		Keyframe{frame_off = 50, value = 0.0},
+		Keyframe{frame_off = 250, value = 1.0},
+	)
+	// Markers are keyed by SOURCE frame. The clip starts at source 100 and the
+	// cut is 200 frames in, so the halves read source [100,300) and [300,500):
+	// one marker each, which is what makes the label-ownership check possible.
+	append(&cl.markers, Clip_Marker{source_frame = 150, label = strings.clone("m-a")})
+	append(&cl.markers, Clip_Marker{source_frame = 350, label = strings.clone("m-b")})
+	selection.track = 0
+	selection.index = 0
+	playhead.frame = 200
+}
+
+// test_split_halves_own_their_payload: after a split, every owned field must
+// belong to exactly one half. The split copied the struct, so both halves held
+// the same name pointer, the same marker labels and (before kf_split_parts
+// rebuilt them) the same keys backing — which free_timeline then double-freed.
+// Mutating one half must not be visible in the other.
+test_split_halves_own_their_payload :: proc() {
+	tl_split_scene()
+	split_clip_at_playhead()
+	clips := timeline.tracks[0].clips
+	tl_probe_check(
+		len(clips) == 2,
+		"split must leave 2 clips (got %d)",
+		len(clips),
+	)
+	if len(clips) != 2 {
+		return
+	}
+	left, right := &clips[0], &clips[1]
+	tl_probe_check(
+		left.clip_id != right.clip_id,
+		"the halves must not share a clip_id (%d == %d)",
+		left.clip_id,
+		right.clip_id,
+	)
+	// Name pointers distinct. Comparing the strings would pass on equal text;
+	// the aliasing is the pointer.
+	tl_probe_check(
+		raw_data(left.name) != raw_data(right.name),
+		"the halves must not share one name string",
+	)
+	tl_probe_check(
+		len(left.keyframe_tracks) == 1 &&
+		len(right.keyframe_tracks) == 1 &&
+		len(left.keyframe_tracks[0].keys) == 1 &&
+		len(right.keyframe_tracks[0].keys) == 1,
+		"each half must own one lane with one key (got %d/%d lanes, %d/%d keys)",
+		len(left.keyframe_tracks),
+		len(right.keyframe_tracks),
+		len(left.keyframe_tracks[0].keys),
+		len(right.keyframe_tracks[0].keys),
+	)
+	tl_probe_check(
+		left.keyframe_tracks[0].keys[0].frame_off == 50 &&
+		right.keyframe_tracks[0].keys[0].frame_off == 50,
+		"the split's slice-1 rule: keys re-relativized by -left_len (got %d, %d)",
+		left.keyframe_tracks[0].keys[0].frame_off,
+		right.keyframe_tracks[0].keys[0].frame_off,
+	)
+	tl_probe_check(
+		len(left.markers) == 1 &&
+		len(right.markers) == 1 &&
+		raw_data(left.markers[0].label) != raw_data(right.markers[0].label),
+		"each half must own its own marker label (got %d/%d markers)",
+		len(left.markers),
+		len(right.markers),
+	)
+	// Editing one half must not disturb the other: the shared-backing failure
+	// mode was invisible until teardown.
+	kf_geom_set_value(right, "transform.x", 50, 0.75)
+	v, _ := kf_lane_value(left.keyframe_tracks[0].keys[0], 0)
+	tl_probe_check(
+		v != 0.75,
+		"a keyframe edit on the right half wrote through to the left (left lane reads %v)",
+		v,
+	)
+}
+
 test_clip_visible_half_open :: proc() {
 	start, length: i64 = 100, 24
 
@@ -770,6 +996,18 @@ timeline_probe_run :: proc(_: string) {
 
 	test_clip_visible_half_open()
 	fmt.println("[tl-probe] clip-visible-half-open ok")
+
+	tl_ripple_dispatch_scene()
+	test_ripple_dispatch_closes_gap()
+	fmt.println("[tl-probe] ripple-dispatch ok")
+
+	tl_straddle_scene()
+	test_ripple_straddle_splits_once()
+	fmt.println("[tl-probe] ripple-straddle ok")
+
+	tl_split_scene()
+	test_split_halves_own_their_payload()
+	fmt.println("[tl-probe] split-ownership ok")
 
 	if tl_probe_fail {
 		fmt.println("[tl-probe] FAILED")

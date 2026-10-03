@@ -458,6 +458,17 @@ target_probe() {
 	env $PROBE_ENV timeout 120 ./vyper
 }
 
+# The keyframe store/evaluator regression check (keyframe_probe.odin). Like the
+# transform probe it was reachable only by setting VYPER_KEYFRAME_PROBE by hand,
+# so nothing ran it -- and it is the only check on the remap helpers
+# (kf_trim_head/kf_trim_tail: slice-1 re-relativization, packed sections,
+# interpolation-mode preservation) that both split paths run. The probe exits
+# 0/1 itself.
+target_keyframe_probe() {
+	require_fresh_binary keyframe-probe || return 1
+	VYPER_KEYFRAME_PROBE=1 timeout 120 ./vyper
+}
+
 # The preview handle/snap geometry regression check (transform_probe.odin).
 # It was reachable only by setting VYPER_TRANSFORM_PROBE by hand, so nothing
 # ran it: it is the one probe covering clip_full_box_dims and the crop/edge
@@ -907,6 +918,7 @@ main() {
 	bench) target_bench ;;
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
+	keyframe_probe) target_keyframe_probe ;;
 	geom_key_probe) target_geom_key_probe ;;
 	geom_key_valgrind) target_geom_key_valgrind ;;
 	render_live_probe) target_render_live_probe ;;

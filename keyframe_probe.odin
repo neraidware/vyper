@@ -200,8 +200,11 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&sp, "gain", 40, 2.0) // on the cut frame -> right half, re-rel 0
 	kf_set_key(&sp, "gain", 45, 3.0)
 	kf_set_key(&sp, "gain", 99, 4.0)
-	sp_right := sp
-	kf_split_parts(&sp, &sp_right, 40)
+	// The halves no longer share one keys backing: the right is an independent
+	// copy (clip_deep_copy at every split site) and each half trims its own.
+	sp_right := clip_deep_copy(&sp)
+	kf_trim_tail(&sp, 40)
+	kf_trim_head(&sp_right, 40)
 	left_ok := false
 	if len(sp.keyframe_tracks) == 1 {
 		lk := sp.keyframe_tracks[0].keys
@@ -248,19 +251,8 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	}
 	kf_probe_check(trim2_ok, "trim_tail drops keys beyond the new length")
 
-	// Split/trim remaps keys through kf_rebuild_tracks; the interpolation mode
-	// must survive the rebuild (each half/full key is a NEW Keyframe there).
-	spt := Clip {}
-	kf_set_key(&spt, "gain", 10, 1.0)
-	kf_set_key(&spt, "gain", 40, 2.0)
-	spt.keyframe_tracks[0].keys[1].interp = .Cubic
-	spt_right := spt
-	kf_split_parts(&spt, &spt_right, 30)
-	split_mode_ok :=
-		len(spt_right.keyframe_tracks) == 1 &&
-		len(spt_right.keyframe_tracks[0].keys) == 1 &&
-		spt_right.keyframe_tracks[0].keys[0] == Keyframe {frame_off = 10, value = 2.0, interp = .Cubic}
-	kf_probe_check(split_mode_ok, "split rebuild preserves the key's interpolation mode")
+	// A trim rebuilds the track, so every kept key is a NEW Keyframe there; the
+	// interpolation mode must survive that.
 	tmt := Clip {}
 	kf_set_key(&tmt, "gain", 5, 1.0)
 	kf_set_key(&tmt, "gain", 40, 2.0)
@@ -550,7 +542,6 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_probe_check(!ok && v == 3.5, "zero-value clip: inactive, base kept")
 	kf_probe_check(kf_track_index(z, "gain") < 0, "zero-value clip: no tracks")
 	kf_del_key(&z, "gain", 0)
-	kf_split_parts(&z, &z, 10)
 	kf_trim_head(&z, 5)
 	kf_trim_tail(&z, 5)
 	kf_probe_check(len(z.keyframe_tracks) == 0, "remaps on zero-value clip are no-ops")
@@ -760,8 +751,9 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_geom_set_packed(&sp2, "crop", 10, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
 	kf_geom_set_packed(&sp2, "crop", 30, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
 	kf_geom_set_packed(&sp2, "crop", 50, {3.0, 6.0, 9.0, 12.0, 0, 0, 0}, 0b1111)
-	sp2r := sp2
-	kf_split_parts(&sp2, &sp2r, 30)
+	sp2r := clip_deep_copy(&sp2)
+	kf_trim_tail(&sp2, 30)
+	kf_trim_head(&sp2r, 30)
 	sp_ok := false
 	if lti := kf_track_index(sp2, "crop"); lti >= 0 {
 		lk := sp2.keyframe_tracks[lti].keys
