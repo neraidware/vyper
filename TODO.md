@@ -4127,3 +4127,86 @@ box until either `dev` exists or the targets fall back to a system ffmpeg.
 - The `dev`-less media gates are an environment gap, not a code defect, and
   `keyframes.odin`'s `kf_split_parts` deletion on the ripple branch is not
   mirrored here — that belongs to the branch that owns it.
+
+---
+
+## Active 16 — `Clip` as POD: session pools for names, labels, keyframe keys
+
+**Status: planned, not started.** Branch `clip-pod` (worktree
+`.worktrees/clip-pod`, base `19c0cdf`). No code written yet — this section is
+the plan, and each step lands + probes + vets before the next. Not started
+deliberately, at the user's instruction.
+
+**Why.** `Clip` (`state.odin:234`) is a value struct with three heap-owning
+fields: `name: string`, `markers: [dynamic]Clip_Marker` (each `label: string`),
+and `keyframe_tracks: [dynamic]Kf_Track` (each `name: string` plus a
+`[dynamic]Keyframe`). Everything expensive about copying a clip follows from
+that: `clip_deep_copy` (`timeline.odin:733`) clones the name, rebuilds the
+marker slice and re-keys every track via `kf_clone_mut`, and `clip_payload_free`
+(`timeline.odin:754`) has to be called on every drop path. Active 14 (Backspace
+ripple + ownership) had to route ten-plus sites through those two procs, and
+that was only correct because the audit found them all — the compiler cannot see
+a forgotten free, and the next clip field that grows a payload re-opens the same
+class of bug. A POD `Clip` makes the copy `src^` and deletes both procs.
+
+**Boundary facts to confirm first (step 0).** The whole plan rests on two
+assumptions; if either is false the shape changes, so verify before writing code:
+- Do undo snapshots outlive the session, or get written to disk? Today they are
+  deep copies held in memory (`undo.odin`), which is what makes pools safe. If a
+  snapshot is ever persisted or restored into a fresh session, it must
+  re-materialize strings on restore and borrowed offsets are wrong.
+- Does anything hold a `Clip` across a project `:open`/`:new`? A pool reset
+  invalidates every offset at once, so a surviving `Clip` would read another
+  project's strings. If one exists, the reset needs a generation check rather
+  than a blind clear.
+
+**Constraint, decided.** The project file format does not change.
+`Saved_Clip` (`project_file.odin:69`) keeps serializing names, labels and keys by
+value; the pools are session-only and invisible to save/load. An old project
+must load byte-identically after this work.
+
+**Steps** (each lands + probe + vet before the next):
+- [ ] S0. Confirm the two boundary facts above by reading the undo snapshot
+      lifetime and the project-open path, and write down what was confirmed.
+- [ ] S1. Session string arena for `Clip.name` and `Clip_Marker.label`. One
+      grow-only session block; `Clip`/`Clip_Marker` carry an offset + length
+      instead of a `string`. Bound it from a real maximum (none exists yet —
+      name one constant at the site, per §8) and assert on a longer write
+      instead of truncating silently (§6). Accessors at the read sites: the
+      inspector's rename path, `clip_label_text`, the dnd rename, `clip_label`
+      drawing. `clip_deep_copy`'s name clone and `clip_payload_free`'s name
+      delete both disappear at this step.
+- [ ] S2. Keyframe keys into the session arena: `Kf_Track.keys` becomes
+      `(off, len)` into one grow-only `[dynamic]Keyframe` store per session,
+      with `Kf_Track.name` interned by offset. This is the risky step — it lands
+      right after the Active 14 split/trim/undo work, which is the code most
+      likely to regress — so it goes in alone, behind the existing
+      `keyframe_probe`.
+- [ ] S3. Delete `clip_deep_copy` and `clip_payload_free`, collapse every copy
+      site to `c := src^`, and delete the now-empty free paths. A `Clip` copy
+      must become a plain struct copy with no proc in between; if a site still
+      calls a copy proc, the field it was copying is still owned somewhere.
+- [ ] S4. `clone_timeline` stops allocating for clip payloads.
+
+**Probe / mutation.** Per step, the existing probes are the regression net
+(`keyframe_probe`, `timeline_probe`, `probe`, `undo_valgrind`) and the memory
+gate is the ownership proof: a borrowed-offset `Clip` has nothing to leak, so
+valgrind's counts must not move — a change there means a payload is still being
+owned somewhere the plan missed. Mutations to prove each step bites: interning
+by pointer instead of offset (two clips with equal names must share storage and
+a rename must not touch the other), and a pool reset without the generation check
+from S0 (a stale offset must fail loudly, not read another project's string).
+
+**Accept.** `check build probe keyframe_probe timeline_probe transform_probe
+geom_key_probe opacity audio_probe valgrind undo_valgrind` all pass; valgrind at
+the current baseline (23 contexts, 0 lost, no invalid access). `clip_deep_copy`
+and `clip_payload_free` are gone from the tree, `rg` shows no remaining per-clip
+payload free, and `:save`/`:open` round-trips a project with names, markers and
+keyframes unchanged — verified by loading a fixture written before this branch
+existed, not one written by it.
+
+**Not claimed.** This does not make `Clip` immutable or shared: two `Clip`s that
+share a name offset share the string, so any future in-place rename must go
+through copy-on-write, and the inspector rename path has to re-intern rather
+than write through. Step 1's interning has to make that explicit before S3
+removes the last code that copied on write.
