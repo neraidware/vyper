@@ -476,7 +476,7 @@ escape_dismiss :: proc() {
 // name. The value is applied on commit (see apply_rename).
 begin_clip_rename :: proc() {
 	if _, clip, ok := selected_clip(); ok {
-		text_input_begin(string(clip.name), TI_RENAME, clip.clip_id)
+		text_input_begin(clip_name(clip), TI_RENAME, clip.clip_id)
 	}
 }
 
@@ -495,17 +495,14 @@ apply_rename :: proc() {
 	}
 	if _, clip, ok := find_clip_by_id(ti.target); ok {
 		new_name := strings.trim_space(name)
-		changed := clip.name != new_name
+		changed := clip_name(clip) != new_name
 		// In create mode the pre-insert capture (add_text_clip_at) is still
 		// pending: the whole create+name is one "Add text clip" node, so the
 		// insertion belongs to this node's parent, not to a separate capture.
 		if !was_create {
 			undo_begin()
 		}
-		if clip.name != "" {
-			delete(clip.name)
-		}
-		clip.name = strings.clone(new_name)
+		clip_set_name(clip, new_name)
 		if was_create {
 			// The create-mode rename is what keeps the just-inserted clip: an
 			// empty/cancelled name already deleted it above, so reaching here
@@ -1793,6 +1790,10 @@ if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); ps
 	}
 	if tlp, _ := os.lookup_env_alloc("VYPER_TL_PROBE", context.temp_allocator); tlp != "" {
 		timeline_probe_run(tlp)
+		return
+	}
+	if ssp, _ := os.lookup_env_alloc("VYPER_SESSION_STR_PROBE", context.temp_allocator); ssp != "" {
+		session_str_probe_run()
 		return
 	}
 	if drp, _ := os.lookup_env_alloc("VYPER_DRAG_PROBE", context.temp_allocator); drp != "" {

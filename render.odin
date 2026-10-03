@@ -4093,7 +4093,9 @@ render_start :: proc() {
 					append(
 						&txts,
 						Render_Text_Src {
-							name = strings.clone(clip.name),
+							// Worker-owned: this crosses a thread hop, and the pool is freed at
+							// teardown without draining queued jobs, so it keeps its own copy.
+							name = strings.clone(clip_name(clip)),
 							timeline_start_frame = clip.timeline_start_frame,
 							source_length_frames = clip.source_length_frames,
 							transform_x = clip.transform_x,
@@ -4395,7 +4397,7 @@ render_test_run :: proc(paths: [2]string) {
 			&timeline.tracks[nt].clips,
 			Clip {
 				clip_id = new_clip_id(),
-				name = "ZORDER",
+				name = session_str_intern("ZORDER"),
 				kind = .Text,
 				generator = .Text,
 				timeline_start_frame = 0,

@@ -692,7 +692,7 @@ draw_clip_markers :: proc(
 				color = BUTTON_BORDER_HOVER
 			}
 			rows := [3]f32{5, 3, 1}
-			for m in clip.markers {
+			for &m in clip.markers {
 				line_x := clamp(
 					box.x + f32(m.source_frame - clip.source_start_frame) * timeline_view.zoom,
 					box.x,
@@ -734,11 +734,11 @@ draw_clip_markers :: proc(
 					y += 3
 				}
 				// Hover hit box: the marker's column within the insert strip.
-				if len(m.label) > 0 && mouse_y >= gap.y && mouse_y <= gap.y + gap.height {
+				if len(marker_label(&m)) > 0 && mouse_y >= gap.y && mouse_y <= gap.y + gap.height {
 					d := abs(mouse_x - line_x)
 					if d <= 6 && d < best_dist {
 						best_dist = d
-						hover_label = m.label
+						hover_label = marker_label(&m)
 						hover_x = line_x
 						// The tooltip renders in the gap strip above the marker's
 						// OWN track, so the strip travels with the winning marker

@@ -332,7 +332,10 @@ Media_Asset :: struct {
 // human-readable name. Markers move/split with the clip.
 Clip_Marker :: struct {
 	source_frame: i64,
-	label:        string,
+	// label is a session-pool handle (TODO.md Active 19): borrowed bytes, no
+	// ownership, so a marker copy is a struct copy. Read through
+	// marker_label, write through marker_set_label.
+	label:        Session_Str_Handle,
 }
 
 Clip :: struct {
@@ -354,7 +357,10 @@ Clip :: struct {
 	path:                 cstring,
 	// name is the clip's editable label. For a Text generator clip it is the
 	// title that will be rendered; for file-backed clips it's a display name.
-	name:                 string,
+	// A session-pool handle, not a heap string (TODO.md Active 19): the bytes are
+	// immutable once interned and owned by the session, so a Clip copy is a
+	// struct copy. Read through clip_name, write through clip_set_name.
+	name:                 Session_Str_Handle,
 	kind:                 Media_Kind,
 	// is_still marks a clip whose source is a single still image: every timeline
 	// frame in the clip maps to the source's one frame (frame 0), so the image

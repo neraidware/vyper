@@ -106,7 +106,7 @@ tl_straddle_scene :: proc() {
 		&timeline.tracks[0].clips,
 		mk_tl_clip(7201, 0, 0, 400, 0, .Video),
 	)
-	timeline.tracks[0].clips[0].name = strings.clone("straddle")
+	timeline.tracks[0].clips[0].name = session_str_intern("straddle")
 	timeline.tracks[0].name = strings.clone("t")
 	selection.track = -1
 	selection.index = -1
@@ -175,8 +175,8 @@ tl_split_scene :: proc() {
 	// Markers are keyed by SOURCE frame. The clip starts at source 100 and the
 	// cut is 200 frames in, so the halves read source [100,300) and [300,500):
 	// one marker each, which is what makes the label-ownership check possible.
-	append(&cl.markers, Clip_Marker{source_frame = 150, label = strings.clone("m-a")})
-	append(&cl.markers, Clip_Marker{source_frame = 350, label = strings.clone("m-b")})
+	append(&cl.markers, Clip_Marker{source_frame = 150, label = session_str_intern("m-a")})
+	append(&cl.markers, Clip_Marker{source_frame = 350, label = session_str_intern("m-b")})
 	selection.track = 0
 	selection.index = 0
 	playhead.frame = 200
@@ -206,11 +206,23 @@ test_split_halves_own_their_payload :: proc() {
 		left.clip_id,
 		right.clip_id,
 	)
-	// Name pointers distinct. Comparing the strings would pass on equal text;
-	// the aliasing is the pointer.
+	// Both halves SHARE the one name handle now: the pool is immutable and
+	// session-owned, so the split's struct copy copied the handle and nothing owns
+	// a second string (TODO.md Active 19). Pointer inequality no longer describes
+	// the invariant -- isolation does. Renaming one half must not reach the other,
+	// which is the property separate heap ownership used to have to buy.
+	orig_name := clip_name(right)
+	clip_set_name(left, "renamed-left")
 	tl_probe_check(
-		raw_data(left.name) != raw_data(right.name),
-		"the halves must not share one name string",
+		clip_name(left) == "renamed-left",
+		"renaming the left half did not take (%q)",
+		clip_name(left),
+	)
+	tl_probe_check(
+		clip_name(right) == orig_name,
+		"renaming the left half reached the right half (%q, was %q)",
+		clip_name(right),
+		orig_name,
 	)
 	tl_probe_check(
 		len(left.keyframe_tracks) == 1 &&
@@ -230,14 +242,25 @@ test_split_halves_own_their_payload :: proc() {
 		left.keyframe_tracks[0].keys[0].frame_off,
 		right.keyframe_tracks[0].keys[0].frame_off,
 	)
+	// Markers, same story: shared label handles, and a rename on one side must
+	// stay on one side.
 	tl_probe_check(
-		len(left.markers) == 1 &&
-		len(right.markers) == 1 &&
-		raw_data(left.markers[0].label) != raw_data(right.markers[0].label),
-		"each half must own its own marker label (got %d/%d markers)",
+		len(left.markers) == 1 && len(right.markers) == 1,
+		"each half must keep one marker (got %d/%d markers)",
 		len(left.markers),
 		len(right.markers),
 	)
+	if len(left.markers) == 1 && len(right.markers) == 1 {
+		orig_label := marker_label(&right.markers[0])
+		marker_set_label(&left.markers[0], "renamed-marker")
+		tl_probe_check(
+			marker_label(&left.markers[0]) == "renamed-marker" &&
+			marker_label(&right.markers[0]) == orig_label,
+			"renaming the left marker reached the right one (%q, was %q)",
+			marker_label(&right.markers[0]),
+			orig_label,
+		)
+	}
 	// Editing one half must not disturb the other: the shared-backing failure
 	// mode was invisible until teardown.
 	kf_geom_set_value(right, "transform.x", 50, 0.75)

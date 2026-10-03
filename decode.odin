@@ -1539,7 +1539,7 @@ import_marker_text_stream :: proc(markers: ^[dynamic]Clip_Marker, fmt_ctx: ^avfm
 		frame := frame_from_seconds(seconds, fps)
 		name := chapter_text_from_sample(pkt.data, pkt.size)
 		if len(name) > 0 && frame != last_frame {
-			append(markers, Clip_Marker{source_frame = frame, label = strings.clone(name)})
+			append(markers, Clip_Marker{source_frame = frame, label = session_str_intern(name)})
 			last_frame = frame
 		}
 		avcodec.packet_unref(pkt)
@@ -1566,7 +1566,7 @@ import_marker_chapters :: proc(markers: ^[dynamic]Clip_Marker, fmt_ctx: ^avfmt.F
 			name = strings.trim_space(string(entry.value))
 		}
 		if len(name) > 0 && frame != last_frame {
-			append(markers, Clip_Marker{source_frame = frame, label = strings.clone(name)})
+			append(markers, Clip_Marker{source_frame = frame, label = session_str_intern(name)})
 			last_frame = frame
 		}
 	}

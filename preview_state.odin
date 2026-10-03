@@ -532,7 +532,7 @@ slot.is_text = true
 				// if source_w/h carried the baked size, the drag would double-count.
 				slot.is_text = true
 				geom_clear_crop(&slot.geom)
-				name_hash := text_clip_hash(clip.name)
+				name_hash := text_clip_hash(clip_name(clip))
 				base_changed := slot.text_hash != name_hash
 				// the slot's SAMPLED scale, not clip.scale: this is the raster RESOLUTION the box
 				// is measured against, so taking the resting value would bake glyphs
@@ -548,7 +548,7 @@ slot.is_text = true
 				// and does NOT jump when the title's deepest glyph changes (the
 				// old tight-ink height did).
 				base_bw, base_bh := text_buf_size_for(
-					clip.name,
+					clip_name(clip),
 					&text_clip_state.font,
 					&text_clip_state.font_init,
 					TEXT_CLIP_FONT_PIXELS,
@@ -559,7 +559,7 @@ slot.is_text = true
 					base_buf := text_buf_ensure(&slot.text_base_buf, need_base)
 					scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(TEXT_CLIP_FONT_PIXELS))
 					_, _, bw0, _ := rasterize_title_into_buffer(
-						clip.name,
+						clip_name(clip),
 						base_buf,
 						base_bw,
 						base_bh,
@@ -590,7 +590,7 @@ slot.is_text = true
 					slot.text_font_px = font_px
 					scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(font_px))
 					bw, bh := text_buf_size_for(
-						clip.name,
+						clip_name(clip),
 						&text_clip_state.font,
 						&text_clip_state.font_init,
 						font_px,
@@ -598,7 +598,7 @@ slot.is_text = true
 					need := bw * bh * 4
 					tex_buf := text_buf_ensure(&slot.text_buf, need)
 					ink_x, _, ink_bw, _ := rasterize_title_into_buffer(
-						clip.name,
+						clip_name(clip),
 						tex_buf,
 						bw,
 						bh,

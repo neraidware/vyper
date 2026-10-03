@@ -362,7 +362,7 @@ label_truncate_fmt :: proc(dst: []u8, text: string, font_size: int, max_px: f32)
 // clip_name_display is the clip's name as the inspector's name row draws it: cut
 // to the field and written into the fixed ui_text buffer, because clay holds the
 // string until the draw pass and the inspector lays out every frame.
-clip_name_display :: proc(cl: Clip) -> string {
+clip_name_display :: proc(cl: ^Clip) -> string {
 	return label_truncate_fmt(
 		ui_text.clip_name[:],
 		clip_label_text(cl),
@@ -663,9 +663,9 @@ project_card :: proc() {
 
 // clip_label_text returns the display name for a clip (its own name, falling
 // back to the file base name).
-clip_label_text :: proc(cl: Clip) -> string {
-	if cl.name != "" {
-		return cl.name
+clip_label_text :: proc(cl: ^Clip) -> string {
+	if n := clip_name(cl); n != "" {
+		return n
 	}
 	if cl.path != "" {
 		return path_basename(cl.path)
@@ -722,7 +722,7 @@ clip_card :: proc() {
 				},
 				) {
 					clay.Text(
-						clip_name_display(cl^),
+						clip_name_display(cl),
 						clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
 					)
 				}
@@ -3107,7 +3107,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 						},
 						) {
 							clips_content_x: f32 = 0
-							for timeline_clip, index in track.clips {
+							for &timeline_clip, index in track.clips {
 								target_x :=
 									f32(timeline_clip.timeline_start_frame) *
 									timeline_view.zoom
@@ -3136,7 +3136,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 								clip_color := BUTTON
 								clip_border := BUTTON_BORDER
 								clip_border_w: u16 = 2
-								clip_label := timeline_clip.name
+								clip_label := clip_name(&timeline_clip)
 								if timeline_clip.kind == .Audio {
 									clip_color = AUDIO_CLIP
 									if clip_label == "" {

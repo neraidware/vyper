@@ -546,7 +546,7 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			link_id              = link,
 			asset_id             = asset.id,
 			path                 = is_sub ? nil : asset.path,
-			name                 = is_sub ? strings.clone(path_basename(asset.path)) : "",
+			name                 = is_sub ? session_str_intern(path_basename(asset.path)) : {},
 			kind                 = is_video ? .Video : (is_sub ? .Text : .Audio),
 			is_still             = asset.is_image,
 			generator            = is_sub ? .Subtitles : .None,

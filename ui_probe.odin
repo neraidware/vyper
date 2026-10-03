@@ -271,35 +271,41 @@ for j := 0; j < len(raw); {
 	if !ui_probe_project_file_asserts() {
 		os.exit(1)
 	}
-	// Marker-label ownership: the round-trip above frees labels through
+	// Marker COPY paths: the round-trip above frees labels through
 	// free_timeline but never copies them, so cover the copy paths here.
-	if !ui_probe_marker_ownership_asserts() {
+	if !ui_probe_marker_copy_asserts() {
 		os.exit(1)
 	}
 	os.exit(0)
 }
 
-// ui_probe_marker_ownership_asserts covers the marker-label ownership rule
-// without media: every Clip_Marker.label is uniquely owned, so the two procs
-// that copy markers (clone_timeline for undo snapshots,
-// filter_markers_in_range for split) must clone the label, and every discard
-// goes through free_markers. Getting this wrong shows up as either a
-// double-free (valgrind "Invalid free" / "Mismatched free") or a definite leak
-// (a label whose only other holder was already freed), so the whole point is
-// that this proc frees four independent marker sets and exits clean.
-ui_probe_marker_ownership_asserts :: proc() -> bool {
+// ui_probe_marker_copy_asserts covers the marker COPY paths without media:
+// clone_timeline (undo snapshots) and filter_markers_in_range (split). Those two
+// used to be the places that had to clone each label, because a label was a
+// uniquely owned heap string and a copy that forgot either the clone or the
+// matching free was a double-free or a leak. Labels are session-pool handles now
+// (TODO.md Active 19), so there is nothing to clone and nothing to free: a marker
+// copy is a struct copy.
+//
+// What still has to be true is that a copy carries the right VALUES and that the
+// copies are independent as arrays -- free_markers drops each array without
+// touching the pool, so this proc frees four marker sets and still exits clean
+// under the memory gate. The isolation that separate heap ownership used to buy
+// is asserted where it is now load-bearing: renaming one half must not reach the
+// other (test_split_halves_own_their_payload).
+ui_probe_marker_copy_asserts :: proc() -> bool {
 	ok := true
 	src := Timeline{tracks = make([dynamic]Track, 1)}
 	src.tracks[0].name = strings.clone("marker-owner")
 	src.tracks[0].clips = make([dynamic]Clip, 1)
-	src.tracks[0].clips[0].name = strings.clone("marker-clip")
+	src.tracks[0].clips[0].name = session_str_intern("marker-clip")
 	src.tracks[0].clips[0].markers = make([dynamic]Clip_Marker, 0, 4)
 	for i in 0 ..< 3 {
 		buf: [32]u8
 		s := fmt.bprintf(buf[:], "m%d", i)
 		append(
 			&src.tracks[0].clips[0].markers,
-			Clip_Marker{source_frame = i64(i) * 10, label = strings.clone(s)},
+			Clip_Marker{source_frame = i64(i) * 10, label = session_str_intern(s)},
 		)
 	}
 	orig := src.tracks[0].clips[0].markers
@@ -310,17 +316,17 @@ ui_probe_marker_ownership_asserts :: proc() -> bool {
 	lo := filter_markers_in_range(orig[:], 0, 20)
 	hi := filter_markers_in_range(orig[:], 20, 20)
 
-	if len(lo) != 2 || lo[0].label != "m0" || lo[1].label != "m1" {
+	if len(lo) != 2 || marker_label(&lo[0]) != "m0" || marker_label(&lo[1]) != "m1" {
 		fmt.eprintf("[ui-probe] lo markers wrong: n=%d\n", len(lo))
 		ok = false
 	}
-	if len(hi) != 1 || hi[0].label != "m2" {
+	if len(hi) != 1 || marker_label(&hi[0]) != "m2" {
 		fmt.eprintf("[ui-probe] hi markers wrong: n=%d\n", len(hi))
 		ok = false
 	}
 	snap_markers := snap.tracks[0].clips[0].markers
 	if len(snap_markers) != 3 ||
-	   snap_markers[2].label != "m2" ||
+	   marker_label(&snap_markers[2]) != "m2" ||
 	   snap_markers[2].source_frame != 20 {
 		fmt.eprintf("[ui-probe] snapshot markers wrong: n=%d\n", len(snap_markers))
 		ok = false
@@ -358,8 +364,8 @@ ui_probe_marker_cull_asserts :: proc() -> bool {
 				continue
 			}
 			clip.markers = make([dynamic]Clip_Marker, 0, 2)
-			append(&clip.markers, Clip_Marker{source_frame = 10, label = strings.clone("m-a")})
-			append(&clip.markers, Clip_Marker{source_frame = 200, label = strings.clone("m-b")})
+			append(&clip.markers, Clip_Marker{source_frame = 10, label = session_str_intern("m-a")})
+			append(&clip.markers, Clip_Marker{source_frame = 200, label = session_str_intern("m-b")})
 		}
 	}
 	saved_top := timeline_view.top
@@ -1350,7 +1356,7 @@ seed_roundtrip_session :: proc() {
 		clip_id              = 100,
 		asset_id             = vid_id,
 		link_id              = 7,
-		name                 = strings.clone("main"),
+		name                 = session_str_intern("main"),
 		kind                 = .Video,
 		generator            = .None,
 		source_start_frame   = 5,
@@ -1367,7 +1373,7 @@ seed_roundtrip_session :: proc() {
 		crop_b               = 0.4,
 		markers = make([dynamic]Clip_Marker, 0, 1),
 	}
-	append(&vclip.markers, Clip_Marker {source_frame = 12, label = strings.clone("chapter")})
+	append(&vclip.markers, Clip_Marker {source_frame = 12, label = session_str_intern("chapter")})
 	vclip.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
 	append(&vclip.keyframe_tracks, Kf_Track {name = strings.clone("scale"), keys = make([dynamic]Keyframe, 0, 2)})
 	append(
@@ -1388,7 +1394,7 @@ seed_roundtrip_session :: proc() {
 	sclip := Clip {
 		clip_id              = 101,
 		asset_id             = srt_id_asset,
-		name                 = strings.clone("subs"),
+		name                 = session_str_intern("subs"),
 		kind                 = .Text,
 		generator            = .Subtitles,
 		srt_id               = 0,
@@ -1398,7 +1404,7 @@ seed_roundtrip_session :: proc() {
 	tclip := Clip {
 		clip_id              = 102,
 		generator            = .Text,
-		name                 = strings.clone("title"),
+		name                 = session_str_intern("title"),
 		kind                 = .Text,
 		source_length_frames = 90,
 		timeline_start_frame = 500,
@@ -1440,6 +1446,24 @@ ui_probe_project_file_asserts :: proc() -> bool {
 		fmt.eprintf("[ui-probe] save failed: %s\n", err)
 		delete(err)
 		return false
+	}
+
+	// The on-disk marker label must still be a CBOR STRING. Clip_Marker.label
+	// became a session-pool handle, and the DTO had to become Saved_Marker
+	// because a handle is not cbor-safe -- if that DTO change were ever dropped
+	// or reshaped, the encoder would silently write two i32s where a string
+	// belongs and every project saved since would fail to load. A CBOR text
+	// string is stored as a length prefix plus the raw bytes, so the literal text
+	// has to be findable in the file; a struct of two i32s cannot contain it.
+	if data, rerr := os.read_entire_file(path, context.allocator); rerr == nil {
+		if !strings.contains(string(data), "chapter") {
+			fmt.eprintf("[ui-probe] marker label is not a cbor string in the saved file\n")
+			ok = false
+		}
+		delete(data)
+	} else {
+		fmt.eprintf("[ui-probe] cannot re-read the saved project: %v\n", rerr)
+		ok = false
 	}
 
 	// Load twice: the second replaces the first (a real teardown of a loaded
@@ -1553,7 +1577,7 @@ project_roundtrip_asserts :: proc(second_pass: bool) -> bool {
 		fmt.eprintf("[ui-probe] clip transform/crop mismatch\n")
 		ok = false
 	}
-	if len(c.markers) != 1 || c.markers[0].label != "chapter" || c.markers[0].source_frame != 12 {
+	if len(c.markers) != 1 || marker_label(&c.markers[0]) != "chapter" || c.markers[0].source_frame != 12 {
 		fmt.eprintf("[ui-probe] marker mismatch\n")
 		ok = false
 	}
@@ -1817,19 +1841,19 @@ ui_probe_inspector_width_asserts :: proc() -> bool {
 		fmt.eprintf("[ui-probe] no transformable clip selected; cannot assert the inspector width\n")
 		return false
 	}
-	saved_name := cl.name
+	saved_name := clip_name(cl)
 	defer {
-		cl.name = saved_name
+		clip_set_name(cl, saved_name)
 		build_page(1920, 1600)
 	}
 	long := "A012_C003_20260314_184522_take07_final_v3.mov"
 	for name in ([]string{saved_name, long}) {
-		cl.name = name
+		clip_set_name(cl, name)
 		_ = build_page(1920, 1600)
 		col := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
 		card := clay.GetElementData(clay.ID("ClipCard")).boundingBox
 		value := clay.GetElementData(clay.ID("NameValue")).boundingBox
-		label := clip_name_display(cl^)
+		label := clip_name_display(cl)
 		fmt.printf(
 			"[ui-probe] name %d chars: column %.1f card %.1f namevalue %.1f label %q\n",
 			len(name),
@@ -2657,7 +2681,7 @@ seed_ui_probe_session :: proc() {
 					clip_id = next_id,
 					asset_id = next_id,
 					path = cstring("probe.mp4"),
-					name = fmt.aprintf("clip %d-%d", t, c),
+					name = session_str_intern(clip_probe_name(t, c)),
 					kind = kind,
 					generator = kind == .Text ? .Text : .None,
 					source_start_frame = 0,
@@ -2704,4 +2728,12 @@ handle_ui_probe :: proc() -> bool {
 		return true
 	}
 	return false
+}
+
+// clip_probe_name formats a probe clip's label into a fixed buffer. Interning
+// copies the bytes, so heap-formatting with aprintf here would leak the
+// intermediate for nothing (TODO.md §1).
+clip_probe_name :: proc(t, c: int) -> string {
+	buf: [48]u8
+	return fmt.bprintf(buf[:], "clip %d-%d", t, c)
 }

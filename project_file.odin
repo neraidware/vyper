@@ -62,11 +62,23 @@ Saved_Asset :: struct {
 	srt_id:        int,
 }
 
+// Saved_Marker is a marker as stored in the file. It exists only because the
+// live Clip_Marker.label became a session-pool HANDLE rather than a string
+// (TODO.md Active 19), which makes the live type no longer cbor-safe -- the
+// decoder would read a CBOR string into two i32s. Field names and types match
+// what Clip_Marker used to encode, so the on-disk format is unchanged; only the
+// in-memory DTO type is explicit now.
+Saved_Marker :: struct {
+	source_frame: i64,
+	label:        string,
+}
+
 // Saved_Clip is one timeline clip as stored in the file: every authored field
 // (identity, timing, transform, crop, gain, stream) plus its markers and
-// keyframe tracks. The live Clip_Marker / Kf_Track types are already cbor-safe
-// (scalar + a packed-union value) so they are reused directly. path is NOT
-// stored -- see the header note.
+// keyframe tracks. Markers use the Saved_Marker DTO above. Kf_Track is still
+// reused directly (its name is a plain string until step 2 moves it into the
+// pool, which must introduce its own DTO the same way). path is NOT stored --
+// see the header note.
 Saved_Clip :: struct {
 	clip_id:              u64,
 	asset_id:             u64,
@@ -98,7 +110,7 @@ Saved_Clip :: struct {
 	// pointer fields, so presence cannot be inferred from a nil ^f32.
 	opacity:              f32,
 	has_opacity:          bool,
-	markers:              [dynamic]Clip_Marker,
+	markers:              [dynamic]Saved_Marker,
 	keyframe_tracks:      [dynamic]Kf_Track,
 }
 
@@ -202,12 +214,12 @@ project_to_file :: proc() -> Project_File {
 			name  = t.name, // string view
 			clips = make([dynamic]Saved_Clip, 0, len(t.clips)),
 		}
-		for c in t.clips {
+		for &c in t.clips {
 			append(&st.clips, Saved_Clip {
 				clip_id              = c.clip_id,
 				asset_id             = c.asset_id,
 				link_id              = c.link_id,
-				name                 = c.name,
+				name                 = clip_name(&c),
 				kind                 = c.kind,
 				is_still             = c.is_still,
 				generator            = c.generator,
@@ -229,7 +241,7 @@ project_to_file :: proc() -> Project_File {
 				crop_b               = c.crop_b,
 				opacity              = c.opacity,
 				has_opacity          = true,
-				markers              = c.markers,         // live array, aliased
+				markers              = saved_markers(&c),
 				keyframe_tracks      = c.keyframe_tracks, // live array, aliased
 			})
 		}
@@ -241,12 +253,21 @@ project_to_file :: proc() -> Project_File {
 	return pf
 }
 
-// project_file_free_containers releases the three container arrays the save
-// side allocated, and each track's clips array. The ELEMENTS alias live session
-// memory (strings, marker/keyframe/srt arrays) and are NOT touched -- freeing
-// them would corrupt the session being saved.
+// project_file_free_containers releases the container arrays the save side
+// allocated, each track's clips array, and each clip's marker DTO array. The
+// remaining ELEMENTS alias live session memory (name strings, keyframe/srt
+// arrays) and are NOT touched -- freeing them would corrupt the session being
+// saved.
+//
+// The marker arrays are the exception: saved_markers BUILDS them for the encode
+// (the live type is a pool handle, not a cbor-safe struct -- see Saved_Marker),
+// so they are this save's to free. Their labels are borrowed pool views and own
+// nothing, so dropping the array is the whole free.
 project_file_free_containers :: proc(pf: ^Project_File) {
 	for &st in pf.tracks {
+		for &sc in st.clips {
+			delete(sc.markers)
+		}
 		delete(st.clips)
 	}
 	delete(pf.tracks)
@@ -288,6 +309,10 @@ session_teardown :: proc() {
 	}
 	free_timeline(&timeline)
 	undo_free_all()
+	// Every handle in every Clip, marker and keyframe track dies with the pool,
+	// so this is the one place that frees it. Nothing allocated above survives
+	// this call: the live timeline and all undo snapshots are freed before it.
+	session_str_reset()
 	srt_cache_free_all()
 	media_bin_free()
 	clear(&selection.extra_set)
@@ -373,7 +398,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				clip_id              = sc.clip_id,
 				asset_id             = sc.asset_id,
 				link_id              = sc.link_id,
-				name                 = strings.clone(sc.name),
+				name                 = session_str_intern(sc.name),
 				kind                 = sc.kind,
 				is_still             = sc.is_still,
 				generator            = sc.generator,
@@ -404,16 +429,17 @@ session_rebuild :: proc(pf: ^Project_File) {
 					c.path = a.path
 				}
 			}
-			// Marker labels are cloned (the DTO's die with the frame arena) and,
-			// like live marker labels, are never freed by free_timeline -- they
-			// are shared-by-design across split/duplicate.
+			// Marker labels are interned into the session pool, so the live
+			// markers own nothing: free_timeline drops the array and the bytes
+			// outlive it. The DTO strings themselves die with the frame arena and
+			// were never freed here either.
 			if len(sc.markers) > 0 {
 				c.markers = make([dynamic]Clip_Marker, len(sc.markers))
 				idx := 0
-				for m in sc.markers {
+				for sm in sc.markers {
 					c.markers[idx] = Clip_Marker {
-						source_frame = m.source_frame,
-						label        = strings.clone(m.label),
+						source_frame = sm.source_frame,
+						label        = session_str_intern(sm.label),
 					}
 					idx += 1
 				}
@@ -519,4 +545,21 @@ PROJECT_FILE_EXTENSION :: ".vyproj"
 // this is the dispatch test.
 project_path_is_project :: proc(path: string) -> bool {
 	return strings.has_suffix(path, PROJECT_FILE_EXTENSION)
+}
+
+// saved_markers renders a clip's markers as the file DTO. The labels are
+// borrowed views of the session pool, valid for the whole save: the pool is not
+// touched while the file is being built, and the DTO is consumed immediately
+// after. Returning an empty (non-nil) array for a clip with no markers keeps the
+// encoder from emitting a null where the old aliased array would have emitted a
+// list.
+saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
+	out := make([dynamic]Saved_Marker, len(c.markers))
+	for &m, i in c.markers {
+		out[i] = Saved_Marker {
+			source_frame = m.source_frame,
+			label        = marker_label(&m),
+		}
+	}
+	return out
 }

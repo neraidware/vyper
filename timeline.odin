@@ -109,7 +109,7 @@ add_subtitle_generator_clip :: proc(
 		clip_id              = new_clip_id(),
 		asset_id             = 0,
 		path                 = nil,
-		name                 = name,
+		name                 = session_str_intern(name),
 		kind                 = .Text,
 		generator            = .Subtitles,
 		srt_id               = src_id,
@@ -688,13 +688,11 @@ toggle_links_for_selection :: proc() {
 	}
 }
 
-// Marker ownership: every Clip_Marker.label is a uniquely owned heap string.
-// Any proc that copies a marker into a second array (range filter, timeline
-// snapshot) must clone the label, and every proc that discards a marker array
-// must go through free_markers — otherwise the copies either dangle (freed
-// twice) or leak (freed never).
+// clone_marker copies a marker. The label is a session-pool handle
+// (TODO.md Active 19), so the copy is a struct copy: no clone, and no free on
+// the way out either — the bytes outlive every marker that names them.
 clone_marker :: proc(m: ^Clip_Marker) -> Clip_Marker {
-	return Clip_Marker{source_frame = m.source_frame, label = strings.clone(m.label)}
+	return m^
 }
 
 // ---------------------------------------------------------------------------
@@ -725,14 +723,16 @@ clone_marker :: proc(m: ^Clip_Marker) -> Clip_Marker {
 // for kf_trim_* rebuilding a keys backing in keyframes.odin.
 // ---------------------------------------------------------------------------
 
-// clip_deep_copy returns a fully independent copy of src: every value the same,
-// every owned field freshly allocated. Callers re-mint identity (clip_id,
+// clip_deep_copy returns an independent copy of src: every value the same, and
+// every OWNED field freshly allocated. The clip's NAME is not owned -- it is a
+// session-pool handle whose bytes are immutable (TODO.md Active 19) -- so the
+// struct copy above carries it and no clone happens; that is the whole reason
+// the name stopped being a heap string. Callers re-mint identity (clip_id,
 // link_id) and adjust geometry on the copy afterwards; that is value editing,
 // which needs no ownership care. Anything else a copy needs to own differently
 // is a sign the call wants clip_payload_free on the original instead.
 clip_deep_copy :: proc(src: ^Clip) -> Clip {
 	c := src^
-	c.name = strings.clone(src.name)
 	if len(src.markers) > 0 {
 		c.markers = make([dynamic]Clip_Marker, len(src.markers))
 		for i in 0 ..< len(src.markers) {
@@ -750,26 +750,24 @@ clip_deep_copy :: proc(src: ^Clip) -> Clip {
 
 // clip_payload_free releases everything the clip OWNS and clears the pointers,
 // so a second call is a no-op. Every drop path calls this; nothing else frees a
-// clip's fields.
+// clip's fields. The name is not one of those fields: it is a pool handle, so
+// there is nothing to release and nothing to clear.
 clip_payload_free :: proc(c: ^Clip) {
 	free_markers(&c.markers)
 	if c.keyframe_tracks != nil {
 		kf_free_tracks(c.keyframe_tracks)
 		c.keyframe_tracks = nil
 	}
-	if c.name != "" {
-		delete(c.name)
-		c.name = ""
-	}
+	// name is a pool handle and owns nothing: it needs no free, and zeroing it
+	// here would be wrong (a caller reading the dropped clip expects its label).
 }
 
 free_markers :: proc(markers: ^[dynamic]Clip_Marker) {
 	if markers^ == nil {
 		return
 	}
-	for m in markers^ {
-		delete(m.label)
-	}
+	// Labels are pool handles now, so dropping the array is the whole free: no
+	// per-marker delete to forget.
 	delete(markers^)
 	markers^ = nil
 }

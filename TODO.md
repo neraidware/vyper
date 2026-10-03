@@ -4409,11 +4409,9 @@ for a bug that was not found is noise.
 
 ## Active 19 — `Clip` as POD: session pools for names, labels, keyframe keys
 
-**Status: planned, not started.** No code written yet — this section is the
-plan, and each step lands + probes + vets before the next. Not started
-deliberately, at the user's instruction. Numbered 19 rather than 16 because main
-took 16 (export rate), 17 (audio rate) and 18 (forward jump) while this plan sat
-on its own branch.
+**Status: S0 + S1 landed.** S2 (keyframe keys) is next. Numbered 19 rather than
+16 because main took 16 (export rate), 17 (audio rate) and 18 (forward jump)
+while this plan sat on its own branch.
 
 **Why.** `Clip` (`state.odin:338`) is a value struct with three heap-owning
 fields: `name: string`, `markers: [dynamic]Clip_Marker` (each `label: string`),
@@ -4444,22 +4442,66 @@ value; the pools are session-only and invisible to save/load. An old project
 must load byte-identically after this work.
 
 **Steps** (each lands + probe + vet before the next):
-- [ ] S0. Confirm the two boundary facts above by reading the undo snapshot
-      lifetime and the project-open path, and write down what was confirmed.
-- [ ] S1. Session string arena for `Clip.name` and `Clip_Marker.label`. One
-      grow-only session block; `Clip`/`Clip_Marker` carry an offset + length
-      instead of a `string`. Bound it from a real maximum (none exists yet —
-      name one constant at the site, per §8) and assert on a longer write
-      instead of truncating silently (§6). Accessors at the read sites: the
-      inspector's rename path, `clip_label_text`, the dnd rename, `clip_label`
-      drawing. `clip_deep_copy`'s name clone and `clip_payload_free`'s name
-      delete both disappear at this step.
+- [x] S0. **Confirmed, both assumptions hold.** Undo snapshots are in-memory
+      only: `Undo_Node.snap`/`Undo_History.pending` live in `undo_hist.slots`,
+      nothing in `undo.odin` touches disk, `session_teardown` calls
+      `undo_free_all`, and `undo_init` (called on project load) frees the old
+      history before snapshotting a new baseline. No snapshot is restored across
+      projects, so a pool reset can never strand one. No `Clip` value survives a
+      reset either: the persistent `^Clip` references found are transient
+      drag/preview state and `PlannedMove.clip` is temp-allocator scoped.
+      Consequence: the reset is a blind rewind, with an assert on the read side
+      to catch a stale handle rather than a generation tag.
+- [x] S1. **Landed.** `session_str.odin`: one fixed-size session block, `Clip.name`
+      and `Clip_Marker.label` are now `Session_Str_Handle{off, len}`, read via
+      `clip_name`/`marker_label`, written via `clip_set_name`/`marker_set_label`.
+      `clip_deep_copy`'s name clone and `clip_payload_free`'s name delete are
+      gone; `free_markers` no longer frees labels; `clone_marker` is `m^`.
+
+      **The block is fixed-size, not grow-only, and the probe is why.** The plan
+      said "grow-only". Implemented as a `[dynamic]u8` first, it was wrong:
+      `session_str_view` hands out a `string` ALIASING the pool, and the first
+      append that reallocated left every captured view dangling — `timeline_probe`
+      read a label back as `áúY...`. No call-site care fixes that,
+      because a caller cannot tell a moved buffer from a live one. So the pool is
+      a fixed 1 MiB block carved by a bump pointer: published bytes never move,
+      which is what makes an alias valid for the session. Exhaustion is an assert
+      naming `SESSION_STR_POOL_BYTES`, not a reallocation. Mutation-confirmed:
+      reverting to `[dynamic]` fails the view-survival check with garbage.
+
+      **Format constraint held, but only just.** `Saved_Clip.markers` was typed
+      `[dynamic]Clip_Marker` precisely because the live type was cbor-safe. A pool
+      handle is not, so that reuse would have silently written two i32s where the
+      file stores a string — every saved project would fail to load. Fixed with an
+      explicit `Saved_Marker` DTO (same field names/types, so bytes are
+      unchanged) plus `saved_markers`, and pinned by a probe assertion that greps
+      the written file for the label text: a struct of two i32s cannot contain it.
+      Mutation-confirmed: reverting the DTO fails that check.
+
+      **Two leaks found and fixed on the way.** `saved_markers` allocates a DTO
+      array per clip (the live-array alias it replaced was free), so
+      `project_file_free_containers` now frees them — the memory gate caught it at
+      8,481 bytes in 135 blocks and is now back to 0/0. And `fmt.println` takes
+      `any`, so two `parity_probe` sites passing `clip.name` still COMPILED after
+      the type change while printing a struct instead of the clip's name: the
+      compiler-driven sweep has a hole wherever a value flows into `any`.
+
+      **One probe premise inverted on purpose.** `test_split_halves_own_their_payload`
+      asserted `raw_data(left.name) != raw_data(right.name)` — pointer inequality,
+      i.e. "the halves must NOT share". Sharing is now the point, so that check
+      became the stronger isolation test: rename the left half, assert the right
+      still reads the original name.
 - [ ] S2. Keyframe keys into the session arena: `Kf_Track.keys` becomes
       `(off, len)` into one grow-only `[dynamic]Keyframe` store per session,
       with `Kf_Track.name` interned by offset. This is the risky step — it lands
       right after the Active 14 split/trim/undo work, which is the code most
       likely to regress — so it goes in alone, behind the existing
-      `keyframe_probe`.
+      `keyframe_probe`. **Carry S1's two lessons in:** (a) `Saved_Clip.keyframe_tracks`
+      is still typed `[dynamic]Kf_Track` for the same reason the marker DTO had to
+      change, so S2 MUST introduce an explicit track DTO with plain strings or it
+      will corrupt the file the same way; (b) a `[dynamic]Keyframe` store is safe
+      to reallocate ONLY because a track's handle is an INDEX, not a pointer into
+      it — do not add an accessor that hands out a borrowed `[]Keyframe`.
 - [ ] S3. Delete `clip_deep_copy` and `clip_payload_free`, collapse every copy
       site to `c := src^`, and delete the now-empty free paths. A `Clip` copy
       must become a plain struct copy with no proc in between; if a site still

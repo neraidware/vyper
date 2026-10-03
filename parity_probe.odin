@@ -115,7 +115,7 @@ parity_probe_report :: proc(clip: ^Clip, timeline_frame, off: i64, diffs: [PARIT
 	parity_probe_fail = true
 	fmt.println(
 		"[parity-probe] FAIL clip",
-		clip.name,
+		clip_name(clip),
 		"frame",
 		timeline_frame,
 		"(clip-relative off",
@@ -520,7 +520,7 @@ parity_probe_dump_state :: proc() {
 			clip := &tr.clips[i]
 			fmt.println(
 				"[parity-probe] clip",
-				clip.name,
+				clip_name(clip),
 				"kind",
 				clip.kind,
 				"tstart",
