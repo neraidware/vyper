@@ -4025,3 +4025,97 @@ into session-owned pools so `Clip` becomes POD data, `clip_deep_copy` becomes a
 struct copy, and `clone_timeline` stops allocating. That is a separate
 work-stream (it touches project-file load/save, undo snapshots, the renderer and
 the ripple rebuild) and should not be smuggled in behind a bug fix.
+
+---
+
+## Active 15 — A/V desync after rapid edits (geometry slab torn read)
+
+**Status: landed 2026-10-03 on `audio-sync` (base `8c01a84`), merged as 15.**
+Numbered 15 on the merge because `file-dnd` took Active 12 on `main`; the three
+fix branches carry 13 (overlay culling), 14 (Backspace ripple + Clip ownership)
+and 15.
+
+**Problem (user):** "try scrubbing around very randomly, creating splits and
+ripple deleting, moving around clips and test the playback after it" — playback
+after an edit session comes out out of sync. No telemetry available, so the
+repro was rebuilt as an assertion.
+
+The audio engine hands its clip geometry to the producer thread through a
+double-buffered slab (`audio_geometry_commit` on the UI thread,
+`audio_provision` on the producer). The premise of a double buffer is that the
+reader's read is short. **This reader's read is not short**: a provision
+reopens every decoder synchronously and holds the slot for tens of
+milliseconds, while the UI rewrites the slab on every single edit. With two
+slots, two commits inside one provision wrap the index around and the second
+one lands on the slot the provision is still reading. The provision then builds
+its segments from a half-written chip list — `n` already reset, `chip[i]` fields
+and the path arena mid-update — so segments carry the wrong source window or
+open the wrong file. That is not a glitch, it is the audio playing something
+other than what the picture shows: desync.
+
+It is also exactly the reported repro's shape. A provision is tens of ms and an
+edit burst commits every few ms, so two commits inside one provision is the
+common case, not the rare one.
+
+**Found by probing, not by reading.** Two hypotheses were checked and rejected
+first, which is why they are written down:
+
+- *Resync storm* — every edit verb ends in `audio_note_edit` → `audio_seek`,
+  which bumps the resync event, and the producer acts on every event change by
+  clearing the device queue and reopening all decoders. Measured: **8 edits in a
+  burst cause 1 re-provision**, because the burst outruns the 2 ms producer poll
+  and collapses into a single event change. Kept as a probe assertion
+  (`audio_probe_edit_burst_provisions`) because it is the property that stops a
+  future "fix" from making this worse, but it is not the bug.
+- *Segment math vs the edited timeline* — checked every provisioned segment's
+  source window against the clip that covers it after scrub + split +
+  ripple-delete + move. **All agree.** Kept as
+  `audio_probe_post_edit_alignment`.
+
+**Steps** (each lands + probe + vet before the next):
+- [x] S1. Reproduce the torn read deterministically:
+      `audio_probe_geom_slab_handoff` takes the slot exactly as a provision
+      does, then commits twice — what a split plus a ripple inside one provision
+      does — and asserts the held slot is byte-identical afterwards. Pre-fix it
+      fails: the published index wraps to the slot the reader holds and
+      `chip0.start` goes 0 → 3000 under it.
+- [x] S2. `AUDIO_GEOM_SLOTS = 3` plus an explicit reader claim.
+      `audio_geom_acquire` / `audio_geom_release` bracket every producer read;
+      `audio_geom_write_slot` picks a slot that is neither the published one nor
+      the claimed one. Three slots, at most two excluded, so the writer never
+      waits. Claim ordering is load-bearing and documented at the acquire: take
+      `idx` first, publish the claim second, or a commit starting in between
+      picks the slot the reader is about to read.
+- [x] S3. Both reader sites claim: `audio_provision` (with `defer`, so every
+      exit releases) and the per-feed `audio_gain_fold` read.
+- [x] S4. `audio_probe` gets a gate target. It had none, so nothing ran it —
+      the same gap `transform_probe` had. The target synthesizes its own
+      deterministic lavfi fixture, so it never depends on a media file someone
+      has to supply.
+- [x] S5. Telemetry: `audio_rpt.provisions` counts producer-side re-provisions.
+      Every one clears the queue and reopens every decoder, so this is the cost
+      of telling the engine the timeline changed; it is what makes the burst
+      check measurable instead of a vibe.
+
+**Probe / mutation.** `audio_probe_geom_slab_handoff` passes post-fix; making
+the writer ignore the reader's claim (`if i != pub`) restores the failure
+exactly, which is the mutation that proves the claim is what fixes it and not
+the third slot alone.
+
+**Accept.** Gates: `check build probe timeline_probe transform_probe
+geom_key_probe opacity audio_probe undo_valgrind valgrind` pass. Valgrind at the
+baseline (0 lost, no invalid access, 23 contexts). `zorder`/`keyed_export` remain
+unrunnable in this environment: their fixtures are synthesized through a `dev
+ffmpeg` wrapper that does not exist here, so the source clip is never created
+and the target fails on the missing file, not on an app defect.
+
+**Not fixed here, and named.** Two things this work does not claim:
+
+- The probe proves the *slab handoff* is sound. It cannot prove what the user
+  hears; there is no telemetry from a real desync, so if audio still drifts
+  after this, the next place to look is the producer's queue/underrun path
+  (`wedge_heal`, `skip_full`, `silence_holes` in the report block) with
+  `VYPER_AUDIO_LOG=1`.
+- The `dev`-less media gates are an environment gap, not a code defect, and
+  `keyframes.odin`'s `kf_split_parts` deletion on the ripple branch is not
+  mirrored here — that belongs to the branch that owns it.

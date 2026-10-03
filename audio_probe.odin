@@ -6,6 +6,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 
 // Headless reproducibility probe for the "after many splits audio drops to a
 // blip" bug: VYPER_AUDIO_PROBE="<file>|<splits>|<audio_tracks>". Runs without an
@@ -249,8 +250,177 @@ audio_probe_run :: proc(v: string) -> int {
 	}
 	fmt.println("[ap] live gain fold check ok")
 
+	slab_ok := audio_probe_geom_slab_handoff()
+	if !slab_ok {
+		fmt.println("[ap] GEOMETRY SLAB HANDOFF FAIL")
+		return 1
+	}
+	fmt.println("[ap] geometry slab handoff ok")
+
+	burst_ok := audio_probe_edit_burst_provisions(path)
+	if !burst_ok {
+		fmt.println("[ap] EDIT-BURST PROVISION FAIL")
+		return 1
+	}
+	fmt.println("[ap] edit-burst provisioning ok")
+
+	edit_ok := audio_probe_post_edit_alignment(path)
+	if !edit_ok {
+		fmt.println("[ap] POST-EDIT ALIGNMENT FAIL")
+		return 1
+	}
+	fmt.println("[ap] post-edit alignment ok")
+
 	audio_reset_play()
 	return 0
+}
+
+// audio_probe_post_edit_alignment is the user's repro as an assertion: scrub
+// around, split, ripple-delete, move clips, then play -- and every frame the
+// engine serves must come from the clip that covers it in the EDITED timeline.
+//
+// This is checked against the provisioned segments rather than by ear. Each
+// Play_Seg carries the source window it was built with (start_s = where in the
+// file, len_a = how long), so "is the audio lined up with the picture" has an
+// exact answer per frame: for every provisioned segment, the timeline clip that
+// covers the segment's timeline span must agree on source_start_frame and
+// length. A stale provision (the edit never invalidated the producer) shows up
+// as a segment pointing into a region that has since been split, moved or
+// removed -- which is precisely what desync sounds like.
+audio_probe_post_edit_alignment :: proc(path: string) -> bool {
+	fmt.println("[ap] --- post-edit alignment ---")
+	ok := true
+	audio_reset_play()
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+	// One audio clip spanning the whole timeline, plus a video clip so the
+	// timeline looks like a real session rather than one lone lane.
+	// Replace the imported session wholesale. track_order is a permutation OF
+	// timeline.tracks, so it has to be replaced with it (sync_track_order
+	// asserts on a length mismatch by design -- it is a real invariant, not
+	// stale state to paper over).
+	timeline.tracks = make([dynamic]Track, 0, 2)
+	timeline.track_order = make([dynamic]int, 0, 2)
+	atrack := Track {
+		name = "a",
+		clips = make([dynamic]Clip, 0, 4),
+	}
+	append(&atrack.clips, Clip {
+		clip_id = new_clip_id(),
+		path = cpath,
+		kind = .Audio,
+		name = "audio",
+		timeline_start_frame = 0,
+		source_length_frames = 240,
+		source_start_frame = 0,
+		stream_index = 0,
+	})
+	append(&timeline.tracks, atrack)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	playhead.frame = 0
+	audio_note_edit()
+
+	// The scrub: move the playhead the way a click does, then let the engine
+	// catch up (audio_update is UI-thread; here we just re-anchor as it does).
+	playhead.frame = 90
+	audio_seek(playhead.frame)
+
+	// Split at the playhead.
+	tr, clip, found := clip_at_frame(playhead.frame)
+	if found {
+		selection.track = track_index_of(tr)
+		selection.index = clip_index_on_track(tr, clip)
+		split_clip_at_playhead()
+	}
+
+	// Ripple-delete a region that swallows the second half of the split.
+	ripple_delete_region(120, 60)
+
+	// Move what is left to a new start, the way a drag does.
+	for &c in timeline.tracks[0].clips {
+		c.timeline_start_frame = 30
+	}
+	audio_note_edit()
+	playhead.frame = 90
+
+	fps := timeline_fps()
+	fmt.printf(
+		"[ap] after edits: clips=%d playhead=%d (%.2fs)\n",
+		len(timeline.tracks[0].clips),
+		playhead.frame,
+		f64(playhead.frame) / fps,
+	)
+
+	audio_geometry_commit()
+	audio_provision(playhead.frame)
+	fmt.printf("[ap] re-provisioned at the playhead: %d sources\n", audio_src.count)
+	if audio_src.count == 0 {
+		fmt.println("[ap] FAIL: the engine provisioned no sources after the edits")
+		return false
+	}
+
+	// Every segment must agree with the timeline as it stands NOW.
+	checked := 0
+	for k in 0 ..< audio_src.count {
+		s := &audio_src.slots[k]
+		for si in 0 ..< s.seg_count {
+			seg := &s.seg[si]
+			// The middle frame of the segment: unambiguously inside it.
+			f := seg.start_a + seg.len_a / 2
+			t2, c2, found2 := clip_at_frame(f)
+			checked += 1
+			if !found2 {
+				fmt.printf(
+					"[ap] FAIL: segment [%d,%d) of source %d covers frame %d, which no clip covers any more\n",
+					seg.start_a,
+					seg.start_a + seg.len_a,
+					k,
+					f,
+				)
+				ok = false
+				continue
+			}
+			_ = t2
+			// The source window must be the CURRENT clip's: same length, and
+			// the same position inside the file.
+			want_s := c2.source_start_frame + (f - c2.timeline_start_frame)
+			if seg.start_s + (f - seg.start_a) != want_s {
+				fmt.printf(
+					"[ap] FAIL: frame %d plays source sample %d, timeline says %d (clip %d+%d, seg %d+%d)\n",
+					f,
+					seg.start_s + (f - seg.start_a),
+					want_s,
+					c2.source_start_frame,
+					c2.source_length_frames,
+					seg.start_s,
+					seg.len_a,
+				)
+				ok = false
+			}
+			if seg.len_a > c2.source_length_frames {
+				fmt.printf(
+					"[ap] FAIL: segment at %d is %d frames long, longer than the clip covering it (%d)\n",
+					seg.start_a,
+					seg.len_a,
+					c2.source_length_frames,
+				)
+				ok = false
+			}
+		}
+	}
+	fmt.printf("[ap] checked %d provisioned segments against the edited timeline\n", checked)
+	if checked == 0 {
+		fmt.println("[ap] FAIL: nothing to check -- the edits left no segments")
+		return false
+	}
+	return ok
 }
 
 // audio_probe_mix_peak decodes `frames` timeline frames starting at `start`
@@ -356,5 +526,240 @@ audio_probe_gain_check :: proc() -> bool {
 	if peak_unity <= 0 || math.abs(ratio - expected) > 0.001 {
 		return false
 	}
+	return true
+}
+
+
+// audio_probe_edit_burst_provisions is the user's repro measured instead of
+// heard: scrub, split, ripple-delete and move in a burst, then watch how many
+// times the engine tore itself down.
+//
+// Every one of those verbs ends in audio_note_edit -> audio_seek, which bumps
+// the resync event. The producer acts on EVERY event change: it clears the
+// device queue and reopens every decoder synchronously before it can mix
+// another frame. So N edits in a burst cost N stream teardowns, and each one
+// drops a full cushion of queued audio on the floor and re-primes the decoders
+// -- audible as audio that keeps restarting behind the picture. The 200 ms
+// re-check coalescing in audio_update does not help: it guards the UI's
+// re-DIAGNOSIS, and audio_seek (which the edits call) stamps anchor_now, so
+// the edits keep resetting that window themselves.
+//
+// The fix belongs where the cost is: a burst of geometry edits must collapse
+// into ONE re-provision. This asserts exactly that, and prints the ratio so a
+// regression shows how bad it got rather than just that it happened.
+audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
+	fmt.println("[ap] --- edit-burst provisioning ---")
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+	timeline.tracks = make([dynamic]Track, 0, 2)
+	timeline.track_order = make([dynamic]int, 0, 2)
+	atrack := Track {name = "a", clips = make([dynamic]Clip, 0, 8)}
+	for i in 0 ..< 4 {
+		append(
+			&atrack.clips,
+			Clip {
+				clip_id = new_clip_id(),
+				path = cpath,
+				kind = .Audio,
+				name = "audio",
+				timeline_start_frame = i64(i) * 300,
+				source_length_frames = 300,
+				source_start_frame = 0,
+				stream_index = 0,
+			},
+		)
+	}
+	append(&timeline.tracks, atrack)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+
+	// The real engine: device, bridge ring and the producer thread, because the
+	// cost being measured happens on the producer and nowhere else.
+	if !audio_device_init() {
+		fmt.println("[ap] SKIP: no audio device available")
+		return true
+	}
+	audio_device_set_active(false)
+	sync.atomic_store(&audio_prod.stop, false)
+	sync.atomic_store(&audio_prod.done, false)
+	sync.atomic_store(&audio_prod.run, false)
+	sync.atomic_store(&audio_prod.resync, 0)
+	audio_prod.thread = thread.create(audio_producer_proc)
+	if audio_prod.thread == nil {
+		fmt.println("[ap] SKIP: could not start the producer thread")
+		return true
+	}
+	thread.start(audio_prod.thread)
+	defer audio_shutdown()
+
+	// Playing, so the producer is live and mixing.
+	playhead.playing = true
+	playback.dir = 1
+	playhead.frame = 0
+	audio_prod.last_ui_frame = 0
+	sync.atomic_store(&audio_prod.run, true)
+	audio_seek(0)
+	// Let it settle into steady playback before the burst.
+	sleep_ms(700)
+	base := audio_rpt.provisions
+	fmt.printf("[ap] steady state: %d provisions\n", base)
+
+	// The burst: the user's sequence, back to back, as fast as the UI can
+	// deliver it. Each verb runs its real audio_note_edit path.
+	EDITS :: 8
+	for i in 0 ..< EDITS {
+		switch i % 4 {
+		case 0:
+			// scrub
+			playhead.frame = 120 + i64(i) * 30
+			audio_seek(playhead.frame)
+		case 1:
+			tr, clip, found := clip_at_frame(playhead.frame)
+			if found {
+				selection.track = track_index_of(tr)
+				selection.index = clip_index_on_track(tr, clip)
+				split_clip_at_playhead()
+			}
+		case 2:
+			ripple_delete_region(playhead.frame, 30)
+		case 3:
+			for &c in timeline.tracks[0].clips {
+				c.timeline_start_frame += 15
+			}
+			audio_note_edit()
+		}
+	}
+	// The producer polls every ~2 ms; give it room to act on what the burst
+	// requested. This is the WINDOW, not a settle: a coalescing fix must not
+	// need seconds to notice, or playback is audibly wrong for seconds.
+	sleep_ms(500)
+	got := audio_rpt.provisions - base
+	fmt.printf(
+		"[ap] %d edits in a burst -> %d re-provisions\n",
+		EDITS,
+		got,
+	)
+	if got > 1 {
+		fmt.printf(
+			"[ap] FAIL: %d edits caused %d stream teardowns (want 1: one per burst)\n",
+			EDITS,
+			got,
+		)
+		return false
+	}
+	return true
+}
+
+
+// audio_probe_geom_slab_handoff pins the producer/UI handoff on the geometry
+// slab. The producer does not read the slab for a moment -- it reads it for a
+// whole PROVISION, which reopens every decoder and takes tens of milliseconds
+// -- while the UI thread rewrites the slab on every edit. With only two slots,
+// two commits inside one provision wrap the index around and the second one
+// lands on the very slot the provision is still reading: a half-written chip
+// list, so segments are built from torn geometry (wrong source window, wrong
+// path) and playback is audibly out of sync with the picture.
+//
+// This is deterministic, not a flake: it holds a slot exactly as a provision
+// does and then commits twice, which is what a short edit burst does. The
+// writer must never touch a slot a reader holds, no matter how many commits
+// pass.
+audio_probe_marker_path :: proc() -> string {
+	return "audio_probe_handoff_marker"
+}
+
+audio_probe_geom_slab_handoff :: proc() -> bool {
+	fmt.println("[ap] --- geometry slab handoff ---")
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "a", clips = make([dynamic]Clip, 0, 2)}
+	buf: [512]u8
+	// A marker path per clip, so the slab's contents are unmistakably different
+	// between the commits below.
+	mp := audio_probe_marker_path()
+	for i in 0 ..< 2 {
+		cn := 0
+		for cn < len(mp) && cn < len(buf) - 1 {
+			buf[cn] = u8(mp[cn])
+			cn += 1
+		}
+		buf[cn] = 0
+		append(
+			&track.clips,
+			Clip {
+				clip_id = new_clip_id(),
+				path = cstring(&buf[0]),
+				kind = .Audio,
+				name = "clip",
+				timeline_start_frame = i64(i) * 100,
+				source_length_frames = 100,
+				source_start_frame = 0,
+				stream_index = 0,
+			},
+		)
+	}
+	append(&timeline.tracks, track)
+	audio_geometry_commit()
+
+	// Take the slab exactly as the producer does before a provision, claim
+	// included: the claim is what the writer must respect.
+	held := audio_geom_acquire()
+	defer audio_geom_release()
+	held_n := held.n
+	held_first := held.chip[0].timeline_start
+	held_path := audio_chip_path(held, &held.chip[0])
+	fmt.printf(
+		"[ap] reader holds slot %d: n=%d chip0.start=%d path=%q\n",
+		int(sync.atomic_load(&audio_geom_state.idx)),
+		held_n,
+		held_first,
+		held_path,
+	)
+
+	// Two commits: what a split plus a ripple-delete inside one provision does.
+	for pass in 0 ..< 2 {
+		for &c in timeline.tracks[0].clips {
+			c.timeline_start_frame += i64(1000 * (pass + 1))
+		}
+		audio_geometry_commit()
+	}
+	published := sync.atomic_load(&audio_geom_state.idx)
+	now_n := held.n
+	now_first := held.chip[0].timeline_start
+	now_path := audio_chip_path(held, &held.chip[0])
+	fmt.printf(
+		"[ap] after 2 commits: published slot %d, held slot now n=%d chip0.start=%d path=%q\n",
+		int(published),
+		now_n,
+		now_first,
+		now_path,
+	)
+	if now_n != held_n || now_first != held_first || now_path != held_path {
+		fmt.println(
+			"[ap] FAIL: the writer overwrote the slot a reader is holding -- with two slots, two commits inside one provision wrap onto it",
+		)
+		return false
+	}
+	// And the freshly published slot must describe the CURRENT timeline, or the
+	// next provision builds from stale geometry.
+	cur := &audio_geom_state.slots[published]
+	want := timeline.tracks[0].clips[0].timeline_start_frame
+	if cur.n == 0 || cur.chip[0].timeline_start != want {
+		fmt.printf(
+			"[ap] FAIL: published slot has n=%d chip0.start=%d, want the timeline's %d\n",
+			cur.n,
+			cur.chip[0].timeline_start,
+			want,
+		)
+		return false
+	}
+	fmt.println("[ap] the reader's slot survived two commits, and the published slot is current")
 	return true
 }

@@ -469,6 +469,30 @@ target_keyframe_probe() {
 	VYPER_KEYFRAME_PROBE=1 timeout 120 ./vyper
 }
 
+# The audio engine regression check (audio_probe.odin). It has no gate target
+# either, so nothing ran it: it is the only check on the geometry-slab handoff
+# between the UI thread and the producer, on segment geometry after edits, and on
+# the per-source gain fold. It needs a media file, which the target synthesizes
+# deterministically (lavfi testsrc2 + sine) so it never depends on a fixture
+# someone has to supply. The probe exits 0/1 itself and skips the parts that
+# need an audio device when there is none.
+target_audio_probe() {
+	require_fresh_binary audio-probe || return 1
+	mkdir -p target/audio_probe
+	local src=target/audio_probe/src.mp4
+	if [ ! -s "$src" ]; then
+		if ! dev ffmpeg -y -f lavfi -i \
+			"testsrc2=size=640x360:rate=30:duration=10" \
+			-f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" \
+			-c:v libx264 -pix_fmt yuv420p -crf 20 -c:a aac -shortest "$src" >/dev/null 2>&1
+		then
+			echo "audio-probe: could not synthesize the source clip" >&2
+			return 1
+		fi
+	fi
+	VYPER_AUDIO_PROBE="$src|4|2" timeout 600 ./vyper
+}
+
 # The preview handle/snap geometry regression check (transform_probe.odin).
 # It was reachable only by setting VYPER_TRANSFORM_PROBE by hand, so nothing
 # ran it: it is the one probe covering clip_full_box_dims and the crop/edge
@@ -947,6 +971,7 @@ main() {
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
 	keyframe_probe) target_keyframe_probe ;;
+	audio_probe) target_audio_probe ;;
 	geom_key_probe) target_geom_key_probe ;;
 	geom_key_valgrind) target_geom_key_valgrind ;;
 	render_live_probe) target_render_live_probe ;;
