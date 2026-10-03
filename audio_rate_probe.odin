@@ -58,6 +58,47 @@ ar_measure_peak :: proc(play_frame: i64) -> (peak, samples: int, covered: bool) 
 	return
 }
 
+// ar_simulate_preview_mix walks the given frames through audio_mix_frame -- the
+// exact call the playback audio thread makes per frame -- and measures the peak
+// amplitude of the MIXED buffer, not merely whether the mix reported that it
+// delivered something. A frame can "deliver" pure zeroes, which is what a
+// mis-pointed source looks like from the device's side, so only the buffer's
+// amplitude distinguishes them.
+//
+// Returns (frames, frames_with_signal, peak).
+ar_simulate_preview_mix :: proc(from, to: i64) -> (frames, with_signal: int, peak: int) {
+	fps := timeline_fps()
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	for f := from; f < to; f += 1 {
+		spf := 1
+		if fps > 0 {
+			b0 := audio_frame_boundary48(f, fps)
+			b1 := audio_frame_boundary48(f + 1, fps)
+			spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
+		}
+		_ = audio_mix_frame(mix[:], f, spf)
+		frames += 1
+		fp := 0
+		for i in 0 ..< spf * 2 {
+			v := mix[i]
+			if v < 0 {
+				v = -v
+			}
+			a := int(v * 32767.0)
+			if a > fp {
+				fp = a
+			}
+		}
+		if fp > peak {
+			peak = fp
+		}
+		if fp >= INAUDIBLE_PEAK_FS {
+			with_signal += 1
+		}
+	}
+	return
+}
+
 // ar_report_rate_invariance asserts the invariant the whole fix rests on: the
 // resolved source start of a clip must not move when the clock does.
 ar_report_rate_invariance :: proc(c: ^Clip, pinned: f64) -> bool {
@@ -158,6 +199,21 @@ audio_rate_probe_run :: proc(v: string) {
 				f64(peak) * 100.0 / 32768.0,
 				peak >= INAUDIBLE_PEAK_FS ? "AUDIBLE" : "IN-AUDIBLE",
 			)
+			// The real preview path: audio_mix_frame per frame, measuring the
+			// mixed buffer's amplitude rather than trusting the delivered flag.
+			audio_provision(ac.timeline_start_frame)
+			mf, ms, mp := ar_simulate_preview_mix(ac.timeline_start_frame, ac.timeline_start_frame + ac.source_length_frames)
+			fmt.printf(
+				"[ar-probe]   preview mix: %d/%d frames carried signal, peak=%d (%.1f%% FS)\n",
+				ms,
+				mf,
+				mp,
+				f64(mp) * 100.0 / 32768.0,
+			)
+			if mf > 0 && ms * 2 < mf {
+				inaudible += 1
+				fail = true
+			}
 			if !covered {
 				fmt.println("[ar-probe]   no decoder covered the playhead -> NOT SCHEDULED")
 			}
@@ -284,7 +340,26 @@ audio_rate_fixture_run :: proc(v: string) {
 		fail = true
 	}
 
-	// 3. NEGATIVE CONTROL: unpin it and the clip must go silent. This is the
+	// 3. The REAL preview mix path, frame by frame, at the new rate. The
+	// measurements above decode straight from the anchor; this walks the same
+	// audio_mix_frame the playback thread calls, so it also covers pacing, the
+	// producer's demand calculation and the mixer.
+	audio_provision(mid)
+	mf, ms, mp := ar_simulate_preview_mix(ac.timeline_start_frame, ac.timeline_start_frame + ac.source_length_frames)
+	fmt.printf(
+		"[ar-probe] preview mix at %v fps: %d/%d frames carried signal, peak=%d (%.1f%% FS)\n",
+		fps,
+		ms,
+		mf,
+		mp,
+		f64(mp) * 100.0 / 32768.0,
+	)
+	if mf > 0 && ms*2 < mf {
+		fmt.println("[ar-probe] FAIL: preview mix delivered mostly silence")
+		fail = true
+	}
+
+	// 4. NEGATIVE CONTROL: unpin it and the clip must go silent. This is the
 	// original defect, reproduced on purpose -- if it stayed audible the fixture
 	// would no longer discriminate and the checks above would be worthless.
 	saved := ac.audio_src_rate
@@ -304,6 +379,7 @@ audio_rate_fixture_run :: proc(v: string) {
 	}
 
 	// Leave the document in the pinned state for the export below.
+	audio_provision(ac.timeline_start_frame)
 	ar_finish(&fail, fps, out_path)
 }
 
