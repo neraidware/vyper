@@ -4009,8 +4009,9 @@ already had.
 - Gates: `check build probe keyframe_probe timeline_probe transform_probe
   geom_key_probe opacity undo_valgrind valgrind` pass. Valgrind is back to the pre-work baseline exactly —
   `11720 errors from 23 contexts` (FFmpeg/Odin noise), `definitely lost: 0`,
-  `indirectly lost: 0`, no invalid free/read/write. `zorder`/`keyed_export` are
-  unrunnable here (missing `target/keyed_export/src.mp4`).
+  `indirectly lost: 0`, no invalid free/read/write. `zorder`/`keyed_export` also
+  pass on `main` once their deterministic fixture is present — see the Active 15
+  note on the missing `dev` wrapper.
 - One defect was found *by* the memory gate rather than by a probe: the ripple
   probe snapshotted track 0 with a shallow `Clip` copy to restore it afterwards,
   which aliased payloads the ripple then freed, so the restore handed teardown an
@@ -4104,10 +4105,17 @@ the third slot alone.
 
 **Accept.** Gates: `check build probe timeline_probe transform_probe
 geom_key_probe opacity audio_probe undo_valgrind valgrind` pass. Valgrind at the
-baseline (0 lost, no invalid access, 23 contexts). `zorder`/`keyed_export` remain
-unrunnable in this environment: their fixtures are synthesized through a `dev
-ffmpeg` wrapper that does not exist here, so the source clip is never created
-and the target fails on the missing file, not on an app defect.
+baseline (0 lost, no invalid access, 23 contexts; `11754 errors from 23 contexts`
+post-merge, the extra count being the probe code, same 23 contexts).
+
+`zorder`/`keyed_export` looked unrunnable in this environment and were not: their
+fixtures are synthesized through a `dev ffmpeg` wrapper that does not exist
+here, so the target failed on the missing file, not on an app defect. Generating
+the same deterministic lavfi clip with the system ffmpeg and re-running both
+targets passes them (`zorder: below=inf hidden under video, above=29.1 drawn over
+it`), and `scripts/gate.sh all` exits 0 on `main`. The wrapper is still missing
+here — a fresh checkout with no cached fixture will fail these targets on this
+box until either `dev` exists or the targets fall back to a system ffmpeg.
 
 **Not fixed here, and named.** Two things this work does not claim:
 
