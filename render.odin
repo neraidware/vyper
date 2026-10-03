@@ -1270,6 +1270,10 @@ Render_Audio_Src :: struct {
 	stream_index:         c.int,
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
+	// source_start_rate pins the rate source_start_frame is counted against,
+	// so the export reads the same part of the file playback does no matter
+	// what the project rate is now (see audio_source_start_sec).
+	source_start_rate:    f64,
 	source_length_frames: i64,
 	// gain is the render's FROZEN copy of the clip's committed gain snapshot,
 	// taken at render start from the same geometry slab the playback producer
@@ -1294,6 +1298,7 @@ render_audio_src_from_chip :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chi
 		stream_index = chip.stream_index,
 		timeline_start_frame = chip.timeline_start,
 		source_start_frame = chip.source_start,
+		source_start_rate = chip.source_rate,
 		source_length_frames = chip.source_len,
 		gain = chip.gain,
 	}
@@ -2109,7 +2114,7 @@ render_audio_pull :: proc(a: ^Render_Audio_Src, up_to48: i64) {
 
 render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> bool {
 	overlap_start := max(a.timeline_start_frame, render_start)
-	content_sec := f64(overlap_start - a.timeline_start_frame + a.source_start_frame) / fps
+	content_sec := audio_content_sec(overlap_start - a.timeline_start_frame, a.source_start_frame, a.source_start_rate, fps)
 	if !open_audio_decoder_resampled(&a.dec, a.path, a.stream_index, RENDER_AUDIO_RATE, 2) {
 		return false
 	}
@@ -3235,9 +3240,8 @@ render_worker_run :: proc() {
 					continue
 				}
 				start48 := i64(
-					f64(timeline_frame - a.timeline_start_frame + a.source_start_frame) *
-					f64(RENDER_AUDIO_RATE) /
-					rfps,
+					audio_content_sec(timeline_frame - a.timeline_start_frame, a.source_start_frame, a.source_start_rate, rfps) *
+					f64(RENDER_AUDIO_RATE),
 				)
 				render_audio_pull(a, start48 + i64(cur_spf))
 				if start48 < a.first48 || a.have48 < start48 + i64(cur_spf) {

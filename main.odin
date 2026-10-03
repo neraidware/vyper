@@ -1844,6 +1844,12 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if ap, _ := os.lookup_env_alloc("VYPER_AUDIO_PROBE", context.temp_allocator); ap != "" {
 		os.exit(audio_probe_run(ap))
 	}
+	if ar, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_PROBE", context.temp_allocator); ar != "" {
+		audio_rate_probe_run(ar)
+	}
+	if arf, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_FIXTURE", context.temp_allocator); arf != "" {
+		audio_rate_fixture_run(arf)
+	}
 	// Headless undo-tree probe: validates the history tree and the viewer's row
 	// renderer without a display (needs no fonts / SDL).
 	if handle_undo_probe() {

@@ -4229,3 +4229,106 @@ box until either `dev` exists or the targets fall back to a system ffmpeg.
 - The `dev`-less media gates are an environment gap, not a code defect, and
   `keyframes.odin`'s `kf_split_parts` deletion on the ripple branch is not
   mirrored here — that belongs to the branch that owns it.
+
+## Active 17 — Changing the project frame rate silently re-pointed audio clips
+
+**Status: fixed 2026-10-03.** Branch `main` (post-`509d7fd`). `audio_rate` is a
+member of `all`. Found while investigating why one audio clip in `baby.vyproj`
+was inaudible after the project was switched from 12 fps to 60 fps.
+
+**The defect.** An audio clip's position inside its source FILE was derived by
+dividing a frame count by the CURRENT project rate:
+
+```
+content_sec := f64(seek_frame - seg.start_a + seg.start_s) / fps
+```
+
+An audio file has no frame rate of its own — `media.odin` quantizes its
+duration into timeline frames at import — so `source_start_frame` only means
+anything against the rate it was authored at. Switching the project to 60 fps
+re-divided every audio offset by 5. The clip at `source_start_frame = 35` went
+from `35/12 = 2.917 s` to `35/60 = 0.583 s`, and the first ~1.2 s of that file
+is digital silence, so the decoder opened, pulled real samples, and every one
+of them was silence: `-60.3 dB` mean over the region the clip now pointed at,
+against `-10.8 dB` where the scream actually is.
+
+The tell that this is a defect and not a semantic choice: the project's *Siren*
+clip has `source_start_frame = 0`, so `0/12 == 0/60` and it kept its content
+(and merely sped up). Only clips with a non-zero source offset moved. One button
+press, two clips, different damage, nothing logged.
+
+**Why a rate and not a stored offset.** `source_start_frame` is adjusted in
+frame space by split, ripple, join and trim (`timeline.odin`, six sites), and it
+is compared in frame space for segment contiguity. Storing a second, pinned
+offset would mean keeping two representations of one fact in lockstep by hand at
+every one of those sites. Pinning the RATE instead keeps the frame number the
+single source of truth and lets those sites stay untouched.
+
+**The fix.**
+
+- `Clip.audio_src_rate` — the rate an audio clip's source frames are counted
+  against. 0 = unpinned, which falls back to the current rate, i.e. exactly the
+  old behavior, so an unpinned clip is never worse than before.
+- `Media_Asset.audio_rate` — the exact `timeline_fps()` at import, not one
+  recovered by dividing `audio_frames` back out of the duration (that drifts:
+  the fixture's 79 frames over 6.6 s gives 11.9697, not 12).
+- `audio_source_start_sec` / `audio_content_sec` (`state.odin`) — the one place
+  a timeline frame becomes a source-file position. The two terms are different
+  kinds of quantity: `frames_into/fps` is a wall-clock distance and follows the
+  rate (a clip gets faster, like video), while the pinned start cannot move.
+  Collapsing them into `(frames_into + start_s) / fps` is the bug.
+- Applied at all six conversion sites: `audio.odin` (provision anchor, demand,
+  re-anchor, resync) and `render.odin` (`render_audio_open`, per-frame
+  `start48`). Both the chip and `Play_Seg` carry the pin.
+- `pf_pin_audio_src_rates` migrates on load, at the only moment the project's
+  original rate is still recoverable. A project saved while its rate already
+  disagreed with its authoring rate cannot be recovered — nothing in the file
+  records the authoring rate — and the effective rate is then the best reading.
+
+The clip still speeds up 5x, which is the accepted consequence of a 5x-faster
+timeline and exactly what the `source_start_frame = 0` clip already did; what it
+no longer does is change WHICH part of the file is heard.
+
+**Steps / probe / acceptance.** `audio_rate_probe.odin`, wired as
+`VYPER_AUDIO_RATE_FIXTURE` (self-contained: the probe synthesizes its own WAV,
+silent for 1.2 s then a 1 kHz tone, and builds the project, because the property
+under test is a relationship between a rate and an offset and no off-the-shelf
+clip is guaranteed to have a non-zero one) and `VYPER_AUDIO_RATE_PROBE` for a
+real project.
+
+- Asserts the resolved source start is IDENTICAL at 12/24/30/60/120 fps. A
+  loudness check alone cannot: a project whose clips happen to sit on non-silent
+  audio would keep passing after the pin reverted to something merely audible.
+- Runs a negative control that unpins the clip and REQUIRES it to go silent, so
+  the fixture cannot silently stop discriminating while still passing.
+- Mutation-verified. Reverting `audio_content_sec` to the original formula:
+  `source start moved with the clock: at 60 fps got 0.500000s, pinned
+  2.500000s`, clip inaudible, gate exits 1.
+- `baby.vyproj` verified end to end: at 60 fps the clip reads `2.917..3.483 s`
+  and the exported window carries the scream at `-20.5 dB` mean / `-5.5 dB` max.
+  Before the fix the same window was `-65.0 dB`.
+
+**The gate also checks the exported file, and that is not redundant.** The probe
+reads the pin off the clip, so it cannot see a render-path regression: breaking
+`Render_Audio_Src.source_start_rate` alone leaves the probe PASSING while the
+muxed file goes to `-65.0 dB`. `scripts/gate.sh audio_rate` therefore
+volumedetects the export (`-7.8 dB` expected, fails below `-30 dB`).
+
+**Pre-existing, not a regression.** `project.frame_rate` already outranked
+`timeline.frame_rate` in `timeline_fps()` before the Active 16 work
+(`64deb4e~1:state.odin`); that work only repointed the EXPORT at the value the
+preview already used. Preview and audio were untouched by it.
+
+**Measurement corrections made along the way, recorded because both first
+produced a wrong verdict.** The probe's audibility floor began at peak 64
+(-42 dBFS) and called the bug's `peak=162` "AUDIBLE", passing a FAIL; ffmpeg
+independently reports that region at `-60 dB` mean. The floor is now 512
+(-36 dBFS). The first export comparison used the window 3.50–4.04 s, which
+overlaps the Siren clip's tail (it ends at frame 219 = 3.65 s) and reported
+`-28 dB` for a build that was actually silent; measured strictly inside the
+clip it is `-65.0 dB`.
+
+**Not fixed here, and named.** The clip's gain is a static `-5 dB` in this
+project; nothing here exercises the keyed-gain path against a rate change, and
+`kf` tracks are keyed in timeline frames, so they retime with the clip the same
+way video does. `baby.vyproj` has no keyed gain track to check that against.

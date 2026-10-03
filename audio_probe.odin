@@ -138,10 +138,14 @@ audio_probe_run :: proc(v: string) -> int {
 	for k in 0 ..< audio_src.count {
 		s := &audio_src.slots[k]
 		start_a, start_s, len_a := i64(0), i64(0), i64(0)
+		start_s_rate := f64(0)
 		if first := play_src_first_seg_at(s, 0); first != nil {
 			start_a, start_s, len_a = first.start_a, first.start_s, first.len_a
+			start_s_rate = first.start_s_rate
 		}
-		expected := i64(f64(start_s) * 48000.0 / fps)
+		// Through the shared conversion, not a second copy of the formula: this
+		// expectation must track the pinned source offset the producer uses.
+		expected := i64(audio_content_sec(0, start_s, start_s_rate, fps) * 48000.0)
 		fmt.printf(
 			"[ap]  src %2d segs=%d a0=[%d,%d) s0=%d first48=%d expected=%d off=%+d (%.3fs)\n",
 			k,

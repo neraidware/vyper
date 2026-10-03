@@ -361,7 +361,8 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 	}
 	// NOTE: audio has no fps of its own; size against the timeline clock
 	// (timeline_fps falls back to 60 before any video import).
-	audio_frames := i64(probe.duration_sec * timeline_fps())
+	audio_rate := timeline_fps()
+	audio_frames := i64(probe.duration_sec * audio_rate)
 	if audio_frames < frame_count {
 		audio_frames = frame_count
 	}
@@ -400,6 +401,7 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 			src_h = src_h,
 			audio_streams = c.int(probe.audio_streams),
 			audio_frames = audio_frames,
+			audio_rate = audio_rate,
 			is_image = is_image,
 			thumb_tex_dirty = true,
 		},
@@ -517,6 +519,7 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	for offset in 0 ..< n_lanes {
 		is_video := asset.kind == .Video && offset == 0
 		is_sub := asset.kind == .Subtitles && offset == 0
+		is_audio := !is_video && !is_sub
 		lane_len := is_video ? asset.frame_count : asset.audio_frames
 		lane := base + offset
 		for len(timeline.tracks) <= lane {
@@ -550,6 +553,10 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			srt_id               = is_sub ? asset.srt_id : -1,
 			stream_index         = is_sub ? c.int(-1) : c.int(offset - (asset.kind == .Video ? 1 : 0)),
 			source_start_frame   = 0,
+			// Pin the audio clip's source-frame space to the rate its length was
+			// measured against (audio_frames above), so a later project-rate
+			// change retimes the clip without moving where it reads in the file.
+			audio_src_rate        = is_audio ? asset.audio_rate : 0,
 			source_length_frames = lane_len,
 			timeline_start_frame = placed,
 		}

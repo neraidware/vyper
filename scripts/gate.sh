@@ -972,6 +972,7 @@ target_proxy_probe() {
 # and the seven invalid inputs that must be rejected -- which no end-to-end path
 # can reach.
 PARITY_DIR=target/parity
+AUDIO_RATE_DIR=target/audio_rate
 
 # The fixture media target_parity synthesizes, factored out because the valgrind
 # twin needs the same two files and must not re-derive them (an ffmpeg build
@@ -1024,6 +1025,54 @@ target_parity() {
 		return 1
 	fi
 	echo "parity: OK (export muxed at $got, matching the 30 fps grid)"
+}
+
+# The audio-rate-change regression check (audio_rate_probe.odin). It needs no
+# fixture from disk: the probe synthesizes its own WAV (digital silence for the
+# first 1.2s, a loud tone after) and builds the project, because the property
+# under test is a relationship between a rate and a source offset -- an
+# off-the-shelf clip either has a non-zero offset or does not.
+#
+# The defect: an audio clip's source offset was divided by the CURRENT project
+# rate, so switching a 12fps project to 60fps moved it from 2.5s into the file
+# to 0.5s -- into the silent head, i.e. silence. The probe asserts the offset is
+# invariant across 12/24/30/60/120 fps, AND runs a negative control that unpins
+# the clip and requires it to go silent, so the fixture cannot stop
+# discriminating while still passing.
+target_audio_rate() {
+	require_fresh_binary audio-rate || return 1
+	mkdir -p "$AUDIO_RATE_DIR"
+	local wav="$AUDIO_RATE_DIR/fixture.wav"
+	local out="$AUDIO_RATE_DIR/out.mp4"
+	local log="$AUDIO_RATE_DIR/audio_rate.log"
+	VYPER_AUDIO_RATE_FIXTURE="$wav|$out" timeout 600 ./vyper >"$log" 2>&1
+	local rc=$?
+	grep -E '^\[ar-probe\]' "$log" || true
+	if [ $rc -ne 0 ]; then
+		echo "audio-rate: FAILED (exit $rc) -- full log in $log" >&2
+		return 1
+	fi
+	# Assert the EXPORTED file independently. The probe reads the pin off the
+	# clip, so it cannot see a render-path regression: breaking
+	# Render_Audio_Src.source_start_rate leaves the probe passing while the muxed
+	# file goes silent. Measured -65 dB that way, against -7.8 dB here. Only
+	# this check catches it.
+	local mean
+	mean=$(dev ffmpeg -hide_banner -nostats -ss 0.05 -to 0.35 -i "$out" \
+		-af volumedetect -f null - 2>&1 | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB/\1/p')
+	if [ -z "$mean" ]; then
+		echo "audio-rate: could not measure $out" >&2
+		return 1
+	fi
+	# -30 dB is far below the fixture's tone (-7.8 dB) and far above the
+	# silence the defect produced (-65 dB), so this fails loudly either way.
+	if awk "BEGIN{exit !($mean > -30)}"; then
+		echo "audio-rate: OK (export carries the tone at $mean dB mean after a 12->60fps change)"
+	else
+		echo "audio-rate: $out is $mean dB mean, expected louder than -30 dB" >&2
+		echo "audio-rate: the export read the wrong part of the source file" >&2
+		return 1
+	fi
 }
 
 # The memory gate for the parity probe. The probe is the one path that builds a
@@ -1153,7 +1202,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe parity yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe parity audio_rate yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1177,6 +1226,7 @@ main() {
 	timeline_probe) target_timeline_probe ;;
 	dnd_probe) target_dnd_probe ;;
 	parity) target_parity ;;
+	audio_rate) target_audio_rate ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
 	yuv_exact) target_yuv_exact ;;

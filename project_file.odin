@@ -57,6 +57,7 @@ Saved_Asset :: struct {
 	src_h:         c.int,
 	audio_streams: c.int,
 	audio_frames:  i64,
+	audio_rate:    f64,
 	is_image:      bool,
 	srt_id:        int,
 }
@@ -78,6 +79,7 @@ Saved_Clip :: struct {
 	stream_index:         c.int,
 	gain:                 f32,
 	source_start_frame:   i64,
+	audio_src_rate:       f64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
 	source_w:             c.int,
@@ -183,6 +185,7 @@ project_to_file :: proc() -> Project_File {
 			src_h         = a.src_h,
 			audio_streams = a.audio_streams,
 			audio_frames  = a.audio_frames,
+			audio_rate    = a.audio_rate,
 			is_image      = a.is_image,
 			srt_id        = a.srt_id,
 		})
@@ -212,6 +215,7 @@ project_to_file :: proc() -> Project_File {
 				stream_index         = c.stream_index,
 				gain                 = c.gain,
 				source_start_frame   = c.source_start_frame,
+				audio_src_rate       = c.audio_src_rate,
 				source_length_frames = c.source_length_frames,
 				timeline_start_frame = c.timeline_start_frame,
 				source_w             = c.source_w,
@@ -327,6 +331,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				src_h         = sa.src_h,
 				audio_streams = sa.audio_streams,
 				audio_frames  = sa.audio_frames,
+				audio_rate    = sa.audio_rate,
 				is_image      = sa.is_image,
 				srt_id        = sa.srt_id,
 				thumb_tex_dirty = true,
@@ -376,6 +381,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				stream_index         = sc.stream_index,
 				gain                 = sc.gain,
 				source_start_frame   = sc.source_start_frame,
+				audio_src_rate       = sc.audio_src_rate,
 				source_length_frames = sc.source_length_frames,
 				timeline_start_frame = sc.timeline_start_frame,
 				source_w             = sc.source_w,
@@ -422,6 +428,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 	copy(timeline.track_order[:], pf.track_order[:])
 	timeline.playhead_frame = pf.playhead_frame
 	timeline.frame_rate = pf.timeline_frame_rate
+	pf_pin_audio_src_rates()
 
 	// Post-load reset: a full session replace invalidates every decoder, the
 	// preview cache, and playback state. Mirrors the import post-edit block.
@@ -454,6 +461,37 @@ session_rebuild :: proc(pf: ^Project_File) {
 // session_rebuild copies everything it needs into the session heap, so the DTO
 // can be transient. Returns a notice text on failure ("" = success); a failed
 // read/decode leaves the live session untouched.
+// pf_pin_audio_src_rates pins the source-frame space of every audio clip that
+// has none (a project saved before Clip.audio_src_rate existed).
+//
+// Without this, opening such a project and then changing the rate re-points its
+// audio clips at a different part of their file -- the defect this pin exists to
+// remove. The pin has to be taken HERE, at load, while the project's own rate is
+// still the one the frame numbers were written against; afterwards the rate is
+// mutable and the original value is unrecoverable.
+//
+// Preference order: the asset's own import rate (exact -- it is the rate
+// audio_frames was measured with), else the project's effective rate at load.
+// A project that was last saved while its rate already disagreed with the rate
+// it was authored at cannot be recovered -- nothing in the file records the
+// authoring rate -- so the effective rate is the best available reading.
+pf_pin_audio_src_rates :: proc() {
+	rate := project_fps()
+	for ti in 0 ..< len(timeline.tracks) {
+		for ci in 0 ..< len(timeline.tracks[ti].clips) {
+			c := &timeline.tracks[ti].clips[ci]
+			if c.kind != .Audio || c.audio_src_rate > 0 {
+				continue
+			}
+			pinned := rate
+			if as := find_asset(c.asset_id); as != nil && as.audio_rate > 0 {
+				pinned = as.audio_rate
+			}
+			c.audio_src_rate = pinned
+		}
+	}
+}
+
 project_file_open :: proc(path: string) -> string {
 	bytes, rerr := os.read_entire_file(path, context.temp_allocator)
 	if rerr != nil {

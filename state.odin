@@ -164,6 +164,47 @@ timeline_fps :: proc() -> f64 {
 	return project_fps()
 }
 
+// audio_source_start_sec returns where an AUDIO clip starts inside its source
+// FILE, in seconds.
+//
+// An audio file has no frame rate of its own: media.odin quantizes its duration
+// into timeline frames at import (audio_frames), so a clip's source_start_frame
+// only means anything against the rate it was authored at. Dividing it by the
+// CURRENT project rate made the clip silently re-point when the rate changed --
+// an offset of 35 frames went from 2.917s (12fps) to 0.583s (60fps), i.e. into
+// the silent head of the file. The rate is therefore pinned per clip
+// (Clip.audio_src_rate) and this is the only place it is turned into seconds.
+//
+// audio_src_rate == 0 means unpinned: a clip from a project saved before the
+// pin existed, or one built by a probe. It falls back to the current rate, which
+// is exactly the old behavior, so an unpinned clip is never worse than before.
+audio_source_start_sec :: proc(source_start_frame: i64, audio_src_rate: f64) -> f64 {
+	rate := audio_src_rate
+	if !(rate > 0) {
+		rate = timeline_fps()
+	}
+	return f64(source_start_frame) / rate
+}
+
+// audio_content_sec is the one place a timeline frame is turned into a position
+// in an audio source file, in seconds. Every producer and the renderer share it
+// so playback and export cannot drift.
+//
+// The two terms are deliberately different kinds of quantity:
+//
+//	frames_into/fps          how far INTO the clip we are -- a wall-clock
+//	                          distance, so it follows the current rate (a clip
+//	                          gets faster when the project does, like video).
+//	start_s_sec               where the clip begins in the FILE -- pinned, so a
+//	                          rate change can never move it (see
+//	                          audio_source_start_sec).
+//
+// Collapsing these into `(frames_into + start_s) / fps` is the bug: it divides
+// the pinned term by a rate it does not belong to.
+audio_content_sec :: proc(frames_into: i64, start_s: i64, start_s_rate: f64, fps: f64) -> f64 {
+	return f64(frames_into) / fps + audio_source_start_sec(start_s, start_s_rate)
+}
+
 // DIAG (temporary): magic playback-clock overrides to isolate whether the
 // playhead's wall-clock cadence affects the audible audio rate.
 //   VYPER_PLAYBACK_MAGIC_MS  > 0  ignore measured wall delta; advance the
@@ -253,6 +294,12 @@ Media_Asset :: struct {
 	// audio_frames is the clip length for the audio stream(s), derived from the
 	// duration at import (never shorter than the video frame count).
 	audio_frames:    i64,
+	// audio_rate is the rate audio_frames was measured against -- the exact
+	// timeline_fps() at import, not one recovered by dividing audio_frames back
+	// out of the duration (that drifts by the frame quantization). A clip
+	// placed from this asset pins Clip.audio_src_rate to it, so the clip's
+	// source-frame space survives a project-rate change exactly.
+	audio_rate:      f64,
 	// is_image marks a still-image source. A still has a single decodable frame
 	// but is placed on the timeline with a one-second length (like every other
 	// import's default), so its frames map to source frame 0 for the whole
@@ -328,6 +375,13 @@ Clip :: struct {
 	// only audible for Audio clips.
 	gain:                 f32,
 	source_start_frame:   i64,
+	// audio_src_rate pins the rate an AUDIO clip's source_start_frame is
+	// counted against, so changing the project rate cannot silently re-point
+	// the clip at a different part of its file (see audio_source_start_sec).
+	// Ignored for every other kind: a video's source frames are real frames of
+	// the file, not a quantization against the timeline clock. 0 = unpinned,
+	// which falls back to the current rate (pre-pin projects).
+	audio_src_rate:        f64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
 	// Native source pixel size (0 = unknown). The clip image is drawn keeping

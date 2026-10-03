@@ -488,6 +488,11 @@ ring_destroy :: proc(r: ^Audio_Ring) {
 Play_Seg :: struct {
 	start_a: i64, // timeline_start_frame
 	start_s: i64, // source_start_frame
+	// start_s_rate pins the rate start_s is counted against; see
+	// audio_source_start_sec. Kept in frames (not pre-converted to seconds) so
+	// the contiguity checks that compare start_s across segments stay in one
+	// space.
+	start_s_rate: f64,
 	len_a:   i64, // source_length_frames
 	// gain is the segment's latched copy of the committed gain snapshot (static
 	// dB + keyed curve), taken once at provision from the geometry slab. Rides
@@ -716,10 +721,14 @@ Audio_Geom_Chip :: struct {
 	timeline_start: i64,
 	source_start:   i64,
 	source_len:     i64,
-	stream_index:   c.int,
-	gain:           Audio_Gain_Snapshot,
-	path_off:       int, // offset into Audio_Geom_Slot.paths
-	path_len:       int,
+	// source_rate pins the rate source_start is counted against, carried with
+	// the clip so the producer converts it without reading live timeline state
+	// (see audio_source_start_sec).
+	source_rate:   f64,
+	stream_index:  c.int,
+	gain:          Audio_Gain_Snapshot,
+	path_off:      int, // offset into Audio_Geom_Slot.paths
+	path_len:      int,
 }
 
 Audio_Geom_Slot :: struct {
@@ -862,6 +871,7 @@ audio_geometry_commit :: proc() {
 			chip := &slot.chip[slot.n]
 			chip.timeline_start = clip.timeline_start_frame
 			chip.source_start = clip.source_start_frame
+			chip.source_rate = clip.audio_src_rate
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
 			// Snapshot the clip's gain (static dB + its keyframe track) into the
@@ -1025,10 +1035,11 @@ audio_provision :: proc(play_frame: i64) {
 			continue
 		}
 		g.seg[g.seg_count] = Play_Seg{
-			start_a = chip.timeline_start,
-			start_s = chip.source_start,
-			len_a   = chip.source_len,
-			gain    = chip.gain,
+			start_a     = chip.timeline_start,
+			start_s     = chip.source_start,
+			start_s_rate = chip.source_rate,
+			len_a       = chip.source_len,
+			gain        = chip.gain,
 		}
 		g.seg_count += 1
 	}
@@ -1041,7 +1052,7 @@ audio_provision :: proc(play_frame: i64) {
 		anchored := false
 		if seg := play_src_first_seg_at(s, play_frame); seg != nil {
 			seek_frame := max(play_frame, seg.start_a)
-			content_sec := f64(seek_frame - seg.start_a + seg.start_s) / fps
+			content_sec := audio_content_sec(seek_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
 			if audio_src_open(s, content_sec) {
 				anchored = true
 			}
@@ -1211,7 +1222,7 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if seg == nil {
 			continue
 		}
-		demand48 := i64(f64(frame - seg.start_a + seg.start_s) * 48000.0 / fps)
+		demand48 := i64(audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
 		if demand48 < s.first48 {
 			// The fifo head is ahead of the needed sample. A gap within one
 			// frame is a boundary-rounding artifact at non-integer fps (the
@@ -1219,7 +1230,7 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 			// A larger gap means a forward jump advanced past content still
 			// needed: re-anchor this stream instead of feeding silence.
 			if s.first48 - demand48 > i64(spf) {
-				content_sec := f64(frame - seg.start_a + seg.start_s) / fps
+				content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
 				if !audio_src_seek_anchor(s, content_sec) {
 					continue
 				}
@@ -1698,7 +1709,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 						in_fifo := false
 						if seg := play_src_seg_at(s, audio_src.next_frame); seg != nil {
 							covered = true
-							at = i64(f64(audio_src.next_frame - seg.start_a + seg.start_s) * 48000.0 / fps)
+							at = i64(audio_content_sec(audio_src.next_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
 							in_fifo = at >= s.first48 && at < s.have48
 						}
 						fmt.printf("[src %d] %s segs=%d dec=%t in=%dHz/%dch out=%dHz/%dch first48=%d have48=%d fifo=%dfr decoded=%dfr/%dch mix_at=%d(into %t) cov=%t\n",
