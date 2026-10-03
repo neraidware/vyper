@@ -594,6 +594,11 @@ Audio_Report :: struct {
 	skip_full:    u64, // feed() exits because the ring hit max_queue
 	skip_nocov:   u64, // feed() exits because no clip covers the next frame
 	rate_rebuilt: u64, // rate-graph (re)builds that re-anchored to the playhead
+	// provisions counts full re-provisions on the producer thread: every one
+	// clears the device queue and reopens EVERY decoder synchronously, so this
+	// is the cost of telling the engine "the timeline changed". A burst of
+	// edits that produces one provision per edit is the audio-restart storm.
+	provisions: u64,
 	wedge_heal:   u64, // backlog drops when prod was queue-capped short of target
 	mix_us:       u64, // time spent inside audio_mix_frame (decode + resample + mix)
 	feed_us:      u64, // time spent in audio_producer_feed outside mix
@@ -694,6 +699,19 @@ audio_gain_linear :: proc(g: ^Audio_Gain_Snapshot, rel: i32) -> f32 {
 	return kf_gain_linear(g.keys[:g.n], rel, g.db)
 }
 
+// AUDIO_GEOM_SLOTS is how many geometry slots exist. Three, not two, and the
+// reason is the READER'S HOLD TIME: the producer does not read the slab for a
+// moment, it reads it for a whole provision (every decoder reopened, tens of
+// ms) while the UI rewrites the slab on every edit. With two slots, two commits
+// inside one provision wrap the index around and the second lands on the slot
+// the provision is still reading. The writer skips the published slot AND the
+// one the reader has claimed, so with one reader three slots always leave one
+// free -- no waiting, no torn read.
+AUDIO_GEOM_SLOTS :: 3
+// AUDIO_GEOM_NO_SLOT is the "no reader" claim value (u32, so it cannot collide
+// with a slot index).
+AUDIO_GEOM_NO_SLOT :: u32(0xFFFFFFFF)
+
 Audio_Geom_Chip :: struct {
 	timeline_start: i64,
 	source_start:   i64,
@@ -711,20 +729,27 @@ Audio_Geom_Slot :: struct {
 	chip:      [AUDIO_GEOM_MAX_CLIPS]Audio_Geom_Chip,
 }
 
-// Audio_Geom is the geometry double-buffer + its handshake: the two slots, the
-// atomic index of the active slot, the gain epoch pair that lets the producer
+// Audio_Geom is the geometry slab + its handshake: the slots, the atomic index
+// of the active slot, the producer's claim on the slot it holds, the gain epoch
+// pair that lets the producer
 // fold gain changes in place, and the two one-shot overflow logs.
 Audio_Geom :: struct {
-	// slots are the two fixed-address buffers; idx is the atomically-swapped
-	// active slot. gain_epoch counts published gain changes (UI bumps it after
+	// slots are the fixed-address buffers; idx is the atomically-swapped
+	// active slot. reader is the slot the producer currently holds (or
+	// NO_SLOT): the writer must not start filling it. Only the producer claims
+	// or releases; the UI only reads it to choose a slot, and publishes idx so
+	// the next claim lands on a slot nobody is in.
+	//
+	// gain_epoch counts published gain changes (UI bumps it after
 	// a commit whose clips' gains differ from the previous slot); the producer
 	// compares it against gain_folded_epoch (producer-thread only) and folds
 	// the new gains into its provisioned segments in place. A gain-knob drag
 	// during playback must be audible within the cushion; a seek per knob move
 	// would reopen every decoder (~16 ms each) and chop the stream on every
 	// nudge. gain_epoch is published AFTER the slot index swap.
-	slots:      [2]Audio_Geom_Slot,
+	slots:      [AUDIO_GEOM_SLOTS]Audio_Geom_Slot,
 	idx:        u32, // atomic: active slot
+	reader:     u32, // atomic: slot the producer holds, or AUDIO_GEOM_NO_SLOT
 	gain_epoch: u64,
 	gain_folded_epoch: u64,
 	// overflow logs once when the timeline holds more audio clips (or more
@@ -762,12 +787,49 @@ audio_reset_play :: proc() {
 	audio_src.next_frame = 0
 }
 
+// audio_geom_acquire claims a slot to read for as long as the caller needs and
+// returns it. The claim is what stops audio_geometry_commit from filling the
+// slot under the reader; pair every acquire with audio_geom_release (defer it).
+//
+// Order matters and is the whole protocol: take idx first, then publish the
+// claim. The reverse order would let a commit that starts in between pick the
+// very slot this call is about to read -- the reader would announce its claim
+// for a slot the writer has already begun overwriting.
+audio_geom_acquire :: proc() -> ^Audio_Geom_Slot {
+	i := sync.atomic_load(&audio_geom_state.idx)
+	sync.atomic_store(&audio_geom_state.reader, i)
+	return &audio_geom_state.slots[i]
+}
+
+// audio_geom_release drops the claim so the writer may reuse the slot.
+audio_geom_release :: proc() {
+	sync.atomic_store(&audio_geom_state.reader, AUDIO_GEOM_NO_SLOT)
+}
+
+// audio_geom_write_slot picks the slot the UI may fill: neither the published
+// one (a reader that just loaded idx is reading it) nor the one the producer
+// holds. Three slots, at most two excluded, so this never has to wait.
+audio_geom_write_slot :: proc() -> int {
+	pub := int(sync.atomic_load(&audio_geom_state.idx))
+	held := int(sync.atomic_load(&audio_geom_state.reader))
+	for i in 0 ..< AUDIO_GEOM_SLOTS {
+		if i != pub && i != held {
+			return i
+		}
+	}
+	// Unreachable: pub and held exclude at most two of three slots. Asserted
+	// rather than returned as a valid index, because falling through would
+	// overwrite the published slot and corrupt a live reader.
+	assert(false, "audio_geom_write_slot: no free slot")
+	return pub
+}
+
 // audio_geometry_commit re-mirrors the audio clip geometry from the timeline
 // into the inactive slab slot and publishes it. UI-thread only (the timeline's
 // single writer). Rebuilding the whole chip array per edit is cheap — the
 // timeline holds tens of clips, not millions.
 audio_geometry_commit :: proc() {
-	write := 1 - int(sync.atomic_load(&audio_geom_state.idx))
+	write := audio_geom_write_slot()
 	slot := &audio_geom_state.slots[write]
 	slot.n = 0
 	slot.path_used = 0
@@ -933,7 +995,10 @@ audio_provision :: proc(play_frame: i64) {
 	sync.atomic_store(&audio_prod.prod_frame, play_frame)
 	audio_rpt.dbg_budget = 8
 	fps := timeline_fps()
-	slot := &audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)]
+	// Held for the WHOLE provision: this is the long read the three-slot scheme
+	// exists for. Released on every exit below.
+	slot := audio_geom_acquire()
+	defer audio_geom_release()
 	// Pass 1: fold the committed chips into one group per contiguous run of a
 	// source stream. Every split of a linked group lands in one group, so a
 	// project with N tracks and any number of splits needs N decoders.
@@ -1221,6 +1286,7 @@ audio_init :: proc() -> bool {
 	// transport opens it. The old code paused the device here for the same reason,
 	// at the cost of a stop/start cycle on every play.
 	audio_device_set_active(false)
+	sync.atomic_store(&audio_geom_state.reader, AUDIO_GEOM_NO_SLOT)
 	sync.atomic_store(&audio_prod.stop, false)
 	sync.atomic_store(&audio_prod.done, false)
 	sync.atomic_store(&audio_prod.run, false)
@@ -1253,6 +1319,10 @@ audio_shutdown :: proc() {
 // a new file is imported (import_media also stops playback).
 audio_reset_for_load :: proc() {
 	sync.atomic_store(&audio_prod.run, false)
+	// The producer is not reading the slab right now, and `reader`'s zero value
+	// is slot 0 -- which would look like a permanent claim on it and cost the
+	// writer one of its three slots forever. Start from the honest value.
+	sync.atomic_store(&audio_geom_state.reader, AUDIO_GEOM_NO_SLOT)
 }
 
 // audio_src_covers_frame reports whether any provisioned segment covers
@@ -1379,7 +1449,9 @@ audio_producer_feed :: proc() {
 	// change since the last fold. No seek, so the drag is audible within the
 	// cushion instead of reopening every decoder per knob move.
 	if sync.atomic_load(&audio_geom_state.gain_epoch) != audio_geom_state.gain_folded_epoch {
-		audio_gain_fold(&audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)])
+		gslot := audio_geom_acquire()
+		audio_gain_fold(gslot)
+		audio_geom_release()
 		audio_geom_state.gain_folded_epoch = sync.atomic_load(&audio_geom_state.gain_epoch)
 	}
 	// Pin the queue to the playhead, extrapolated from the UI's published clock
@@ -1541,6 +1613,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				audio_device_clear()
 				had_evt = true
 				audio_device_set_active(true)
+				audio_rpt.provisions += 1
 				audio_provision(sync.atomic_load(&audio_prod.anchor_frame))
 				// Provisioning reopens every decoder synchronously -- hundreds
 				// of ms once several sources are open. Video runs on the wall
