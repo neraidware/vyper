@@ -1206,7 +1206,13 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe parity audio_rate yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	#
+	# audio_probe and keyframe_probe were reachable but absent here, so a
+	# regression either caught was invisible to `all` -- including the forward-
+	# jump case, which fails if a jump decodes the audio it skipped instead of
+	# seeking. Both degrade to SKIP rather than fail when no audio device is
+	# present, so they cost a synthetic fixture on a headless box.
+	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe parity audio_rate audio_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1249,7 +1255,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac
