@@ -77,6 +77,11 @@ KF_DIAMOND_ROT :: [2]f32{0.70710678, 0.70710678} // cos/sin of 45°: squares up 
 KF_DIAMOND_CORNER :: 2     // Diamond corner rounding, keeps a point on each axis.
 KF_DIAMOND_BORDER :: 1     // 1px border, drawn inside the diamond.
 KF_HIT_MARGIN :: f32(6)    // Diamond pick radius: pointer within this of a key's center selects it.
+// MARKER_CULL_SLACK is the horizontal slack allowed when skipping a timeline
+// marker whose column falls outside the visible clip lane. The widest thing a
+// marker paints is its gap triangle (5px wide, centered on the column), so the
+// slack covers that and a marker inside it is merely clipped rather than culled.
+MARKER_CULL_SLACK :: f32(8)
 // Pointer travel (px) from a diamond press before the gesture counts as a drag.
 // Below this the press is just a click and must never nudge the key, so the key
 // only moves on a deliberate click+drag.

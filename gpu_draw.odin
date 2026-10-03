@@ -389,6 +389,84 @@ render_clay :: proc(
 	}
 }
 
+// tracks_scroll_box is the track list's own viewport: the TracksSection box, which
+// is the rect Clay clips the rows to (clip.vertical) and slides them by
+// (childOffset = -timeline_view.top).
+//
+// It is the ONE rect every track-lane overlay must intersect. draw_clip_markers
+// and draw_keyframes run after render_clay, so they do not inherit Clay's scissor
+// stack and set their own; scissoring to the row's own ClipsSection box alone let
+// a vertically scrolled row paint over the ruler strip and the panels above the
+// timeline, because the row box has already moved out of the viewport. Reads zero
+// when the timeline is not laid out (empty timeline, collapsed subtree), which the
+// callers' `width <= 0` guards already treat as "nothing to paint".
+tracks_scroll_box :: proc() -> clay.BoundingBox {
+	return clay.GetElementData(clay.ID("TracksSection")).boundingBox
+}
+
+// box_union is the smallest rect containing both boxes. The marker pass needs it
+// because a track's paintable span is its lane PLUS the insert gap above it. An
+// empty input is treated as absent, so unioning a laid-out box with a collapsed
+// one returns the laid-out one rather than inflating its bounds to the origin.
+box_union :: proc(a, b: clay.BoundingBox) -> clay.BoundingBox {
+	if a.width <= 0 || a.height <= 0 {
+		return b
+	}
+	if b.width <= 0 || b.height <= 0 {
+		return a
+	}
+	x := min(a.x, b.x)
+	y := min(a.y, b.y)
+	return clay.BoundingBox {
+		x      = x,
+		y      = y,
+		width  = max(a.x + a.width, b.x + b.width) - x,
+		height = max(a.y + a.height, b.y + b.height) - y,
+	}
+}
+
+// box_intersect clips `a` to `b`, returning an EMPTY rect (zero or negative
+// extent) when they do not overlap. An empty result is the cull signal: the
+// overlay loop skips a track rather than setting a degenerate scissor.
+box_intersect :: proc(a, b: clay.BoundingBox) -> clay.BoundingBox {
+	x := max(a.x, b.x)
+	y := max(a.y, b.y)
+	x2 := min(a.x + a.width, b.x + b.width)
+	y2 := min(a.y + a.height, b.y + b.height)
+	return clay.BoundingBox{x = x, y = y, width = x2 - x, height = y2 - y}
+}
+
+// kf_lane_rect is the region draw_keyframes paints one track into: its clip lane,
+// clipped to the track-list viewport. Empty when the track is scrolled out of view.
+kf_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
+	lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
+	if lane.width <= 0 || lane.height <= 0 {
+		return {}
+	}
+	return box_intersect(lane, tracks_scroll_box())
+}
+
+// marker_lane_rect is the region draw_clip_markers paints one track into: the
+// clip lane plus the insert gap above it, clipped to the track-list viewport. The
+// gap holds the point-marker triangles, so it is inside the same rect.
+//
+// The gap is keyed by ORDER row (ui.odin keys TrackGap by r, ClipsSection by
+// storage index), so this is the row the track occupies in the visual stack, not
+// its storage index. Storage==row only until the first reorder.
+marker_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
+	lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
+	row := order_row_of(track_idx)
+	if row < 0 {
+		return {}
+	}
+	gap := clay.GetElementData(clay.ID("TrackGap", u32(row))).boundingBox
+	span := box_union(lane, gap)
+	if span.width <= 0 || span.height <= 0 {
+		return {}
+	}
+	return box_intersect(span, tracks_scroll_box())
+}
+
 // scissor_intersect clips a Clay command's bounds to the active scissor rect.
 scissor_intersect :: proc(bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect {
 	x := max(c.int(bounds.x), clip.x)
@@ -572,31 +650,34 @@ draw_clip_markers :: proc(
 	hover_x: f32
 	gap_bounds: clay.BoundingBox
 	best_dist := f32(1e9)
-	// Marker lines and triangles must stay inside their track's column; a marker
-	// inside a tile that has slid under the track-name gutter (or off the right
-	// edge) would otherwise render on top of neighboring rows and headers. The
-	// gap triangle sits above the lane, so the scissor spans lane + insert gap
-	// on one column.
+	// Marker lines and triangles must stay inside their track's column AND
+	// inside the track list's visible viewport; a marker inside a tile that has
+	// slid under the track-name gutter (or off the right edge) would otherwise
+	// render on top of neighboring rows and headers, and a row scrolled out of
+	// the viewport would render on top of the ruler strip and the panels above
+	// the timeline. The gap triangle sits above the lane, so the scissor spans
+	// lane + insert gap, clipped to the viewport.
 	restore_full := false
 	for track, track_idx in timeline.tracks {
+		// Scissor to the track's lane AND insert gap, clipped to the track-list
+		// viewport. The viewport half is what keeps a vertically scrolled row's
+		// markers inside the timeline: the row box alone has already slid out
+		// under the ruler, so scissoring to it alone painted over the panels
+		// above. Empty rect -> the whole track is scrolled out of view.
+		span := marker_lane_rect(track_idx)
+		if span.width <= 0 || span.height <= 0 {
+			continue
+		}
 		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
-		// The gap above a track is laid out per ORDER row (ui.odin keys
-		// TrackGap by r while it keys ClipsSection by storage index), so the
-		// tile's gap is the row this track occupies in the visual stack, not
-		// its storage index. Storage==row only until the first reorder.
 		gap :=
 			clay.GetElementData(
 				clay.ID("TrackGap", u32(order_row_of(track_idx))),
 			).boundingBox
-		if lane.width > 0 && lane.height > 0 {
-			lo_y := min(lane.y, gap.y)
-			hi_y := max(lane.y + lane.height, gap.y + gap.height)
-			sdl.SetGPUScissor(
-				pass,
-				sdl.Rect{c.int(lane.x), c.int(lo_y), c.int(lane.width), c.int(hi_y - lo_y)},
-			)
-			restore_full = true
-		}
+		sdl.SetGPUScissor(
+			pass,
+			sdl.Rect{c.int(span.x), c.int(span.y), c.int(span.width), c.int(span.height)},
+		)
+		restore_full = true
 		for clip, index in track.clips {
 			if len(clip.markers) == 0 {
 				continue
@@ -617,6 +698,14 @@ draw_clip_markers :: proc(
 					box.x,
 					box.x + box.width,
 				)
+				// Cull markers scrolled out of the lane's frame window. The
+				// scissor rejects these quads anyway, but each one still costs a
+				// uniform upload and a draw, and a long project carries markers
+				// far outside the visible range at any zoom.
+				if line_x < span.x - MARKER_CULL_SLACK ||
+				   line_x > span.x + span.width + MARKER_CULL_SLACK {
+					continue
+				}
 				// Thin vertical line from the tile's top down to its bottom.
 				render_sdf_rect(
 					renderer,
@@ -737,7 +826,13 @@ draw_keyframes :: proc(
 		return
 	}
 	for track, track_idx in timeline.tracks {
-		lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
+		// Scissor to the track's clip lane CLIPPED TO THE TRACK-LIST VIEWPORT, and
+		// skip the track entirely when that is empty. The row's own box has
+		// already been slid by the vertical scroll (TracksSection's childOffset),
+		// so scissoring to it alone let a row scrolled up or down paint its
+		// diamonds over the ruler strip and the panels above the timeline. Empty
+		// rect -> the track is off screen and costs no draw calls.
+		lane := kf_lane_rect(track_idx)
 		if lane.width <= 0 || lane.height <= 0 {
 			continue
 		}
@@ -766,6 +861,14 @@ draw_keyframes :: proc(
 					frame, selected :=
 						kf_sel_frame(Kf_Ref{track_idx, index, tr, k_idx}, k.frame_off)
 					cx, cy := kf_key_center(box, tr, frame)
+					// Cull keys scrolled out of the lane's visible range. The
+					// scissor rejects these quads anyway, but each still costs two
+					// uniform uploads and two draws, and at TIMELINE_MIN_ZOOM a
+					// long project's keys sit megabytes off screen -- so the pass
+					// paid full price for geometry no one could see.
+					if cx < lane.x - KF_DIAMOND_R || cx > lane.x + lane.width + KF_DIAMOND_R {
+						continue
+					}
 					fill := KF_DIAMOND_FILL
 					if selected {
 						fill = KF_DIAMOND_FILL_SELECTED
