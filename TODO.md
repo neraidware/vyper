@@ -3093,7 +3093,11 @@ what it keeps — so `sdl.free` on the event buffer is the only owner that can
 release it, and `dnd_valgrind` is the gate that measures that handoff (0
 definitely lost, 0 indirectly lost, no invalid free).
 
-## Active 13 — Export frame rate came from the first video source, not the frame grid
+## Active 16 — Export frame rate came from the first video source, not the frame grid
+
+(Numbered after main's Active 13-15 rather than taking 13: this branch was based
+on d279b45, before those landed, and two sections numbered 13 is exactly the drift
+the rest of this file's naming rules exist to prevent.)
 
 **Status: fixed 2026-10-03.** Branch `parity` (base `d279b45`). `parity` is a
 member of `all`. Found while investigating why `baby.vyproj` exports 9.72 s of
