@@ -3026,6 +3026,73 @@ derived fact that can disagree with the first, and the failure is a video file
 that looks right. Not worth it until an incremental export is actually needed
 rather than anticipated.
 
+## Active 12 — OS file drag-and-drop: media bin + timeline
+
+**Status: landed 2026-10-02.** Branch `file-dnd` (base `8c01a84`), merged into
+`main`. `dnd_probe` + `dnd_valgrind` are members of `all`.
+
+**The defect.** Dragging a file in from the desktop did nothing, on every
+platform. Not a Wayland problem: `event.odin` is the app's only `sdl.PollEvent`
+site and its switch handled six event types (`QUIT`, `WINDOW_CLOSE_REQUESTED`,
+`KEY_UP`, `KEY_DOWN`, `TEXT_INPUT`, `MOUSE_WHEEL`). None of the five drop kinds
+were routed, and nothing in the tree read them — the SDL3 binding exposes
+`DROP_FILE`/`DROP_TEXT`/`DROP_BEGIN`/`DROP_COMPLETE`/`DROP_POSITION` and a
+`DropEvent` union, all unused. So Windows and Linux failed identically, which is
+what ruled out the Wayland theory; `TODO.md` had no DnD entry at all, so nothing
+tracked the gap either. `mediabin.odin:349` even describes the bin drag ghost as
+mirroring "OS file drag-and-drop" — the counterpart was intended and never built.
+
+**Why it stayed invisible.** Ignoring events is not a crash. There was no path
+that could fail, so no gate had anything to catch.
+
+**What it does now.** `dnd.odin` owns the gesture:
+- `DROP_BEGIN`/`POSITION`/`FILE`/`COMPLETE` are routed from the SDL switch;
+  `DROP_TEXT` is routed too and deliberately dropped — a text selection dragged
+  out of another app is not a path, and importing the clipboard as a file name
+  would be worse than ignoring it.
+- Drop on the **media bin** → imported to the bin only. Drop on the
+  **timeline** → imported *and* placed on the hovered lane. Anywhere else →
+  refused, silently (the pointer already shows where the user aimed; a notice per
+  release would nag on every pass over dead space).
+- "Decodable or readable" is one gate, `import_path_to_bin`, lifted out of
+  `open_file_at` so the open-file flow and a drop cannot drift apart on what the
+  bin will hold. `.srt` still lands in the bin only.
+- The timeline drop runs the same two calls `end_media_drag` runs
+  (`import_path_to_bin` then `add_asset_to_timeline` with
+  `timeline_drop_target`/`timeline_frame_from_x`), which is what makes "dropped
+  on the timeline" identical to "dragged out of the bin" by construction instead
+  of by two paths agreeing today.
+- The drop zone highlights while the drag is over the window (tint + border +
+  "Drop to import"/"Drop to place"), re-resolved every frame because the target
+  depends on layout as well as on the pointer.
+
+**One honest limitation, and why it is not a gap.** No backend reveals a dragged
+file's *name* before the release — X11, Wayland and Windows all report only "a
+drag is over this window" until the drop. So the per-stream ghost lanes a bin
+drag paints cannot exist here: at `DROP_BEGIN` the document does not know what is
+coming. The highlight therefore shows the zone, and nothing more. This is why
+`drop_zone_at` asks `timeline_drop_target` (the resolver the bin drag releases
+through) rather than testing the timeline panel's box: the first version tested
+the box and refused every drop on an *empty* timeline, because with no tracks
+`TrackArea` is never laid out and the timeline body *is* `EmptyTimeline`. The
+probe sweeps the window in both directions to keep that equivalence pinned.
+
+**Probe.** `dnd_probe.odin` (VYPER_DND_PROBE) covers the decisions a drop makes
+after delivery, since a probe cannot synthesise a cross-process drag: the box
+arithmetic including a degenerate pre-layout box, the real laid-out panels (bin
+centre imports, empty-timeline centre places, preview refuses), the
+bin-drag/OS-drop equivalence swept across the window, the import gate refusing a
+text file and a vanished path, and the BEGIN/POSITION/COMPLETE state (a
+position must not survive into the next drag; COMPLETE must clear the whole
+gesture). Mutation-checked: reverting the lane resolver to the panel box fails
+331 assertions, dropping the `has_position` reset or the COMPLETE clear fails
+three, and removing the import gate fails two.
+
+**Memory.** Each dropped file hands an SDL-owned buffer to the bin, which clones
+what it keeps — so `sdl.free` on the event buffer is the only owner that can
+release it, and `dnd_valgrind` is the gate that measures that handoff (0
+definitely lost, 0 indirectly lost, no invalid free).
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

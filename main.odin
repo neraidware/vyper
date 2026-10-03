@@ -1798,6 +1798,14 @@ if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); ps
 		drag_probe_run(drp)
 		return
 	}
+	// Headless OS file drag-and-drop probe: the zone routing, the "decodable
+	// or readable" import gate, and the BEGIN/POSITION/COMPLETE gesture state.
+	// Nothing caught the missing feature for years because ignoring all five
+	// SDL drop events is not a crash; this is the check that it stays wired.
+	if _, ok := os.lookup_env_alloc("VYPER_DND_PROBE", context.temp_allocator); ok {
+		dnd_probe_run()
+		return
+	}
 	if xp, _ := os.lookup_env_alloc("VYPER_PROXY_PROBE", context.temp_allocator); xp != "" {
 		proxy_probe_run(xp)
 		return
@@ -2134,6 +2142,9 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		width, height: c.int
 		sdl.GetWindowSize(window, &width, &height)
 		inp := read_mouse_input()
+		// After the mouse read, so a backend that never sends DROP_POSITION
+		// resolves the highlighted zone from the live pointer.
+		refresh_file_drag()
 		interaction_pre_build(inp)
 
 		commands := build_page(width, height)
