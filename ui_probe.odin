@@ -183,6 +183,12 @@ for j := 0; j < len(raw); {
 	if !ui_probe_layout_asserts() {
 		os.exit(1)
 	}
+	// The marker/keyframe overlay must stay inside the visible lane. Runs right
+	// after the layout asserts because it needs the seeded session intact: the
+	// finder-save and project-file round-trips below tear it down and reload.
+	if !ui_probe_marker_cull_asserts() {
+		os.exit(1)
+	}
 	// A clip tile is frames*zoom wide; its label must never size it.
 	if !ui_probe_clip_tile_width_asserts() {
 		os.exit(1)
@@ -318,6 +324,178 @@ ui_probe_marker_ownership_asserts :: proc() -> bool {
 	free_markers(&lo)
 	free_markers(&hi)
 	return ok
+}
+
+// ui_probe_marker_cull_asserts pins the visible-range clip for the two timeline
+// overlay passes (draw_clip_markers, draw_keyframes). Both paint into the track
+// lanes directly rather than as Clay content, so neither inherits Clay's scissor
+// stack: each sets its own, and each used to set it to the track's own
+// ClipsSection box. That box follows the row when the track list scrolls
+// vertically (TracksSection applies timeline_view.top as a Clay childOffset),
+// so a row scrolled up carried its scissor -- and with it the marker lines, gap
+// triangles and keyframe diamonds -- off the top of the lane viewport and over
+// the ruler strip and the panels above the timeline.
+//
+// The contract asserted here is what a Clay element in that lane would have been
+// clipped to: the overlay rect is the lane intersected with the TracksSection
+// viewport on BOTH axes. A track scrolled out of view reports an empty rect (the
+// draw loop skips it) rather than a rect sitting over unrelated panels.
+ui_probe_marker_cull_asserts :: proc() -> bool {
+	ok := true
+	// Markers on every clip, so the marker pass has something to place in each
+	// lane: a clip with no markers is skipped before any geometry is computed.
+	for t in 0 ..< len(timeline.tracks) {
+		for c in 0 ..< len(timeline.tracks[t].clips) {
+			clip := &timeline.tracks[t].clips[c]
+			if len(clip.markers) > 0 {
+				continue
+			}
+			clip.markers = make([dynamic]Clip_Marker, 0, 2)
+			append(&clip.markers, Clip_Marker{source_frame = 10, label = strings.clone("m-a")})
+			append(&clip.markers, Clip_Marker{source_frame = 200, label = strings.clone("m-b")})
+		}
+	}
+	saved_top := timeline_view.top
+	defer timeline_view.top = saved_top
+	saved_upper := panel_layout.upper_area_height
+	defer panel_layout.upper_area_height = saved_upper
+
+	// The seeded rows all fit at the default split, so there is nothing to scroll
+	// and the invariant would hold trivially. Grow the upper area until the track
+	// viewport is smaller than the content, which is the state a user reaches by
+	// dragging the divider up.
+	build_page(1920, 1600)
+	content_h := timeline_tracks_content_height()
+	// Two rows' worth of viewport: enough that the last row is genuinely off
+	// screen at full scroll, without pinning the list so tight that Clay starts
+	// collapsing elements.
+	want_view_h := 2 * (TRACK_ROW_H + TRACK_GAP_H) + KF_ROW_H * f32(ui_probe_tracks)
+	for _ in 0 ..< 8 {
+		sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+		if sec.height <= 0 {
+			break
+		}
+		if sec.height <= want_view_h {
+			break
+		}
+		panel_layout.upper_area_height += sec.height - want_view_h
+		build_page(1920, 1600)
+	}
+	view := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	if view.width <= 0 || view.height <= 0 {
+		fmt.eprintf(
+			"[ui-probe] marker cull: TracksSection never laid out (%.1fx%.1f)\n",
+			view.width,
+			view.height,
+		)
+		return false
+	}
+	max_top := max(content_h - view.height, 0)
+	if max_top <= 0 {
+		// Without a scroll range every row is visible and the invariant is
+		// trivially true, so this probe would pass without testing anything.
+		fmt.eprintf(
+			"[ui-probe] marker cull: no vertical scroll room (content %.1f vs viewport %.1f)\n",
+			content_h,
+			view.height,
+		)
+		return false
+	}
+
+	// Walk the scroll range including a hard overshoot: an unclamped top is the
+	// state a fast wheel scroll passes through before the app's clamp runs, so
+	// it is exactly the state that must not paint.
+	scrolls := []f32{0, max_top * 0.5, max_top, max_top * 4}
+	for top in scrolls {
+		timeline_view.top = top
+		build_page(1920, 1600)
+		for t in 0 ..< len(timeline.tracks) {
+			if order_row_of(t) < 0 {
+				fmt.eprintf("[ui-probe] marker cull: track %d has no order row\n", t)
+				ok = false
+				continue
+			}
+			// The rects the two passes paint into, from the same accessors they
+			// use. The marker one adds the insert gap above the lane, so its top
+			// edge is the part that used to escape.
+			passes := [2]struct{name: string, rect: clay.BoundingBox} {
+				{name = "keyframes", rect = kf_lane_rect(t)},
+				{name = "markers", rect = marker_lane_rect(t)},
+			}
+			for pass in passes {
+				r := pass.rect
+				if r.width <= 0 || r.height <= 0 {
+					// Off-screen tracks must skip, not paint a degenerate sliver.
+					continue
+				}
+				if r.x < view.x - 0.5 ||
+				   r.x + r.width > view.x + view.width + 0.5 ||
+				   r.y < view.y - 0.5 ||
+				   r.y + r.height > view.y + view.height + 0.5 {
+					fmt.eprintf(
+						"[ui-probe] marker cull: top=%.1f track %d %s paints (%.1f,%.1f %.1fx%.1f) outside viewport (%.1f,%.1f %.1fx%.1f)\n",
+						top,
+						t,
+						pass.name,
+						r.x,
+						r.y,
+						r.width,
+						r.height,
+						view.x,
+						view.y,
+						view.width,
+						view.height,
+					)
+					ok = false
+				}
+			}
+		}
+	}
+
+	// With every row scrolled out of view, neither pass may report a paintable
+	// rect at all. This is the cull the draw loops key on, so it is the half of
+	// the fix that actually stops the draw calls.
+	timeline_view.top = max_top * 4
+	build_page(1920, 1600)
+	for t in 0 ..< len(timeline.tracks) {
+		if r := kf_lane_rect(t); r.width > 0 && r.height > 0 {
+			fmt.eprintf(
+				"[ui-probe] marker cull: track %d keyframe lane still %.1fx%.1f with every row scrolled away\n",
+				t,
+				r.width,
+				r.height,
+			)
+			ok = false
+		}
+	}
+
+	// The horizontal side of the same rule, and the case where a tile has slid
+	// under the track-name gutter: scroll to the end of the timeline so the lane
+	// sits mostly off to the left, then require every rect to stop at the lane's
+	// own left edge rather than reaching into the gutter.
+	saved_start := timeline_view.start
+	timeline_view.top = 0
+	timeline_view.start = f32(timeline_duration())
+	build_page(1920, 1600)
+	for t in 0 ..< len(timeline.tracks) {
+		r := kf_lane_rect(t)
+		if r.width > 0 && r.height > 0 && r.x < view.x - 0.5 {
+			fmt.eprintf(
+				"[ui-probe] marker cull: track %d paints from x %.1f, left of the lane edge %.1f\n",
+				t,
+				r.x,
+				view.x,
+			)
+			ok = false
+		}
+	}
+	timeline_view.start = saved_start
+
+	if !ok {
+		return false
+	}
+	fmt.printf("[ui-probe] marker/keyframe overlay confined to the lane viewport\n")
+	return true
 }
 
 // ui_probe_finder_asserts opens the in-app finder over the seeded session and

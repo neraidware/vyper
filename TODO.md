@@ -3786,3 +3786,68 @@ gate unreproducible afterwards.
   "gain readout on the first key must show the keyed dB, got 0".
 - Gates: all 10 (`check build geom_key_probe probe transform_probe timeline_probe
   valgrind geom_key_valgrind undo_valgrind keyed_export`) pass.
+
+---
+
+## Active 12 — Keyframe/marker overlay culled to the visible lane
+
+**Why:** keyframe diamonds and clip markers painted over other panels. They are
+drawn by `draw_keyframes` / `draw_clip_markers` (gpu_draw.odin), which run as an
+overlay AFTER `render_clay`, because a tile's final position only exists via
+`clay.GetElementData`. Being outside the Clay command stream, neither inherits
+Clay's scissor stack — each set its own, and each set it to the track's own
+`ClipsSection` box.
+
+That box has already been slid by the vertical scroll: `TracksSection` carries
+`clip = {vertical = true, childOffset = {0, -timeline_view.top}}` (ui.odin), so
+scrolling the track list moved each row's box out from under the viewport along
+with the row. Scissoring to it alone therefore covered whatever the row had slid
+over — the ruler strip and the panels above the timeline — and the marker lines,
+gap triangles and diamonds painted there. Clay clips the same rows correctly
+because it walks a scissor stack that nests `TracksSection`'s clip around each
+lane; the overlay had to rebuild that intersection and didn't.
+
+Horizontal clipping was already correct (the lane box IS the horizontal viewport),
+but nothing culled, so both passes walked every key and every marker of every
+clip on every track each frame and paid two/five SDF draws apiece for geometry
+the scissor then discarded. At `TIMELINE_MIN_ZOOM` (0.001) a long project's keys
+sit megabytes off screen.
+
+Steps:
+- [x] S1. Characterization probe first: `ui_probe_marker_cull_asserts` seeds
+      markers on every clip (the seed ships none, so the leak had nothing to
+      draw and stayed invisible), shrinks the track list until it overflows, and
+      asserts for every track that both passes' rect is inside the
+      `TracksSection` viewport — across the whole scroll range plus a hard
+      overshoot, and at a horizontal scroll that pushes the lane under the
+      gutter. Mutation-checked: reverting only the two `box_intersect` calls
+      makes it fail on 20+ cases (`track 3 keyframes paints (184.0,1508.0 ...)
+      outside viewport (28.0,1332.0 ...)`), which is the shipped defect.
+- [x] S2. `tracks_scroll_box` names the one rect every lane overlay must
+      intersect (the `TracksSection` box: the viewport Clay clips to AND slides
+      the rows by). `kf_lane_rect` / `marker_lane_rect` are the two paintable
+      rects, each intersected with it; the marker one unions lane + insert gap
+      (where the triangles live) and intersects each half BEFORE the union, so
+      an off-viewport gap can't re-widen an already-clipped rect. Empty result is
+      the cull signal — both draw loops `continue` on it, so an off-screen track
+      costs no draw calls.
+- [x] S3. Horizontal culling on top of the scissor, mirroring what the ruler
+      already does (`draw_timeline_ruler` breaks out of its tick loop at the
+      right edge): a key or marker whose column falls outside the lane is skipped
+      before its diamonds/triangles are built. `MARKER_CULL_SLACK` (layout.odin)
+      covers the widest thing a marker paints, its 5px gap triangle. Keyframe
+      culling reads the frame `kf_sel_frame` returns, i.e. the drag-PREVIEWED
+      destination, so a key dragged in from off screen appears immediately rather
+      than only at its release.
+- Gates: `check build probe timeline_probe transform_probe geom_key_probe
+  opacity valgrind` pass. (`zorder`/`keyed_export` cannot run in this checkout:
+  they need `target/keyed_export/src.mp4`, a generated fixture no target here
+  produces — unrelated to this change.)
+
+### Note on the scissor restore
+
+Both overlay passes restore to the full window rather than to the enclosing
+Clay scissor. That is correct today only because `render_clay` also restores to
+full (`defer` at gpu_draw.odin:232) and every overlay runs after it. Left as is:
+the enclosing scissor is always full at these points, so saving it would be
+indirection with no invariant to protect.
