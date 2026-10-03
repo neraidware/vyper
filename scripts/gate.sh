@@ -490,7 +490,11 @@ target_audio_probe() {
 			return 1
 		fi
 	fi
-	VYPER_AUDIO_PROBE="$src|4|2" timeout 600 ./vyper
+	VYPER_AUDIO_PROBE="$src|4|2" timeout 600 ./vyper || return 1
+	# The forward-jump death, in its own process: it needs a clean timeline, and
+	# it is the only check covering a jump larger than the forward-decode bound
+	# (the mixer must seek there, not decode the skipped audio through).
+	VYPER_AUDIO_JUMP_PROBE="$src" timeout 600 ./vyper
 }
 
 # The preview handle/snap geometry regression check (transform_probe.odin).

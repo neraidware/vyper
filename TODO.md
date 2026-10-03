@@ -4332,3 +4332,77 @@ clip it is `-65.0 dB`.
 project; nothing here exercises the keyed-gain path against a rate change, and
 `kf` tracks are keyed in timeline frames, so they retime with the clip the same
 way video does. `baby.vyproj` has no keyed gain track to check that against.
+
+## Active 18 — A forward jump decoded through the skipped audio instead of seeking
+
+**Symptom.** Playing `~/Videos/Recordings/2026-10-02/2026-10-02_12-40.mp4`
+(AV1 60 fps, 3x FLAC, 6070 s) and moving the playhead forward 10000 frames
+(166.7 s): the sound dies. The user's framing is the correct one — the engine
+did not die, it *caught up*, and catching up is itself the defect.
+
+**Cause, from the engine's own telemetry** (`VYPER_AUDIO_LOG=500
+VYPER_AUDIO_FULL=1`) at the jump:
+
+```
+t=20.84s ph=78044 anchor=77735 prod=77751 skew=-5.133s mix=5243.0ms under=540 clr=3
+  [src 0] first48=62200800 have48=62201856 fifo=1056fr decoded=62201856fr/15186ch
+```
+
+`mix=5243.0ms` is one `audio_mix_frame` call spending 5.2 s of producer-thread
+time inside a 500 ms report window, and `decoded=62201856fr` is all 166 s of
+FLAC decoded (15186 chunks) to travel 10000 frames. `under=540` is the device
+eating the result: a blocked producer with an emptied queue underruns, which is
+the "dies" the user hears.
+
+`audio_mix_frame` re-anchored a source whenever the fifo head was *ahead* of the
+demand, but had no case for the demand being far *ahead* of what the decoder
+held — so it pulled the gap one chunk at a time. The forward-skip in
+`audio_producer_feed` is deliberately not a re-provision (reopening every
+decoder on every forward move is the restart storm Active 14/15 removed), which
+left decode-through as the only way forward.
+
+**Fix.** `AUDIO_FORWARD_DECODE_MAX_SEC` (1 s) bounds how much skipped audio a
+forward move may buy by decoding rather than seeking. Under it, decoding in
+place stays cheaper than a seek and the existing behaviour is unchanged; over
+it, `audio_mix_frame` re-anchors the source with `audio_src_seek_anchor`, the
+same call the behind-the-head case already used. Sized at the crossover
+measured here: FLAC decodes ~160x realtime (~6 ms per source per second), and
+a seek costs one preroll decode plus the seek. Mirrors `FORWARD_STREAM_MAX_SEC`
+on the video side, which streams instead of seeks only inside the same bound.
+
+The two directions also now share one clamp, since a seek lands on the decoder's
+real PTS and rounding can put it either side of the demand.
+
+**Measured on the user's file, 10000-frame jump, 5 sources:**
+
+| | before | after |
+|---|---|---|
+| wall time in `audio_mix_frame` | 937.7 ms | 4.0 ms |
+| decoded frames | 7,999,488 (166.7 s) | 53,248 (1.1 s) |
+
+**Gate.** `audio_probe_forward_jump` asserts the jump SEEKS rather than
+decoding through: the decode budget is the gap up to the bound, plus the seek
+preroll, plus the frames actually asked for, plus one decoder frame of chunk
+overshoot. Silent frames right after the jump fail the same case — there is no
+"it needed a moment" case. Mutation-verified: forcing the head-behind test
+false gives `decoded 7999488` on the real file and `241664` on the fixture,
+against a budget of `144000`.
+
+It runs in its own process (`VYPER_AUDIO_JUMP_PROBE`, wired into
+`target_audio_probe`) because it re-imports the source onto a clean timeline:
+appended to the split-and-ripple-deleted timeline the earlier cases leave
+behind, it measured that mess and reported "nothing decodes at frame 0". Its
+gap is derived from the clip (`JUMP_GAP_SEC`, 5 s) rather than the user's
+10000 frames, because the fixture is 10 s long and a 166 s gap can only skip —
+a probe that skips is not a gate. The 10000-frame case stays available:
+`VYPER_AUDIO_JUMP_PROBE="<file>|10000"`.
+
+**Not fixed here, and named.** The AV1 `libdav1d` "Missing reference frame
+needed for show_existing_frame" scrub error is a separate, unreproduced defect.
+An isolated `decode_source_frame` walk over `baby.vyproj`'s webm — 657
+sequential/random/reverse requests — produced zero failures, zero libdav1d
+errors and zero send/recv errors, and CLI seeks are clean too, so it does not
+reproduce in the shipped source-decode path. Whatever emits it is in the live
+async/proxy path, not `decode_source_frame`. The probe that walked the source
+is parked at `/tmp/opencode/av1-scaffold/` rather than shipped, since a gate
+for a bug that was not found is noise.
