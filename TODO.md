@@ -3951,3 +3951,277 @@ gate unreproducible afterwards.
   "gain readout on the first key must show the keyed dB, got 0".
 - Gates: all 10 (`check build geom_key_probe probe transform_probe timeline_probe
   valgrind geom_key_valgrind undo_valgrind keyed_export`) pass.
+
+---
+
+## Active 13 — Keyframe/marker overlay culled to the visible lane
+
+**Why:** keyframe diamonds and clip markers painted over other panels. They are
+drawn by `draw_keyframes` / `draw_clip_markers` (gpu_draw.odin), which run as an
+overlay AFTER `render_clay`, because a tile's final position only exists via
+`clay.GetElementData`. Being outside the Clay command stream, neither inherits
+Clay's scissor stack — each set its own, and each set it to the track's own
+`ClipsSection` box.
+
+That box has already been slid by the vertical scroll: `TracksSection` carries
+`clip = {vertical = true, childOffset = {0, -timeline_view.top}}` (ui.odin), so
+scrolling the track list moved each row's box out from under the viewport along
+with the row. Scissoring to it alone therefore covered whatever the row had slid
+over — the ruler strip and the panels above the timeline — and the marker lines,
+gap triangles and diamonds painted there. Clay clips the same rows correctly
+because it walks a scissor stack that nests `TracksSection`'s clip around each
+lane; the overlay had to rebuild that intersection and didn't.
+
+Horizontal clipping was already correct (the lane box IS the horizontal viewport),
+but nothing culled, so both passes walked every key and every marker of every
+clip on every track each frame and paid two/five SDF draws apiece for geometry
+the scissor then discarded. At `TIMELINE_MIN_ZOOM` (0.001) a long project's keys
+sit megabytes off screen.
+
+Steps:
+- [x] S1. Characterization probe first: `ui_probe_marker_cull_asserts` seeds
+      markers on every clip (the seed ships none, so the leak had nothing to
+      draw and stayed invisible), shrinks the track list until it overflows, and
+      asserts for every track that both passes' rect is inside the
+      `TracksSection` viewport — across the whole scroll range plus a hard
+      overshoot, and at a horizontal scroll that pushes the lane under the
+      gutter. Mutation-checked: reverting only the two `box_intersect` calls
+      makes it fail on 20+ cases (`track 3 keyframes paints (184.0,1508.0 ...)
+      outside viewport (28.0,1332.0 ...)`), which is the shipped defect.
+- [x] S2. `tracks_scroll_box` names the one rect every lane overlay must
+      intersect (the `TracksSection` box: the viewport Clay clips to AND slides
+      the rows by). `kf_lane_rect` / `marker_lane_rect` are the two paintable
+      rects, each intersected with it; the marker one unions lane + insert gap
+      (where the triangles live) and intersects each half BEFORE the union, so
+      an off-viewport gap can't re-widen an already-clipped rect. Empty result is
+      the cull signal — both draw loops `continue` on it, so an off-screen track
+      costs no draw calls.
+- [x] S3. Horizontal culling on top of the scissor, mirroring what the ruler
+      already does (`draw_timeline_ruler` breaks out of its tick loop at the
+      right edge): a key or marker whose column falls outside the lane is skipped
+      before its diamonds/triangles are built. `MARKER_CULL_SLACK` (layout.odin)
+      covers the widest thing a marker paints, its 5px gap triangle. Keyframe
+      culling reads the frame `kf_sel_frame` returns, i.e. the drag-PREVIEWED
+      destination, so a key dragged in from off screen appears immediately rather
+      than only at its release.
+- Gates: `check build probe timeline_probe transform_probe geom_key_probe
+  opacity valgrind` pass. (`zorder`/`keyed_export` cannot run in this checkout:
+  they need `target/keyed_export/src.mp4`, a generated fixture no target here
+  produces — unrelated to this change.)
+
+### Note on the scissor restore
+
+Both overlay passes restore to the full window rather than to the enclosing
+Clay scissor. That is correct today only because `render_clay` also restores to
+full (`defer` at gpu_draw.odin:232) and every overlay runs after it. Left as is:
+the enclosing scissor is always full at these points, so saving it would be
+indirection with no invariant to protect.
+
+---
+
+## Active 14 — Backspace ripple delete + Clip ownership in two procs
+
+**Status: landed 2026-10-03 on `ripple-delete` (base `8c01a84`).**
+Numbered 14 on the merge, not 13: `file-dnd` took Active 12 on `main` and
+overlay culling took 13, so the three fix branches carry 13/14/15 and no two
+headings collide.
+
+**Problem.** Backspace did nothing. `route_key_down` asked
+`edit_field_claims_key` before the app action layer, and that proc claimed
+Backspace, Return and Escape **unconditionally** — the guard it needed was a
+comment saying "the router checks the field state", but the router never did.
+So with no field open, an edit field still ate every key a user would use to
+delete a clip, dismiss the help overlay, or close a menu. The action table was
+fine; the key never got there.
+
+Investigating it turned up the reason it was worth more than one line of
+router: **`Clip` is a value struct with three hidden owning fields** — `name`
+(heap string), `markers` (entries own a `label`) and `keyframe_tracks` (entries
+own a name and a keys backing). So a plain `Clip` copy silently aliases all
+three, and the list of things to free on drop had been written out **five**
+times for free and **three** times for copy. The two lists already disagreed,
+in the two most-used edit verbs in the app:
+
+| Site | Was | Cost |
+|---|---|---|
+| `delete_selected_clip_raw` | freed markers + keyframes, not `name` | leaked name per raw delete |
+| ripple delete, contained-clip case | freed markers + keyframes, not `name` | leaked name per ripple |
+| `split_clip_at_playhead` | `right := c^` (value copy) | both halves shared **one** name |
+| ripple straddle case | `right := c` **and appended `left` twice** | duplicated clip; shared name/keyframe backing |
+| `duplicate_clip` | 25-line hand-written field list | a field added later silently defaulted to zero on the copy |
+
+The name leaks were invisible to the compiler and to every probe; the split
+aliasing was a latent double free that the leak was *hiding* (only one free ever
+happened). Both are the same defect: a site has to remember a list, and it
+already had.
+
+**Steps** (each lands + probe + vet before the next):
+- [x] S1. Key routing: `edit_field_claims_key` returns false when
+      `edit_state.field == .None`, so Backspace/Return/Escape fall through to
+      the app layer. With no field open the router reaches `app_claims_key`; with
+      one open the field still owns its three keys.
+- [x] S2. Ownership: `clip_deep_copy(src: ^Clip) -> Clip` and
+      `clip_payload_free(c: ^Clip)` in `timeline.odin` are now the only way to
+      build a Clip from another Clip and the only way to drop one. `clone_timeline`,
+      `free_timeline`, `remove_track`, both delete paths, both split paths and
+      both duplicate paths call them; the hand-written lists are gone
+      (`duplicate_clip` lost 25 lines and can no longer forget a field).
+      `clip_payload_free` clears what it frees, so a second call is a no-op.
+- [x] S3. Ripple straddle correctness: the right half is deep-copied from the
+      **pristine** clip before the left half's edits free the shared backing, it
+      re-mints `clip_id`, and `left` is appended exactly once. The old branch
+      did all three wrong.
+- [x] S4. Keyframe trims: `kf_trim_tail`/`kf_trim_head` replace
+      `kf_split_parts` at both split sites. They were needed because the two
+      halves no longer share one backing — a helper whose contract is "these two
+      clips alias one keys array" has no remaining caller, and keeping it would
+      be an invitation to reintroduce the aliasing. The slice-1 remap rule (left
+      keeps keys `< F`, right re-relativizes by `-F`, values preserved) is
+      unchanged and still probed.
+
+**Probe.**
+- `ui_probe_backspace_ripple_asserts`: clicks clip 1 on track 0, presses real
+  `sdl.K_BACKSPACE`, asserts the clip is gone, the clip before the cut did not
+  move, and the tail slid left by exactly the removed span (the gap closing — the
+  actual bug). Also asserts Escape reaches `escape_dismiss` with no field open,
+  and that Backspace still edits an **open** number field ("073" → "07"), which
+  is the reason the field owns keys at all.
+- `ui_probe_key_routing_asserts`: a closed number field claims no key; an open
+  one claims exactly Escape, Return, Keypad-Enter and Backspace.
+- `timeline_probe` `test_ripple_dispatch_closes_gap`: the same gap-closing
+  invariant through `dispatch_action(.Delete_At_Playhead)`, without the mouse.
+- `timeline_probe` `test_ripple_straddle_splits_once`: a region strictly inside a
+  clip leaves exactly **2** clips (the old branch left 3), with different
+  `clip_id`s and the right piece reading the source after the removed span.
+- `timeline_probe` `test_split_halves_own_their_payload`: after a split the halves
+  have distinct name pointers, one keyframe lane each with one key, distinct
+  marker-label pointers, and a keyframe edit on one half does not appear in the
+  other.
+- Mutations, all caught: restoring the double `append` in the straddle branch
+  fails with "a straddle ripple must leave 2 clips (got 3)"; restoring
+  `right := c^` in the split segfaults inside the probe (the shared keys backing
+  freed by the left half's trim is read by the right half); reverting the S1
+  router guard fails the ripple probe with "the gap did NOT close".
+
+**Accept.**
+- Gates: `check build probe keyframe_probe timeline_probe transform_probe
+  geom_key_probe opacity undo_valgrind valgrind` pass. Valgrind is back to the pre-work baseline exactly —
+  `11720 errors from 23 contexts` (FFmpeg/Odin noise), `definitely lost: 0`,
+  `indirectly lost: 0`, no invalid free/read/write. `zorder`/`keyed_export` also
+  pass on `main` once their deterministic fixture is present — see the Active 15
+  note on the missing `dev` wrapper.
+- One defect was found *by* the memory gate rather than by a probe: the ripple
+  probe snapshotted track 0 with a shallow `Clip` copy to restore it afterwards,
+  which aliased payloads the ripple then freed, so the restore handed teardown an
+  already-freed name (`free(): invalid size`). The backup is now a
+  `clip_deep_copy` and the rebuilt clips are released with `clip_payload_free`.
+  Worth recording because the shallow backup looked correct and passed every
+  assertion — the probe was green and the process aborted at exit.
+
+**Not done here (deliberately).** `Clip` stays a value struct with owned fields.
+The follow-up is to move `name`, marker labels, keyframe track names and keys
+into session-owned pools so `Clip` becomes POD data, `clip_deep_copy` becomes a
+struct copy, and `clone_timeline` stops allocating. That is a separate
+work-stream (it touches project-file load/save, undo snapshots, the renderer and
+the ripple rebuild) and should not be smuggled in behind a bug fix.
+
+---
+
+## Active 15 — A/V desync after rapid edits (geometry slab torn read)
+
+**Status: landed 2026-10-03 on `audio-sync` (base `8c01a84`), merged as 15.**
+Numbered 15 on the merge because `file-dnd` took Active 12 on `main`; the three
+fix branches carry 13 (overlay culling), 14 (Backspace ripple + Clip ownership)
+and 15.
+
+**Problem (user):** "try scrubbing around very randomly, creating splits and
+ripple deleting, moving around clips and test the playback after it" — playback
+after an edit session comes out out of sync. No telemetry available, so the
+repro was rebuilt as an assertion.
+
+The audio engine hands its clip geometry to the producer thread through a
+double-buffered slab (`audio_geometry_commit` on the UI thread,
+`audio_provision` on the producer). The premise of a double buffer is that the
+reader's read is short. **This reader's read is not short**: a provision
+reopens every decoder synchronously and holds the slot for tens of
+milliseconds, while the UI rewrites the slab on every single edit. With two
+slots, two commits inside one provision wrap the index around and the second
+one lands on the slot the provision is still reading. The provision then builds
+its segments from a half-written chip list — `n` already reset, `chip[i]` fields
+and the path arena mid-update — so segments carry the wrong source window or
+open the wrong file. That is not a glitch, it is the audio playing something
+other than what the picture shows: desync.
+
+It is also exactly the reported repro's shape. A provision is tens of ms and an
+edit burst commits every few ms, so two commits inside one provision is the
+common case, not the rare one.
+
+**Found by probing, not by reading.** Two hypotheses were checked and rejected
+first, which is why they are written down:
+
+- *Resync storm* — every edit verb ends in `audio_note_edit` → `audio_seek`,
+  which bumps the resync event, and the producer acts on every event change by
+  clearing the device queue and reopening all decoders. Measured: **8 edits in a
+  burst cause 1 re-provision**, because the burst outruns the 2 ms producer poll
+  and collapses into a single event change. Kept as a probe assertion
+  (`audio_probe_edit_burst_provisions`) because it is the property that stops a
+  future "fix" from making this worse, but it is not the bug.
+- *Segment math vs the edited timeline* — checked every provisioned segment's
+  source window against the clip that covers it after scrub + split +
+  ripple-delete + move. **All agree.** Kept as
+  `audio_probe_post_edit_alignment`.
+
+**Steps** (each lands + probe + vet before the next):
+- [x] S1. Reproduce the torn read deterministically:
+      `audio_probe_geom_slab_handoff` takes the slot exactly as a provision
+      does, then commits twice — what a split plus a ripple inside one provision
+      does — and asserts the held slot is byte-identical afterwards. Pre-fix it
+      fails: the published index wraps to the slot the reader holds and
+      `chip0.start` goes 0 → 3000 under it.
+- [x] S2. `AUDIO_GEOM_SLOTS = 3` plus an explicit reader claim.
+      `audio_geom_acquire` / `audio_geom_release` bracket every producer read;
+      `audio_geom_write_slot` picks a slot that is neither the published one nor
+      the claimed one. Three slots, at most two excluded, so the writer never
+      waits. Claim ordering is load-bearing and documented at the acquire: take
+      `idx` first, publish the claim second, or a commit starting in between
+      picks the slot the reader is about to read.
+- [x] S3. Both reader sites claim: `audio_provision` (with `defer`, so every
+      exit releases) and the per-feed `audio_gain_fold` read.
+- [x] S4. `audio_probe` gets a gate target. It had none, so nothing ran it —
+      the same gap `transform_probe` had. The target synthesizes its own
+      deterministic lavfi fixture, so it never depends on a media file someone
+      has to supply.
+- [x] S5. Telemetry: `audio_rpt.provisions` counts producer-side re-provisions.
+      Every one clears the queue and reopens every decoder, so this is the cost
+      of telling the engine the timeline changed; it is what makes the burst
+      check measurable instead of a vibe.
+
+**Probe / mutation.** `audio_probe_geom_slab_handoff` passes post-fix; making
+the writer ignore the reader's claim (`if i != pub`) restores the failure
+exactly, which is the mutation that proves the claim is what fixes it and not
+the third slot alone.
+
+**Accept.** Gates: `check build probe timeline_probe transform_probe
+geom_key_probe opacity audio_probe undo_valgrind valgrind` pass. Valgrind at the
+baseline (0 lost, no invalid access, 23 contexts; `11754 errors from 23 contexts`
+post-merge, the extra count being the probe code, same 23 contexts).
+
+`zorder`/`keyed_export` looked unrunnable in this environment and were not: their
+fixtures are synthesized through a `dev ffmpeg` wrapper that does not exist
+here, so the target failed on the missing file, not on an app defect. Generating
+the same deterministic lavfi clip with the system ffmpeg and re-running both
+targets passes them (`zorder: below=inf hidden under video, above=29.1 drawn over
+it`), and `scripts/gate.sh all` exits 0 on `main`. The wrapper is still missing
+here — a fresh checkout with no cached fixture will fail these targets on this
+box until either `dev` exists or the targets fall back to a system ffmpeg.
+
+**Not fixed here, and named.** Two things this work does not claim:
+
+- The probe proves the *slab handoff* is sound. It cannot prove what the user
+  hears; there is no telemetry from a real desync, so if audio still drifts
+  after this, the next place to look is the producer's queue/underrun path
+  (`wedge_heal`, `skip_full`, `silence_holes` in the report block) with
+  `VYPER_AUDIO_LOG=1`.
+- The `dev`-less media gates are an environment gap, not a code defect, and
+  `keyframes.odin`'s `kf_split_parts` deletion on the ripple branch is not
+  mirrored here — that belongs to the branch that owns it.

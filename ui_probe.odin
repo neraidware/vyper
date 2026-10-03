@@ -183,6 +183,12 @@ for j := 0; j < len(raw); {
 	if !ui_probe_layout_asserts() {
 		os.exit(1)
 	}
+	// The marker/keyframe overlay must stay inside the visible lane. Runs right
+	// after the layout asserts because it needs the seeded session intact: the
+	// finder-save and project-file round-trips below tear it down and reload.
+	if !ui_probe_marker_cull_asserts() {
+		os.exit(1)
+	}
 	// A clip tile is frames*zoom wide; its label must never size it.
 	if !ui_probe_clip_tile_width_asserts() {
 		os.exit(1)
@@ -199,6 +205,13 @@ for j := 0; j < len(raw); {
 	// Click vs drag on a keyframe diamond: the press must not collapse a run the
 	// user may be about to retime, and the narrowing belongs on mouse-up.
 	if !ui_probe_kf_click_vs_drag_asserts() {
+		os.exit(1)
+	}
+	// Backspace ripple-deletes the selected clip and closes the gap. Driven from
+	// a real clip press through the real key router, because the report was
+	// "Backspace doesn't ripple" and every layer of that chain (which element the
+	// press selects, the router, the action, the ripple) is a place it can break.
+	if !ui_probe_backspace_ripple_asserts() {
 		os.exit(1)
 	}
 	// The opacity fill's painted width is opacity * the track's laid-out width.
@@ -318,6 +331,178 @@ ui_probe_marker_ownership_asserts :: proc() -> bool {
 	free_markers(&lo)
 	free_markers(&hi)
 	return ok
+}
+
+// ui_probe_marker_cull_asserts pins the visible-range clip for the two timeline
+// overlay passes (draw_clip_markers, draw_keyframes). Both paint into the track
+// lanes directly rather than as Clay content, so neither inherits Clay's scissor
+// stack: each sets its own, and each used to set it to the track's own
+// ClipsSection box. That box follows the row when the track list scrolls
+// vertically (TracksSection applies timeline_view.top as a Clay childOffset),
+// so a row scrolled up carried its scissor -- and with it the marker lines, gap
+// triangles and keyframe diamonds -- off the top of the lane viewport and over
+// the ruler strip and the panels above the timeline.
+//
+// The contract asserted here is what a Clay element in that lane would have been
+// clipped to: the overlay rect is the lane intersected with the TracksSection
+// viewport on BOTH axes. A track scrolled out of view reports an empty rect (the
+// draw loop skips it) rather than a rect sitting over unrelated panels.
+ui_probe_marker_cull_asserts :: proc() -> bool {
+	ok := true
+	// Markers on every clip, so the marker pass has something to place in each
+	// lane: a clip with no markers is skipped before any geometry is computed.
+	for t in 0 ..< len(timeline.tracks) {
+		for c in 0 ..< len(timeline.tracks[t].clips) {
+			clip := &timeline.tracks[t].clips[c]
+			if len(clip.markers) > 0 {
+				continue
+			}
+			clip.markers = make([dynamic]Clip_Marker, 0, 2)
+			append(&clip.markers, Clip_Marker{source_frame = 10, label = strings.clone("m-a")})
+			append(&clip.markers, Clip_Marker{source_frame = 200, label = strings.clone("m-b")})
+		}
+	}
+	saved_top := timeline_view.top
+	defer timeline_view.top = saved_top
+	saved_upper := panel_layout.upper_area_height
+	defer panel_layout.upper_area_height = saved_upper
+
+	// The seeded rows all fit at the default split, so there is nothing to scroll
+	// and the invariant would hold trivially. Grow the upper area until the track
+	// viewport is smaller than the content, which is the state a user reaches by
+	// dragging the divider up.
+	build_page(1920, 1600)
+	content_h := timeline_tracks_content_height()
+	// Two rows' worth of viewport: enough that the last row is genuinely off
+	// screen at full scroll, without pinning the list so tight that Clay starts
+	// collapsing elements.
+	want_view_h := 2 * (TRACK_ROW_H + TRACK_GAP_H) + KF_ROW_H * f32(ui_probe_tracks)
+	for _ in 0 ..< 8 {
+		sec := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+		if sec.height <= 0 {
+			break
+		}
+		if sec.height <= want_view_h {
+			break
+		}
+		panel_layout.upper_area_height += sec.height - want_view_h
+		build_page(1920, 1600)
+	}
+	view := clay.GetElementData(clay.ID("TracksSection")).boundingBox
+	if view.width <= 0 || view.height <= 0 {
+		fmt.eprintf(
+			"[ui-probe] marker cull: TracksSection never laid out (%.1fx%.1f)\n",
+			view.width,
+			view.height,
+		)
+		return false
+	}
+	max_top := max(content_h - view.height, 0)
+	if max_top <= 0 {
+		// Without a scroll range every row is visible and the invariant is
+		// trivially true, so this probe would pass without testing anything.
+		fmt.eprintf(
+			"[ui-probe] marker cull: no vertical scroll room (content %.1f vs viewport %.1f)\n",
+			content_h,
+			view.height,
+		)
+		return false
+	}
+
+	// Walk the scroll range including a hard overshoot: an unclamped top is the
+	// state a fast wheel scroll passes through before the app's clamp runs, so
+	// it is exactly the state that must not paint.
+	scrolls := []f32{0, max_top * 0.5, max_top, max_top * 4}
+	for top in scrolls {
+		timeline_view.top = top
+		build_page(1920, 1600)
+		for t in 0 ..< len(timeline.tracks) {
+			if order_row_of(t) < 0 {
+				fmt.eprintf("[ui-probe] marker cull: track %d has no order row\n", t)
+				ok = false
+				continue
+			}
+			// The rects the two passes paint into, from the same accessors they
+			// use. The marker one adds the insert gap above the lane, so its top
+			// edge is the part that used to escape.
+			passes := [2]struct{name: string, rect: clay.BoundingBox} {
+				{name = "keyframes", rect = kf_lane_rect(t)},
+				{name = "markers", rect = marker_lane_rect(t)},
+			}
+			for pass in passes {
+				r := pass.rect
+				if r.width <= 0 || r.height <= 0 {
+					// Off-screen tracks must skip, not paint a degenerate sliver.
+					continue
+				}
+				if r.x < view.x - 0.5 ||
+				   r.x + r.width > view.x + view.width + 0.5 ||
+				   r.y < view.y - 0.5 ||
+				   r.y + r.height > view.y + view.height + 0.5 {
+					fmt.eprintf(
+						"[ui-probe] marker cull: top=%.1f track %d %s paints (%.1f,%.1f %.1fx%.1f) outside viewport (%.1f,%.1f %.1fx%.1f)\n",
+						top,
+						t,
+						pass.name,
+						r.x,
+						r.y,
+						r.width,
+						r.height,
+						view.x,
+						view.y,
+						view.width,
+						view.height,
+					)
+					ok = false
+				}
+			}
+		}
+	}
+
+	// With every row scrolled out of view, neither pass may report a paintable
+	// rect at all. This is the cull the draw loops key on, so it is the half of
+	// the fix that actually stops the draw calls.
+	timeline_view.top = max_top * 4
+	build_page(1920, 1600)
+	for t in 0 ..< len(timeline.tracks) {
+		if r := kf_lane_rect(t); r.width > 0 && r.height > 0 {
+			fmt.eprintf(
+				"[ui-probe] marker cull: track %d keyframe lane still %.1fx%.1f with every row scrolled away\n",
+				t,
+				r.width,
+				r.height,
+			)
+			ok = false
+		}
+	}
+
+	// The horizontal side of the same rule, and the case where a tile has slid
+	// under the track-name gutter: scroll to the end of the timeline so the lane
+	// sits mostly off to the left, then require every rect to stop at the lane's
+	// own left edge rather than reaching into the gutter.
+	saved_start := timeline_view.start
+	timeline_view.top = 0
+	timeline_view.start = f32(timeline_duration())
+	build_page(1920, 1600)
+	for t in 0 ..< len(timeline.tracks) {
+		r := kf_lane_rect(t)
+		if r.width > 0 && r.height > 0 && r.x < view.x - 0.5 {
+			fmt.eprintf(
+				"[ui-probe] marker cull: track %d paints from x %.1f, left of the lane edge %.1f\n",
+				t,
+				r.x,
+				view.x,
+			)
+			ok = false
+		}
+	}
+	timeline_view.start = saved_start
+
+	if !ok {
+		return false
+	}
+	fmt.printf("[ui-probe] marker/keyframe overlay confined to the lane viewport\n")
+	return true
 }
 
 // ui_probe_finder_asserts opens the in-app finder over the seeded session and
@@ -564,16 +749,46 @@ ui_probe_key_routing_asserts :: proc() -> bool {
 		want:  bool,
 		which: string,
 	}
-	claims := [?]Claim {
+	// CLOSED: every one of these has to fall through. Backspace ripple-deletes
+	// the selection and Esc dismisses overlays, so a closed field claiming them
+	// silently kills both -- which is exactly what shipped (see
+	// ui_probe_backspace_ripple_asserts).
+	closed := [?]Claim {
+		{ sdl.K_U, false, "an unbound key reaches the app" },
+		{ sdl.K_ESCAPE, false, "Esc reaches escape_dismiss" },
+		{ sdl.K_RETURN, false, "Enter reaches the app" },
+		{ sdl.K_RETURN2, false, "the keypad Enter reaches the app" },
+		{ sdl.K_BACKSPACE, false, "Backspace reaches the ripple delete" },
+		{ sdl.K_DELETE, false, "Delete is not the number field's: it deletes a clip" },
+		{ sdl.K_F1, false, "F1 stays a global shortcut" },
+	}
+	for c in closed {
+		if got := edit_field_claims_key(c.key); got != c.want {
+			fmt.eprintf(
+				"[ui-probe] closed edit_field_claims_key(K_%v) = %v, want %v (%s)\n",
+				c.key, got, c.want, c.which,
+			)
+			ok = false
+		}
+	}
+	// OPEN: the field takes exactly its three keys and passes the rest through.
+	open_claims := [?]Claim {
 		{ sdl.K_U, false, "an unbound key reaches the app" },
 		{ sdl.K_ESCAPE, true, "Esc cancels the field" },
 		{ sdl.K_RETURN, true, "Enter commits the field" },
 		{ sdl.K_RETURN2, true, "the keypad Enter commits too" },
 		{ sdl.K_BACKSPACE, true, "Backspace edits the field" },
-		{ sdl.K_DELETE, false, "Delete is NOT the number field's: it deletes a clip" },
+		{ sdl.K_DELETE, false, "Delete is not the number field's: it deletes a clip" },
 		{ sdl.K_F1, false, "F1 stays a global shortcut" },
 	}
-	for c in claims {
+	defer edit_cancel()
+	for c in open_claims {
+		// Esc and Return CLOSE the field as a side effect of claiming, so the
+		// field has to be re-opened for every case or the rest are measured
+		// against a closed field.
+		if edit_state.field == .None {
+			edit_begin(.X, 0)
+		}
 		if got := edit_field_claims_key(c.key); got != c.want {
 			fmt.eprintf(
 				"[ui-probe] edit_field_claims_key(K_%v) = %v, want %v (%s)\n",
@@ -2086,6 +2301,167 @@ ui_probe_clip_tile_width_asserts :: proc() -> bool {
 	}
 	if ok {
 		fmt.printf("[ui-probe] clip tile width ok\n")
+	}
+	return ok
+}
+
+// ui_probe_backspace_ripple_asserts: press the body of clip 1 on track 0, then
+// route a real Backspace keydown. Asserts the clip is gone AND that its tail
+// neighbour slid left by the removed span — the gap closing is the ripple, and
+// a delete that merely removed the clip (or silently did nothing) is the bug.
+ui_probe_backspace_ripple_asserts :: proc() -> bool {
+	ok := true
+	kf_dbl_click = {}
+	kf_clear()
+	kf_brush_disarm()
+	build_page(1920, 1600)
+	if len(timeline.tracks) == 0 || len(timeline.tracks[0].clips) < 3 {
+		fmt.eprintf("[ui-probe] backspace ripple fixture wants 3+ clips on track 0\n")
+		return false
+	}
+	track := &timeline.tracks[0]
+	// The ripple rebuilds the track's clip array (delete + reassign) and drops a
+	// clip, so keep a copy: the probes after this one lay out the same seeded
+	// session and would otherwise see a short track 0.
+	//
+	// DEEP, not a value copy. A shallow backup aliases the payloads the ripple
+	// is about to free, so restoring it hands a later teardown a name that was
+	// already freed — an invalid free that only shows under valgrind, long
+	// after the probe that caused it has printed "ok".
+	saved_clips := make([dynamic]Clip, 0, len(track.clips), context.temp_allocator)
+	for &c in track.clips {
+		append(&saved_clips, clip_deep_copy(&c))
+	}
+	target := track.clips[1]
+	span := target.source_length_frames
+	tail_id := track.clips[2].clip_id
+	tail_start := track.clips[2].timeline_start_frame
+	head_start := track.clips[0].timeline_start_frame
+	// The clip's own tile box, exactly as the frame loop would find it: the
+	// press has to land on the element the renderer painted.
+	box := clay.GetElementData(clay.ID("TimelineClip", 1)).boundingBox
+	if box.width <= 0 || box.height <= 0 {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: clip 1 never laid out (%.1fx%.1f)\n",
+			box.width,
+			box.height,
+		)
+		return false
+	}
+	defer {
+		kf_clear()
+		kf_brush_disarm()
+		// Release the rebuilt clips before restoring the backup: the moved
+		// clips alias the SEED payloads (which only the backup used to share,
+		// and it no longer does) and the straddle's right half owns fresh
+		// ones. Freeing them here is what makes the restore leak-free as well
+		// as free-of-double-frees.
+		for &c in track.clips {
+			clip_payload_free(&c)
+		}
+		delete(track.clips)
+		track.clips = saved_clips
+		selection.track, selection.index = 0, 0
+		// The ripple pushed a real undo node (a cloned timeline plus its
+		// label). Nothing downstream reads the tree, and the probe exits
+		// without the app teardown, so drop it here instead of leaking a
+		// snapshot of the seed.
+		undo_free_all()
+		undo_init()
+		build_page(1920, 1600)
+	}
+
+	x, y := box.x + box.width * 0.5, box.y + box.height * 0.5
+	clay.SetPointerState({x, y}, true)
+	interaction_click_dispatch(Mouse_Input{x, y, true, false, false, false, false, false}, false)
+	clay.SetPointerState({x, y}, false)
+	interaction_release(Mouse_Input{x, y, false, false, false, false, false, false})
+
+	// The premise: a plain press on the tile must have SELECTED it. Without
+	// this the rest of the probe could report a broken ripple for what is
+	// really a broken click.
+	if selection.track != 0 || selection.index != 1 {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: press on clip 1 selected %d/%d, want 0/1\n",
+			selection.track,
+			selection.index,
+		)
+		return false
+	}
+
+	if !route_key_down(sdl.K_BACKSPACE, {}, false) {
+		fmt.eprintf("[ui-probe] backspace ripple: the key router dropped Backspace\n")
+		return false
+	}
+
+	if len(track.clips) != ui_probe_clips_per_track - 1 {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: clip count %d, want %d (nothing was deleted)\n",
+			len(track.clips),
+			ui_probe_clips_per_track - 1,
+		)
+		return false
+	}
+	tail_after: i64 = -1
+	for &c in track.clips {
+		if c.clip_id == target.clip_id {
+			fmt.eprintf("[ui-probe] backspace ripple: the selected clip is still there\n")
+			ok = false
+		}
+		if c.clip_id == tail_id {
+			tail_after = c.timeline_start_frame
+		}
+	}
+	if track.clips[0].timeline_start_frame != head_start {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: the clip before the cut moved to %d, want %d\n",
+			track.clips[0].timeline_start_frame,
+			head_start,
+		)
+		ok = false
+	}
+	// The tail must have slid left by exactly the removed span, closing the gap.
+	if tail_after != tail_start - span {
+		fmt.eprintf(
+			"[ui-probe] backspace ripple: tail clip at %d, want %d (slid left by the %d-frame cut) — the gap did NOT close\n",
+			tail_after,
+			tail_start - span,
+			span,
+		)
+		ok = false
+	}
+	// Escape took the same path and was equally dead: the help overlay and the
+	// context menus could only be dismissed with the mouse.
+	editor_flags.help_open = true
+	defer editor_flags.help_open = false
+	route_key_down(sdl.K_ESCAPE, {}, false)
+	if editor_flags.help_open {
+		fmt.eprintf("[ui-probe] Escape with no field open must reach escape_dismiss\n")
+		ok = false
+	}
+	// ...and the number field must STILL get its three keys, which is the whole
+	// reason it is a separate owner: Backspace has to edit the digits there.
+	// edit_begin laid down "0"; the two appends made "073"; one Backspace must
+	// leave "07" — proving the key reached the FIELD, not the app layer.
+	edit_begin(.X, 0)
+	edit_append('7')
+	edit_append('3')
+	route_key_down(sdl.K_BACKSPACE, {}, false)
+	if edit_state.len != 2 || edit_state.chars[0] != '0' || edit_state.chars[1] != '7' {
+		fmt.eprintf(
+			"[ui-probe] Backspace must still edit an open number field (got %d chars, first %q)\n",
+			edit_state.len,
+			edit_state.chars[:max(edit_state.len, 1)],
+		)
+		ok = false
+	}
+	edit_cancel()
+	if edit_state.field != .None {
+		fmt.eprintf("[ui-probe] the number field must be closed after cancel\n")
+		ok = false
+	}
+	if ok {
+		fmt.printf("[ui-probe] backspace ripple-deletes and closes the gap ok\n")
 	}
 	return ok
 }
