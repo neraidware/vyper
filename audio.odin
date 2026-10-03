@@ -376,6 +376,26 @@ MAX_PLAY_SEGMENTS :: 256
 // extra), so the preroll content is skipped, not duplicated or shifted.
 AUDIO_SEEK_PREROLL_SEC :: 0.5
 
+// AUDIO_FORWARD_DECODE_MAX_SEC bounds how much SKIPPED audio a forward playhead
+// move may buy by DECODING THROUGH it rather than seeking. Past this bound the
+// skipped content costs more producer-thread time than a seek, and a producer
+// that blocks is a producer that underruns the device: measured on a 10000
+// frame jump over 166s of 3x FLAC, decoding through took 5.2s inside one
+// audio_mix_frame and cost 540 device underruns. The content behind the jump is
+// never played, so paying to decode it is pure loss. Sized where the two are
+// comparable -- FLAC decodes ~160x realtime here (~6ms per source per second
+// of audio), and a seek costs one preroll decode plus the seek itself -- so the
+// worst case added to a mixed frame stays in the tens of milliseconds. Mirrors
+// FORWARD_STREAM_MAX_SEC on the video side, which streams instead of seeks only
+// inside the same bound. Gaps under it keep decoding in place: a seek there
+// would cost more than the decode it replaces.
+AUDIO_FORWARD_DECODE_MAX_SEC :: 1.0
+
+// The same bound in sample-frames, which is what the mixer compares against.
+// Kept as its own name so the fifo arithmetic below reads in samples without
+// a seconds-to-samples conversion repeated at the call site.
+AUDIO_FORWARD_DECODE_MAX_48 :: i64(AUDIO_FORWARD_DECODE_MAX_SEC * 48000.0)
+
 // Audio_Ring is a growable circular buffer of interleaved stereo f32
 // sample-frames. It replaces a plain [dynamic]f32 drained by shifting the
 // remaining content down to index 0 on every consume: that pattern is O(n)
@@ -1223,22 +1243,29 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 			continue
 		}
 		demand48 := i64(audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
-		if demand48 < s.first48 {
-			// The fifo head is ahead of the needed sample. A gap within one
-			// frame is a boundary-rounding artifact at non-integer fps (the
-			// floor step can differ from 48000/fps by one): mix from the head.
-			// A larger gap means a forward jump advanced past content still
-			// needed: re-anchor this stream instead of feeding silence.
-			if s.first48 - demand48 > i64(spf) {
-				content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
-				if !audio_src_seek_anchor(s, content_sec) {
-					continue
-				}
-			}
-			if demand48 < s.first48 {
-				demand48 = s.first48
+		// The fifo sits somewhere other than where this frame needs samples.
+		// Both distances are re-anchored with a seek, because a decode only
+		// substitutes when it is cheaper:
+		//   head ahead  -- a forward jump advanced past content still needed;
+		//                  feeding silence here is the only other option.
+		//   head behind -- the demand is past what the decoder holds. Under
+		//                  AUDIO_FORWARD_DECODE_MAX_SEC, decoding the gap in
+		//                  place is cheaper than a seek. Over it, the gap is
+		//                  content nobody will ever play and decoding through
+		//                  blocks the producer long enough to underrun the
+		//                  device, so the jump is sought instead.
+		head_ahead := s.first48 - demand48 > i64(spf)
+		head_behind := demand48 - s.have48 > AUDIO_FORWARD_DECODE_MAX_48
+		if head_ahead || head_behind {
+			content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
+			if !audio_src_seek_anchor(s, content_sec) {
+				continue
 			}
 		}
+		// A seek lands on the decoder's real PTS, which the demuxer's slack
+		// can put a sample or two either side of the demand. Mix from the fifo
+		// head when it landed ahead, so the base is never before the head.
+		demand48 = max(demand48, s.first48)
 		start48 := demand48
 		audio_src_pull(s, start48 + i64(spf))
 		if s.have48 < start48 + i64(spf) {

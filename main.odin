@@ -1844,6 +1844,23 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	if ap, _ := os.lookup_env_alloc("VYPER_AUDIO_PROBE", context.temp_allocator); ap != "" {
 		os.exit(audio_probe_run(ap))
 	}
+	if jp, _ := os.lookup_env_alloc("VYPER_AUDIO_JUMP_PROBE", context.temp_allocator); jp != "" {
+		// The forward-jump death on its own: audio_probe_run's other checks are
+		// written against the synthetic two-lane fixture and a real recording
+		// (3 FLAC streams, 60 fps, 1.9 GB) trips the gain check before this one
+		// gets a chance to run.
+		jpath, jf := jp, i64(0)
+		if parts := strings.split(jp, "|"); len(parts) > 1 {
+			jpath = parts[0]
+			if v, ok := strconv.parse_int(parts[1]); ok {
+				jf = i64(v)
+			}
+		}
+		if audio_probe_forward_jump(jpath, jf) {
+			os.exit(0)
+		}
+		os.exit(1)
+	}
 	if ar, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_PROBE", context.temp_allocator); ar != "" {
 		audio_rate_probe_run(ar)
 	}

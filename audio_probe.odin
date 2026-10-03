@@ -767,3 +767,173 @@ audio_probe_geom_slab_handoff :: proc() -> bool {
 	fmt.println("[ap] the reader's slot survived two commits, and the published slot is current")
 	return true
 }
+
+// audio_probe_forward_jump is the "audio DIES" report: drag the playhead a long
+// way forward while playing and the sound never comes back. It runs in its own
+// process (VYPER_AUDIO_JUMP_PROBE, wired into the gate) because it re-imports
+// the source onto a clean timeline: appended to the split-and-ripple-deleted
+// timeline the earlier cases leave behind, it measures that mess instead of a
+// jump.
+//
+// The forward skip in audio_producer_feed is deliberately NOT a re-provision:
+// it trims each fifo, moves next_frame to the playhead and lets the decoders
+// "just keep decoding forward", because reopening every decoder on every
+// forward move is the restart storm the Active 14/15 work removed. The claim
+// this probe checks is that the claim holds at a JUMP size -- the decoders are
+// now hundreds of seconds behind the demand, and audio_mix_frame has to
+// either catch them up or re-anchor them. A 10000-frame jump at 60 fps is
+// 166 s of content, which is why this is not a small perturbation.
+//
+// What it asserts: the jump SEEKS rather than decoding through the gap. Silent
+// frames right after the jump are the same bug by another name, so they are a
+// failure too -- there is no "it needed a moment" case.
+// audio_probe_forward_jump covers the user's repro: playing a long AV1/FLAC
+// recording and moving the playhead forward a long way, which "dies".
+//
+// JUMP_MIX_FRAMES is the window mixed after the jump. JUMP_DECODE_SLACK_SEC is
+// the decoder-chunk overshoot allowed on top of the seek's own decode budget.
+// JUMP_GAP_SEC is the gap the gate fixture jumps: past
+// AUDIO_FORWARD_DECODE_MAX_SEC, so the seek path is the one under test and the
+// case cannot skip on a clip shorter than the user's 166s jump.
+JUMP_MIX_FRAMES :: 30
+JUMP_DECODE_SLACK_SEC :: 0.5
+JUMP_GAP_SEC :: 5.0
+
+// jump_frames <= 0 derives the gap from the clip, so the gate fixture jumps too.
+audio_probe_forward_jump :: proc(path: string, jump_frames: i64) -> bool {
+	jump := jump_frames
+	fmt.println("[ap] --- forward jump ---")
+	editor_flags.async_import_mode = false
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+	import_media(cpath)
+	atrack := find_audio_track()
+	if atrack == nil || len(atrack.clips) == 0 {
+		fmt.println("[ap] SKIP: no audio track from", path)
+		return true
+	}
+	audio_geometry_commit()
+	audio_reset_play()
+	fps := f64(timeline_fps())
+	if fps <= 0 {
+		fmt.println("[ap] SKIP: no project fps")
+		return true
+	}
+	span := i64(0)
+	for &c in atrack.clips {
+		span = max(span, c.timeline_start_frame + c.source_length_frames)
+	}
+	if jump <= 0 {
+		jump = min(i64(JUMP_GAP_SEC * fps), span - i64(JUMP_GAP_SEC * fps))
+	}
+	fmt.printf("[ap] jump=%d frames (%.1fs) over a %.1fs clip at %.0f fps\n",
+		jump, f64(jump) / fps, f64(span) / fps, fps)
+	if jump >= span {
+		fmt.println("[ap] SKIP: jump lands past the clip; nothing to play there")
+		return true
+	}
+	audio_provision(0)
+	fmt.printf("[ap] provisioned %d sources at frame 0\n", audio_src.count)
+
+	// Steady state before the jump: prove the engine is audible first, so a
+	// failure after the jump cannot be a file that was silent all along.
+	delivered := audio_probe_mix_run(0, JUMP_MIX_FRAMES, fps)
+	fmt.printf("[ap] before jump: %d/%d frames delivered\n", delivered, JUMP_MIX_FRAMES)
+	if delivered == 0 {
+		fmt.println("[ap] FAIL: nothing decodes at frame 0; the jump proves nothing")
+		return false
+	}
+
+	// The forward skip, exactly as audio_producer_feed applies jump_frame.
+	delta48 := audio_frame_boundary48(jump, fps) - audio_frame_boundary48(audio_src.next_frame, fps)
+	for k in 0 ..< audio_src.count {
+		s := &audio_src.slots[k]
+		if !s.dec.opened || s.fifo.buf == nil || delta48 <= 0 {
+			continue
+		}
+		drop := int(min(delta48, i64(ring_len(&s.fifo))))
+		if drop > 0 {
+			s.first48 += i64(drop)
+			ring_drop(&s.fifo, drop)
+		}
+	}
+	audio_src.next_frame = jump
+	fmt.printf("[ap] after skip: next_frame=%d, srcs=%d, fifo=%d frames\n",
+		jump, audio_src.count, ring_len(&audio_src.slots[0].fifo))
+
+	// Now mix at the jumped-to position. This is where "dies" shows up.
+	//
+	// Delivered frames alone are the wrong assertion: the engine "catches up"
+	// -- it decodes everything between the old and new position and comes back,
+	// which is what made this look like a transient. It is a defect, because
+	// that catch-up is 5.2s of producer-thread blocking on a 166s jump (540
+	// device underruns, measured), and the skipped audio is never played. So
+	// the assertion is on decoding, not delivery: a jumped-to mixer may only
+	// decode the seek preroll plus the frames actually asked for.
+	dec_before := audio_src.slots[0].dec.decoded_frames
+	ns_before := monotonic_ns()
+	after := audio_probe_mix_run(jump, JUMP_MIX_FRAMES, fps)
+	elapsed_ms := f64(i64(monotonic_ns() - ns_before)) / 1e6
+	decoded := audio_src.slots[0].dec.decoded_frames - dec_before
+	// What the mixer may legitimately decode: the gap, but only up to the
+	// forward bound that is the whole point of the bound, plus the seek's own
+	// preroll, plus what was asked for, plus one decoder frame of chunk
+	// overshoot.
+	gap48 := audio_frame_boundary48(jump, fps) - audio_frame_boundary48(0, fps)
+	budget := min(gap48, AUDIO_FORWARD_DECODE_MAX_48) +
+		i64((AUDIO_SEEK_PREROLL_SEC + f64(JUMP_MIX_FRAMES) / fps + JUMP_DECODE_SLACK_SEC) * 48000.0)
+	fmt.printf("[ap] after jump: %d/%d frames delivered in %.1fms, decoded %d frames (budget %d)\n",
+		after, JUMP_MIX_FRAMES, elapsed_ms, decoded, budget)
+	if after == 0 {
+		fmt.println("[ap] FAIL: a forward jump left the engine permanently silent")
+		return false
+	}
+	if after < JUMP_MIX_FRAMES {
+		fmt.printf("[ap] FAIL: %d frames silent right after the jump\n",
+			JUMP_MIX_FRAMES - after)
+		return false
+	}
+	if decoded > budget {
+		fmt.printf(
+			"[ap] FAIL: the jump decoded %d frames of skipped content (budget %d, %.1fs of audio) instead of seeking\n",
+			decoded, budget, f64(decoded) / 48000.0,
+		)
+		return false
+	}
+	fmt.println("[ap] forward jump ok (seeked, did not decode the gap)")
+	return true
+}
+
+// audio_probe_mix_run mixes `count` frames from `start`, advancing audio_src
+// next_frame exactly as audio_producer_feed does, and returns how many of them
+// actually delivered audio.
+audio_probe_mix_run :: proc(start: i64, count: int, fps: f64) -> int {
+	audio_src.next_frame = start
+	delivered := 0
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	for i in 0 ..< count {
+		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(48000.0 / fps + 0.5)))
+		if audio_mix_frame(mix[:], audio_src.next_frame, spf) {
+			delivered += 1
+		}
+		audio_src.next_frame += 1
+	}
+	return delivered
+}
+
+find_audio_track :: proc() -> ^Track {
+	for &t in timeline.tracks {
+		for &c in t.clips {
+			if c.kind == .Audio {
+				return &t
+			}
+		}
+	}
+	return nil
+}
