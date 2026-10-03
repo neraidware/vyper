@@ -3093,6 +3093,104 @@ what it keeps — so `sdl.free` on the event buffer is the only owner that can
 release it, and `dnd_valgrind` is the gate that measures that handoff (0
 definitely lost, 0 indirectly lost, no invalid free).
 
+## Active 13 — Export frame rate came from the first video source, not the frame grid
+
+**Status: fixed 2026-10-03.** Branch `parity` (base `d279b45`). `parity` is a
+member of `all`. Found while investigating why `baby.vyproj` exports 9.72 s of
+video for a 20.25 s timeline.
+
+**The defect.** The export worker derived its output rate from the first entry
+of `render_job.videos`:
+
+```
+} else if len(render_job.videos) > 0 {
+    rfps_num = render_job.videos[0].dec.fps_num
+```
+
+"How fast does this file play" is a different question from "what rate is the
+frame grid defined on", and the two coincide only when the first visual source
+is the one that set the grid. A still image is the case that breaks it: an image
+demuxer reports an arbitrary `avg_frame_rate` (`25/1` for a PNG), so a project
+whose first video clip was a still exported at 25 while its timeline played at
+12. Every complaint follows from that single number — the file was retimed by
+`25/12 = 2.08x`, so keyed values, positions and clip lengths all landed on
+different output frames, and the duration was wrong by that factor. The old
+comment claimed the fallback existed so the timeline grid would render 1:1 with
+the sources, which is what made it look deliberate; it did the opposite, and
+`media.odin:359` already excludes stills when SETTING the grid rate, so the
+import side and the export side disagreed about what the grid is.
+
+**The fix.** One resolver, one snapshot, no second opinion:
+- `state.odin`: `project_rate_ok` (rejects zero, negative, NaN, Inf — a rate
+  loaded from a project file is data that arrives broken, so it falls through
+  rather than asserting) and `project_fps` (explicit project rate → the rate the
+  first non-still import established → 60). `timeline_fps` is now
+  `playback.magic_fps` → `project_fps`, so the DIAG playback override stays a
+  preview-only knob and can never reach a container's time base.
+- `state.odin`: `fps_rational` maps a rate to its exact container fraction,
+  keeping the `1001` denominator for 23.976 / 29.97 / 59.94. Rounding 23.976 to
+  `24/1` makes an export 0.1% long — a frame lost every ~40 seconds.
+- `render.odin`: `Render_Job` carries `fps`/`fps_num`/`fps_den`, resolved once
+  in `render_start` on the UI thread — before the snapshot walk, because the
+  subtitle clips built by that walk copy the rate into their own struct. The
+  worker reads the snapshot; the video mux, the 48 kHz audio bus and the subtitle
+  timing all read the same three fields.
+
+**Probe.** `parity_probe.odin`, gate `parity`, in two modes.
+- `VYPER_PARITY_FIXTURE` builds a project that collides BY CONSTRUCTION: a still
+  imported first (so it is `videos[0]`) and a 30 fps clip second (so the grid
+  rate comes from the video). It ASSERTS the precondition that the still's own
+  reported rate still differs from the grid's — a future ffmpeg that made image
+  streams report a sane rate would otherwise leave the gate unable to detect the
+  bug, passing for a reason that means nothing.
+- `VYPER_PARITY_PROBE="<in.vyproj>|<out.mp4>"` runs the same checks against any
+  real project. This is how `baby.vyproj` was verified: `12/1`, 243 frames,
+  20.25 s, exit 0 (it was `25/1`, 9.72 s before).
+- Three separate claims, because the first version of this probe checked only
+  the geometry and passed a project that was broken in the rate: the rate the
+  job carries, the rate the OUTPUT FILE carries, and the per-frame resolved pose
+  across both evaluators. The middle one is not redundant: asserting the job
+  struct proves only that `render_start` resolved something, and the restored
+  pre-fix worker passed that assertion while muxing a different rate. Only the
+  container can speak for what shipped.
+- The resolver's own table is checked directly (7 rates mapped, 7 invalid inputs
+  rejected), including the NTSC rationals, which no end-to-end path reaches and
+  which a dropped branch would leave green.
+- Mutation-checked. Restoring the source-derived chain fails with "is muxed at
+  25/1 but the frame grid is 30"; breaking the NTSC branch fails with "rate
+  23.976 became 24/1".
+
+**Memory.** `parity_valgrind` is a member of `all`. The gate found two things
+and the first version of this note was wrong about which:
+- The probe's own `os.exit` skipped main's `defer sdl.Quit()`, while the export
+  worker's `sdl.Init(VIDEO)` had run — 471 bytes definitely lost. The app itself
+  always paired them; this was a probe-exit bug, and the fix is the probe's
+  `parity_probe_exit` (GPU objects released first, then SDL down, as SDL
+  requires).
+- The GPU resampler singleton genuinely had no success-path teardown, and
+  `gpu_resample_release` now provides one — but deleting that call moves the
+  leak totals by ZERO bytes, so it is not what the number was measuring. It is
+  kept because SDL's documented ordering requires it, not because it closes a
+  leak; recorded here so nobody later reads the teardown as leak-fixed.
+- 72 bytes in 1 block remain, from the `sdl.Init(VIDEO)` the export WORKER thread
+  issues: SDL's per-thread video state is orphaned when that thread exits and no
+  later release reaches it. One block per process. The gate asserts an invalid-
+  access invariant (which caught the probe's own use-after-free), non-vacuity, a
+  0/0 SDL Init+Quit control proving the exit teardown is complete, and a named
+  bound on definitely-lost so any new leak fails. The control is executed by the
+  gate rather than quoted: an earlier "SDL alone leaks 120 bytes" baseline was
+  measured against a stale binary that never ran the control at all.
+
+**Two probe bugs found while building it, both the ownership rules biting.**
+The drain loop first returned a buffer its own `defer delete` had freed (a
+use-after-free on every run), and it read the buffer after the final
+`render_live_drain` returned false — reporting "the export is black" about a
+frame nobody delivered, on a file with pictures in it. The probe also has to set
+`render_live.shown` itself: `render_live_publish` refuses to publish until a
+consumer has drawn, so a probe that only drains measures a mailbox nobody wrote
+to. A probe that reports a measurement it did not take is worse than no probe.
+
+
 ## Queued — Performance / Cleanup
 
 - **Consolidate top-level mutable globals into named state structs** — the

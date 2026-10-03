@@ -1742,6 +1742,7 @@ main :: proc() {
 		render_test_run(test_paths)
 		return
 	}
+	parity_probe_env()
 	if hw_probe, _ := os.lookup_env_alloc("VYPER_HW_PROBE", context.temp_allocator); hw_probe != "" {
 		preview_hw_probe_run(hw_probe)
 		return

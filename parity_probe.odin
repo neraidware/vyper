@@ -1,0 +1,854 @@
+package main
+
+// ---------------------------------------------------------------------------
+// Preview/export parity probe.
+//
+//   VYPER_PARITY_PROBE="in.vyproj|out.mp4"    check a real project file
+//   VYPER_PARITY_FIXTURE="still|clip|out.mp4"  build the discriminating fixture
+//
+// Two invariants, because "the export matches the preview" is two claims and
+// checking only one of them is how a broken project passed:
+//
+//  1. FRAME RATE. The export must run at the rate the frame grid is defined on
+//     (project_fps), so frame N denotes the same instant in the file and on the
+//     canvas. The worker used to take its rate from the FIRST VIDEO SOURCE
+//     instead, which is a different question -- "what rate does this file have"
+//     -- and the two agree only when that source is the grid-defining one. A
+//     still image is the case that broke it: an image demuxer reports an
+//     arbitrary avg_frame_rate, so a project whose first video clip was a still
+//     exported at the still's rate. Everything the user could name as
+//     "different" follows from that one number -- keyed values, positions and
+//     clip lengths all land on a different output frame when the whole timeline
+//     is retimed.
+//
+//  2. RESOLVED POSE. For every output frame and every visible visual clip, the
+//     two evaluators must agree on scale, transform, crop, opacity and the
+//     rounded destination box. This is the check that FALSIFIED a suspected
+//     keyframe-offset bug: both samplers convert a timeline frame to the
+//     clip-relative offset internally (kf_geom_sample_lane -> kf_sample_for),
+//     so they agree, and the probe reporting agreement is what said so.
+//
+// The fixture mode exists because a gate needs a project that reliably breaks
+// the rate chain. It imports a still FIRST (so it is videos[0]) and a video at
+// a different rate second (so the grid rate comes from the video), then ASSERTS
+// the still's own rate still differs from the grid. If a future ffmpeg makes
+// image streams report the grid rate, that assertion fails loudly: the fixture
+// has lost its teeth, and passing it would mean nothing.
+//
+// Exit 0 = both invariants hold, 1 = a parity failure (the report IS the
+// finding), 2 = usage, 3 = the fixture, load, or export itself failed.
+// ---------------------------------------------------------------------------
+
+import "core:c"
+import "core:fmt"
+import "core:math"
+import "core:os"
+import "core:sync"
+import "core:strings"
+import "core:time"
+import sdl "vendor:sdl3"
+
+parity_probe_fail := false
+parity_probe_hard_fail := false
+
+parity_probe_failf :: proc(msg: string, args: ..any) {
+	parity_probe_fail = true
+	fmt.println("[parity-probe] FAIL:", fmt.tprintf(msg, ..args))
+}
+
+// PARITY_PROBE_LANES is the property set under test, one name per lane. Bounded
+// by hand rather than by Render_Geom_Prop._COUNT because box_w/box_h are
+// derived columns with no Render_Geom_Prop of their own, and a probe that
+// allocated per frame to stay in sync would be the wrong trade. The array the
+// frame comparison fills is one wider: index PARITY_PROBE_LANES carries box_h.
+PARITY_PROBE_LANES :: 11
+
+parity_probe_lane_names := [PARITY_PROBE_LANES]string {
+	"scale",
+	"trans_x",
+	"trans_y",
+	"opacity",
+	"crop_l",
+	"crop_r",
+	"crop_t",
+	"crop_b",
+	"box_x",
+	"box_y",
+	"box_w",
+}
+
+// parity_eps is the pose comparison tolerance. Both sides are f32 through a
+// shared evaluator, so bit equality is too strict a bar; 1e-4 in project units
+// is a ten-thousandth of a pixel at 1080p, far below anything visible, while
+// still catching a lane sampled one keyframe off.
+parity_eps :: f32(1e-4)
+
+// parity_probe_report prints one failing frame: the lane names with their
+// preview-minus-export deltas. Deltas rather than both values because the
+// question a reader has is "how far apart", and the magnitude is what
+// distinguishes a rounding wobble from a whole wrong keyframe.
+//
+// The lane text is assembled in a fixed array and joined once, not appended
+// into a byte buffer: fmt.bprintf returns a string, so growing one buffer
+// across lanes would allocate per lane on a per-frame path.
+parity_probe_report :: proc(clip: ^Clip, timeline_frame, off: i64, diffs: [PARITY_PROBE_LANES + 1]f32) {
+	// The aprintf strings ride the frame arena, which the probe's os.exit
+	// never reaches a free for -- same reason render_test_run does not free its
+	// own scratch. Nothing here outlives the call that prints them.
+	parts: [PARITY_PROBE_LANES + 1]string
+	n := 0
+	for lane in 0 ..< PARITY_PROBE_LANES + 1 {
+		d := diffs[lane]
+		if abs(d) <= parity_eps {
+			continue
+		}
+		name := "box_h"
+		if lane < PARITY_PROBE_LANES {
+			name = parity_probe_lane_names[lane]
+		}
+		parts[n] = fmt.aprintf("%s %+.4f", name, d)
+		n += 1
+	}
+	if n == 0 {
+		return
+	}
+	parity_probe_fail = true
+	fmt.println(
+		"[parity-probe] FAIL clip",
+		clip.name,
+		"frame",
+		timeline_frame,
+		"(clip-relative off",
+		off,
+		")",
+		strings.join(parts[:n], "; "),
+	)
+}
+
+// parity_probe_frame compares one output frame across the two evaluators.
+//
+// Preview side: geom_sample_clip(clip, timeline_frame) -- the absolute frame,
+// the live clip, the live evaluator.
+// Export side: geom_sample_flat over the flat snapshot the worker was handed,
+// at the clip-relative offset -- the exact basis render_kf_geom_rect uses.
+//
+// The box lanes compare rounded output pixels, because that is what each side
+// composites: the worker draws ox/oy/rw/rh, the preview hands the GPU a quad
+// derived from the same edges.
+parity_probe_frame :: proc(clip: ^Clip, v: ^Render_Video_Src, timeline_frame: i64, pw, ph: f32) {
+	pv := geom_sample_clip(clip, timeline_frame)
+	off := i32(timeline_frame - v.timeline_start_frame)
+	ev := geom_sample_flat(v.geom_base, &v.kf_geom, off)
+	cw_e, ch_e := full_box_dims(v.source_w, v.source_h, ev[int(Render_Geom_Prop.Scale)], pw, ph)
+	el, et, er, eb := cropped_box_edges(
+		ev[int(Render_Geom_Prop.Trans_X)],
+		ev[int(Render_Geom_Prop.Trans_Y)],
+		cw_e,
+		ch_e,
+		ev[int(Render_Geom_Prop.Crop_L)],
+		ev[int(Render_Geom_Prop.Crop_R)],
+		ev[int(Render_Geom_Prop.Crop_T)],
+		ev[int(Render_Geom_Prop.Crop_B)],
+	)
+	cw_p, ch_p := full_box_dims(
+		clip.source_w,
+		clip.source_h,
+		pv[int(Render_Geom_Prop.Scale)],
+		pw,
+		ph,
+	)
+	pl, pt, pr, pb := cropped_box_edges(
+		pv[int(Render_Geom_Prop.Trans_X)],
+		pv[int(Render_Geom_Prop.Trans_Y)],
+		cw_p,
+		ch_p,
+		pv[int(Render_Geom_Prop.Crop_L)],
+		pv[int(Render_Geom_Prop.Crop_R)],
+		pv[int(Render_Geom_Prop.Crop_T)],
+		pv[int(Render_Geom_Prop.Crop_B)],
+	)
+	// The preview rounds its origin the same way the worker's setup does
+	// (render.odin: v.ox = c.int(l + 0.5)).
+	diffs: [PARITY_PROBE_LANES + 1]f32
+	diffs[0] = pv[int(Render_Geom_Prop.Scale)] - ev[int(Render_Geom_Prop.Scale)]
+	diffs[1] = pv[int(Render_Geom_Prop.Trans_X)] - ev[int(Render_Geom_Prop.Trans_X)]
+	diffs[2] = pv[int(Render_Geom_Prop.Trans_Y)] - ev[int(Render_Geom_Prop.Trans_Y)]
+	diffs[3] = pv[int(Render_Geom_Prop.Opacity)] - ev[int(Render_Geom_Prop.Opacity)]
+	diffs[4] = pv[int(Render_Geom_Prop.Crop_L)] - ev[int(Render_Geom_Prop.Crop_L)]
+	diffs[5] = pv[int(Render_Geom_Prop.Crop_R)] - ev[int(Render_Geom_Prop.Crop_R)]
+	diffs[6] = pv[int(Render_Geom_Prop.Crop_T)] - ev[int(Render_Geom_Prop.Crop_T)]
+	diffs[7] = pv[int(Render_Geom_Prop.Crop_B)] - ev[int(Render_Geom_Prop.Crop_B)]
+	diffs[8] = f32(c.int(math.round(pl))) - f32(c.int(math.round(el)))
+	diffs[9] = f32(c.int(math.round(pt))) - f32(c.int(math.round(et)))
+	diffs[10] = f32(px_extent(pr - pl)) - f32(px_extent(er - el))
+	// box_h is derived from the same edges with no Render_Geom_Prop of its own,
+	// so it takes the one lane past the name table.
+	diffs[PARITY_PROBE_LANES] = f32(px_extent(pb - pt)) - f32(px_extent(eb - et))
+	parity_probe_report(clip, timeline_frame, i64(off), diffs)
+}
+
+// parity_probe_check_rate asserts the export rate against the grid rate, from
+// three sides: the job snapshot, the exact container rational, and the rate the
+// playhead itself advances at. It also prints the rate the first video SOURCE
+// reports, because that is the value the old chain used and seeing it differ is
+// what makes the report legible.
+parity_probe_check_rate :: proc() {
+	grid := project_fps()
+	fmt.println(
+		"[parity-probe] rates: grid(project_fps)",
+		grid,
+		"playback(timeline_fps)",
+		timeline_fps(),
+		"job",
+		render_job.fps,
+		"job_rational",
+		render_job.fps_num,
+		"/",
+		render_job.fps_den,
+	)
+	// A playback DIAG override in the environment would make timeline_fps()
+	// disagree with the grid by design, which is not a parity failure but does
+	// invalidate the comparison this probe is making. Say so instead of
+	// reporting a mismatch nobody can act on.
+	if playback.magic_fps > 0 {
+		fmt.println(
+			"[parity-probe] NOTE: VYPER_PLAYBACK_FPS is set (",
+			playback.magic_fps,
+			"); comparing the job against the grid rate only",
+		)
+	}
+	if math.abs(render_job.fps - grid) > 1e-9 {
+		parity_probe_failf(
+			"export rate %f is not the grid rate %f -- the output is retimed against the preview",
+			render_job.fps,
+			grid,
+		)
+	}
+	if render_job.fps > 0 && math.abs(render_job.fps - timeline_fps()) > 1e-9 &&
+	   playback.magic_fps <= 0 {
+		parity_probe_failf(
+			"export rate %f does not match the playback rate %f",
+			render_job.fps,
+			timeline_fps(),
+		)
+	}
+	exp_num, exp_den := fps_rational(grid)
+	if render_job.fps_num != exp_num || render_job.fps_den != exp_den {
+		parity_probe_failf(
+			"container time base %d/%d is not the exact rational for %f (%d/%d)",
+			render_job.fps_num,
+			render_job.fps_den,
+			grid,
+			exp_num,
+			exp_den,
+		)
+	}
+	// What the old chain used, read through the same probe the importer used, so
+	// the report shows the competing value rather than only asserting the chosen
+	// one. Read from the file, not from dec: the worker closes the decoder and
+	// zeroes those fields before the export completes, so a post-export read of
+	// them reports 0/0 for every source, stills included.
+	if len(render_job.videos) > 0 {
+		v0 := &render_job.videos[0]
+		path := strings.clone_to_cstring(string(v0.path))
+		sp := probe_streams(path)
+		delete(path)
+		if sp.has_video && sp.video_fps_den != 0 {
+			src := f64(sp.video_fps_num) / f64(sp.video_fps_den)
+			fmt.println(
+				"[parity-probe] first video source reports",
+				src,
+				"fps (still:",
+				v0.is_still,
+				") -- the rate the old chain used instead of the grid rate",
+			)
+		} else {
+			fmt.println("[parity-probe] first video source reported no rate")
+		}
+	}
+	// The user-visible consequence, stated as the duration the file will have:
+	// it must be the frame count over the grid rate, or every clip length,
+	// keyed value and position in the output denotes a different moment than
+	// it does on the canvas.
+	secs := f64(render_job.nframes) / grid
+	fmt.println(
+		"[parity-probe] output duration:",
+		secs,
+		"s for",
+		render_job.nframes,
+		"frames at",
+		grid,
+		"fps",
+	)
+}
+
+// parity_probe_frame_content counts pixels whose colour channels are not
+// black. Alpha is deliberately not counted: an opaque black frame must read as
+// empty, or every frame looks like content.
+parity_probe_frame_content :: proc(buf: []u8) -> int {
+	n := 0
+	i := 0
+	for i + 3 < len(buf) {
+		if buf[i] > 8 || buf[i + 1] > 8 || buf[i + 2] > 8 {
+			n += 1
+		}
+		i += 4
+	}
+	return n
+}
+
+// Parity_Probe_Drain is what the drain loop measured about the export it stood
+// in for. A struct rather than a pile of out-params because the caller wants all
+// three together, and a black export is a claim that needs its evidence
+// attached: WHICH frames were delivered, and how many of them had content.
+Parity_Probe_Drain :: struct {
+	frames_drained:  int, // successful render_live_drain calls
+	frames_with_content: int,
+	last_nonblack:   int,
+	last_frame:      i64, // timeline frame in the last drained buffer
+	pixels:          int,
+}
+
+// parity_probe_check_output_rate asserts the rate in the FILE, not the rate in
+// the job struct.
+//
+// This distinction is not pedantry: it is the difference between a regression
+// test and a test that cannot fail. The job snapshot is written by render_start
+// before the worker starts, so asserting on it only proves render_start
+// resolved a rate -- the worker could then mux at a completely different one
+// and the assertion would still pass. It did. Restoring the old
+// source-derived chain in the worker left this probe green while the file came
+// out at the still's 25 fps instead of the grid's 30. The only thing that can
+// speak for what shipped is the container, so ask the container -- through the
+// same libavformat probe the importer uses, so this check exercises the app's
+// own demux path rather than a second opinion from the ffmpeg CLI.
+parity_probe_check_output_rate :: proc(out_path: string, grid: f64) {
+	path := strings.clone_to_cstring(out_path)
+	defer delete(path)
+	sp := probe_streams(path)
+	if !sp.has_video {
+		parity_probe_failf("%s has no video stream to check", out_path)
+		return
+	}
+	if sp.video_fps_den <= 0 {
+		parity_probe_failf("%s reports no frame rate (%d/%d)", out_path, sp.video_fps_num, sp.video_fps_den)
+		return
+	}
+	exp_num, exp_den := fps_rational(grid)
+	fmt.println(
+		"[parity-probe] output file reports",
+		sp.video_fps_num,
+		"/",
+		sp.video_fps_den,
+		"= expected",
+		exp_num,
+		"/",
+		exp_den,
+	)
+	if sp.video_fps_num != exp_num || sp.video_fps_den != exp_den {
+		parity_probe_failf(
+			"%s is muxed at %d/%d but the frame grid is %f (%d/%d) -- the file is retimed against the preview",
+			out_path,
+			sp.video_fps_num,
+			sp.video_fps_den,
+			grid,
+			exp_num,
+			exp_den,
+		)
+	}
+}
+
+// parity_probe_check_nonblack reports whether the export actually put pixels on
+// the canvas. A project can be structurally perfect and still export nothing (a
+// layer at opacity 0, a clip with no video), and "the export is black" is an
+// outcome the user should never have to discover by opening the file: it is
+// either wrong or it is intended, and the probe cannot tell which, so it
+// reports the measurement and leaves the judgement to the run.
+parity_probe_check_nonblack :: proc(d: Parity_Probe_Drain) {
+	// A sample, not a census: the live view is a throttled mailbox of the
+	// composite, so it holds far fewer frames than the export encodes and its
+	// count says nothing about the file's frame count. The encoded file is the
+	// authority on that (scripts/gate.sh parity ffprobes it); this line only
+	// reports what the mailbox happened to deliver.
+	fmt.println(
+		"[parity-probe] live frames sampled:",
+		d.frames_drained,
+		"(last was timeline frame",
+		d.last_frame,
+		");",
+		d.frames_with_content,
+		"had content; that frame:",
+		d.last_nonblack,
+		"of",
+		d.pixels,
+		"pixels non-black",
+	)
+	if d.frames_drained == 0 {
+		fmt.println("[parity-probe] NOTE: the live mailbox delivered no frames at all")
+		return
+	}
+	if d.frames_with_content == 0 {
+		fmt.println(
+			"[parity-probe] NOTE: no delivered frame had any content -- every visual clip is transparent, empty or off-canvas",
+		)
+	}
+}
+
+// parity_probe_live_visuals flattens the live timeline's visual clips in
+// track_order walk order -- the same order render_start snapshots them in, so
+// index i here is render_job.videos[i] there. Caller owns the slice.
+// Parity_Rate_Case is one row of the rate resolver's ledger: the rate a project
+// asks for, and the exact container fraction it must become.
+Parity_Rate_Case :: struct {
+	fps:   f64,
+	num:   c.int,
+	den:   c.int,
+}
+
+// parity_probe_check_rate_resolver pins the mapping the whole export rests on,
+// row by row, including the NTSC rates and the inputs that must be REJECTED.
+//
+// The end-to-end fixture proves the still-first collision is fixed. It cannot
+// reach these rows: it exercises one rate through one container, and it cannot
+// ask for a NaN through a project file at all. A resolver that quietly dropped
+// the NTSC branch, or started accepting a negative rate, would leave every
+// end-to-end check green -- so the table is checked directly.
+parity_probe_check_rate_resolver :: proc() {
+	accept: []Parity_Rate_Case = {
+		{12, 12, 1},
+		{25, 25, 1},
+		{30, 30, 1},
+		{60, 60, 1},
+		// NTSC keeps its 1001 denominator. Rounding 23.976 to 24/1 makes the
+		// export 0.1% long -- a frame lost roughly every 40 seconds -- which is
+		// the kind of error nobody sees until they compare durations.
+		{23.976, 24000, 1001},
+		{29.97, 30000, 1001},
+		{59.94, 60000, 1001},
+	}
+	for c in accept {
+		if !project_rate_ok(c.fps) {
+			parity_probe_failf("rate %f was rejected but is a valid rate", c.fps)
+			continue
+		}
+		n, d := fps_rational(c.fps)
+		if n != c.num || d != c.den {
+			parity_probe_failf("rate %f became %d/%d, expected %d/%d", c.fps, n, d, c.num, c.den)
+		}
+	}
+	// Every input that must NOT reach the rational mapper: zero and negative are
+	// "no rate", and NaN/Inf are what a corrupt CBOR float decodes to. Each has to
+	// come back false so project_fps falls through to the timeline rate and then
+	// to 60 -- a defined outcome, never a division by zero or a NaN frame count.
+	// Built by bit pattern, not by dividing: 0.0/0.0 is a trap in some
+	// configurations and Inf-by-division depends on the FP environment, while
+	// these two constants are exactly what a corrupt CBOR float decodes to on
+	// any target.
+	NAN_BITS := transmute(f64)u64(0x7ff8000000000000)
+	POS_INF_BITS := transmute(f64)u64(0x7ff0000000000000)
+	NEG_INF_BITS := transmute(f64)u64(0xfff0000000000000)
+	reject: []f64 = {0, -0.0, -1, -29.97, NAN_BITS, POS_INF_BITS, NEG_INF_BITS}
+	for r in reject {
+		if project_rate_ok(r) {
+			parity_probe_failf("rate %f was accepted but is not a usable rate", r)
+		}
+	}
+	fmt.println("[parity-probe] rate resolver: 7 rates mapped, 7 invalid rates rejected")
+}
+
+// parity_probe_exit is the probe's exit, and it is not a bare os.exit.
+//
+// The export brings up real resources that outlive the check: the GPU resampler
+// singleton and, headless, the SDL video subsystem behind it. main unwinds those
+// with `defer sdl.Quit()`, but os.exit skips every defer -- which is how the
+// first parity_valgrind run reported 607 bytes definitely lost through
+// gpu_resample_create, from a path no earlier gate reached. Release the GPU
+// objects BEFORE the subsystem, as SDL requires, then exit. gpu_nv12_probe does
+// the same teardown by hand for the same reason.
+parity_probe_exit :: proc(code: int) {
+	gpu_resample_release()
+	sdl.Quit()
+	os.exit(code)
+}
+
+parity_probe_live_visuals :: proc() -> [dynamic]^Clip {
+	out: [dynamic]^Clip
+	sync_track_order()
+	for w := 0; w < len(timeline.track_order); w += 1 {
+		tr := &timeline.tracks[timeline.track_order[w]]
+		for i := 0; i < len(tr.clips); i += 1 {
+			if tr.clips[i].kind == .Video || tr.clips[i].kind == .Image {
+				append(&out, &tr.clips[i])
+			}
+		}
+	}
+	return out
+}
+
+parity_probe_dump_state :: proc() {
+	fmt.println(
+		"[parity-probe] loaded",
+		project.width,
+		"x",
+		project.height,
+		"@",
+		project_fps(),
+		"fps, duration",
+		timeline_duration(),
+		"frames",
+	)
+	for a in media_bin.assets {
+		fmt.println(
+			"[parity-probe] asset",
+			a.id,
+			string(a.path),
+			"kind",
+			a.kind,
+			"is_image",
+			a.is_image,
+			"frames",
+			a.frame_count,
+			"src",
+			a.src_w,
+			"x",
+			a.src_h,
+		)
+	}
+	for w := 0; w < len(timeline.track_order); w += 1 {
+		tr := &timeline.tracks[timeline.track_order[w]]
+		for i := 0; i < len(tr.clips); i += 1 {
+			clip := &tr.clips[i]
+			fmt.println(
+				"[parity-probe] clip",
+				clip.name,
+				"kind",
+				clip.kind,
+				"tstart",
+				clip.timeline_start_frame,
+				"len",
+				clip.source_length_frames,
+				"src",
+				clip.source_w,
+				"x",
+				clip.source_h,
+				"scale",
+				clip.scale,
+				"at",
+				clip.transform_x,
+				",",
+				clip.transform_y,
+				"opacity",
+				clip.opacity,
+				"kf_tracks",
+				len(clip.keyframe_tracks),
+			)
+		}
+	}
+}
+
+// parity_probe_compare walks every exported frame and cross-checks the two
+// evaluators through their own product entry points -- no reimplementation of
+// either, since a hand-copied formula would agree with itself by construction
+// and prove nothing.
+parity_probe_compare :: proc() {
+	vis := parity_probe_live_visuals()
+	// Caller owns the slice (stated on the proc), so the caller frees it. It is a
+	// dynamic array of POINTERS into the timeline's clip storage, so deleting it
+	// releases the index array only -- no clip is touched.
+	defer delete(vis)
+	pw := f32(render_job.width)
+	ph := f32(render_job.height)
+	compared := 0
+	for frame := render_job.start; frame <= render_job.end; frame += 1 {
+		for vi in 0 ..< len(render_job.videos) {
+			v := &render_job.videos[vi]
+			if !clip_visible_at(frame, v.timeline_start_frame, v.source_length_frames) {
+				continue
+			}
+			compared += 1
+			parity_probe_frame(vis[vi], v, frame, pw, ph)
+		}
+	}
+	fmt.println(
+		"[parity-probe] compared",
+		compared,
+		"clip-frames across",
+		render_job.nframes,
+		"output frames",
+	)
+}
+
+// parity_probe_drain_until_done stands in for the UI thread until the export
+// reaches a terminal state: render_start sized the live mailbox and the worker
+// publishes into it, so somebody has to drain it or the worker only ever hits
+// the DROP overflow policy. Same reason render_test_run drains.
+//
+// Its own proc so the readback buffer's lifetime is bounded here: the caller
+// os.exit's on the way out, which would leave a defer in that scope
+// unreachable, and a probe that leaks its scratch on the way to os.exit is a
+// probe that trains the reader to ignore the ownership rules.
+parity_probe_drain_until_done :: proc(buf: []u8) -> Parity_Probe_Drain {
+	d: Parity_Probe_Drain
+	d.pixels = len(buf) / 4
+	// Stand in for the UI thread's half of the handoff: render_live_publish
+	// refuses to publish until a consumer has drawn at least one frame (the
+	// `shown` flag, which gpu_draw.odin:2040 sets after its first draw). Without
+	// this the worker never publishes a single frame and every measurement below
+	// describes a mailbox nobody ever wrote to.
+	sync.atomic_store(&render_live.shown, true)
+	for render_is_busy() {
+		_, _, _, ok := render_live_drain(buf)
+		if ok {
+			// Only a delivered frame says anything about content. The old
+			// version read buf unconditionally after the loop, which reported
+			// the last FAILED drain -- an untouched buffer -- as "the export is
+			// black" on a file with pictures in it.
+			d.frames_drained += 1
+			n := parity_probe_frame_content(buf)
+			d.last_nonblack = n
+			if n > 0 {
+				d.frames_with_content += 1
+			}
+		}
+		time.sleep(20 * time.Millisecond)
+	}
+	poll_completed_thread()
+	// One last drain: the loop can exit on the same poll where the final frame
+	// was published, and that frame is the one worth seeing.
+	f, _, _, ok := render_live_drain(buf)
+	if ok {
+		d.frames_drained += 1
+		n := parity_probe_frame_content(buf)
+		d.last_nonblack = n
+		if n > 0 {
+			d.frames_with_content += 1
+		}
+		d.last_frame = f
+	}
+	return d
+}
+
+// parity_probe_export starts the real export and runs both invariant checks.
+// Returns the process exit code.
+parity_probe_export :: proc(out_path: string) -> int {
+	render_set_out_path(out_path)
+	render_start()
+	if render_status() != .Rendering {
+		fmt.println("[parity-probe] FAIL: render did not start:", render_status_text())
+		return 3
+	}
+	fmt.println(
+		"[parity-probe] job",
+		render_job.width,
+		"x",
+		render_job.height,
+		"frames",
+		render_job.nframes,
+		"[",
+		render_job.start,
+		",",
+		render_job.end,
+		"] videos",
+		len(render_job.videos),
+	)
+	for &v in render_job.videos {
+		keys := 0
+		for p in 0 ..< int(Render_Geom_Prop._COUNT) {
+			keys += v.kf_geom[p].n
+		}
+		fmt.println(
+			"[parity-probe] snapshot",
+			string(v.path),
+			"tstart",
+			v.timeline_start_frame,
+			"len",
+			v.source_length_frames,
+			"still",
+			v.is_still,
+			"stage",
+			v.fw,
+			"x",
+			v.fh,
+			"box",
+			v.ox,
+			",",
+			v.oy,
+			v.rw,
+			"x",
+			v.rh,
+			"keyed",
+			v.geom_keyed,
+			"scale_keyed",
+			v.scale_keyed,
+			"opacity_keyed",
+			v.opacity_keyed,
+			"stage_scale",
+			v.stage_scale,
+			"kf_keys",
+			keys,
+			"base_scale",
+			v.geom_base[int(Render_Geom_Prop.Scale)],
+			"base_opacity",
+			v.geom_base[int(Render_Geom_Prop.Opacity)],
+		)
+	}
+	grid := project_fps()
+	parity_probe_check_rate_resolver()
+	parity_probe_check_rate()
+	parity_probe_compare()
+	// Caller-owned readback: the drain proc used to allocate and return this,
+	// which handed back a buffer its own defer had already freed. The caller
+	// allocates so the free happens in a scope that can still reach it.
+	buf := make([]u8, int(render_live.w) * int(render_live.h) * 4)
+	defer delete(buf)
+	drain := parity_probe_drain_until_done(buf)
+	parity_probe_check_nonblack(drain)
+	if render_status() == .Done {
+		parity_probe_check_output_rate(out_path, grid)
+	}
+	fmt.println("[parity-probe] export status:", render_status_text())
+	fmt.println("[parity-probe] keyed frames:", render_keyed_frames)
+	fmt.println("[parity-probe] out:", out_path)
+	if render_status() != .Done {
+		return 3
+	}
+	if parity_probe_hard_fail {
+		return 3
+	}
+	return parity_probe_fail ? 1 : 0
+}
+
+// parity_probe_run checks a project file the user already has.
+parity_probe_run :: proc(in_path, out_path: string) {
+	if in_path == "" || out_path == "" {
+		fmt.println("parity-probe: need VYPER_PARITY_PROBE=\"<in.vyproj>|<out.mp4>\"")
+		parity_probe_exit(2)
+	}
+	if perr := project_file_open(in_path); perr != "" {
+		fmt.println("[parity-probe] FAIL:", perr)
+		parity_probe_exit(3)
+	}
+	parity_probe_dump_state()
+	parity_probe_exit(parity_probe_export(out_path))
+}
+
+// parity_probe_build_fixture constructs the project that used to break the rate
+// chain: a still imported FIRST, so it is the first video source, and a video at
+// a different rate imported second, so the grid rate comes from the video.
+//
+// The still is given a keyframe and pushed off frame 0 as well, so the pose
+// comparison runs over a clip whose keyframes sit at a non-zero offset -- the
+// shape that made the sampler-offset hypothesis worth testing in the first
+// place.
+parity_probe_build_fixture :: proc(still_c, clip_c: cstring, out_path: string) {
+	import_media(still_c)
+	import_media(clip_c)
+	if len(media_bin.assets) < 2 {
+		fmt.println("[parity-probe] FAIL: fixture imports did not produce two assets")
+		parity_probe_exit(3)
+	}
+	grid := project_fps()
+	// Precondition, asserted rather than assumed: the fixture only discriminates
+	// while the still's OWN reported rate differs from the grid. A future ffmpeg
+	// that made image streams report a sane rate would leave this fixture unable
+	// to catch the bug it exists to catch, and a gate that quietly stops testing
+	// anything is worse than no gate.
+	still_probe := probe_streams(still_c)
+	if still_probe.has_video && still_probe.video_fps_num > 0 {
+		src := f64(still_probe.video_fps_num) / f64(still_probe.video_fps_den)
+		fmt.println("[parity-probe] fixture: still reports", src, "fps, grid is", grid, "fps")
+		if math.abs(src - grid) < 0.001 {
+			parity_probe_hard_fail = true
+			fmt.println(
+				"[parity-probe] FAIL: the fixture no longer discriminates -- the still reports the grid rate, so a source-derived export rate would pass. Pick a fixture whose first source rate differs.",
+			)
+		}
+	} else {
+		parity_probe_hard_fail = true
+		fmt.println("[parity-probe] FAIL: the still probed as a non-video source; fixture is void")
+	}
+	// sync_track_order first: the edit loop below walks track_order, and an
+	// unsynced order is exactly the stale-global read the export path was just
+	// fixed for -- it silently iterated nothing.
+	sync_track_order()
+	// Push the video clip off frame 0 and key its scale, so the pose comparison
+	// covers a late-starting keyed clip rather than only frame-0 geometry.
+	for ti in timeline.track_order {
+		for &clip in timeline.tracks[ti].clips {
+			if clip.kind != .Video && clip.kind != .Image {
+				continue
+			}
+			if clip.is_still {
+				continue
+			}
+			clip.timeline_start_frame = 5
+			kf_set_key(&clip, "scale", 0, 1.0)
+			kf_set_key(&clip, "scale", 10, 0.5)
+		}
+	}
+	// Set the range so the job covers the keyed clip's whole span.
+	project.start_frame = -1
+	project.end_frame = -1
+	parity_probe_dump_state()
+	parity_probe_exit(parity_probe_export(out_path))
+}
+
+parity_probe_env :: proc() {
+	// The SDL control run, kept rather than removed: scripts/gate.sh
+	// parity_valgrind measures this and subtracts it, because SDL's video
+	// subsystem does not return all of its own memory on Init+Quit. Measured
+	// bare, with nothing of ours running: 120 bytes definitely lost in 2 blocks
+	// and 2,440 indirectly -- MORE than a full parity export leaks (72 / 535).
+	// So the export path's own contribution is zero and the remainder is SDL's,
+	// established by running the control rather than by deciding it looks like
+	// third-party noise. Disable with VYPER_PARITY_SDL_CONTROL=0.
+	if v, _ := os.lookup_env_alloc("VYPER_PARITY_SDL_CONTROL", context.temp_allocator); v == "1" {
+		if !sdl.Init(sdl.INIT_VIDEO) {
+			fmt.println("[parity-probe] SDL_Init(VIDEO) failed:", sdl.GetError())
+			parity_probe_exit(3)
+		}
+		sdl.Quit()
+		fmt.println("[parity-probe] control: SDL_Init(VIDEO) + SDL_Quit done")
+		parity_probe_exit(0)
+	}
+	if v, _ := os.lookup_env_alloc("VYPER_PARITY_FIXTURE", context.allocator); v != "" {
+		parts := strings.split(v, "|")
+		defer delete(parts)
+		if len(parts) < 3 {
+			fmt.println("parity-probe: need VYPER_PARITY_FIXTURE=\"<still>|<clip>|<out.mp4>\"")
+			parity_probe_exit(2)
+		}
+		// Text clips rasterize through font_state.data and this probe returns
+		// before main's load_font_data, so a fixture with a text clip would read
+		// out of bounds. Same reason render_test_run loads it.
+		if !load_font_data() {
+			fmt.println("[parity-probe] FAIL: could not load font data")
+			parity_probe_exit(3)
+		}
+		// The clones are freed by this proc's normal return; the fixture body
+		// cannot hold them itself, because it ends in os.exit and the compiler is
+		// right to call that defer unreachable.
+		still_c := strings.clone_to_cstring(parts[0])
+		clip_c := strings.clone_to_cstring(parts[1])
+		parity_probe_build_fixture(still_c, clip_c, parts[2])
+		delete(still_c)
+		delete(clip_c)
+		return
+	}
+	v, _ := os.lookup_env_alloc("VYPER_PARITY_PROBE", context.allocator)
+	if v == "" {
+		return
+	}
+	parts := strings.split(v, "|")
+	defer delete(parts)
+	res: [2]string
+	if len(parts) >= 2 {
+		res[0] = parts[0]
+		res[1] = parts[1]
+	}
+	if !load_font_data() {
+		fmt.println("[parity-probe] FAIL: could not load font data")
+		parity_probe_exit(3)
+	}
+	parity_probe_run(res[0], res[1])
+}

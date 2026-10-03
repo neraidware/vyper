@@ -1316,6 +1316,21 @@ Render_Job :: struct {
 	start:    i64,
 	end:      i64, // inclusive
 	nframes:  i64,
+	// fps is the PROJECT rate the frame grid is defined on (project_fps), and
+	// fps_num/fps_den its exact container form. Snapshotted here, on the UI
+	// thread, for the same reason the clip arrays are: the worker must not read
+	// the project globals to decide what a frame index means.
+	//
+	// The worker used to re-derive this from the first video source's own rate,
+	// which is a DIFFERENT question -- "what rate does this file have" -- and the
+	// two answers coincided only when the first source was the grid-defining
+	// one. A still image is the case that broke it: an image demuxer reports an
+	// arbitrary avg_frame_rate, so a project whose first video clip was a still
+	// exported at that image's rate instead of the timeline's, retiming every
+	// keyed value, position and clip boundary onto a different output frame.
+	fps:      f64,
+	fps_num:  c.int,
+	fps_den:  c.int,
 }
 render_job: Render_Job
 
@@ -2837,32 +2852,16 @@ render_worker_run :: proc() {
 		thread.start(render_pipe.decode)
 	}
 
-	// The output frame rate: an explicit project fps wins; otherwise it comes
-	// from the first video source so the timeline frame grid (which is the
-	// source's own frame indices) renders 1:1 with both the video and the 48 kHz
-	// audio bus.
-	rfps_num, rfps_den := c.int(60), c.int(1)
-	if project.frame_rate > 0 {
-		rfps_num, rfps_den = 0, 1
-	} else if len(render_job.videos) > 0 {
-		rfps_num = render_job.videos[0].dec.fps_num
-		rfps_den = render_job.videos[0].dec.fps_den
-		if rfps_num <= 0 || rfps_den <= 0 {
-			rfps_num, rfps_den = 60, 1
-		}
-	}
-	rfps := f64(rfps_num) / f64(rfps_den)
-	if project.frame_rate > 0 {
-		rfps = project.frame_rate
-		rfps_num, rfps_den = c.int(rfps), 1
-		if math.abs(rfps - 23.976) < 0.001 {
-			rfps_num, rfps_den = 24000, 1001
-		} else if math.abs(rfps - 29.97) < 0.001 {
-			rfps_num, rfps_den = 30000, 1001
-		} else if math.abs(rfps - 59.94) < 0.001 {
-			rfps_num, rfps_den = 60000, 1001
-		}
-	}
+	// The output frame rate is the PROJECT rate the frame grid is defined on,
+	// resolved once on the UI thread into the job snapshot (render_job.fps /
+	// fps_num / fps_den). The worker reads that snapshot rather than
+	// re-deriving a rate of its own, so the muxer's time base, the audio
+	// samples-per-frame and the playhead all measure frames against one value:
+	// the timeline grid is 1 frame == 1 source frame, and any second opinion
+	// about the rate retimes the export against the preview it is supposed to
+	// match.
+	rfps_num, rfps_den := render_job.fps_num, render_job.fps_den
+	rfps := render_job.fps
 	spf := int(MAX_AUDIO_FRAME_SAMPLES)
 	if rfps > 0 {
 		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(0, int(math.round(48000.0 / rfps))))
@@ -4007,6 +4006,15 @@ render_start :: proc() {
 	for ti in timeline.track_order {
 		n_clips += len(timeline.tracks[ti].clips)
 	}
+
+	// The frame rate is resolved ONCE, here, before anything snapshots it: the
+	// subtitle clips built by the walk below copy it into their own struct, and
+	// the worker reads it back off the job. Resolving it further down would
+	// leave that snapshot reading a zero it never asked for -- the same
+	// second-fallback-chain hazard as the worker deriving its own, one step
+	// closer to home.
+	render_job.fps = project_fps()
+	render_job.fps_num, render_job.fps_den = fps_rational(render_job.fps)
 	reserve(&cls, n_clips)
 	reserve(&txts, n_clips)
 	for w := 0; w < len(timeline.track_order); w += 1 {
@@ -4066,7 +4074,7 @@ render_start :: proc() {
 						&subs,
 						Render_Sub_Src {
 							srt_id = clip.srt_id,
-							fps = f32(timeline_fps()),
+							fps = f32(render_job.fps),
 							timeline_start_frame = clip.timeline_start_frame,
 							source_start_frame = clip.source_start_frame,
 							source_length_frames = clip.source_length_frames,
@@ -4103,7 +4111,7 @@ render_start :: proc() {
 						&subs,
 						Render_Sub_Src {
 							srt_id = clip.srt_id,
-							fps = f32(timeline_fps()),
+							fps = f32(render_job.fps),
 							timeline_start_frame = clip.timeline_start_frame,
 							source_start_frame = clip.source_start_frame,
 							source_length_frames = clip.source_length_frames,

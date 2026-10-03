@@ -3,6 +3,7 @@ package main
 import clay "clay-odin"
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:strings"
 import sdl "vendor:sdl3"
 
@@ -89,22 +90,78 @@ SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.001)
 TIMELINE_MAX_ZOOM :: f32(16)
 
-// timeline_fps returns the timeline's frame rate (the source video's native
-// rate, set at import, unless the project fps has been set explicitly). The
-// timeline grid is 1 frame == 1 source frame, so the playhead and the render
-// canvas must tick at this rate for 1:1 audio/video.
-// Falls back to 60 as a safe default before any media is open.
+// project_rate_ok rejects a rate that cannot define a frame grid: zero,
+// negative, NaN, or infinite. This is a value that ARRIVES broken, not an
+// invariant -- project.frame_rate is loaded from a project file and
+// timeline.frame_rate is computed from ffprobe's video_fps_den, which is 0 for
+// some containers -- so the correct response is to fall through to the next
+// source, never to assert and never to propagate the garbage into the muxer's
+// time base, where it would surface as a silently wrong export duration.
+project_rate_ok :: proc(fps: f64) -> bool {
+	return fps > 0 && !math.is_nan(fps) && !math.is_inf(fps)
+}
+
+// project_fps is the rate the FRAME GRID is defined on: the explicit project
+// rate when the user set one, else the rate the first imported non-still video
+// established (media.odin sets timeline.frame_rate and skips stills, whose
+// ffprobe rate is an artifact of the image demuxer), else 60 before any media
+// is open.
+//
+// Every consumer that measures a frame count against a wall clock reads this,
+// including the export: the timeline grid is 1 frame == 1 source frame, so the
+// playhead, clip lengths and the render output must all tick at the same rate
+// or the same frame index denotes a different moment in each. Deriving the
+// export rate from a source's OWN rate instead (the old behavior) put a second,
+// independent fallback chain next to this one, and the two disagreed whenever
+// the first video source was not the grid-defining one -- a still image, whose
+// rate is an artifact, retimed a whole export.
+project_fps :: proc() -> f64 {
+	if project_rate_ok(project.frame_rate) {
+		return project.frame_rate
+	}
+	if project_rate_ok(timeline.frame_rate) {
+		return timeline.frame_rate
+	}
+	return 60
+}
+
+// FPS_NTSC_TOLERANCE is how far a rate may sit from an NTSC rate and still be
+// treated as it. 23.976 stored as a f64 is 23.976023976..., so the comparison
+// has to be a tolerance rather than an equality; 1e-3 is far tighter than any
+// two rates a user can actually pick apart.
+FPS_NTSC_TOLERANCE :: f64(1e-3)
+
+// fps_rational maps a frame rate to the exact num/den the container time base
+// needs. NTSC rates (23.976 / 29.97 / 59.94) keep their 1001 denominator:
+// rounding 23.976 to num=24,den=1 makes the export 0.1% long, which is one
+// dropped frame every ~40 seconds of output.
+//
+// The input is project_fps(), which guarantees a finite positive rate, so a
+// non-positive one here would be an invariant violation rather than bad data.
+fps_rational :: proc(fps: f64) -> (num, den: c.int) {
+	assert(fps > 0, fmt.tprintf("fps_rational: non-positive rate %f", fps))
+	if math.abs(fps - 23.976) < FPS_NTSC_TOLERANCE {
+		return 24000, 1001
+	}
+	if math.abs(fps - 29.97) < FPS_NTSC_TOLERANCE {
+		return 30000, 1001
+	}
+	if math.abs(fps - 59.94) < FPS_NTSC_TOLERANCE {
+		return 60000, 1001
+	}
+	return c.int(math.round(fps)), 1
+}
+
+// timeline_fps is project_fps with the DIAG playback override in front of it.
+// Only the PLAYBACK cadence may be overridden (VYPER_PLAYBACK_FPS exists to
+// isolate wall-clock jitter from the audible rate); anything that defines what
+// a frame index means -- durations, clip lengths, the export -- reads
+// project_fps, so a diagnostic can never change the shipped output.
 timeline_fps :: proc() -> f64 {
 	if playback.magic_fps > 0 {
 		return playback.magic_fps
 	}
-	if project.frame_rate > 0 {
-		return project.frame_rate
-	}
-	if timeline.frame_rate > 0 {
-		return timeline.frame_rate
-	}
-	return 60
+	return project_fps()
 }
 
 // DIAG (temporary): magic playback-clock overrides to isolate whether the

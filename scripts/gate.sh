@@ -914,6 +914,203 @@ target_proxy_probe() {
 	}
 }
 
+# Preview/export parity (parity_probe.odin).
+#
+# The export used to take its frame rate from the FIRST VIDEO SOURCE rather than
+# from the rate the frame grid is defined on. The two coincide only when that
+# source is the grid-defining one, so a project whose first video clip was a
+# still exported at the image demuxer's arbitrary rate (25/1 for a PNG here)
+# while the timeline played at 12 -- one number retiming every keyed value,
+# position and clip length, and a file whose duration did not match the preview
+# by a factor of 2.08. Nothing caught it: the export path had no test that
+# compared a rate against anything.
+#
+# The fixture is built to collide by construction -- a still imported FIRST so it
+# is videos[0], then a 30 fps clip so the grid rate comes from the video. The
+# probe asserts the precondition (the still's own reported rate must still
+# differ from the grid's) rather than assuming it, because a future ffmpeg that
+# made image streams report a sane rate would leave this gate unable to detect
+# the bug and passing it would mean nothing.
+#
+# Verified to fail on the pre-fix chain: exit 1, "is muxed at 25/1 but the frame
+# grid is 30". Also covers the rate resolver's own table -- the NTSC rationals
+# and the seven invalid inputs that must be rejected -- which no end-to-end path
+# can reach.
+PARITY_DIR=target/parity
+
+# The fixture media target_parity synthesizes, factored out because the valgrind
+# twin needs the same two files and must not re-derive them (an ffmpeg build
+# under valgrind would measure ffmpeg).
+parity_fixture() {
+	mkdir -p "$PARITY_DIR"
+	# A PNG, because a still is the source whose reported rate is an artifact of
+	# the image demuxer rather than of anything the user chose. Regenerated only
+	# when absent, like the other fixtures: both are deterministic.
+	if [ ! -s "$PARITY_DIR/still.png" ]; then
+		if ! dev ffmpeg -y -f lavfi -i "color=c=red:s=320x240" \
+			-frames:v 1 "$PARITY_DIR/still.png" >/dev/null 2>&1
+		then
+			echo "parity: could not synthesize the still" >&2
+			return 1
+		fi
+	fi
+	if [ ! -s "$PARITY_DIR/clip.webm" ]; then
+		if ! dev ffmpeg -y -f lavfi -i \
+			"testsrc=s=320x240:rate=30:duration=2" \
+			-c:v libvpx -an "$PARITY_DIR/clip.webm" >/dev/null 2>&1
+		then
+			echo "parity: could not synthesize the 30 fps clip" >&2
+			return 1
+		fi
+	fi
+}
+
+target_parity() {
+	require_fresh_binary parity || return 1
+	parity_fixture || return 1
+
+	local log="$PARITY_DIR/parity.log"
+	VYPER_PARITY_FIXTURE="$PARITY_DIR/still.png|$PARITY_DIR/clip.webm|$PARITY_DIR/out.mp4" \
+		timeout 600 ./vyper >"$log" 2>&1
+	local rc=$?
+	grep -E '^\[parity-probe\]' "$log" || true
+	if [ $rc -ne 0 ]; then
+		echo "parity: FAILED (exit $rc) -- full log in $log" >&2
+		return 1
+	fi
+	# The probe exits 0/1 on its own contract, but what it measured is a
+	# container, so assert the file independently: it fails differently than the
+	# probe does if the probe itself ever stops checking.
+	local got
+	got=$(dev ffprobe -v error -select_streams v:0 -show_entries \
+		stream=r_frame_rate -of csv=p=0 "$PARITY_DIR/out.mp4")
+	if [ "$got" != "30/1" ]; then
+		echo "parity: $PARITY_DIR/out.mp4 is $got, expected 30/1" >&2
+		return 1
+	fi
+	echo "parity: OK (export muxed at $got, matching the 30 fps grid)"
+}
+
+# The memory gate for the parity probe. The probe is the one path that builds a
+# timeline from nothing and then runs a real export inside the same process, so
+# it is exactly the shape that orphans a buffer the shipped code never touches:
+# the imports populate the session heap, the walk allocates per-clip snapshots,
+# and the drain loop owns a readback buffer whose lifetime had to be moved into
+# the caller to stop a use-after-free. Same four invariants as target_valgrind,
+# plus the probe's own success line as the non-vacuity marker -- a run that died
+# early would lose nothing and pass vacuously.
+# parity_valgrind: what this target asserts, and the one number it tolerates.
+#
+# History, because the first version of this comment was wrong in a way the
+# measurement contradicted. The claim was that the memory gate found a shipped
+# leak -- the GPU resampler singleton the export worker creates had no
+# success-path teardown. The teardown gap is real (create() releases everything
+# again on each of its four FAILURE returns; nothing released it after a
+# completed export) and gpu_resample_release now exists, because SDL requires
+# GPU objects released before the video subsystem goes down. But deleting that
+# call changes the leak totals by ZERO bytes. It was not what the number was
+# measuring, and a comment claiming otherwise would be the same lie in reverse:
+# naming a fix for a leak the fix does not close.
+#
+# What the number WAS measuring was the probe's own exit. The export worker calls
+# sdl.Init(VIDEO); the probe ended in os.exit, which skips main's
+# `defer sdl.Quit()`, so 471 bytes were definitely lost before the exit was given
+# a teardown. The real app already pairs Init with Quit -- this was a probe-exit
+# bug, not a shipped one.
+#
+# So the target asserts three things that are ours, plus one named bound:
+#   - no invalid free/read/write (this is what caught the probe's own
+#     use-after-free while it was being written);
+#   - non-vacuity: a probe that died early would satisfy every bound for free;
+#   - the SDL Init+Quit control is 0/0, proving the exit's teardown is complete
+#     on the calling thread -- a leak there is ours and unconditional;
+#   - the probe's definitely-lost stays inside the residue below, so a new leak
+#     of any size still fails the gate.
+#
+# The residue is 72 bytes in 1 block from the sdl.Init(VIDEO) at
+# render_gpu.odin:142, which the export WORKER THREAD issues; SDL's per-thread
+# video state is orphaned when that thread exits and no later release call can
+# reach it. One block per process, not per export. The control is run here
+# rather than quoted from a comment: an earlier "SDL alone leaks 120 bytes"
+# baseline was measured against a stale binary that never ran the control at
+# all, which is precisely how a wrong baseline gets believed.
+PARITY_SDL_WORKER_TLS_BYTES=72 # measured; see above
+PARITY_SDL_WORKER_TLS_SLACK=64 # headroom for SDL version drift
+
+# Echo "<definitely_lost_bytes> <indirectly_lost_bytes>" from a valgrind log.
+valgrind_lost_bytes() {
+	local log=$1
+	local direct indirect
+	direct=$(grep -oE 'definitely lost: [0-9,]+ bytes' "$log" | tail -1 | grep -oE '[0-9,]+' | tr -d ,)
+	indirect=$(grep -oE 'indirectly lost: [0-9,]+ bytes' "$log" | tail -1 | grep -oE '[0-9,]+' | tr -d ,)
+	echo "${direct:-0} ${indirect:-0}"
+}
+
+target_parity_valgrind() {
+	require_fresh_valgrind_binary parity-valgrind || return 1
+	parity_fixture || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/parity.log
+	local ctl=target/valgrind/parity_sdl_control.log
+
+	VYPER_PARITY_SDL_CONTROL=1 timeout 300 valgrind --leak-check=full \
+		--error-exitcode=99 "$VALGRIND_BIN" >"$ctl" 2>&1
+	local ctl_rc=$?
+	echo "parity-valgrind: SDL control exit=$ctl_rc (expected 99)"
+	grep -q '\[parity-probe\] control: SDL_Init' "$ctl" || {
+		echo "parity-valgrind: SDL control never ran -- baseline unknown" >&2
+		return 1
+	}
+
+	VYPER_PARITY_FIXTURE="$PARITY_DIR/still.png|$PARITY_DIR/clip.webm|$PARITY_DIR/out_valgrind.mp4" \
+		timeout 900 valgrind --leak-check=full \
+		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	local rc=$?
+	echo "parity-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+
+	# Same non-vacuity rule as valgrind_assert: a probe that died before doing any
+	# work would satisfy every leak bound below for free.
+	if ! grep -q 'output file reports' "$log"; then
+		echo "parity-valgrind: probe never reported success -- vacuous pass" >&2
+		tail -20 "$log" >&2
+		return 1
+	fi
+	if grep -q "Unrecognised instruction" "$log"; then
+		echo "parity-valgrind: memcheck died on an instruction VEX cannot decode -- vacuous pass" >&2
+		return 1
+	fi
+	# An invalid access is never SDL's business, and this is the invariant that
+	# caught the probe's own use-after-free while it was being written.
+	if grep -qE "Invalid (free|read|write)" "$log"; then
+		echo "parity-valgrind: invalid free/read/write" >&2
+		grep -B2 -A8 -E "Invalid (free|read|write)" "$log" | head -40 >&2
+		return 1
+	fi
+
+	local got ctl_bytes
+	got=$(valgrind_lost_bytes "$log")
+	ctl_bytes=$(valgrind_lost_bytes "$ctl")
+	echo "parity-valgrind: probe lost/indirectly $(echo "$got" | tr ' ' '/') bytes; SDL Init+Quit control $(echo "$ctl_bytes" | tr ' ' '/') bytes; worker-thread residue allowance $((PARITY_SDL_WORKER_TLS_BYTES + PARITY_SDL_WORKER_TLS_SLACK))"
+
+	local d i cd ci failed=0
+	d=$(echo "$got" | cut -d' ' -f1)
+	i=$(echo "$got" | cut -d' ' -f2)
+	cd_=$(echo "$ctl_bytes" | cut -d' ' -f1)
+	ci=$(echo "$ctl_bytes" | cut -d' ' -f2)
+	# The control must be clean. It runs Init+Quit and the GPU release on the
+	# calling thread, so a leak here is ours and unconditional.
+	if [ "$cd_" != "0" ] || [ "$ci" != "0" ]; then
+		echo "parity-valgrind: SDL control leaked $cd_/$ci bytes -- the release pairing on the calling thread is incomplete" >&2
+		failed=1
+	fi
+	if [ "$d" -gt $((PARITY_SDL_WORKER_TLS_BYTES + PARITY_SDL_WORKER_TLS_SLACK)) ]; then
+		echo "parity-valgrind: $d bytes definitely lost, allowance $((PARITY_SDL_WORKER_TLS_BYTES + PARITY_SDL_WORKER_TLS_SLACK)) -- more than the worker-thread SDL residue, so something of ours leaked" >&2
+		failed=1
+	fi
+	[ $failed -ne 0 ] && return 1
+	echo "parity-valgrind: ok (no invalid access; SDL control clean; definitely-lost within the worker-thread residue; full log: $log)"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -921,7 +1118,7 @@ target_all() {
 	# teardown call at all, and the decoder never freed its destination image),
 	# so it is now a member: the leaks it exists to catch were all reachable
 	# from the export path, which no other target in this list executes.
-	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe dnd_probe parity yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -942,7 +1139,9 @@ main() {
 	undo_valgrind) target_undo_valgrind ;;
 	timeline_probe) target_timeline_probe ;;
 	dnd_probe) target_dnd_probe ;;
+	parity) target_parity ;;
 	dnd_valgrind) target_dnd_valgrind ;;
+	parity_valgrind) target_parity_valgrind ;;
 	yuv_exact) target_yuv_exact ;;
 	gpu_nv12) target_gpu_nv12 ;;
 	gpu_composite) target_gpu_composite ;;
@@ -959,7 +1158,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

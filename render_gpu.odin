@@ -928,6 +928,30 @@ gpu_composite_end_nv12 :: proc(c: ^GPU_Composite, dst: []u8) -> bool {
 	return true
 }
 
+// gpu_resample_release tears down the lazily-created singleton, which had no
+// success-path teardown at all: create() releases everything again on each of
+// its four FAILURE returns, and nothing released it after a completed export.
+// `ready` goes back to false so a later frame rebuilds rather than handing out a
+// destroyed device -- the same make-the-zero-value-useful rule the rest of the
+// tree follows.
+//
+// It is here for SDL's ORDERING rule (GPU objects must be released before the
+// video subsystem goes down), not because it closes a leak. Measured: deleting
+// this call moves parity_valgrind's totals by zero bytes, since SDL_Quit reclaims
+// the device anyway. Stated here so nobody later reads the teardown as
+// leak-fixed, and so the four failure paths and this one stop disagreeing about
+// who releases the singleton.
+//
+// A caller that exits the process must call it itself: main's `defer sdl.Quit()`
+// cannot run behind an os.exit.
+gpu_resample_release :: proc() {
+	if !gpu_resample_ready && gpu_resample_singleton.device == nil {
+		return
+	}
+	gpu_resample_destroy(&gpu_resample_singleton)
+	gpu_resample_ready = false
+}
+
 gpu_resample_destroy :: proc(g: ^GPU_Resample) {
 	if g == nil {
 		return
