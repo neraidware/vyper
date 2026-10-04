@@ -33,17 +33,9 @@ draw_timeline_ruler :: proc(
 	// Everything this proc paints (ticks, labels, the playhead line, its grab
 	// handle) lives horizontally inside the ruler bar; clamp it there so the
 	// playhead handle can't render over the track-name gutter or off the right
-	// edge. Vertically the scissor spans the whole window since the playhead
-	// line runs down through every track row.
-	sdl.SetGPUScissor(
-		pass,
-		sdl.Rect {
-			c.int(ruler.x),
-			c.int(ruler.y - 8),
-			c.int(ruler.width),
-			c.int(renderer.viewport.y),
-		},
-	)
+	// edge. Vertically the band runs from just above the ruler down to the
+	// window's bottom edge, since the playhead line runs through every track row.
+	scissor_to_bottom(renderer, pass, ruler.x, ruler.y - 8, ruler.width)
 	defer sdl.SetGPUScissor(
 		pass,
 		sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
@@ -150,10 +142,7 @@ draw_render_range :: proc(
 	}
 	// The band and its edge caps can stick out over the gutter when the range
 	// starts before the current view; keep them inside the ruler bar's width.
-	sdl.SetGPUScissor(
-		pass,
-		sdl.Rect{c.int(ruler.x), 0, c.int(ruler.width), c.int(renderer.viewport.y)},
-	)
+	scissor_to_bottom(renderer, pass, ruler.x, 0, ruler.width)
 	defer sdl.SetGPUScissor(
 		pass,
 		sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},
@@ -465,6 +454,33 @@ marker_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
 		return {}
 	}
 	return box_intersect(span, tracks_scroll_box())
+}
+
+// scissor_to_bottom sets a scissor to the vertical band starting at `top` and
+// running to the window's bottom edge, `width` wide from `x`.
+//
+// The height is the window height LEFT OVER below `top`, not the window height
+// itself. SDL rejects a scissor whose y+h exceeds the render target
+// (SDL_SetGPUScissor_REAL, SDL_gpu.c:1982) and logs an assertion for it, so
+// naming the band by its bottom edge is the only way to write it correctly: a
+// full-height rect at a non-zero y overshoots by exactly `top`. Every band that
+// starts below the window's top edge -- the ruler's playhead column, the render
+// range, the marker tooltip -- goes through here rather than spelling the
+// subtraction out at each site.
+scissor_to_bottom :: proc(
+	renderer: ^GPU_Renderer,
+	pass: ^sdl.GPURenderPass,
+	x, top, width: f32,
+) {
+	sdl.SetGPUScissor(
+		pass,
+		sdl.Rect {
+			c.int(x),
+			c.int(top),
+			c.int(width),
+			c.int(renderer.viewport.y - top),
+		},
+	)
 }
 
 // scissor_intersect clips a Clay command's bounds to the active scissor rect.
@@ -1059,15 +1075,7 @@ draw_marker_tooltip :: proc(
 	// pill to the clip-lane region so it can't drift over the headers.
 	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
 	if ruler.width > 0 {
-		sdl.SetGPUScissor(
-			pass,
-			sdl.Rect {
-				c.int(ruler.x),
-				c.int(ruler.y - 8),
-				c.int(ruler.width),
-				c.int(renderer.viewport.y),
-			},
-		)
+		scissor_to_bottom(renderer, pass, ruler.x, ruler.y - 8, ruler.width)
 		defer sdl.SetGPUScissor(
 			pass,
 			sdl.Rect{0, 0, c.int(renderer.viewport.x), c.int(renderer.viewport.y)},

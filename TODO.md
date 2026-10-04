@@ -4628,3 +4628,50 @@ Session ranges reset only after timeline and undo holders are released.
 **Not claimed.** `Clip` remains mutable. Name changes intern a new immutable
 string handle; marker and key edits resolve their respective COW ranges before
 writing.
+---
+
+## Active 20 — A scissor that ran past the render target asserted every frame
+
+**Why:** SDL logged `Assertion failure at SDL_SetGPUScissor_REAL
+(SDL_gpu.c:1984), triggered N times: '!"Scissor rectangle size exceeds current
+render target dimensions"'` — once per frame from the moment the timeline had a
+track in it. Only visible on a project with tracks, which is why it read as an
+import bug: the first track appears when media is dropped on the timeline, so
+`vyper <file>.mp4` reproduced it on the frame after the decode.
+
+The check is `((Uint32)(scissor->y + scissor->h) > max_viewport_height)`, where
+in debug mode `max_viewport_height` is the swapchain texture's height
+(`BeginGPURenderPass` mins it over the color targets) — which is exactly what
+`WaitAndAcquireGPUSwapchainTexture` reports as `pixel_height`, which is what
+`renderer.viewport.y` holds (frame.odin). So the bound is the window, and
+`renderer.viewport.y` is a legal height ONLY at y == 0.
+
+Three sites wrote `{x, ruler.y - 8, ruler.width, renderer.viewport.y}`: the
+playhead column and marker tooltip in `draw_timeline_ruler` /
+`draw_marker_tooltip`, plus `draw_render_range`'s band. The comments said the
+scissor "spans the whole window", which is the intent — but the window was
+written into the HEIGHT field at a non-zero y, so the rect overshot the target
+by exactly `ruler.y - 8`. Measured in a 951x1028 window: `y=820, h=1028`,
+`y+h = 1848` against a 1028-tall target. `draw_render_range` was the one that
+survived, purely because its y is 0.
+
+Steps:
+- [x] S1. Characterization first: wrap all 29 `SetGPUScissor` calls to print any
+      rect exceeding `gpu_renderer.viewport` (deduped on the in-bounds
+      transition, so it names the shape once). Reproduced with
+      `./vyper /home/andrei/Videos/Recordings/2026-10-02/2026-10-02_12-40.mp4`
+      — 19 assertions in 12s, one offending rect, x/w in bounds and only h
+      over. That isolated it to the bottom-banded scissors without guessing.
+- [x] S2. `scissor_to_bottom(renderer, pass, x, top, width)` names the band by
+      its BOTTOM edge and derives the height (`viewport.y - top`), and the three
+      call sites go through it. Both truncations round toward zero, so
+      `c.int(top) + c.int(viewport.y - top) <= pixel_height` holds for a
+      negative `top` too — no clamp, no guard, nothing to keep in sync at the
+      sites. The rest of the scissors are safe by construction and were left
+      alone: element boxes and `box_intersect` results live inside the window,
+      and `render_clay`'s are intersected with the full-window baseline.
+
+**Probe / mutation.** `./vyper <the mp4>` for 25s: 0 assertions (was 19 in 12s).
+Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
+
+**Accept.** `check build probe` pass.
