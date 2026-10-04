@@ -4409,7 +4409,7 @@ for a bug that was not found is noise.
 
 ## Active 19 — `Clip` as POD: session pools for names, labels, keyframe keys
 
-**Status: S0, S1 and S2a landed.** S2b (the key array store) is next. Numbered 19 rather than
+**Status: S0, S1 and S2a landed; S2b's store is landed and the 205 call sites are next.** Numbered 19 rather than
 16 because main took 16 (export rate), 17 (audio rate) and 18 (forward jump)
 while this plan sat on its own branch.
 
@@ -4522,11 +4522,57 @@ must load byte-identically after this work.
       equality is only faster for a caller that ALREADY holds a handle, and no
       such caller exists yet — `Kf_Snap.name` is the one place a lane name
       crosses into a still-owned heap string, and it keeps its clone.
-- [ ] S2b. Keyframe keys into the session arena: `Kf_Track.keys` becomes
-      `(off, len)` into one `[dynamic]Keyframe` store per session. This is the
-      risky step — it lands right after the Active 14 split/trim/undo work, which
-      is the code most likely to regress — so it goes in alone, behind the
-      existing `keyframe_probe`, and ~200 `.keys` sites move.
+- [~] S2b. Keyframe keys into the session arena, going straight to the COW end
+      state (chosen over landing a deep-copy step first), so a Clip copy becomes
+      `^` and S3 is just deleting the copy procs. ~205 `.keys` sites move.
+
+      **The store landed first, alone and mutation-proven.** `session_kf.odin`
+      + `session_kf_probe.odin` (`scripts/gate.sh session_kf_probe`, wired into
+      `all`): a flat `[dynamic]Keyframe`, a `Kf_Keys_Range{first, slots, n,
+      shared}` handle, first-fit allocation, a sorted free list with coalescing,
+      doubling growth, and `session_kf_push`/`erase`/`set` as the insert and
+      remove primitives that replace `append(&track.keys, …)`. No call site uses
+      it yet. `session_kf_reset` is already called from `session_teardown`, so
+      the reset invariant is in place before any key goes in.
+
+      **It is an allocator, not a bump pointer, and the probe is why.** Two
+      caller facts forced it. Keys are inserted one at a time (auto-key on a
+      drag), so without capacity slack every insert would reallocate and copy —
+      O(n) on a per-edit-frame path; `slots` >= `n` with doubling makes it
+      amortized. And keys are deleted constantly (ripple edits), so a bump
+      pointer would burn a range per delete and pass the bound within an hour of
+      editing; freed spans are reused and adjacent ones coalesce. The first draft
+      of the probe reused the SAME range 500 times, which passed with coalescing
+      deleted — a test that cannot fail is not a test, so it now frees two
+      ADJACENT ranges and requires them merged. Mutations all caught: drop the
+      in-place growth path, drop coalescing, make `session_kf_make_unique` a
+      no-op.
+
+      **Growth has TWO arms, and the probe pins both.** A range at the tail of
+      the store has no free span after it to eat, so it RELOCATES; a range with a
+      free span following extends IN PLACE, keeping its address and leaving
+      borrowed views valid. The first version of the probe asserted in-place
+      growth for a tail range and failed — the assertion was wrong, not the
+      allocator. So: relocation is counted (`session_kf_moves`) and the probe
+      bounds it at log2(N) for N inserts, which is the property that actually
+      keeps inserts cheap.
+
+      **Why keys get a relocatable store when strings got a fixed block.** The
+      census: 205 `.keys` sites, but only TWELVE ever take a keys slice, and each
+      is consumed by the very next expression (`kf_sample_keys(tk.keys[:], …)`,
+      `kf_fill_snapshot(clip, name, dst[:])`). The thread hop already copies into
+      a caller-owned fixed array — `Audio_Gain_Snapshot.keys` is
+      `[GAIN_KF_MAX_KEYS]Keyframe`, built UI-side, and render does
+      `kf_geom_fill_snapshot(clip, …, slot.keys[:])` — so NO borrowed view of live
+      keys reaches a worker. Strings are the opposite case: their views are
+      long-lived and captured all over the tree, which is why that pool is fixed.
+      So keys can move, and for keys reuse matters more than stability. The rule
+      is written into `session_kf_view`: valid until the next alloc, free or
+      relocating grow, and never store it.
+
+      **Still to do:** point the 205 sites at the store, then pool
+      `Clip.keyframe_tracks` itself with the same COW rule (two-level: a track
+      write must make the track unique BEFORE its keys are unique).
 
       **Carry S1's lesson in:** a `[dynamic]Keyframe` store is safe to reallocate
       ONLY because a track's handle is an INDEX, not a pointer into it. Do not

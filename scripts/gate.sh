@@ -606,6 +606,20 @@ target_session_str_probe() {
 	VYPER_SESSION_STR_PROBE=1 timeout 120 ./vyper
 }
 
+# The session keyframe store check (session_kf_probe.odin). Clip keyframe keys
+# move out of per-track owned arrays into one session-owned store addressed by
+# range, with a copy-on-write bit so a Clip copy can be a struct copy
+# (TODO.md Active 19). Unlike the string pool this store RELOCATES a range when
+# it cannot grow in place, so the probe is about what movement breaks: in-place
+# growth across many inserts, sharing resolved on write and only on write,
+# freeing actually reusing space (the reason it is an allocator and not a bump
+# pointer), one relocation copying keys intact, and a reset leaving every handle
+# out of bounds. Exits 0/1.
+target_session_kf_probe() {
+	require_fresh_binary session-kf-probe || return 1
+	VYPER_SESSION_KF_PROBE=1 timeout 120 ./vyper
+}
+
 # The OS file-drag-and-drop probe (dnd_probe.odin). Dragging a file in from the
 # desktop used to do NOTHING at all: the app polled SDL events and handled six
 # of them, none of them the five drop kinds, so the feature was absent on every
@@ -1223,7 +1237,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe session_str_probe dnd_probe parity audio_rate audio_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe session_str_probe session_kf_probe dnd_probe parity audio_rate audio_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1246,6 +1260,7 @@ main() {
 	undo_valgrind) target_undo_valgrind ;;
 	timeline_probe) target_timeline_probe ;;
 	session_str_probe) target_session_str_probe ;;
+	session_kf_probe) target_session_kf_probe ;;
 	dnd_probe) target_dnd_probe ;;
 	parity) target_parity ;;
 	audio_rate) target_audio_rate ;;
@@ -1267,7 +1282,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

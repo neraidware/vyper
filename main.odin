@@ -1799,6 +1799,10 @@ if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); ps
 		session_str_probe_run()
 		return
 	}
+	if skp, _ := os.lookup_env_alloc("VYPER_SESSION_KF_PROBE", context.temp_allocator); skp != "" {
+		session_kf_probe_run()
+		return
+	}
 	if drp, _ := os.lookup_env_alloc("VYPER_DRAG_PROBE", context.temp_allocator); drp != "" {
 		drag_probe_run(drp)
 		return
