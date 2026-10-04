@@ -107,8 +107,8 @@ render_kf_probe_run :: proc() -> int {
 	clipC := Clip{}
 	kf_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
 	kf_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-	clipC.keyframe_tracks[0].keys[0].interp = .Ease_Out
-	clipC.keyframe_tracks[0].keys[1].interp = .Ease_In
+	kf_key_mut(&clipC, 0, 0).interp = .Ease_Out
+	kf_key_mut(&clipC, 0, 1).interp = .Ease_In
 	geomC: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		p := Render_Geom_Prop(pi)
@@ -136,10 +136,10 @@ render_kf_probe_run :: proc() -> int {
 	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 11, 100)
 	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 21, 250)
 	kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 31, 350)
-	dtk := &clipD.keyframe_tracks[0]
-	dtk.keys[1].interp = .Cubic
-	dtk.keys[2].interp = .Cubic
-	dtk.keys[3].interp = .Cubic
+	dtk := session_trk_view_mut(&clipD.keyframe_tracks, 0)
+	kf_key_mut(&clipD, 0, 1).interp = .Cubic
+	kf_key_mut(&clipD, 0, 2).interp = .Cubic
+	kf_key_mut(&clipD, 0, 3).interp = .Cubic
 	geomD: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		p := Render_Geom_Prop(pi)
@@ -158,7 +158,7 @@ render_kf_probe_run :: proc() -> int {
 	clipE1 := Clip{}
 	kf_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
 	kf_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-	clipE1.keyframe_tracks[0].keys[1].interp = .Ease_In
+	kf_key_mut(&clipE1, 0, 1).interp = .Ease_In
 	pe1, _ := kf_geom_sample_lane(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 	render_kf_probe_check_near(pe1, 12.5, 0.001, "E1 preview scalar eased")
 
@@ -169,7 +169,7 @@ render_kf_probe_run :: proc() -> int {
 	lanesH[0] = 100
 	kf_geom_set_packed(&clipE2, "transform", 1, lanesL, 1)
 	kf_geom_set_packed(&clipE2, "transform", 21, lanesH, 1)
-	clipE2.keyframe_tracks[0].keys[1].interp = .Ease_In
+	kf_key_mut(&clipE2, 0, 1).interp = .Ease_In
 	pe2, _ := kf_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 	render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview packed lane eased")
 

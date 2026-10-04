@@ -249,9 +249,10 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 kf_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 	n := 0
 	for &c in track.clips {
-		for &t in c.keyframe_tracks {
+		for i in 0..<c.keyframe_tracks.n {
+			t := session_trk_view(c.keyframe_tracks,i)
 			dup := false
-			lane := kf_track_name(&t)
+			lane := kf_track_name(t)
 			for i in 0 ..< n {
 				if out[i] == lane {
 					dup = true
@@ -1029,7 +1030,7 @@ keyframe_readout :: proc() {
 	}
 	name_buf := ui_text.kf_name[:]
 	clay.Text(
-		fmt.bprintf(name_buf[:], "%s", cl.keyframe_tracks[lane].name),
+		fmt.bprintf(name_buf[:], "%s", kf_track_name(session_trk_view(cl.keyframe_tracks,lane))),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
 	)
 	frame_buf := ui_text.kf_frame[:]
@@ -3176,7 +3177,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 								// the diamond overlay (draw_keyframes) paints into and
 								// give the interaction slice click targets; a hairline
 								// on each lane's top makes the stack read as a strip.
-								kf_n := len(timeline_clip.keyframe_tracks)
+								kf_n := timeline_clip.keyframe_tracks.n
 								if clay.UI(
 									clay.ID(
 										"TimelineClipWrap",

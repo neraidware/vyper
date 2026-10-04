@@ -929,21 +929,36 @@ kf_clip_at :: proc(track_idx, clip_index: int) -> (cl: ^Clip, ok: bool) {
 	return &trn.clips[clip_index], true
 }
 
-// kf_resolve bounds-checks one ref against the LIVE tree, so a stale index
-// reads as "gone" rather than aliasing whatever now lives there.
-kf_resolve :: proc(r: Kf_Ref) -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
+// kf_resolve_value bounds-checks a live ref and copies Keyframe out of the
+// relocatable arena, so the result survives later arena growth.
+kf_resolve_value :: proc(r: Kf_Ref) -> (cl: ^Clip, lane: int, k: Keyframe, ok: bool) {
 	clip, found := kf_clip_at(r.track_idx, r.clip_index)
 	if !found {
+		return nil, -1, {}, false
+	}
+	if r.lane < 0 || r.lane >= clip.keyframe_tracks.n {
+		return nil, -1, {}, false
+	}
+	trk := session_trk_view(clip.keyframe_tracks, int(r.lane))
+	if r.key < 0 || r.key >= trk.keys.n {
+		return nil, -1, {}, false
+	}
+	return clip, r.lane, session_kf_at(trk.keys, int(r.key)), true
+}
+
+// Writable resolution first makes track row unique, then its key range unique.
+// A pointer is valid only until the next arena mutation.
+kf_resolve :: proc(r: Kf_Ref) -> (cl: ^Clip, lane: int, k: ^Keyframe, ok: bool) {
+	clip, found := kf_clip_at(r.track_idx, r.clip_index)
+	if !found || r.lane < 0 || r.lane >= clip.keyframe_tracks.n {
 		return nil, -1, nil, false
 	}
-	if r.lane < 0 || r.lane >= len(clip.keyframe_tracks) {
+	trk := session_trk_view_mut(&clip.keyframe_tracks, int(r.lane))
+	if r.key < 0 || r.key >= trk.keys.n {
 		return nil, -1, nil, false
 	}
-	trk := &clip.keyframe_tracks[r.lane]
-	if r.key < 0 || r.key >= len(trk.keys) {
-		return nil, -1, nil, false
-	}
-	return clip, r.lane, &trk.keys[r.key], true
+	session_kf_make_unique(&trk.keys)
+	return clip, r.lane, session_kf_at_ptr(trk.keys, int(r.key)), true
 }
 
 // kf_selected resolves the selection when it is EXACTLY ONE keyframe, and
@@ -990,19 +1005,19 @@ kf_sel_contains :: proc(r: Kf_Ref) -> bool {
 kf_sel_same_lane :: proc() -> (name: string, ok: bool) {
 	first: Kf_Ref
 	for item in kf_sel.items {
-		cl, lane, _, resolved := kf_resolve(item)
+		cl, lane, _, resolved := kf_resolve_value(item)
 		if !resolved {
 			continue
 		}
 		if !ok {
 			first = item
-			name = kf_track_name(&cl.keyframe_tracks[lane])
+			name = kf_track_name(session_trk_view(cl.keyframe_tracks,lane))
 			ok = true
 			continue
 		}
 		if item.track_idx != first.track_idx ||
 		   item.clip_index != first.clip_index ||
-		   kf_track_name(&cl.keyframe_tracks[lane]) != name {
+		   kf_track_name(session_trk_view(cl.keyframe_tracks,lane)) != name {
 			return "", false
 		}
 	}
@@ -1017,7 +1032,7 @@ kf_sel_same_lane :: proc() -> (name: string, ok: bool) {
 kf_sel_frame_span :: proc() -> (lo, hi: i64) {
 	seen := false
 	for item in kf_sel.items {
-		cl, _, k, ok := kf_resolve(item)
+		cl, _, k, ok := kf_resolve_value(item)
 		if !ok {
 			continue
 		}
@@ -1045,7 +1060,7 @@ kf_sel_interp :: proc() -> (interp: Kf_Interp, mixed, seen: bool) {
 	n := 0
 	out: Kf_Interp
 	for item in kf_sel.items {
-		_, _, k, ok := kf_resolve(item)
+		_, _, k, ok := kf_resolve_value(item)
 		if !ok {
 			continue
 		}
@@ -1060,23 +1075,17 @@ kf_sel_interp :: proc() -> (interp: Kf_Interp, mixed, seen: bool) {
 }
 
 // kf_set_interp_all writes one interpolation mode onto EVERY selected key as a
-// single undoable edit, returning whether any key actually changed (a re-click
-// on the mode already in use is a no-op, not a node). It is a plain in-place
-// field write per key — interp lives in the key itself and nothing reallocates
-// — so all the keys are resolved before the first write without any of them
-// dangling.
+// single undoable edit. It stores refs, not pointers: making each target unique
+// can relocate the session arenas between writes.
 kf_set_interp_all :: proc(choice: Kf_Interp) -> bool {
-	keys: [dynamic]^Keyframe
-	defer delete(keys)
 	// Decide `changed` from the scan rather than from the write loop, so the
 	// no-op case is known before any undo seam opens.
 	changed := false
 	for item in kf_sel.items {
-		_, _, k, ok := kf_resolve(item)
+		_, _, k, ok := kf_resolve_value(item)
 		if !ok {
 			continue
 		}
-		append(&keys, k)
 		changed = changed || k.interp != choice
 	}
 	if !changed {
@@ -1091,8 +1100,11 @@ kf_set_interp_all :: proc(choice: Kf_Interp) -> bool {
 	// delete_selected_keyframe are the other two writers, and both open the seam
 	// before touching the store.
 	undo_begin()
-	for k in keys {
-		k.interp = choice
+	for item in kf_sel.items {
+		_, _, k, ok := kf_resolve(item)
+		if ok {
+			k.interp = choice
+		}
 	}
 	undo_push(.Value, "Set keyframe interpolation")
 	return true
@@ -1147,7 +1159,7 @@ kf_capture_sel :: proc(dst: ^[dynamic]Kf_Snap) -> int {
 	kf_snaps_drop(dst)
 	n := 0
 	for item in kf_sel.items {
-		cl, lane, k, ok := kf_resolve(item)
+		cl, lane, k, ok := kf_resolve_value(item)
 		if !ok {
 			continue
 		}
@@ -1156,7 +1168,7 @@ kf_capture_sel :: proc(dst: ^[dynamic]Kf_Snap) -> int {
 		// Kf_Snap.name is still an owned heap string (it is a UI-side selection
 		// snapshot, freed by the caller), so it keeps its clone -- reading the
 		// lane name through the accessor is the only borrow here.
-		s.name = strings.clone(kf_track_name(&cl.keyframe_tracks[lane]))
+		s.name = strings.clone(kf_track_name(session_trk_view(cl.keyframe_tracks,lane)))
 		s.start = k.frame_off
 		s.final = k.frame_off
 		s.mask = k.mask
@@ -1349,7 +1361,7 @@ clip_under_pointer :: proc() -> (int, int) {
 kf_keys_at :: proc(mx, my: f32, dst: ^[dynamic]Kf_Ref) {
 	for track, ti in timeline.tracks {
 		for clip, ci in track.clips {
-			if len(clip.keyframe_tracks) == 0 {
+			if clip.keyframe_tracks.n == 0 {
 				continue
 			}
 			box :=
@@ -1357,8 +1369,11 @@ kf_keys_at :: proc(mx, my: f32, dst: ^[dynamic]Kf_Ref) {
 			if box.width <= 0 || box.height <= 0 {
 				continue
 			}
-			for tr in 0 ..< len(clip.keyframe_tracks) {
-				for k, ki in clip.keyframe_tracks[tr].keys {
+			for tr in 0 ..< clip.keyframe_tracks.n {
+				keys := session_trk_view(clip.keyframe_tracks, tr).keys
+				v := session_kf_view(keys)
+				for ki in 0 ..< keys.n {
+					k := v[ki]
 					cx, cy := kf_key_center(box, tr, k.frame_off)
 					if abs(mx - cx) <= KF_HIT_MARGIN && abs(my - cy) <= KF_HIT_MARGIN {
 						append(dst, Kf_Ref{ti, ci, tr, ki})
@@ -1801,6 +1816,14 @@ if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); ps
 	}
 	if skp, _ := os.lookup_env_alloc("VYPER_SESSION_KF_PROBE", context.temp_allocator); skp != "" {
 		session_kf_probe_run()
+		return
+	}
+	if stp, _ := os.lookup_env_alloc("VYPER_SESSION_TRK_PROBE", context.temp_allocator); stp != "" {
+		session_trk_probe_run()
+		return
+	}
+	if smp, _ := os.lookup_env_alloc("VYPER_SESSION_MARKER_PROBE", context.temp_allocator); smp != "" {
+		session_marker_probe_run()
 		return
 	}
 	if drp, _ := os.lookup_env_alloc("VYPER_DRAG_PROBE", context.temp_allocator); drp != "" {

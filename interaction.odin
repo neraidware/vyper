@@ -644,7 +644,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				kf_dbl_click.ns = 0
 				return true
 			}
-			gcl, _, k, kok := kf_resolve(grab)
+			gcl, _, k, kok := kf_resolve_value(grab)
 			// A stale hit (the key vanished between the hit-test and the resolve)
 			// must read as a plain click, never as a double-click against a
 			// borrowed frame: park the record so no second press can match it.
@@ -1043,10 +1043,13 @@ commit_keyframe_drag :: proc() {
 		if li < 0 {
 			continue
 		}
-		keys := &cl.keyframe_tracks[li].keys
-		for ki in 0 ..< len(keys) {
-			if keys[ki].frame_off == s.final {
-				keys[ki].interp = s.interp
+		trk := session_trk_view_mut(&cl.keyframe_tracks, li)
+		session_kf_make_unique(&trk.keys)
+		keys := &trk.keys
+		for ki in 0 ..< keys.n {
+			v := session_kf_view(keys^)
+			if v[ki].frame_off == s.final {
+				vm := session_kf_view_mut(keys^); vm[ki].interp = s.interp
 				append(&picked, Kf_Ref{s.ref.track_idx, s.ref.clip_index, li, ki})
 				break
 			}

@@ -518,11 +518,11 @@ split_clip_at_playhead :: proc() {
 		if left_len <= 0 || right_len <= 0 {
 			continue
 		}
-		// The right half is an independent clip, not a value copy: a copy would
-		// alias the name (freed twice by free_timeline) and the keyframe backs
-		// (mutated by both halves). Everything after this point edits the copy's
-		// own allocations.
-		right := clip_deep_copy(c)
+		// Build both halves from source ranges before releasing their exclusive
+		// spans. Undo snapshots may also hold these ranges, so release honors COW.
+		source_markers := c.markers
+		source_tracks := c.keyframe_tracks
+		right := c^
 		// The new half is a distinct clip instance: re-mint its identity instead
 		// of inheriting the left half's id (two clips sharing one clip_id breaks
 		// every clip_id-keyed path -- preview slot identity, find_preview_slot,
@@ -538,23 +538,24 @@ split_clip_at_playhead :: proc() {
 		right.source_length_frames = right_len
 		right.timeline_start_frame = frame
 		c.markers = filter_markers_in_range(
-			c.markers[:],
+			source_markers,
 			c.source_start_frame,
 			left_len,
 		)
 		c.source_length_frames = left_len
 		right.markers = filter_markers_in_range(
-			right.markers[:],
+			source_markers,
 			right.source_start_frame,
 			right_len,
 		)
 		// Split remap (slice-1 rule): left keeps keys < left_len, right gets
-		// keys >= left_len re-relativized by -left_len; values preserved. The
-		// halves own separate backings (the right's came from clip_deep_copy), so
-		// each trims its own -- kf_split_parts, which rebuilt both from one
-		// shared backing, is for copies that still alias.
-		kf_trim_tail(c, i32(left_len))
-		kf_trim_head(&right, i32(left_len))
+		// keys >= left_len re-relativized by -left_len; both read source before
+		// either candidate replaces it.
+		kf_bump_structure()
+		c.keyframe_tracks = kf_rebuild_tracks(source_tracks, 0, i32(left_len))
+		right.keyframe_tracks = kf_rebuild_tracks(source_tracks, i32(left_len), KF_MAX_OFFSET)
+		session_marker_release(source_markers)
+		kf_free_tracks(source_tracks)
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
 	if vyper_trace {
@@ -688,106 +689,34 @@ toggle_links_for_selection :: proc() {
 	}
 }
 
-// clone_marker copies a marker. The label is a session-pool handle
-// (TODO.md Active 19), so the copy is a struct copy: no clone, and no free on
-// the way out either — the bytes outlive every marker that names them.
-clone_marker :: proc(m: ^Clip_Marker) -> Clip_Marker {
-	return m^
-}
-
-// ---------------------------------------------------------------------------
-// Clip ownership: the whole copy/free contract, in two procs.
-//
-// A Clip is a VALUE struct with three hidden owning fields: `name` (heap
-// string), `markers` (an array whose entries each own a `label`), and
-// `keyframe_tracks` (an array whose entries own a name and a keys backing). A
-// value copy of a Clip therefore SILENTLY ALIASES all three, and every site that
-// built or dropped a Clip had to remember all three by hand.
-//
-// That list was written out five times for free and three times for copy, and
-// the two lists disagreed: the ripple delete (timeline.odin) and the raw delete
-// each freed markers and keyframe tracks but NOT the name, so every deleted clip
-// leaked its name; and the two split paths copied the struct instead of deep
-// copying, so both halves held ONE name pointer that free_timeline then freed
-// twice. A list a site has to remember is a list a site will get wrong — twice
-// already, in the two most-used edit verbs in the app.
-//
-// So: clip_deep_copy is the only way to build a Clip from another Clip, and
-// clip_payload_free is the only way to drop one. A site that copies or drops a
-// clip calls these and does nothing else.
-//
-// The audit is therefore: no site outside this pair frees a CLIP's fields by
-// hand. `free_markers(&old_markers)` in the ripple's trim branches is NOT a
-// violation — those replace one clip's marker array with a filtered one and must
-// release the old array, which is a field edit, not a clip drop; the same goes
-// for kf_trim_* rebuilding a keys backing in keyframes.odin.
-// ---------------------------------------------------------------------------
-
-// clip_deep_copy returns an independent copy of src: every value the same, and
-// every OWNED field freshly allocated. The clip's NAME is not owned -- it is a
-// session-pool handle whose bytes are immutable (TODO.md Active 19) -- so the
-// struct copy above carries it and no clone happens; that is the whole reason
-// the name stopped being a heap string. Callers re-mint identity (clip_id,
-// link_id) and adjust geometry on the copy afterwards; that is value editing,
-// which needs no ownership care. Anything else a copy needs to own differently
-// is a sign the call wants clip_payload_free on the original instead.
-clip_deep_copy :: proc(src: ^Clip) -> Clip {
-	c := src^
-	if len(src.markers) > 0 {
-		c.markers = make([dynamic]Clip_Marker, len(src.markers))
-		for i in 0 ..< len(src.markers) {
-			c.markers[i] = clone_marker(&src.markers[i])
-		}
-	} else {
-		c.markers = nil
-	}
-	// The copy's tracks ALIAS src's right now (c := src^ copied the pointer);
-	// kf_clone_mut replaces the pointer without freeing, which is exactly right
-	// here — freeing would hit src's memory.
-	kf_clone_mut(&c, src^)
-	return c
-}
-
-// clip_payload_free releases everything the clip OWNS and clears the pointers,
-// so a second call is a no-op. Every drop path calls this; nothing else frees a
-// clip's fields. The name is not one of those fields: it is a pool handle, so
-// there is nothing to release and nothing to clear.
-clip_payload_free :: proc(c: ^Clip) {
-	free_markers(&c.markers)
-	if c.keyframe_tracks != nil {
-		kf_free_tracks(c.keyframe_tracks)
-		c.keyframe_tracks = nil
-	}
-	// name is a pool handle and owns nothing: it needs no free, and zeroing it
-	// here would be wrong (a caller reading the dropped clip expects its label).
-}
-
-free_markers :: proc(markers: ^[dynamic]Clip_Marker) {
-	if markers^ == nil {
-		return
-	}
-	// Labels are pool handles now, so dropping the array is the whole free: no
-	// per-marker delete to forget.
-	delete(markers^)
-	markers^ = nil
-}
-
-// filter_markers_in_range returns a new dynamic array with the markers whose
-// source_frame lies in [start, start+length). The result is PERSISTED on the
-// caller's clip (.markers survives across frames), so it allocates on
-// context.allocator, not the frame temp arena.
+// filter_markers_in_range builds a session range with markers in the half-open
+// source interval. Rows are POD and labels remain session string handles.
 filter_markers_in_range :: proc(
-	markers: []Clip_Marker,
+	markers: Clip_Markers_Range,
 	start, length: i64,
-) -> [dynamic]Clip_Marker {
-	out := make([dynamic]Clip_Marker)
-	for i in 0 ..< len(markers) {
-		m := markers[i]
+) -> Clip_Markers_Range {
+	out := Clip_Markers_Range{}
+	for i in 0..<markers.n {
+		m := session_marker_at(markers, i)
 		if m.source_frame >= start && m.source_frame < start + length {
-			append(&out, clone_marker(&markers[i]))
+			session_marker_push(&out, m)
 		}
 	}
 	return out
+}
+
+// clip_marker_mut resolves marker-range COW before a marker field edit.
+clip_marker_mut :: proc(c: ^Clip, i: int) -> ^Clip_Marker {
+	return session_marker_at_mut(&c.markers, i)
+}
+
+// clip_ranges_release returns this Clip's exclusive session ranges to their
+// arenas. Shared ranges remain reserved for the other Clip/undo snapshot.
+clip_ranges_release :: proc(c: ^Clip) {
+	session_marker_release(c.markers)
+	kf_free_tracks(c.keyframe_tracks)
+	c.markers = Clip_Markers_Range{}
+	c.keyframe_tracks = Kf_Track_Range{}
 }
 
 // delete_selected_clip_raw removes the selected clip (and, when it belongs to a
@@ -841,7 +770,7 @@ delete_selected_clip_raw :: proc() {
 		}
 		removed := tt.clips[target.index]
 		ordered_remove(&tt.clips, target.index)
-		clip_payload_free(&removed)
+		clip_ranges_release(&removed)
 		if vyper_trace {
 			fmt.printf(
 				"[tl] deleted clip raw src=%s start=%d len=%d\n",
@@ -897,8 +826,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 		ce := clip_timeline_end(c)
 		switch {
 		case ce <= start:
-			// Entirely before the region: untouched (keeps the original
-			// markers slice: the new copy still references it).
+			// Entirely before the region: transfer the POD record unchanged.
 			append(&new_clips, c)
 		case cs >= end:
 			// Entirely after the region: slide left to close the gap.
@@ -906,31 +834,18 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			append(&new_clips, c)
 		case cs < start && ce > end:
 			// Straddles the whole region: split into left + right pieces.
-			//
-			// The right half is an independent deep copy, taken FIRST and from
-			// the pristine `c`: the left half edits below free the marker array
-			// and keys backing that `c` still points at, so a copy made after
-			// them would clone freed memory.
-			//
-			// Both halves must be separate instances, not two value copies of one
-			// struct: sharing the name is a double free at teardown, sharing a
-			// keys backing lets either half's edits strand the other, and
-			// sharing a clip_id breaks every clip_id-keyed path (preview slot
-			// identity, find_preview_slot, the prewarm decoder handoff). This
-			// branch did all three, and appended `left` twice.
-			right := clip_deep_copy(&c)
+			source_markers := c.markers
+			source_tracks := c.keyframe_tracks
+			right := c
 			right.clip_id = new_clip_id()
 
 			left := c
 			left.source_length_frames = start - cs
 			left.markers = filter_markers_in_range(
-				left.markers[:],
+				source_markers,
 				left.source_start_frame,
 				left.source_length_frames,
 			)
-			// Keyframe remap (slice-1 rule): left keeps keys < (start-cs).
-			kf_trim_tail(&left, i32(start - cs))
-			append(&new_clips, left)
 
 			if !right.is_still {
 				right.source_start_frame += end - cs
@@ -938,27 +853,31 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			right.source_length_frames = ce - end
 			right.timeline_start_frame = start
 			right.markers = filter_markers_in_range(
-				right.markers[:],
+				source_markers,
 				right.source_start_frame,
 				right.source_length_frames,
 			)
-			// right keeps the rest, re-relativized by -(start-cs).
-			kf_trim_head(&right, i32(start - cs))
+			// Left keeps keys < cut; right keeps keys >= cut and re-relativizes.
+			cut := i32(start - cs)
+			kf_bump_structure()
+			left.keyframe_tracks = kf_rebuild_tracks(source_tracks, 0, cut)
+			right.keyframe_tracks = kf_rebuild_tracks(source_tracks, cut, KF_MAX_OFFSET)
+			session_marker_release(source_markers)
+			kf_free_tracks(source_tracks)
+			append(&new_clips, left)
 			append(&new_clips, right)
-			// Original markers array no longer referenced by any copy.
-			free_markers(&c.markers)
 		case cs < start:
 			// Overlaps the left edge only: trim its tail.
 			old_markers := c.markers
 			c.source_length_frames = start - cs
 			c.markers = filter_markers_in_range(
-				old_markers[:],
+				old_markers,
 				c.source_start_frame,
 				c.source_length_frames,
 			)
 			kf_trim_tail(&c, i32(start - cs))
 			append(&new_clips, c)
-			free_markers(&old_markers)
+			session_marker_release(old_markers)
 		case ce > end:
 			// Overlaps the right edge only: trim its head, shifted to start.
 			// The trimmed head is [cs, end), so the source advances by end - cs
@@ -973,7 +892,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			c.source_length_frames = ce - end
 			c.timeline_start_frame = start
 			c.markers = filter_markers_in_range(
-				old_markers[:],
+				old_markers,
 				c.source_start_frame,
 				c.source_length_frames,
 			)
@@ -982,10 +901,10 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			// - (start-cs).
 			kf_trim_head(&c, i32(start - cs))
 			append(&new_clips, c)
-			free_markers(&old_markers)
+			session_marker_release(old_markers)
 		case cs >= start && ce <= end:
 			// Otherwise the clip is entirely inside the region: dropped.
-			clip_payload_free(&c)
+			clip_ranges_release(&c)
 		}
 	}
 	delete(track.clips)
@@ -1794,8 +1713,8 @@ move_track_to_row :: proc(ti: int, target_row: int) {
 }
 
 // duplicate_track inserts a copy of the track directly ABOVE the original (one
-// row up in the visual stack), deep-copying every clip into a new dynamic array
-// so the two tracks are fully independent. The copy lands adjacent to its
+// row up in the visual stack), copying clip POD records into a new dynamic array.
+// Session ranges share until first write. The copy lands adjacent to its
 // source no matter where the source sits on the stack -- it never jumps over
 // unrelated tracks to the very top, which is what silently reordered rows and
 // left the duplicated video stacked above things the user wasn't looking at.
@@ -1805,7 +1724,7 @@ duplicate_track :: proc(index: int) {
 	src := &timeline.tracks[index]
 	new_track := Track {
 		name = next_track_name(),
-		// Deep copy array persists on the inserted track: context.allocator.
+		// Clip records persist on the inserted track.
 		clips = make([dynamic]Clip, 0, len(src.clips)),
 	}
 	// A duplicated clip is a NEW clip instance: mint a fresh identity so
@@ -1814,14 +1733,12 @@ duplicate_track :: proc(index: int) {
 	// wins and the copy's content never paints). Sever the link group too, so
 	// selecting a duplicate never drags the original's partner tracks along.
 	//
-	// Deep copy rather than value copy: the duplicate must own its name,
-	// markers and keyframe backing outright — deleting this track frees them,
-	// and a keyframe edit here must not strand the original on a reallocated
-	// backing. clip_deep_copy is the same rule split_clip_at_playhead and the
-	// ripple straddle follow, so it cannot be honoured there and forgotten
-	// here.
+	// Share pooled ranges explicitly; first marker/key write separates only the
+	// touched range. Scalar fields and immutable string handles copy by value.
 	for i in 0 ..< len(src.clips) {
-		c := clip_deep_copy(&src.clips[i])
+		c := src.clips[i]
+		c.markers = session_marker_share(&src.clips[i].markers)
+		c.keyframe_tracks = session_trk_share(&src.clips[i].keyframe_tracks)
 		c.clip_id = new_clip_id()
 		c.link_id = 0
 		append(&new_track.clips, c)
@@ -1836,20 +1753,17 @@ duplicate_track :: proc(index: int) {
 	undo_push(.Duplicate, fmt.tprintf("Duplicate track \"%s\"", src.name))
 }
 
-// duplicate_clip inserts an independent copy of the clip at (track_idx,index)
+// duplicate_clip inserts a COW copy of the clip at (track_idx,index)
 // on the same track, placed in the nearest free slot directly after the
-// original, and returns the new clip's index. The copy is a fresh clip (new
-// clip_id, link_id 0) with cloned name and markers, so the two never share
-// state -- mirroring duplicate_track's copy-by-value semantics.
+// original, and returns new index. It gets a fresh identity and link group.
 duplicate_clip :: proc(track_idx, index: int) -> int {
 	undo_begin()
 	track := &timeline.tracks[track_idx]
 	src := &track.clips[index]
-	// A fresh instance of the same clip: clip_deep_copy carries every value
-	// (including ones added to Clip since this was written by hand — the field
-	// list was the bug: a new field silently defaulted to zero on the copy),
-	// and re-minting identity below is the only difference.
-	c := clip_deep_copy(src)
+	// Clip is POD; share pooled ranges after the value copy.
+	c := src^
+	c.markers = session_marker_share(&src.markers)
+	c.keyframe_tracks = session_trk_share(&src.keyframe_tracks)
 	c.clip_id = new_clip_id()
 	c.link_id = 0
 	place := clip_timeline_end(src^)
@@ -1865,7 +1779,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 }
 
 // remove_track deletes the track at index (and all of its clips) from the
-// timeline. Frees per-clip markers and the track's owned arrays, clears or
+// timeline. Releases exclusive session ranges and track-owned arrays, clears or
 // adjusts the saved selection (clips on other tracks keep their indices, so
 // selection.index is preserved), and invalidates the preview/audio state the
 // way every clip-delete path must (see delete_selected_clip_raw).
@@ -1877,7 +1791,7 @@ remove_track :: proc(index: int) {
 	undo_begin()
 	removed := timeline.tracks[index]
 	for &c in removed.clips {
-		clip_payload_free(&c)
+		clip_ranges_release(&c)
 	}
 	delete(removed.clips)
 	name_buf: [128]u8

@@ -68,6 +68,18 @@ kf_probe_profile_match :: proc(a, b: Kf_Lane_Profile) -> bool {
 	return true
 }
 
+kp_set_interp :: proc(clip: ^Clip, ti, ki: int, interp: Kf_Interp) {
+	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	session_kf_make_unique(&track.keys)
+	session_kf_at_ptr(track.keys, ki).interp = interp
+}
+
+kp_set_value :: proc(clip: ^Clip, ti, ki: int, value: f32) {
+	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	session_kf_make_unique(&track.keys)
+	session_kf_at_ptr(track.keys, ki).value = value
+}
+
 keyframe_probe_run :: proc() -> int {
 	// --- sorted insert + replace-in-place ---------------------------------
 	c := Clip {}
@@ -77,17 +89,18 @@ keyframe_probe_run :: proc() -> int {
 	kf_set_key(&c, "gain", 10, 5.0) // replace the key already on frame 10
 	ti := kf_track_index(c, "gain")
 	kf_probe_check(ti >= 0, "track 'gain' must exist after 3 inserts")
-	kf_probe_check(len(c.keyframe_tracks) == 1, "one property => one track, got %d", len(c.keyframe_tracks))
+	kf_probe_check(c.keyframe_tracks.n == 1, "one property => one track, got %d", c.keyframe_tracks.n)
 	if ti >= 0 {
-		keys := c.keyframe_tracks[ti].keys
-		kf_probe_check(len(keys) == 3, "3 distinct frames => 3 keys, got %d", len(keys))
+		keys := session_trk_view(c.keyframe_tracks, ti).keys
+		vk := session_kf_view(keys); v := vk
+		kf_probe_check(keys.n == 3, "3 distinct frames => 3 keys, got %d", keys.n)
 		kf_probe_check(
-			keys[0] == Keyframe {frame_off = 10, value = 5.0},
-			"inserts must stay sorted and the repeated frame replaced: keys[0]=%v",
-			keys[0],
+			v[0] == Keyframe {frame_off = 10, value = 5.0},
+			"inserts must stay sorted and the repeated frame replaced: v[0]=%v",
+			v[0],
 		)
-kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", keys[1])
-	kf_probe_check(keys[2] == Keyframe {frame_off = 30, value = 3.0}, "keys[2]=%v", keys[2])
+kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
+	kf_probe_check(v[2] == Keyframe {frame_off = 30, value = 3.0}, "v[2]=%v", v[2])
 	}
 
 	// --- lookup: missing name ---------------------------------------------
@@ -104,8 +117,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 
 	kf_set_lane_interp :: proc(clip: ^Clip, name: string, interp: Kf_Interp) {
 		if ti := kf_track_index(clip^, name); ti >= 0 {
-			for k in 0 ..< len(clip.keyframe_tracks[ti].keys) {
-				clip.keyframe_tracks[ti].keys[k].interp = interp
+			trk := session_trk_view_mut(&clip.keyframe_tracks, ti)
+			session_kf_make_unique(&trk.keys)
+			for k in 0 ..< trk.keys.n {
+					p := session_kf_at_ptr(trk.keys, k); p.interp = interp
 			}
 		}
 	}
@@ -117,7 +132,7 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	gt := kf_track_index(smp, "gain")
 	gain: ^Kf_Track
 	if gt >= 0 {
-		gain = &smp.keyframe_tracks[gt]
+		gain = session_trk_view(smp.keyframe_tracks, gt)
 	}
 	v, ok := kf_sample(gain, 0, 7.0)
 	kf_probe_check(!ok && v == 7.0, "before first key: inactive, base kept (v=%v ok=%v)", v, ok)
@@ -155,7 +170,7 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	dt := kf_track_index(d, "x")
 	dx: ^Kf_Track
 	if dt >= 0 {
-		dx = &d.keyframe_tracks[dt]
+		dx = session_trk_view(d.keyframe_tracks, dt)
 	}
 	v, ok = kf_sample(dx, 5, 10.0)
 	kf_probe_check(ok && v == 0.0, "lone key pins its frame (got %v)", v)
@@ -171,7 +186,7 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	st := kf_track_index(s, "scale")
 	sx: ^Kf_Track
 	if st >= 0 {
-		sx = &s.keyframe_tracks[st]
+		sx = session_trk_view(s.keyframe_tracks, st)
 	}
 	v, ok = kf_sample(sx, 3, 1.0)
 	kf_probe_check(ok && v == 10.0, "first key applies at its frame (got %v)", v)
@@ -200,30 +215,33 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&sp, "gain", 40, 2.0) // on the cut frame -> right half, re-rel 0
 	kf_set_key(&sp, "gain", 45, 3.0)
 	kf_set_key(&sp, "gain", 99, 4.0)
-	// The halves no longer share one keys backing: the right is an independent
-	// copy (clip_deep_copy at every split site) and each half trims its own.
-	sp_right := clip_deep_copy(&sp)
+	// A Clip value copy marks its session ranges shared before either trim.
+	sp_right := sp
+	sp_right.markers = session_marker_share(&sp.markers)
+	sp_right.keyframe_tracks = session_trk_share(&sp.keyframe_tracks)
 	kf_trim_tail(&sp, 40)
 	kf_trim_head(&sp_right, 40)
 	left_ok := false
-	if len(sp.keyframe_tracks) == 1 {
-		lk := sp.keyframe_tracks[0].keys
-		left_ok = len(lk) == 1 && lk[0] == Keyframe {frame_off = 10, value = 1.0}
+	if sp.keyframe_tracks.n == 1 {
+		lk := session_trk_view(sp.keyframe_tracks, 0).keys
+		lv := session_kf_view(lk)
+		left_ok = lk.n == 1 && lv[0] == Keyframe {frame_off = 10, value = 1.0}
 	}
 	kf_probe_check(left_ok, "left keeps only keys < cut, values preserved")
 	right_ok := false
-	if len(sp_right.keyframe_tracks) == 1 {
-		rk := sp_right.keyframe_tracks[0].keys
-		right_ok = len(rk) == 3 &&
-		rk[0] == Keyframe {frame_off = 0, value = 2.0} &&
-		rk[1] == Keyframe {frame_off = 5, value = 3.0} &&
-		rk[2] == Keyframe {frame_off = 59, value = 4.0}
+	if sp_right.keyframe_tracks.n == 1 {
+		rk := session_trk_view(sp_right.keyframe_tracks,0)^.keys
+		rv := session_kf_view(rk)
+		right_ok = rk.n == 3 &&
+		rv[0] == Keyframe {frame_off = 0, value = 2.0} &&
+		rv[1] == Keyframe {frame_off = 5, value = 3.0} &&
+		rv[2] == Keyframe {frame_off = 59, value = 4.0}
 	}
 	kf_probe_check(right_ok, "right re-relatives keys >= cut by -cut")
 	if right_ok {
-		v, _ = kf_sample(&sp_right.keyframe_tracks[0], 0, 0.0)
+		v, _ = kf_sample(&session_trk_view(sp_right.keyframe_tracks,0)^, 0, 0.0)
 		kf_probe_check(v == 2.0, "right off 0 == old frame 40: the key's own value applies")
-		v, _ = kf_sample(&sp_right.keyframe_tracks[0], 5, 0.0)
+		v, _ = kf_sample(&session_trk_view(sp_right.keyframe_tracks,0)^, 5, 0.0)
 		kf_probe_check(v == 3.0, "right off 5 == old frame 45: key value applies at its frame")
 	}
 
@@ -234,9 +252,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&tr, "gain", 45, 3.0)
 	kf_trim_head(&tr, 40)
 	trim_ok := false
-	if len(tr.keyframe_tracks) == 1 {
-		tk := tr.keyframe_tracks[0].keys
-		trim_ok = len(tk) == 2 && tk[0] == Keyframe {frame_off = 0, value = 2.0} && tk[1] == Keyframe {frame_off = 5, value = 3.0}
+	if tr.keyframe_tracks.n == 1 {
+		tk := session_trk_view(tr.keyframe_tracks,0)^.keys
+		tv := session_kf_view(tk)
+		trim_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 0, value = 2.0} && tv[1] == Keyframe {frame_off = 5, value = 3.0}
 	}
 	kf_probe_check(trim_ok, "trim_head drops head keys and re-relatives survivors")
 	tr2 := Clip {}
@@ -245,9 +264,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&tr2, "gain", 45, 3.0)
 	kf_trim_tail(&tr2, 42)
 	trim2_ok := false
-	if len(tr2.keyframe_tracks) == 1 {
-		tk := tr2.keyframe_tracks[0].keys
-		trim2_ok = len(tk) == 2 && tk[0] == Keyframe {frame_off = 5, value = 1.0} && tk[1] == Keyframe {frame_off = 40, value = 2.0}
+	if tr2.keyframe_tracks.n == 1 {
+		tk := session_trk_view(tr2.keyframe_tracks,0)^.keys
+		tv := session_kf_view(tk)
+		trim2_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 5, value = 1.0} && tv[1] == Keyframe {frame_off = 40, value = 2.0}
 	}
 	kf_probe_check(trim2_ok, "trim_tail drops keys beyond the new length")
 
@@ -256,12 +276,12 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	tmt := Clip {}
 	kf_set_key(&tmt, "gain", 5, 1.0)
 	kf_set_key(&tmt, "gain", 40, 2.0)
-	tmt.keyframe_tracks[0].keys[1].interp = .Ease_In_Out
+	kp_set_interp(&tmt, 0, 1, .Ease_In_Out)
 	kf_trim_head(&tmt, 20)
 	trim_mode_ok :=
-		len(tmt.keyframe_tracks) == 1 &&
-		len(tmt.keyframe_tracks[0].keys) == 1 &&
-		tmt.keyframe_tracks[0].keys[0] == Keyframe {frame_off = 20, value = 2.0, interp = .Ease_In_Out}
+		tmt.keyframe_tracks.n == 1 &&
+		session_trk_view(tmt.keyframe_tracks,0)^.keys.n == 1 &&
+		session_kf_view(session_trk_view(tmt.keyframe_tracks,0)^.keys)[0] == Keyframe {frame_off = 20, value = 2.0, interp = .Ease_In_Out}
 	kf_probe_check(trim_mode_ok, "trim rebuild preserves the key's interpolation mode")
 
 	// --- flat-copy evaluator (the audio producer's sampler) mirrors kf_sample --
@@ -274,11 +294,11 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	fc_ti := kf_track_index(fc, "gain")
 	fc_same := false
 	if fc_ti >= 0 {
-		tk := &fc.keyframe_tracks[fc_ti]
+		tk := &session_trk_view(fc.keyframe_tracks,fc_ti)^
 		fc_same = true
 		for off := i32(0); off <= 40; off += 1 {
 			tv, tok := kf_sample(tk, off, 4.0)
-			fv, fok := kf_sample_keys(tk.keys[:], off, 4.0)
+			fv, fok := kf_sample_keys(session_kf_view(tk.keys), off, 4.0)
 			if tv != fv || tok != fok {
 				fc_same = false
 				break
@@ -288,10 +308,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 		// clip-relative 10 applies its own value at 210, then interpolates
 		// toward the next key's 2: 211 -> 7.4, 219 -> 2.6, and past the last
 		// key (225) the resting base 4 rules.
-		f10, _ := kf_sample_keys(tk.keys[:], i32(210 - 200), 4.0)
-		f11, _ := kf_sample_keys(tk.keys[:], i32(211 - 200), 4.0)
-		f19, _ := kf_sample_keys(tk.keys[:], i32(219 - 200), 4.0)
-		f25, fok := kf_sample_keys(tk.keys[:], i32(225 - 200), 4.0)
+		f10, _ := kf_sample_keys(session_kf_view(tk.keys), i32(210 - 200), 4.0)
+		f11, _ := kf_sample_keys(session_kf_view(tk.keys), i32(211 - 200), 4.0)
+		f19, _ := kf_sample_keys(session_kf_view(tk.keys), i32(219 - 200), 4.0)
+		f25, fok := kf_sample_keys(session_kf_view(tk.keys), i32(225 - 200), 4.0)
 		kf_probe_check(
 			f10 == 8.0 && kf_approx(f11, 7.4) && kf_approx(f19, 2.6) && !fok && f25 == 4.0,
 			"flat sampler is clip-relative on timeline addresses (210->%v 211->%v 219->%v 225->%v ok=%v)",
@@ -329,8 +349,8 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&twok, "gain", 10, 100.0)
 	cubic_ok := true
 	if sti := kf_track_index(twok, "gain"); sti >= 0 {
-		sk2 := &twok.keyframe_tracks[sti]
-		sk2.keys[1].interp = .Cubic
+		sk2 := session_trk_view(twok.keyframe_tracks,sti)
+		kp_set_interp(&twok, sti, 1, .Cubic)
 		for off in i32(0) ..= 10 {
 			vc, _ := kf_sample(sk2, off, 0.0)
 			if !kf_approx(vc, f32(off) * 10.0) {
@@ -348,22 +368,22 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&sc, "gain", 0, 0.0)
 	kf_set_key(&sc, "gain", 10, 100.0)
 	if sti := kf_track_index(sc, "gain"); sti >= 0 {
-		sk := &sc.keyframe_tracks[sti]
-		sk.keys[1].interp = .Ease_In
+		sk := session_trk_view(sc.keyframe_tracks,sti)
+		kp_set_interp(&sc, sti, 1, .Ease_In)
 		ki0, _ := kf_sample(sk, 0, 0.0)
 		kim, _ := kf_sample(sk, 5, 0.0)
 		ki1, _ := kf_sample(sk, 10, 0.0)
-		sk.keys[1].interp = .Ease_Out
+		kp_set_interp(&sc, sti, 1, .Ease_Out)
 		kom, _ := kf_sample(sk, 5, 0.0)
-		sk.keys[1].interp = .Ease_In_Out
+		kp_set_interp(&sc, sti, 1, .Ease_In_Out)
 		kio_m, _ := kf_sample(sk, 5, 0.0)
-		sk.keys[1].interp = .Elastic
+		kp_set_interp(&sc, sti, 1, .Elastic)
 		kel_m, _ := kf_sample(sk, 5, 0.0)
 		// Ownership pin: setting the FIRST (departing) key's mode must not
 		// reshape the segment — nothing arrives at the first key, its mode is
 		// inert. Rearm the arriving key to Linear and bounce the first one.
-		sk.keys[1].interp = .Linear
-		sk.keys[0].interp = .Elastic
+		kp_set_interp(&sc, sti, 1, .Linear)
+		kp_set_interp(&sc, sti, 0, .Elastic)
 		kfirst, _ := kf_sample(sk, 5, 0.0)
 		kf_probe_check(
 			ki0 == 0.0 && kf_approx(kim, 12.5) && ki1 == 100.0 &&
@@ -383,10 +403,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_key(&spc, "gain", 20, 250.0)
 	kf_set_key(&spc, "gain", 30, 350.0)
 	if sti := kf_track_index(spc, "gain"); sti >= 0 {
-		spk := &spc.keyframe_tracks[sti]
-		spk.keys[0].interp = .Cubic
-		spk.keys[1].interp = .Cubic
-		spk.keys[2].interp = .Cubic
+		spk := session_trk_view(spc.keyframe_tracks, sti)
+		kp_set_interp(&spc, sti, 0, .Cubic)
+		kp_set_interp(&spc, sti, 1, .Cubic)
+		kp_set_interp(&spc, sti, 2, .Cubic)
 		// segment 10->20: tangents (250-0)/20 == (350-100)/20 == 12.5 each =>
 		// Hermite midpoint == (100+250)/2 == 175.
 		sm_mid, _ := kf_sample(spk, 15, 0.0)
@@ -409,14 +429,15 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_packed_key(&peck, "sec", 0, lanes0, 1)
 	kf_set_packed_key(&peck, "sec", 10, lanes1, 1)
 	if pti := kf_track_index(peck, "sec"); pti >= 0 {
-		pk := &peck.keyframe_tracks[pti]
-		pk.keys[1].interp = .Ease_Out
+		pk := session_trk_view(peck.keyframe_tracks,pti)
+		kp_set_interp(&peck, pti, 1, .Ease_Out)
 		pv_m, pok := kf_sample_packed_lane(pk, 5, 0, 0.0)
 		pek := Clip {}
 		kf_set_key(&pek, "sec", 0, 0.0)
 		kf_set_key(&pek, "sec", 10, 100.0)
-		peks := &pek.keyframe_tracks[kf_track_index(pek, "sec")]
-		peks.keys[1].interp = .Ease_Out
+		peks_ti := kf_track_index(pek, "sec")
+		peks := session_trk_view(pek.keyframe_tracks, peks_ti)
+		kp_set_interp(&pek, peks_ti, 1, .Ease_Out)
 		sv_m, _ := kf_sample(peks, 5, 0.0)
 		kf_probe_check(
 			pok && kf_approx(pv_m, 87.5) && pv_m == sv_m,
@@ -440,23 +461,25 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_set_packed_key(&pecs, "sec", 10, l1, 1)
 	kf_set_packed_key(&pecs, "sec", 20, l2, 1)
 	kf_set_packed_key(&pecs, "sec", 30, l3, 1)
-	seck := &pecs.keyframe_tracks[kf_track_index(pecs, "sec")]
+	seck_ti := kf_track_index(pecs, "sec")
+	seck := session_trk_view(pecs.keyframe_tracks, seck_ti)
 	for i in 0 ..= 2 {
-		seck.keys[i].interp = .Cubic
+		kp_set_interp(&pecs, seck_ti, i, .Cubic)
 	}
 	sc2 := Clip {}
 	kf_set_key(&sc2, "sec", 0, 0.0)
 	kf_set_key(&sc2, "sec", 10, 100.0)
 	kf_set_key(&sc2, "sec", 20, 250.0)
 	kf_set_key(&sc2, "sec", 30, 350.0)
-	sc2k := &sc2.keyframe_tracks[kf_track_index(sc2, "sec")]
-	sc2k.keys[0].interp = .Cubic
-	sc2k.keys[1].interp = .Cubic
-	sc2k.keys[2].interp = .Cubic
+	sc2_ti := kf_track_index(sc2, "sec")
+	sc2k := session_trk_view(sc2.keyframe_tracks, sc2_ti)
+	kp_set_interp(&sc2, sc2_ti, 0, .Cubic)
+	kp_set_interp(&sc2, sc2_ti, 1, .Cubic)
+	kp_set_interp(&sc2, sc2_ti, 2, .Cubic)
 	spline_parity := true
 	for off := i32(0); off <= 30; off += 1 {
 		pv, _ := kf_sample_packed_lane(seck, off, 0, 0.0)
-		sv, _ := kf_sample_keys(sc2k.keys[:], off, 0.0)
+		sv, _ := kf_sample_keys(session_kf_view(sc2k.keys), off, 0.0)
 		if !kf_approx(pv, sv) {
 			spline_parity = false
 			break
@@ -479,14 +502,14 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_probe_check(kf_track_index(cl^, "gain") >= 0, "clone carried the gain track")
 	kf_probe_check(kf_track_index(cl^, "scale") >= 0, "clone carried the scale track")
 	if cgt := kf_track_index(cl^, "gain"); cgt >= 0 {
-		cl_gain := cl.keyframe_tracks[cgt].keys[0].value
+		cl_gain := session_kf_view(session_trk_view(cl.keyframe_tracks,cgt).keys)[0].value
 		kf_probe_check(cl_gain == 1.5, "clone carried the base key's value (got %v)", cl_gain)
 	}
 	// Poke the clone: delete its key at 20, smash its scale key value.
 	kf_del_key(cl, "gain", 20)
 	bsi := kf_track_index(cl^, "scale")
 	if bsi >= 0 {
-		cl.keyframe_tracks[bsi].keys[0].value = -1.0
+		kp_set_value(cl, bsi, 0, -1.0)
 	}
 	// The original must not feel either poke, and vice versa: give the
 	// ORIGINAL a new key at 30 and the clone must not see it.
@@ -494,10 +517,12 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	base_ti := kf_track_index(base, "gain")
 	orig_ok := false
 	if base_ti >= 0 {
-		keys := base.keyframe_tracks[base_ti].keys
+		keys := session_trk_view(base.keyframe_tracks,base_ti)^.keys
 		has20 := false
 		has30 := false
-		for k in keys {
+		vk := session_kf_view(keys); v := vk
+		for i in 0 ..< keys.n {
+			k := v[i]
 			if k.frame_off == 20 && k.value == 2.5 {
 				has20 = true
 			}
@@ -505,19 +530,20 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 				has30 = true
 			}
 		}
-		orig_ok = has20 && has30 && len(keys) == 3
+		orig_ok = has20 && has30 && keys.n == 3
 	}
 	kf_probe_check(orig_ok, "original keeps its key 20 AND gains key 30 (clone's delete is invisible)")
 	clone_ok := false
 	if clone_ti := kf_track_index(cl^, "gain"); clone_ti >= 0 {
-		keys := cl.keyframe_tracks[clone_ti].keys
+		keys := session_trk_view(cl.keyframe_tracks,clone_ti)^.keys
 		no30 := true
-		for k in keys {
-			if k.frame_off == 30 {
+		vk := session_kf_view(keys)
+		for i in 0 ..< keys.n {
+			if vk[i].frame_off == 30 {
 				no30 = false
 			}
 		}
-		clone_ok = no30 && len(keys) == 1
+		clone_ok = no30 && keys.n == 1
 	}
 	kf_probe_check(clone_ok, "clone is unaffected by the original's new key 30 (deep copy)")
 	sv, _ := kf_geom_sample_lane(&base, "scale", 59, 0.0) // off 9, past the lone key
@@ -532,7 +558,7 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	ti_d := kf_track_index(del, "gain")
 	kf_probe_check(ti_d >= 0, "delete setup: track exists")
 	kf_del_key(&del, "gain", 7)
-	kf_probe_check(len(del.keyframe_tracks) == 0, "track dropped once its only key is deleted")
+	kf_probe_check(del.keyframe_tracks.n == 0, "track dropped once its only key is deleted")
 	v, ok = kf_geom_sample_lane(&del, "gain", 7, 2.0)
 	kf_probe_check(!ok && v == 2.0, "deleted track is inactive")
 
@@ -544,7 +570,7 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_del_key(&z, "gain", 0)
 	kf_trim_head(&z, 5)
 	kf_trim_tail(&z, 5)
-	kf_probe_check(len(z.keyframe_tracks) == 0, "remaps on zero-value clip are no-ops")
+	kf_probe_check(z.keyframe_tracks.n == 0, "remaps on zero-value clip are no-ops")
 
 	// --- packed sections: grouped whole-crop/transform keys -----------------
 	// A packed key lives on a SECTION track ("crop"), n > 0 lanes. Section and
@@ -556,22 +582,22 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_geom_set_packed(&crop, "crop", 10, {11.0, 13.0, 3.0, 7.0, 0, 0, 0}, 0b1111)
 	cti := kf_track_index(crop, "crop")
 	kf_probe_check(cti >= 0, "packed: section track exists")
-	kf_probe_check(len(crop.keyframe_tracks) == 1, "packed: one section track, got %d", len(crop.keyframe_tracks))
+	kf_probe_check(crop.keyframe_tracks.n == 1, "packed: one section track, got %d", crop.keyframe_tracks.n)
 	kf_probe_check(
 		kf_geom_full_mask("crop") == 0b1111 && kf_geom_full_mask("transform") == 0b11,
 		"group masks: whole crop = all 4 edges, whole transform = both axes",
 	)
 	kf_probe_check(kf_track_index(crop, "crop.l") < 0, "packed: lane track absent while the section is packed")
 	if cti >= 0 {
-		ck := crop.keyframe_tracks[cti].keys
-		kf_probe_check(len(ck) == 2, "packed: same-frame replace keeps 2 keys, got %d", len(ck))
-		if len(ck) == 2 {
-			kf_probe_check(ck[0].frame_off == 10 && ck[0].mask == 0b1111, "packed: sorted, mask preserved on frame 10 (got %v)", ck[0])
-			lv, cov := kf_lane_value(ck[0], 0)
+		ck := session_trk_view(crop.keyframe_tracks,cti).keys
+		kf_probe_check(ck.n == 2, "packed: same-frame replace keeps 2 keys, got %d", ck.n)
+		if ck.n == 2 {
+			kf_probe_check(session_kf_at(ck,0).frame_off == 10 && session_kf_at(ck,0).mask == 0b1111, "packed: sorted, mask preserved on frame 10 (got %v)", session_kf_at(ck,0))
+			lv, cov := kf_lane_value(session_kf_at(ck,0), 0)
 			kf_probe_check(lv == 11.0 && cov, "packed: replace overwrote lane 0 (got %v)", lv)
-			rv, rcov := kf_lane_value(ck[1], 1)
+			rv, rcov := kf_lane_value(session_kf_at(ck,1), 1)
 			kf_probe_check(rv == 8.0 && rcov, "packed: frame 30 lane 1 (got %v)", rv)
-			_, ucv := kf_lane_value(ck[0], 4)
+			_, ucv := kf_lane_value(session_kf_at(ck,0), 4)
 			kf_probe_check(!ucv, "packed: lane index >= n reads as uncovered")
 		}
 	}
@@ -729,8 +755,8 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	pk := kf_track_index(pc, "crop")
 	del_ok := false
 	if pk >= 0 {
-		keys := pc.keyframe_tracks[pk].keys
-		del_ok = len(keys) == 1 && keys[0].frame_off == 40 && keys[0].mask == 0b1111
+		keys := session_trk_view(pc.keyframe_tracks,pk)^.keys
+		vk := session_kf_view(keys); del_ok = keys.n == 1 && vk[0].frame_off == 40 && vk[0].mask == 0b1111
 	}
 	kf_probe_check(del_ok, "del on a packed section drops only the frame, n survives")
 	th := Clip {}
@@ -739,10 +765,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_trim_head(&th, 40)
 	th_ok := false
 	if ti := kf_track_index(th, "crop"); ti >= 0 {
-		keys := th.keyframe_tracks[ti].keys
-		th_ok = len(keys) == 1 && keys[0].frame_off == 0 && keys[0].mask == 0b1111
+		keys := session_trk_view(th.keyframe_tracks,ti)^.keys
+		vk2 := session_kf_view(keys); th_ok = keys.n == 1 && vk2[0].frame_off == 0 && vk2[0].mask == 0b1111
 		if th_ok {
-			zv, _ := kf_lane_value(keys[0], 0)
+			zv, _ := kf_lane_value(vk2[0], 0)
 			th_ok = zv == 2.0
 		}
 	}
@@ -751,18 +777,20 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	kf_geom_set_packed(&sp2, "crop", 10, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
 	kf_geom_set_packed(&sp2, "crop", 30, {2.0, 4.0, 6.0, 8.0, 0, 0, 0}, 0b1111)
 	kf_geom_set_packed(&sp2, "crop", 50, {3.0, 6.0, 9.0, 12.0, 0, 0, 0}, 0b1111)
-	sp2r := clip_deep_copy(&sp2)
+	sp2r := sp2
+	sp2r.markers = session_marker_share(&sp2.markers)
+	sp2r.keyframe_tracks = session_trk_share(&sp2.keyframe_tracks)
 	kf_trim_tail(&sp2, 30)
 	kf_trim_head(&sp2r, 30)
 	sp_ok := false
 	if lti := kf_track_index(sp2, "crop"); lti >= 0 {
-		lk := sp2.keyframe_tracks[lti].keys
-		sp_ok = len(lk) == 1 && lk[0].frame_off == 10 && lk[0].mask == 0b1111
+		lk := session_trk_view(sp2.keyframe_tracks,lti).keys
+		sp_ok = lk.n == 1 && session_kf_at(lk,0).frame_off == 10 && session_kf_at(lk,0).mask == 0b1111
 	}
 	if sp_ok {
 		if rti := kf_track_index(sp2r, "crop"); rti >= 0 {
-			rk := sp2r.keyframe_tracks[rti].keys
-			sp_ok = len(rk) == 2 && rk[0].frame_off == 0 && rk[0].mask == 0b1111 && rk[1].frame_off == 20 && rk[1].mask == 0b1111
+			rk := session_trk_view(sp2r.keyframe_tracks,rti).keys
+			sp_ok = rk.n == 2 && session_kf_at(rk,0).frame_off == 0 && session_kf_at(rk,0).mask == 0b1111 && session_kf_at(rk,1).frame_off == 20 && session_kf_at(rk,1).mask == 0b1111
 		} else {
 			sp_ok = false
 		}
@@ -781,10 +809,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	cpcl := &cp_cloned.tracks[0].clips[0]
 	cp_ok := false
 	if ti := kf_track_index(cpcl^, "crop"); ti >= 0 {
-		keys := cpcl.keyframe_tracks[ti].keys
-		cp_ok = len(keys) == 1 && keys[0].mask == 0b1111
+		keys := session_trk_view(cpcl.keyframe_tracks,ti).keys
+		cvk := session_kf_view(keys); cp_ok = keys.n == 1 && cvk[0].mask == 0b1111
 		if cp_ok {
-			cv, _ := kf_lane_value(keys[0], 3)
+			cv, _ := kf_lane_value(cvk[0], 3)
 			cp_ok = cv == 4.0
 		}
 	}
@@ -806,15 +834,15 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	ak := Clip {timeline_start_frame = 10, source_length_frames = 40}
 	kf_set_key(&ak, "gain", 5, 1.0)
 	kf_set_key(&ak, "gain", 30, 2.0)
-	ak.keyframe_tracks[0].keys[1].interp = .Ease_In_Out
-	ak_ti := &ak.keyframe_tracks[0]
+	kp_set_interp(&ak, 0, 1, .Ease_In_Out)
+	ak_ti := &session_trk_view(ak.keyframe_tracks,0)^
 
 	// Playhead INSIDE the clip, mid-segment, no key on the frame: insert.
 	// (playhead 20 -> clip-relative off 10, between the keys at 5 and 30.)
 	playhead.frame = 20
-	got_track_before := len(ak.keyframe_tracks[0].keys)
+	got_track_before := session_trk_view(ak.keyframe_tracks,0)^.keys.n
 	created := kf_auto_key(&ak, "gain", 3.0)
-	ak_ok := created && len(ak_ti.keys) == got_track_before + 1
+	ak_ok := created && ak_ti.keys.n == got_track_before + 1
 	if ak_ok {
 		akv, _ := kf_sample(ak_ti, 10, 0.0)
 		ak_ok = akv == 3.0
@@ -825,12 +853,12 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 	// unchanged, and the key keeps its interpolation mode. The original key
 	// sits at clip-relative off 30 (timeline frame 40).
 	playhead.frame = 40
-	mode_before := ak_ti.keys[2].interp
+	akv_view := session_kf_view(ak_ti.keys); mode_before := akv_view[2].interp
 	updated := kf_auto_key(&ak, "gain", 9.0)
-	ak_ok = updated && len(ak_ti.keys) == got_track_before + 1
+	ak_ok = updated && ak_ti.keys.n == got_track_before + 1
 	if ak_ok {
 		akv, _ := kf_sample(ak_ti, 30, 0.0)
-		ak_ok = akv == 9.0 && ak_ti.keys[2].interp == mode_before
+		ak_ok = akv == 9.0 && akv_view[2].interp == mode_before
 	}
 	kf_probe_check(ak_ok, "auto-key on an existing key updates it in place, preserving its mode")
 
@@ -863,24 +891,24 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 			{frame_off = 0, value = f32(-40.0), interp = .Linear},
 			{frame_off = 41, value = f32(0.0), interp = .Linear},
 		}
-		g0 := kf_gain_linear(db_keys[:], 0, 0)
+		g0 := kf_gain_linear(db_keys[:2], 0, 0)
 		kf_probe_check(
 			kf_approx(g0, db_to_linear(-40)),
 			"keyed gain at frame 0: want linear(-40dB)=%.5f, got %.5f (raw dB applied as a multiplier would be -40)",
 			db_to_linear(-40),
 			g0,
 		)
-		kf_probe_check(kf_approx(kf_gain_linear(db_keys[:], 41, 0), 1.0), "keyed gain lands at unity on the 0 dB key")
+		kf_probe_check(kf_approx(kf_gain_linear(db_keys[:2], 41, 0), 1.0), "keyed gain lands at unity on the 0 dB key")
 		// Past the last key the track is inactive: the STATIC base rules. Here
 		// that base is 0 dB, so the value is unity again (not silence, and not
 		// the raw last key value either).
 		kf_probe_check(
-			kf_approx(kf_gain_linear(db_keys[:], 50, 0), 1.0),
+			kf_approx(kf_gain_linear(db_keys[:2], 50, 0), 1.0),
 			"past the last gain key the static gain rules",
 		)
 		// A keyed midpoint sits between the endpoints in amplitude, not at the
 		// raw dB number.
-		mid := kf_gain_linear(db_keys[:], 20, 0)
+		mid := kf_gain_linear(db_keys[:2], 20, 0)
 		kf_probe_check(
 			mid > g0 && mid < 1.0,
 			"a keyed segment interpolates in amplitude: mid=%.5f must be inside (%.5f, 1)",
@@ -897,8 +925,10 @@ kf_probe_check(keys[1] == Keyframe {frame_off = 20, value = 2.0}, "keys[1]=%v", 
 		// through audio_gain_linear, so a key's dB value can never be treated
 		// as a multiplier on one path but not the other.
 		snap := Audio_Gain_Snapshot{db = 0, n = 2}
-		snap.keys[0] = db_keys[0]
-		snap.keys[1] = db_keys[1]
+		vk := db_keys[:2]
+		snap.keys[0] = vk[0]
+		snap.keys[1] = vk[1]
+
 		kf_probe_check(
 			kf_approx(audio_gain_linear(&snap, 0), g0),
 			"committed gain snapshot must agree with kf_gain_linear",

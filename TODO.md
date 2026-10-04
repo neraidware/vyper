@@ -4409,21 +4409,15 @@ for a bug that was not found is noise.
 
 ## Active 19 — `Clip` as POD: session pools for names, labels, keyframe keys
 
-**Status: S0, S1 and S2a landed; S2b's store is landed and the 205 call sites are next.** Numbered 19 rather than
+**Status: S0, S1, S2a, S2b, S2c and S3 implemented; S4 integrated.** Numbered 19 rather than
 16 because main took 16 (export rate), 17 (audio rate) and 18 (forward jump)
 while this plan sat on its own branch.
 
-**Why.** `Clip` (`state.odin:338`) is a value struct with three heap-owning
-fields: `name: string`, `markers: [dynamic]Clip_Marker` (each `label: string`),
-and `keyframe_tracks: [dynamic]Kf_Track` (each `name: string` plus a
-`[dynamic]Keyframe`). Everything expensive about copying a clip follows from
-that: `clip_deep_copy` (`timeline.odin:733`) clones the name, rebuilds the
-marker slice and re-keys every track via `kf_clone_mut`, and `clip_payload_free`
-(`timeline.odin:754`) has to be called on every drop path. Active 14 (Backspace
-ripple + ownership) had to route ten-plus sites through those two procs, and
-that was only correct because the audit found them all — the compiler cannot see
-a forgotten free, and the next clip field that grows a payload re-opens the same
-class of bug. A POD `Clip` makes the copy `src^` and deletes both procs.
+**Why.** Before this work, `Clip` (`state.odin:338`) owned heap name, marker and
+keyframe payloads. Every copy/drop path had to clone or release each field by
+hand, so the compiler could not catch missed ownership. Active 14 already found
+leaks and double-frees in split/delete paths. Session handles and ranges now make
+those payloads POD; copies mark ranges shared and first writes resolve COW.
 
 **Boundary facts to confirm first (step 0).** The whole plan rests on two
 assumptions; if either is false the shape changes, so verify before writing code:
@@ -4522,7 +4516,7 @@ must load byte-identically after this work.
       equality is only faster for a caller that ALREADY holds a handle, and no
       such caller exists yet — `Kf_Snap.name` is the one place a lane name
       crosses into a still-owned heap string, and it keeps its clone.
-- [~] S2b. Keyframe keys into the session arena, going straight to the COW end
+- [x] S2b. Keyframe keys into the session arena, going straight to the COW end
       state (chosen over landing a deep-copy step first), so a Clip copy becomes
       `^` and S3 is just deleting the copy procs. ~205 `.keys` sites move.
 
@@ -4570,9 +4564,10 @@ must load byte-identically after this work.
       is written into `session_kf_view`: valid until the next alloc, free or
       relocating grow, and never store it.
 
-      **Still to do:** point the 205 sites at the store, then pool
-      `Clip.keyframe_tracks` itself with the same COW rule (two-level: a track
-      write must make the track unique BEFORE its keys are unique).
+       **Migration complete.** The 205 key accesses now use the range API across
+       editing, sampling, rendering, audio snapshots, save/load and probes. The
+       stored render/audio snapshots remain caller-owned fixed arrays; they never
+       alias a live key range.
 
       **Carry S1's lesson in:** a `[dynamic]Keyframe` store is safe to reallocate
       ONLY because a track's handle is an INDEX, not a pointer into it. Do not
@@ -4581,39 +4576,55 @@ must load byte-identically after this work.
       exactly like S1's view. Index instead, or read through a guard that
       re-resolves after any mutation.
 
-      **Two things this must answer, both unresolved:** (a) the store is
-      per-session and shared, so two `Clip`s that copied a track now share one
-      range — a write to one must not be visible in the other, which means
-      copy-on-write with an explicit shared flag (no refcount: the owner is the
-      session, the mutator is decided by the write path); (b) `Clip` is not POD
-      until `clip.keyframe_tracks` itself stops being an owned `[dynamic]`, and
-      that array is the same COW question one level up. S3's "collapse to
-      `c := src^`" is not reachable until both are, so do not start S3 first.
-- [ ] S3. Delete `clip_deep_copy` and `clip_payload_free`, collapse every copy
-      site to `c := src^`, and delete the now-empty free paths. A `Clip` copy
-      must become a plain struct copy with no proc in between; if a site still
-      calls a copy proc, the field it was copying is still owned somewhere.
-- [ ] S4. `clone_timeline` stops allocating for clip payloads.
+       **Two-level COW is now implemented.** `Clip.keyframe_tracks` is a
+       `Kf_Track_Range` into `session_tracks.odin`; track copies share the range,
+       first track mutation clones track rows and marks their key ranges shared,
+       then the key write clones its key range. Writable key access resolves both
+       layers through `kf_key_mut`/`kf_resolve`. Saved project DTOs still
+       materialize plain strings and key arrays.
+       `session_trk_reset` joins the blind session teardown. The new
+       `session_trk_probe` pins track block reuse and track-before-key COW;
+       `render_kf_probe` is now a named gate target.
 
-**Probe / mutation.** Per step, the existing probes are the regression net
-(`keyframe_probe`, `timeline_probe`, `probe`, `undo_valgrind`) and the memory
-gate is the ownership proof: a borrowed-offset `Clip` has nothing to leak, so
-valgrind's counts must not move — a change there means a payload is still being
-owned somewhere the plan missed. Mutations to prove each step bites: interning
-by pointer instead of offset (two clips with equal names must share storage and
-a rename must not touch the other), and a pool reset without the generation check
-from S0 (a stale offset must fail loudly, not read another project's string).
+       **S2c acceptance checks:** build, keyframe/timeline/geometry/render-key
+       probes and undo valgrind pass. A key-store COW probe caught a real stale
+       borrowed view: `session_kf_make_unique` took a view before allocation,
+       then arena growth moved its backing block. It now allocates first and
+       re-resolves source through its range handle before copying.
 
-**Accept.** `check build probe keyframe_probe timeline_probe transform_probe
-geom_key_probe opacity audio_probe valgrind undo_valgrind` all pass; valgrind at
-the current baseline (23 contexts, 0 lost, no invalid access). `clip_deep_copy`
-and `clip_payload_free` are gone from the tree, `rg` shows no remaining per-clip
-payload free, and `:save`/`:open` round-trips a project with names, markers and
-keyframes unchanged — verified by loading a fixture written before this branch
-existed, not one written by it.
+- [x] S2c. Pool `Clip.keyframe_tracks` as POD range and implement two-level COW:
+       copy track range, make track unique before key range. `session_tracks.odin`
+       owns rows and coalescing free spans; `session_trk_probe` covers range reuse
+       and source/copy key isolation. Mutations in keyframes, packed geometry,
+       selection editing and interpolation now resolve track COW before key COW.
+       Copy boundaries mark track ranges shared; teardown resets track arena after
+       timeline and undo holders die. No serialized representation
+       changed; load/save continues through DTOs.
+- [x] S3. Pool marker rows in `session_markers.odin` and make `Clip` a POD range
+       aggregate: `name`, marker rows and keyframe tracks are session handles or
+       ranges; every payload field survives `c := src^`. Existing copy sites now
+       copy Clip directly and mark marker/key ranges shared; first writes resolve
+       COW. `clip_deep_copy`, `clip_payload_free`, `free_markers` and `kf_clone_mut`
+       are removed. Range release remains explicit at timeline/snapshot drop
+       boundaries so exclusive slots can return to session arenas.
+       `session_marker_probe` pins marker COW isolation and reuse; project
+       serialization remains DTO-only.
+- [x] S4. `clone_timeline` copies Clip records into its snapshot array and shares
+       session ranges; it allocates no per-Clip payload arrays.
 
-**Not claimed.** This does not make `Clip` immutable or shared: two `Clip`s that
-share a name offset share the string, so any future in-place rename must go
-through copy-on-write, and the inspector rename path has to re-intern rather
-than write through. Step 1's interning has to make that explicit before S3
-removes the last code that copied on write.
+**Probe / mutation.** `session_str_probe`, `session_kf_probe`,
+`session_trk_probe`, `session_marker_probe`, keyframe/timeline/render-key/UI
+probes pin pool bounds, COW isolation, serialization DTOs and split remaps.
+Undo/render/geometry valgrind targets assert 0 lost bytes and no invalid access.
+
+**Accept.** `check`, `build`, UI/transform/keyframe/render-key/timeline/geometry
+probes, session pool probes, `audio_probe`, `render_live_probe`, `valgrind`,
+`undo_valgrind`, `render_valgrind`, and `geom_key_valgrind` pass. Valgrind gates
+report 0 definitely/indirectly lost bytes and no invalid access. Project format
+remains byte-compatible through saved DTOs. No `clip_deep_copy`,
+`clip_payload_free`, `free_markers`, or `kf_clone_mut` remains in Odin sources.
+Session ranges reset only after timeline and undo holders are released.
+
+**Not claimed.** `Clip` remains mutable. Name changes intern a new immutable
+string handle; marker and key edits resolve their respective COW ranges before
+writing.

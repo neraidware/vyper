@@ -3,16 +3,13 @@ package main
 // Session_Str is the session-scoped string pool: one block holding every interned
 // clip name, marker label and keyframe track name for the life of the session.
 //
-// Before this, each of those was a heap `string` owned by the struct that held
-// it. That made a Clip copy a deep copy: clip_deep_copy had to clone the name,
-// clip_payload_free had to delete it, and every site that dropped a clip had to
-// remember which proc owned the free. The compiler cannot see a forgotten free,
-// and the next clip field that grows a payload re-opens the same class of bug
-// (TODO.md Active 19).
+// Before this, each was a heap `string` owned by its struct. Interned handles
+// make names and labels immutable session data, so Clip value copies never
+// allocate or free those bytes (TODO.md Active 19).
 //
-// The pool removes the ownership, not the data. A Clip holds a handle instead of
-// a `string`; nothing owns those bytes, nothing frees them, and copying a Clip
-// is a struct copy.
+// The pool removes string ownership, not marker/key range ownership. Clip name
+// handles copy by value; when two live Clips retain one pooled range, copy sites
+// set that range's COW bit before either side can mutate it.
 //
 // ---------------------------------------------------------------------------
 // Why the block is FIXED-SIZE and never grows

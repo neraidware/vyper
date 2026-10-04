@@ -679,7 +679,7 @@ draw_clip_markers :: proc(
 		)
 		restore_full = true
 		for clip, index in track.clips {
-			if len(clip.markers) == 0 {
+			if clip.markers.n == 0 {
 				continue
 			}
 			box :=
@@ -692,7 +692,8 @@ draw_clip_markers :: proc(
 				color = BUTTON_BORDER_HOVER
 			}
 			rows := [3]f32{5, 3, 1}
-			for &m in clip.markers {
+			for marker_idx in 0..<clip.markers.n {
+				m := session_marker_at(clip.markers, marker_idx)
 				line_x := clamp(
 					box.x + f32(m.source_frame - clip.source_start_frame) * timeline_view.zoom,
 					box.x,
@@ -841,7 +842,7 @@ draw_keyframes :: proc(
 			sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
 		)
 		for clip, index in track.clips {
-			rows := len(clip.keyframe_tracks)
+			rows := clip.keyframe_tracks.n
 			if rows == 0 {
 				continue
 			}
@@ -851,7 +852,9 @@ draw_keyframes :: proc(
 				continue
 			}
 			for tr in 0 ..< rows {
-				for k, k_idx in clip.keyframe_tracks[tr].keys {
+				v := session_kf_view(session_trk_view(clip.keyframe_tracks,tr).keys)
+				for k_idx in 0 ..< session_trk_view(clip.keyframe_tracks,tr).keys.n {
+					k := v[k_idx]
 					// kf_sel_frame answers both questions the paint asks of
 					// every diamond — is this key selected, and where should it
 					// be — in one scan. During a drag the frame it returns is the

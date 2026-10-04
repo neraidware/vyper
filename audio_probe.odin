@@ -72,9 +72,10 @@ audio_probe_run :: proc(v: string) -> int {
 	// cuts them too (the "1 video + 5 audio" linked-group case).
 	for k in 1 ..< lanes {
 		clone := audio_clip^
+		clone.keyframe_tracks = session_trk_share(&audio_clip.keyframe_tracks)
 		clone.clip_id = new_clip_id()
 		clone.link_id = video_link
-		clone.markers = nil
+		clone.markers = Clip_Markers_Range{}
 		nt := Track {
 			name  = strings.clone("audio-copy"),
 			clips = make([dynamic]Clip, 0, 8),

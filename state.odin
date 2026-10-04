@@ -414,13 +414,15 @@ Clip :: struct {
 	// A resting field like scale/gain, not a geometry lane -- it changes how the
 	// clip is blended, not where it sits. Read directly by preview and render.
 	opacity:              f32,
-	// Markers embedded in the clip (chapter markers, etc.), source-relative.
-	markers:              [dynamic]Clip_Marker,
+	// Session range of source-relative markers. Zero range is empty; copying a
+	// Clip shares this range until the first marker edit.
+	markers:              Clip_Markers_Range,
 	// keyframe_tracks: the generic keyframe store (keyframes.odin) — opaque,
 	// name-addressed (frame_off, value) series. The system never interprets a
 	// track's name; consumers mint tracks named by their own property path.
-	// Sorted tracks, each sorted by frame_off (clip-relative). nil = no keys.
-	keyframe_tracks:      [dynamic]Kf_Track,
+	// Session range of sorted tracks; each key range is sorted by clip-relative
+	// frame_off. The zero range means no tracks.
+	keyframe_tracks:      Kf_Track_Range,
 	// geom_modified: a bitmask over Render_Geom_Prop marking geometry lanes
 	// edited WITHOUT a keyframe, i.e. sitting in the resting field. The
 	// inspector's "keyframe all modified" button keys exactly this set. Set by

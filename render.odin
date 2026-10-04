@@ -619,7 +619,7 @@ kf_geom_unwrap_section :: proc(clip: ^Clip, sec: string) {
 	}
 	defs := kf_geom_sections
 	def := defs[sec_index]
-	src_keys := clip.keyframe_tracks[si].keys
+	trk := session_trk_view(clip.keyframe_tracks, si); src_keys := trk.keys
 	li: int = 0
 	for lane_prop in def.lanes {
 		lane_name := kf_lane_name(lane_prop)
@@ -627,24 +627,25 @@ kf_geom_unwrap_section :: proc(clip: ^Clip, sec: string) {
 			kf_track_index(clip^, lane_name) < 0,
 			fmt.tprintf("lane %q coexists with its packed section %q", lane_name, sec),
 		)
-		append(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(lane_name)})
-		lane := &clip.keyframe_tracks[len(clip.keyframe_tracks) - 1]
-		lane.keys = make([dynamic]Keyframe, 0, len(src_keys))
-		for k in src_keys {
-			if v, covered := kf_lane_value(k, li); covered {
-				append(&lane.keys, Keyframe {frame_off = k.frame_off, value = v, interp = k.interp})
+		session_trk_push(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(lane_name)})
+		lane := session_trk_view_mut(&clip.keyframe_tracks, clip.keyframe_tracks.n-1)
+		v := session_kf_view(src_keys)
+		session_kf_reserve(&lane.keys, src_keys.n)
+		for i in 0 ..< src_keys.n {
+			k := v[i]
+			if vval, covered := kf_lane_value(k, li); covered {
+				session_kf_push(&lane.keys, Keyframe{frame_off=k.frame_off, value=vval, interp=k.interp})
 			}
 		}
 		li += 1
 	}
-	// The section track is freed only after all fans read src_keys.
-	// The section track's NAME is a pool handle: nothing to free. Its keys are
-	// still an owned array at this step, so those are released.
-	keys := clip.keyframe_tracks[si].keys
-	if keys != nil {
-		delete(keys)
+	// Section keys stay live until all scalar lanes have been built. Return
+	// exclusive key slots only; a shared source range remains with its peer.
+	keys := session_trk_view(clip.keyframe_tracks, si)^.keys
+	if !keys.shared {
+		session_kf_release(keys)
 	}
-	ordered_remove(&clip.keyframe_tracks, si)
+	session_trk_erase(&clip.keyframe_tracks, si)
 }
 
 // kf_geom_any_lane_tracked reports whether any lane of `def` owns a live track.
@@ -680,8 +681,11 @@ kf_geom_fold_lanes :: proc(
 	defer delete(frames)
 	for lane_prop in def.lanes {
 		if ti := kf_track_index(clip^, kf_lane_name(lane_prop)); ti >= 0 {
-			assert(len(clip.keyframe_tracks[ti].keys) > 0, "an empty lane track is a store invariant violation")
-			for k in clip.keyframe_tracks[ti].keys {
+			track_keys := session_trk_view(clip.keyframe_tracks, ti).keys
+			assert(track_keys.n > 0, "an empty lane track is a store invariant violation")
+			v := session_kf_view(track_keys)
+			for i in 0 ..< track_keys.n {
+				k := v[i]
 				append(&frames, k.frame_off)
 			}
 		}
@@ -705,7 +709,10 @@ kf_geom_fold_lanes :: proc(
 			if ti := kf_track_index(clip^, kf_lane_name(def.lanes[li])); ti >= 0 {
 				// A lane is in this knot only at its OWN key frames; a knot on
 				// someone else's frame must not break its curve.
-				for &ck in clip.keyframe_tracks[ti].keys {
+				track_keys := session_trk_view(clip.keyframe_tracks, ti).keys
+				v := session_kf_view(track_keys)
+				for i in 0 ..< track_keys.n {
+					ck := v[i]
 					if ck.frame_off == fk {
 						packed[li] = ck.value.(f32)
 						knot_mask |= 1 << uint(li)
@@ -721,11 +728,13 @@ kf_geom_fold_lanes :: proc(
 	// hold only keys — folding never leaves an authority behind).
 	for lane_prop in def.lanes {
 		if ti := kf_track_index(clip^, kf_lane_name(lane_prop)); ti >= 0 {
-			tr := &clip.keyframe_tracks[ti]
-			assert(len(tr.keys) > 0, "folding dropped a keyed lane")
+			tr := session_trk_view_mut(&clip.keyframe_tracks, ti)
+			assert(tr.keys.n > 0, "folding dropped a keyed lane")
 			// name is a pool handle; only the keys array is owned.
-			delete(tr.keys)
-			ordered_remove(&clip.keyframe_tracks, ti)
+			if !tr.keys.shared {
+				session_kf_release(tr.keys)
+			}
+			session_trk_erase(&clip.keyframe_tracks, ti)
 		}
 	}
 }
@@ -786,9 +795,12 @@ kf_geom_set_packed_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, v
 	if si < 0 {
 		return false
 	}
-	tr := &clip.keyframe_tracks[si]
+	tr := session_trk_view_mut(&clip.keyframe_tracks, si)
 	bit := u8(1) << uint(li)
-	for &k in tr.keys {
+	session_kf_make_unique(&tr.keys)
+	v := session_kf_view_mut(tr.keys)
+	for i in 0 ..< tr.keys.n {
+		k := &v[i]
 		if k.frame_off != frame_off {
 			continue
 		}
@@ -858,7 +870,7 @@ kf_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64, base
 		if si := kf_track_index(clip^, defs[sec_index].name); si >= 0 {
 			assert(kf_track_index(clip^, name) < 0, "a lane must be absent while its section is packed")
 			return kf_sample_packed_lane(
-				&clip.keyframe_tracks[si],
+				&session_trk_view(clip.keyframe_tracks, si)^,
 				i32(timeline_frame - clip.timeline_start_frame),
 				li,
 				base,
@@ -882,17 +894,21 @@ kf_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n,
 		si := kf_track_index(clip^, sec)
 		if si >= 0 {
 			assert(kf_track_index(clip^, name) < 0, "a lane must be absent while its section is packed")
-			for k in clip.keyframe_tracks[si].keys {
+			track_keys := session_trk_view(clip.keyframe_tracks, si).keys
+			v := session_kf_view(track_keys)
+			for i in 0 ..< track_keys.n {
+				k := v[i]
 				if _, covered := kf_lane_value(k, li); covered {
 					total += 1
 				}
 			}
 			n = min(total, len(dst))
 			di := 0
-			for k in clip.keyframe_tracks[si].keys {
-				if v, covered := kf_lane_value(k, li); covered {
+			for i in 0 ..< track_keys.n {
+				k := v[i]
+				if value, covered := kf_lane_value(k, li); covered {
 					if di < n {
-						dst[di] = Keyframe {frame_off = k.frame_off, value = v, interp = k.interp}
+						dst[di] = Keyframe {frame_off = k.frame_off, value = value, interp = k.interp}
 						di += 1
 					}
 				}
@@ -4307,7 +4323,7 @@ render_test_run :: proc(paths: [2]string) {
 	z_span := i64(0)
 	if len(timeline.tracks) > 0 && len(timeline.tracks[0].clips) > 0 {
 		vclip := &timeline.tracks[0].clips[0]
-		fmt.println("render-test clip markers:", len(vclip.markers))
+		fmt.println("render-test clip markers:", vclip.markers.n)
 		// VYPER_CROP="l,r,t,b" applies a crop to the first clip so the render
 		// output's crop behavior can be verified headlessly.
 		if cv, cv_ok := os.lookup_env_alloc("VYPER_CROP", context.allocator); cv_ok && cv != "" {

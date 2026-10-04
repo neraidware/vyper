@@ -265,10 +265,9 @@ project_to_file :: proc() -> Project_File {
 }
 
 // project_file_free_containers releases the container arrays the save side
-// allocated, each track's clips array, and each clip's marker DTO array. The
-// remaining ELEMENTS alias live session memory (name strings, keyframe/srt
-// arrays) and are NOT touched -- freeing them would corrupt the session being
-// saved.
+// allocated, each track's clips array, and each clip's marker/keyframe DTO
+// arrays. String fields inside DTOs are borrowed pool views; scalar fields and
+// inline key payloads are values.
 //
 // The marker arrays are the exception: saved_markers BUILDS them for the encode
 // (the live type is a pool handle, not a cbor-safe struct -- see Saved_Marker),
@@ -326,14 +325,15 @@ session_teardown :: proc() {
 	}
 	free_timeline(&timeline)
 	undo_free_all()
-	// Every handle in every Clip, marker and keyframe track dies with the pools,
-	// so this is the one place that frees them. Nothing allocated above survives
-	// this call: the live timeline and all undo snapshots are freed before it.
-	// Both resets are blind rewinds for the reason recorded in TODO.md Active 19
+	// Every Clip, marker and keyframe-track range dies with these session pools.
+	// Nothing above survives: live timeline and undo snapshots are released first.
+	// Pool resets are blind rewinds for the reason recorded in TODO.md Active 19
 	// S0 -- no Clip, snapshot or timeline outlives teardown, so there is nothing
 	// to invalidate beyond the bounds assert on the read side.
 	session_str_reset()
 	session_kf_reset()
+	session_trk_reset()
+	session_marker_reset()
 	srt_cache_free_all()
 	media_bin_free()
 	clear(&selection.extra_set)
@@ -343,11 +343,10 @@ session_teardown :: proc() {
 	kf_selection_free()
 }
 
-// session_rebuild makes the decoded DTO the live session. Every string and
-// dynamic array it installs is a fresh session-heap copy (the DTO itself lives
-// on the frame temp arena and dies at the next free_all), so nothing here
-// references the DTO after it returns. Mirrors the import post-edit reset, then
-// resets undo so the loaded session is the new baseline.
+// session_rebuild makes decoded DTO values live: strings/marker/key rows enter
+// session pools, while timeline containers use session heap. The DTO itself
+// lives on frame temp and dies at the next free_all. Mirrors import reset, then
+// resets undo so loaded session is new baseline.
 session_rebuild :: proc(pf: ^Project_File) {
 	// Project identity.
 	project_set_name(pf.name)
@@ -450,32 +449,23 @@ session_rebuild :: proc(pf: ^Project_File) {
 					c.path = a.path
 				}
 			}
-			// Marker labels are interned into the session pool, so the live
-			// markers own nothing: free_timeline drops the array and the bytes
-			// outlive it. The DTO strings themselves die with the frame arena and
-			// were never freed here either.
+			// Marker labels and rows enter session pools; DTO strings stay plain
+			// CBOR values and remain format-compatible.
 			if len(sc.markers) > 0 {
-				c.markers = make([dynamic]Clip_Marker, len(sc.markers))
-				idx := 0
+				c.markers = Clip_Markers_Range{}
 				for sm in sc.markers {
-					c.markers[idx] = Clip_Marker {
+					session_marker_push(&c.markers, Clip_Marker {
 						source_frame = sm.source_frame,
 						label        = session_str_intern(sm.label),
-					}
-					idx += 1
+					})
 				}
 			}
-			// Keyframe tracks off the DTO: the lane NAME is interned into the
-			// session pool (so it owns nothing), and the keys are deep-copied
-			// because they are still a per-track owned array at this step.
+			// Rebuild session ranges from the plain-string/key-array file DTO.
 			if len(sc.keyframe_tracks) > 0 {
-				c.keyframe_tracks = make([dynamic]Kf_Track, len(sc.keyframe_tracks))
-				for kt, i in sc.keyframe_tracks {
-					c.keyframe_tracks[i] = Kf_Track {
-						name = session_str_intern(kt.name),
-						keys = make([dynamic]Keyframe, len(kt.keys)),
-					}
-					copy(c.keyframe_tracks[i].keys[:], kt.keys[:])
+				c.keyframe_tracks = Kf_Track_Range{}
+				for kt in sc.keyframe_tracks {
+					r := session_kf_make(kt.keys[:])
+					session_trk_push(&c.keyframe_tracks, Kf_Track{name=session_str_intern(kt.name), keys=r})
 				}
 			}
 			append(&tr.clips, c)
@@ -586,8 +576,9 @@ project_path_is_project :: proc(path: string) -> bool {
 // encoder from emitting a null where the old aliased array would have emitted a
 // list.
 saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
-	out := make([dynamic]Saved_Marker, len(c.markers))
-	for &m, i in c.markers {
+	out := make([dynamic]Saved_Marker, c.markers.n)
+	for i in 0..<c.markers.n {
+		m := session_marker_at(c.markers, i)
 		out[i] = Saved_Marker {
 			source_frame = m.source_frame,
 			label        = marker_label(&m),
@@ -602,11 +593,13 @@ saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
 // the encode must not depend on the session staying put. The arrays are freed by
 // project_file_free_containers.
 saved_kf_tracks :: proc(c: ^Clip) -> [dynamic]Saved_Kf_Track {
-	out := make([dynamic]Saved_Kf_Track, len(c.keyframe_tracks))
-	for &t, i in c.keyframe_tracks {
-		keys := make([dynamic]Keyframe, len(t.keys))
-		copy(keys[:], t.keys[:])
-		out[i] = Saved_Kf_Track {name = kf_track_name(&t), keys = keys}
+	out := make([dynamic]Saved_Kf_Track, c.keyframe_tracks.n)
+	for i in 0..<c.keyframe_tracks.n {
+		t := session_trk_view(c.keyframe_tracks, i)
+		vv := session_kf_view(t.keys)
+		keys := make([dynamic]Keyframe, len(vv))
+		for j in 0..<len(vv) { keys[j] = vv[j] }
+		out[i] = Saved_Kf_Track {name = kf_track_name(t), keys = keys}
 	}
 	return out
 }

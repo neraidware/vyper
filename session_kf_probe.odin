@@ -132,6 +132,11 @@ session_kf_probe_main :: proc() -> int {
 	// The invariant that lets a Clip copy be a struct copy. Without it,
 	// duplicating a clip and then editing one half would silently edit both.
 	{
+		// Force the COW allocation to grow the global key backing. A view taken
+		// before this allocation would point into the old block after realloc.
+		session_kf_reset()
+		delete(session_kf_keys)
+		session_kf_keys = nil
 		a := Kf_Keys_Range{}
 		session_kf_reserve(&a, 2)
 		session_kf_push(&a, session_kf_key(5, 50.0))

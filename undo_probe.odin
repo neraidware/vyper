@@ -256,7 +256,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	edit_commit()
 	rcheck(undo_count() == 1, "keyframe value edit adds one node", fail)
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].value == 42.0,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 42.0,
 		"keyframe value edit applied",
 		fail,
 	)
@@ -265,7 +265,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// touching it (the captured pointer dangles into the freed tree).
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].value == 100.0,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 100.0,
 		"undo restores pre-edit keyframe value",
 		fail,
 	)
@@ -273,7 +273,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	undo_redo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].value == 42.0,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 42.0,
 		"redo restores edited keyframe value",
 		fail,
 	)
@@ -284,25 +284,25 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// zero value) — editing TO a non-default mode makes the round trip verify
 	// a real transition in both directions.
 	undo_begin()
-	clip0.keyframe_tracks[0].keys[1].interp = .Ease_In_Out
+	kf_key_mut(clip0, 0, 1).interp = .Ease_In_Out
 	undo_push(.Value, "Set keyframe interpolation")
 	rcheck(undo_count() == 2, "interpolation edit adds one undo node", fail)
 	rcheck(
-		clip0.keyframe_tracks[0].keys[1].interp == .Ease_In_Out,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Ease_In_Out,
 		"interpolation edit applied",
 		fail,
 	)
 	undo_undo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[1].interp == .Cubic,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Cubic,
 		"undo restores the mode the key had before the edit (default .Cubic)",
 		fail,
 	)
 	undo_redo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[1].interp == .Ease_In_Out,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Ease_In_Out,
 		"redo restores edited interpolation mode",
 		fail,
 	)
@@ -343,22 +343,20 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	base_fixture :: proc() {
 		cl := &timeline.tracks[0].clips[0]
 		cl.timeline_start_frame = 10
-		// A track owns its cloned name AND its key array, so both go before the
-		// row is dropped. `clear` and not `delete` on the list itself: clear
-		// keeps the outer capacity so the two fixed tracks re-mint into the same
-		// buffer, while delete frees the rows and leaves a header that append
-		// then re-reserves from (segfaulting on the second base_fixture call).
-		for tr in &cl.keyframe_tracks {
+		// Return exclusive keys and track slots before resetting fixture's rows.
+		for i in 0..<cl.keyframe_tracks.n {
+			tr := session_trk_view_mut(&cl.keyframe_tracks, i)
 			// Lane names are pool handles (TODO.md Active 19); only keys are owned.
-			delete(tr.keys)
+			if !tr.keys.shared { session_kf_release(tr.keys) }
 		}
-		clear(&cl.keyframe_tracks)
-		append(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("transform.x")})
-		append(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("scale")})
+		session_trk_release_range(cl.keyframe_tracks)
+		cl.keyframe_tracks = Kf_Track_Range{}
+		session_trk_push(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("transform.x")})
+		session_trk_push(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("scale")})
 		kf_geom_set_lane_key(cl, "transform.x", 10, 1.0)
 		kf_geom_set_lane_key(cl, "transform.x", 20, 2.0)
 		kf_geom_set_lane_key(cl, "scale", 5, 1.0)
-		cl.keyframe_tracks[0].keys[1].interp = .Elastic
+		session_kf_at_ptr(session_trk_view(cl.keyframe_tracks,0).keys,1).interp = .Elastic
 		kf_geom_set_lane_key(cl, "transform.x", 50, 3.0)
 		undo_init()
 	}
@@ -425,7 +423,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	rcheck(undo_count() == 1, "one interp pick on four keys is ONE undo node", fail)
 	all_ease := true
 	for item in kf_sel.items {
-		_, _, k, kok := kf_resolve(item)
+		_, _, k, kok := kf_resolve_value(item)
 		all_ease = all_ease && kok && k.interp == .Ease_Out
 	}
 	rcheck(all_ease, "the pick wrote every selected key", fail)
@@ -443,15 +441,15 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	undo_undo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[1].interp == .Elastic &&
-			clip0.keyframe_tracks[0].keys[0].interp == .Cubic,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Elastic &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).interp == .Cubic,
 		"undo restores the per-key modes the set had before the pick",
 		fail,
 	)
 	undo_redo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].interp == .Ease_Out,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).interp == .Ease_Out,
 		"redo re-applies the mode to the whole set",
 		fail,
 	)
@@ -472,24 +470,25 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	rcheck(undo_count() == 1, "moving four keys is ONE undo node", fail)
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].frame_off == 13 &&
-			clip0.keyframe_tracks[0].keys[1].frame_off == 23 &&
-			clip0.keyframe_tracks[0].keys[2].frame_off == 50 &&
-			clip0.keyframe_tracks[1].keys[0].frame_off == 8,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 13 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 23 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,2).frame_off == 50 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,1)^.keys,0).frame_off == 8,
 		"every key slid by the same delta, each clamped into its own clip",
 		fail,
 	)
 	rcheck(
-		clip0.keyframe_tracks[0].keys[1].interp == .Elastic,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Elastic,
 		"a move preserves the key's interpolation (the insert path would zero it)",
 		fail,
 	)
 	rcheck(kf_sel_count() == 4, "the whole set is re-selected after the move", fail)
 	sorted_ok := true
-	for lane in 0 ..< len(clip0.keyframe_tracks) {
-		keys := &clip0.keyframe_tracks[lane].keys
-		for ki in 1 ..< len(keys) {
-			sorted_ok &= keys[ki - 1].frame_off < keys[ki].frame_off
+	for lane in 0 ..< clip0.keyframe_tracks.n {
+		keys := session_trk_view(clip0.keyframe_tracks,lane).keys
+		kn := keys.n
+		for ki in 1..<kn {
+			sorted_ok &= session_kf_at(keys, ki-1).frame_off < session_kf_at(keys, ki).frame_off
 		}
 	}
 	rcheck(sorted_ok, "every lane comes back sorted and frame-unique", fail)
@@ -497,9 +496,9 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	undo_undo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].frame_off == 10 &&
-			clip0.keyframe_tracks[0].keys[1].frame_off == 20 &&
-			clip0.keyframe_tracks[1].keys[0].frame_off == 5,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 10 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 20 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,1)^.keys,0).frame_off == 5,
 		"undo restores all four frames",
 		fail,
 	)
@@ -519,19 +518,19 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	clip0 = &timeline.tracks[0].clips[0]
 	// The unselected key at 50 is untouched, so the lane is [20, 30, 50].
 	rcheck(
-		len(clip0.keyframe_tracks[0].keys) == 3,
+		session_trk_view(clip0.keyframe_tracks,0)^.keys.n == 3,
 		"a key sliding onto a vacated frame moves both keys, not one",
 		fail,
 	)
 	rcheck(
-		clip0.keyframe_tracks[0].keys[0].frame_off == 20 &&
-			clip0.keyframe_tracks[0].keys[0].value == 1.0,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 20 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 1.0,
 		"the slid key re-landed on the vacated frame WITH ITS OWN VALUE",
 		fail,
 	)
 	rcheck(
-		clip0.keyframe_tracks[0].keys[1].frame_off == 30 &&
-			clip0.keyframe_tracks[1 - 1].keys[1].value == 2.0,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 30 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).value == 2.0,
 		"and the key it displaced moved on carrying its own value",
 		fail,
 	)
@@ -554,7 +553,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	rcheck(undo_count() == 0, "a drag whose every key clamps back commits no undo node", fail)
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		clip0.keyframe_tracks[0].keys[2].frame_off == 50,
+		session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,2).frame_off == 50,
 		"the clamped key stayed where it was",
 		fail,
 	)
@@ -573,11 +572,11 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// makes it reachable by dragging over keys the user did not pick, so it is
 	// pinned here rather than left to be discovered as silent key loss.
 	rcheck(
-		len(clip0.keyframe_tracks[0].keys) == 2 &&
-			clip0.keyframe_tracks[0].keys[0].frame_off == 20 &&
-			clip0.keyframe_tracks[0].keys[0].value == 1.0 &&
-			clip0.keyframe_tracks[0].keys[1].frame_off == 50 &&
-			clip0.keyframe_tracks[0].keys[1].value == 3.0,
+		session_trk_view(clip0.keyframe_tracks,0)^.keys.n == 2 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 20 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 1.0 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 50 &&
+			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).value == 3.0,
 		"the clamped key held its frame, the other slid, and the unselected key it landed on was absorbed",
 		fail,
 	)
@@ -612,22 +611,22 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	rcheck(!kf_sel_active(), "delete drops the whole selection", fail)
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		len(clip0.keyframe_tracks) == 0,
+		clip0.keyframe_tracks.n == 0,
 		"every key is gone, and each track dropped with its last one",
 		fail,
 	)
 	undo_undo()
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
-		len(clip0.keyframe_tracks) == 2 &&
-			len(clip0.keyframe_tracks[0].keys) == 3 &&
-			len(clip0.keyframe_tracks[1].keys) == 1,
+		clip0.keyframe_tracks.n == 2 &&
+			session_trk_view(clip0.keyframe_tracks,0)^.keys.n == 3 &&
+			session_trk_view(clip0.keyframe_tracks,1)^.keys.n == 1,
 		"undo restores every deleted key and both dropped tracks",
 		fail,
 	)
 	undo_redo()
 	clip0 = &timeline.tracks[0].clips[0]
-	rcheck(len(clip0.keyframe_tracks) == 0, "redo deletes the whole set again", fail)
+	rcheck(clip0.keyframe_tracks.n == 0, "redo deletes the whole set again", fail)
 	// A stale set must never come back as live: kf_clear keeps the buffer, so the
 	// next selection re-stamps the gen rather than inheriting the old one.
 	rcheck(!kf_sel_active(), "the selection is still clear after the redo's tree swap", fail)

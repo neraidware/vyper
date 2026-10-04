@@ -54,9 +54,9 @@ geom_key_check :: proc(cond: bool, msg: string, args: ..any) {
 // invisible, so the fixture must be inside the span or it proves nothing.
 geom_key_fixture :: proc() -> (cl: ^Clip) {
 	// Each case gets its own single-track timeline. free_timeline (not clear)
-	// because a Track owns dynamic arrays of Clips, and each Clip owns
-	// keyframe track names + key arrays — clear would orphan all of them, and
-	// appending a fresh track each case would leave the earlier cases'
+	// because a Track owns a dynamic Clip array, and its Clips hold session range
+	// reservations — clear would orphan those slots and appending a fresh track
+	// each case would leave the earlier cases'
 	// clips alive with selection pointing into the wrong one.
 	free_timeline(&timeline)
 	append(&timeline.tracks, Track{})
@@ -95,20 +95,19 @@ geom_key_fixture :: proc() -> (cl: ^Clip) {
 // paired with the resting-baseline value each is keyed at. Derived from the
 // enum rather than hand-listed so a new Render_Geom_Prop cannot be silently
 // left out of the fixture.
-// geom_key_drop_track removes a keyframe track by name, freeing the name and
-// key arrays it owns. The probe builds fixtures by hand, so it has to honor the
-// same ownership rules the store does or valgrind would rightly complain.
+// geom_key_drop_track removes a keyframe track by name and returns its exclusive
+// key range. The probe builds fixtures by hand, so it honors session ownership.
 geom_key_drop_track :: proc(cl: ^Clip, name: string) {
 	ti := kf_track_index(cl^, name)
 	if ti < 0 {
 		return
 	}
-	tr := &cl.keyframe_tracks[ti]
-	// name is a pool handle: nothing to free. keys are still owned.
-	if tr.keys != nil {
-		delete(tr.keys)
+	tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
+	// Name is interned; shared key ranges remain with their other holder.
+	if tr.keys.slots > 0 && !tr.keys.shared {
+		session_kf_release(tr.keys)
 	}
-	ordered_remove(&cl.keyframe_tracks, ti)
+	session_trk_erase(&cl.keyframe_tracks, ti)
 }
 
 // geom_key_unkeyed_fixture is geom_key_fixture with every keyframe track
@@ -118,14 +117,14 @@ geom_key_drop_track :: proc(cl: ^Clip, name: string) {
 // every pending-related assertion starts here.
 geom_key_unkeyed_fixture :: proc() -> (cl: ^Clip) {
 	cl = geom_key_fixture()
-	for ti := len(cl.keyframe_tracks) - 1; ti >= 0; ti -= 1 {
-		name := kf_track_name(&cl.keyframe_tracks[ti])
+	for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
+		name := kf_track_name(&session_trk_view(cl.keyframe_tracks, ti)^)
 		if name == "" {
 			continue
 		}
 		geom_key_drop_track(cl, name)
 	}
-	geom_key_check(len(cl.keyframe_tracks) == 0, "fixture: the un-keyed case must start with no tracks")
+	geom_key_check(cl.keyframe_tracks.n == 0, "fixture: the un-keyed case must start with no tracks")
 	geom_key_check(!clip_geom_any_modified(cl), "fixture: a fresh clip has nothing pending")
 	return cl
 }
@@ -276,15 +275,15 @@ geom_key_probe_run :: proc() -> int {
 	{
 		cl := geom_key_fixture()
 		// Strip every geometry track: same clip, nothing keyed.
-		for ti := len(cl.keyframe_tracks) - 1; ti >= 0; ti -= 1 {
-			tr := &cl.keyframe_tracks[ti]
+		for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
+			tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
 			// name is a pool handle: nothing to free here.
-			if tr.keys != nil {
-				delete(tr.keys)
+			if tr.keys.slots > 0 && !tr.keys.shared {
+				session_kf_release(tr.keys)
 			}
-			ordered_remove(&cl.keyframe_tracks, ti)
+			session_trk_erase(&cl.keyframe_tracks, ti)
 		}
-		geom_key_check(len(cl.keyframe_tracks) == 0, "fixture: the un-keyed case must start with no tracks")
+		geom_key_check(cl.keyframe_tracks.n == 0, "fixture: the un-keyed case must start with no tracks")
 		cl.crop_l = 0.1
 		cl.crop_r = 0.1
 		before, _ := geom_key_sample(cl, .Crop_L)
@@ -297,9 +296,9 @@ geom_key_probe_run :: proc() -> int {
 			after,
 		)
 		geom_key_check(
-			len(cl.keyframe_tracks) == 0,
+			cl.keyframe_tracks.n == 0,
 			"un-keyed clip: Alt+drag must NOT mint a track (auto-key never mints) — got %d tracks",
-			len(cl.keyframe_tracks),
+			cl.keyframe_tracks.n,
 		)
 		geom_key_check(
 			abs(cl.crop_l - 0.1) > 0.0001,
@@ -366,7 +365,7 @@ geom_key_probe_run :: proc() -> int {
 		// A no-op commit must not stamp a key: the field was seeded from the
 		// sampled value, so re-committing it unchanged changes nothing visible.
 		ti := kf_track_index(cl^, "crop.l")
-		keys_before := len(cl.keyframe_tracks[ti].keys)
+		keys_before := session_trk_view(cl.keyframe_tracks,ti).keys.n
 		edit_begin(.Crop_L, clip_geom_get(cl, .Crop_L))
 		for i in 0 ..< len(edit_state.chars) {
 			edit_state.chars[i] = 0
@@ -377,10 +376,10 @@ geom_key_probe_run :: proc() -> int {
 		}
 		edit_commit()
 		geom_key_check(
-			len(cl.keyframe_tracks[ti].keys) == keys_before,
+			session_trk_view(cl.keyframe_tracks,ti).keys.n == keys_before,
 			"committing the value already on screen must not add a key (%d -> %d)",
 			keys_before,
-			len(cl.keyframe_tracks[ti].keys),
+			session_trk_view(cl.keyframe_tracks,ti).keys.n,
 		)
 	}
 
@@ -394,13 +393,13 @@ geom_key_probe_run :: proc() -> int {
 	{
 		cl := geom_key_fixture()
 		// Replace the per-lane tracks with one packed crop section.
-		for ti := len(cl.keyframe_tracks) - 1; ti >= 0; ti -= 1 {
-			tr := &cl.keyframe_tracks[ti]
+		for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
+			tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
 			if kf_track_name(tr) == "crop" {
-				if tr.keys != nil {
-					delete(tr.keys)
+				if tr.keys.slots > 0 && !tr.keys.shared {
+					session_kf_release(tr.keys)
 				}
-				ordered_remove(&cl.keyframe_tracks, ti)
+				session_trk_erase(&cl.keyframe_tracks, ti)
 			}
 		}
 		geom_key_drop_track(cl, "crop.l")
@@ -486,10 +485,12 @@ geom_key_probe_run :: proc() -> int {
 		// "stamps keys nobody asked for" failure clip_geom_drag exists to avoid.
 		crop_ti := kf_track_index(cl^, "crop")
 		if crop_ti >= 0 {
-			keys := cl.keyframe_tracks[crop_ti].keys
+			keys := session_trk_view(cl.keyframe_tracks,crop_ti).keys
 			off_new := i32(playhead.frame - cl.timeline_start_frame)
 			found := false
-			for &k in keys {
+			kv := session_kf_view(keys)
+			for i in 0 ..< keys.n {
+				k := kv[i]
 				if k.frame_off != off_new {
 					continue
 				}
@@ -535,11 +536,11 @@ geom_key_probe_run :: proc() -> int {
 		ti := kf_track_index(cl^, "crop.l")
 		geom_key_check(ti >= 0, "fixture: the guard case still has a crop.l track")
 		if ti >= 0 {
-			keys := cl.keyframe_tracks[ti].keys
+			keys := session_trk_view(cl.keyframe_tracks,ti).keys
 			geom_key_check(
-				len(keys) == 2,
+				keys.n == 2,
 				"an off-clip edit must not mint a key (2 fixture keys expected, got %d)",
-				len(keys),
+				keys.n,
 			)
 		}
 		geom_key_check(
@@ -692,19 +693,19 @@ geom_key_probe_run :: proc() -> int {
 			if ti < 0 {
 				continue
 			}
-			keys := cl.keyframe_tracks[ti].keys
+			keys := session_trk_view(cl.keyframe_tracks,ti).keys
 			geom_key_check(
-				len(keys) == 1,
+				keys.n == 1,
 				"one gesture at one playhead => one key on the section (got %d)",
-				len(keys),
+				keys.n,
 			)
-			if len(keys) == 1 {
-				if v, is_pack := keys[0].value.([KF_PACK_MAX]f32); is_pack {
+			if keys.n == 1 {
+				if v, is_pack := session_kf_at(keys,0).value.([KF_PACK_MAX]f32); is_pack {
 					geom_key_check(
-						keys[0].mask == kf_geom_full_mask(name),
+						session_kf_at(keys,0).mask == kf_geom_full_mask(name),
 						"the %q knot must key every lane the pan wrote (mask %d)",
 						name,
-						keys[0].mask,
+					session_kf_at(keys,0).mask,
 					)
 					geom_key_check(
 						kf_approx(v[0], clip_geom_get(cl, defs[sec_index].lanes[0])),

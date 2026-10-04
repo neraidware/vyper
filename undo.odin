@@ -66,12 +66,9 @@ Undo_History :: struct {
 undo_hist: Undo_History
 
 // ---------------------------------------------------------------------------
-// Snapshot ownership. A snapshot duplicates the owned dynamic arrays and the
-// owned string fields (track.name, clip.name, marker labels) — every heap
-// string free_timeline releases — so a stored snapshot never dangles when the
-// live copy is freed, and free_timeline can release all of it without leaking
-// on repeated undo. clip.path (asset-owned) is shared as-is and never freed
-// here: it points into the media bin, which outlives every timeline.
+// Snapshot ownership. Outer track/clip arrays and track names are cloned;
+// Clip POD records share session marker/key ranges through COW. clip.path
+// (asset-owned) and interned strings remain shared and are never freed here.
 // ---------------------------------------------------------------------------
 
 clone_timeline :: proc(src: Timeline) -> Timeline {
@@ -92,7 +89,9 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 			clips = make([dynamic]Clip, len(st.clips)),
 		}
 		for j in 0 ..< len(st.clips) {
-			nt.clips[j] = clip_deep_copy(&st.clips[j])
+			nt.clips[j] = st.clips[j]
+			nt.clips[j].markers = session_marker_share(&st.clips[j].markers)
+			nt.clips[j].keyframe_tracks = session_trk_share(&st.clips[j].keyframe_tracks)
 		}
 		out.tracks[i] = nt
 	}
@@ -103,7 +102,7 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 free_timeline :: proc(t: ^Timeline) {
 	for &tr in t.tracks {
 		for &c in tr.clips {
-			clip_payload_free(&c)
+			clip_ranges_release(&c)
 		}
 		if tr.clips != nil {
 			delete(tr.clips)

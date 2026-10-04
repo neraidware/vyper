@@ -540,7 +540,7 @@ parity_probe_dump_state :: proc() {
 				"opacity",
 				clip.opacity,
 				"kf_tracks",
-				len(clip.keyframe_tracks),
+				clip.keyframe_tracks.n,
 			)
 		}
 	}

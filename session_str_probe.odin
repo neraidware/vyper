@@ -80,7 +80,7 @@ session_str_probe_run :: proc() {
 	// The Clip-level shape of the same property: a copy shares the handle, a
 	// rename publishes a new one, and the original copy is unaffected.
 	src := Clip{name = h}
-	dup := src // what clip_deep_copy does for the name field
+	dup := src // Clip value copies carry the immutable name handle
 	clip_set_name(&dup, "renamed")
 	session_str_probe_check(
 		clip_name(&src) == "A012_C003_take07.mov" && clip_name(&dup) == "renamed",

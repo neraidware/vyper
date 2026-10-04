@@ -89,10 +89,13 @@ Kf_Track :: struct {
 	// owned by the session, so a track copy is a struct copy. Read through
 	// kf_track_name, match through kf_track_index.
 	name: Session_Str_Handle,
-	// keys: sorted ascending by frame_off. STILL a per-track owned array at this
-	// step; keys move into a session store once the copy-on-write story for them
-	// is settled (TODO.md Active 19, S2).
-	keys: [dynamic]Keyframe,
+	// keys: sorted ascending by frame_off. A window into the session key store
+	// (session_kf.odin), not an owned array: the session owns the slots and
+	// outlives every holder, so copying a track is a struct copy and there is
+	// nothing per-track to free. Read through session_kf_view/session_kf_at,
+	// mutate through session_kf_push/insert/erase/set after session_kf_make_unique
+	// has resolved sharing (TODO.md Active 19, S2b).
+	keys: Kf_Keys_Range,
 }
 
 // kf_track_name is the track's name. The result borrows the pool. Note this is
@@ -143,12 +146,21 @@ kf_lane_value :: proc(k: Keyframe, idx: int) -> (value: f32, covered: bool) {
 // path, on a predicate clip_geom evaluates per frame. Borrowing costs a compare
 // over a handful of lanes and allocates nothing.
 kf_track_index :: proc(clip: Clip, name: string) -> int {
-	for i in 0 ..< len(clip.keyframe_tracks) {
-		if kf_track_name(&clip.keyframe_tracks[i]) == name {
+	n := clip.keyframe_tracks.n
+	for i in 0 ..< n {
+		if kf_track_name(session_trk_view(clip.keyframe_tracks, i)) == name {
 			return i
 		}
 	}
 	return -1
+}
+
+// Resolve writable key access through both COW layers before returning a
+// pointer. Never retain returned pointer across a track/key store mutation.
+kf_key_mut :: proc(clip: ^Clip, track_index, key_index: int) -> ^Keyframe {
+	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
+	session_kf_make_unique(&track.keys)
+	return session_kf_at_ptr(track.keys, key_index)
 }
 
 // kf_fill_snapshot copies `name`'s track into `dst` (a flat fixed array) up to
@@ -164,11 +176,11 @@ kf_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, tota
 	if ti < 0 {
 		return 0, 0
 	}
-	tk := &clip.keyframe_tracks[ti]
-	total = len(tk.keys)
+	tk := session_trk_view(clip.keyframe_tracks, ti)
+	total = tk.keys.n
 	n = min(total, len(dst))
 	if n > 0 {
-		mem.copy(raw_data(dst[:n]), raw_data(tk.keys[:n]), n * size_of(Keyframe))
+		mem.copy(raw_data(dst[:n]), raw_data(session_kf_view(tk.keys)), n * size_of(Keyframe))
 	}
 	return
 }
@@ -195,32 +207,26 @@ kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
 	kf_bump_structure()
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
-		append(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(name)})
-		ti = len(clip.keyframe_tracks) - 1
+		session_trk_push(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(name)})
+		ti = clip.keyframe_tracks.n - 1
 	}
-	track := &clip.keyframe_tracks[ti]
+	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	// Sharing first: this clip may be a copy that shares its keys with the clip it
+	// came from, and writing before resolving that would edit both.
+	session_kf_make_unique(&track.keys)
 	// Insertion point: last key at-or-before frame_off.
 	ip := 0
-	for ip < len(track.keys) && track.keys[ip].frame_off <= frame_off {
+	for ip < track.keys.n && session_kf_at(track.keys, ip).frame_off <= frame_off {
 		ip += 1
 	}
-	if ip > 0 && track.keys[ip-1].frame_off == frame_off {
-		track.keys[ip-1].value = value
+	if ip > 0 && session_kf_at(track.keys, ip - 1).frame_off == frame_off {
+		session_kf_at_ptr(track.keys, ip - 1).value = value
 		return
 	}
-	// Grow the dynamic array by one (sentinel slot) before the slide, so both
-	// the fresh-track first key (ip == 0, empty keys) and an end-append
-	// (ip == len(old keys)) have a valid slot to land in.
-	append(&track.keys, Keyframe {})
-	if ip < len(track.keys) - 1 {
-		// Slide the tail right to make room, keeping the array sorted.
-		mem.copy(
-			mem.raw_data(track.keys[ip + 1:]),
-			mem.raw_data(track.keys[ip:len(track.keys) - 1]),
-			size_of(Keyframe) * (len(track.keys) - 1 - ip),
-		)
-	}
-	track.keys[ip] = Keyframe {frame_off = frame_off, value = value}
+	// One call, replacing the append-a-sentinel-then-slide-the-tail dance. That
+	// dance had to grow the array before the mem.copy so there would be a slot to
+	// land in; get the order wrong and the key is silently dropped.
+	session_kf_insert(&track.keys, ip, Keyframe {frame_off = frame_off, value = value})
 }
 
 // kf_del_key removes the key at frame_off from `name`'s track; drops the track
@@ -231,21 +237,15 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 	if ti < 0 {
 		return
 	}
-	track := &clip.keyframe_tracks[ti]
-	for i in 0 ..< len(track.keys) {
-		if track.keys[i].frame_off == frame_off {
-			if i < len(track.keys) - 1 {
-				mem.copy(
-					mem.raw_data(track.keys[i:]),
-					mem.raw_data(track.keys[i + 1:]),
-					size_of(Keyframe) * (len(track.keys) - 1 - i),
-				)
-			}
-			pop(&track.keys)
+	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	session_kf_make_unique(&track.keys)
+	for i in 0 ..< track.keys.n {
+		if session_kf_at(track.keys, i).frame_off == frame_off {
+			session_kf_erase(&track.keys, i)
 			break
 		}
 	}
-	if len(track.keys) == 0 {
+	if track.keys.n == 0 {
 		// The track owns its key array, and the deletion above only POPPED it:
 		// pop shortens without releasing the buffer, so track.keys still holds a
 		// live allocation here. Dropping the row with ordered_remove then shifted
@@ -255,11 +255,11 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 		// a path deleting keys down to empty). So the keys array is deleted here;
 		// the name used to be deleted alongside it and no longer needs to be,
 		// because it is a pool handle (TODO.md Active 19).
-		delete(track.keys)
+		session_kf_release(track.keys)
 		// name is a pool handle: no delete, and nothing to blank either -- the row
 		// leaves the array on the next line.
-		track.keys = nil
-		ordered_remove(&clip.keyframe_tracks, ti)
+		track.keys = {}
+		session_trk_erase(&clip.keyframe_tracks, ti)
 	}
 }
 
@@ -273,30 +273,26 @@ kf_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 kf_set_packed_key :: proc(clip: ^Clip, name: string, frame_off: i32, lanes: [KF_PACK_MAX]f32, mask: u8) {
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
-		append(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(name)})
-		ti = len(clip.keyframe_tracks) - 1
+		session_trk_push(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(name)})
+		ti = clip.keyframe_tracks.n - 1
 	}
-	track := &clip.keyframe_tracks[ti]
+	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	session_kf_make_unique(&track.keys)
 	ip := 0
-	for ip < len(track.keys) && track.keys[ip].frame_off <= frame_off {
+	for ip < track.keys.n && session_kf_at(track.keys, ip).frame_off <= frame_off {
 		ip += 1
 	}
-	if ip > 0 && track.keys[ip-1].frame_off == frame_off {
-		track.keys[ip-1].mask = mask
-		track.keys[ip-1].value = lanes
+	if ip > 0 && session_kf_at(track.keys, ip - 1).frame_off == frame_off {
+		kp := session_kf_at_ptr(track.keys, ip - 1)
+		kp.mask = mask
+		kp.value = lanes
 		return
 	}
-	// Grow the dynamic array by one (sentinel slot) before the slide, the
-	// same first-key/end-append/ordered-insert contract kf_set_key uses.
-	append(&track.keys, Keyframe {})
-	if ip < len(track.keys) - 1 {
-		mem.copy(
-			mem.raw_data(track.keys[ip + 1:]),
-			mem.raw_data(track.keys[ip:len(track.keys) - 1]),
-			size_of(Keyframe) * (len(track.keys) - 1 - ip),
-		)
-	}
-	track.keys[ip] = Keyframe {frame_off = frame_off, mask = mask, value = lanes}
+	session_kf_insert(
+		&track.keys,
+		ip,
+		Keyframe {frame_off = frame_off, mask = mask, value = lanes},
+	)
 }
 
 // --- curve math (easing + spline evaluators) -----------------------------
@@ -434,7 +430,7 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 // fold keeps every lane's own keyframe set intact. Before the lane's first
 // covering knot and after its last, the lane is inactive and `base` rules.
 kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: f32) -> (f32, bool) {
-	if track == nil || len(track.keys) == 0 {
+	if track == nil || track.keys.n == 0 {
 		return base, false
 	}
 	// Backward scan: the last covering knot at or before the frame (prev) and
@@ -444,8 +440,8 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 	prev2: Keyframe
 	have_prev := false
 	have_prev2 := false
-	for i := len(track.keys) - 1; i >= 0; i -= 1 {
-		k := track.keys[i]
+	for i := track.keys.n - 1; i >= 0; i -= 1 {
+		k := session_kf_at(track.keys, i)
 		if k.frame_off > frame_off {
 			continue
 		}
@@ -471,8 +467,8 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 	next2: Keyframe
 	have_next := false
 	have_next2 := false
-	for i := 0; i < len(track.keys); i += 1 {
-		k := track.keys[i]
+	for i := 0; i < track.keys.n; i += 1 {
+		k := session_kf_at(track.keys, i)
 		if k.frame_off <= frame_off {
 			continue
 		}
@@ -519,10 +515,10 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 // property is inactive and the caller keeps its own value — direct edits and
 // drags apply there.
 kf_sample :: proc(track: ^Kf_Track, frame_off: i32, base: f32) -> (f32, bool) {
-	if track == nil || len(track.keys) == 0 {
+	if track == nil || track.keys.n == 0 {
 		return base, false
 	}
-	return kf_sample_keys(track.keys[:], frame_off, base)
+	return kf_sample_keys(session_kf_view(track.keys), frame_off, base)
 }
 
 // kf_sample_for resolves `name` against the clip and samples at a TIMELINE
@@ -534,44 +530,22 @@ kf_sample_for :: proc(clip: ^Clip, name: string, timeline_frame: i64, base: f32)
 	if ti < 0 {
 		return base, false
 	}
-	return kf_sample(&clip.keyframe_tracks[ti], i32(timeline_frame - clip.timeline_start_frame), base)
+	return kf_sample(session_trk_view(clip.keyframe_tracks, ti), i32(timeline_frame - clip.timeline_start_frame), base)
 }
 
-// --- deep-copy / free (the clip ownership matrix's keyframe half) -----------
-
-// kf_clone_mut deep-clones src's tracks into dst, REPLACING dst's current
-// tracks. Callers are the deep-copy sites (clone_timeline snapshots,
-// duplicate_track/clip): after this the two clips share no owned memory. dst's
-// prior tracks are NOT freed -- callers hand a fresh struct (or one whose
-// tracks alias src, like the split copies), so freeing would hit src's memory.
-kf_clone_mut :: proc(dst: ^Clip, src: Clip) {
-	if len(src.keyframe_tracks) == 0 {
-		dst.keyframe_tracks = nil
+// kf_free_tracks releases exclusively held track rows and key ranges. Shared
+// ranges stay session-owned because another Clip may still address them.
+kf_free_tracks :: proc(r: Kf_Track_Range) {
+	if r.shared {
 		return
 	}
-	dst.keyframe_tracks = make([dynamic]Kf_Track, len(src.keyframe_tracks))
-	for i in 0 ..< len(src.keyframe_tracks) {
-		st := src.keyframe_tracks[i]
-		nt := Kf_Track {name = st.name} // pool handle: copying it is the copy
-		if len(st.keys) > 0 {
-			nt.keys = make([dynamic]Keyframe, len(st.keys))
-			copy(nt.keys[:], st.keys[:])
-		}
-		dst.keyframe_tracks[i] = nt
-	}
-}
-
-// kf_free_tracks releases one clip's keyframe data: each track's name string
-// and keys backing, then the tracks array itself. Call only on arrays the clip
-// solely owns (teardown, delete paths).
-kf_free_tracks :: proc(tracks: [dynamic]Kf_Track) {
-	for &t in tracks {
-		// name is a pool handle and owns nothing; only keys need a free.
-		if t.keys != nil {
-			delete(t.keys)
+	for i in 0..<r.n {
+		t := session_trk_view(r, i)
+		if t.keys.slots > 0 && !t.keys.shared {
+			session_kf_release(t.keys)
 		}
 	}
-	delete(tracks)
+	session_trk_release_range(r)
 }
 
 // kf_rebuild_tracks builds a fresh track array from src by filtering each
@@ -579,24 +553,38 @@ kf_free_tracks :: proc(tracks: [dynamic]Kf_Track) {
 // Tracks left with no keys are dropped. src is untouched (its owner frees it
 // after the halves are built), so the output shares no owned memory with it --
 // the name, being a pool handle, is shared by design and needs no copy.
-kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Track {
-	out := make([dynamic]Kf_Track, 0, len(src))
-	for st in src {
-		keys := make([dynamic]Keyframe, 0, len(st.keys))
-		for k in st.keys {
+kf_rebuild_tracks :: proc(src: Kf_Track_Range, lo, hi: i32) -> Kf_Track_Range {
+	out := Kf_Track_Range{}
+	sn := src.n
+	for si in 0..<sn {
+		st := session_trk_view(src, si)^
+		if st.keys.n == 0 {
+			continue
+		}
+		r := Kf_Keys_Range{}
+		for i in 0 ..< st.keys.n {
+			k := session_kf_at(st.keys, i)
 			if k.frame_off >= lo && k.frame_off < hi {
-// Preserve mask + union payload + interpolation mode: a packed
-			// (section) key rides the split/trim remap intact with its own
-			// curve, mask=0 -> scalar comes along for free. Dropping interp
-			// here (as each half is a NEW key) would silently reset every
-			// eased/spline mode to Linear on split or trim.
-			append(&keys, Keyframe {frame_off = k.frame_off - lo, mask = k.mask, value = k.value, interp = k.interp})
+				// Preserve mask + union payload + interpolation mode: a packed
+				// (section) key rides the split/trim remap intact with its own
+				// curve, mask=0 -> scalar comes along for free. Dropping interp
+				// here (as each half is a NEW key) would silently reset every
+				// eased/spline mode to Linear on split or trim.
+				session_kf_push(
+					&r,
+					Keyframe {
+						frame_off = k.frame_off - lo,
+						mask      = k.mask,
+						value     = k.value,
+						interp    = k.interp,
+					},
+				)
 			}
 		}
-		if len(keys) > 0 {
-			append(&out, Kf_Track {name = st.name, keys = keys}) // pool handle
+		if r.n > 0 {
+			session_trk_push(&out, Kf_Track {name = st.name, keys = r}) // pool handle
 		} else {
-			delete(keys)
+			session_kf_release(r)
 		}
 	}
 	return out
@@ -605,7 +593,7 @@ kf_rebuild_tracks :: proc(src: [dynamic]Kf_Track, lo, hi: i32) -> [dynamic]Kf_Tr
 // kf_trim_head drops keys on the trimmed head and re-relativizes the rest
 // (a clip whose head was cut off and which shifted left by `cut`).
 kf_trim_head :: proc(clip: ^Clip, cut: i32) {
-	if len(clip.keyframe_tracks) == 0 {
+	if clip.keyframe_tracks.n == 0 {
 		return
 	}
 	kf_bump_structure()
@@ -617,7 +605,7 @@ kf_trim_head :: proc(clip: ^Clip, cut: i32) {
 // kf_trim_tail drops keys beyond the clip's new length (`keep` = new length);
 // survivors keep their offsets.
 kf_trim_tail :: proc(clip: ^Clip, keep: i32) {
-	if len(clip.keyframe_tracks) == 0 {
+	if clip.keyframe_tracks.n == 0 {
 		return
 	}
 	kf_bump_structure()
@@ -633,8 +621,8 @@ kf_trim_tail :: proc(clip: ^Clip, keep: i32) {
 kf_rows_for :: proc(track: ^Track) -> int {
 	rows := 0
 	for &c in track.clips {
-		if len(c.keyframe_tracks) > rows {
-			rows = len(c.keyframe_tracks)
+		if c.keyframe_tracks.n > rows {
+			rows = c.keyframe_tracks.n
 		}
 	}
 	return rows

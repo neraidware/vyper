@@ -572,7 +572,9 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			clip.scale = 1
 			// OBS hybrid MP4 recordings embed chapter markers as a text stream;
 			// surface them on the video clip as embedded clip markers.
-			clip.markers = import_obs_chapters(asset.path)
+			imported_markers := import_obs_chapters(asset.path)
+			clip.markers = session_marker_from_slice(imported_markers[:])
+			delete(imported_markers)
 		} else if is_sub {
 			// Subtitle generator clip sits centered on the project canvas at
 			// native scale, exactly like add_subtitle_generator_clip sets it.

@@ -95,7 +95,7 @@ edit_commit :: proc() {
 		if !kok {
 			return
 		}
-		lane_name := kf_track_name(&kcl.keyframe_tracks[klane])
+		lane_name := kf_track_name(session_trk_view(kcl.keyframe_tracks, klane))
 		frame := k.frame_off
 		v0: f32
 		if k.mask != 0 {

@@ -162,31 +162,26 @@ tl_split_scene :: proc() {
 	tl_straddle_scene()
 	cl := &timeline.tracks[0].clips[0]
 	cl.source_start_frame = 100
-	cl.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
-	append(&cl.keyframe_tracks, Kf_Track {
+	cl.keyframe_tracks = Kf_Track_Range{}
+	session_trk_push(&cl.keyframe_tracks, Kf_Track {
 		name = session_str_intern("transform.x"),
-		keys = make([dynamic]Keyframe, 0, 4),
+		keys = Kf_Keys_Range{},
 	})
-	append(
-		&cl.keyframe_tracks[0].keys,
-		Keyframe{frame_off = 50, value = 0.0},
-		Keyframe{frame_off = 250, value = 1.0},
-	)
+	track := session_trk_view_mut(&cl.keyframe_tracks, 0)
+	session_kf_push(&track.keys, Keyframe{frame_off=50,value=0.0})
+	session_kf_push(&track.keys, Keyframe{frame_off=250,value=1.0})
 	// Markers are keyed by SOURCE frame. The clip starts at source 100 and the
 	// cut is 200 frames in, so the halves read source [100,300) and [300,500):
 	// one marker each, which is what makes the label-ownership check possible.
-	append(&cl.markers, Clip_Marker{source_frame = 150, label = session_str_intern("m-a")})
-	append(&cl.markers, Clip_Marker{source_frame = 350, label = session_str_intern("m-b")})
+	session_marker_push(&cl.markers, Clip_Marker{source_frame = 150, label = session_str_intern("m-a")})
+	session_marker_push(&cl.markers, Clip_Marker{source_frame = 350, label = session_str_intern("m-b")})
 	selection.track = 0
 	selection.index = 0
 	playhead.frame = 200
 }
 
-// test_split_halves_own_their_payload: after a split, every owned field must
-// belong to exactly one half. The split copied the struct, so both halves held
-// the same name pointer, the same marker labels and (before kf_split_parts
-// rebuilt them) the same keys backing — which free_timeline then double-freed.
-// Mutating one half must not be visible in the other.
+// test_split_halves_own_their_payload pins clip identity plus COW isolation for
+// interned names, marker ranges and keyframe ranges.
 test_split_halves_own_their_payload :: proc() {
 	tl_split_scene()
 	split_clip_at_playhead()
@@ -225,46 +220,48 @@ test_split_halves_own_their_payload :: proc() {
 		orig_name,
 	)
 	tl_probe_check(
-		len(left.keyframe_tracks) == 1 &&
-		len(right.keyframe_tracks) == 1 &&
-		len(left.keyframe_tracks[0].keys) == 1 &&
-		len(right.keyframe_tracks[0].keys) == 1,
+		left.keyframe_tracks.n == 1 &&
+		right.keyframe_tracks.n == 1 &&
+		session_trk_view(left.keyframe_tracks,0)^.keys.n == 1 &&
+		session_trk_view(right.keyframe_tracks,0)^.keys.n == 1,
 		"each half must own one lane with one key (got %d/%d lanes, %d/%d keys)",
-		len(left.keyframe_tracks),
-		len(right.keyframe_tracks),
-		len(left.keyframe_tracks[0].keys),
-		len(right.keyframe_tracks[0].keys),
+		left.keyframe_tracks.n,
+		right.keyframe_tracks.n,
+		session_trk_view(left.keyframe_tracks,0)^.keys.n,
+		session_trk_view(right.keyframe_tracks,0)^.keys.n,
 	)
 	tl_probe_check(
-		left.keyframe_tracks[0].keys[0].frame_off == 50 &&
-		right.keyframe_tracks[0].keys[0].frame_off == 50,
+		session_kf_at(session_trk_view(left.keyframe_tracks,0)^.keys,0).frame_off == 50 &&
+			session_kf_at(session_trk_view(right.keyframe_tracks,0)^.keys,0).frame_off == 50,
 		"the split's slice-1 rule: keys re-relativized by -left_len (got %d, %d)",
-		left.keyframe_tracks[0].keys[0].frame_off,
-		right.keyframe_tracks[0].keys[0].frame_off,
+		session_kf_at(session_trk_view(left.keyframe_tracks,0)^.keys,0).frame_off,
+		session_kf_at(session_trk_view(right.keyframe_tracks,0)^.keys,0).frame_off,
 	)
-	// Markers, same story: shared label handles, and a rename on one side must
-	// stay on one side.
+	// Marker ranges share until a label write triggers marker-list COW.
 	tl_probe_check(
-		len(left.markers) == 1 && len(right.markers) == 1,
+		left.markers.n == 1 && right.markers.n == 1,
 		"each half must keep one marker (got %d/%d markers)",
-		len(left.markers),
-		len(right.markers),
+		left.markers.n,
+		right.markers.n,
 	)
-	if len(left.markers) == 1 && len(right.markers) == 1 {
-		orig_label := marker_label(&right.markers[0])
-		marker_set_label(&left.markers[0], "renamed-marker")
+	if left.markers.n == 1 && right.markers.n == 1 {
+		right_marker := session_marker_at(right.markers, 0)
+		orig_label := marker_label(&right_marker)
+		marker_set_label(clip_marker_mut(left, 0), "renamed-marker")
+		left_marker := session_marker_at(left.markers, 0)
+		right_marker = session_marker_at(right.markers, 0)
 		tl_probe_check(
-			marker_label(&left.markers[0]) == "renamed-marker" &&
-			marker_label(&right.markers[0]) == orig_label,
+			marker_label(&left_marker) == "renamed-marker" &&
+			marker_label(&right_marker) == orig_label,
 			"renaming the left marker reached the right one (%q, was %q)",
-			marker_label(&right.markers[0]),
+			marker_label(&right_marker),
 			orig_label,
 		)
 	}
 	// Editing one half must not disturb the other: the shared-backing failure
 	// mode was invisible until teardown.
 	kf_geom_set_value(right, "transform.x", 50, 0.75)
-	v, _ := kf_lane_value(left.keyframe_tracks[0].keys[0], 0)
+	vk := session_kf_view(session_trk_view(left.keyframe_tracks,0)^.keys); v,_ := kf_lane_value(vk[0], 0)
 	tl_probe_check(
 		v != 0.75,
 		"a keyframe edit on the right half wrote through to the left (left lane reads %v)",

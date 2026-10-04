@@ -279,31 +279,19 @@ for j := 0; j < len(raw); {
 	os.exit(0)
 }
 
-// ui_probe_marker_copy_asserts covers the marker COPY paths without media:
-// clone_timeline (undo snapshots) and filter_markers_in_range (split). Those two
-// used to be the places that had to clone each label, because a label was a
-// uniquely owned heap string and a copy that forgot either the clone or the
-// matching free was a double-free or a leak. Labels are session-pool handles now
-// (TODO.md Active 19), so there is nothing to clone and nothing to free: a marker
-// copy is a struct copy.
-//
-// What still has to be true is that a copy carries the right VALUES and that the
-// copies are independent as arrays -- free_markers drops each array without
-// touching the pool, so this proc frees four marker sets and still exits clean
-// under the memory gate. The isolation that separate heap ownership used to buy
-// is asserted where it is now load-bearing: renaming one half must not reach the
-// other (test_split_halves_own_their_payload).
+// Marker arena probe: timeline snapshots share a POD range, writes COW the
+// marker list, and split filters build independent ranges.
 ui_probe_marker_copy_asserts :: proc() -> bool {
 	ok := true
 	src := Timeline{tracks = make([dynamic]Track, 1)}
 	src.tracks[0].name = strings.clone("marker-owner")
 	src.tracks[0].clips = make([dynamic]Clip, 1)
 	src.tracks[0].clips[0].name = session_str_intern("marker-clip")
-	src.tracks[0].clips[0].markers = make([dynamic]Clip_Marker, 0, 4)
+	src.tracks[0].clips[0].markers = Clip_Markers_Range{}
 	for i in 0 ..< 3 {
 		buf: [32]u8
 		s := fmt.bprintf(buf[:], "m%d", i)
-		append(
+		session_marker_push(
 			&src.tracks[0].clips[0].markers,
 			Clip_Marker{source_frame = i64(i) * 10, label = session_str_intern(s)},
 		)
@@ -313,29 +301,37 @@ ui_probe_marker_copy_asserts :: proc() -> bool {
 	// Snapshot clone (undo path) and two range filters (split path): each must
 	// carry its own labels, so editing or freeing one never touches another.
 	snap := clone_timeline(src)
-	lo := filter_markers_in_range(orig[:], 0, 20)
-	hi := filter_markers_in_range(orig[:], 20, 20)
+	lo := filter_markers_in_range(orig, 0, 20)
+	hi := filter_markers_in_range(orig, 20, 20)
 
-	if len(lo) != 2 || marker_label(&lo[0]) != "m0" || marker_label(&lo[1]) != "m1" {
-		fmt.eprintf("[ui-probe] lo markers wrong: n=%d\n", len(lo))
+	lo0, lo1 := session_marker_at(lo, 0), session_marker_at(lo, 1)
+	if lo.n != 2 || marker_label(&lo0) != "m0" || marker_label(&lo1) != "m1" {
+		fmt.eprintf("[ui-probe] lo markers wrong: n=%d\n", lo.n)
 		ok = false
 	}
-	if len(hi) != 1 || marker_label(&hi[0]) != "m2" {
-		fmt.eprintf("[ui-probe] hi markers wrong: n=%d\n", len(hi))
+	hi0 := session_marker_at(hi, 0)
+	if hi.n != 1 || marker_label(&hi0) != "m2" {
+		fmt.eprintf("[ui-probe] hi markers wrong: n=%d\n", hi.n)
 		ok = false
 	}
 	snap_markers := snap.tracks[0].clips[0].markers
-	if len(snap_markers) != 3 ||
-	   marker_label(&snap_markers[2]) != "m2" ||
-	   snap_markers[2].source_frame != 20 {
-		fmt.eprintf("[ui-probe] snapshot markers wrong: n=%d\n", len(snap_markers))
+	snap2 := session_marker_at(snap_markers, 2)
+	if snap_markers.n != 3 || marker_label(&snap2) != "m2" || snap2.source_frame != 20 {
+		fmt.eprintf("[ui-probe] snapshot markers wrong: n=%d\n", snap_markers.n)
+		ok = false
+	}
+	marker_set_label(clip_marker_mut(&snap.tracks[0].clips[0], 2), "snapshot-only")
+	source2 := session_marker_at(src.tracks[0].clips[0].markers, 2)
+	snapshot2 := session_marker_at(snap.tracks[0].clips[0].markers, 2)
+	if marker_label(&source2) != "m2" || marker_label(&snapshot2) != "snapshot-only" {
+		fmt.eprintln("[ui-probe] marker COW isolation failed")
 		ok = false
 	}
 
 	free_timeline(&snap)
 	free_timeline(&src)
-	free_markers(&lo)
-	free_markers(&hi)
+	session_marker_release(lo)
+	session_marker_release(hi)
 	return ok
 }
 
@@ -360,12 +356,12 @@ ui_probe_marker_cull_asserts :: proc() -> bool {
 	for t in 0 ..< len(timeline.tracks) {
 		for c in 0 ..< len(timeline.tracks[t].clips) {
 			clip := &timeline.tracks[t].clips[c]
-			if len(clip.markers) > 0 {
+			if clip.markers.n > 0 {
 				continue
 			}
-			clip.markers = make([dynamic]Clip_Marker, 0, 2)
-			append(&clip.markers, Clip_Marker{source_frame = 10, label = session_str_intern("m-a")})
-			append(&clip.markers, Clip_Marker{source_frame = 200, label = session_str_intern("m-b")})
+			clip.markers = Clip_Markers_Range{}
+			session_marker_push(&clip.markers, Clip_Marker{source_frame = 10, label = session_str_intern("m-a")})
+			session_marker_push(&clip.markers, Clip_Marker{source_frame = 200, label = session_str_intern("m-b")})
 		}
 	}
 	saved_top := timeline_view.top
@@ -1371,22 +1367,17 @@ seed_roundtrip_session :: proc() {
 		crop_r               = 0.2,
 		crop_t               = 0.3,
 		crop_b               = 0.4,
-		markers = make([dynamic]Clip_Marker, 0, 1),
 	}
-	append(&vclip.markers, Clip_Marker {source_frame = 12, label = session_str_intern("chapter")})
-	vclip.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
-	append(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("scale"), keys = make([dynamic]Keyframe, 0, 2)})
-	append(
-		&vclip.keyframe_tracks[0].keys,
-		Keyframe {frame_off = 0, value = 1.0},
-		Keyframe {frame_off = 60, value = 2.0, interp = .Elastic},
-	)
-	append(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("crop"), keys = make([dynamic]Keyframe, 0, 1)})
+	session_marker_push(&vclip.markers, Clip_Marker {source_frame = 12, label = session_str_intern("chapter")})
+	vclip.keyframe_tracks = Kf_Track_Range{}
+	session_trk_push(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("scale"), keys = Kf_Keys_Range{}})
+	track0 := session_trk_view_mut(&vclip.keyframe_tracks, 0)
+	session_kf_push(&track0.keys, Keyframe{frame_off=0,value=1.0})
+	session_kf_push(&track0.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
+	session_trk_push(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("crop"), keys = Kf_Keys_Range{}})
 	// A packed key: mask != 0, value carries the [KF_PACK_MAX]f32 payload.
-	append(
-		&vclip.keyframe_tracks[1].keys,
-		Keyframe {frame_off = 10, mask = 0b101, value = [KF_PACK_MAX]f32{1, 2, 3, 4, 5, 6, 7}},
-	)
+	track1 := session_trk_view_mut(&vclip.keyframe_tracks, 1)
+	session_kf_push(&track1.keys, Keyframe{frame_off=10,mask=0b101,value=[KF_PACK_MAX]f32{1,2,3,4,5,6,7}})
 
 	tr0 := Track {name = strings.clone("V1"), clips = make([dynamic]Clip, 0, 1)}
 	append(&tr0.clips, vclip)
@@ -1586,27 +1577,28 @@ project_roundtrip_asserts :: proc(second_pass: bool) -> bool {
 		fmt.eprintf("[ui-probe] clip transform/crop mismatch\n")
 		ok = false
 	}
-	if len(c.markers) != 1 || marker_label(&c.markers[0]) != "chapter" || c.markers[0].source_frame != 12 {
+	marker := session_marker_at(c.markers, 0)
+	if c.markers.n != 1 || marker_label(&marker) != "chapter" || marker.source_frame != 12 {
 		fmt.eprintf("[ui-probe] marker mismatch\n")
 		ok = false
 	}
-	if len(c.keyframe_tracks) != 2 {
-		fmt.eprintf("[ui-probe] %d kf tracks want 2\n", len(c.keyframe_tracks))
+	if c.keyframe_tracks.n != 2 {
+		fmt.eprintf("[ui-probe] %d kf tracks want 2\n", c.keyframe_tracks.n)
 		ok = false
 	} else {
-		sk := c.keyframe_tracks[0]
-		if kf_track_name(&sk) != "scale" || len(sk.keys) != 2 {
+		sk := session_trk_view(c.keyframe_tracks, 0)
+		if kf_track_name(sk) != "scale" || sk.keys.n != 2 {
 			fmt.eprintf("[ui-probe] scalar kf track mismatch\n")
 			ok = false
-		} else if sk.keys[1].value != 2.0 || sk.keys[1].interp != .Elastic {
+		} else if session_kf_at(sk.keys,1).value != 2.0 || session_kf_at(sk.keys,1).interp != .Elastic {
 			fmt.eprintf("[ui-probe] scalar key value/interp mismatch\n")
 			ok = false
 		}
-		packed := c.keyframe_tracks[1]
-		if len(packed.keys) != 1 || packed.keys[0].mask != 0b101 {
+		packed := session_trk_view(c.keyframe_tracks, 1)
+		if packed.keys.n != 1 || session_kf_at(packed.keys,0).mask != 0b101 {
 			fmt.eprintf("[ui-probe] packed key mask mismatch\n")
 			ok = false
-		} else if v, is_packed := packed.keys[0].value.([KF_PACK_MAX]f32); !is_packed || v[6] != 7 {
+		} else if v, is_packed := session_kf_at(packed.keys,0).value.([KF_PACK_MAX]f32); !is_packed || v[6] != 7 {
 			fmt.eprintf("[ui-probe] packed key payload mismatch\n")
 			ok = false
 		}
@@ -1955,9 +1947,9 @@ ui_probe_kf_brush_asserts :: proc() -> bool {
 	// naming and order (a seeded "scale" track comes back normalized), so an
 	// index-based fixture would be testing the normalization, not the brush.
 	lane, k_first, k_second := -1, -1, -1
-	for li in 0 ..< len(cl.keyframe_tracks) {
-		n := len(cl.keyframe_tracks[li].keys)
-		if n >= 2 && (lane < 0 || n > len(cl.keyframe_tracks[lane].keys)) {
+	for li in 0 ..< cl.keyframe_tracks.n {
+		n := session_trk_view(cl.keyframe_tracks,li).keys.n
+		if n >= 2 && (lane < 0 || n > session_trk_view(cl.keyframe_tracks,lane)^.keys.n) {
 			lane, k_first, k_second = li, 0, 1
 		}
 	}
@@ -1966,8 +1958,8 @@ ui_probe_kf_brush_asserts :: proc() -> bool {
 		return false
 	}
 	box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-	f_a := cl.keyframe_tracks[lane].keys[k_first].frame_off
-	f_b := cl.keyframe_tracks[lane].keys[k_second].frame_off
+	f_a := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, k_first).frame_off
+	f_b := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, k_second).frame_off
 	x_a, y_a := kf_key_center(box, lane, f_a)
 	x_b, y_b := kf_key_center(box, lane, f_b)
 	// An empty spot to arm the brush on. It has to be past the clip's RIGHT EDGE,
@@ -2128,8 +2120,8 @@ ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
 	// reorders lanes during build, so a fixture pinned to (lane 0, key 0/1)
 	// tests that normalization instead of the gesture.
 	lane := -1
-	for li in 0 ..< len(cl.keyframe_tracks) {
-		if len(cl.keyframe_tracks[li].keys) >= 2 {
+	for li in 0 ..< cl.keyframe_tracks.n {
+		if session_trk_view(cl.keyframe_tracks,li).keys.n >= 2 {
 			lane = li
 			break
 		}
@@ -2137,7 +2129,7 @@ ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
 	if lane < 0 {
 		fmt.eprintf(
 			"[ui-probe] click/drag fixture wants a lane with 2+ keys, got %d lanes\n",
-			len(cl.keyframe_tracks),
+			cl.keyframe_tracks.n,
 		)
 		return false
 	}
@@ -2154,9 +2146,9 @@ ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
 	// tracks, which invalidates the INDEX but not the view -- the pool block is
 	// fixed, so published bytes never move. This is the property the clone used
 	// to be protecting against, now gone at the source.
-	lane_name := kf_track_name(&cl.keyframe_tracks[lane])
-	f_a := cl.keyframe_tracks[lane].keys[0].frame_off
-	f_b := cl.keyframe_tracks[lane].keys[1].frame_off
+	lane_name := kf_track_name(session_trk_view(cl.keyframe_tracks,lane))
+	f_a := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, 0).frame_off
+	f_b := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, 1).frame_off
 	box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
 	x_a, y := kf_key_center(box, lane, f_a)
 	x_b, _ := kf_key_center(box, lane, f_b)
@@ -2276,8 +2268,8 @@ ui_probe_kf_click_vs_drag_asserts :: proc() -> bool {
 // the geometry layer can mint or retire lanes while re-landing keys, which slides
 // every index after it.
 kf_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
-	for i in 0 ..< len(cl.keyframe_tracks) {
-		if kf_track_name(&cl.keyframe_tracks[i]) == name {
+	for i in 0 ..< cl.keyframe_tracks.n {
+		if kf_track_name(session_trk_view(cl.keyframe_tracks,i)) == name {
 			return i, true
 		}
 	}
@@ -2289,9 +2281,9 @@ kf_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
 kf_frames_by_name :: proc(cl: Clip, name: string) -> [2]i32 {
 	li, ok := kf_lane_by_name(cl, name)
 	assert(ok, "kf_frames_by_name: the probe's lane vanished from the store")
-	keys := cl.keyframe_tracks[li].keys
-	assert(len(keys) == 2, "kf_frames_by_name wants exactly the 2 keys its fixture selected")
-	return [2]i32{keys[0].frame_off, keys[1].frame_off}
+	keys := session_trk_view(cl.keyframe_tracks,li).keys
+	assert(keys.n == 2, "kf_frames_by_name wants exactly the 2 keys its fixture selected")
+	return [2]i32{session_kf_at(keys,0).frame_off, session_kf_at(keys,1).frame_off}
 }
 // ui_probe_clip_tile_width_asserts holds the tile to the model's width. A tile
 // sized by its content (label text + padding) instead of by frames*zoom drew
@@ -2360,13 +2352,13 @@ ui_probe_backspace_ripple_asserts :: proc() -> bool {
 	// clip, so keep a copy: the probes after this one lay out the same seeded
 	// session and would otherwise see a short track 0.
 	//
-	// DEEP, not a value copy. A shallow backup aliases the payloads the ripple
-	// is about to free, so restoring it hands a later teardown a name that was
-	// already freed — an invalid free that only shows under valgrind, long
-	// after the probe that caused it has printed "ok".
+	// Back up Clip POD records and mark session ranges shared before ripple edits.
 	saved_clips := make([dynamic]Clip, 0, len(track.clips), context.temp_allocator)
-	for &c in track.clips {
-		append(&saved_clips, clip_deep_copy(&c))
+	for i in 0..<len(track.clips) {
+		c := track.clips[i]
+		c.markers = session_marker_share(&track.clips[i].markers)
+		c.keyframe_tracks = session_trk_share(&track.clips[i].keyframe_tracks)
+		append(&saved_clips, c)
 	}
 	target := track.clips[1]
 	span := target.source_length_frames
@@ -2387,13 +2379,9 @@ ui_probe_backspace_ripple_asserts :: proc() -> bool {
 	defer {
 		kf_clear()
 		kf_brush_disarm()
-		// Release the rebuilt clips before restoring the backup: the moved
-		// clips alias the SEED payloads (which only the backup used to share,
-		// and it no longer does) and the straddle's right half owns fresh
-		// ones. Freeing them here is what makes the restore leak-free as well
-		// as free-of-double-frees.
+		// Release session ranges held by rebuilt clips before restoring backup.
 		for &c in track.clips {
-			clip_payload_free(&c)
+			clip_ranges_release(&c)
 		}
 		delete(track.clips)
 		track.clips = saved_clips
@@ -2714,11 +2702,14 @@ seed_ui_probe_session :: proc() {
 	// later tears this session down, and free_timeline frees keyframe-track
 	// names, exactly as a real session's are freed.
 	kf0 := &timeline.tracks[0].clips[0]
-	kf0.keyframe_tracks = make([dynamic]Kf_Track, 0, 2)
-	append(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("transform.x"), keys = make([dynamic]Keyframe, 0, 4)})
-	append(&kf0.keyframe_tracks[0].keys, Keyframe {frame_off = 0, value = 0}, Keyframe {frame_off = 120, value = 1})
-	append(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("zoom"), keys = make([dynamic]Keyframe, 0, 4)})
-	append(&kf0.keyframe_tracks[1].keys, Keyframe {frame_off = 30, value = 1})
+	kf0.keyframe_tracks = Kf_Track_Range{}
+	session_trk_push(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("transform.x"), keys = Kf_Keys_Range{}})
+	track0 := session_trk_view_mut(&kf0.keyframe_tracks, 0)
+	session_kf_push(&track0.keys, Keyframe{frame_off=0,value=0})
+	session_kf_push(&track0.keys, Keyframe{frame_off=120,value=1})
+	session_trk_push(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("zoom"), keys = Kf_Keys_Range{}})
+	track1 := session_trk_view_mut(&kf0.keyframe_tracks, 1)
+	session_kf_push(&track1.keys, Keyframe{frame_off=30,value=1})
 
 	sync_track_order()
 

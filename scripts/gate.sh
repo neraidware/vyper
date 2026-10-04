@@ -469,6 +469,11 @@ target_keyframe_probe() {
 	VYPER_KEYFRAME_PROBE=1 timeout 120 ./vyper
 }
 
+target_render_kf_probe() {
+	require_fresh_binary render-kf-probe || return 1
+	VYPER_RENDER_KF_PROBE=1 timeout 120 ./vyper
+}
+
 # The audio engine regression check (audio_probe.odin). It has no gate target
 # either, so nothing ran it: it is the only check on the geometry-slab handoff
 # between the UI thread and the producer, on segment geometry after edits, and on
@@ -522,7 +527,7 @@ target_geom_key_probe() {
 
 # The memory gate for geom_key_probe. The probe builds and tears down clip
 # keyframe tracks by hand -- dropping packed sections, unwrapping them into
-# per-lane tracks, deleting names and key arrays -- so it is exactly the kind
+# per-lane tracks and releasing session key ranges -- so it is exactly the kind
 # of code the ownership claims in AGENTS.md cannot check by compiling, and it
 # is the one path that exercises kf_geom_unwrap_section from a pending-partial
 # state that no other target reaches. Same four invariants as target_valgrind.
@@ -618,6 +623,18 @@ target_session_str_probe() {
 target_session_kf_probe() {
 	require_fresh_binary session-kf-probe || return 1
 	VYPER_SESSION_KF_PROBE=1 timeout 120 ./vyper
+}
+
+# The session track-row arena check (session_tracks_probe.odin). It pins bounded
+# reuse and both COW layers: track rows first, then their key ranges.
+target_session_trk_probe() {
+	require_fresh_binary session-trk-probe || return 1
+	VYPER_SESSION_TRK_PROBE=1 timeout 120 ./vyper
+}
+
+target_session_marker_probe() {
+	require_fresh_binary session-marker-probe || return 1
+	VYPER_SESSION_MARKER_PROBE=1 timeout 120 ./vyper
 }
 
 # The OS file-drag-and-drop probe (dnd_probe.odin). Dragging a file in from the
@@ -1237,7 +1254,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_live_probe timeline_probe session_str_probe session_kf_probe dnd_probe parity audio_rate audio_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1252,6 +1269,7 @@ main() {
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
 	keyframe_probe) target_keyframe_probe ;;
+	render_kf_probe) target_render_kf_probe ;;
 	audio_probe) target_audio_probe ;;
 	geom_key_probe) target_geom_key_probe ;;
 	geom_key_valgrind) target_geom_key_valgrind ;;
@@ -1261,6 +1279,8 @@ main() {
 	timeline_probe) target_timeline_probe ;;
 	session_str_probe) target_session_str_probe ;;
 	session_kf_probe) target_session_kf_probe ;;
+	session_trk_probe) target_session_trk_probe ;;
+	session_marker_probe) target_session_marker_probe ;;
 	dnd_probe) target_dnd_probe ;;
 	parity) target_parity ;;
 	audio_rate) target_audio_rate ;;
@@ -1282,7 +1302,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|geom_key_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

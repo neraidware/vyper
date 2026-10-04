@@ -301,9 +301,11 @@ session_kf_make_unique :: proc(r: ^Kf_Keys_Range) {
 	if !r.shared {
 		return
 	}
-	src := session_kf_view(r^)
 	slots := max(r.n, SESSION_KF_MIN_CAP)
 	off := session_kf_alloc(slots)
+	// Allocation may grow session_kf_keys and move every live range. Resolve
+	// source only after allocation, from its stable range handle.
+	src := session_kf_view(r^)
 	mem.copy(
 		raw_data(session_kf_keys[off:]),
 		raw_data(src),
@@ -382,4 +384,53 @@ session_kf_set :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
 	assert(!r.shared, "session_kf_set: range is shared; make it unique first")
 	assert(i >= 0 && i < r.n, "session_kf_set: index out of range")
 	session_kf_keys[r.first + i] = k
+}
+
+// session_kf_at reads one key by index. Indexing the range through the store
+// rather than through a slice is what keeps the call sites free of borrowed
+// views; the bounds assert is the same one session_kf_view raises.
+session_kf_at :: proc(r: Kf_Keys_Range, i: int) -> Keyframe {
+	assert(i >= 0 && i < r.n, "session_kf_at: index out of range")
+	return session_kf_keys[r.first + i]
+}
+
+// session_kf_at_ptr borrows one key in place, for the sites that mutate a single
+// field (`k.value = v`) without replacing the whole key. Same lifetime rule as
+// session_kf_view: do not hold this across a mutation of the range.
+session_kf_at_ptr :: proc(r: Kf_Keys_Range, i: int) -> ^Keyframe {
+	assert(!r.shared, "session_kf_at_ptr: range is shared; make it unique first")
+	assert(i >= 0 && i < r.n, "session_kf_at_ptr: index out of range")
+	return &session_kf_keys[r.first + i]
+}
+
+// session_kf_insert splices a key into a unique range at `i`, shifting the rest
+// up. This replaces the append-a-sentinel-then-mem.copy-the-tail dance the
+// ordered insert sites used, which had to grow the array before the slide so
+// there was a slot to land in -- two chances to get the order wrong, and the
+// wrong order silently drops the key.
+session_kf_insert :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
+	assert(!r.shared, "session_kf_insert: range is shared; make it unique first")
+	assert(i >= 0 && i <= r.n, "session_kf_insert: insert position out of range")
+	session_kf_reserve(r, r.n + 1)
+	keys := session_kf_keys[r.first : r.first + r.n + 1]
+	mem.copy(&keys[i + 1], &keys[i], (r.n - i) * size_of(Keyframe))
+	keys[i] = k
+	r.n += 1
+}
+
+// session_kf_make builds a fresh private range holding `n` default keys. Replaces
+// `make([dynamic]Keyframe, 0, cap)` followed by appends at the sites that build a
+// track from a known key list.
+session_kf_make :: proc(keys: []Keyframe) -> Kf_Keys_Range {
+	r := Kf_Keys_Range{}
+	if len(keys) > 0 {
+		session_kf_reserve(&r, len(keys))
+		mem.copy(
+			raw_data(session_kf_keys[r.first :]),
+			raw_data(keys),
+			len(keys) * size_of(Keyframe),
+		)
+		r.n = len(keys)
+	}
+	return r
 }
