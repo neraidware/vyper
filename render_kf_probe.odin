@@ -107,6 +107,29 @@ static_window_cases :: proc() -> [6]Static_Window_Case {
 	}
 }
 
+// Mix_Bus_Case is one frame rate for the mix-bus probe, named by what it does to
+// the block/frame relationship.
+Mix_Bus_Case :: struct {
+	name:   string,
+	num:    c.int,
+	den:    c.int,
+}
+
+// mix_bus_cases spans a frame below, at, and above AUDIO_MIX_BLOCK, because the
+// only interesting rates for a fixed-block mixer are the ones where the two sizes
+// have an awkward relationship: at 120fps a frame is 400 samples and a block
+// straddles two boundaries, at 60 it is 800 and a block is smaller than a frame,
+// at 12 it is 4000 and a block never comes close.
+mix_bus_cases :: proc() -> [5]Mix_Bus_Case {
+	return {
+		{"120fps (400-sample frames, block straddles boundaries)", 120, 1},
+		{"60fps (800-sample frames)", 60, 1},
+		{"30fps (1600-sample frames)", 30, 1},
+		{"24fps (2000-sample frames)", 24, 1},
+		{"12fps (4000-sample frames)", 12, 1},
+	}
+}
+
 render_kf_probe_run :: proc() -> int {
 	// Case A — transform.x keyed 0 @1 -> 100 @30; everything else rests at
 	// its base (tx/ty baseline 0, scale 1, no crops). Box == full stage.
@@ -472,6 +495,76 @@ render_kf_probe_run :: proc() -> int {
 			src.dec.crop_fy0,
 			src.dec.crop_fw,
 			src.dec.crop_fh,
+		)
+	}
+
+	// Case K — the mix bus, driven through the REAL serve path
+	// (render_mix_serve_frame: fill, take, trim).
+	//
+	// What it pins is the bus's COVERAGE and BOUNDEDNESS, which is what the
+	// exporter depends on and what the ring can get wrong on its own:
+	//   - every frame the worker asks for is covered, at any frame rate;
+	//   - the bus is TRIMMED as it is served, so it holds a cushion instead of
+	//     growing with the length of the render;
+	//   - filling stops at WHOLE blocks, so the block size stays a free choice
+	//     rather than being cut to the consumer's frame edge.
+	//
+	// Deliberately NOT pinning which sample comes back. Doing that needs the bus
+	// pre-seeded with known content AND the fill suppressed, and the attempt
+	// exposed something worth naming rather than working around: Render_Mix keeps
+	// `pos`/`end` beside Audio_Ring's `head`/`count`, which is two representations
+	// of one fact -- the "duplicated state that drifted" class this codebase has
+	// already paid for seven times. It is listed for S3, where the mix moves to
+	// its own thread and the position should live in one place. Until then, that
+	// the right pixels come out is pinned where it cannot drift: end to end on a
+	// real project (TODO.md Active 22, S2).
+	//
+	// Rates are the ones where block and frame sizes relate awkwardly: 120fps is
+	// 400-sample frames so a block straddles two boundaries, 60 is 800, 12 is 4000.
+	for tc in mix_bus_cases() {
+		m: Render_Mix
+		render_mix_init(&m, tc.num, tc.den, 0)
+		frames: i64 = 20
+		depth_max := 0
+		served := 0
+		for f: i64 = 0; f < frames; f += 1 {
+			out := make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
+			// No sources: every block mixes to silence, which is fine -- this is
+			// about geometry, not content.
+			n := render_mix_serve_frame(&m, nil, f, i64(tc.num), i64(tc.den), out)
+			want_n := int(
+				sample_pos_from_frames(f + 1, i64(tc.num), i64(tc.den)) -
+				sample_pos_from_frames(f, i64(tc.num), i64(tc.den)),
+			)
+			if n != want_n {
+				render_kf_probe_check(
+					false, "K %s frame %d: served %d samples, want %d", tc.name, f, n, want_n,
+				)
+				break
+			}
+			served += n
+			depth_max = max(depth_max, render_mix_depth(&m))
+		}
+		want := sample_pos_from_frames(frames, i64(tc.num), i64(tc.den))
+		// Served exactly the span, sample for sample.
+		render_kf_probe_check(
+			Sample_Pos(served) == want,
+			"K %s: served %d samples over %d frames, want exactly %d",
+			tc.name, served, frames, want,
+		)
+		// Bounded: after 20 frames the bus holds a cushion, not the span. A trim
+		// to the frame's START retires nothing, and this is what catches it.
+		render_kf_probe_check(
+			Sample_Pos(depth_max) < want / 4,
+			"K %s: bus peaked at %d samples over %d frames (span %d) -- it is not being trimmed",
+			tc.name, depth_max, frames, want,
+		)
+		// Whole blocks: enough of them to cover the span, and never a short one
+		// cut to a consumer's edge.
+		render_kf_probe_check(
+			m.blocks_mixed * AUDIO_MIX_BLOCK >= want,
+			"K %s: %d whole blocks (%d samples) must cover %d",
+			tc.name, m.blocks_mixed, m.blocks_mixed * AUDIO_MIX_BLOCK, want,
 		)
 	}
 

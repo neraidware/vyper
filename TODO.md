@@ -4964,10 +4964,63 @@ future regression cannot hide behind green telemetry the way `1a38d78` did.
       either way, and the single-clip export is byte-for-byte the same length
       (479232 samples, 469 packets, AAC skip-samples intact). The win is at the
       rates where the arithmetic was wrong.
-- [ ] S2. **A2** — fixed-block mixer + mix ring, render consumer first.
-      Probe: a new block-boundary regression pins that mixing is independent of
-      the frame size — the same source mixed at 24fps and 60fps produces the same
-      samples at the same sample positions.
+- [x] S2. **A2** — fixed-block mixer + mix ring, render consumer first. Shipped.
+
+      `Render_Mix`: the export's bus is a ring in the SAMPLE domain (reusing
+      `Audio_Ring`, not a second ring type) carrying `pos`/`end` beside it, the
+      job's exact rate, and a hole counter. `AUDIO_MIX_BLOCK = 512`.
+      `render_mix_serve_frame` owns fill -> take -> trim as ONE proc, because the
+      order of those three is the whole invariant and it is invisible at a call
+      site; the worker is now a three-line call.
+
+      The payoff is a consequence of S1 rather than a separate mechanism: with a
+      sample clock, the content position of a clip at an arbitrary bus sample is
+      just `bus - clip_start_sample + source_start_sample`, because one sample of
+      bus elapsed IS one sample of content elapsed. So the mixer needs no frame
+      lookup to place content at all -- the frame grid only decides what the
+      CONSUMER asks for.
+
+      **Measured on `~/sallyface.vyproj`, the defect this section exists for:**
+
+      | | before | after |
+      |---|---|---|
+      | mid-content holes (sound was due) | **133 runs / 1961 ms** | **0** |
+      | clip regions misaligned | not measured | **0 of 10** |
+      | correlation vs source | not measured | **0.9988 - 1.0000** |
+      | export length vs frame grid | -6.7 ms | -6.7 ms (S6) |
+
+      Content fidelity was verified against the SOURCE, not inferred: each clip
+      region of the export is correlated against N x source (N = the 5 audio
+      tracks carrying it), at lags of +/- one frame. Every region lands at lag 0.
+      That is the check a hole counter cannot do -- "correct audio with a gap" and
+      "the wrong audio" look identical to a counter.
+
+      **Probe, and its two limits.** `render_kf_probe` case K drives the real
+      `render_mix_serve_frame` at 12/24/30/60/120fps and pins coverage, whole
+      blocks, and that the bus is trimmed rather than growing. Mutation: "serve
+      never trims" is caught. Three limits, stated rather than papered over:
+        - "trim to the frame's START" is NOT caught, because it leaves the content
+          intact and only under-trims. A near-equivalent mutant, not a live bug.
+        - "take skips the pos offset" is NOT caught, because the probe mixes no
+          sources and therefore has no content to misplace. It is exactly the bug
+          the real-project correlation check DOES catch, which is why that check is
+          the primary gate for this and the probe is secondary.
+        - Attempting to pin sample values in the probe required hand-rolling the
+          fill, and hand-rolling the fill means testing the probe's copy of it --
+          the first version passed a mutation of the worker's own trim call site.
+          The duplicate proc that workaround needed is also the "duplicated state
+          that drifted" class this repo has paid for seven times, in
+          `Render_Mix.pos/end` beside `Audio_Ring.head/count`. Resolving that
+          belongs to S3, where the mix moves to its own thread and the position
+          should live in one place.
+
+      **`scripts/audio-verify.sh <project.vyproj>`** (not a gate -- it needs a real
+      project and its media) exports a project and checks it against its sources:
+      per-region lag and correlation, export length against the frame grid, and
+      mid-content holes where sound was due. Counting a silence run only where
+      the expected signal is audible matters: the recording has a genuine 696ms
+      quiet passage at 85.4s, and a hole counter that counted it would report the
+      same number forever and then get ignored.
 - [ ] S3. **A3** — mix on its own thread with a cushion. Probe: the export's
       silence-run count goes to zero on `~/sallyface.vyproj`, which is the
       measured defect this whole section exists to close.

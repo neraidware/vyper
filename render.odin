@@ -1290,6 +1290,215 @@ Render_Audio_Src :: struct {
 	have48:               i64, // content frames produced so far (next un-produced)
 }
 
+// AUDIO_MIX_BLOCK is the mixer's fixed block, in sample-frames (512 = 10.67ms at
+// 48 kHz, and the block size REAPER, Resolve and JUCE hosts all expose as a
+// setting).
+//
+// The point is that the mixer's unit of work is NOT the video grid's. A frame is
+// 1601/1602 samples at 29.97 and 400 at 120fps, so a frame-sized mixer cannot
+// precompute anything and cannot be fed a fixed-size buffer. Mixing in blocks
+// and handing the result to a ring lets the consumer take whatever range its
+// frame covers -- including a range that straddles two blocks, which is the
+// normal case rather than an edge case.
+AUDIO_MIX_BLOCK :: 512
+
+// Render_Mix is the export's mix bus: a ring in the SAMPLE domain, produced in
+// fixed AUDIO_MIX_BLOCK blocks and consumed one video frame at a time.
+//
+// It reuses Audio_Ring rather than declaring a second ring type -- head/count/wrap
+// is the same problem, and the render and playback fifos should not be able to
+// drift apart. What this adds beside the ring is the bus POSITION bookkeeping,
+// because the ring only knows how many samples it holds, not where in the
+// timeline they came from.
+//
+// num/den are the JOB's exact frame rate, not project_fps(): the worker must
+// place samples against the rate the job was built on, for the same reason
+// render_job.fps exists (any second opinion retimes the export against the
+// preview it is meant to match).
+Render_Mix :: struct {
+	ring:           Audio_Ring,
+	pos:            Sample_Pos, // bus position of the ring's oldest sample
+	end:            Sample_Pos, // bus position one past the newest sample
+	num, den:       i64,
+	// holes counts blocks a source could not fill: a decode that did not keep
+	// pace with the block it was asked for. Counted because after the mix moves
+	// to its own thread this is the number that says whether the cushion is deep
+	// enough, and it is a SAMPLE-domain count -- the frame-domain counter that
+	// shipped alongside complete distortion (`1a38d78`) could not see this class
+	// of defect at all.
+	holes:          i64,
+	blocks_mixed:   i64,
+}
+
+// render_mix_fill mixes blocks until the bus covers bus position `until`.
+//
+// Always a WHOLE block, even the one that overshoots `until`: a short final block
+// would make the block size depend on where the consumer's frame boundary fell,
+// which is the coupling this exists to remove. The overshoot is not waste -- it is
+// the headroom the next frame takes from without a mixing pass of its own.
+render_mix_fill :: proc(m: ^Render_Mix, auds: []Render_Audio_Src, until: Sample_Pos) {
+	block: [AUDIO_MIX_BLOCK * 2]f32
+	for m.end < until {
+		render_mix_block(m, auds, block[:], m.end, AUDIO_MIX_BLOCK)
+		ring_reserve(&m.ring, AUDIO_MIX_BLOCK)
+		render_mix_append(m, block[:], AUDIO_MIX_BLOCK)
+	}
+}
+
+// render_mix_serve_frame hands the consumer the samples for one video frame:
+// fill the bus until it covers the frame's end, take the frame's range, then trim
+// what was consumed.
+//
+// Extracted because the ORDER of those three steps is the whole invariant and it
+// is not visible at the call site -- filling after taking underruns, trimming to
+// the frame's START retires nothing and lets the bus grow with the length of the
+// render (a bug this proc's first version had, found by the probe that calls it).
+// Returns the sample-frames written to `out`, or 0 when the bus could not cover
+// the frame -- which the caller must treat as a hole rather than as stale audio.
+render_mix_serve_frame :: proc(
+	m: ^Render_Mix,
+	auds: []Render_Audio_Src,
+	frame: i64,
+	num, den: i64,
+	out: []f32,
+) -> int {
+	b0 := sample_pos_from_frames(frame, num, den)
+	b1 := sample_pos_from_frames(frame + 1, num, den)
+	n := int(min(b1 - b0, Sample_Pos(MAX_AUDIO_FRAME_SAMPLES)))
+	if n <= 0 {
+		return 0
+	}
+	render_mix_fill(m, auds, b1)
+	if !render_mix_take(m, b0, n, out) {
+		return 0
+	}
+	// Trim to the END of what was taken, not its start.
+	render_mix_drop(m, b0 + Sample_Pos(n))
+	return n
+}
+
+// render_mix_init points the bus at the job's rate and its first sample.
+render_mix_init :: proc(m: ^Render_Mix, num, den: c.int, start: Sample_Pos) {
+	m.ring = {}
+	m.pos = start
+	m.end = start
+	m.num = i64(num)
+	m.den = i64(den)
+	m.holes = 0
+	m.blocks_mixed = 0
+}
+
+// render_mix_depth is how many sample-frames the bus is holding.
+render_mix_depth :: proc(m: ^Render_Mix) -> int {
+	return ring_len(&m.ring)
+}
+
+// render_mix_has reports whether the bus covers [from, from+n).
+render_mix_has :: proc(m: ^Render_Mix, from: Sample_Pos, n: int) -> bool {
+	return from >= m.pos && from + Sample_Pos(n) <= m.end
+}
+
+// render_mix_block mixes one block of `n` sample-frames at bus position `at`
+// into `out` (interleaved stereo f32, n*2 samples).
+//
+// The content position of a clip at a bus sample is just the offset from the
+// clip's first frame plus its pinned source offset -- one sample of bus elapsed
+// is one sample of content elapsed, because both are the same 48 kHz timeline.
+// That is the whole reason this can be frame-free: the old per-frame path had to
+// re-derive a content position from a frame index on every frame, and any
+// disagreement between that derivation and the fifo's own labelling showed up as
+// a hole.
+render_mix_block :: proc(m: ^Render_Mix, auds: []Render_Audio_Src, out: []f32, at: Sample_Pos, n: int) {
+	for i in 0 ..< len(out) {
+		out[i] = 0
+	}
+	m.blocks_mixed += 1
+	for &a in auds {
+		if !a.dec.opened {
+			continue
+		}
+		clip_t0 := sample_pos_from_frames(a.timeline_start_frame, m.num, m.den)
+		clip_t1 := sample_pos_from_frames(a.timeline_start_frame + a.source_length_frames, m.num, m.den)
+		if at + Sample_Pos(n) <= clip_t0 || at >= clip_t1 {
+			continue // outside this clip's timeline span
+		}
+		// Clip the block to the clip's own span: a block that straddles a clip
+		// boundary contributes only the part inside it, which is what a
+		// per-frame mixer got for free by never straddling anything.
+		blk_lo := max(at, clip_t0)
+		blk_hi := min(at + Sample_Pos(n), clip_t1)
+		content := (blk_lo - clip_t0) +
+			audio_source_start_sample(a.source_start_frame, a.source_start_rate)
+		want := blk_hi - blk_lo
+		render_audio_pull(&a, i64(content + want))
+		if a.first48 > i64(content) || a.have48 < i64(content + want) {
+			// The fifo cannot cover this block. Silence for the span, counted --
+			// and NOT a silent `continue`, because the rest of the block belongs
+			// to this source and dropping it would punch a hole shaped like the
+			// source list rather than like the shortfall.
+			m.holes += 1
+			continue
+		}
+		base := int(content - a.first48)
+		// Gain automation is keyed in timeline FRAMES, so this is the one thing
+		// that still needs a frame index -- resolved once per block, not per
+		// sample, and exactly (frame_at_sample).
+		rel := i32(frame_at_sample(blk_lo - clip_t0, m.num, m.den) - a.timeline_start_frame)
+		g := audio_gain_linear(&a.gain, rel)
+		for s in 0 ..< int(want) {
+			l, r := ring_at(&a.fifo, base + s)
+			off := int(blk_lo - at) * 2
+			out[off + s * 2 + 0] += l * g
+			out[off + s * 2 + 1] += r * g
+		}
+		// Drop what this block consumed so the fifo stays forward-only and a long
+		// render does not accumulate whole clips.
+		drop := base + int(want)
+		if drop > 0 {
+			a.first48 += i64(drop)
+			ring_drop(&a.fifo, drop)
+		}
+	}
+}
+
+// render_mix_append publishes a freshly mixed block on the bus. The caller has
+// already reserved room.
+render_mix_append :: proc(m: ^Render_Mix, block: []f32, n: int) {
+	copy(m.ring.buf[(m.ring.head + m.ring.count) % ring_cap(&m.ring) * 2:], block[:n * 2])
+	m.ring.count += n
+	m.end += Sample_Pos(n)
+}
+
+// render_mix_take copies n sample-frames starting at bus position `from` into
+// `out` (n*2 interleaved samples). Returns false when the bus does not reach,
+// which is the hole signal the caller reports rather than papering over.
+render_mix_take :: proc(m: ^Render_Mix, from: Sample_Pos, n: int, out: []f32) -> bool {
+	if !render_mix_has(m, from, n) {
+		return false
+	}
+	base := int(from - m.pos)
+	for s in 0 ..< n {
+		l, r := ring_at(&m.ring, base + s)
+		out[s * 2 + 0] = l
+		out[s * 2 + 1] = r
+	}
+	return true
+}
+
+// render_mix_drop trims everything before bus position `up_to`, which is what the
+// consumer does once it has taken a frame.
+render_mix_drop :: proc(m: ^Render_Mix, up_to: Sample_Pos) {
+	if up_to <= m.pos {
+		return
+	}
+	drop := int(up_to - m.pos)
+	drop = min(drop, ring_len(&m.ring))
+	if drop > 0 {
+		ring_drop(&m.ring, drop)
+		m.pos += Sample_Pos(drop)
+	}
+}
+
 // render_audio_src_from_chip copies one committed geometry chip into the job's
 // Render_Audio_Src: identity fields plus the chip's gain snapshot. The export
 // reads the SAME committed source playback does (audio_geometry_commit's slab),
@@ -2210,6 +2419,10 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 // Main worker.
 // ---------------------------------------------------------------------------
 
+// render_mix is the export's mix bus. Worker-owned for the life of the job and
+// freed with the job arena, like everything else the worker allocates.
+render_mix: Render_Mix
+
 // Render_Enc_Slot is one entry of the encode ring.
 RENDER_ENC_SLOTS :: 4
 Render_Enc_Slot :: struct {
@@ -2277,6 +2490,11 @@ Render_Pipeline :: struct {
 	// Encoder-thread timing, written before it exits and read after the join.
 	enc_video_ns:      i64,
 	enc_audio_ns:      i64,
+	// audio_holes counts video frames the mix bus could not cover. Worker-written,
+	// read by the render-test summary after the join. Sample-domain by
+	// construction: the bus knows in samples, so this counts the thing that
+	// actually got dropped rather than a frame-shaped proxy for it.
+	audio_holes:       i64,
 	// Sub-split of enc_video_ns for the hw-upload path probe: how much is CPU
 	// RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
 	// send+drain (encoder wait).
@@ -2861,6 +3079,7 @@ render_worker_run :: proc() {
 	// match.
 	rfps_num, rfps_den := render_job.fps_num, render_job.fps_den
 	rfps := render_job.fps
+	mnum, mden := i64(rfps_num), i64(rfps_den)
 	spf := int(MAX_AUDIO_FRAME_SAMPLES)
 	if rfps > 0 {
 		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(0, int(math.round(48000.0 / rfps))))
@@ -2868,6 +3087,16 @@ render_worker_run :: proc() {
 
 	has_audio := len(render_job.audios) > 0
 	if has_audio {
+		// The mix bus starts at the job's first sample and is sized for a whole
+		// frame plus the block the fill overshoots by, so a steady state never
+		// grows the ring.
+		render_mix_init(
+			&render_mix,
+			rfps_num,
+			rfps_den,
+			sample_pos_from_frames(render_job.start, mnum, mden),
+		)
+		ring_reserve(&render_mix.ring, AUDIO_MIX_BLOCK + MAX_AUDIO_FRAME_SAMPLES)
 		for i in 0 ..< len(render_job.audios) {
 			a := &render_job.audios[i]
 			if !render_audio_open(a, render_job.start, rfps) {
@@ -3206,59 +3435,30 @@ render_worker_run :: proc() {
 
 		eslot.spf = 0
 		if has_audio && spf > 0 {
-			mix := eslot.mix
-			mem.zero(raw_data(mix), len(mix) * size_of(f32))
-			// Exact per-frame sample count: difference of consecutive 48 kHz
-			// frame boundaries, not a fixed rounded 48000/fps. For fps that
-			// don't evenly divide 48000 (23.976/29.97/59.94) this alternates
-			// (e.g. 1601/1602 at 29.97) and averages to the true rate, so the
-			// rendered audio length matches the video instead of drifting.
-			cur_spf := spf
-			if rfps > 0 {
-				b0 := audio_frame_boundary48(timeline_frame, rfps)
-				b1 := audio_frame_boundary48(timeline_frame + 1, rfps)
-				cur_spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
-			}
-			for aa in 0 ..< len(render_job.audios) {
-				a := &render_job.audios[aa]
-				if !a.dec.opened {
-					continue
-				}
-				if !clip_visible_at(timeline_frame, a.timeline_start_frame, a.source_length_frames) {
-					continue
-				}
-			start48 := i64(
-				audio_content_sample(timeline_frame - a.timeline_start_frame, a.source_start_frame, a.source_start_rate),
+			// The frame's bus range, exactly. What fills it is no longer this
+			// loop's business: the mixer works in fixed AUDIO_MIX_BLOCK blocks
+			// and the bus hands back the samples this frame covers, whether that
+			// range is one block, part of three, or three and a bit. So a decode
+			// that ran late costs the bus a block's worth of work once, instead
+			// of a frame-shaped hole in the output every time it happened.
+			cur_spf := render_mix_serve_frame(
+				&render_mix,
+				render_job.audios,
+				timeline_frame,
+				mnum,
+				mden,
+				eslot.mix,
 			)
-				render_audio_pull(a, start48 + i64(cur_spf))
-				if start48 < a.first48 || a.have48 < start48 + i64(cur_spf) {
-					continue
-				}
-				base := int(start48 - a.first48)
-				// Per-clip gain re-evaluated at this timeline frame, so a keyed
-				// gain track automates the export exactly as it does playback
-				// (one audio_gain_linear call per source per frame; the value is
-				// constant across the frame's samples). audio_gain_linear carries
-				// the dB→linear conversion, so the slider is in dB here too.
-				g := audio_gain_linear(&a.gain, i32(timeline_frame - a.timeline_start_frame))
-				for s in 0 ..< cur_spf {
-					l, r := ring_at(&a.fifo, base + s)
-					mix[s * 2 + 0] += l * g
-					mix[s * 2 + 1] += r * g
-				}
-				// Trim the consumed fifo head so decode stays forward-only and
-				// long renders don't accumulate the whole clip in memory
-				// (mirrors playback's per-frame trim). O(1) head move, not a
-				// per-frame mem.copy of the whole queue.
-				drop := base + cur_spf
-				if drop > 0 {
-					a.first48 += i64(drop)
-					ring_drop(&a.fifo, drop)
-				}
+			if cur_spf > 0 {
+				eslot.spf = cur_spf
+			} else {
+				// The bus could not cover this frame. Silence for it -- the
+				// alternative is feeding a stale buffer, which is how a hole
+				// becomes a burst of the previous frame's audio. The shortfall
+				// itself is already counted inside the fill.
+				mem.zero(raw_data(eslot.mix), len(eslot.mix) * size_of(f32))
+				render_pipe.audio_holes += 1
 			}
-			// Publish the mixed PCM for the encoder thread; it owns the AAC
-			// encoder + muxer, so no encode call happens here anymore.
-			eslot.spf = cur_spf
 		}
 		if split_timing {
 			audio_ns += time.now()._nsec - loop_start

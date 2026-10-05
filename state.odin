@@ -260,6 +260,43 @@ audio_content_sample :: proc(frames_into: i64, start_s: i64, start_s_rate: f64) 
 	return timeline_frame_sample(frames_into) + audio_source_start_sample(start_s, start_s_rate)
 }
 
+// frame_at_sample is timeline_frame_at_sample over an explicit rate, so the
+// export's mixer can place a sample against the JOB's rate rather than the live
+// project's -- the same rule render_job.fps exists to enforce.
+frame_at_sample :: proc(at: Sample_Pos, rate_num, rate_den: i64) -> i64 {
+	assert(rate_num > 0 && rate_den > 0, "frame_at_sample: bad rate")
+	want := max(at, 0)
+	f := i64(want * rate_num / (AUDIO_BUS_RATE * rate_den))
+	for f > 0 && sample_pos_from_frames(f, rate_num, rate_den) > want {
+		f -= 1
+	}
+	for sample_pos_from_frames(f+1, rate_num, rate_den) <= want {
+		f += 1
+	}
+	return f
+}
+
+// timeline_frame_at_sample is the inverse of timeline_frame_sample: the largest
+// frame index whose boundary is at or before `at`.
+//
+// The fixed-block mixer needs this because it resolves positions at ARBITRARY bus
+// samples, not at frame boundaries -- a 512-sample block does not have to divide
+// a frame (at 120fps a frame is 400 samples, so a block straddles two
+// boundaries; at 12fps it is 4000, so it never comes close). Without an inverse,
+// "which frame is this sample in" would be answered by the same per-frame scan
+// the mixer is trying to get away from.
+//
+// Computed in integers with a bounded correction rather than by dividing and
+// rounding: flooring does not distribute over the rational, so the quotient is
+// within a sample or two and the loops make it exact. Which arithmetic produced
+// the initial guess does not matter -- the correction is what makes it exact, and
+// a mutation that swaps the guess for a float divide is an equivalent mutant
+// that the probe correctly does not flag.
+timeline_frame_at_sample :: proc(at: Sample_Pos) -> i64 {
+	num, den := fps_rational(project_fps())
+	return frame_at_sample(at, i64(num), i64(den))
+}
+
 // audio_content_sec is the one place a timeline frame is turned into a position
 // in an audio source file, in seconds. Every producer and the renderer share it
 // so playback and export cannot drift.

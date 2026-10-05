@@ -596,6 +596,59 @@ parity_probe_check_sample_clock :: proc() {
 		}
 	}
 
+	// 8. The inverse agrees with the forward function, and it is what lets the
+	//    fixed-block mixer resolve a content position at an arbitrary bus sample.
+	//    Checked both ways, because an inverse that is merely self-consistent is
+	//    still wrong: it has to agree with the boundaries the mixers already use.
+	for rate in rates {
+		saved := project.frame_rate
+		project.frame_rate = rate
+		rnum, rden := fps_rational(rate)
+		for f: i64 = 0; f < 3000; f += 1 {
+			at_boundary := timeline_frame_at_sample(sample_pos_from_frames(f, i64(rnum), i64(rden)))
+			if at_boundary != f {
+				parity_probe_failf("rate %f: frame %d boundary resolved back to %d", rate, f, at_boundary)
+				break
+			}
+			// One sample before the next boundary is still this frame.
+			next_b := sample_pos_from_frames(f + 1, i64(rnum), i64(rden))
+			if next_b > sample_pos_from_frames(f, i64(rnum), i64(rden)) + 1 {
+				just_before := timeline_frame_at_sample(next_b - 1)
+				if just_before != f {
+					parity_probe_failf(
+						"rate %f: sample %d (one before frame %d) resolved to frame %d",
+						rate, next_b - 1, f + 1, just_before,
+					)
+					break
+				}
+			}
+		}
+		// And the round trip that matters to the mixer: for any bus sample inside
+		// a frame, the content position is that frame's boundary plus the offset
+		// within it. Exact, or the mix is off by a sample mid-block.
+		for start_s in ([]i64{0, 441, 2731}) {
+			offset := audio_source_start_sample(start_s, rate)
+			for f: i64 = 0; f < 500; f += 1 {
+				b0 := sample_pos_from_frames(f, i64(rnum), i64(rden))
+				b1 := sample_pos_from_frames(f + 1, i64(rnum), i64(rden))
+				for p in (b0 ..< b1) {
+					back := timeline_frame_at_sample(p)
+					want := sample_pos_from_frames(back, i64(rnum), i64(rden)) + (p - b0)
+					if back != f || want != p {
+						parity_probe_failf(
+							"rate %f: sample %d in frame %d resolved to frame %d",
+							rate, p, f, back,
+						)
+						f = 500
+						break
+					}
+				}
+			}
+		}
+		project.frame_rate = saved
+	}
+
+
 	fmt.println("[parity-probe] sample clock: whole-second + whole-frame ground truth, adjacent-frame exactness, pinned source term, telescoping boundaries, 1601/1602, pts units")
 }
 
