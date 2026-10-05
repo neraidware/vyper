@@ -1302,118 +1302,188 @@ Render_Audio_Src :: struct {
 // normal case rather than an edge case.
 AUDIO_MIX_BLOCK :: 512
 
-// Render_Mix is the export's mix bus: a ring in the SAMPLE domain, produced in
-// fixed AUDIO_MIX_BLOCK blocks and consumed one video frame at a time.
+// RENDER_MIX_CUSHION_FRAMES is how far ahead of the consumer the mix producer
+// runs, in video frames -- the render's answer to the question playback already
+// answers with AUDIO_CUSHION_SEC. The export had none: the composite thread mixed
+// whatever the current frame needed, one frame at a time, so a decode that ran
+// late dropped that source for the whole frame and the next one started from
+// silence. 12 frames is 0.5s at 24fps and 0.1s at 120fps, both far more than
+// mixing one AUDIO_MIX_BLOCK of a few sources costs.
+RENDER_MIX_CUSHION_FRAMES :: 12
+
+// render_mix_bus_frames is the bus capacity in sample-frames, which IS the
+// cushion: the producer keeps the bus full to capacity and stalls when it is
+// full, so the depth of the cushion is the depth of the buffer and there is no
+// second number to keep in agreement with it. One extra frame so a frame still
+// fits when the bus is sitting at exactly the cushion.
+render_mix_bus_frames :: proc() -> int {
+	return (RENDER_MIX_CUSHION_FRAMES + 1) * MAX_AUDIO_FRAME_SAMPLES
+}
+
+// Render_Mix_Bus is the handover from the mix producer to the composite worker:
+// single-producer single-consumer, no mutex, no lock, no condvar.
 //
-// It reuses Audio_Ring rather than declaring a second ring type -- head/count/wrap
-// is the same problem, and the render and playback fifos should not be able to
-// drift apart. What this adds beside the ring is the bus POSITION bookkeeping,
-// because the ring only knows how many samples it holds, not where in the
-// timeline they came from.
+// The position lives in exactly one place per side. `write` belongs to the
+// producer and `read` to the consumer; each is published with a release store
+// and loaded with an acquire load, and the depth is their difference. That is the
+// whole point: the previous shape kept an Audio_Ring (head/count) AND a
+// Sample_Pos pos/end beside it -- two representations of one position, which is
+// the duplicated-state-that-drifts class this repo has paid for seven times, and
+// the S2 probe could only avoid testing content because hand-seeding that ring
+// meant hand-rolling the fill beside it.
 //
-// num/den are the JOB's exact frame rate, not project_fps(): the worker must
-// place samples against the rate the job was built on, for the same reason
-// render_job.fps exists (any second opinion retimes the export against the
-// preview it is meant to match).
+// The counters count sample-frames from the job's first frame, so they index the
+// buffer modulo its capacity and never need wrapping. A count's bus POSITION is
+// start + count, and the consumer converts once, when it computes a frame's
+// range.
+Render_Mix_Bus :: struct {
+	buf:    []f32, // interleaved stereo, frames*2 samples
+	frames: int,   // capacity in sample-frames
+	write:  i64,   // atomic: sample-frames published by the producer
+	read:   i64,   // atomic: sample-frames consumed by the worker
+}
+
+render_mix_bus_init :: proc(b: ^Render_Mix_Bus, frames: int) {
+	b.buf = make([]f32, frames * 2)
+	b.frames = frames
+	b.write = 0
+	b.read = 0
+}
+
+render_mix_bus_destroy :: proc(b: ^Render_Mix_Bus) {
+	delete(b.buf)
+	b.buf = nil
+	b.frames = 0
+}
+
+// render_mix_bus_room is producer-side only: only the producer can stall, and
+// only the consumer frees room, so this needs no lock even though `read` moves
+// underneath it.
+render_mix_bus_room :: proc(b: ^Render_Mix_Bus) -> int {
+	return b.frames - int(b.write - sync.atomic_load(&b.read))
+}
+
+// render_mix_bus_publish copies one mixed block onto the bus and releases it.
+// Producer only. Split across the wrap rather than assuming the block is
+// contiguous, because a block CAN straddle the end of the buffer.
+render_mix_bus_publish :: proc(b: ^Render_Mix_Bus, pcm: []f32, n: int) {
+	w := b.write
+	off := int(w % i64(b.frames))
+	head := min(n, b.frames - off)
+	copy(b.buf[off*2:], pcm[:head*2])
+	if head < n {
+		copy(b.buf, pcm[head*2:n*2])
+	}
+	// Release: the block above is visible to the consumer's acquire load.
+	sync.atomic_store(&b.write, w + i64(n))
+}
+
+// render_mix_bus_consume copies the n sample-frames at count `from` and advances
+// the consumer. `from` must be the consumer's own position: it walks the bus in
+// order and never skips, so a mismatch is a bug in the caller, not a recoverable
+// condition -- hence the assert rather than a hole. Returns false only when the
+// producer has not published that far yet, which is the one legitimate wait.
+render_mix_bus_consume :: proc(b: ^Render_Mix_Bus, from: i64, n: int, out: []f32) -> bool {
+	r := b.read
+	w := sync.atomic_load(&b.write)
+	assert(r == from, "mix bus consumed out of order")
+	if w - r < i64(n) {
+		return false
+	}
+	off := int(r % i64(b.frames))
+	head := min(n, b.frames - off)
+	copy(out[:head*2], b.buf[off*2:(off+head)*2])
+	if head < n {
+		copy(out[head*2:n*2], b.buf[:(n-head)*2])
+	}
+	sync.atomic_store(&b.read, r + i64(n))
+	return true
+}
+
+// Render_Mix is the export's mix bus and the producer's state. Only the mix
+// producer touches bus, holes or blocks_mixed after setup: the composite worker
+// reads the bus and nothing else, and owns the per-source audio DECODERS not at
+// all. Decoders are single-writer, so this split is also what makes it safe for
+// the producer to run ahead -- it is the only thread that can decode.
 Render_Mix :: struct {
-	ring:           Audio_Ring,
-	pos:            Sample_Pos, // bus position of the ring's oldest sample
-	end:            Sample_Pos, // bus position one past the newest sample
-	num, den:       i64,
+	bus:         Render_Mix_Bus,
+	start:       Sample_Pos, // bus position of sample-frame 0
+	num, den:    i64,
 	// holes counts blocks a source could not fill: a decode that did not keep
-	// pace with the block it was asked for. Counted because after the mix moves
-	// to its own thread this is the number that says whether the cushion is deep
-	// enough, and it is a SAMPLE-domain count -- the frame-domain counter that
-	// shipped alongside complete distortion (`1a38d78`) could not see this class
-	// of defect at all.
-	holes:          i64,
-	blocks_mixed:   i64,
+	// pace with the block it was asked for. Producer-written, read after the
+	// join. It is a SAMPLE-domain count -- the frame-domain counter that shipped
+	// alongside complete distortion (`1a38d78`) could not see this class of
+	// defect at all.
+	holes:        i64,
+	blocks_mixed: i64,
 }
 
-// render_mix_fill mixes blocks until the bus covers bus position `until`.
+// render_mix_step mixes as many whole blocks as the bus has room for, up to the
+// job's audio span, and returns false once the span is complete.
 //
-// Always a WHOLE block, even the one that overshoots `until`: a short final block
-// would make the block size depend on where the consumer's frame boundary fell,
-// which is the coupling this exists to remove. The overshoot is not waste -- it is
-// the headroom the next frame takes from without a mixing pass of its own.
-render_mix_fill :: proc(m: ^Render_Mix, auds: []Render_Audio_Src, until: Sample_Pos) {
+// It does NOT wait. Full bus and finished job are different answers, and only
+// the caller knows which one to give: the thread loop turns "full" into a yield,
+// and a probe that drives the producer and the consumer alternately turns it into
+// "let the consumer have a frame". Collapsing the two is what produced the first
+// version of this, where the producer stalled on a full bus inside a step and a
+// caller that had not yet consumed anything could never make progress -- the
+// probe deadlocked against code that works in the render, because running the
+// producer to completion and then consuming is not a sequence the render performs.
+render_mix_step :: proc(m: ^Render_Mix, job_end: Sample_Pos) -> bool {
 	block: [AUDIO_MIX_BLOCK * 2]f32
-	for m.end < until {
-		render_mix_block(m, auds, block[:], m.end, AUDIO_MIX_BLOCK)
-		ring_reserve(&m.ring, AUDIO_MIX_BLOCK)
-		render_mix_append(m, block[:], AUDIO_MIX_BLOCK)
+	for {
+		cur := m.start + Sample_Pos(sync.atomic_load(&m.bus.write))
+		if cur >= job_end {
+			return false
+		}
+		room := render_mix_bus_room(&m.bus)
+		if room < AUDIO_MIX_BLOCK {
+			return true
+		}
+		n := min(AUDIO_MIX_BLOCK, room, int(job_end - cur))
+		render_mix_block(m, block[:], cur, n)
+		render_mix_bus_publish(&m.bus, block[:], n)
 	}
 }
 
-// render_mix_serve_frame hands the consumer the samples for one video frame:
-// fill the bus until it covers the frame's end, take the frame's range, then trim
-// what was consumed.
+// render_mix_proc is the mix producer thread. It mixes the job's whole audio span
+// in fixed AUDIO_MIX_BLOCK blocks, keeping the bus full to its capacity, and exits
+// once it has published the last frame -- it never waits on the consumer, so the
+// worker's wait for a frame is always bounded by work the producer has already
+// been given.
 //
-// Extracted because the ORDER of those three steps is the whole invariant and it
-// is not visible at the call site -- filling after taking underruns, trimming to
-// the frame's START retires nothing and lets the bus grow with the length of the
-// render (a bug this proc's first version had, found by the probe that calls it).
-// Returns the sample-frames written to `out`, or 0 when the bus could not cover
-// the frame -- which the caller must treat as a hole rather than as stale audio.
-render_mix_serve_frame :: proc(
-	m: ^Render_Mix,
-	auds: []Render_Audio_Src,
-	frame: i64,
-	num, den: i64,
-	out: []f32,
-) -> int {
-	b0 := sample_pos_from_frames(frame, num, den)
-	b1 := sample_pos_from_frames(frame + 1, num, den)
-	n := int(min(b1 - b0, Sample_Pos(MAX_AUDIO_FRAME_SAMPLES)))
-	if n <= 0 {
-		return 0
+// Mixed into a fixed stack block, never an allocation: this is a hot loop and a
+// surprise allocation here is the same defect as one per frame in the mixer it
+// replaces. The decode path allocates only inside FFmpeg.
+render_mix_proc :: proc(m: ^Render_Mix) {
+	block: [AUDIO_MIX_BLOCK * 2]f32
+	job_end := sample_pos_from_frames(
+		render_job.start + render_job.nframes,
+		m.num,
+		m.den,
+	)
+	for render_mix_step(m, job_end) {
+		// The bus is full: the consumer is the slow one now, which is the whole
+		// point of the cushion. Yield rather than sleep -- the wait is one frame of
+		// composite work, and a futex round trip here would cost more than the
+		// mixing it is waiting for.
+		if sync.atomic_load(&render_pipe.mix_stop) {
+			return
+		}
+		thread.yield()
 	}
-	render_mix_fill(m, auds, b1)
-	if !render_mix_take(m, b0, n, out) {
-		return 0
-	}
-	// Trim to the END of what was taken, not its start.
-	render_mix_drop(m, b0 + Sample_Pos(n))
-	return n
 }
 
-// render_mix_init points the bus at the job's rate and its first sample.
-render_mix_init :: proc(m: ^Render_Mix, num, den: c.int, start: Sample_Pos) {
-	m.ring = {}
-	m.pos = start
-	m.end = start
-	m.num = i64(num)
-	m.den = i64(den)
-	m.holes = 0
-	m.blocks_mixed = 0
+render_mix_thread :: proc(t: ^thread.Thread) {
+	render_mix_proc(&render_mix)
 }
 
-// render_mix_depth is how many sample-frames the bus is holding.
-render_mix_depth :: proc(m: ^Render_Mix) -> int {
-	return ring_len(&m.ring)
-}
-
-// render_mix_has reports whether the bus covers [from, from+n).
-render_mix_has :: proc(m: ^Render_Mix, from: Sample_Pos, n: int) -> bool {
-	return from >= m.pos && from + Sample_Pos(n) <= m.end
-}
-
-// render_mix_block mixes one block of `n` sample-frames at bus position `at`
-// into `out` (interleaved stereo f32, n*2 samples).
-//
-// The content position of a clip at a bus sample is just the offset from the
-// clip's first frame plus its pinned source offset -- one sample of bus elapsed
-// is one sample of content elapsed, because both are the same 48 kHz timeline.
-// That is the whole reason this can be frame-free: the old per-frame path had to
-// re-derive a content position from a frame index on every frame, and any
-// disagreement between that derivation and the fifo's own labelling showed up as
-// a hole.
-render_mix_block :: proc(m: ^Render_Mix, auds: []Render_Audio_Src, out: []f32, at: Sample_Pos, n: int) {
-	for i in 0 ..< len(out) {
+render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
+	for i in 0 ..< n * 2 {
 		out[i] = 0
 	}
 	m.blocks_mixed += 1
-	for &a in auds {
+	for &a in render_job.audios {
 		if !a.dec.opened {
 			continue
 		}
@@ -1461,42 +1531,53 @@ render_mix_block :: proc(m: ^Render_Mix, auds: []Render_Audio_Src, out: []f32, a
 	}
 }
 
-// render_mix_append publishes a freshly mixed block on the bus. The caller has
-// already reserved room.
-render_mix_append :: proc(m: ^Render_Mix, block: []f32, n: int) {
-	copy(m.ring.buf[(m.ring.head + m.ring.count) % ring_cap(&m.ring) * 2:], block[:n * 2])
-	m.ring.count += n
-	m.end += Sample_Pos(n)
+// render_mix_init points the bus at the job's rate and its first sample.
+// render_mix_depth is how many sample-frames the bus holds right now. Either
+// side may call it: depth is the difference of two published counters, so it is a
+// reading, not a mutation.
+render_mix_depth :: proc(m: ^Render_Mix) -> int {
+	return int(sync.atomic_load(&m.bus.write) - sync.atomic_load(&m.bus.read))
 }
 
-// render_mix_take copies n sample-frames starting at bus position `from` into
-// `out` (n*2 interleaved samples). Returns false when the bus does not reach,
-// which is the hole signal the caller reports rather than papering over.
-render_mix_take :: proc(m: ^Render_Mix, from: Sample_Pos, n: int, out: []f32) -> bool {
-	if !render_mix_has(m, from, n) {
-		return false
-	}
-	base := int(from - m.pos)
-	for s in 0 ..< n {
-		l, r := ring_at(&m.ring, base + s)
-		out[s * 2 + 0] = l
-		out[s * 2 + 1] = r
-	}
-	return true
+render_mix_init :: proc(m: ^Render_Mix, num, den: c.int, start: Sample_Pos) {
+	m.start = start
+	m.num = i64(num)
+	m.den = i64(den)
+	m.holes = 0
+	m.blocks_mixed = 0
+	render_mix_bus_init(&m.bus, render_mix_bus_frames())
 }
 
-// render_mix_drop trims everything before bus position `up_to`, which is what the
-// consumer does once it has taken a frame.
-render_mix_drop :: proc(m: ^Render_Mix, up_to: Sample_Pos) {
-	if up_to <= m.pos {
-		return
+// render_mix_serve_frame hands the consumer the samples for one video frame.
+//
+// The bus is already filled to the cushion by the producer, so this is a wait
+// that normally does not wait: the frame it needs was mixed long before the
+// composite got here. The wait is bounded because the producer publishes the
+// whole job's span without waiting on the consumer -- so this can only be
+// unbounded if the producer was stopped or failed, which is what mix_stop and
+// mix_fail are for. Returns the sample-frames written to `out`, or 0 when the
+// frame could not be had, which the caller must treat as a hole rather than as
+// stale audio.
+render_mix_serve_frame :: proc(
+	m: ^Render_Mix,
+	frame: i64,
+	num, den: i64,
+	out: []f32,
+) -> int {
+	b0 := sample_pos_from_frames(frame, num, den)
+	b1 := sample_pos_from_frames(frame + 1, num, den)
+	n := int(min(b1 - b0, Sample_Pos(MAX_AUDIO_FRAME_SAMPLES)))
+	if n <= 0 {
+		return 0
 	}
-	drop := int(up_to - m.pos)
-	drop = min(drop, ring_len(&m.ring))
-	if drop > 0 {
-		ring_drop(&m.ring, drop)
-		m.pos += Sample_Pos(drop)
+	from := i64(b0 - m.start)
+	for !render_mix_bus_consume(&m.bus, from, n, out) {
+		if sync.atomic_load(&render_pipe.mix_stop) {
+			return 0
+		}
+		thread.yield()
 	}
+	return n
 }
 
 // render_audio_src_from_chip copies one committed geometry chip into the job's
@@ -2490,10 +2571,27 @@ Render_Pipeline :: struct {
 	// Encoder-thread timing, written before it exits and read after the join.
 	enc_video_ns:      i64,
 	enc_audio_ns:      i64,
-	// audio_holes counts video frames the mix bus could not cover. Worker-written,
-	// read by the render-test summary after the join. Sample-domain by
-	// construction: the bus knows in samples, so this counts the thing that
-	// actually got dropped rather than a frame-shaped proxy for it.
+	// A3 mix producer: render_mix_proc mixes the job's whole audio span in fixed
+	// AUDIO_MIX_BLOCK blocks and keeps render_mix.bus full to
+	// RENDER_MIX_CUSHION_FRAMES, so the composite thread consumes finished audio
+	// instead of mixing whatever the current frame happens to need. Same shape as
+	// the decode producer: one atomic stop flag, one thread, joined before the
+	// audio decoders it owns are reset. The producer owns the audio decoders
+	// outright -- they are single-writer, and after this split the worker touches
+	// none of their fields.
+	mix:              ^thread.Thread,
+	mix_stop:         bool, // atomic: worker sets at EOF/cancel; producer polls
+	// mix_faulted is the producer's own panic/stop escape: if it cannot finish
+	// the span, the consumer's wait must not become unbounded, and a frame the
+	// bus never got is a hole counted rather than a render that hangs.
+	mix_faulted:      bool, // atomic: producer set
+	mix_ns:           i64, // producer-side wall time: decode + mix
+	mix_wait_ns:      i64, // ...of which was stalled waiting for the consumer
+	// audio_holes counts video frames the mix bus could not cover, plus the
+	// producer's own count of source shortfalls. Read by the render-test summary
+	// after the join. Sample-domain by construction: the bus knows in samples, so
+	// this counts the thing that actually got dropped rather than a frame-shaped
+	// proxy for it.
 	audio_holes:       i64,
 	// Sub-split of enc_video_ns for the hw-upload path probe: how much is CPU
 	// RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
@@ -2793,6 +2891,18 @@ render_worker_run :: proc() {
 				err_msg = string(render_pipe.enc_err[:render_pipe.enc_err_len])
 			}
 		}
+		// Stop+join the mix producer BEFORE the audio decoders are reset: it owns
+		// them outright (they are single-writer and the worker no longer touches
+		// them), so a reset while it is mid-decode is a use-after-free. It exits on
+		// its own once it has published the last frame, so this join is immediate
+		// on the normal path and only waits on a cancel.
+		if render_pipe.mix != nil {
+			sync.atomic_store(&render_pipe.mix_stop, true)
+			thread.destroy(render_pipe.mix)
+			render_pipe.mix = nil
+		}
+		render_pipe.audio_holes += render_mix.holes
+		render_mix_bus_destroy(&render_mix.bus)
 		enc_cleanup(&e)
 		for &v in render_job.videos {
 			clip_decoder_reset(&v.dec)
@@ -3087,22 +3197,24 @@ render_worker_run :: proc() {
 
 	has_audio := len(render_job.audios) > 0
 	if has_audio {
-		// The mix bus starts at the job's first sample and is sized for a whole
-		// frame plus the block the fill overshoots by, so a steady state never
-		// grows the ring.
+		// The mix bus starts at the job's first sample, and its capacity IS the
+		// cushion (render_mix_bus_frames).
 		render_mix_init(
 			&render_mix,
 			rfps_num,
 			rfps_den,
 			sample_pos_from_frames(render_job.start, mnum, mden),
 		)
-		ring_reserve(&render_mix.ring, AUDIO_MIX_BLOCK + MAX_AUDIO_FRAME_SAMPLES)
 		for i in 0 ..< len(render_job.audios) {
 			a := &render_job.audios[i]
 			if !render_audio_open(a, render_job.start, rfps) {
 				a.dec.opened = false
 			}
 		}
+		// Started only once every audio decoder is open: the producer owns them
+		// from here, and opening one underneath it would be a use-after-free.
+		render_pipe.mix = thread.create(render_mix_thread)
+		thread.start(render_pipe.mix)
 	}
 
 	if !render_open_output(
@@ -3443,7 +3555,6 @@ render_worker_run :: proc() {
 			// of a frame-shaped hole in the output every time it happened.
 			cur_spf := render_mix_serve_frame(
 				&render_mix,
-				render_job.audios,
 				timeline_frame,
 				mnum,
 				mden,

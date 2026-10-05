@@ -5021,6 +5021,76 @@ future regression cannot hide behind green telemetry the way `1a38d78` did.
       the expected signal is audible matters: the recording has a genuine 696ms
       quiet passage at 85.4s, and a hole counter that counted it would report the
       same number forever and then get ignored.
+- [x] S3. **A3** — mix on its own thread with a cushion. Shipped.
+
+      The export had no cushion at all: the composite thread mixed whatever the
+      current frame needed, one frame at a time, so a decode that ran late dropped
+      that source for the whole frame and the next frame started from silence.
+      Playback has `AUDIO_CUSHION_SEC = 0.25`; the export's answer was zero.
+
+      `render_mix_proc` mixes the job's whole audio span in fixed blocks on its own
+      thread and keeps `render_mix.bus` full to `RENDER_MIX_CUSHION_FRAMES` (12
+      frames -- 0.5s at 24fps, 0.1s at 120fps). The bus's CAPACITY is the cushion,
+      so there is no second number to keep in agreement with it. The producer never
+      waits on the consumer: it publishes the entire span, exiting once it has
+      published the last frame, which is what makes the worker's wait bounded by
+      work the producer has already been given.
+
+      **The bus is a lock-free SPSC ring, and the position now lives in one place.**
+      `Render_Mix_Bus` has `write` (producer-owned) and `read` (consumer-owned),
+      each published with a release store and loaded with an acquire load; depth is
+      their difference. That replaces S2's `Audio_Ring` (head/count) sitting beside
+      a `Sample_Pos` pos/end -- two representations of one fact, which is the
+      duplicated-state-that-drifted class this repo has paid for seven times, and
+      the reason S2's probe could not pin content. Counters count sample-frames from
+      the job's first frame, so they index modulo capacity and never wrap
+      arithmetically.
+
+      **Decoder ownership moved with the mixing.** The audio decoders are
+      single-writer, so they now belong to the producer outright; the composite
+      thread touches none of their fields, and teardown joins the producer BEFORE
+      resetting them. A reset underneath a running producer is a use-after-free.
+
+      **Two design bugs the probe found, both in the producer's contract:**
+
+      - The first `render_mix_proc` stalled on a full bus *inside* the mixing step.
+        In the render that works -- producer and consumer run concurrently -- but
+        "produce the whole span, then consume" deadlocked, because a caller that
+        has consumed nothing can never make the producer proceed. That is not a
+        usage the render performs, but it is a usage a probe wants, and the code
+        had no way to express the difference. Split into `render_mix_step`, which
+        mixes what fits and RETURNS when full (the caller decides whether that means
+        yield or "your turn"), and a thread loop that yields.
+      - The bus-boundedness assertion failed on correct code: at 20 frames the whole
+        render fits inside the 12-frame cushion, so "the bus holds the whole span"
+        was the right answer. The probe now runs 200 frames, long enough that the
+        cushion binds at every rate in the table.
+
+      **Probe: values, not just geometry.** The S3 split is what made a value test
+      possible -- publishing and consuming are separate steps on separate threads,
+      so the bus can be filled with KNOWN samples and read back, with no
+      hand-seeded ring and no hand-rolled fill beside the real one.
+        - K1 alternates producer and consumer for 200 frames at 12/24/30/60/120fps:
+          every frame served with its exact sample count, the span served exactly,
+          the bus drained at the end, and depth bounded by capacity rather than by
+          the span. `read == write` at the end is also what catches a producer that
+          runs past the job's end.
+        - K2 publishes and consumes the sequence 1..12 through an 8-frame buffer, so
+          a publication, a read, and a read that starts wrapped each straddle the
+          end. Buffer indexing that is only correct for a block which happens not to
+          straddle is the exact failure a block-based mixer exists to make rare.
+      Mutation: "publish ignores the wrap" and "consume ignores the wrap" are both
+      caught, with the sample index and the value that came back
+      (`sample 9 came back 1,1, want 9,9`). These are the mutations S2's probe
+      structurally could not catch.
+
+      `~/sallyface.vyproj`, unchanged from S2: 0 holes where sound was due, 10 of 10
+      clip regions at lag 0, correlation 0.9988-1.0000, export -6.7ms against the
+      frame grid (S6). Same output, now produced a frame ahead of time on a thread
+      that owns the decoders.
+      Gates: check build parity audio_probe keyed_export render_kf_probe
+      timeline_probe render_live_probe yuv_exact probe smoke render_valgrind.
+
 - [ ] S3. **A3** — mix on its own thread with a cushion. Probe: the export's
       silence-run count goes to zero on `~/sallyface.vyproj`, which is the
       measured defect this whole section exists to close.

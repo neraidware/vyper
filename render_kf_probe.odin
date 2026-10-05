@@ -3,6 +3,7 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:sync"
 
 // Headless probe for render_kf_geom_rect (render.odin:586) — the pure
 // per-frame keyed-geometry math the compositor worker calls in
@@ -519,54 +520,151 @@ render_kf_probe_run :: proc() -> int {
 	// the right pixels come out is pinned where it cannot drift: end to end on a
 	// real project (TODO.md Active 22, S2).
 	//
+	// Two things, because the S3 split made a value test possible where before it
+	// was not: publishing and consuming are now separate steps on separate
+	// threads, so the bus can be filled with KNOWN samples and read back without
+	// hand-seeding the ring -- which is exactly what was impossible while the fill
+	// and the take shared one struct's position bookkeeping, and why this case was
+	// coverage-only in S2.
+	//
+	// K1 geometry and ownership: the producer publishes the job's span and STOPS,
+	// the bus never holds more than its capacity, and every frame is served with
+	// its exact sample count.
+	//
+	// K2 the wrap, with real samples in the bus. Buffer indexing that is only
+	// right for a block which happens not to straddle the end is the failure a
+	// block-based mixer is specifically supposed to make rare -- "the bus is a
+	// ring" is an invariant to test, not a shape to assume.
+	//
 	// Rates are the ones where block and frame sizes relate awkwardly: 120fps is
 	// 400-sample frames so a block straddles two boundaries, 60 is 800, 12 is 4000.
+	// Long enough that the cushion BINDS at every rate in the table: the bus is
+	// (12+1)*MAX_AUDIO_FRAME_SAMPLES = 53248 sample-frames, and 200 frames is
+	// 80000 samples even at 120fps. A shorter render fits inside the cushion
+	// entirely, and then "the bus holds the whole span" is the correct answer --
+	// which is why this started at 20 and failed on correct code.
+	frames: i64 = 200
 	for tc in mix_bus_cases() {
 		m: Render_Mix
 		render_mix_init(&m, tc.num, tc.den, 0)
-		frames: i64 = 20
-		depth_max := 0
+		span := sample_pos_from_frames(frames, i64(tc.num), i64(tc.den))
+		cap := render_mix_bus_frames()
+
+		// K1: run the producer to completion first -- it mixes the whole span and
+		// returns, bounded by capacity rather than by the consumer.
+		render_job.start = 0
+		render_job.nframes = frames
 		served := 0
+		depth_max := 0
 		for f: i64 = 0; f < frames; f += 1 {
 			out := make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
-			// No sources: every block mixes to silence, which is fine -- this is
-			// about geometry, not content.
-			n := render_mix_serve_frame(&m, nil, f, i64(tc.num), i64(tc.den), out)
+			// Alternate producer and consumer, which is what the two threads do
+			// concurrently. Producing the whole span first is NOT a sequence the
+			// render performs: the producer fills to capacity and waits, so a
+			// caller that has consumed nothing yet gets no further audio and
+			// deadlocks. Driving both sides here keeps the probe deterministic
+			// without standing up a thread to race.
+			render_mix_step(&m, span)
+			depth_max = max(depth_max, render_mix_depth(&m))
+			// No sources: every block mixes to silence. This part is about the
+			// handoff's geometry, and K2 covers what comes back.
+			n := render_mix_serve_frame(&m, f, i64(tc.num), i64(tc.den), out)
 			want_n := int(
 				sample_pos_from_frames(f + 1, i64(tc.num), i64(tc.den)) -
 				sample_pos_from_frames(f, i64(tc.num), i64(tc.den)),
 			)
 			if n != want_n {
 				render_kf_probe_check(
-					false, "K %s frame %d: served %d samples, want %d", tc.name, f, n, want_n,
+					false, "K1 %s frame %d: served %d samples, want %d", tc.name, f, n, want_n,
 				)
 				break
 			}
 			served += n
-			depth_max = max(depth_max, render_mix_depth(&m))
 		}
-		want := sample_pos_from_frames(frames, i64(tc.num), i64(tc.den))
-		// Served exactly the span, sample for sample.
+		// Served exactly the span, sample for sample, and the bus is drained --
+		// the consumer's position and the producer's meet at the end.
 		render_kf_probe_check(
-			Sample_Pos(served) == want,
-			"K %s: served %d samples over %d frames, want exactly %d",
-			tc.name, served, frames, want,
+			Sample_Pos(served) == span,
+			"K1 %s: served %d samples over %d frames, want exactly %d",
+			tc.name, served, frames, span,
 		)
-		// Bounded: after 20 frames the bus holds a cushion, not the span. A trim
-		// to the frame's START retires nothing, and this is what catches it.
 		render_kf_probe_check(
-			Sample_Pos(depth_max) < want / 4,
-			"K %s: bus peaked at %d samples over %d frames (span %d) -- it is not being trimmed",
-			tc.name, depth_max, frames, want,
+			sync.atomic_load(&m.bus.read) == sync.atomic_load(&m.bus.write),
+			"K1 %s: bus not drained: read %d, write %d",
+			tc.name, sync.atomic_load(&m.bus.read), sync.atomic_load(&m.bus.write),
 		)
-		// Whole blocks: enough of them to cover the span, and never a short one
-		// cut to a consumer's edge.
+		// Bounded by the cushion, not by the span: this is the assertion that
+		// would fail if the producer ran away from the consumer.
 		render_kf_probe_check(
-			m.blocks_mixed * AUDIO_MIX_BLOCK >= want,
-			"K %s: %d whole blocks (%d samples) must cover %d",
-			tc.name, m.blocks_mixed, m.blocks_mixed * AUDIO_MIX_BLOCK, want,
+			Sample_Pos(depth_max) <= Sample_Pos(cap),
+			"K1 %s: bus peaked at %d samples, over its %d-sample capacity",
+			tc.name, depth_max, cap,
 		)
+		render_kf_probe_check(
+			Sample_Pos(depth_max) < span,
+			"K1 %s: bus peaked at %d samples, holding the whole %d-sample span",
+			tc.name, depth_max, span,
+		)
+		render_mix_bus_destroy(&m.bus)
 	}
+
+	// K2: the wrap, with values. Capacity 8, and the sequence runs 1..12 so the
+	// counters lap the buffer twice and a publication, a read, and both at once
+	// each straddle the end at least once.
+	b: Render_Mix_Bus
+	render_mix_bus_init(&b, 8)
+	out := make([]f32, 64)
+	blk: [6]f32
+
+	seq := proc(vals: ..f32) -> ([6]f32) {
+		r: [6]f32
+		for v, i in vals {
+			r[i * 2 + 0] = v
+			r[i * 2 + 1] = v
+		}
+		return r
+	}
+	expect := proc(out: []f32, first: f32, n: int, label: string) {
+		for s in 0 ..< n {
+			want := first + f32(s)
+			render_kf_probe_check(
+				out[s * 2 + 0] == want && out[s * 2 + 1] == want,
+				"%s: sample %d came back %g,%g, want %g,%g",
+				label, int(first) + s, out[s * 2 + 0], out[s * 2 + 1], want, want,
+			)
+		}
+	}
+
+	blk = seq(1, 2, 3)
+	render_mix_bus_publish(&b, blk[:], 3)
+	render_kf_probe_check(
+		render_mix_bus_consume(&b, 0, 2, out), "K2: first consume refused",
+	)
+	expect(out, 1, 2, "K2 read 1..2")
+	// 4..6 lands across the write boundary: capacity 8, so frames 6 and 7 of the
+	// buffer are the tail and frame 0 is the head.
+	blk = seq(4, 5, 6)
+	render_mix_bus_publish(&b, blk[:], 3)
+	blk = seq(7, 8, 9)
+	render_mix_bus_publish(&b, blk[:], 3)
+	// One read of 7 frames from count 2: starts at offset 2 and wraps to 0.
+	render_kf_probe_check(
+		render_mix_bus_consume(&b, 2, 7, out), "K2: wrapping consume refused",
+	)
+	expect(out, 3, 7, "K2 read 3..9")
+	// And a read that starts wrapped.
+	blk = seq(10, 11, 12)
+	render_mix_bus_publish(&b, blk[:], 3)
+	render_kf_probe_check(
+		render_mix_bus_consume(&b, 9, 3, out), "K2: wrapped consume refused",
+	)
+	expect(out, 10, 3, "K2 read 10..12")
+	render_kf_probe_check(
+		sync.atomic_load(&b.read) == sync.atomic_load(&b.write),
+		"K2: bus not drained after reading 1..12: read %d write %d",
+		sync.atomic_load(&b.read), sync.atomic_load(&b.write),
+	)
+	render_mix_bus_destroy(&b)
 
 	if render_kf_probe_fail {
 		fmt.println("[render-kf-probe] failed")
