@@ -6563,3 +6563,48 @@ render_live_probe decode_repeat` pass; `render_valgrind parity_valgrind
 undo_valgrind` clean. New span cases
 assert both directions separately, because a span test that only checks the
 permissive direction passes a helper that is off by one in the restrictive one.
+
+**`~/baby.vyproj` found four defects no fixture reached.** The project stores an AV1
+webm as a clip of kind `.Audio` over an asset of kind `.Video`. Both `pf_pin_src_fps`
+and `clip_duration_sec` filtered on `Clip.kind`, so that clip matched no rung at all:
+`src_fps` stayed 0, it resolved to the project rate, and a 12fps source played at
+60fps speed. The "5 times faster" report was STILL LIVE after the conform fix,
+because the pin never ran on that clip. Both now branch on the **asset's** kind,
+which comes from probing the file — the clip's kind is precisely the field an
+older-written or hand-edited project gets wrong. `timeline_probe` gained the
+kind-mismatch case; restoring the filter fails it at `one second advanced 60.000
+source frames, want 12`.
+
+Three more, all from running the real file:
+
+- **A rate returned where a duration was wanted.** The derive fallback computed
+  `frame_count/dur_us` = 11.99 for an 18.26s source, and 11.99 is a
+  plausible-looking duration — it reads as a slightly-short clip rather than as an
+  arithmetic slip. It returns `dur_us` directly now, which is already the duration.
+- **The asset's duration would have un-trimmed every trimmed clip.** A clip trimmed
+  to half a second snaps back to its source's full length on the next rate change,
+  and nothing about that looks wrong. The asset's duration is used only when the
+  clip verifiably IS the whole asset.
+- **The load-time rebase stretched the project's PNG to 20.17s.** A still has no
+  measurable duration, so the rebase divided its extent by `timeline.frame_rate`
+  (12) when it had in fact been authored at the project's 60. It now rebases only
+  clips with a measured duration and leaves the rest exactly as found. A single
+  global authoring rate cannot be right even in principle: in that one file the
+  webm's extent was authored at 12fps and the still's at 60.
+
+**A project now tests its own fps model.** `VYPER_PROJECT_EXPORT` takes an optional
+third field, the rate — the only way to ask "does this project look the same at 12
+and at 60" headlessly, since a project file stores exactly one rate. It applies
+through `set_project_fps`, so the export runs against a REFLOWED timeline rather
+than one whose extents were rewritten behind the model's back. A layout dump prints
+each clip's resolved extent, rate, source length and content, so a wrong extent is
+visible as a number rather than only as an output duration. Verified on
+`~/baby.vyproj`: the webm resolves to **18.261s of content at both rates**, extent
+219 frames at 12fps and 1096 at 60.
+
+**STILL OPEN, and it is not an fps problem.** That webm clip is of kind `.Audio`, so
+`render_clip_sink` returns `ok=false` and its AV1 video is **never decoded** — at any
+frame rate. Both exports of the file are essentially black. So the "completely
+different preview" was a still image and black rather than a retimed webm, and this
+project cannot demonstrate the fps fix visually until the classification is
+re-derived from the asset. That is the next thing to decide.
