@@ -1369,13 +1369,21 @@ target_audio_drift_parity() {
 	mkdir -p target/mixparity
 	if [ ! -s "$wav" ] || [ ! -s "$aac" ]; then
 		echo "audio-drift-parity: synthesizing a ${secs}s fixture" >&2
-		ffmpeg -v error -f lavfi -i "sine=frequency=997:sample_rate=48000:duration=$secs" \
+		ffmpeg -v error -f lavfi -i "anoisesrc=color=white:sample_rate=48000:duration=$secs:amplitude=0.5:seed=7" \
 			-ac 2 -c:a pcm_s16le "$wav" -y || return 1
 		ffmpeg -v error -i "$wav" -c:a aac -b:a 128k "$aac" -y || return 1
 	fi
-	# 997 Hz is deliberate: it is coprime with 60, with 30000/1001 and with 48000,
-	# so a rounded boundary shows up as a phase error instead of cancelling out
-	# over the window the way 440 or 1000 Hz would.
+	# Broadband noise, deliberately. A pure tone -- 997 Hz was the first choice --
+	# is coprime with 60, 30000/1001 and 48000, so a rounded boundary does show as
+	# phase error, but it has a 48.1-sample period at 48 kHz, which makes
+	# cross-correlation ambiguous: every shift differing by a period correlates
+	# just as well, so the "best shift" cannot localise anything within ~48
+	# samples. Chasing that produced a confident number that meant nothing.
+	#
+	# Noise has no period, so the correlation has one peak. It also exposes
+	# rounding MORE sharply than a tone: a boundary rounded by one sample moves
+	# every sample after it against uncorrelated noise, which is the largest
+	# possible error rather than a phase wobble that partly cancels.
 	for spec in "600|60" "600|29.97" "600|30"; do
 		printf '[gate] drift %ss at %s fps\n' "${spec%%|*}" "${spec##*|}"
 		VYPER_AUDIO_DRIFT_PARITY="$PWD/$src|${spec%%|*}|${spec##*|}" timeout 1800 ./vyper 2>&1 | tail -2

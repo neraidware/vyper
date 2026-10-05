@@ -6049,10 +6049,30 @@ been very expensive to believe.
 
 **Still open: 29.97 and 30 sample parity.** Not root-caused. Block boundaries
 (512) do not coincide with frame boundaries at any of these rates, but 60 is clean
-and 29.97 is not, so "blocks straddle frames" is not the whole of it. The next
-measurement is the per-source gain each sink applies — `play_seg_gain_linear`
-against `audio_gain_linear(&a.gain, rel)` — and then the per-block
-`blk_lo`/`want` derivation at a frame whose length alternates.
+and 29.97 is not, so "blocks straddle frames" is not the whole of it.
+
+**The measurement itself was fixed first, because it could not have found this.**
+The fixture was a 997 Hz tone — chosen because it is coprime with 60, 30000/1001
+and 48000, so a rounded boundary shows as phase error. But a 48.1-sample period at
+48 kHz makes cross-correlation ambiguous: every shift differing by a period
+correlates equally well, so "best content shift = 694" localises nothing within
+~48 samples. It was a confident number about nothing — the fourth such number in
+this work.
+
+The fixture is now broadband noise, which has no period (one correlation peak) and
+exposes rounding MORE sharply than a tone did: one rounded boundary moves every
+subsequent sample against uncorrelated noise, which is the largest possible error
+rather than a phase wobble that partly cancels. With it, 29.97 diverges with best
+shift -432 and 30 with -585, against 60 fps still bit-identical.
+
+Ruled out along the way: the frame mix buffer is `MAX_AUDIO_FRAME_SAMPLES = 4096`,
+sized for 12 fps, so a 1601-sample NTSC frame is not being truncated.
+
+Next measurement, in order: whether the divergence begins at the first frame
+whose length DIFFERS from its predecessor (1602 vs 1601 at NTSC), which would
+point at a per-frame boundary difference rather than at anything inside a block;
+then the per-source gain each sink applies, `play_seg_gain_linear` against
+`audio_gain_linear(&a.gain, rel)`.
 
 `audio_drift_parity` stays OUT of `all` while it is red, for the reason
 `audio_mix_parity` was: a failing member gets disabled, and a check nobody runs
