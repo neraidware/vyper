@@ -2605,18 +2605,35 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 	// "contributed last block".
 	a.muted = true
 	overlap_start := max(a.timeline_start_frame, render_start)
-	content_sec := audio_content_sec(overlap_start - a.timeline_start_frame, a.source_start_frame, a.source_start_rate, fps)
 	if !open_audio_decoder_resampled(&a.dec, a.path, a.stream_index, RENDER_AUDIO_RATE, 2) {
 		return false
 	}
-	if !seek_audio(&a.dec, content_sec) {
+	// Where this clip's content actually begins, as an exact 48 kHz sample
+	// (audio_source_start_sample, the S1 integer path -- no float seconds).
+	content := i64(
+		audio_source_start_sample(
+			a.source_start_frame + (overlap_start - a.timeline_start_frame),
+			a.source_start_rate,
+		),
+	)
+	// Preroll: seek EARLY and decode forward, exactly as playback's
+	// audio_src_seek_anchor does.
+	//
+	// Seeking to the asked position and then labelling the fifo with wherever the
+	// decoder landed fixes the LABEL but not the CONTENT, and the export had only
+	// the label. A seek lands on a keyframe, which can be after the ask: the
+	// audio_probe fixture lands +43ms late, and that is 43ms of every clip's opening
+	// simply absent from the fifo. The mix then asks for content it does not have,
+	// `a.first48 > content` is true, and the clip's first block comes out a
+	// shortfall -- silent, counted, and audible as a gap at every cut.
+	//
+	// The label still comes from the decoder's real landing PTS rather than the
+	// asked time: labelling with the asked time compounds the seek's error over the
+	// whole render (playground's audio_provision fix, same reason).
+	if !seek_audio(&a.dec, max(0.0, f64(content)/f64(RENDER_AUDIO_RATE) - AUDIO_SEEK_PREROLL_SEC)) {
 		return false
 	}
-	// Align the fifo base to the decoder's real landing PTS, not the asked
-	// position: an AAC seek can land tens of ms off, and labeling the fifo with
-	// the asked time compounds that offset over the whole render. Same fix
-	// playback applied (audio.odin audio_provision).
-	n := decode_audio_chunk(&a.dec, content_sec)
+	n := decode_audio_chunk(&a.dec, -1.0)
 	if n <= 0 {
 		return false
 	}
@@ -2624,6 +2641,28 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 	a.first48 = i64(decoder_pts_sample(src.first_ts, src.stream.time_base))
 	a.have48 = a.first48 + i64(n)
 	ring_push_pcm(&a.fifo, a.dec.s16[:n * 2], n)
+	// Decode forward until the fifo covers the clip's first content sample plus a
+	// block, so the mix's opening request is satisfied from real audio rather than
+	// from a hole the preroll was supposed to prevent.
+	render_audio_pull(a, content + AUDIO_MIX_BLOCK)
+
+	// Reaching here with the fifo starting past the content means the source cannot
+	// supply the clip's beginning at all -- the decoder's first decodable audio is
+	// after the clip's first sample. Counted and logged rather than left to become
+	// a silent hole per block: the mix will treat every one of those blocks as a
+	// shortfall, and the export ends up with a gap at every cut of that clip with
+	// nothing in the log to connect the two.
+	if a.first48 > content {
+		render_pipe.audio_preroll_miss += 1
+		if !render_preroll_logged {
+			render_preroll_logged = true
+			fmt.printf(
+				"[render] audio: %s opens %.1fms after its first clip sample; preroll could not cover it\n",
+				a.path,
+				f64(a.first48 - content) * 1000.0 / f64(RENDER_AUDIO_RATE),
+			)
+		}
+	}
 	return true
 }
 
@@ -2634,6 +2673,11 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 // render_mix is the export's mix bus. Worker-owned for the life of the job and
 // freed with the job arena, like everything else the worker allocates.
 render_mix: Render_Mix
+
+// render_preroll_logged keeps the "decoder opens after its clip's first sample"
+// warning to one line per render rather than one per clip: every clip of an
+// affected file reports it, and a project with twenty of them should say so once.
+render_preroll_logged: bool
 
 // Render_Enc_Slot is one entry of the encode ring.
 RENDER_ENC_SLOTS :: 4
@@ -2724,6 +2768,12 @@ Render_Pipeline :: struct {
 	// this counts the thing that actually got dropped rather than a frame-shaped
 	// proxy for it.
 	audio_holes:       i64,
+	// audio_preroll_miss counts clips whose decoder opens AFTER the clip's first
+	// sample, so the opening could not be covered by preroll and every block of it
+	// is a shortfall. Worker-written, read after the join. In samples, like every
+	// other audio number here: a frame-domain count of this is a count of the wrong
+	// thing, since the damage is a span of time inside the first frame.
+	audio_preroll_miss: i64,
 	// Sub-split of enc_video_ns for the hw-upload path probe: how much is CPU
 	// RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
 	// send+drain (encoder wait).

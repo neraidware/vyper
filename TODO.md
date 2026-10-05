@@ -220,11 +220,50 @@ Steps (each lands + probe + vet before the next):
       checkable when the truncation stopped eating it -- the one at frame 1699 --
       and all 11 sit at lag 0 with 0 holes where sound is due.
 
-- [ ] S6b. **A6** — render preroll + sample-domain counters.
-      Not started. `AUDIO_SEEK_PREROLL_SEC` is still 0 for the export: the first
-      block of a clip can begin at a sample the AAC seek did not land on exactly,
-      so the opening samples of every clip are whatever the decoder happened to
-      return there.
+- [x] S6b. **A6** — render preroll. Shipped. Active 22 is now complete.
+
+      The export sought to the clip's content position and then labelled its fifo
+      from wherever the decoder landed. That fixes the LABEL and not the CONTENT,
+      and it had only the label. A seek lands on a keyframe, which can be AFTER the
+      ask -- `audio_probe` measures its own fixture landing +43ms late -- so the
+      clip's opening samples were simply not in the fifo. The mix then asked for
+      content it did not have, `a.first48 > content` was true, and the clip's first
+      block came out a shortfall: silent, counted as a hole, and audible as a gap at
+      every cut. Playback has solved this since forever in `audio_src_seek_anchor`
+      by seeking EARLY (`AUDIO_SEEK_PREROLL_SEC`) and decoding forward; the export
+      now does the same.
+
+      The content position is computed with S1's integer `audio_source_start_sample`,
+      not seconds, so the preroll target is exact rather than approximately right.
+
+      **Measured**, on a project whose clip starts 1.0s into a file whose decoder
+      seeks late (the `audio_probe` fixture, reproduced by building a one-clip
+      `.vyproj` against `target/audio_probe/src.mp4`):
+
+      | | first 10ms rms | near-silent samples of the first 480 |
+      |---|---|---|
+      | source | 2846.5 | - |
+      | with preroll | **1624.1** | 41 |
+      | without preroll | 266.7 | 141 |
+
+      Without it the clip's opening is silence. With it, the opening is present and
+      the residual near-silent samples are the S4 declick fade-in, which is supposed
+      to be there.
+
+      **The residual case is now visible instead of silent.** Preroll cannot always
+      win -- if the decoder's first decodable audio is after the clip's first sample,
+      every block of that clip is a shortfall. `render_pipe.audio_preroll_miss`
+      counts those clips in SAMPLES and logs the offset once per render, so a gap at
+      every cut of one clip connects to a cause instead of appearing as an
+      unexplained run of `audio_holes`. The measurement above shows the detector
+      working: with preroll disabled it printed `opens 2.7ms after its first clip
+      sample`.
+
+      **Sample-domain counters.** `audio_holes`, `blocks_mixed` and now
+      `audio_preroll_miss` are all sample counts. The frame-domain counter that
+      shipped alongside complete distortion (`1a38d78`) could not see this class of
+      defect: the damage is a span of time INSIDE the first frame, so a per-frame
+      tally reports it as one frame either way.
 
 - [x] S5. **A5** — edit generations: reconcile instead of re-provision. Shipped.
 
