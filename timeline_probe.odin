@@ -1789,6 +1789,90 @@ test_pin_src_fps_kind_mismatch :: proc() {
 	)
 }
 
+
+// test_audio_head_trim is ~/baby.vyproj's "Sr Pelo" clip, which was 5x short at
+// every rate and stayed that way through four rounds of the fps work.
+//
+// Two independent defects, and the second is the one that kept it wrong:
+//
+//  1. Its asset has audio_rate=0 (a project saved before that field existed), so
+//     pf_pin_audio_src_rates fell through to the PROJECT rate — 60 — when the
+//     clip's counts were measured at 11.97 (79 audio frames over 6.6s). A 44-frame
+//     extent read at 60 is 0.733s; at 11.97 it is 3.676s. The audio pin had no
+//     derive rung at all, which is the same gap the video pin had.
+//  2. The clip starts at source frame 35, and the rebase skipped any clip whose
+//     source_start_frame != 0. That is true and irrelevant: the extent is a
+//     LENGTH, and where the clip starts in the source says nothing about how long
+//     it is. Skipping on it left the extent stranded in the authoring timebase.
+//
+// The fixture is the real file's numbers: an audio asset with audio_rate=0,
+// audio_frames=79, dur_us=6.6s, and a clip of 44 frames starting at source frame
+// 35 — a head trim, so not the whole asset, and the asset's 6.6s duration must NOT
+// be used for it.
+test_audio_head_trim :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id = 9201, kind = .Audio, frame_count = 1,
+			dur_us = 6600000, audio_rate = 0, audio_frames = 79,
+		},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 9, kind = .Audio, asset_id = 9201,
+			timeline_start_frame = 0, source_length_frames = 44, source_start_frame = 35,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 60.0
+
+	pf_rebase_extents()
+
+	c := &timeline.tracks[0].clips[0]
+	// The duration is 44 frames read at the rate its counts were measured at.
+	want := 44.0 / (79.0 * 1e6 / 6600000.0)
+	got := f64(c.source_length_frames) / project_fps()
+	tl_probe_check(
+		math.abs(got - want) < 0.02,
+		"a head-trimmed audio clip must keep its real duration — got %.4fs, want %.4fs",
+		got, want,
+	)
+	// NOT the asset's 6.6s: the head trim means this is a fragment, and using the
+	// asset's duration would stretch a 3.7s clip to 6.6s.
+	tl_probe_check(
+		got < 5.0,
+		"a trimmed audio clip must not take the asset's full duration — got %.4fs of 6.6s",
+		got,
+	)
+	// And the pin recovered the authoring rate, which is what makes the duration
+	// recoverable at all.
+	pf_pin_audio_src_rates()
+	rate := c.audio_src_rate
+	tl_probe_check(
+		math.abs(rate - 79.0 * 1e6 / 6600000.0) < 0.05,
+		"the audio pin must derive the authoring rate from the asset — got %.4f, want %.4f",
+		rate, 79.0 * 1e6 / 6600000.0,
+	)
+
+	// And it survives a rate change at both rates.
+	targets := ([]f64{12.0, 60.0})
+	for target in targets {
+		set_project_fps(target)
+		d := clip_duration_sec(c, project_fps())
+		tl_probe_check(
+			math.abs(d - want) < 0.05,
+			"the clip must keep %.4fs of audio at %gfps — got %.4fs",
+			want, target, d,
+		)
+	}
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow()
@@ -1799,6 +1883,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow_keyframes()
 	fmt.println("[tl-probe] fps-reflow-keyframes ok")
+	tl_scene()
+	test_audio_head_trim()
+	fmt.println("[tl-probe] audio-head-trim ok")
 	tl_scene()
 	test_pin_src_fps_kind_mismatch()
 	fmt.println("[tl-probe] pin-kind-mismatch ok")

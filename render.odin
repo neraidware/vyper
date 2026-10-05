@@ -5090,7 +5090,7 @@ project_export_dump_layout :: proc() {
 			// asset it would have read.
 			as := find_asset(clip.asset_id)
 			fmt.printf(
-				"project-export:   t%d kind=%v start=%d extent=%d (%.3fs) src_fps=%.4f src_len=%d content=%.3fs\n",
+				"project-export:   t%d kind=%v start=%d extent=%d (%.3fs) src_fps=%.4f src_len=%d content=%.3fs src_start=%d\n",
 				ti,
 				clip.kind,
 				clip.timeline_start_frame,
@@ -5099,6 +5099,7 @@ project_export_dump_layout :: proc() {
 				clip.src_fps,
 				clip_src_len_frames(&clip),
 				clip_duration_sec(&clip, project_fps()),
+				clip.source_start_frame,
 			)
 			fmt.printf(
 				"project-export:       asset=%d found=%v kind=%v video_fps=%.4f frame_count=%d dur_us=%d audio_rate=%.4f audio_frames=%d\n",

@@ -513,7 +513,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 	// AUTHORING rate, which needs nothing pinned; the pins then read assets, which
 	// is independent. But the rebase is what makes the extent<->duration invariant
 	// hold, and every later rate change depends on it.
-	pf_rebase_extents(pf.timeline_frame_rate)
+	pf_rebase_extents()
 	pf_pin_audio_src_rates()
 	pf_pin_src_fps()
 
@@ -570,9 +570,15 @@ pf_pin_audio_src_rates :: proc() {
 			if c.kind != .Audio || c.audio_src_rate > 0 {
 				continue
 			}
-			pinned := rate
-			if as := find_asset(c.asset_id); as != nil && as.audio_rate > 0 {
-				pinned = as.audio_rate
+			// asset_authoring_rate covers all three rungs, including the one this
+			// never had: an asset from a project saved before Media_Asset
+			// .audio_rate existed has audio_rate=0, so this used to fall straight
+			// through to the PROJECT rate and read the clip's source_start_frame in
+			// the wrong timebase. ~/baby.vyproj's opus is that case — its counts were
+			// measured at 11.97fps and were being read at 60.
+			pinned, _ := asset_authoring_rate(c.asset_id)
+			if !(pinned > 0) {
+				pinned = rate
 			}
 			c.audio_src_rate = pinned
 		}
