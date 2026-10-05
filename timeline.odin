@@ -96,6 +96,45 @@ clip_source_frame :: proc(
 	return source_start + i64(math.round(f64(off) * (rate / proj)))
 }
 
+// clip_source_span is the half-open range of SOURCE frames a clip can display
+// across its whole timeline extent, under conform.
+//
+// It exists because "the clip's source range" is no longer
+// [source_start, source_start+length): that identity assumed 1:1, and every
+// caller that bounds a source frame by a clip's extent was silently wrong the
+// moment conform landed. Two ways it went wrong, both live:
+//
+//   - too PERMISSIVE: a 300-frame 30fps clip on a 60fps timeline displays source
+//     frames 0-149, but the old window accepted 0-299 — so a stale async result
+//     left over from a previous clip on the same path, at frame 200, would be
+//     accepted as this clip's.
+//   - too RESTRICTIVE, and this one freezes the preview: a 60fps source on a 30fps
+//     timeline displays 0-599 from a 300-frame extent, so every frame past 300
+//     was rejected as stale and the clip stopped updating.
+//
+// Derived through clip_source_frame so there is one conform policy rather than a
+// second restatement of it here. The `+ 1` makes it half-open at the far end: the
+// last timeline frame displays source frame hi-1, not hi.
+clip_source_span :: proc(
+	source_start, timeline_start, length: i64,
+	src_fps: f64,
+) -> (lo, hi: i64) {
+	if length <= 0 {
+		return source_start, source_start
+	}
+	// Sampled at the LAST frame the clip actually has, t0+length-1. Sampling
+	// t0+length reads one frame past the clip, which makes the identity case
+	// return a 301-frame window for a 300-frame clip -- one frame wider than the
+	// clip, and enough to let a stale async result at the boundary pass as this
+	// clip's. The probe's identity assertion is what caught it.
+	lo = clip_source_frame(source_start, timeline_start, timeline_start, false, src_fps)
+	hi = clip_source_frame(source_start, timeline_start, timeline_start + length - 1, false, src_fps) + 1
+	if hi <= lo {
+		hi = lo + 1
+	}
+	return lo, hi
+}
+
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
 // starting at `start_frame` (timeline frames). The duration is one second at the
 // current timeline frame rate. If the free gap that contains start_frame can't

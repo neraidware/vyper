@@ -6419,8 +6419,49 @@ is not bundled into a speed fix:
    rewrites the project's frame numbers, and a keyframe track stored in timeline
    frames has to be rescaled with it or keyframes land on the wrong content.
 
-The probe's own invariant assumes (1): it holds a clip's extent fixed at
-`CLIP_SEC × project_fps` timeline frames and asserts the source advances at
-`src_fps/project_fps` through them. Under (2) that same assertion still holds,
-because a retimed clip is still conformed at the same ratio — so the speed work
-above is correct either way, and only the extent question is open.
+**Decision: conform in place (1).** Retime is deferred to a manual, user-applied
+operation in a future update. Nothing in the conform is provisional: the speed work
+above is the same either way, because a retimed clip is still conformed at the
+same ratio — only the extent is in question, and conform-in-place means the
+extent is simply left as authored.
+
+**Conforming in place required finishing the job, and the interesting part was
+there.** "The clip's source range" was `[source_start, source_start+length)`
+everywhere, and that identity IS the 1:1 assumption. Conform makes it wrong, and
+wrong in both directions at once, both of them live:
+
+- **too permissive.** A 300-frame 30fps clip on a 60fps timeline displays source
+  frames 0-149, but the old window accepted 0-299 — so a stale async decode left
+  over from a previous clip on the same path, at frame 200, would be accepted as
+  this clip's and painted.
+- **too restrictive, and this one freezes the preview.** A 60fps source on a 30fps
+  timeline displays 0-599 from a 300-frame extent, so every frame past 300 was
+  rejected as "stale" and the clip stopped updating. 30fps projects with 60fps
+  footage are common, so this is the shape a user hits first.
+
+`clip_source_span` is the fix, derived through `clip_source_frame` so there is one
+conform policy rather than a second restatement of it, and used at all three
+sites: the async stale-result window (correctness), the adjacency test that lets
+two abutting clips donate a decoded frame across a cut (a decode per cut
+otherwise), and the forward cache buttress (which otherwise warms frames the clip
+never shows and misses ones it is about to).
+
+Its own first version had an off-by-one and the probe caught it: sampling
+`t0+length` reads one frame PAST the clip's last, so the identity case returned a
+301-frame window for a 300-frame clip — exactly wide enough to let a stale result
+at the boundary pass. Caught by asserting the identity case, which is the one that
+has to hold for every pre-conform project; `span: unpinned and rate-equal clips
+keep the identity window` fails on the revert.
+
+**Also conformed: the probes that compute `expected` from the identity.** Five
+sites in `preview_probe_run` and `boundary_probe_run` derived the frame a slot
+"should" hold as `source_start + f - timeline_start`. They would have compared
+against a frame the app never displays — a test that passes by checking the wrong
+thing, which is how the stale-window bug would have survived a green run. They now
+route through `clip_source_frame` with the slot's pin.
+
+**Accept.** `check build probe transform_probe geom_key_probe render_kf_probe
+keyframe_probe timeline_probe opacity zorder subtitle_probe keyed_export parity
+render_live_probe` pass; `render_valgrind parity_valgrind` clean. New span cases
+assert both directions separately, because a span test that only checks the
+permissive direction passes a helper that is off by one in the restrictive one.

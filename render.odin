@@ -5593,7 +5593,13 @@ preview_probe_run :: proc(paths: [2]string) {
 				slot.asset_id,
 				slot.timeline_start_frame,
 				slot.source_start_frame,
-				slot.source_start_frame + i64(f) - slot.timeline_start_frame,
+				clip_source_frame(
+					slot.source_start_frame,
+					slot.timeline_start_frame,
+					i64(f),
+					false,
+					slot.src_fps,
+				),
 				slot.dec.last_frame,
 				slot.dec.have_last,
 			)
@@ -5613,7 +5619,9 @@ preview_probe_run :: proc(paths: [2]string) {
 				if !slot.in_use {
 					continue
 				}
-				expected := slot.source_start_frame + i64(f) - slot.timeline_start_frame
+				expected := clip_source_frame(
+					slot.source_start_frame, slot.timeline_start_frame, i64(f), false, slot.src_fps,
+				)
 				diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
 				fmt.printf(
 					"  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
@@ -5730,7 +5738,9 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			expected := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
+			expected := clip_source_frame(
+				slot.source_start_frame, slot.timeline_start_frame, playhead.frame, false, slot.src_fps,
+			)
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
 			fmt.printf(
 				"[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v gt=%v diff=%d maxd=%d\n",
@@ -5767,7 +5777,9 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			shown := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
+			shown := clip_source_frame(
+				slot.source_start_frame, slot.timeline_start_frame, playhead.frame, false, slot.src_fps,
+			)
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, shown, slot.buffer[:])
 			fmt.printf(
 				"[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v last=%d | gt=%v diff=%d maxd=%d\n",
@@ -5827,7 +5839,9 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			expected := slot.source_start_frame + ph - slot.timeline_start_frame
+			expected := clip_source_frame(
+				slot.source_start_frame, slot.timeline_start_frame, ph, false, slot.src_fps,
+			)
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
 			fmt.printf(
 				"[bprobe replay ph=%d] cf=%d tl=%d src=%d last=%d hv=%v has_frame=%v | gt=%v diff=%d maxd=%d\n",

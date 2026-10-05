@@ -616,6 +616,63 @@ transform_probe_run :: proc(v: string) {
 		check(&fail, unpinned_ok, "speed: an unpinned clip keeps the historical 1:1 on old projects", 0, 0, 0, 0)
 
 		check(&fail, sp_ok, "speed: a clip plays at its own rate at every project rate", 0, 0, 0, 0)
+
+	// --- clip_source_span: which source frames a clip can show, under conform.
+	// Every caller that bounded a source frame by a clip's extent was written for
+	// [source_start, source_start+length), and conform makes that identity wrong.
+	// Two live failure modes, one in each direction, so both are asserted.
+	{
+		saved_fps2 := project.frame_rate
+		defer project.frame_rate = saved_fps2
+
+		// The case that FROZE the preview: a 60fps source on a 30fps timeline
+		// displays twice the source its 300-frame extent implies, so the old
+		// window rejected every frame past 300 as stale and the clip stopped
+		// updating. The span must cover what is actually shown.
+		project.frame_rate = 30.0
+		lo, hi := clip_source_span(0, 0, 300, 60.0)
+		// 300 timeline frames at ratio 2 cover source frames 0,2,...,598.
+		span_wide_ok := hi == 599 && lo == 0
+		// And it must contain the last frame the clip really shows.
+		shown_last := clip_source_frame(0, 0, 299, false, 60.0)
+		span_wide_ok = span_wide_ok && shown_last < hi && shown_last >= lo
+		if !span_wide_ok {
+			fmt.printf(
+				"[transform-probe] FAIL span wide: 60fps source on a 30fps timeline over 300 frames gave [%d,%d), last shown %d\n",
+				lo, hi, shown_last,
+			)
+		}
+
+		// The permissive direction: a 30fps source on a 60fps timeline displays
+		// only 150 of the 300 frames the old window would have accepted, so a
+		// stale async result at frame 200 could pass as this clip's.
+		project.frame_rate = 60.0
+		lo2, hi2 := clip_source_span(0, 0, 300, 30.0)
+		// 300 timeline frames at ratio 0.5 cover 0,0,1,1,...,150.
+		span_tight_ok := hi2 == 151 && lo2 == 0
+		if !span_tight_ok {
+			fmt.printf(
+				"[transform-probe] FAIL span tight: 30fps source on a 60fps timeline over 300 frames gave [%d,%d), want [0,151)\n",
+				lo2, hi2,
+			)
+		}
+
+		// The identity must still hold exactly when unpinned or rate-equal, or
+		// every pre-conform project changes behaviour.
+		project.frame_rate = 30.0
+		lo3, hi3 := clip_source_span(10, 5, 300, 0)
+		lo4, hi4 := clip_source_span(10, 5, 300, 30.0)
+		identity_ok := lo3 == 10 && hi3 == 310 && lo4 == 10 && hi4 == 310
+		// A zero-length clip is degenerate, not inverted: an empty range, not a
+		// backwards one.
+		lo5, hi5 := clip_source_span(10, 5, 0, 60.0)
+		identity_ok = identity_ok && lo5 == 10 && hi5 == 10
+		project.frame_rate = saved_fps2
+
+		check(&fail, span_wide_ok, "span: covers every source frame a conformed clip shows", 0, 0, 0, 0)
+		check(&fail, span_tight_ok, "span: excludes frames beyond what a conformed clip shows", 0, 0, 0, 0)
+		check(&fail, identity_ok, "span: unpinned and rate-equal clips keep the identity window", 0, 0, 0, 0)
+	}
 	}
 	}
 
