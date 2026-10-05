@@ -4675,3 +4675,225 @@ Steps:
 Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
+
+## Active 22 — The audio engine: a sample clock, a fixed block, and one mixer
+
+**Why:** three user-reported symptoms — the engine "dies", it "desyncs
+frequently", and "the rendered audio is literally popping". Measured on
+`~/sallyface.vyproj` (1786 frames, 12 video sources, 5 stacked audio tracks):
+
+| measurement | result |
+|---|---|
+| digital-silence runs >4ms in the exported audio | **136**, totalling **2922 ms** of 29.76s |
+| of those, at a clip boundary | 3 |
+| **mid-clip dropouts** | **133 runs, 1961 ms = 6.6% of the timeline** |
+| single-clip export length | 479232 samples emitted vs 480000 expected (exactly 468x1024) |
+| audio mix cost | 0.59 ms/frame average (9.2% of frame time) |
+
+A step from signal to digital zero and back is two clicks, not one, so 133
+dropouts is 266 clicks. The popping is measured, not inferred.
+
+**Not the cause, and cleared:** AAC priming is handled — FFmpeg's encoder emits
+`AV_PKT_DATA_SKIP_SAMPLES` and the file carries it (first packet pts -1024). A
+single clean clip with no edits exports correctly apart from lossy-codec
+differences. So the encoder and the muxer are innocent.
+
+### The class of bug
+
+37 commits touch the audio engine; ~29 distinct bugs. The recurrences, counted:
+
+- **Reopen cost paid on the audio thread — 10 commits.** `audio_seek` was
+  treated as "move the playhead" for three weeks. Every symptom was a different
+  *timing* of that one cost: `801026f` (282 resyncs/83s re-open storm),
+  `e69afb5` (a scrub queued seeks faster than the producer retired them, audio
+  dead for the session), `9df668b` (a no-move click armed a drag that reopened
+  every decoder per held frame), `bddbcd2`, `5d90eba`.
+- **Clock authority rewritten — 8 commits.** "What does the producer target?"
+  changed five times (`b668cb3` device-consumed clock, `599e562`
+  `max(dev_pos, ph)`, `7ffa667` seqlock playback clock, `5d90eba`, `96d058d`).
+- **Assuming the decoder is where we asked — 7 commits.** Landing PTS != asked
+  time (`599e562`, `bddbcd2`), project fps != file fps (`f0b721b`),
+  `frame_count` == 1 for audio-only (`a877c43`), `frame_rate` == 0 before any
+  video import (`5488701`).
+- **Diagnostics that lie — 8 commits.** Every counter is frame-domain; complete
+  distortion once shipped with every counter green (`1a38d78`).
+- **Silence or zero-fill used to paper a hole — 6 sites.**
+
+Three generations of self-heal now exist (`1c5eb2e`, `801026f`, `886357b`),
+each masking the defect it was added to catch. That is the shape of the problem:
+the engine has no owner for "where am I" and no owner for "what is playing", so
+every fix negotiated between two subsystems that both think they own it.
+
+### What the reference systems do differently
+
+- **REAPER publishes two positions.** `GetPlayPosition()` is "the time the user
+  is hearing"; `GetPlayPosition2()` is "the time of the audio block that is
+  being processed by the host… **this may be behind where your plug-in is
+  processing**". Any engine with one position is guessing which one a reader
+  wants. Documented defaults: 1200ms media prebuffer, 200ms render-ahead.
+  <https://cockos.com/reaper/sdk/vst/vst_ext.php>
+- **Unity makes DSP time the master clock.** VideoPlayer's clock options include
+  "DSP Time — use the same clock source that processes audio", and sync is
+  corrected by dropping *video* frames. Audio is never dropped to fix sync.
+  <https://docs.unity3d.com/Manual/class-VideoPlayer.html>
+- **Every one of them mixes on a fixed sample block** (64–2048), never per video
+  frame. At 48kHz/29.97 a frame is 1601.6 samples — non-integer, and not a whole
+  number of 512-sample blocks. JUCE: "variable-sized blocks can be expected from
+  some hosts… you're going to get clicks and crashes".
+  <https://docs.juce.com/master/classAudioProcessor.html>
+- **Every edit-created edge gets a ramp.** Vegas Quick Fade: "a rapid fade is
+  applied to the edges of audio events to soften potentially harsh transitions
+  that can result from cutting data or splitting events". REAPER auto-crossfades
+  razor edits, with configurable shape and curvature.
+- **Playback and render are two graphs over one model.** REAPER's audio
+  accessors (`GetAudioAccessorSamples`, offline-safe, main thread) exist
+  alongside the realtime path; JUCE has `setNonRealtime`; Premiere has a
+  conformed media cache for preview and defers rate conformance to export.
+- **Buffer depth is measured, not guessed.** Android: "lowering it after each
+  write() call until the audio glitches… then the buffer size can be increased
+  until there are no glitches."
+
+### The plan
+
+Six items. The first three are the redesign; the last three are small and exist
+because they are cheap and they stop specific measured defects. Ordered
+biggest-first, and each item states how it is proved.
+
+**A1 — The sample clock (the foundation everything else stands on).**
+One integer 48kHz sample counter owns position, and nothing else owns one.
+Today position is re-derived per video frame from
+`audio_frame_boundary48(frame, fps)`, so audio is a slave of video framing and
+every fix that needed a rate-independent position (`f0b721b`) had to bolt one on.
+Concretely: a `Sample_Pos` (i64, 48kHz) is the only currency between the
+timeline, the mixers, the source fifos and the encoder. Timeline code converts
+frame<->sample once, in one place, with exact rational arithmetic
+(`frame * 48000 * fps_den / (fps_num)`), never by dividing then rounding.
+Video becomes the elastic element: it asks for the frame covering sample N and
+drops/holds/resamples to suit, which is what Unity's `canSetSkipOnDrop` does.
+
+**A2 — A fixed-block mixer with a mix ring, shared by preview and render.**
+`AUDIO_BLOCK :: 512` (10.67ms). One `Audio_Engine` owns: the source list, one
+decode ring + one gain-ramp state per source, the mix output ring, and the mix
+position. It exposes exactly two consumer-shaped operations:
+`mix_fill(target_depth)` and `mix_take(n)`. Playback's consumer is the miniaudio
+callback; the render worker's consumer is the video frame loop. That is REAPER's
+shape (one engine, two accessors) and it deletes the duplication TODO.md Active
+11 already names: "decode | `audio_src_pull`/`audio_src_seek_anchor` |
+`render_audio_pull` (a reimplementation; it even dropped the seek preroll)".
+The render consumer takes exactly `boundary48(f+1) - boundary48(f)` samples per
+frame — still frame-sized, because the muxer wants it — but the *mixing* that
+produced them happened on fixed blocks, so a decode hiccup no longer punches a
+frame-shaped hole in the waveform.
+
+**A3 — The mix runs on its own thread, ahead of its consumer.**
+The 133 holes are the measured defect and the cause is structural: render audio
+decode runs in demand on the composite worker thread (`render.odin:3243`) with
+the fifo trimmed to the exact consumed point every frame, so there is no
+cushion at all — playback has `AUDIO_CUSHION_SEC = 0.25`, render has zero. One
+spike over budget and `if start48 < a.first48 || a.have48 < start48 + cur_spf {
+continue }` drops the source for a whole video frame. Audio average is only
+0.59 ms/f, so this is spikes, not sustained load. Fix: the mix ring is filled by
+a producer thread to a named cushion, mirroring playback, and the composite
+thread only ever *takes* from it. Decode stops competing with video composite
+for the same core.
+
+**A4 — Declick: a ramp generator on every source enter, exit and discontinuity.**
+This is what removes the *class* rather than the instances, and it is cheap.
+The mixer already knows the gain it wants; it ramps to it over
+`AUDIO_DECLICK_SAMPLES` (256 = 5.3ms, linear) instead of stepping. Three sites
+become ramps rather than steps: a source entering coverage, a source leaving, and
+the `continue` hole. After A3 there should be no holes left, so A4 is belt-and-
+braces for the boundaries A3 cannot remove — but boundaries are where every
+remaining click lives, and a cut with no ramp is a click by construction.
+
+**A5 — Edits publish a generation; the engine reconciles at a block boundary.**
+This is the 10-commit class. Today `audio_seek`/`audio_note_edit` means "clear
+the device and reopen every decoder synchronously", and it is called from the
+UI, from scrub, from a gain commit, from a rate change. Instead: an edit bumps
+`audio_geom_state.generation` and the engine diffs generations at the top of a
+block — sources whose coverage changed are ramped out and back in, sources whose
+*content* changed get their decoder pointed at a new position with a ramp, and
+nothing is ever reopened on the thread that mixes. A seek becomes "the mix
+position is now N", which is a store, not a teardown.
+
+**A6 — Small, measured, do last.** (a) Pad the final partial AAC block instead
+of dropping it: 480000 samples in, 479232 out, 16ms silently lost plus a hard
+truncation click at the end of every export. (b) Give `render_audio_open` the
+`AUDIO_SEEK_PREROLL_SEC` preroll playback has had since `bddbcd2` — "every split
+opened with ~0.1s of silence". (c) Frame-domain counters → sample-domain, so a
+future regression cannot hide behind green telemetry the way `1a38d78` did.
+
+### Steps
+
+- [x] S0. Measure. Reproduce the popping on the real project, decompose it into
+      boundary holes vs mid-clip holes, and clear AAC priming and the muxer as
+      suspects. Result: 133 mid-clip dropouts, 6.6% of the timeline, cause is
+      the zero-cushion in-demand pull on the composite thread.
+- [x] S1. **A1** — `Sample_Pos` as the only position currency. Shipped.
+
+      `Sample_Pos` (i64, 48kHz) in state.odin, with one frame→sample
+      conversion (`sample_pos_from_frames`) over an exact num/den from the
+      existing `fps_rational`, and two derived uses: `timeline_frame_sample` and
+      `audio_content_sample` (timeline boundary + pinned source offset, kept as
+      separate terms). Both mixers' fifo bases now come from
+      `decoder_pts_sample` — a `rescale_q` straight from the stream's time base
+      into 1/48000 — instead of `i64(real_sec * 48000)` via float microseconds.
+      Five float round-trips became integer arithmetic.
+
+      **What it was worth, measured:** the float form is wrong at 23.976, where a
+      frame is exactly 2002 samples. `24000*48000.0/23.976023976023978` evaluates
+      to 2001.9999999999998, so the OLD code lost a sample on the very first
+      frame of a 23.976 project and wandered from there. At 29.97/59.94 the
+      samples-per-frame is non-integral (1601.6) and the float form happened to
+      agree, which is why this survived: the one rate with a whole samples-per-
+      frame is the one the float form breaks, and 23.976 is not a rate anyone
+      tests by ear at frame 0.
+
+      **Probe / mutation.** `parity_probe_check_sample_clock`, seven properties.
+      Getting this probe right took three attempts and the failures are the
+      useful part:
+        - v1 asserted "exact over a long span" and a mutation back to the float
+          form PASSED it. The float form's error is per-call (±1) and not
+          cumulative, so "exactness over a span" is not a property it breaks.
+        - v2 asserted "adjacent frames differ by exactly one frame" and failed
+          the CORRECT code: at 29.97 a frame legitimately advances 1601 then
+          1602. Asserting that away would have removed the alternation the
+          mixers depend on.
+        - v3 computed its expected values with the function under test, so any
+          mutation applied to both sides passed. The properties that have teeth
+          derive the expectation from the RATE alone (`num` frames at `num/den`
+          is exactly one second; a whole samples-per-frame is constant), with no
+          call into the code being checked.
+        - Also: the first expectation used `i64(num)/i64(den)` for
+          frames-per-second, which silently turns 23.976 into 23. The mutation
+          run caught that in the probe, not the code.
+
+      All 7 mutations now caught: float form, NTSC denominator dropped, floor
+      became round-up, pinned term refolded into fps, floor dropped (early
+      truncation), pts rescale via float microseconds, source rate not
+      NTSC-snapped.
+
+      Neutral on the 60fps export by construction — frames*48000/60 is exact
+      either way, and the single-clip export is byte-for-byte the same length
+      (479232 samples, 469 packets, AAC skip-samples intact). The win is at the
+      rates where the arithmetic was wrong.
+- [ ] S2. **A2** — fixed-block mixer + mix ring, render consumer first.
+      Probe: a new block-boundary regression pins that mixing is independent of
+      the frame size — the same source mixed at 24fps and 60fps produces the same
+      samples at the same sample positions.
+- [ ] S3. **A3** — mix on its own thread with a cushion. Probe: the export's
+      silence-run count goes to zero on `~/sallyface.vyproj`, which is the
+      measured defect this whole section exists to close.
+- [ ] S4. **A4** — declick ramps. Probe: assert no inter-sample step exceeds the
+      local peak across a clip boundary or a simulated hole.
+- [ ] S5. **A5** — edit generations. Probe: a burst of N edits produces O(1)
+      decoder reopens, not O(N) — the direct analogue of `e69afb5`.
+- [ ] S6. **A6** — AAC tail padding, render preroll, sample-domain counters.
+
+### Accept
+
+- The export of `~/sallyface.vyproj` has **zero** mid-clip silence runs (was
+  133) and no step discontinuities at clip boundaries.
+- `audio_probe`, `audio_rate_probe`, `atempo_probe`, `keyed_export`, `parity`,
+  `render_live_probe`, `render_valgrind` all pass.
+- A 10s single-clip export is 480000 samples, not 479232.

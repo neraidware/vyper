@@ -2146,16 +2146,7 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 		return false
 	}
 	src := &a.dec
-	real_sec :=
-		f64(
-			avutil.rescale_q(
-				src.first_ts,
-				src.stream.time_base,
-				avutil.Rational{num = 1, den = 1_000_000},
-			),
-		) /
-		1e6
-	a.first48 = i64(real_sec * f64(RENDER_AUDIO_RATE))
+	a.first48 = i64(decoder_pts_sample(src.first_ts, src.stream.time_base))
 	a.have48 = a.first48 + i64(n)
 	ring_push_pcm(&a.fifo, a.dec.s16[:n * 2], n)
 	return true
@@ -3255,10 +3246,9 @@ render_worker_run :: proc() {
 				if !clip_visible_at(timeline_frame, a.timeline_start_frame, a.source_length_frames) {
 					continue
 				}
-				start48 := i64(
-					audio_content_sec(timeline_frame - a.timeline_start_frame, a.source_start_frame, a.source_start_rate, rfps) *
-					f64(RENDER_AUDIO_RATE),
-				)
+			start48 := i64(
+				audio_content_sample(timeline_frame - a.timeline_start_frame, a.source_start_frame, a.source_start_rate),
+			)
 				render_audio_pull(a, start48 + i64(cur_spf))
 				if start48 < a.first48 || a.have48 < start48 + i64(cur_spf) {
 					continue

@@ -186,6 +186,80 @@ audio_source_start_sec :: proc(source_start_frame: i64, audio_src_rate: f64) -> 
 	return f64(source_start_frame) / rate
 }
 
+// Sample_Pos is a position on the 48 kHz audio bus, counted in sample-frames
+// from sample 0. It is the ONLY position currency in the audio engine: the
+// mixers, the per-source decode fifos, the bridge ring and the encoder's PTS
+// basis are all in these, and a timeline frame index is converted to one at
+// exactly one place (timeline_frame_sample).
+//
+// It is a distinct type rather than a bare i64 for the reason the whole engine
+// was rewritten: positions used to travel as float seconds and be truncated back
+// to samples at each hop -- `i64(audio_content_sec(...) * 48000.0)` against a
+// fifo base labelled `i64(real_sec * 48000)`. Two different float round-trips
+// either side of one comparison is an off-by-one that moves with position, which
+// is a drift bug wearing a sync bug's clothes.
+Sample_Pos :: i64
+
+// sample_pos_from_frames is the one frame->sample conversion, over an exact
+// num/den rate. Everything that needs it derives the rate first (fps_rational),
+// so there is no second spelling of this arithmetic anywhere.
+sample_pos_from_frames :: proc(frames: i64, rate_num, rate_den: i64) -> Sample_Pos {
+	assert(rate_num > 0 && rate_den > 0, "sample_pos_from_frames: bad rate")
+	return Sample_Pos(frames) * AUDIO_BUS_RATE * rate_den / rate_num
+}
+
+// timeline_frame_sample is the bus sample position of a timeline frame's
+// boundary, at the project's rate.
+//
+// Flooring is deliberate and matches the boundary-difference the mixers already
+// use: at 29.97 the samples-per-frame alternates 1601/1602 and averages to the
+// true rate with no long-term drift. A frame boundary is what both engines
+// already mean by "where frame N starts", so keeping the same floor keeps every
+// existing boundary-difference computation correct.
+timeline_frame_sample :: proc(frame: i64) -> Sample_Pos {
+	num, den := fps_rational(project_fps())
+	return sample_pos_from_frames(frame, i64(num), i64(den))
+}
+
+// audio_source_start_sample returns where an AUDIO clip starts inside its source
+// FILE, in bus samples -- the integer twin of audio_source_start_sec, and it
+// inherits that proc's reasoning about why the rate is pinned per clip.
+//
+// The rate is snapped to a rational so the division is exact. An audio file's
+// authored rate is a sample rate or a project rate, so the interesting cases are
+// integers and the NTSC rates; anything else rounds, which is no worse than the
+// float it replaces.
+audio_source_start_sample :: proc(source_start_frame: i64, audio_src_rate: f64) -> Sample_Pos {
+	rate := audio_src_rate
+	if !(rate > 0) {
+		rate = timeline_fps()
+	}
+	assert(rate > 0, "audio_source_start_sample: no usable source rate")
+	num: i64 = i64(math.round(rate))
+	den: i64 = 1
+	if math.abs(rate - 23.976) < FPS_NTSC_TOLERANCE {
+		num, den = 24000, 1001
+	} else if math.abs(rate - 29.97) < FPS_NTSC_TOLERANCE {
+		num, den = 30000, 1001
+	} else if math.abs(rate - 59.94) < FPS_NTSC_TOLERANCE {
+		num, den = 60000, 1001
+	}
+	return sample_pos_from_frames(source_start_frame, num, den)
+}
+
+// audio_content_sample is where a timeline frame lands inside an audio clip's
+// source file, in bus samples. It is the integer replacement for
+// `i64(audio_content_sec(frames_into, start_s, start_s_rate, fps) * 48000.0)`,
+// and it is what the mixers ask their fifos for.
+//
+// The two terms stay separate kinds of quantity, exactly as in
+// audio_content_sec: frames_into follows the CURRENT project rate, start_s is
+// pinned to the rate the file was authored at. Adding them as floats and
+// truncating the sum once is what made the old form position-dependent.
+audio_content_sample :: proc(frames_into: i64, start_s: i64, start_s_rate: f64) -> Sample_Pos {
+	return timeline_frame_sample(frames_into) + audio_source_start_sample(start_s, start_s_rate)
+}
+
 // audio_content_sec is the one place a timeline frame is turned into a position
 // in an audio source file, in seconds. Every producer and the renderer share it
 // so playback and export cannot drift.
@@ -211,13 +285,20 @@ audio_content_sec :: proc(frames_into: i64, start_s: i64, start_s_rate: f64, fps
 //                               playhead by exactly this many ms per frame tick
 //                               (16.6667 = perfect 60fps cadence, zero jitter).
 //   VYPER_PLAYBACK_FPS       > 0  override timeline_fps() for the playhead
-//                               advance, the mixer's start48/spf mapping, and
-//                               the audio producer. 0 = use the imported rate.
+//     advance, the mixer's spf mapping, and the audio producer. 0 = use the
+//     imported rate.
+//
 // These live in the Playback struct alongside the clock they override. This
 // comment keeps the env-var names in one place the writer (system_main_init)
 // and readers (timeline_fps, the main loop) can share.
 //
-// [playback struct below holds magic_ms/magic_fps]
+// It deliberately does NOT reach audio_content_sample. The override is about the
+// playhead's WALL CADENCE — how fast the transport is driven — and the demand
+// for frame N is a statement about CONTENT ("where in the file does frame N
+// live"), which is fixed by the timeline grid. When the override still reached
+// the demand, moving the cadence also moved every clip's content offset, which
+// is the class of coupling the Sample_Pos work exists to remove: the transport
+// overriding the sample clock, rather than following it.
 
 Project :: struct {
 	name:        string,

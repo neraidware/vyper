@@ -46,6 +46,7 @@ import "core:os"
 import "core:sync"
 import "core:strings"
 import "core:time"
+import avutil "vendor/ffmpeg/avutil"
 import sdl "vendor:sdl3"
 
 parity_probe_fail := false
@@ -456,6 +457,148 @@ parity_probe_check_rate_resolver :: proc() {
 	fmt.println("[parity-probe] rate resolver: 7 rates mapped, 7 invalid rates rejected")
 }
 
+// parity_probe_check_sample_clock pins Sample_Pos, the position currency the
+// audio engine now uses everywhere.
+//
+// Each property below is one a PLAUSIBLE regression actually breaks. The first
+// attempt at this probe asserted "exact over a long span" and passed a mutation
+// back to the float form, because the float form's error is per-call (+/-1) and
+// not cumulative -- a pure function of `frames` drifts nowhere. What the float
+// form really breaks is AGREEMENT: adjacent positions stop being exactly one
+// frame apart, which is what a fifo indexed by position quietly depends on.
+parity_probe_check_sample_clock :: proc() {
+	rates := []f64{12, 24, 25, 30, 48, 50, 60, 23.976, 29.97, 59.94}
+
+	// 1. Content position is EXACTLY the timeline boundary plus the pinned source
+	//    offset -- for every frame, at every rate, from every clip offset. That
+	//    decomposition IS the property: the two terms are different kinds of
+	//    quantity (one follows the project rate, one is pinned to the file), and
+	//    the float form this replaced added them first and truncated once, so it
+	//    lost a sample wherever the sum straddled an integer.
+	//
+	//    Stated as a window sum it cannot be exact -- floor((f+K)x) - floor(fx)
+	//    is floor(Kx) or floor(Kx)+1 by construction -- which is why this is
+	//    checked against the boundary directly instead.
+	for rate in rates {
+		saved := project.frame_rate
+		project.frame_rate = rate
+		rnum, rden := fps_rational(rate)
+		for start_s in ([]i64{0, 1, 7, 30, 441, 1000, 2731}) {
+			offset := audio_source_start_sample(start_s, rate)
+			bad := 0
+			for f: i64 = 0; f < 20000; f += 1 {
+				got := audio_content_sample(f, start_s, rate)
+				want := sample_pos_from_frames(f, i64(rnum), i64(rden)) + offset
+				if got != want {
+					bad += 1
+					if bad == 1 {
+						parity_probe_failf(
+							"rate %f start_s %d: frame %d resolved to %d, want %d (boundary %d + offset %d)",
+							rate, start_s, f, got, want,
+							sample_pos_from_frames(f, i64(rnum), i64(rden)), offset,
+						)
+					}
+				}
+			}
+		}
+		project.frame_rate = saved
+	}
+
+	// 2. The pinned source term does not move when the project rate does. This is
+	//    the f0b721b bug's shape (a clip silently re-pointing into the file's
+	//    silent head after a rate change), stated as an invariant so it cannot
+	//    come back through a different arithmetic.
+	for start_s in ([]i64{35, 441, 2731}) {
+		saved := project.frame_rate
+		project.frame_rate = 12
+		at12 := audio_source_start_sample(start_s, 48000)
+		project.frame_rate = 60
+		at60 := audio_source_start_sample(start_s, 48000)
+		project.frame_rate = saved
+		if at12 != at60 {
+			parity_probe_failf(
+				"start_s %d moved with the project rate: %d at 12fps, %d at 60fps",
+				start_s, at12, at60,
+			)
+		}
+	}
+
+	// 3. Boundary differences telescope: summing them equals the boundary. Both
+	//    mixers derive spf this way and accumulate, so a floor that moved between
+	//    two calls would drift here rather than at either call.
+	for rate in rates {
+		num, den := fps_rational(rate)
+		rn, rd := i64(num), i64(den)
+		sum: Sample_Pos = 0
+		frames := (90 * rn / rd) * 2 + 1
+		for f in 0 ..< frames {
+			a := sample_pos_from_frames(f, rn, rd)
+			b := sample_pos_from_frames(f + 1, rn, rd)
+			if b <= a {
+				parity_probe_failf("rate %f: frame %d did not advance (%d -> %d)", rate, f, a, b)
+				break
+			}
+			sum += b - a
+		}
+		if want := sample_pos_from_frames(frames, rn, rd); sum != want {
+			parity_probe_failf(
+				"rate %f: %d differences summed to %d, want %d", rate, frames, sum, want,
+			)
+		}
+	}
+
+	// 4. The 29.97 alternation, named rather than left implicit. 1601/1602 is the
+	//    whole reason the mixers use boundary differences instead of a rounded
+	//    constant, so losing the 1001 denominator must fail here.
+	alt := sample_pos_from_frames(1, 30000, 1001) - sample_pos_from_frames(0, 30000, 1001)
+	if alt != 1601 {
+		parity_probe_failf("29.97 fps: first frame is %d samples, expected 1601", alt)
+	}
+	// And the source term keeps it: a clip authored at 29.97 starts 1601/1602
+	// samples per source-frame, not 1600.
+	if got := audio_source_start_sample(1001, 29.97) - audio_source_start_sample(1000, 29.97); got != 1601 {
+		parity_probe_failf("29.97 source term: advanced %d per frame, expected 1601", got)
+	}
+
+	// 5. decoder_pts_sample is in the same units as audio_content_sample. For a
+	//    stream whose time base divides the bus rate the round trip is exact, so
+	//    a bus position must survive PTS -> position -> PTS unchanged; this is
+	//    the comparison the mixer makes every frame between a demand and a fifo
+	//    base, and it is where the two float round-trips used to disagree by one.
+	for pos in ([]Sample_Pos{0, 1, 479, 48000, 48001, 96000, 123457, 48000 * 60}) {
+		pts := avutil.rescale_q(c.int64_t(pos), avutil.Rational{num = 1, den = AUDIO_BUS_RATE}, avutil.Rational{num = 1, den = AUDIO_BUS_RATE})
+		if back := decoder_pts_sample(pts, avutil.Rational{num = 1, den = AUDIO_BUS_RATE}); back != pos {
+			parity_probe_failf("pts round trip: %d -> %d -> %d", pos, pts, back)
+		}
+	}
+	// 7. Where a frame is a WHOLE number of samples, EVERY frame is that many.
+	//    23.976 is the case that matters: 48000*1001/24000 is exactly 2002, and
+	//    the float form evaluates the first frame as 2001.9999999999998 -- so it
+	//    loses a sample at the very start of a 23.976 project and wanders from
+	//    there. Derived from the rate alone, so it is not circular.
+	for rate in rates {
+		num, den := fps_rational(rate)
+		scaled := AUDIO_BUS_RATE * i64(den)
+		if scaled % i64(num) != 0 {
+			continue // non-integral samples-per-frame (29.97, 59.94): covered by 4
+		}
+		spf := scaled / i64(num)
+		for f: i64 = 0; f < 5000; f += 1 {
+			a := sample_pos_from_frames(f, i64(num), i64(den))
+			b := sample_pos_from_frames(f + 1, i64(num), i64(den))
+			if b - a != spf {
+				parity_probe_failf(
+					"rate %f: frame %d advanced %d samples, want exactly %d (the whole samples-per-frame)",
+					rate, f, b - a, spf,
+				)
+				break
+			}
+		}
+	}
+
+	fmt.println("[parity-probe] sample clock: whole-second + whole-frame ground truth, adjacent-frame exactness, pinned source term, telescoping boundaries, 1601/1602, pts units")
+}
+
 // parity_probe_exit is the probe's exit, and it is not a bare os.exit.
 //
 // The export brings up real resources that outlive the check: the GPU resampler
@@ -694,6 +837,7 @@ parity_probe_export :: proc(out_path: string) -> int {
 	}
 	grid := project_fps()
 	parity_probe_check_rate_resolver()
+	parity_probe_check_sample_clock()
 	parity_probe_check_rate()
 	parity_probe_compare()
 	// Caller-owned readback: the drain proc used to allocate and return this,

@@ -1140,6 +1140,21 @@ audio_src_pull :: proc(s: ^Play_Src, up_to48: i64) {
 // audio_src_open opens s's decoder and anchors it at content second
 // `content_sec` (see audio_src_seek_anchor). Returns false on open/seek failure
 // so the caller can drop the group.
+// decoder_pts_sample converts a decoded frame's PTS into a bus Sample_Pos.
+//
+// Rescaled straight from the stream's own time base into 1/48000, so it is exact
+// integer arithmetic. It replaces `i64(real_sec * 48000)` where real_sec was
+// microseconds-as-f64 divided by 1e6 -- and that is not a cosmetic change: the
+// fifo base it produces is compared against a demand that is now computed in
+// exact samples (audio_content_sample), so the two had to be brought onto the
+// same arithmetic or an off-by-one that moves with position reappears at the
+// comparison instead of at the conversion. Pinned by parity_probe property 5.
+decoder_pts_sample :: proc(ts: c.int64_t, time_base: avutil.Rational) -> Sample_Pos {
+	return Sample_Pos(
+		avutil.rescale_q(ts, time_base, avutil.Rational{num = 1, den = AUDIO_BUS_RATE}),
+	)
+}
+
 audio_src_open :: proc(s: ^Play_Src, content_sec: f64) -> bool {
 	if !open_audio_decoder_resampled(&s.dec, s.path, s.stream_index, 48000, 2) {
 		return false
@@ -1161,8 +1176,7 @@ audio_src_seek_anchor :: proc(s: ^Play_Src, content_sec: f64) -> bool {
 	if n <= 0 {
 		return false
 	}
-	real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
-	s.first48 = i64(real_sec * 48000)
+	s.first48 = i64(decoder_pts_sample(s.dec.first_ts, s.dec.stream.time_base))
 	s.have48 = s.first48 + i64(n)
 	audio_src_dump_dec(s, n)
 	audio_src_append(s, n)
@@ -1211,13 +1225,21 @@ clip_gain_db_at_playhead :: proc(clip: ^Clip) -> f32 {
 	return clip.gain
 }
 
-// audio_frame_boundary48 returns the exact (fractional, floor-truncated) 48kHz
-// sample index at which timeline frame `frame` begins, relative to the start
-// of the timeline (frame 0). Used to derive the true per-frame sample count
-// as a difference of boundaries, instead of a single rounded 48000/fps
-// constant that drifts over time whenever fps doesn't evenly divide 48000.
+// audio_frame_boundary48 returns the 48kHz sample index at which timeline frame
+// `frame` begins, relative to the start of the timeline (frame 0). Used to derive
+// the true per-frame sample count as a difference of boundaries, instead of a
+// single rounded 48000/fps constant that drifts over time whenever fps doesn't
+// evenly divide 48000.
+//
+// Takes the rate rather than reading project_fps() because the render path
+// passes the job's rate and the probes pass a fixture's; both must be able to
+// place a boundary at a rate that is not the live project's. The arithmetic is
+// sample_pos_from_frames -- integer, against the exact num/den -- and not
+// `i64(frame * 48000.0 / fps)`, which loses a sample on the first frame of a
+// 23.976 project (see parity_probe property 7).
 audio_frame_boundary48 :: proc(frame: i64, fps: f64) -> i64 {
-	return i64(f64(frame) * 48000.0 / fps)
+	num, den := fps_rational(fps)
+	return i64(sample_pos_from_frames(frame, i64(num), i64(den)))
 }
 
 // audio_mix_frame zeros mix[0..spf*2) and sums every covering segment's window,
@@ -1242,7 +1264,7 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if seg == nil {
 			continue
 		}
-		demand48 := i64(audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
+		demand48 := i64(audio_content_sample(frame - seg.start_a, seg.start_s, seg.start_s_rate))
 		// The fifo sits somewhere other than where this frame needs samples.
 		// Both distances are re-anchored with a seek, because a decode only
 		// substitutes when it is cheaper:
