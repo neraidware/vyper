@@ -1742,7 +1742,7 @@ draw_preview_hud :: proc(
 			holes, holes-audio_skew_diag.prev_holes,
 			audio_rpt.skip_nocov, audio_rpt.skip_nocov-audio_skew_diag.prev_ncov,
 			audio_rpt.skip_full, audio_rpt.skip_full-audio_skew_diag.prev_full,
-			audio_rpt.wedge_heal, audio_rpt.wedge_heal-audio_skew_diag.prev_wedge,
+			audio_rpt.starve_ticks, audio_rpt.starve_ticks-audio_skew_diag.prev_wedge,
 			audio_rpt.rate_rebuilt, audio_rpt.rate_rebuilt-audio_skew_diag.prev_rebuilt,
 			playback.rate, playback.boost,
 		)
@@ -1751,7 +1751,7 @@ draw_preview_hud :: proc(
 		audio_skew_diag.prev_holes = holes
 		audio_skew_diag.prev_ncov = audio_rpt.skip_nocov
 		audio_skew_diag.prev_full = audio_rpt.skip_full
-		audio_skew_diag.prev_wedge = audio_rpt.wedge_heal
+		audio_skew_diag.prev_wedge = audio_rpt.starve_ticks
 		audio_skew_diag.prev_rebuilt = audio_rpt.rate_rebuilt
 	}
 	fs: u16 = FONT_SMALL

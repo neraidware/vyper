@@ -1584,12 +1584,6 @@ Render_Audio_Src :: struct {
 	// export cannot drift from playback (it previously applied no gain at all,
 	// so a rendered file ignored the slider and its automation entirely).
 	gain:                 Audio_Gain_Snapshot,
-	// muted is true when this source contributed nothing to the previous mixed
-	// block, or has not contributed yet. It is what makes a resume-after-shortfall
-	// fade in rather than appear at full amplitude: the output has a step there
-	// whether or not the block boundary is a clip boundary, and without this the
-	// only thing that ramps is a clip edge.
-	muted:                bool,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
 	fifo:                 Audio_Ring, // converted stereo f32, content-relative
 	first48:              i64, // content 48 kHz frame of fifo's head
@@ -1812,9 +1806,7 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 			// and NOT a silent `continue`, because the rest of the block belongs
 			// to this source and dropping it would punch a hole shaped like the
 			// source list rather than like the shortfall. The source is marked
-			// muted so that its return fades in instead of arriving at full level.
 			m.holes += 1
-			a.muted = true
 			continue
 		}
 		base := int(content - a.first48)
@@ -1839,7 +1831,6 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 			out[off + s * 2 + 0] += l * f
 			out[off + s * 2 + 1] += r * f
 		}
-		a.muted = false
 		// Drop what this block consumed so the fifo stays forward-only and a long
 		// render does not accumulate whole clips.
 		drop := base + int(want)
@@ -2856,7 +2847,6 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 	// rather than defaulted, because the zero value of Render_Audio_Src has to
 	// stay useful and a struct that means "unopened" should not read as
 	// "contributed last block".
-	a.muted = true
 	overlap_start := max(a.timeline_start_frame, render_start)
 	if !open_audio_decoder_resampled(&a.dec, a.path, a.stream_index, RENDER_AUDIO_RATE, 2) {
 		return false

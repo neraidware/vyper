@@ -484,15 +484,6 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 // interface in audio_device.odin, so nothing in the engine knows what backs it.
 audio_atempo: Atempo_Graph
 
-// AUDIO_AUDIBLE_SKEW_TOL is the maximum wall-time the audible content position
-// (playback.dev_frame) may trail the playhead before audio_update forces a
-// re-anchor. Healthy steady playback keeps it at ~0; a deficit this large means
-// the producer is throttled at the queue cap and can never close the gap on its
-// own. Kept well under the ~0.25s cushion so a snappable defect is caught
-// rather than tolerated; the 200ms post-seek coalesce gate above prevents
-// firing during legitimate queue-ramp transients.
-AUDIO_AUDIBLE_SKEW_TOL :: 0.1
-
 // MAX_PLAY_AUDIO bounds simultaneous playback decoders. One decoder serves a
 // whole source stream (every contiguous split segment shares it), so this
 // bounds STREAMS, not clips.
@@ -701,12 +692,6 @@ Play_Src :: struct {
 	fifo:  Audio_Ring, // content-relative stereo f32 at 48 kHz
 	first48: i64,       // content 48 kHz sample of fifo's head
 	have48:  i64,       // content 48 kHz samples produced so far
-	// muted records that this source's last contribution did not arrive (a
-	// shortfall the fifo could not cover), so its RETURN fades in rather than
-	// reappearing at full level. An edge a listener hears even though no clip
-	// changed, and the same state the export's Render_Audio_Src.muted holds --
-	// it is what makes a hole's recovery sound like the export's.
-	muted: bool,
 	seg:          [MAX_PLAY_SEGMENTS]Play_Seg, // in timeline order
 	seg_count:    int,
 }
@@ -904,7 +889,6 @@ Audio_Report :: struct {
 	// real one empty and dropped, which reports as an Open for every source and
 	// looks from the outside exactly like the re-provision it replaced.
 	slots_new:   u64,
-	wedge_heal:   u64, // backlog drops when prod was queue-capped short of target
 	mix_us:       u64, // time spent inside audio_mix_frame (decode + resample + mix)
 	feed_us:      u64, // time spent in audio_producer_feed outside mix
 	min_q:        i64, // smallest queue depth (frames) seen in the window
@@ -1771,7 +1755,6 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if head_ahead || head_behind {
 			content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
 			if !audio_src_seek_anchor(s, content_sec) {
-				s.muted = true
 				continue
 			}
 		}
@@ -1791,11 +1774,9 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		audio_src_pull(s, start48 + i64(spf))
 		if s.have48 < start48 + i64(spf) {
 			// The fifo cannot cover this frame. Silence for the span, and mark the
-			// source muted so its RETURN fades in instead of arriving at full
 			// level -- the export's render_mix_block does exactly this, and a
 			// resume after a hole is an edge a listener hears even though no clip
 			// changed.
-			s.muted = true
 			continue
 		}
 		base := int(start48 - s.first48)
@@ -1836,7 +1817,6 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 			mix[off + 0] += l * d
 			mix[off + 1] += r * d
 		}
-		s.muted = false
 		delivered = true
 		if audio_rpt.trace {
 			fmt.printf(
@@ -2080,14 +2060,20 @@ audio_producer_feed :: proc() {
 	// to prod, the fill loop re-fills against the true target, and dev lands
 	// back on the playhead. Self-limiting — after the heal prod sits at target,
 	// so the condition stops.
-	if target > audio_src.next_frame && audio_device_queued() >= max_queue && audio_src.next_frame < target-i64(AUDIO_AUDIBLE_SKEW_TOL*want_ratio*f64(fps)) {
-		audio_device_clear()
-		queued_frames = 0
-		dev_pos = audio_src.next_frame
-		sync.atomic_store(&playback.dev_at_ns, i64(monotonic_ns()))
-		sync.atomic_store(&playback.dev_frame, dev_pos)
-		audio_rpt.wedge_heal += 1
-	}
+	// There is no wedge watchdog here any more, and it is worth saying why it could
+	// not have worked even before the clock inversion. Its condition was
+	//   queued_samples >= max_queue   AND   next_frame < target - AUDIO_AUDIBLE_SKEW_TOL*fps
+	// and with target = dev_pos + cushion and dev_pos = next_frame - queued that
+	// second clause is `cushion_frames - queued_frames > 0.1*fps`. At a full queue
+	// queued_frames is exactly the cushion minus one, so the difference is 1 frame
+	// against a 6-frame bar at 60fps -- and the two clauses are in different units
+	// besides (samples against frames). It measured heal=0 for every run.
+	//
+	// It existed to drop the backlog when a full queue left the producer short,
+	// which SHIFTED THE PLAYHEAD -- the same class of silent position change the
+	// clock inversion removed. It is deleted rather than fixed: with the device as
+	// the clock there is no backlog to drop, because the producer's target IS the
+	// device position.
 	if target <= audio_src.next_frame {
 		return
 	}
@@ -2341,7 +2327,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					audio_rpt.dec_open,
 					audio_rpt.dec_drop,
 					audio_device_rate(), audio_device_channels(), audio_device_bits(),
-					audio_device_underruns(), audio_device_clears(), audio_rpt.wedge_heal)
+					audio_device_underruns(), audio_device_clears(), 0)
 				if audio_rpt.log_full {
 					for k in 0 ..< audio_src.count {
 						s := &audio_src.slots[k]
@@ -2485,16 +2471,24 @@ audio_update :: proc() {
 				playhead.frame, prod, sync.atomic_load(&audio_prod.anchor_frame), reason, fwd, src_name, catch)
 		}
 		audio_seek(playhead.frame)
-	} else if playhead.frame > prod + i64(AUDIO_CUSHION_SEC * fps) + 6 {
-		// Producer (or device) fell behind the playhead. Skip forward in place —
-		// never reloop, that reads as slowed/stuttering audio against a correct
-		// video. The producer trims fifos and continues decoding forward.
-		sync.atomic_store(&audio_prod.jump_frame, playhead.frame)
-		if audio_rpt.trace {
-			fmt.printf("[ph] t=%.2fs ph=%d prod=%d -> forward skip to ph (fwd=%+d)\n",
-				f64(now-audio_rpt.thread_start_ns)/1e9,
-				playhead.frame, prod, fwd)
-		}
+	// There is no forward-skip branch here any more, and its absence is the point of
+	// the clock inversion rather than a simplification.
+	//
+	// It guarded `playhead.frame > prod + cushion + 6` -- "the producer fell behind,
+	// so jump it forward". But the playhead is now READ FROM the device, and
+	// dev_pos = next_frame - queued, so that guard reduces to
+	//
+	//     -queued_frames > cushion + 6
+	//
+	// which is unsatisfiable: queued_frames is a non-negative count. The playhead
+	// cannot outrun what the producer has already fed, by construction, so the branch
+	// was unreachable -- measured resync=4 at startup, constant since.
+	//
+	// It was also the LAST way the engine could silently move the playhead during
+	// playback. A producer stall now costs the listener a gap and nothing else: the
+	// device drains, dev_pos advances with it, the playhead follows, and the producer
+	// resumes feeding on from where it stopped. That is what the branch was trying to
+	// buy, except it bought it by shifting position.
 	}
 }
 

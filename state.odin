@@ -152,11 +152,22 @@ fps_rational :: proc(fps: f64) -> (num, den: c.int) {
 	return c.int(math.round(fps)), 1
 }
 
-// timeline_fps is project_fps with the DIAG playback override in front of it.
-// Only the PLAYBACK cadence may be overridden (VYPER_PLAYBACK_FPS exists to
-// isolate wall-clock jitter from the audible rate); anything that defines what
-// a frame index means -- durations, clip lengths, the export -- reads
-// project_fps, so a diagnostic can never change the shipped output.
+// timeline_fps is project_fps with VYPER_PLAYBACK_FPS in front of it.
+//
+// WHY THE OVERRIDE MUST NOT BE TREATED AS "the frame rate": this function returns
+// the rate used to decide WHERE SAMPLE BOUNDARIES FALL, not just how fast to tick.
+// Content positions come from project_fps (timeline_frame_sample), so setting
+// VYPER_PLAYBACK_FPS alone makes the engine demand content at one rate and mix it
+// at another. That is not hypothetical: it was done by mistake during Active 30 and
+// produced a convincing 29.97-vs-60 divergence that took four wrong hypotheses to
+// dismiss. The symptom was invisible because the mixer absorbed it -- 1786 clamps,
+// worst case 29.5 seconds of content read from the wrong place -- and reported
+// success throughout.
+//
+// So: anything that defines what a frame index MEANS -- durations, clip lengths,
+// the export, content positions -- reads project_fps. To exercise a different
+// frame rate, change the PROJECT's rate. A probe that needs to do that sets
+// project.frame_rate (see audio_probe_drift_parity), never this.
 timeline_fps :: proc() -> f64 {
 	if playback.magic_fps > 0 {
 		return playback.magic_fps
