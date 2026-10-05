@@ -394,6 +394,13 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 			// referenced by the bin.
 			path = strings.clone_to_cstring(string(path)),
 			kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
+			// The source's OWN rate, kept. See Media_Asset.video_fps: this is the
+			// value a clip pins so the project rate cannot retime it.
+			video_fps = (
+				!is_image && probe.has_video && probe.video_fps_num > 0
+					? f64(probe.video_fps_num) / f64(probe.video_fps_den)
+					: 0
+			),
 			metadata = project.info_text,
 			frame_count = frame_count,
 			dur_us = i64(probe.duration_sec * 1_000_000),
@@ -557,6 +564,10 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			// measured against (audio_frames above), so a later project-rate
 			// change retimes the clip without moving where it reads in the file.
 			audio_src_rate        = is_audio ? asset.audio_rate : 0,
+			// Same idea for the video half: pin the clip to the source's rate, so
+			// the timeline consumes its frames at the clip's real speed instead of
+			// one timeline frame per source frame.
+			src_fps               = is_video ? asset.video_fps : 0,
 			source_length_frames = lane_len,
 			timeline_start_frame = placed,
 		}

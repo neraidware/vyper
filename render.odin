@@ -1171,6 +1171,9 @@ Render_Video_Src :: struct {
 	path:                 cstring, // owned copy, freed by the worker
 	stream_index:         c.int,
 	source_start_frame:   i64,
+	// src_fps travels with the offsets so the worker conforms the clip's speed
+	// without reading a live Clip; see clip_source_frame.
+	src_fps:              f64,
 	source_length_frames: i64,
 	// is_still marks a single-frame image source; every timeline frame maps to
 	// source_start_frame (see media_is_image / Clip.is_still).
@@ -1448,6 +1451,9 @@ Render_Sub_Src :: struct {
 	fps:                  f32, // project rate, cues resolve to frames at this
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
+	// src_fps travels with the offsets so the worker conforms the clip's speed
+	// without reading a live Clip; see clip_source_frame.
+	src_fps:              f64,
 	source_length_frames: i64,
 	// geom is the same shared carrier a video or text clip carries, so a keyed
 	// subtitle clip exports animated too. This struct previously copied the
@@ -3133,6 +3139,7 @@ slot_idx := int(frame_idx & 1)
 				v.timeline_start_frame,
 				timeline_frame,
 				v.is_still,
+				v.src_fps,
 			)
 			t_src := time.now()._nsec
 			if !decode_source_frame(&v.dec, src_frame) {
@@ -4839,6 +4846,7 @@ render_start :: proc() {
 						path = strings.clone_to_cstring(string(clip.path)),
 						stream_index = clip.stream_index,
 						source_start_frame = clip.source_start_frame,
+						src_fps = clip.src_fps,
 						source_length_frames = clip.source_length_frames,
 						is_still = clip.is_still,
 						timeline_start_frame = clip.timeline_start_frame,

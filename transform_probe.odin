@@ -18,6 +18,7 @@ package main
 // asserts the pointer/border behavior. pixel<->project is identity here.
 
 import "core:c"
+import "core:math"
 import "core:fmt"
 import "core:os"
 import clay "clay-odin"
@@ -464,7 +465,7 @@ transform_probe_run :: proc(v: string) {
 		sf_ok := true
 		// A non-still maps linearly from its source offset.
 		for off in ([]i64{0, 1, 30, 90}) {
-			got := clip_source_frame(10, 5, 5 + off, false)
+			got := clip_source_frame(10, 5, 5 + off, false, project_fps())
 			if got != 10 + off {
 				sf_ok = false
 				fmt.printf(
@@ -474,7 +475,7 @@ transform_probe_run :: proc(v: string) {
 		}
 		// A still pins every timeline frame in its span to its one source frame.
 		for off in ([]i64{0, 1, 30, 90}) {
-			got := clip_source_frame(7, 5, 5 + off, true)
+			got := clip_source_frame(7, 5, 5 + off, true, project_fps())
 			if got != 7 {
 				sf_ok = false
 				fmt.printf(
@@ -483,6 +484,139 @@ transform_probe_run :: proc(v: string) {
 			}
 		}
 		check(&fail, sf_ok, "source frame: one mapping for preview, export and the proxy picker", 0, 0, 0, 0)
+
+	// --- a clip's SPEED must not depend on the project rate. This is the defect
+	// the conform fixes: the mapping used to be unconditionally 1:1, so the
+	// project rate WAS every clip's playback speed, and changing it retimed the
+	// whole project with no setting anywhere that said so.
+	//
+	// The property asserted is real-world speed, not per-frame arithmetic: the
+	// source frames a clip shows per second of its own playback must equal the
+	// source's rate, whatever the project rate is. Asserted by WALKING the clip
+	// and timing it, because a per-frame expectation would pass for a mapping
+	// that was right on the frames sampled and wrong between them.
+	{
+		sp_ok := true
+		saved_fps := project.frame_rate
+		defer project.frame_rate = saved_fps
+
+		SRC_FPS  :: f64(30.0)
+		CLIP_SEC :: f64(2.0)
+
+		for proj_fps in ([]f64{24.0, 25.0, 30.0, 50.0, 60.0, 59.94, 29.97}) {
+			project.frame_rate = proj_fps
+			// The clip occupies exactly CLIP_SEC of its source's content. At a
+			// project rate of P that is CLIP_SEC*P timeline frames.
+			clip_frames := i64(math.round(CLIP_SEC * proj_fps))
+			// How far through the SOURCE it advanced, over the frames it played.
+			// Counting DISTINCT frames instead measures the window's edges, not
+			// the rate: a 30fps source on a 60fps timeline ends its last frame on
+			// 59.5 and rounds up, so 120 timeline frames show 61 distinct frames,
+			// not 60.
+			advanced := f64(clip_source_frame(0, 0, clip_frames, false, SRC_FPS))
+			played := f64(clip_frames)
+			// Playback elapsed is played/proj seconds and content elapsed is
+			// advanced/SRC_FPS seconds. Native speed means they are equal, i.e. the
+			// advance rate is exactly SRC_FPS/proj_fps. One source frame of slack
+			// absorbs the rounding at the single boundary frame.
+			rate_error := math.abs(advanced / played - SRC_FPS / proj_fps) * played
+			if rate_error > 1.0 + 0.001 {
+				sp_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL speed: project %.4f fps, a %.0ffps clip %v frames long advanced %.2f source frames, want %.2f (off by %.2f)\n",
+					proj_fps, SRC_FPS, clip_frames, advanced, played * SRC_FPS / proj_fps, rate_error,
+				)
+			}
+		}
+		project.frame_rate = saved_fps
+
+		// And the direction, asserted as an ADVANCE RATE at concrete frames
+		// rather than as a phase convention. The conform is nearest-frame, so a
+		// timeline frame sitting exactly between two source frames (f=1 at ratio
+		// 0.5) resolves to the LATER one -- a half-source-frame phase shift at
+		// most, and not drift, which is the property that matters. Pinning the
+		// phase here would be asserting the rounding, not the speed.
+		project.frame_rate = 60.0
+		hold_ok := clip_source_frame(0, 0, 0, false, 30.0) == 0 &&
+			clip_source_frame(0, 0, 2, false, 30.0) == 1 &&
+			clip_source_frame(0, 0, 4, false, 30.0) == 2 &&
+			clip_source_frame(0, 0, 100, false, 30.0) == 50
+		// And the reverse: a 60fps source on a 30fps timeline DROPS frames —
+		// two source frames per timeline frame. The rate has to be set HERE: read
+		// at the 60fps left over from the case above, src==proj and the case
+		// silently degrades to checking 1:1.
+		project.frame_rate = 30.0
+		drop_ok := clip_source_frame(0, 0, 0, false, 60.0) == 0 &&
+			clip_source_frame(0, 0, 1, false, 60.0) == 2 &&
+			clip_source_frame(0, 0, 10, false, 60.0) == 20
+		// The decoder-facing invariant: the mapping NEVER goes backwards, in
+		// either direction and at any rate. A non-monotonic conform would make the
+		// decoder seek backwards on every frame of the clip.
+		mono_ok := true
+		for rate in ([]f64{23.976, 24.0, 25.0, 29.97, 30.0, 50.0, 59.94, 60.0, 120.0}) {
+			for proj in ([]f64{24.0, 30.0, 60.0}) {
+				project.frame_rate = proj
+				prev := clip_source_frame(0, 0, 0, false, rate)
+				for f in 1 ..< 600 {
+					cur := clip_source_frame(0, 0, i64(f), false, rate)
+					if cur < prev {
+						mono_ok = false
+						fmt.printf(
+							"[transform-probe] FAIL monotonic: src %.3f at project %.2f went backwards at frame %d (%d -> %d)\n",
+							rate, proj, f, prev, cur,
+						)
+						break
+					}
+					prev = cur
+				}
+			}
+		}
+		// A non-integer rate ratio is where a truncating conform shows: 30/29.97
+		// never lands on a whole frame, so truncating creeps early every frame and
+		// the clip gains a frame of lead. Rounding must not.
+		project.frame_rate = 29.97
+		frac_ok := true
+		for f in 1 ..< 200 {
+			want := i64(math.round(f64(f) * (30.0 / 29.97)))
+			got := clip_source_frame(0, 0, i64(f), false, 30.0)
+			if got != want {
+				frac_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL non-integer ratio: frame %d gave source %d, want %d\n",
+					f, got, want,
+				)
+				break
+			}
+		}
+		project.frame_rate = saved_fps
+
+		check(&fail, hold_ok, "speed: a 30fps source on a 60fps timeline holds each frame twice", 0, 0, 0, 0)
+		check(&fail, drop_ok, "speed: a 60fps source on a 30fps timeline drops frames", 0, 0, 0, 0)
+		check(&fail, frac_ok, "speed: a non-integer rate ratio does not creep", 0, 0, 0, 0)
+		check(&fail, mono_ok, "speed: the mapping never runs backwards, at any rate pair", 0, 0, 0, 0)
+
+		// An UNPINNED clip (src_fps 0, a project saved before the field existed)
+		// must keep the historical 1:1 exactly, whatever the project rate is.
+		// Silently re-speeding old projects on load would be a worse bug than
+		// the one being fixed.
+		unpinned_ok := true
+		for proj_fps in ([]f64{24.0, 30.0, 60.0}) {
+			project.frame_rate = proj_fps
+			for off in ([]i64{0, 1, 7, 90}) {
+				if clip_source_frame(10, 5, 5 + off, false, 0) != 10 + off {
+					unpinned_ok = false
+					fmt.printf(
+						"[transform-probe] FAIL unpinned: project %.2f fps off %d gave %d, want %d\n",
+						proj_fps, off, clip_source_frame(10, 5, 5 + off, false, 0), 10 + off,
+					)
+				}
+			}
+		}
+		project.frame_rate = saved_fps
+		check(&fail, unpinned_ok, "speed: an unpinned clip keeps the historical 1:1 on old projects", 0, 0, 0, 0)
+
+		check(&fail, sp_ok, "speed: a clip plays at its own rate at every project rate", 0, 0, 0, 0)
+	}
 	}
 
 	if !fail {

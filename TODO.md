@@ -6347,3 +6347,80 @@ whose buffer predated the merge that created Active 31, deleting 311 lines and t
 whole zoom/pan record with it. Restored from `c03c1d1`. The code was never at risk
 — only the record of it — but a stale editor buffer overwriting a merged file is
 silent, and nothing in the gate set reads TODO.md.
+
+## Active 32 — A clip plays at its own rate; the project rate is a timebase, not a speed
+
+**Why:** changing the project frame rate changed the playback speed of every clip
+in the project. The mapping from timeline frame to source frame was
+unconditionally 1:1 (`clip_source_frame` returned
+`source_start + timeline_frame - timeline_start`), so a clip's speed WAS the
+project rate by definition — there was no setting anywhere that said otherwise, and
+no way to express a clip that holds its own speed. A 30fps source on a 60fps
+timeline played at double speed.
+
+The source's own rate was probed at import and then thrown away: `media.odin` read
+`probe.video_fps_num/den` only to seed `timeline.frame_rate` on the first import.
+That is exactly why the bug looked absent — the project rate was set FROM the
+first clip, so until the user touched the rate, source rate and project rate were
+the same number by coincidence and 1:1 was accidentally correct.
+
+**Fix.** `Media_Asset.video_fps` keeps the probed source rate; `Clip.src_fps` pins
+it to the clip, the video half of the existing `audio_src_rate` pin.
+`clip_source_frame` now advances through the source at `src_fps / project_fps`, so
+the timeline consumes a clip's frames at the clip's real speed: a 60fps timeline
+holds each frame of a 30fps source twice, a 24fps timeline drops frames from a
+60fps source. Conform, not resample — the project rate only decides how finely the
+timeline samples it.
+
+`src_fps == 0` means unpinned, and resolves to the project rate, which reproduces
+the historical 1:1 exactly so a project saved before the field existed does not
+change speed on load. The rate-equal case returns through integer arithmetic and
+never touches a float: that is the overwhelmingly common path and it has to stay
+bit-exact.
+
+One choke point, so preview, export and the proxy picker cannot disagree — they
+already all routed through `clip_source_frame`, which is why this needed no
+per-site change beyond passing the pin.
+
+**Accept.** `check build probe transform_probe geom_key_probe render_kf_probe
+keyframe_probe timeline_probe opacity zorder subtitle_probe keyed_export parity
+render_live_probe` pass; `render_valgrind parity_valgrind` clean. The speed case
+walks a clip at 24/25/30/50/59.94/60/29.97 project fps and asserts the source
+advance rate is `src_fps/project_fps` at every one; restoring 1:1 fails it with
+`project 60.0000 fps, a 30fps clip 120 frames long advanced 120.00 source frames,
+want 60.00`. It also pins what was NOT obvious: a non-integer ratio must round
+rather than truncate (30/29.97 creeps early under truncation), and the mapping
+must never run backwards at any of 9×3 rate pairs, since a non-monotonic conform
+makes the decoder seek backwards every frame.
+
+**Still open — clip EXTENT, deliberately not done here.** This fixes SPEED only,
+and it leaves a second, separate coupling in place: a clip's length on the timeline
+is its SOURCE frame count (`Clip.source_length_frames` is `asset.frame_count`,
+used directly as the timeline extent), and an audio clip's is
+`duration_sec × import-time fps`. Both are therefore measured in whatever rate
+happened to be current when the clip was placed. Consequences after an fps change:
+
+- a 30fps clip of 300 frames occupies 300 timeline frames, so at 60fps it covers
+  5 seconds of its 10 seconds of content — conformed correctly, and truncated;
+- an audio clip's audible content no longer matches its lane, so it overruns or is
+  cut off at its end.
+
+Both are one decision with two possible answers and they are not equivalent, so it
+is not bundled into a speed fix:
+
+1. **Conform in place** — leave every clip's extent as authored and let the fps
+   change alter how much source each clip covers. Non-destructive: no position
+   moves, no keyframe is touched, and every clip keeps its real-world speed. The
+   visible artifact is that a clip can cover less (or more) of its source than it
+   did, which reads as truncation to the user.
+2. **Retime the timeline** — on an fps change, rescale every clip extent and
+   position (and every keyframe offset, and audio sample offsets) by
+   `new/old`, so durations and coverage are preserved exactly. Correct, but it
+   rewrites the project's frame numbers, and a keyframe track stored in timeline
+   frames has to be rescaled with it or keyframes land on the wrong content.
+
+The probe's own invariant assumes (1): it holds a clip's extent fixed at
+`CLIP_SEC × project_fps` timeline frames and asserts the source advances at
+`src_fps/project_fps` through them. Under (2) that same assertion still holds,
+because a retimed clip is still conformed at the same ratio — so the speed work
+above is correct either way, and only the extent question is open.

@@ -455,6 +455,7 @@ update_preview_slots :: proc() -> bool {
 			}
 			slot.timeline_start_frame = clip.timeline_start_frame
 			slot.source_start_frame = clip.source_start_frame
+			slot.src_fps = clip.src_fps
 			if anchor_shifted {
 				// A clip was moved (drag) or its source window changed. The
 				// slot's decoded buffer + texture still hold the OLD position's
@@ -659,6 +660,7 @@ slot.is_text = true
 				clip.timeline_start_frame,
 				req,
 				clip.is_still,
+				clip.src_fps,
 			)
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
 			// the background builder lands more segments, so the frame the

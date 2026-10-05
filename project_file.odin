@@ -92,6 +92,10 @@ Saved_Clip :: struct {
 	gain:                 f32,
 	source_start_frame:   i64,
 	audio_src_rate:       f64,
+	// src_fps persists the same pin for video. Saved unconditionally rather than
+	// behind a presence flag: an absent field decodes to 0, which already means
+	// "unpinned", so a flag would carry no information the value does not.
+	src_fps:              f64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
 	source_w:             c.int,
@@ -251,6 +255,7 @@ project_to_file :: proc() -> Project_File {
 				gain                 = c.gain,
 				source_start_frame   = c.source_start_frame,
 				audio_src_rate       = c.audio_src_rate,
+				src_fps              = c.src_fps,
 				source_length_frames = c.source_length_frames,
 				timeline_start_frame = c.timeline_start_frame,
 				source_w             = c.source_w,
@@ -442,6 +447,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				gain                 = sc.gain,
 				source_start_frame   = sc.source_start_frame,
 				audio_src_rate       = sc.audio_src_rate,
+				src_fps              = sc.src_fps,
 				source_length_frames = sc.source_length_frames,
 				timeline_start_frame = sc.timeline_start_frame,
 				source_w             = sc.source_w,
@@ -495,6 +501,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 	timeline.playhead_frame = pf.playhead_frame
 	timeline.frame_rate = pf.timeline_frame_rate
 	pf_pin_audio_src_rates()
+	pf_pin_src_fps()
 
 	// Post-load reset: a full session replace invalidates every decoder, the
 	// preview cache, and playback state. Mirrors the import post-edit block.
@@ -554,6 +561,35 @@ pf_pin_audio_src_rates :: proc() {
 				pinned = as.audio_rate
 			}
 			c.audio_src_rate = pinned
+		}
+	}
+}
+
+// pf_pin_src_fps pins the rate of every video clip that has none — a project
+// saved before Clip.src_fps existed.
+//
+// The video half of pf_pin_audio_src_rates, and it has to run HERE, at load,
+// while the project's own rate is still the one the frame numbers were written
+// against. After that the rate is mutable and the authoring value is
+// unrecoverable, so a project that does not pin here is a project whose clips
+// silently change speed the first time the user touches the frame rate.
+//
+// Preference order: the asset's own probed rate (exact — it is the rate the
+// source actually has), else the project's effective rate at load, which
+// reproduces the pre-pin 1:1 exactly and so leaves such projects as they were.
+pf_pin_src_fps :: proc() {
+	rate := project_fps()
+	for ti in 0 ..< len(timeline.tracks) {
+		for ci in 0 ..< len(timeline.tracks[ti].clips) {
+			c := &timeline.tracks[ti].clips[ci]
+			if c.kind == .Audio || c.kind == .Text || c.src_fps > 0 {
+				continue
+			}
+			pinned := rate
+			if as := find_asset(c.asset_id); as != nil && as.video_fps > 0 {
+				pinned = as.video_fps
+			}
+			c.src_fps = pinned
 		}
 	}
 }

@@ -45,14 +45,55 @@ clip_visible_at :: proc(frame, start, length: i64) -> bool {
 // export and the proxy picker each had their own copy of this arithmetic,
 // including the still case, and a divergence there is a clip that previews one
 // frame and exports another.
+//
+// src_fps is where the clip's SPEED is decided, and it is a parameter for the
+// same reason the offsets are: the worker must not read a live clip.
+//
+// A clip plays at its OWN rate. src_fps is the rate pinned to the clip at
+// import; project_fps() is the timebase the timeline happens to be quantized to.
+// Those are different things, and the mapping used to conflate them -- it was
+// unconditionally 1:1, so a clip's speed WAS the project rate by definition. A
+// 30fps source on a 60fps timeline therefore played at double speed, with no
+// setting anywhere that said so, and changing the project rate retimed every
+// clip in the project.
+//
+// The timeline frame now advances through the source at src_fps/project_fps: a
+// 60fps timeline showing a 30fps source holds each source frame for two
+// timeline frames, and a 24fps timeline showing a 60fps source drops frames.
+// Both are conform -- the clip keeps its real-world speed, the timebase only
+// decides how finely it is sampled.
+//
+// Two deliberate exactness choices:
+//
+//   - src_fps <= 0 means UNPINNED, a project saved before the field existed. It
+//     resolves to the project rate, reproducing the historical 1:1 exactly, so
+//     old projects keep the speed they had rather than changing on load.
+//   - The rates-equal case returns through integer arithmetic and never touches
+//     a float. That is the overwhelmingly common path (a clip imported at the
+//     project's own rate) and it has to stay bit-exact: rounding it would put a
+//     wobble into every frame of every clip to accommodate a case that does not
+//     apply.
 clip_source_frame :: proc(
 	source_start, timeline_start, timeline_frame: i64,
 	still: bool,
+	src_fps: f64,
 ) -> i64 {
 	if still {
 		return source_start
 	}
-	return source_start + timeline_frame - timeline_start
+	off := timeline_frame - timeline_start
+	rate := src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	proj := project_fps()
+	if !(rate > 0) || !(proj > 0) || rate == proj {
+		return source_start + off
+	}
+	// Round, not truncate: truncation biases every frame one late, which at a
+	// non-integer ratio reads as the clip starting a fraction of a frame in and
+	// never catching up.
+	return source_start + i64(math.round(f64(off) * (rate / proj)))
 }
 
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
