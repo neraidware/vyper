@@ -1511,7 +1511,6 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	mix_exp: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	worst, worst_frame := f32(0), i64(-1)
 	first_bad := i64(-1)
-	exp_have := i64(0)
 	mixed_samples := i64(0)
 	for f in 0 ..< total_frames {
 		b0 := audio_frame_boundary48(f, fps)
@@ -1521,10 +1520,22 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 			fmt.printf("[ap] drift: playback hole at frame %d (%.2fs)\n", f, f64(f)/fps)
 			return false
 		}
-		for exp_have < b1 {
-			blk := min(AUDIO_MIX_BLOCK, b1 - exp_have)
-			render_mix_block(&render_mix, mix_exp[:], exp_have, int(blk))
-			exp_have += i64(blk)
+		// render_mix_block writes at `blk_lo - at` WITHIN the slice it is handed,
+		// and zeroes it first. So the slice must start at this block's offset
+		// inside the FRAME, not at the frame's own start -- handing it the whole
+		// buffer each time makes every block overwrite the previous one from
+		// offset 0, leaving only the last block and stale samples after it. That
+		// is what made the two sinks look like they differed by a factor of six:
+		// playback's frame was being compared against a buffer holding the wrong
+		// 512 samples.
+		for i in 0 ..< spf * 2 {
+			mix_exp[i] = 0
+		}
+		for blk_lo := b0; blk_lo < b1; {
+			blk := min(AUDIO_MIX_BLOCK, b1 - blk_lo)
+			off := int(blk_lo - b0)
+			render_mix_block(&render_mix, mix_exp[off * 2:], blk_lo, int(blk))
+			blk_lo += blk
 		}
 		mixed_samples += i64(spf)
 		if f == 0 {

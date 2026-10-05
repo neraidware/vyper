@@ -6004,63 +6004,55 @@ a truncated tail), and it **asserts** that two unity windows agree. That
 assertion is the point: previously the ratio's premise was invisible, and the
 only reason it held was the bug it was sitting next to.
 
-### S6b/S6c/S6d: drift measured; the clip-head divergence narrowed to mix ORIGIN
+### S6b/S6c/S6d: drift measured clean at 60; 29.97 still diverges
 
 `audio_probe_drift_parity` runs BOTH mixers continuously over a long span,
 compares every sample, and asserts the position invariant as a number rather than
 trusting it: the samples handed to the device must equal
 `audio_frame_boundary48(total_frames)`.
 
-**No drift, at any rate, over 600 s.** 28,800,000 samples mixed, 28,800,000
-required, delta 0 — identically at 60, at 30, and at **30000/1001** (29.97). That
-closes the S6b hole honestly: a frame there is 1601 or 1602 samples alternating
-forever, so per-frame rounding drifts while never showing a single-frame error.
+**Position invariant holds at every rate: 28,800,000 samples mixed against
+28,800,000 required, delta 0** over 600 s — at 60, at 30, and at 30000/1001. No
+accumulated drift, and 29.97's alternating 1601/1602 frames included. That is
+S6b's substance and it is closed.
 
 The fixture is 997 Hz deliberately: coprime with 60, with 30000/1001 and with
 48000, so a rounded boundary shows as phase error instead of cancelling over the
 window the way 440 or 1000 Hz would.
 
-**S6d, narrowed to where it can be finished.** At frame 0 of a single long clip
-the two sinks disagree, and it is NOT what the first reading suggested. Measured,
-in order:
+**Sample parity is clean at 60 and NOT at 29.97.** At 60 fps the two sinks are
+identical for the whole 600 s: `worst=0.000000`, no divergence. At 30000/1001
+they diverge from **frame 2** (0.07 s), worst 0.194 by frame 4739 — with the
+position invariant still exact, so it is a mixer-origin divergence, not drift.
 
-- Both fifo heads after mixing frame 0: `first48=800 have48=4096`, **identical**.
-- Both raw fifos, sample for sample: **identical**.
-  `[-0.05947876, -0.067596436, -0.07458496, -0.08029175, ...]` on both sides.
-- Mixed output at frame 0: `play[0]=0.0592` against `exp[0]=0.0099`.
+Getting there took three probe bugs, all of which read as product faults, and all
+three of the same shape: an instrument reporting on something other than what it
+claimed to measure.
 
-So the two decoders produce the same samples at the same labelled positions, and
-the divergence is entirely in **how each mixer maps a timeline sample to a ring
-index and a gain envelope**. It is about **5 samples (0.1 ms)**, not the 18 an
-earlier correlation fit suggested — that fit was against an all-zero export and
-should not have been trusted, which is the second time in this work that a
-correlation over a silent signal read as a measurement.
+- **The export's sources were never opened.** An unopened source contributes
+  nothing, indistinguishable from one that opened and hit a hole — so the probe
+  reported the export as silent at frame 0 and pointed at the mixer.
+- **Every export block overwrote the frame from offset 0.** `render_mix_block`
+  writes at `blk_lo - at` within the slice it is handed, so handing it the whole
+  frame buffer each time left only the last 512-sample block plus stale samples
+  after it. Playback's 800 samples were being compared against the wrong 512. This
+  is what produced the convincing "they differ by a factor of six throughout" —
+  `worst` in the middle of a frame, nowhere near a real divergence.
+- **A correlation fit against an all-zero signal** gave "18 samples", which was
+  read as a measurement. It was the first iteration winning against a signal with
+  no energy in it.
 
-**Two things this ruled out**, both of which looked like the answer:
+The pattern is worth more than the fixes: three times, a number that looked like a
+finding was an artefact of how the probe was wired. A correlation over silence,
+a buffer that was not the buffer, a source that was never opened. Each would have
+been very expensive to believe.
 
-- It is NOT float-vs-exact position arithmetic. `audio_frame_boundary48` already
-  delegates to `sample_pos_from_frames`, so both sinks compute frame boundaries
-  through the same exact integer path. They cannot disagree there.
-- It is NOT the `demand48 = max(demand48, s.first48)` clamp. That clamp IS a real
-  asymmetry -- playback silently mixes from the fifo head when the decoder lands
-  ahead, while the export calls the same condition a shortfall and silences the
-  span. But the export's counterpart branch provably does not fire here (`exp[0]`
-  moved only in the 5th decimal when it was changed to match), so it is not this
-  bug. The change was reverted rather than landed: an unverified asymmetry fix is
-  machinery for a problem that is not the one in front of us.
-
-**And the finding that reframes S6d.** The two sinks do not merely disagree at the
-clip head -- `worst` is at frame 143 with a delta of 0.163, while the head
-difference is only ~0.05. So they differ by a factor of roughly 6 THROUGHOUT the
-timeline, not by a 5-sample offset at the opening. The head is where the
-divergence becomes visible because that is where the signal is smallest, not
-where it starts. That is closer to a GAIN difference than a position difference,
-which is why the position-oriented hypotheses kept failing.
-
-Not yet root-caused. The next thing to measure is the per-source GAIN each sink
-applies -- `play_seg_gain_linear` on one side, `audio_gain_linear(&a.gain, rel)`
-on the other -- since a constant factor is what a dB/linear unit mismatch looks
-like.
+**Still open: 29.97 and 30 sample parity.** Not root-caused. Block boundaries
+(512) do not coincide with frame boundaries at any of these rates, but 60 is clean
+and 29.97 is not, so "blocks straddle frames" is not the whole of it. The next
+measurement is the per-source gain each sink applies — `play_seg_gain_linear`
+against `audio_gain_linear(&a.gain, rel)` — and then the per-block
+`blk_lo`/`want` derivation at a frame whose length alternates.
 
 `audio_drift_parity` stays OUT of `all` while it is red, for the reason
 `audio_mix_parity` was: a failing member gets disabled, and a check nobody runs
