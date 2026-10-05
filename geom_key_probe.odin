@@ -928,6 +928,59 @@ geom_key_probe_run :: proc() -> int {
 		)
 		editor_flags.auto_keyframe = false
 	}
+	// --- EVERY clip's box is CENTERED on its transform, whatever its kind.
+	//
+	// Text used to be the exception: clip_image_bounds returned its top-left
+	// directly, so the selection border, the handles and the hit-test all measured
+	// against a different anchor than every other source, and the export's
+	// render_text_blit had to reproduce that same top-left or the preview and the
+	// export disagreed about where one clip was. A keyframed text transform and a
+	// keyframed video transform animated around different points while reading the
+	// same two fields.
+	//
+	// Asserted on the box's OWN center against the transformed position, which is
+	// the property rather than a baked rectangle: it holds for any transform, any
+	// scale and any canvas, and it is exactly what was wrong.
+	{
+		canvas := probe_canvas()
+		kinds := [?]Media_Kind{.Video, .Text}
+		// Transform, position and scale chosen so the box is off-centre on the
+		// canvas at more than one size -- a box that happened to be centred could
+		// agree with a top-left implementation by coincidence.
+		cases := [3][3]f32{
+			{400, 300, 1.0},
+			{1200, 700, 2.5},
+			{960, 540, 0.4},
+		}
+		for &k in kinds {
+			for &c in cases {
+				cl := geom_key_fixture()
+				cl.kind = k
+				if k == .Text {
+					cl.generator = .Text
+				}
+				clip_geom_set(cl, .Trans_X, c[0])
+				clip_geom_set(cl, .Trans_Y, c[1])
+				clip_geom_set(cl, .Scale, c[2])
+				ib := clip_image_bounds(canvas, cl)
+				cx, cy := project_to_pixel(canvas, c[0], c[1])
+				label := fmt.tprintf("kind %d at (%.0f,%.0f) scale %.1f: box %vx%v", int(k), c[0], c[1], c[2], ib.width, ib.height)
+				render_kf_probe_check_near(
+					ib.x + ib.width / 2,
+					cx,
+					0.75,
+					fmt.tprintf("%s -- box center x %.2f, transform maps to %.2f", label, ib.x + ib.width/2, cx),
+				)
+				render_kf_probe_check_near(
+					ib.y + ib.height / 2,
+					cy,
+					0.75,
+					fmt.tprintf("%s -- box center y %.2f, transform maps to %.2f", label, ib.y + ib.height/2, cy),
+				)
+			}
+		}
+	}
+
 
 	// --- the bounds box follows the playhead. clip_image_bounds is what the
 	// selection border, the handles, and the hit-test all measure against,

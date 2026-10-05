@@ -1419,13 +1419,20 @@ Render_Sub_Src :: struct {
 	source_h:             c.int,
 }
 
-// sub_box_center is the box center a subtitle's cue text stays centered on:
-// the clip's top-left plus half its box, in output pixels. transform/scale come
-// in already SAMPLED, so the same proc serves an unkeyed clip (resting values)
-// and a keyed one (per-frame values) without either having its own center math.
+// sub_box_center is the point a subtitle's cue text stays centered on, in output
+// pixels. transform/scale come in already SAMPLED, so the same proc serves an
+// unkeyed clip (resting values) and a keyed one (per-frame values) without either
+// having its own center math.
+//
+// Subtitles are NOT on the center pivot and deliberately so: a cue's box grows
+// upward around a stable baseline (see update_subtitle_slot), so Trans_X/Y here is
+// the cue's top-left and this converts it to the center the blit wants. Text and
+// media moved to the center pivot; this path did not, because a center-pivoted
+// subtitle would float as its line count changes. Renaming it to say top-left
+// would be clearer still -- the name is the only thing here that lies.
 //
 // A clip with no measured source dims has no box to center, so it falls back to
-// the canvas center — the long-standing behavior for a subtitle whose dims have
+// the canvas center -- the long-standing behavior for a subtitle whose dims have
 // not been measured yet.
 sub_box_center :: proc(
 	geom: Geom_Sample,
@@ -4504,6 +4511,12 @@ render_text_blit :: proc(
 	text_buf: []u8,
 	bw: int,
 	ox, oy, ow, oh: int,
+	// tx, ty are the box CENTER, the same anchor every other source uses:
+	// video through cropped_box_edges, subtitles through sub_box_center. Text
+	// used to pass Trans_X/Y straight through as a top-left, which made it the
+	// only source whose stored transform meant something different from its
+	// siblings' -- so a keyframed text transform and a keyframed video transform
+	// animated around different points while reading the same two fields.
 	tx, ty, scale: f32,
 	opacity: f32,
 ) {
@@ -4523,11 +4536,11 @@ render_text_blit :: proc(
 	bh0 := f32(oh) * factor
 	w := bw0 * scale
 	h := bh0 * scale
-	x0 := tx
-	y0 := ty
 	if w <= 0 || h <= 0 {
 		return
 	}
+	x0 := tx - w / 2
+	y0 := ty - h / 2
 	left := max(c.int(x0), 0)
 	top := max(c.int(y0), 0)
 	right := min(c.int(x0 + w), draw_w)

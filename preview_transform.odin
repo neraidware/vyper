@@ -157,17 +157,27 @@ snap_transform :: proc(clip: ^Clip, margin: f32) {
 		f := clip.scale * PW / f32(PREVIEW_W)
 		w := f32(clip.source_w) * f
 		h := f32(clip.source_h) * f
-		left := clip.transform_x
-		top := clip.transform_y
+		// Half-extents from the CENTER, matching the video branch below: it
+		// snaps the center to +d_l / PW-d_r, and this branch was writing raw
+		// top-left values (0, PW-w) into a field that is now a center. The
+		// geometry is the same either way -- only the anchor moved.
+		d_l := w / 2
+		d_r := w / 2
+		d_t := h / 2
+		d_b := h / 2
+		left := clip.transform_x - d_l
+		right := clip.transform_x + d_r
+		top := clip.transform_y - d_t
+		bottom := clip.transform_y + d_b
 		if abs(left) <= margin {
-			clip.transform_x = 0
-		} else if abs(left + w - PW) <= margin {
-			clip.transform_x = PW - w
+			clip.transform_x = d_l
+		} else if abs(right - PW) <= margin {
+			clip.transform_x = PW - d_r
 		}
 		if abs(top) <= margin {
-			clip.transform_y = 0
-		} else if abs(top + h - PH) <= margin {
-			clip.transform_y = PH - h
+			clip.transform_y = d_t
+		} else if abs(bottom - PH) <= margin {
+			clip.transform_y = PH - d_b
 		}
 		return
 	}
@@ -454,21 +464,25 @@ clip_image_bounds_geom :: proc(
 	// dimensions (clip.source_w x source_h are TEXT pixels, not project units),
 	// which must map to screen with ONE uniform scale so the title never gets
 	// squished (an aspect probe through project resolution would scale x and y
-	// differently for any project that isn't 16:9). transform_x/y is the text's
-	// TOP-LEFT in project coords (the drag + scale math below is written for a
-	// top-left anchor), and the clip's scale multiplies the text's base pixel
-	// size so resizing via the handles works on the text's own bounding box.
+	// differently for any project that isn't 16:9).
+	//
+	// transform_x/y is the text's CENTER, exactly as it is for video and for
+	// subtitles. It used to be the text's top-left, which made text the one
+	// source whose two transform fields meant something its siblings' did not --
+	// so a keyframed text transform and a keyframed video transform animated
+	// around different points while reading the same fields, and every box the
+	// preview drew for text needed its own anchor arithmetic to compensate.
 	if kind == .Text && source_w > 0 && source_h > 0 {
 		f := v.width / f32(PREVIEW_W)
 		scale := geom[int(Render_Geom_Prop.Scale)]
 		w := f32(source_w) * f * scale
 		h := f32(source_h) * f * scale
-		tx, ty := project_to_pixel(
+		cx, cy := project_to_pixel(
 			canvas,
 			geom[int(Render_Geom_Prop.Trans_X)],
 			geom[int(Render_Geom_Prop.Trans_Y)],
 		)
-		return {x = tx, y = ty, width = w, height = h}
+		return {x = cx - w / 2, y = cy - h / 2, width = w, height = h}
 	}
 	cx, cy := project_to_pixel(
 		canvas,
@@ -987,11 +1001,13 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 	}
 	h := handle_drag.handle.?
 
-	// Text clips use a different transform model than video: transform_x/y is
-	// the text's TOP-LEFT corner (in project units), not its center, and the box
-	// size is the text's base pixel extent scaled by clip.scale (in project
-	// units). The video math below anchors the transform as the center, so text
-	// scales through its own top-left-anchored math. No cropping for text.
+	// Text clips need their own box SIZE, not their own pivot: clip.source_w/h are
+	// TEXT pixels, so the box is the text's base extent mapped through one uniform
+	// project factor, where the video path below uses full_box_dims on real source
+	// pixels. The PIVOT, though, is the same center every other source uses, so the
+	// edges below are derived from the center and the writes store the center.
+	// This branch used to be top-left anchored as well, which is why it had its own
+	// center0 math to undo the difference.
 	if clip.kind == .Text {
 		switch handle_drag.kind {
 		case .None, .Crop:
@@ -1015,10 +1031,10 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 		scale0 := handle_drag.start_scale
 		tx0 := handle_drag.start_tx
 		ty0 := handle_drag.start_ty
-		left0 := tx0
-		right0 := tx0 + bw0 * scale0
-		top0 := ty0
-		bottom0 := ty0 + bh0 * scale0
+		left0 := tx0 - bw0 * scale0 / 2
+		right0 := tx0 + bw0 * scale0 / 2
+		top0 := ty0 - bh0 * scale0 / 2
+		bottom0 := ty0 + bh0 * scale0 / 2
 		pmx, pmy := pixel_to_project_unclamped(canvas, mx, my)
 		if handle_drag_frozen(clip, h, pmx, pmy, snap_margin(canvas, SNAP_MARGIN_PX)) {
 			return
@@ -1031,8 +1047,8 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			w := bw0 * s
 			h := bh0 * s
 			clip.scale = clamp(s, 0.05, 100.0)
-			clip.transform_x = cpx - w / 2
-			clip.transform_y = cpy - h / 2
+			clip.transform_x = cpx
+			clip.transform_y = cpy
 			return
 		}
 
@@ -1131,8 +1147,9 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 			ty = top0
 		}
 		clip.scale = clamp(s, 0.05, 100.0)
-		clip.transform_x = tx
-		clip.transform_y = ty
+		// tx/ty are the dragged box's top-left; the transform stores its center.
+		clip.transform_x = tx + new_w / 2
+		clip.transform_y = ty + new_h / 2
 		if is_corner(h) {
 			dtx, dty, snapped := corner_snap_both(
 				h,

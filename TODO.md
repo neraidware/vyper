@@ -5521,3 +5521,54 @@ count).
 
 **Accept.** `check build keyframe_probe geom_key_probe render_kf_probe parity
 parity_valgrind` pass.
+
+- [x] Active 25 — Text transformed about its top-left while everything else used its center
+
+  **Why:** `Trans_X`/`Trans_Y` meant two different things. Video and images read
+  them as the box CENTER (`cropped_box_edges(cx, cy, ...)`, shared by preview and
+  export). Text read them as the box TOP-LEFT, in three places at once:
+  `clip_image_bounds_geom`'s text branch returned `{x = tx, y = ty}`;
+  `render_text_blit` took them as `x0`/`y0`; and `update_handle_drag` had a whole
+  separate top-left-anchored branch that existed only to undo the difference.
+  Subtitles are a third case again — see below.
+
+  So a keyframed text transform and a keyframed video transform animated around
+  DIFFERENT POINTS while reading the SAME TWO FIELDS, and the preview's selection
+  border, handles and hit-test measured against a different anchor than the export
+  drew with. Nothing caught it because preview and export were consistent with each
+  other in the wrong way: every gate compares them against each other, so a shared
+  wrong anchor passes all of them.
+
+  **Fix — a deletion, not an addition.** Text no longer has its own pivot. Its box
+  is derived from the center like every other source, and `update_handle_drag`'s
+  text branch keeps its own box SIZE arithmetic (clip.source_w/h are TEXT pixels,
+  so the box needs one uniform project factor where the video path uses
+  `full_box_dims` on real source pixels) but writes the center. The snap-to-edge
+  branch got the same treatment: it was writing raw top-left values `0` / `PW-w`
+  into a field that is now a center, which is why it is compared against
+  `d_l`/`PW-d_r` now, like the video branch below it.
+
+  **Subtitles deliberately did NOT move.** `update_subtitle_slot` documents the
+  intent: "keep the box CENTER in x and the box BOTTOM EDGE in y fixed… subtitles
+  grow upward around a stable baseline". A cue's box therefore grows around its
+  baseline as line count changes, which is typographically right and is NOT the
+  center pivot. `sub_box_center` stays the top-left-to-center conversion it always
+  was. Changing it was my first attempt here and it was wrong: it made the export
+  center-pivoted while the slot updater still wrote top-left, so subtitles would
+  have drifted by half a box on every re-anchor. The name still lies — it returns
+  a center, but the fields under it are a top-left — and that is now noted in the
+  comment rather than left for the next reader to trip over.
+
+  **Probe.** `geom_key_probe` asserts the box's own center against the transformed
+  clip position, for video AND text, at three (position, scale) pairs chosen so the
+  box is off-centre at more than one size. Asserting the property rather than a
+  baked rectangle keeps it true for any transform. Mutation: reverting the text
+  branch to top-left is caught with the numbers —
+  `box center x 2800.00, transform maps to 400.00`.
+
+  No backwards compatibility: an existing text clip moves up-left by half its box,
+  which is the price of one anchor for one field.
+
+  Gates: check build parity subtitle_probe transform_probe render_kf_probe
+  audio_probe keyed_export timeline_probe geom_key_probe keyframe_probe
+  yuv_exact opacity zorder probe smoke render_live_probe render_valgrind valgrind.
