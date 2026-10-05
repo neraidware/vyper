@@ -2832,7 +2832,9 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 		),
 	)
 	// Preroll: seek EARLY and decode forward, exactly as playback's
-	// audio_src_seek_anchor does.
+	// audio_src_seek_anchor does, and through the same proc -- decode_from_content.
+	// Both of them used to clamp that seek to zero, which is what pinned the
+	// export a whole packet after every clip's first sample.
 	//
 	// Seeking to the asked position and then labelling the fifo with wherever the
 	// decoder landed fixes the LABEL but not the CONTENT, and the export had only
@@ -2845,10 +2847,7 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 	// The label still comes from the decoder's real landing PTS rather than the
 	// asked time: labelling with the asked time compounds the seek's error over the
 	// whole render (playground's audio_provision fix, same reason).
-	if !seek_audio(&a.dec, max(0.0, f64(content)/f64(RENDER_AUDIO_RATE) - AUDIO_SEEK_PREROLL_SEC)) {
-		return false
-	}
-	n := decode_audio_chunk(&a.dec, -1.0)
+	n := decode_from_content(&a.dec, content)
 	if n <= 0 {
 		return false
 	}

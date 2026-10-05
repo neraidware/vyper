@@ -42,6 +42,19 @@ Audio_Clip_Decoder :: struct {
 	// recent decode_audio_chunk call, used to relabel the fifo base after a seek.
 	first_ts: i64,
 	have_first: bool,
+	// cursor_ts is the content position of the NEXT sample this decoder will emit,
+	// and have_cursor says whether it is known yet. It is invalidated by a seek
+	// (flush_buffers makes the next frame's position unknowable until it is read)
+	// and re-established from that frame.
+	//
+	// This exists because a seek lands on a PACKET BOUNDARY, not on the position
+	// asked for: seeking to 0 in a file whose first packet is pts=-1024 carrying
+	// skip_samples=1024 measures first_ts=1024, so content samples 0..1023 are
+	// unreachable by asking for 0. Every consumer that took the decoder's landing
+	// point at face value therefore began 1024 samples (21.3ms) late -- the export
+	// on every clip, playback on the first. See audio_probe_priming_trace.
+	cursor_ts: i64,
+	have_cursor: bool,
 
 	// Interleaved S16 scratch written by swr for one chunk.
 	s16: []i16,
@@ -212,6 +225,49 @@ audio_to_stream_ts :: proc(dec: ^Audio_Clip_Decoder, seconds: f64) -> c.int64_t 
 }
 
 // seek_audio seeks the input to (at or before) the given timeline seconds.
+// decode_from_content decodes so that the returned chunk BEGINS exactly at
+// `content_sample`, a sample position in the decoder's output rate.
+//
+// This is the one place a clip's opening is established, because getting it
+// wrong is silent and costs a visible amount of audio: a seek lands on a PACKET
+// BOUNDARY, not on the position asked for. Measured on the AAC fixture (see
+// audio_probe_priming_trace): seeking to 0 lands at 1024, so content samples
+// 0..1023 are unreachable by asking for 0 -- and that is what the export was
+// logging as "preroll could not cover it" while mixing a gap into the file at
+// every cut, while playback silently dropped the first frame of the first clip.
+//
+// Two halves, and both are needed:
+//
+//   - Seek BEFORE the ask, by the preroll, and NEVER clamp to zero. Clamping is
+//     what made this unrecoverable: for content 0 it pins the seek to 0, which
+//     lands after content 0, and the samples in between are gone rather than
+//     merely mislabelled. A file whose muxer wrote an encoder delay has a
+//     negative-pts first packet precisely so this seek is possible.
+//   - Then let decode_audio_chunk TRIM to the ask. Seeking early can land before
+//     the target (the usual case, and harmless) or at it.
+//
+// Returns the number of output samples, 0 on failure.
+decode_from_content :: proc(dec: ^Audio_Clip_Decoder, content_sample: i64) -> int {
+	sec := f64(content_sample) / f64(dec.out_rate)
+	// Seek ONLY to skip ahead. Near the start of the stream there is nothing to
+	// skip to, and a freshly opened decoder already sits at the beginning -- which
+	// is the only position from which content 0 is reachable at all.
+	//
+	// It is tempting to seek to (sec - preroll) unconditionally and let ffmpeg
+	// clamp it, and that was the bug: with the preroll clamped to zero the seek
+	// for content 0 pinned to 0 and landed a packet LATE, putting content 0
+	// behind the playhead. Seeking genuinely negative is worse, not better --
+	// measured, seeking to -0.5s lands at +2048 rather than at the file's first
+	// packet (-1024), because there is no index entry below it. So the early case
+	// takes no seek, and the late case overshoots by the preroll as before.
+	if sec > AUDIO_SEEK_PREROLL_SEC {
+		if !seek_audio(dec, sec - AUDIO_SEEK_PREROLL_SEC) {
+			return 0
+		}
+	}
+	return decode_audio_chunk(dec, sec)
+}
+
 seek_audio :: proc(dec: ^Audio_Clip_Decoder, seconds: f64) -> bool {
 	ts := audio_to_stream_ts(dec, seconds)
 	if ret := avfmt.seek_frame(dec.fmt_ctx, dec.audio_idx, ts, avfmt.SeekFlags{.Backward}); ret < 0 {
@@ -220,6 +276,7 @@ seek_audio :: proc(dec: ^Audio_Clip_Decoder, seconds: f64) -> bool {
 	}
 	avcodec.flush_buffers(dec.dec_ctx)
 	dec.have_last = false
+	dec.have_cursor = false
 	return true
 }
 
@@ -238,19 +295,38 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 	dec.have_first = false
 	sequential := at_seconds < 0
 	dbg_first := !dec.have_last
+	target_ts := i64(0)
+	// How many output samples must be discarded before this chunk begins at
+	// at_seconds. See decode_from_content for why a seek cannot be trusted to
+	// land where it was asked to. Zero in sequential mode, which is the only
+	// mode where the decoder's own position is authoritative.
+	skip := 0
 	if !sequential {
-		target_ts := audio_to_stream_ts(dec, at_seconds)
+		target_ts = i64(audio_to_stream_ts(dec, at_seconds))
 		if dec.have_last && target_ts < dec.last_ts {
 			last_sec := f64(avutil.rescale_q(dec.last_ts, dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
 			if audio_rpt.trace && audio_rpt.dbg_budget > 0 {
 				fmt.printf("[adbg] re-seek back: asked=%.3fs last_pts=%.3fs delta=%+.3fs\n", at_seconds, last_sec, at_seconds - last_sec)
 				audio_rpt.dbg_budget -= 1
 			}
-			if !seek_audio(dec, at_seconds) {
+			// Overshoot backward by the preroll and let the trim below land on the
+			// ask, exactly as decode_from_content does. Seeking straight to at_seconds
+			// lands a packet late, which reads as "the target is in the past" and
+			// silently drops the audio in between.
+			if !seek_audio(dec, at_seconds - AUDIO_SEEK_PREROLL_SEC) {
 				return 0
 			}
+			dec.have_cursor = false
+			skip = 0
 		}
 	}
+	if !sequential && dec.have_cursor {
+		skip = int(dec.cursor_ts - target_ts)
+		if skip < 0 {
+			skip = 0
+		}
+	}
+
 	out_planes: [1][^]u8
 	out_count := c.int(AUDIO_CHUNK)
 	produced := 0
@@ -287,16 +363,76 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 				&in_planes[0], dec.frame.nb_samples,
 			)
 			frame_ts_at_decode := dec.frame.best_effort_timestamp
+			if frame_ts_at_decode == avutil.AV_NOPTS_VALUE {
+				// A frame with no position cannot advance a cursor and cannot be
+				// trimmed against one. Sequential decoding is the only mode in which
+				// that is acceptable, and there `skip` is 0, so relabelling keeps
+				// working; asking for a position is not something we can honour.
+				assert(
+					sequential,
+					"decode_audio_chunk: unpositioned frame while seeking to a specific sample",
+				)
+				frame_ts_at_decode = dec.cursor_ts
+			}
+			// `pos` is the absolute content position of the output sample this frame
+			// is about to write, so the cursor stays a single number across the
+			// whole chunk whether or not a trim is in play.
+			pos := dec.cursor_ts
+			if !dec.have_cursor {
+				pos = frame_ts_at_decode
+				dec.cursor_ts = pos
+				dec.have_cursor = true
+				// The seek landed at the frame, not at the ask, so the trim can only
+				// be sized now that the landing point is known. This is the case
+				// that matters: measured, seeking to 0 lands at 1024.
+				if !sequential {
+					skip = int(pos - target_ts)
+					if skip < 0 {
+						skip = 0
+					}
+				}
+			}
+			// Trim the OUTPUT, not the input. The resampler has already been fed
+			// this frame and its filter state has to stay continuous, so the padding
+			// is dropped by sliding the freshly converted tail back over it. Only
+			// the first chunk after a seek can have skip > 0.
+			dropped := 0
+			if skip > 0 && n > 0 {
+				dropped = min(skip, int(n))
+				ch := int(dec.out_channels)
+				bsz := size_of(i16)
+				tail := int(n) - dropped
+				if tail > 0 {
+					mem.copy(
+						raw_data(dec.s16)[produced * ch * bsz:],
+						raw_data(dec.s16)[(produced + dropped) * ch * bsz:],
+						tail * ch * bsz,
+					)
+				}
+				n -= c.int(dropped)
+				skip -= dropped
+			}
+			// The kept samples begin after whatever was dropped, so that -- not the
+			// frame's own timestamp -- is where the fifo has to be labelled from.
+			kept_start := pos + i64(dropped)
 			if !dec.have_first {
-				dec.first_ts = frame_ts_at_decode
+				dec.first_ts = kept_start
 				dec.have_first = true
 			}
 			avutil.frame_unref(dec.frame)
 			if n <= 0 {
+				if dropped > 0 {
+					// The trim consumed this entire frame -- which is the common
+					// case, because a seek lands one packet late and that packet is
+					// exactly what had to go. Returning here would report "no audio"
+					// for a decoder that has plenty, so pull the next frame instead.
+					continue
+				}
 				return produced
 			}
 			dec.last_ts = frame_ts_at_decode
 			dec.have_last = true
+			dec.cursor_ts = pos + i64(int(n))
 			if audio_rpt.trace && dbg_first && audio_rpt.dbg_budget > 0 {
 				pts_sec := f64(avutil.rescale_q(frame_ts_at_decode, dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
 				fmt.printf("[adbg] first frame after seek: asked=%.3fs pts=%.3fs delta=%+.3fs\n", at_seconds, pts_sec, pts_sec - at_seconds)
@@ -1540,10 +1676,10 @@ audio_src_open :: proc(s: ^Play_Src, content_sec: f64) -> bool {
 // offset every frame and drift the content against the playhead (reads as
 // half-speed), while not seeking early enough leaves the segment head silent.
 audio_src_seek_anchor :: proc(s: ^Play_Src, content_sec: f64) -> bool {
-	if !seek_audio(&s.dec, max(f64(0), content_sec - AUDIO_SEEK_PREROLL_SEC)) {
-		return false
-	}
-	n := decode_audio_chunk(&s.dec, content_sec)
+	// One proc for the opening, shared with the export. This used to clamp the
+	// preroll seek to zero and then take whatever the decoder landed on, which
+	// silently dropped the first frame of the first clip.
+	n := decode_from_content(&s.dec, i64(content_sec * f64(s.dec.out_rate)))
 	if n <= 0 {
 		return false
 	}

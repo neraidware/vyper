@@ -463,7 +463,29 @@ audio_probe_mix_peak :: proc(mix: []f32, start: i64, frames: i64, fps: f64) -> f
 // the stale unity value, proving the segment gains were rewritten in place.
 audio_probe_live_gain_check :: proc() -> bool {
 	fps := timeline_fps()
-	gain_frames := i64(120)
+	// Both measured windows must sit in the clip's STEADY state, and one of them
+	// must be a unity window the fold can be divided by.
+	//
+	// Measuring the unity window at the very start of the clip only worked while
+	// the clip's opening was missing: a decoder that lands a packet late drops the
+	// encoder's first frame, and that frame is where the transient lives. Once
+	// decode_from_content made content 0 reachable, window [0,120) contained a
+	// transient that [120,240) does not, the two peaks stopped being equal, and the
+	// ratio came out 0.083 instead of 0.100 -- the test was measuring the
+	// fixture's start, not the fold.
+	//
+	// WARMUP_FRAMES gets past that transient, and the two unity windows then
+	// establish stationarity as an ASSERTED precondition, so a fixture that stops
+	// being stationary fails loudly instead of yielding a meaningless ratio.
+	//
+	// The fixture's audio occupies frames [0,200) -- two 100-frame clips -- and is
+	// SILENCE after that, so every window has to live inside it or the "peak" is
+	// measured off a truncated tail. Windows therefore sit in the second clip,
+	// clear of its start transient: 110..130 and 130..150 at unity, 150..170 after
+	// the fold. Any window of a full sine period contains that sine's peak, so the
+	// three windows are directly comparable.
+	WARMUP_FRAMES := i64(110)
+	GAIN_WINDOW := i64(20)
 	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	// Previous checks leave every clip at -20 dB. Restore unity (and commit)
 	// first so the drag below is a real 0 -> -20 transition the commit must
@@ -478,7 +500,18 @@ audio_probe_live_gain_check :: proc() -> bool {
 	audio_geometry_commit()
 	audio_reset_play()
 	audio_provision(0)
-	peak_unity := audio_probe_mix_peak(mix[:], 0, gain_frames, fps)
+	audio_probe_mix_peak(mix[:], 0, WARMUP_FRAMES, fps)
+	unity_a := audio_probe_mix_peak(mix[:], WARMUP_FRAMES, GAIN_WINDOW, fps)
+	unity_b := audio_probe_mix_peak(mix[:], WARMUP_FRAMES + GAIN_WINDOW, GAIN_WINDOW, fps)
+	peak_unity := unity_b
+	if math.abs(unity_a - unity_b) > 0.001 {
+		fmt.printf(
+			"[ap] fold: unity windows differ (%.5f vs %.5f); the fixture is not stationary here, so a gain ratio would mean nothing\n",
+			unity_a,
+			unity_b,
+		)
+		return false
+	}
 	for ti in 0 ..< len(timeline.tracks) {
 		for &c in timeline.tracks[ti].clips {
 			if c.kind == .Audio {
@@ -494,7 +527,12 @@ audio_probe_live_gain_check :: proc() -> bool {
 	}
 	audio_gain_fold(&audio_geom_state.slots[sync.atomic_load(&audio_geom_state.idx)])
 	audio_geom_state.gain_folded_epoch = sync.atomic_load(&audio_geom_state.gain_epoch)
-	peak_live := audio_probe_mix_peak(mix[:], gain_frames, gain_frames, fps)
+	peak_live := audio_probe_mix_peak(
+		mix[:],
+		WARMUP_FRAMES + 2 * GAIN_WINDOW,
+		GAIN_WINDOW,
+		fps,
+	)
 	expected := db_to_linear(-20)
 	ratio := peak_unity > 0 ? peak_live / peak_unity : 0
 	fmt.printf(
@@ -1296,6 +1334,50 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 // the same range -- audio_mix_frame for the frame, render_mix_block for
 // [frame_start, frame_end) -- and compares the buffers. Same input, same numbers,
 // one pipeline to change later.
+// audio_probe_priming_trace opens `path` exactly as render_audio_open does and
+// prints the first few decoded frames with their content positions. It answers
+// "where does the decoder actually land, and why" for a source whose muxer wrote
+// an encoder delay (AAC's first packet is pts=-1024 carrying skip_samples=1024).
+// Read-only: it mutates no application state and is not part of `audio_probe`.
+audio_probe_priming_trace :: proc(path: string) -> bool {
+	// Same NUL-terminated conversion audio_probe_declick_check uses: the decoder
+	// wants a cstring and the env var gives us a string.
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	// For each ask, report where the seek to (ask - preroll) actually lands and
+	// where decode_from_content then says the content begins. The gap between
+	// those two numbers is the whole defect, so print both.
+	asks := []i64{0, 1024, 4096, 24000}
+	for _, ask in asks {
+		dec: Audio_Clip_Decoder
+		if !open_audio_decoder_resampled(&dec, cpath, 0, 48000, 2) {
+			fmt.println("[ap] priming: could not open", path)
+			return false
+		}
+		seek_sec := f64(ask)/f64(dec.out_rate) - AUDIO_SEEK_PREROLL_SEC
+		seek_ok := seek_audio(&dec, seek_sec)
+		n := decode_audio_chunk(&dec, f64(ask)/f64(dec.out_rate))
+		landed := i64(-1)
+		if dec.have_first {
+			landed = i64(decoder_pts_sample(dec.first_ts, dec.stream.time_base))
+		}
+		fmt.printf(
+			"[ap] priming: ask=%6d seek=%+8.3fs ok=%v landed=%6d n=%5d content_begins=%6d\n",
+			int(ask), seek_sec, seek_ok, int(landed), n,
+			int(landed) + n,
+		)
+		audio_decoder_reset(&dec)
+	}
+	return true
+}
+
 audio_probe_mix_parity :: proc(path: string) -> bool {
 	fps := timeline_fps()
 	if fps <= 0 {

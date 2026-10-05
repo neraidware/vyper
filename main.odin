@@ -1918,6 +1918,15 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		flash_probe_run(fp)
 		return
 	}
+	// Characterisation only: opens a file and reports where the decoder lands
+	// after a seek, which is how Active 30 S4's "why" got answered (the muxer
+	// writes AAC's encoder delay as pts=-1024 + skip_samples=1024 on packet 0,
+	// and the decoder's landing point after seeking to 0 decides whether content
+	// 0 is reachable at all).
+	if pt, _ := os.lookup_env_alloc("VYPER_AUDIO_PRIMING_TRACE", context.temp_allocator); pt != "" {
+		ok: bool = audio_probe_priming_trace(pt)
+		os.exit(ok ? 0 : 1)
+	}
 	// Standalone, and NOT dispatched from audio_probe: this one currently FAILS,
 	// which is the finding rather than a nuisance (see TODO.md Active 30 S2). It has
 	// its own gate target so the failure is named and runnable instead of either
