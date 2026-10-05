@@ -361,12 +361,10 @@ create_gpu_renderer :: proc(device: ^sdl.GPUDevice, format: sdl.GPUTextureFormat
 	}
 	defer sdl.ReleaseGPUShader(device, vertex_shader)
 	defer sdl.ReleaseGPUShader(device, fragment_shader)
-	blend := sdl.GPUColorTargetBlendState{
-		src_color_blendfactor = .SRC_ALPHA, dst_color_blendfactor = .ONE_MINUS_SRC_ALPHA, color_blend_op = .ADD,
-		src_alpha_blendfactor = .ONE, dst_alpha_blendfactor = .ONE_MINUS_SRC_ALPHA, alpha_blend_op = .ADD,
-		color_write_mask = {.R, .G, .B, .A}, enable_blend = true, enable_color_write_mask = true,
+	target := sdl.GPUColorTargetDescription{
+		format = format,
+		blend_state = gpu_straight_alpha_blend(),
 	}
-	target := sdl.GPUColorTargetDescription{format = format, blend_state = blend}
 	pipeline_info := sdl.GPUGraphicsPipelineCreateInfo{
 		vertex_shader = vertex_shader, fragment_shader = fragment_shader,
 		primitive_type = .TRIANGLELIST,
@@ -593,4 +591,30 @@ upload_icons :: proc(renderer: ^GPU_Renderer, command_buffer: ^sdl.GPUCommandBuf
 		renderer.icon_textures[id] = texture
 	}
 	return true
+}
+
+// gpu_straight_alpha_blend is the ONE blend state every alpha-composited target
+// uses: straight alpha, out = src*a + dst*(1-a), matching blend_row on the CPU
+// and blend_pixel_rgb inside render_text_blit.
+//
+// It was spelled out twice — here for the preview's pipelines and in
+// render_gpu.odin for the export's composite canvas — and the export's copy
+// carries a comment about the write mask defaulting to zero "to mirror the
+// preview's target state", which is a statement that the two must agree. A
+// comment asserting an invariant is not the invariant; this is.
+//
+// The write mask is not optional: with blending enabled SDL defaults it to zero,
+// so a target that blends without it draws into nothing.
+gpu_straight_alpha_blend :: proc() -> sdl.GPUColorTargetBlendState {
+	return {
+		src_color_blendfactor  = .SRC_ALPHA,
+		dst_color_blendfactor  = .ONE_MINUS_SRC_ALPHA,
+		color_blend_op         = .ADD,
+		src_alpha_blendfactor  = .ONE,
+		dst_alpha_blendfactor  = .ONE_MINUS_SRC_ALPHA,
+		alpha_blend_op         = .ADD,
+		color_write_mask       = {.R, .G, .B, .A},
+		enable_blend           = true,
+		enable_color_write_mask = true,
+	}
 }

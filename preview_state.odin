@@ -540,7 +540,8 @@ slot.is_text = true
 				// clip whose scale is keyed — visibly soft, and re-baked only when
 				// the title changes. The two have to come from the same frame or the
 				// raster and the box it fills disagree about what scale means.
-				font_px := f32(TEXT_CLIP_FONT_PIXELS) * slot.geom[int(Render_Geom_Prop.Scale)]
+				text_scale := slot.geom[int(Render_Geom_Prop.Scale)]
+				font_px := text_font_px_for(text_scale)
 				// The box is ink WIDTH x metric BOX HEIGHT: width is the tight
 				// ink (single line, so it hugs the text); height is the font's
 				// typographic line box at 48 (ascent + descent + TEXT_BOX_PAD
@@ -585,7 +586,7 @@ slot.is_text = true
 					clip.source_h = c.int(base_bh)
 					slot.source_h = c.int(base_bh)
 				}
-				if base_changed || stale_box || slot.text_font_px != font_px {
+				if base_changed || stale_box || text_font_needs_rebake(slot.text_font_px, text_scale) {
 					// Re-render at the baked font (48*scale) for the texture.
 					slot.text_font_px = font_px
 					scratch := text_buf_ensure(&slot.text_scratch, text_scratch_size_for(font_px))
@@ -653,11 +654,12 @@ slot.is_text = true
 				active_interaction == .Playhead_Scrub &&
 				playback.scrub_tick % SCRUB_DECIMATION != 0 &&
 				!async_has_worker(slot_idx)
-			clip_frame := clip.source_start_frame + req - clip.timeline_start_frame
-			if clip.is_still {
-				// A still has one source frame: hold it for the whole clip span.
-				clip_frame = clip.source_start_frame
-			}
+			clip_frame := clip_source_frame(
+				clip.source_start_frame,
+				clip.timeline_start_frame,
+				req,
+				clip.is_still,
+			)
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
 			// the background builder lands more segments, so the frame the
 			// decoder serves may switch files (segment N -> source, or N -> N+1)
@@ -966,8 +968,8 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 	// is the same "baked, not sampled" quantity — it just has to be baked at the
 	// scale being drawn.
 	scale := slot.geom[int(Render_Geom_Prop.Scale)]
-	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
-	if cue_changed || slot.text_font_px != font_px {
+	font_px := text_font_px_for(scale)
+	if cue_changed || text_font_needs_rebake(slot.text_font_px, scale) {
 		// Split the cue text into lines once and reuse for both the base
 		// measure and the baked raster. Temp arena: event-driven (cue/font
 		// change), and the frame's free_all reclaims it either way.

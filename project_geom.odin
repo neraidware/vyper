@@ -111,3 +111,39 @@ crop_src_rect :: proc(fw, fh: int, crop_l, crop_r, crop_t, crop_b: f32) -> Crop_
 	r.h = clamp(int(fh32 * (1.0 - crop_t - crop_b) + 0.5), 1, fh - r.y)
 	return r
 }
+
+// text_pixels_to_project is the uniform factor mapping TEXT pixels to project
+// units, given the canvas width `pw`.
+//
+// One factor for both axes on purpose: text is rasterized into a buffer sized to
+// the ink, and letting x and y scale independently would stretch the glyphs
+// whenever the project's aspect differs from 16:9. Both sinks derive their text
+// box through here so a text clip's box is the same shape in the preview and in
+// the export; they used to spell `f32(w) / f32(PREVIEW_W)` out at six sites,
+// and the preview's own copy disagreed with the export's about the HEIGHT in
+// particular (preview used the font's metric line box, export the tight ink
+// rect, which are different quantities).
+//
+// `pw` is the canvas width in whichever space the caller is working in — the
+// preview's letterboxed view, or the export's output width — because the factor
+// is "canvas pixels per PREVIEW_W project pixels" in both cases.
+text_pixels_to_project :: proc(text_px: f32, pw: f32) -> f32 {
+	return text_px * pw / f32(PREVIEW_W)
+}
+
+// text_box_dims is a text clip's box size in project units from its BASE ink
+// dims at font 48 and the clip's SAMPLED scale.
+//
+// `base_w` is the tight ink width and `base_h` the font's metric line-box height
+// (ascent + descent + TEXT_BOX_PAD), both at font 48 and scale-independent —
+// which is what clip.source_w/source_h carry. `scale` is the sampled Scale lane,
+// not the clip's resting field, so a keyed scale produces the box it previews.
+//
+// Both sinks call this rather than multiplying the dims themselves: the export
+// used to scale its raster's MEASURED ink rect instead of these base dims, so
+// the two boxes differed by however much air the metric box carries around the
+// ink. Passing the base dims is what makes them one box.
+text_box_dims :: proc(base_w, base_h: c.int, scale, pw: f32) -> (f32, f32) {
+	f := text_pixels_to_project(1, pw)
+	return f32(base_w) * f * scale, f32(base_h) * f * scale
+}

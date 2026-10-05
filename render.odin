@@ -1024,7 +1024,7 @@ render_geom_snap_fill :: proc(snap: ^Render_Geom_Snap, clip: ^Clip) {
 // property added to the enum is present here without a second hand-written
 // list to drift. Preview fills it live from the clip (geom_sample_clip); export
 // fills it from the job's flat keyframe snapshot (geom_sample_flat). Both read
-// the SAME resting base (geom_resting_value / the exported resting fields) and
+// the SAME resting base (clip_geom_resting, which both sides call) and
 // the SAME evaluator per source.
 //
 // The claim this shape used to make but could not keep was that "preview shows
@@ -1038,32 +1038,6 @@ render_geom_snap_fill :: proc(snap: ^Render_Geom_Snap, clip: ^Clip) {
 // carrier rather than to a clip kind.
 Geom_Sample :: [int(Render_Geom_Prop._COUNT)]f32
 
-// geom_resting_value is a clip's resting (un-keyed) value for one geometry
-// property — the base a lane samples against when it has no covering key.
-geom_resting_value :: proc(clip: ^Clip, p: Render_Geom_Prop) -> f32 {
-	switch p {
-	case .Trans_X:
-		return clip.transform_x
-	case .Trans_Y:
-		return clip.transform_y
-	case .Scale:
-		return clip.scale
-	case .Crop_L:
-		return clip.crop_l
-	case .Crop_R:
-		return clip.crop_r
-	case .Crop_T:
-		return clip.crop_t
-	case .Crop_B:
-		return clip.crop_b
-	case .Opacity:
-		return clip.opacity
-	case ._COUNT:
-		unreachable()
-	}
-	return 0
-}
-
 // geom_sample_clip evaluates every animated geometry property of a LIVE clip at
 // a timeline frame. UI-thread only (reads the clip's tracks); this is the one
 // evaluator the preview uses, and the flat export sampler mirrors it key for
@@ -1072,7 +1046,7 @@ geom_sample_clip :: proc(clip: ^Clip, timeline_frame: i64) -> Geom_Sample {
 	s: Geom_Sample
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		p := Render_Geom_Prop(pi)
-		s[pi], _ = kf_geom_sample_lane(clip, render_geom_name(p), timeline_frame, geom_resting_value(clip, p))
+		s[pi], _ = kf_geom_sample_lane(clip, render_geom_name(p), timeline_frame, clip_geom_resting(clip, p))
 	}
 	return s
 }
@@ -1097,7 +1071,7 @@ geom_clear_crop :: proc(s: ^Geom_Sample) {
 geom_sample_resting :: proc(clip: ^Clip) -> Geom_Sample {
 	s: Geom_Sample
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
-		s[pi] = geom_resting_value(clip, Render_Geom_Prop(pi))
+		s[pi] = clip_geom_resting(clip, Render_Geom_Prop(pi))
 	}
 	return s
 }
@@ -1230,26 +1204,20 @@ render_text_font: Render_Text_Font
 // was last drawn at. Baking scale into the raster (font = 48*scale) is what
 // keeps the output crisp, and it means the raster is CACHED STATE rather than a
 // sampled value — so an animated scale has to re-bake it, exactly as the
-// preview re-bakes on its text_font_px change. blit_scale stays 1 so the box
-// falls out of the tight dims times the uniform factor, with no double-scaling.
+// preview re-bakes on its text_font_px change.
+//
+// No blit_scale: the box comes from the clip's BASE dims through the shared
+// text_box_dims with the sampled scale (render_text_blit), so the ink carrying
+// the scale and the box applying it cannot drift into a double-scaling.
 Render_Text_Job :: struct {
 	raster:         []u8,
 	bw:             int, // raster row stride
 	ox, oy, ow, oh: int, // tight ink rect in raster
-	blit_scale:     f32,
 	// font_px is the baked font size, i.e. the scale this raster's RESOLUTION
 	// corresponds to. The per-frame gate compares the sampled scale's font
 	// against it to decide whether a re-bake is owed.
 	font_px: f32,
 }
-
-// TEXT_REBAKE_EPS: how far a clip's scale may drift before the raster is
-// re-baked. Comparing floats exactly would re-rasterize on sub-ULP wobble
-// (an eased curve's rounding); a tolerance too loose would leave the raster
-// visibly coarser than the scale asks for. A tenth of a pixel of font height is
-// below what a glyph raster can express, so it costs nothing and stops the
-// churn.
-TEXT_REBAKE_EPS :: 0.1
 
 // setup_text_job rasterizes a text clip at `scale` (the multiplier baked into
 // the baked font = 48*scale). source_w/source_h are the BASE tight dims (font
@@ -1266,7 +1234,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, r
 	if !rebake && over.raster != nil {
 		return
 	}
-	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
+	font_px := text_font_px_for(scale)
 	if t.name == "" || t.source_w <= 0 || t.source_h <= 0 {
 		over^ = {}
 		return
@@ -1296,7 +1264,6 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, r
 	over.raster = buf
 	over.bw = bw
 	over.ox, over.oy, over.ow, over.oh = ox, oy, ow, oh
-	over.blit_scale = 1
 	over.font_px = font_px
 }
 
@@ -1311,7 +1278,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, r
 // changes (preview_state.odin's text_font_px gate) — so both sinks converge on
 // the same ink for the same scale.
 text_job_rescale :: proc(j: ^Render_Text_Job, t: Render_Text_Src, scale: f32) -> bool {
-	if !geom_scale_needs_rebake(j.font_px, scale) {
+	if !text_font_needs_rebake(j.font_px, scale) {
 		return false
 	}
 	// The old raster stays valid until the new one lands, and setup_text_job
@@ -1327,13 +1294,6 @@ text_job_rescale :: proc(j: ^Render_Text_Job, t: Render_Text_Src, scale: f32) ->
 	}
 	delete(stale)
 	return true
-}
-
-// geom_scale_needs_rebake reports whether a raster baked at `font_px` no longer
-// matches the font size `scale` asks for. Split out so the re-bake decision is
-// stated once and the tolerance has one home.
-geom_scale_needs_rebake :: proc(font_px, scale: f32) -> bool {
-	return abs(font_px - f32(TEXT_CLIP_FONT_PIXELS) * scale) > TEXT_REBAKE_EPS
 }
 
 // snapshot_text_src builds the worker snapshot for a .Text generator clip.
@@ -1488,7 +1448,7 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 	if len(lines) == 0 || (len(lines) == 1 && strings.trim_space(lines[0]) == "") {
 		return
 	}
-	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
+	font_px := text_font_px_for(scale)
 	bw, bh := text_buf_size_for_lines(lines, &render_text_font.font, &render_text_font.init, font_px)
 	if bw <= 0 || bh <= 0 {
 		return
@@ -3135,12 +3095,12 @@ slot_idx := int(frame_idx & 1)
 				continue
 			}
 			slot := &v.blit_slots[slot_idx]
-			// A still image has one source frame; map every timeline frame in
-			// its span to it so the image holds instead of seeking past EOF.
-			src_frame := v.source_start_frame
-			if !v.is_still {
-				src_frame += timeline_frame - v.timeline_start_frame
-			}
+			src_frame := clip_source_frame(
+				v.source_start_frame,
+				v.timeline_start_frame,
+				timeline_frame,
+				v.is_still,
+			)
 			t_src := time.now()._nsec
 			if !decode_source_frame(&v.dec, src_frame) {
 				slot.ok = false
@@ -3890,9 +3850,11 @@ render_worker_run :: proc() {
 					j.oy,
 					j.ow,
 					j.oh,
+					t.source_w,
+					t.source_h,
 					sg[int(Render_Geom_Prop.Trans_X)],
 					sg[int(Render_Geom_Prop.Trans_Y)],
-					j.blit_scale,
+					sg[int(Render_Geom_Prop.Scale)],
 					sg[int(Render_Geom_Prop.Opacity)],
 				)
 			}
@@ -3971,14 +3933,14 @@ render_worker_run :: proc() {
 			rebake :=
 				jc.raster == nil ||
 				jc.cue_idx != ci ||
-				geom_scale_needs_rebake(jc.font_px, scale)
+				text_font_needs_rebake(jc.font_px, scale)
 			if rebake {
 				if jc.raster != nil {
 					delete(jc.raster)
 				}
 				rasterize_subtitle_cue(jc, src.cues[ci].text, scale)
 				jc.cue_idx = ci
-				jc.font_px = f32(TEXT_CLIP_FONT_PIXELS) * scale
+				jc.font_px = text_font_px_for(scale)
 				if jc.raster == nil {
 					continue
 				}
@@ -4002,9 +3964,12 @@ render_worker_run :: proc() {
 				render_job.width,
 				render_job.height,
 			)
-			w := f32(jc.ow) * sub_factor
-			h := f32(jc.bh) * sub_factor
-			bottom := anchor_y + f32(s.source_h) * scale * sub_factor / 2
+			// Box from the clip's BASE dims and the sampled scale, the same
+			// text_box_dims the preview and the text path use, rather than from the
+			// cue raster's measured ink -- so a subtitle's box is the same rectangle
+			// on both sides.
+			w, h := text_box_dims(s.source_w, s.source_h, scale, f32(render_job.width))
+			bottom := anchor_y + h / 2
 			if vyper_trace ||
 			   os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
 				fmt.printf(
@@ -4024,6 +3989,7 @@ render_worker_run :: proc() {
 					anchor_y,
 					s.source_w,
 					s.source_h,
+					scale,
 				)
 			}
 			render_text_blit(
@@ -4036,9 +4002,11 @@ render_worker_run :: proc() {
 				0,
 				jc.ow,
 				jc.bh,
-				anchor_x - w / 2,
-				bottom - h,
-				1,
+				s.source_w,
+				s.source_h,
+				anchor_x,
+				anchor_y,
+				scale,
 				sg[int(Render_Geom_Prop.Opacity)],
 			)
 		}
@@ -4524,8 +4492,7 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 
 // render_text_blit alpha-blends a rasterized text clip onto the canvas. text_buf
 // holds the title rasterized at the BAKED font (font = 48*scale, where scale is
-// the clip's sampled Scale and the job's blit_scale stays 1), so the raster
-// already carries the scale. The tight ink rect [ox..ox+ow)x[oy..oy+oh) is
+// the clip's sampled Scale lane), so the raster's ink already carries it. The tight ink rect [ox..ox+ow)x[oy..oy+oh) is
 // scaled to the output box anchored at the clip's top-left (tx, ty) in project
 // pixels, matching the preview's text box math: a UNIFORM factor
 // bw0 = ow * (out_w/PREVIEW_W) scales both axes (so text is never squished by
@@ -4546,12 +4513,21 @@ render_text_blit :: proc(
 	text_buf: []u8,
 	bw: int,
 	ox, oy, ow, oh: int,
+	// base_w/base_h are the clip's BASE ink dims at font 48 (clip.source_w/h).
+	// They set the box; ow/oh are the MEASURED ink rect inside this raster and set
+	// only the source sampling, so the glyphs land where the box says they should.
+	base_w, base_h: c.int,
 	// tx, ty are the box CENTER, the same anchor every other source uses:
 	// video through cropped_box_edges, subtitles through sub_box_center. Text
 	// used to pass Trans_X/Y straight through as a top-left, which made it the
 	// only source whose stored transform meant something different from its
 	// siblings' -- so a keyframed text transform and a keyframed video transform
 	// animated around different points while reading the same two fields.
+	//
+	// scale is the clip's SAMPLED Scale lane. It multiplies the base dims into the
+	// box; it does NOT scale the raster, which is already baked at 48*scale (that
+	// is why the job's blit_scale is gone: the ink carries the scale and the box
+	// gets it from the base dims, not from a second multiplication).
 	tx, ty, scale: f32,
 	opacity: f32,
 ) {
@@ -4566,11 +4542,14 @@ render_text_blit :: proc(
 	if op <= 0.0 {
 		return
 	}
-	factor := f32(draw_w) / f32(PREVIEW_W)
-	bw0 := f32(ow) * factor
-	bh0 := f32(oh) * factor
-	w := bw0 * scale
-	h := bh0 * scale
+	// The box comes from the clip's BASE ink dims (source_w/source_h, measured at
+	// font 48 and scale-independent) through the shared text_box_dims, exactly as
+	// the preview derives it, with the clip's SAMPLED scale. It used to scale
+	// this raster's MEASURED ink rect (ow/oh) instead, so the two boxes were
+	// different shapes -- preview used the font's metric line box for height,
+	// export the tight ink -- and a text clip's box was not the same rectangle on
+	// both sides. ow/oh now serve only the source sampling below.
+	w, h := text_box_dims(base_w, base_h, scale, f32(draw_w))
 	if w <= 0 || h <= 0 {
 		return
 	}

@@ -353,7 +353,7 @@ render_kf_probe_run :: proc() -> int {
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
 			flatG[pi] = render_kf_fill_flat(&clipG, p)
-			baseG[pi] = geom_resting_value(&clipG, p)
+			baseG[pi] = clip_geom_resting(&clipG, p)
 		}
 		// off 0 (first keys), 10 (between), 20 (last keys), 30 (past the end,
 		// so both fall back to the shared resting base).

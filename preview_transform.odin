@@ -473,10 +473,12 @@ clip_image_bounds_geom :: proc(
 	// around different points while reading the same fields, and every box the
 	// preview drew for text needed its own anchor arithmetic to compensate.
 	if kind == .Text && source_w > 0 && source_h > 0 {
-		f := v.width / f32(PREVIEW_W)
-		scale := geom[int(Render_Geom_Prop.Scale)]
-		w := f32(source_w) * f * scale
-		h := f32(source_h) * f * scale
+		w, h := text_box_dims(
+			source_w,
+			source_h,
+			geom[int(Render_Geom_Prop.Scale)],
+			v.width,
+		)
 		cx, cy := project_to_pixel(
 			canvas,
 			geom[int(Render_Geom_Prop.Trans_X)],

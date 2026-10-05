@@ -400,8 +400,93 @@ transform_probe_run :: proc(v: string) {
 		preview_cam.fit_to_window = true
 	}
 
+	// --- the shared text box: preview and export must place a text clip in the
+	// same rectangle. This is the one duplication that changed OUTPUT rather than
+	// just removing a copy -- render_text_blit used to scale the raster's measured
+	// tight-ink rect while the preview used the clip's base dims, so the two
+	// differed in HEIGHT by the font's metric line box (ascent + descent +
+	// TEXT_BOX_PAD) around the ink. Every text/subtitle case above measured a
+	// VIDEO box, so nothing caught it.
+	//
+	// The property under test is the box both sinks derive, not a baked
+	// rectangle: the preview's clip_image_bounds_geom text branch and the export's
+	// render_text_blit now call text_box_dims, so the assertion is that the
+	// preview's box equals what the export computes from the same inputs at
+	// several scales. A single scale could agree by luck.
+	{
+		bw, bh: c.int = 320, 96 // base ink dims at font 48
+		text_ok := true
+		for scale in ([]f32{0.5, 1.0, 1.8, 3.0}) {
+			geom: Geom_Sample
+			geom[int(Render_Geom_Prop.Scale)] = scale
+			geom[int(Render_Geom_Prop.Trans_X)] = f32(project.width) / 2
+			geom[int(Render_Geom_Prop.Trans_Y)] = f32(project.height) / 2
+			canvas := probe_canvas()
+			pv := clip_image_bounds_geom(canvas, .Text, geom, bw, bh)
+			// What the export derives for the same clip: the shared helper at the
+			// output width. Same proc, so this asserts the CALLERS pass the same
+			// inputs rather than that the arithmetic agrees with itself.
+			ew, eh := text_box_dims(bw, bh, scale, f32(project.width))
+			if abs(pv.width - ew) > 0.01 || abs(pv.height - eh) > 0.01 {
+				text_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL text box scale=%.1f preview %.2fx%.2f export %.2fx%.2f\n",
+					scale, pv.width, pv.height, ew, eh,
+				)
+			}
+			// The box is centered on the transform, and it must actually respond
+			// to scale -- a box frozen at scale 1 would satisfy a naive equality.
+			if abs(pv.width - f32(bw) * scale * f32(project.width) / f32(PREVIEW_W)) > 0.01 {
+				text_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL text box width does not track scale at %.1f: %.2f\n",
+					scale, pv.width,
+				)
+			}
+			// Centered: the transform maps to the box's midpoint, which is the
+			// anchor Active 25 unified text onto.
+			cx, cy := project_to_pixel(canvas, geom[int(Render_Geom_Prop.Trans_X)], geom[int(Render_Geom_Prop.Trans_Y)])
+			if abs((pv.x + pv.width / 2) - cx) > 0.01 || abs((pv.y + pv.height / 2) - cy) > 0.01 {
+				text_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL text box center %.2f,%.2f is not the transform %.2f,%.2f\n",
+					pv.x + pv.width / 2, pv.y + pv.height / 2, cx, cy,
+				)
+			}
+		}
+		check(&fail, text_ok, "text box: preview and export must place the same rectangle", 0, 0, 0, 0)
+	}
+
+	// --- the source-frame mapping: one helper, so a clip cannot preview one
+	// frame and export another. Three sites used to spell it out, each with its
+	// own still-image special case.
+	{
+		sf_ok := true
+		// A non-still maps linearly from its source offset.
+		for off in ([]i64{0, 1, 30, 90}) {
+			got := clip_source_frame(10, 5, 5 + off, false)
+			if got != 10 + off {
+				sf_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL source frame: off %d gave %d, want %d\n", off, got, 10 + off,
+				)
+			}
+		}
+		// A still pins every timeline frame in its span to its one source frame.
+		for off in ([]i64{0, 1, 30, 90}) {
+			got := clip_source_frame(7, 5, 5 + off, true)
+			if got != 7 {
+				sf_ok = false
+				fmt.printf(
+					"[transform-probe] FAIL still frame: off %d gave %d, want 7\n", off, got,
+				)
+			}
+		}
+		check(&fail, sf_ok, "source frame: one mapping for preview, export and the proxy picker", 0, 0, 0, 0)
+	}
+
 	if !fail {
-		fmt.println("[transform-probe] OK: driven edge tracks the pointer, snaps only the active handle, pinned edge holds")
+		fmt.println("[transform-probe] OK: driven edge tracks the pointer, snaps only the active handle, pinned edge holds; text box and source frame shared")
 		os.exit(0)
 	}
 	os.exit(1)

@@ -640,7 +640,12 @@ proxy_build_schedule :: proc() {
 		return
 	}
 	// Source frame under the playhead, then its segment.
-	src_frame := clip.source_start_frame + playhead.frame - clip.timeline_start_frame
+	src_frame := clip_source_frame(
+		clip.source_start_frame,
+		clip.timeline_start_frame,
+		playhead.frame,
+		clip.is_still,
+	)
 	if src_frame < 0 {
 		src_frame = 0
 	}

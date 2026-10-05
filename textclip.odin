@@ -23,6 +23,38 @@ text_clip_state: Text_Clip_State
 
 TEXT_CLIP_FONT_PIXELS :: 48
 
+// TEXT_REBAKE_EPS: how far a clip's scale may drift, in baked font pixels,
+// before its raster is discarded and re-rasterized.
+//
+// Comparing floats exactly re-bakes on sub-ULP wobble — an eased curve's
+// rounding — which under an animated scale is a rasterize per frame for a
+// difference no glyph can express. A tolerance too loose leaves the raster
+// coarser than the scale asks for. A tenth of a pixel of font height sits below
+// what a glyph raster can express at any size, so it costs nothing visually and
+// stops the churn.
+//
+// Shared by both sinks, which is the point: the preview compared
+// `slot.text_font_px != font_px` EXACTLY while the export used a tolerance, so
+// the same clip could re-rasterize on one side and not the other. Scale is baked
+// into a text raster's resolution rather than applied at blit time, so both
+// sides answer "is this ink still the right size" and must answer it the same
+// way.
+TEXT_REBAKE_EPS :: 0.1
+
+// text_font_px_for is the baked font size for a clip's SAMPLED scale — the
+// resolution its raster is drawn at. Both sinks rasterize at this and compare
+// against the size they last baked, so "what font does this scale ask for" has
+// one answer rather than one per sink.
+text_font_px_for :: proc(scale: f32) -> f32 {
+	return f32(TEXT_CLIP_FONT_PIXELS) * scale
+}
+
+// text_font_needs_rebake reports whether a raster baked at `baked_font_px` no
+// longer matches the font size `scale` asks for.
+text_font_needs_rebake :: proc(baked_font_px, scale: f32) -> bool {
+	return abs(baked_font_px - text_font_px_for(scale)) > TEXT_REBAKE_EPS
+}
+
 // TEXT_BOX_PAD is the small air margin above the first line's ascenders and
 // below the last line's descenders kept inside a text/subtitle box, so the
 // antialias overshoot never kisses the box edge. It is the ONLY vertical

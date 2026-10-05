@@ -31,6 +31,30 @@ clip_visible_at :: proc(frame, start, length: i64) -> bool {
 	return frame >= start && frame < start + length
 }
 
+// clip_source_frame maps a TIMELINE frame to the source frame it reads: the
+// clip's source offset plus however far the timeline frame sits past the clip's
+// own start.
+//
+// Three i64 plus a `still` flag rather than a Clip parameter, for the same
+// reason clip_visible_at takes three: the export's Render_Video_Src carries its
+// own offsets and must not read a live clip from the worker.
+//
+// `still` pins every timeline frame in the clip's span to the clip's single
+// source frame, so an image holds instead of seeking past its one frame. It is
+// the flag rather than a separate branch at each call site because preview,
+// export and the proxy picker each had their own copy of this arithmetic,
+// including the still case, and a divergence there is a clip that previews one
+// frame and exports another.
+clip_source_frame :: proc(
+	source_start, timeline_start, timeline_frame: i64,
+	still: bool,
+) -> i64 {
+	if still {
+		return source_start
+	}
+	return source_start + timeline_frame - timeline_start
+}
+
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
 // starting at `start_frame` (timeline frames). The duration is one second at the
 // current timeline frame rate. If the free gap that contains start_frame can't

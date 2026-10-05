@@ -5604,3 +5604,90 @@ Steps:
 **Accept.** `check build probe keyframe_probe subtitle_probe geom_key_probe
 render_kf_probe opacity parity keyed_export` pass; `parity_valgrind` clean.
 
+
+## Active 27 — Every remaining preview/export duplication, deduplicated
+
+**Why:** Active 26 fixed three two-writer paths and the question left hanging was
+the rest of the inventory. An audit of both sinks for a fact stated twice turned
+up six more, three of which were silent-drift vectors for the worker's own input
+and one of which was changing output. All six are gone; each is now one proc both
+sides call, or one proc with one home.
+
+**1. The resting-value switch existed twice.** `clip_geom.odin`'s
+`clip_geom_resting` and `render.odin`'s `geom_resting_value` were the same
+8-case `Render_Geom_Prop → clip field` mapping, character for character. A ninth
+lane meant editing both, and the export's copy is the one that silently feeds the
+worker. `geom_resting_value` is deleted; the export calls `clip_geom_resting`.
+
+**2. Frame→source-frame was written three times.** `preview_state.odin`,
+`render.odin`'s decode producer, and `proxy.odin` each spelled
+`source_start + timeline_frame - timeline_start`, and each carried its own
+`is_still` special case. `clip_source_frame(source_start, timeline_start,
+timeline_frame, still)` in timeline.odin replaces all three, next to
+`clip_visible_at`, which was already the shared visibility test and whose comment
+explains why it takes plain numbers rather than a Clip (the worker's snapshot
+must not read live state).
+
+**3. The re-bake tolerance was two policies.** The preview compared
+`slot.text_font_px != font_px` EXACTLY; the export used `TEXT_REBAKE_EPS`. So the
+same clip could re-rasterize on one side and not the other, and the preview's
+strict compare meant a rasterize per frame on any animated scale. Both now call
+`text_font_needs_rebake` / `text_font_px_for`, which live in textclip.odin beside
+`TEXT_CLIP_FONT_PIXELS`. The epsilon is now stated once with the reason it exists
+(sub-ULP wobble from an eased curve) instead of once per sink.
+
+**4. The text box was two different rectangles.** This one changed output.
+`render_text_blit` scaled the raster's MEASURED tight-ink rect; the preview used
+the clip's base dims — tight ink WIDTH but the font's METRIC line-box HEIGHT.
+Those are different quantities, so a text clip's box differed between preview and
+export in height by the pad air and ascent/descent slack the ink doesn't cover.
+Both now call `text_box_dims(base_w, base_h, scale, pw)` in project_geom.odin,
+which is what "one pipeline" means here: same base dims, same sampled scale, same
+uniform factor, so the box is one rectangle derived twice by one proc. The export
+passes `ow/oh` still — they now set only the source sampling, not the box.
+
+That also deleted `Render_Text_Job.blit_scale`. The raster's ink already carries
+the scale (it is baked at 48*scale), so a separate field applying it again was a
+second place for the scale to live, and `render_text_blit`'s `scale` argument is
+now the clip's SAMPLED lane feeding `text_box_dims` rather than a constant 1.
+Subtitles go through the same helper, and their `sub_factor` arithmetic with it.
+
+**5. The `W / PREVIEW_W` factor was spelled out at sixteen sites.** Four in
+render.odin, eleven in preview_transform.odin, one in preview_state.odin — and
+the crop-UV half of preview_transform.odin is not even the same factor (it is
+`PW / PREVIEW_W`, a different numerator, so it does NOT belong to this helper and
+was left alone). `text_pixels_to_project` names the one both text paths need.
+
+**6. The GPU blend state was two literals.** `gpu_renderer.odin` for the preview's
+pipelines and `render_gpu.odin` for the export's composite canvas, identical
+SRC_ALPHA/ONE_MINUS_SRC_ALPHA/ADD plus write mask. The export's copy carried a
+comment about mirroring "the preview's target state" — a comment asserting an
+invariant instead of being one, which is the same failure as the text blend
+comment Active 26 removed. `gpu_straight_alpha_blend()` is now the single source,
+write mask included (SDL defaults it to zero when blending is on, so a target
+that blends without it draws into nothing).
+
+**Probe / mutation.** `transform_probe` gains two cases, both mutation-verified:
+
+- Text box: asserts the preview's `clip_image_bounds_geom` box equals what the
+  export derives from the same inputs at four scales (0.5/1.0/1.8/3.0), that the
+  width tracks scale, and that the box is CENTERED on the transform. The center
+  assertion pins the anchor Active 25 unified text onto, and the scale assertion
+  exists because a box frozen at scale 1 would satisfy a naive equality.
+  Perturbing the shared factor by 2% — which is roughly what the tight-ink vs
+  metric-box mismatch was — fails it with the numbers.
+- Source frame: asserts the linear mapping and the still pin across four offsets.
+  Dropping the still case fails it (`off 30 gave 37, want 7`).
+
+Deliberately NOT done, and the reason is worth recording: the crop→UV mapping
+(`gpu_draw.odin`'s normalized insets over the letterboxed fit, `render_gpu.odin`'s
+integer pixel rects via `crop_src_rect`) is still two derivations. They are not
+one rule in two places — they are the same rule in two INPUT SPACES, one floating
+UV fraction and one integer source rect, because the preview samples a texture
+quad and the export region-copies a decode stage. Forcing them together would mean
+one function returning two types. That is a real distinction, not an excuse, and
+it is the only remaining duplication I would argue for keeping.
+
+**Accept.** `check build probe transform_probe subtitle_probe geom_key_probe
+render_kf_probe keyframe_probe opacity gpu_probe parity keyed_export` pass;
+`parity_valgrind render_valgrind` clean.

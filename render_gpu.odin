@@ -224,19 +224,10 @@ gpu_resample_create :: proc(g: ^GPU_Resample) -> bool {
 	// static path's exactness against the CPU reference is unchanged.
 	target := sdl.GPUColorTargetDescription {
 		format = .R8G8B8A8_UNORM,
-		blend_state = {
-			src_color_blendfactor = .SRC_ALPHA,
-			dst_color_blendfactor = .ONE_MINUS_SRC_ALPHA,
-			color_blend_op = .ADD,
-			src_alpha_blendfactor = .ONE,
-			dst_alpha_blendfactor = .ONE_MINUS_SRC_ALPHA,
-			alpha_blend_op = .ADD,
-			// The write mask defaults to zero when blending is enabled; without
-			// it the draw blends into nothing. Mirror the preview's target state.
-			color_write_mask      = {.R, .G, .B, .A},
-			enable_blend          = true,
-			enable_color_write_mask = true,
-		},
+		// The shared straight-alpha state, so this canvas composites exactly the
+		// way the preview's targets do — including the write mask, which SDL
+		// defaults to zero when blending is on and which this proc sets.
+		blend_state = gpu_straight_alpha_blend(),
 	}
 	pi := sdl.GPUGraphicsPipelineCreateInfo {
 		vertex_shader   = vshader,
