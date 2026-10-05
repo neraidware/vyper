@@ -1306,24 +1306,44 @@ target_atempo_probe() {
 }
 
 # audio_mix_parity drives the playback mixer and the export mixer over the same
-# timeline span and compares them sample for sample. It CURRENTLY FAILS, by about
-# 520 samples (10.8 ms) -- see TODO.md Active 30 S2. It is a target rather than a
-# case inside audio_probe precisely because it fails: a red line inside `all` gets
-# disabled, and a check nobody runs proves nothing. Named, runnable, and honest.
+# timeline span and compares them sample for sample. It runs against TWO fixtures,
+# because the interesting part is the DIFFERENCE between them:
+#
+#   wav  -- uncompressed, no encoder delay. Both mixers must be BIT-IDENTICAL.
+#           This is the regression guard for the mixing arithmetic itself.
+#   aac  -- encoder-delayed. This one CURRENTLY FAILS, and it fails because
+#           neither sink can supply content 0 (see TODO.md Active 30 S4).
+#
+# It is a gate target rather than a case inside audio_probe precisely because of
+# that: a red line inside `all` gets disabled, and a check nobody runs proves
+# nothing. Run it to see the state; do not wire it into `all` until it is green.
 target_audio_mix_parity() {
 	require_fresh_binary audio-mix-parity || return 1
-	local src=target/audio_probe/src.mp4
-	if [ ! -s "$src" ]; then
-		echo "audio-mix-parity: no fixture at $src -- run scripts/gate.sh audio_probe first" >&2
+	local wav=target/mixparity/src.wav
+	local aac=target/audio_probe/src.mp4
+	local rc=0
+	if [ ! -s "$wav" ]; then
+		echo "audio-mix-parity: synthesizing the no-encoder-delay fixture" >&2
+		mkdir -p target/mixparity
+		ffmpeg -v error -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" \
+			-ac 2 -c:a pcm_s16le "$wav" -y || return 1
+	fi
+	if [ ! -s "$aac" ]; then
+		echo "audio-mix-parity: no AAC fixture at $aac -- run scripts/gate.sh audio_probe first" >&2
 		return 1
 	fi
-	VYPER_AUDIO_MIX_PARITY="$src" timeout 600 ./vyper 2>&1 | tail -3
-	local rc=${PIPESTATUS[0]}
+	# The green half: identical arithmetic, no codec delay in the way.
+	VYPER_AUDIO_MIX_PARITY="$PWD/$wav" timeout 600 ./vyper 2>&1 | tail -2
+	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
+	# The red half: the encoder-delay case. Reported, not swallowed, and not
+	# allowed to hide the green half's verdict by running second.
+	VYPER_AUDIO_MIX_PARITY="$PWD/$aac" timeout 600 ./vyper 2>&1 | tail -2
+	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
 	if [ $rc -ne 0 ]; then
-		echo "audio-mix-parity: FAILED -- the two mixers disagree (known; TODO.md Active 30 S2)" >&2
+		echo "audio-mix-parity: FAILED (known; TODO.md Active 30 S4)" >&2
 		return 1
 	fi
-	echo "audio-mix-parity: ok (both mixers produced identical samples)"
+	echo "audio-mix-parity: ok"
 }
 
 target_all() {

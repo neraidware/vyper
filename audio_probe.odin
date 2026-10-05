@@ -1438,6 +1438,30 @@ audio_probe_mix_parity :: proc(path: string) -> bool {
 				bad = true
 			}
 		}
+		if frame == 0 {
+			// The fifo HEADS, which is where a content offset actually lives: two
+			// mixers can do identical arithmetic and still disagree if their decoders
+			// landed at different content positions. Printed at frame 0 because that
+			// is the only frame where an OPENING shortfall is the whole story --
+			// afterwards a head is just the fifo advancing.
+			//
+			// Measured on the AAC fixture: playback slot 0 first48=800 (exactly one
+			// 60fps frame, so playback drops frame 0 of the first clip) while every
+			// export source reports first48=1024 (the AAC encoder delay, so the
+			// export drops the first 21.3ms of EVERY clip). On a WAV fixture both
+			// report 0 and the mixers are bit-identical. So this line is the
+			// difference between "the mixers disagree" and "neither sink can supply
+			// content 0".
+			fmt.printf("[ap] mix-parity heads (play then export):")
+			for i in 0 ..< audio_src.count {
+				sl := &audio_src.slots[i]
+				fmt.printf(" p%d.first48=%d", i, sl.first48)
+			}
+			for i in 0 ..< len(export_audios) {
+				fmt.printf(" e%d.first48=%d", i, export_audios[i].first48)
+			}
+			fmt.println()
+		}
 		if bad {
 			mismatches += 1
 			if mismatches <= 3 {

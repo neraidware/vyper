@@ -1924,7 +1924,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// breaking `all` or being quietly skipped.
 	if mp, _ := os.lookup_env_alloc("VYPER_AUDIO_MIX_PARITY", context.temp_allocator); mp != "" {
 		parts := strings.split(mp, "|")
-		ok := audio_probe_mix_parity(strings.trim_space(parts[0]))
+		ok: bool = audio_probe_mix_parity(strings.trim_space(parts[0]))
 		if !ok {
 			os.exit(1)
 		}

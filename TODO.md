@@ -5918,9 +5918,19 @@ frame covers, including one straddling two blocks) and playback has not caught u
       See "The finding" below.
 - [ ] S3. `Mix_Src` node + one `mix_src_block`, both mixers onto it. Pure
       deletion: the two pull procs and the duplicated gain/declick/span math
-      collapse into one.
+      collapse into one. **UNBLOCKED as of S4a** — the WAV fixture proves the two
+      mixing paths are already bit-identical, so there is no reconciliation to do
+      first. The duplication is real debt, not a cover for a behavioural
+      difference.
 - [ ] S4. Latency: every node declares it, the graph sums it, both sinks
       compensate. Measured and reported, not asserted by comment.
+  - [x] S4a. Root-caused the divergence (see "The finding" below): the mixers
+        agree; the CODEC's encoder delay does not, and it silently eats the
+        opening of every clip in both sinks.
+  - [ ] S4b. Make ONE sink authoritative and fix the other. Needs a decision on
+        where priming lives, not a patch — see the finding for the two options.
+  - [ ] S4c. Latency as a declared per-node quantity compensated at each sink,
+        which subsumes S4b and also covers `swr` delay and `atempo` lookahead.
 - [ ] S5. Granularity as a parameter — playback asks for a frame's range and the
       same mixer serves it.
 - [x] S6a. `atempo_probe` wired into `gate.sh` and `all`. It had an entry point
@@ -5931,44 +5941,69 @@ frame covers, including one straddling two blocks) and playback has not caught u
       exactly, and NTSC is where the 1601/1602 alternation lives).
 - [ ] S6c. Nothing measures drift beyond 30 s.
 
-### The finding (S2)
+### The finding (S2/S4a)
 
-The two mixers are **not** sample-equivalent, and nothing had ever compared them.
-They differ by a constant ~520 samples (10.8 ms): one of them reads the source
-from a position the other does not. That is the desync class Active 30 exists to
-close, found by the measurement added to enable the refactor — before any of the
-refactor, which is the order that matters.
+**The two mixers are already equivalent.** On a WAV fixture they are
+BIT-IDENTICAL: 0 of 141 frames differ, worst delta 0.000000. So the duplicated
+mixing arithmetic is not the defect, and **S3 (collapse both onto one node) is
+safe to do** — there is nothing to reconcile first. That is the useful result,
+and it is the opposite of what the first run appeared to show.
 
-Three things were ruled out while finding it, each a plausible-looking wrong
-answer:
+**What actually differs is the codecs' encoder delay, and it breaks BOTH sinks.**
+On the AAC fixture the fifo heads at timeline 0 are:
 
-- **It is not the probe driving the export at the wrong granularity.** The first
-  version handed `render_mix_block` a whole video frame at once; the real producer
-  mixes `AUDIO_MIX_BLOCK` (512) and the consumer takes whatever range its frame
-  covers. Re-driven at the natural 512 block size the shift is unchanged, so the
-  export's content mapping does not depend on how it is chopped.
-- **It is not an amplitude or ordering bug.** Cross-correlating the two frames
-  gives a clean non-zero best shift rather than a zero shift with a wrong gain, so
-  the same audio is present in both, 520 samples apart.
-- **It is not the correlation window silently measuring nothing.** The first
-  correlation used an offset past the end of the frame, so every shift was skipped
-  and the "best shift" printed as 0 — which reads as proof of alignment when
-  nothing had been compared.
+```
+p0.first48=800  p1.first48=1024  p2.first48=1024
+e0.first48=1024 e1.first48=1024 e2.first48=1024
+```
 
-The 520 samples are the right size to be the missing LATENCY COMPENSATION this
-section is about: `swr` resampling, the `atempo` graph and the AAC encoder's
-priming each delay audio by a bounded amount, and the two sinks anchor their
-decoders against that differently. `audio.odin` already notes a measured "~0.1s
-AFTER the requested time" that `AUDIO_SEEK_PREROLL_SEC` absorbs per-seek for
-playback; the export has no equivalent correction. **Which of the two is correct
-has not been established** — the probe proves they disagree, not which one is
-right, and S4 is where that gets answered rather than assumed.
+- Every **export** source starts at 1024 — the AAC encoder delay, 21.3 ms. The
+  first 21.3 ms of *every clip* is absent from the export: a gap at every cut.
+  `render.odin` already detects and reports this ("preroll could not cover it")
+  and then exports anyway.
+- **Playback** slot 0 starts at 800 — exactly one 60 fps frame (48000/60). Playback
+  silently drops frame 0 of the first clip, and does not report it.
 
-`audio_mix_parity` is a GATE TARGET, not a case inside `audio_probe`, precisely
-because it fails: a red line inside `all` gets disabled, and a check nobody runs
-proves nothing. It is named, runnable, and currently red.
+So there is one root cause with two symptoms: **neither sink guarantees its
+decoder's fifo covers content 0.** They differ only in how loudly they fail —
+the export logs, playback does not. This is the gap Active 30 exists to close,
+found by the measurement added to enable the refactor and before any of it.
 
-**Not started.** S2 is measurement only and is the prerequisite for the rest: S3
-is a rewrite of the engine's hot path, and doing it before something can PROVE the
-two mixers agreed beforehand would be the exact discipline failure this file keeps
-recording.
+`AV_PKT_DATA_SKIP_SAMPLES` is bound (`avcodec.SkipSamples`) and is how the codec
+declares this delay, but **the fix is NOT a matter of reading that side data**:
+the drop has to happen either at the resampler's input or at the post-resample
+output, and each wrong choice is silent. Zeroing the input frame after
+`swres.convert` has already written is a no-op; advancing the destination
+pointer to skip input samples desynchronises the resampler's filter state. Both
+were tried and neither was landed, because a priming fix that is plausible and
+unverified is worse than a known-red gate.
+
+**S4b therefore stays open, and it is a design decision, not a patch.** The
+question is where priming lives: as a per-decoder constant subtracted from the
+first output (simple, assumes the side data is on the first packet) or as a
+declared per-source LATENCY the sink compensates at its boundary (general, and
+the one the Resolve model actually wants — it also covers `swr` delay and the
+`atempo` lookahead, not just AAC). The second is the real answer and it is S4c.
+
+### Probe shape (kept deliberately)
+
+`audio_mix_parity` takes the source path as an argument and the gate target runs
+it against **two** fixtures, because the difference between them IS the finding:
+
+- **wav** — uncompressed, no encoder delay. Both mixers bit-identical. This is the
+  standing regression guard on the mixing arithmetic.
+- **aac** — encoder-delayed. Currently red, because neither sink can supply
+  content 0.
+
+It also prints each sink's fifo head at frame 0 (`p0.first48=…`, `e0.first48=…`).
+That single line is the difference between "the mixers disagree" and "neither
+sink can supply content 0", which is the whole diagnosis in one number.
+
+Two measurement mistakes were made and corrected while building this, both
+worth keeping in mind because each read as proof:
+
+- Correlating with an offset past the end of the frame skips every shift, so
+  "best shift 0" printed while nothing had been compared at all.
+- Driving the export one whole video frame at a time instead of its natural
+  512-sample blocks suggested the mixers were misaligned. At 512 they are
+  identical.
