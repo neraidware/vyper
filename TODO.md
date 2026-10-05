@@ -5916,13 +5916,17 @@ frame covers, including one straddling two blocks) and playback has not caught u
       (10.8 ms) content SHIFT** — cross-correlating one frame's export output
       against the same frame's playback output peaks at +520 samples, not at 0.
       See "The finding" below.
-- [ ] S3. `Mix_Src` node + one `mix_src_block`, both mixers onto it. Pure
-      deletion: the two pull procs and the duplicated gain/span math collapse into
-      one. **Guarded by three fixtures, all inside `all`**: wav (no encoder
-      delay), aac (real encoder delay) and a 600 s drift run at 60 / 30 /
-      30000-over-1001, all bit-identical. The mixers now differ ONLY in how they
-      chunk, so collapsing them has a gate that fails the moment it stops being a
-      pure deletion.
+- [x] S3. `mix_src_block` — ONE mixing loop, called by both sinks. The arithmetic
+      that existed twice now exists once; the two callers keep only what genuinely
+      differs, which is how they REFILL and how they express a position (a frame
+      index for playback, an absolute `Sample_Pos` for the export). Both are resolved
+      by the caller before the block reaches the shared core, so nothing positional
+      leaks into it.
+      It is a proc over the fields rather than a `Mix_Src` STRUCT on purpose: both
+      sources already carry a fifo, a head and a tail, and copying them into a third
+      struct per block would have reintroduced the duplication this removes.
+      **Verified as a pure refactor**: bit-identical over 600 s at 60 / 30 /
+      30000-over-1001, plus the wav and aac parity fixtures and the stall case.
 - [ ] S4. Latency: every node declares it, the graph sums it, both sinks
       compensate. Measured and reported, not asserted by comment.
   - [x] S4a. Root-caused the divergence (see "The finding" below): the mixers

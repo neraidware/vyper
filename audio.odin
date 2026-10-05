@@ -1723,6 +1723,49 @@ audio_frame_boundary48 :: proc(frame: i64, fps: f64) -> i64 {
 // flat. Returns true if any covering segment actually delivered samples into
 // mix (false means the frame was fed to the device as silence while a segment
 // covered it — a decode/seek hole).
+// Mix_Src is what a source looks like to the mixer: a fifo of decoded content
+// samples, the content position of that fifo's head, and the clip's span on the
+// bus. It is deliberately NOT a struct -- both sinks' sources (Play_Src and
+// Render_Audio_Src) already carry these fields, and copying them into a third
+// struct per block would be the duplication this is meant to remove.
+//
+// Everything a source needs in order to be mixed is here: where its content
+// starts, how far it reaches, where its buffer begins and ends, and the pull that
+// refills it. The two sinks differ only in HOW they refill and in how they express
+// a position -- playback has a frame index, the export an absolute Sample_Pos --
+// and both of those are resolved by the caller before the block reaches
+// mix_src_block. What is left is arithmetic that must not exist twice.
+mix_src_block :: proc(
+	fifo: ^Audio_Ring,
+	first48: i64,
+	have48: i64,
+	content: i64,
+	want: int,
+	g: f32,
+	out: []f32,
+	off: int,
+) -> (mixed: bool) {
+	if want <= 0 {
+		return false
+	}
+	base := int(content - first48)
+	if base < 0 {
+		// The fifo head is PAST the content this block asks for. The caller has
+		// already decided what to do about it (the export counts it, playback clamps
+		// its demand forward); this is the backstop that keeps the index arithmetic
+		// honest, because reading a negative ring index would return whatever happens
+		// to be in the buffer rather than an error.
+		return false
+	}
+	for f in 0 ..< want {
+		l, r := ring_at(fifo, base + f)
+		o := (off + f) * 2
+		out[o + 0] += l * g
+		out[o + 1] += r * g
+	}
+	return true
+}
+
 audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 	for i in 0 ..< len(mix) {
 		mix[i] = 0
@@ -1796,28 +1839,21 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if want <= 0 {
 			continue
 		}
+		// One mixing loop for both sinks (mix_src_block). `base` and the shortfall
+		// checks above are the playback half; the export has its own, and the arithmetic
+		// that used to be copy-pasted between them now exists once.
+		//
+		// No automatic ramp at a clip edge -- a cut is a cut. There was a declick here
+		// and it was this engine's SECOND fade mechanism: gain is already automated per
+		// sample through the clip's keyframe envelope, so an edge ramp was an implicit
+		// fade on every edit whether the user wanted one or not. The two mechanisms
+		// disagreed at ~2.5e-3 in a clip's final fade, because the ramp normalised
+		// against the CALLER'S CHUNK LENGTH. An authored fade is expressed through the
+		// envelope; the engine's job is that what you cut is what you hear.
 		sample_off := int(blk_lo - frame_lo)
-		for f in 0 ..< want {
-			l, r := ring_at(&s.fifo, base + sample_off + f)
-			// No automatic ramp at a clip edge. A cut is a cut.
-			//
-			// There was a declick here, and it was this engine's second fade
-			// mechanism: gain is already automated per sample through the clip's
-			// keyframe envelope, so an edge ramp was an IMPLICIT fade applied to every
-			// edit whether the user wanted one or not. Two mechanisms for one job is
-			// the shape where the two disagree -- and they did, at ~2.5e-3 in a clip's
-			// final fade, because the ramp was normalised against the caller's chunk
-			// length and playback chunks by frame while the export chunks by block.
-			//
-			// A step at a cut is a real discontinuity and can be heard; that is what
-			// an authored fade is for, and the envelope is already there to express
-			// one. The engine's job is that what you cut is what you hear.
-			d := g
-			off := (sample_off + f) * 2
-			mix[off + 0] += l * d
-			mix[off + 1] += r * d
+		if mix_src_block(&s.fifo, s.first48, s.have48, start48 + i64(sample_off), want, g, mix[:], sample_off) {
+			delivered = true
 		}
-		delivered = true
 		if audio_rpt.trace {
 			fmt.printf(
 				"[tr mix] fr=%d k=%d seg0=%d start48=%d have48=%d fifo=%d del=%v\n",
