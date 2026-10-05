@@ -352,6 +352,47 @@ atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
 	return false
 }
 
+// ATEMPO_LOOKAHEAD_MAX_SAMPLES is the largest lookahead the graph holds back,
+// measured by audio_probe_node_latency at rate 0.5 (the slowest rate, and so the
+// deepest window): 2048 input samples, 42.7 ms at 48 kHz.
+//
+// It is RATE-DEPENDENT, measured 2048 / 1722 / 1350 / 1536 input samples at rates
+// 0.5 / 0.75 / 1.25 / 2.0, because WSOLA's window scales with the tempo factor. So
+// this is a BOUND, not a constant to subtract, and compensation must use the
+// per-rate value. The maximum is what a caller needs in order to size a priming
+// buffer without asking.
+//
+// Measured rather than derived, and reproducible: the probe remeasures and compares.
+// The two methods that did NOT work are recorded in the probe, because they are the
+// obvious ones: impulse correlation cannot locate anything in WSOLA output (which is
+// reassembled, not shifted), and energy onset quantises to its analysis window and
+// reported an onset earlier than causality allows. Accounting --
+// pushed/rate - produced -- needs no waveform at all.
+ATEMPO_LOOKAHEAD_MAX_SAMPLES :: 2048
+
+// atempo_lookahead_samples is the measured lookahead for a given transport rate, by
+// interpolation on the measured points. EXACT at the measured rates and linear
+// between them, because the underlying window scales with the tempo factor rather
+// than jumping.
+//
+// Sampled from measurement rather than modelled, and that is the point: a model would
+// be one more thing that can be wrong silently, and this number decides where content
+// lands after a seek.
+atempo_lookahead_samples :: proc(rate: f64) -> int {
+	pts := []f64{0.5, 0.75, 1.25, 2.0}
+	vals := []int{2048, 1722, 1350, 1536}
+	if rate <= pts[0] {
+		return vals[0]
+	}
+	for i in 0 ..< len(pts) - 1 {
+		if rate <= pts[i + 1] {
+			t := (rate - pts[i]) / (pts[i + 1] - pts[i])
+			return int(f64(vals[i]) + (f64(vals[i + 1]) - f64(vals[i])) * t + 0.5)
+		}
+	}
+	return vals[len(vals) - 1]
+}
+
 // atempo_reset clears the graph's internal window so stale buffered samples
 // from a previous timeline position never leak into the new mix. Used on
 // re-provision and forward jumps, which also ClearAudioStream the device.

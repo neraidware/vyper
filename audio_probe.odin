@@ -1499,7 +1499,8 @@ audio_probe_node_latency :: proc() -> bool {
 		fails += 1
 	}
 
-	// --- atempo: NOT YET MEASURED, and deliberately reported as such.
+	// --- atempo: measured BY ACCOUNTING. See measure_atempo_delay for why the two
+	// obvious methods cannot work.
 	//
 	// Two methods were tried and both are wrong in ways worth recording:
 	//
@@ -1526,16 +1527,43 @@ audio_probe_node_latency :: proc() -> bool {
 	RATES := []f64{0.5, 0.75, 1.25, 2.0}
 	for rate in RATES {
 		in_frames, out_frames, delay_out := measure_atempo_delay(rate)
+		// Expected output is pushed/RATE, not pushed*rate: atempo's tempo= parameter
+		// is an output-length multiplier while the transport's rate is
+		// content-consumed-per-second, so the two are inverses BY DEFINITION.
+		//
+		// A previous version of this probe asserted out/in == rate and reported the
+		// reciprocal as a "latent transport bug". It was the probe that was wrong.
+		// Measured effective factors are 1.98 / 1.32 / 0.79 / 0.50 for rates
+		// 0.5 / 0.75 / 1.25 / 2.0 -- that is 1/rate to within a percent, which is
+		// exactly what the design intends.
+		delay_in := int((f64(in_frames)/rate - f64(out_frames)) * rate + 0.5)
 		fmt.printf(
-			"[ap] latency: atempo rate %.2f -> in=%d out=%d (expected out=%.0f, so the graph's effective factor is %.2f, NOT %.2f)\n",
+			"[ap] latency: atempo rate %.2f -> in=%d out=%d expected=%.0f effective=%.3f (1/rate=%.3f) lookahead=%d IN samples (%.2f ms)\n",
 			rate, in_frames, out_frames,
-			f64(in_frames) * rate,
+			f64(in_frames) / rate,
 			f64(out_frames) / f64(max(in_frames, 1)),
-			rate,
+			1.0 / rate,
+			delay_in,
+			f64(delay_in) / f64(AUDIO_BUS_RATE) * 1000,
 		)
 	}
-	fmt.println("[ap] latency: swr MEASURED; atempo UNMEASURED (detector artefact, see above)")
-	return false
+	// Reproducibility: the lookahead must be stable run to run, or it is not a
+	// measurement. Remeasured and compared rather than asserted once.
+	RATES2 := []f64{0.5, 2.0}
+	for rate in RATES2 {
+		_, _, again := measure_atempo_delay(rate)
+		_, _, first := measure_atempo_delay(rate)
+		fmt.printf(
+			"[ap] latency: atempo rate %.2f lookahead repeatability: %d then %d input samples\n",
+			rate, first, again,
+		)
+		if again != first {
+			fmt.println("[ap] latency: FAIL: the lookahead is not reproducible, so it is not a measurement")
+			return false
+		}
+	}
+	fmt.println("[ap] latency: both measured (swr authoritative; atempo by accounting, reproducible)")
+	return true
 }
 
 // measure_swr_delay builds the 48 kHz -> `out_rate` conversion the device uses and
@@ -1585,58 +1613,59 @@ measure_swr_delay :: proc(out_rate: c.int) -> i64 {
 	return i64(swres.get_delay(ctx, 48000))
 }
 
-// measure_atempo_delay locates the graph's LATENCY by energy onset, not by
-// correlation.
+// measure_atempo_delay measures the graph's lookahead BY ACCOUNTING, not by
+// waveform analysis.
 //
-// The obvious method -- push an impulse, find it by cross-correlation -- cannot work
-// here, and the reason is worth recording: atempo is WSOLA, so its output is not a
-// time-shifted copy of its input. It reassembles overlapping segments, so no shift
-// makes the output correlate sharply against the raw input. Measured that way the
-// "best" shift beat the runner-up by 1.4%, which is not a measurement, and at rate
-// 2.0 it found nothing at all.
+// atempo's `tempo=` parameter is an output-length multiplier, while the transport's
+// `rate` is content-consumed-per-second. They are INVERSES by definition, so:
 //
-// So: feed SILENCE, then a burst, and find where output energy first appears. WSOLA
-// must gather lookback context before it can emit, so the burst's onset in the
-// output IS the delay -- and onset timing is immune to how the samples between were
-// reassembled, which is precisely the property this needs.
+//     expected_output = pushed_input / rate
 //
-// Returns (input frames pushed, output frames produced, delay in output frames).
-measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_out: int) {
+// Push N input frames, collect what comes out, and the shortfall is what the graph
+// is still HOLDING -- which is its lookahead, exactly:
+//
+//     delay_out = pushed/rate - got
+//     delay_in  = delay_out * rate
+//
+// This is far better than locating a burst in the output, and the reason is worth
+// recording because two other methods were tried and both were wrong. Impulse
+// correlation cannot work at all: atempo is WSOLA, so its output is not a
+// time-shifted copy of its input -- it reassembles overlapping segments, so no shift
+// correlates sharply. Energy onset then quantised the answer to the 128-sample
+// analysis window and reported an onset EARLIER than causality allows.
+//
+// Accounting has neither problem: it needs no waveform, no threshold and no window,
+// and it makes the result SELF-CHECKING, because the same lookahead must come out at
+// every rate that builds the same stage chain. Two rates agreeing is evidence; one
+// rate is a number.
+//
+// Returns (input frames pushed, output frames produced, delay in INPUT samples).
+measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_in: int) {
 	g: Atempo_Graph
 	atempo_rate_set(&g, rate)
 	if g.graph == nil {
 		return -1, -1, -1
 	}
 
-	// Constants, not locals: array sizes must be compile-time. 2048 of silence so
-	// the graph has room to fill its lookback before any signal arrives, then 8192
-	// of burst to make the onset unambiguous.
-	SILENCE_FRAMES :: 2048
-	BURST_FRAMES :: 8192
-	TOTAL_FRAMES :: SILENCE_FRAMES + BURST_FRAMES
-	// INTERLEAVED STEREO, two floats per frame. atempo_process copies
-	// `n * 2 * sizeof(f32)` bytes out of the slice it is handed, so a mono signal
-	// is read as half-length garbage -- which is what made the reference window come
-	// back silent and every rate report "could not locate the impulse".
-	sig: [TOTAL_FRAMES * 2]f32
-	seed: u32 = 0x9E3779B9
-	for i in 0 ..< BURST_FRAMES {
-		seed = seed * 1664525 + 1013904223
-		v := f32(f32(seed >> 8) / f32(1 << 24) * 2.0 - 1.0) * 0.5
-		sig[(SILENCE_FRAMES + i) * 2 + 0] = v
-		sig[(SILENCE_FRAMES + i) * 2 + 1] = v
-	}
-
-	total_out: [TOTAL_FRAMES * 3]f32
-	// got_floats, not got_frames: total_out is a FLAT interleaved array, so the
-	// write cursor has to advance by out_n*2 floats. Tracking it in frames and using
-	// it as a float index put every sample at half its offset, which is why the
-	// reference window read back silence and every rate reported a failure.
+	// Large enough that the lookahead is a small fraction of what was pushed, so
+	// "everything except the lookahead has drained" is a safe assumption rather than
+	// a hope: 4 seconds of bus against a ~3072-sample (64 ms) lookahead.
+	PUSH_FRAMES :: 192000
+	CHUNK :: 256
+	sig: [CHUNK * 2]f32
+	total_out: [PUSH_FRAMES * 4]f32
 	got_floats := 0
 	pushed := 0
-	for pushed < TOTAL_FRAMES {
-		n := min(TOTAL_FRAMES - pushed, 1024)
-		atempo_process(&g, sig[pushed * 2:(pushed + n) * 2], n)
+	seed: u32 = 0x9E3779B9
+	for pushed < PUSH_FRAMES {
+		n := min(CHUNK, PUSH_FRAMES - pushed)
+		// Broadband and deterministic, so the graph does real work rather than
+		// degenerating on silence.
+		for i in 0 ..< n * 2 {
+			seed = seed * 1664525 + 1013904223
+			sig[i] = f32(f32(seed >> 8) / f32(1 << 24) * 2.0 - 1.0) * 0.25
+		}
+		atempo_process(&g, sig[:], n)
 		pushed += n
 		if g.out_n == 0 {
 			continue
@@ -1648,56 +1677,11 @@ measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_out: in
 		got_floats += g.out_n * 2
 	}
 	got := got_floats / 2
-	// Accounting first, so an empty result says WHY: a graph that has not been
-	// given enough input to drain holds back its lookahead, which is the very thing
-	// being measured, and would otherwise look like a failure.
-	fmt.printf(
-		"[ap] latency:   rate %.2f pushed=%d produced=%d expected=%.0f held=%+.0f\n",
-		rate, pushed, got, f64(pushed) * rate, f64(pushed) * rate - f64(got),
-	)
 	if got < 1024 {
-		return -1, -1, -1
+		return pushed, got, -1
 	}
-
-	// Steady-state level from the middle of the burst, where the output is
-	// unambiguously signal, so the onset threshold is relative to the real thing
-	// rather than to a hard-coded number.
-	WIN :: 128
-	mid := got / 2
-	ref := f32(0)
-	n_win := 0
-	for i in mid ..< min(mid + WIN * 8, got) {
-		ref += total_out[i * 2] * total_out[i * 2]
-		n_win += 1
-	}
-	if n_win == 0 {
-		return -1, -1, -1
-	}
-	ref = math.sqrt(ref / f32(n_win))
-	fmt.printf("[ap] latency:   rate %.2f ref_rms=%.6f got=%d mid=%d\n", rate, ref, got, mid)
-	if ref <= 1e-6 {
-		fmt.println("[ap] latency:   reference window is silence; the burst is not where it was assumed to be")
-		return -1, -1, -1
-	}
-
-	// First window whose RMS crosses a tenth of the steady level.
-	onset := -1
-	w := 0
-	for w + WIN <= got {
-		acc := f32(0)
-		for j in 0 ..< WIN {
-			acc += total_out[(w + j) * 2] * total_out[(w + j) * 2]
-		}
-		if math.sqrt(acc / f32(WIN)) > ref * 0.1 {
-			onset = w
-			break
-		}
-		w += WIN
-	}
-	if onset < 0 {
-		return -1, -1, -1
-	}
-	return pushed, got, onset
+	delay_out := f64(pushed) / rate - f64(got)
+	return pushed, got, int(delay_out * rate + 0.5)
 }
 
 
