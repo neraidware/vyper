@@ -93,6 +93,64 @@ Steps (each lands + probe + vet before the next):
       throughout `import_bg.odin`, `proxy.odin`. No `run_capture` of
       ffmpeg/ffprobe left; no `"ffmpeg"`/`"ffprobe"` string literals remain in
       the binary. Vet clean.
+- [x] S4. **A4** — declick. Shipped.
+
+      A source's contribution entering or leaving is a STEP in the mixed output,
+      and a step is a click. This applies to more than clip edges: a source that
+      comes back after a shortfall is an edge too, even though no clip changed,
+      which is why the envelope is driven by a per-source `muted` flag rather than
+      by geometry alone.
+
+      `AUDIO_DECLICK_SAMPLES = 256` (5.3ms), raised cosine, applied per source in
+      the sample domain at the contribution's edges -- fade in from the clip's span
+      start (or from the resume point, whichever is later), fade out to its span
+      end. The shape and both fade lengths live in one named proc
+      (`render_declick_gain`) because inline the shape appears twice, ascending
+      and descending, with mirrored expressions; two copies of a ramp that must
+      agree is the kind of thing that drifts.
+
+      Each fade is normalised by its OWN length and stepped so the argument runs
+      1/fade .. 1 INCLUSIVE, so the gain lands on exactly `g` at the last faded
+      sample. The probe caught the first version reaching only 0.99996 -- inaudible,
+      but it made the comment's claim a lie, and the fix is one character. It also
+      means a block shorter than the fade still completes it instead of leaving the
+      contribution permanently attenuated.
+
+      **This project cannot show the improvement, and saying so is part of the
+      result.** `~/sallyface.vyproj`'s clips TILE continuously on the timeline, so
+      there is no edit discontinuity to declick; the four places where the SOURCE
+      jumps (frames 367/1351/1513/1699, where the edit skips forward in the
+      recording) land in quiet passages, with steps of 800-1200 against a local
+      signal of 11000 and a music slew of 15209, and its only true edge -- the
+      render start -- is in silence. So the acceptance is the probe plus a direct
+      measurement, not a before/after on this project, and manufacturing a
+      synthetic project to manufacture an improvement would be the fixture trap this
+      probe already fell into once.
+
+      **Probe case L** pins the envelope's contract: it reaches 0 at both ends,
+      exactly `g` in the middle and at the last faded sample, is monotonic, scales
+      the automation gain rather than replacing it, does not reach across the block
+      when only one end is faded, and fits inside a block shorter than the fade.
+      Mutations, all caught: fade never applied, fade_in ignored, fade_out never
+      applied, ramp does not reach 1, and linear substituted for raised cosine. That
+      last one needed a slope check rather than an endpoint check -- both ramps are
+      monotonic with identical endpoints, and what distinguishes them is that a
+      linear ramp stops at full slope at its ends, which is itself an audible tick.
+      Two of those assertions failed against correct code first: one measured the
+      middle of the BLOCK rather than the middle of the FADE, where every sample is
+      unfaded and the step is zero.
+
+      **End-to-end**, `scripts/audio-verify.sh` now excludes the declick bands from
+      the correlation and checks them separately: a contribution must arrive from
+      silence, not at full level. Disabling the ramps makes it report 3 clips
+      starting at 6-13% of their level. With them, `~/sallyface.vyproj` is 10 of 10
+      regions at lag 0 with correlation 0.9996-1.0001 (it was 1.0000 against a naive
+      N x source before the ramps existed, which is precisely what the ramps are for),
+      0 holes where sound was due, -6.7ms against the frame grid (S6).
+
+      Gates: check build parity audio_probe keyed_export render_kf_probe
+      timeline_probe render_live_probe yuv_exact probe smoke render_valgrind.
+
 - [x] S4. HW decode in `Clip_Decoder`: enumerate the codec's hw configs
       (`get_hw_config`) for one with an `HW_Device_Ctx` method, create the
       device (`hwdevice_ctx_create`), attach it via `hw_device_ctx`; the decoder

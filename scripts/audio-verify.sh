@@ -103,7 +103,16 @@ for tr in tracks[:1]:
         if s1 + elen > len(src):
             print(f"{t0:>6} {n:>5} {'-':>5} {'n/a':>8} {'-':>7}  SOURCE WINDOW TOO SHORT")
             continue
-        want, got = src[s1:s1+elen] * NT, exp[e0:e0+elen]
+        # The declick ramps are supposed to make the output DIFFER from a naive
+        # N x source inside AUDIO_DECLICK_SAMPLES of the clip's own edges, so
+        # those bands are excluded from the correlation and checked separately
+        # below. Including them measures the ramp instead of the content.
+        band = min(256, elen // 4)
+        lo, hi = band, elen - band
+        if hi <= lo:
+            lo, hi = 0, elen
+        want = src[s1+lo:s1+hi] * NT
+        got = exp[e0+lo:e0+hi]
         best = (0, corr(want, got))
         for lag in (-spf, -spf//2, 0, spf//2, spf):
             aa, bb = (want[:len(want)-lag], got[lag:]) if lag >= 0 else (want[-lag:], got[:len(got)+lag])
@@ -113,6 +122,16 @@ for tr in tracks[:1]:
         lag, cv = best
         err = float(np.sqrt(np.mean((want - got) ** 2)))
         checked += 1
+        # Declick: a contribution must ARRIVE from silence rather than at full
+        # level, so the export's first samples of the clip have to be far below
+        # what the source is doing there. Before the ramp this ratio is ~1.
+        ref = float(np.max(np.abs(src[s1+lo:s1+hi]))) * NT
+        if ref > 64.0:
+            first = float(np.max(np.abs(exp[e0:e0+8])))
+            if first / ref > 0.05:
+                print(f"{t0:>6} {n:>5} {'-':>5} {'n/a':>8} {'-':>7}  "
+                      f"NO DECLICK: starts at {first/ref*100:.0f}% of {ref:.0f}")
+                bad += 1
         if cv is None:
             ok = err == 0
             cs, verdict = "n/a", ("both silent (exact)" if ok else "SILENT MISMATCH")
