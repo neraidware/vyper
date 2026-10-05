@@ -512,6 +512,46 @@ Render_Geom_Prop :: enum u8 {
 	_COUNT,
 }
 
+// render_geom_short_name is the inspector's abbreviated label for a lane, used by
+// the pending-lane summary row.
+//
+// It is a switch, not a positional table beside render_geom_name, and that is the
+// whole point: the positional version had eight entries for an eleven-lane enum,
+// so it read past the end of the literal whenever enough lanes were pending at
+// once — a segfault from formatting a garbage string pointer, reachable only
+// after enough geometry edits to light up the high lanes. A switch against the
+// enum cannot drift: adding a lane is a compile error here, not an out-of-bounds
+// read three frames later.
+render_geom_short_name :: proc(p: Render_Geom_Prop) -> string {
+	switch p {
+	case .Trans_X:
+		return "X"
+	case .Trans_Y:
+		return "Y"
+	case .Scale:
+		return "Scale"
+	case .Crop_L:
+		return "L"
+	case .Crop_R:
+		return "R"
+	case .Crop_T:
+		return "T"
+	case .Crop_B:
+		return "B"
+	case .Opacity:
+		return "Opac"
+	case .Zoom:
+		return "Zoom"
+	case .Pan_X:
+		return "PanX"
+	case .Pan_Y:
+		return "PanY"
+	case ._COUNT:
+		unreachable()
+	}
+	return ""
+}
+
 render_geom_name :: proc(p: Render_Geom_Prop) -> string {
 	switch p {
 	case .Trans_X:

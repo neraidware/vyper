@@ -66,8 +66,10 @@ UI_Text_Buffers :: struct {
 	kf_frame:    [64]u8,
 	kf_val:      [64]u8,
 	// "keyframe all modified" row: the heading and the pending-lane list.
-	// Seven lanes plus separators is well under this, and a fixed buffer keeps
-	// the row from allocating a string every frame the inspector is drawn.
+	// Eleven lanes plus separators is 47 bytes (28 of names, 20 of ", "), so 64
+	// still fits with room for the NUL. The bound is asserted at the write rather
+	// than trusted from this comment — the comment was what said "seven lanes"
+	// while the table behind it had eight and the enum had eleven.
 	kf_pending:      [64]u8,
 	kf_pending_list: [64]u8,
 	// The inspector's clip-name label, cut to fit the name field. A display
@@ -607,7 +609,6 @@ geom_key_pending_labels :: proc(cl: ^Clip, any: bool) -> string {
 	if !any {
 		return "none"
 	}
-	short := []string{"X", "Y", "Scale", "L", "R", "T", "B", "Opac"}
 	buf := ui_text.kf_pending_list[:]
 	n := 0
 	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
@@ -617,8 +618,12 @@ geom_key_pending_labels :: proc(cl: ^Clip, any: bool) -> string {
 		if n > 0 {
 			n += len(fmt.bprintf(buf[n:], ", "))
 		}
-		n += len(fmt.bprintf(buf[n:], "%s", short[i]))
+		n += len(fmt.bprintf(buf[n:], "%s", render_geom_short_name(Render_Geom_Prop(i))))
 	}
+	// fmt.bprintf truncates silently, so a lane too long for the buffer would draw
+	// a clipped list with nothing on screen to say so. Assert instead: the whole
+	// set must render, or the buffer needs sizing against _COUNT.
+	assert(n <= len(buf), "ui: pending-lane list truncated — size kf_pending_list from _COUNT")
 	return string(buf[:n])
 }
 

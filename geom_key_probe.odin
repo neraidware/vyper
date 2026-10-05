@@ -1145,6 +1145,19 @@ geom_key_probe_run :: proc() -> int {
 	// is the mistake an earlier draft of this case made, and it fails for the
 	// unzoomed case only because the two insets happen to be equal there.
 	win_w :: proc(w: Source_Window) -> f32 { return 1 - w.l - w.r }
+
+// geom_key_pending_count is how many lanes are pending on a clip. The UI only
+// ever needs the list, so nothing in the app had a count — which is why the
+// eight-entry table survived an eleven-lane enum: no code path compared the two.
+geom_key_pending_count :: proc(cl: ^Clip) -> int {
+	n := 0
+	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
+		if clip_geom_key_modified(cl, Render_Geom_Prop(i)) {
+			n += 1
+		}
+	}
+	return n
+}
 	win_h :: proc(w: Source_Window) -> f32 { return 1 - w.t - w.b }
 	{
 		geom: Geom_Sample
@@ -1362,6 +1375,47 @@ geom_key_probe_run :: proc() -> int {
 			kf_approx(clip_geom_get(cl, .Pan_Y), geom_pan_range(geom).y_hi),
 			"the y lane must stop at its own limit (got %v)",
 			clip_geom_get(cl, .Pan_Y),
+		)
+	}
+
+	// --- the inspector's pending-lane summary must render EVERY lane. It read
+	// past the end of an eight-entry name table whenever nine or more lanes were
+	// pending, formatting a garbage string pointer: a segfault reachable only
+	// after enough geometry edits to light the high lanes, which is why it needed
+	// a real project with a few crop and scale edits rather than any probe.
+	// Marking all lanes pending is the only way in, and the count is asserted
+	// rather than assumed.
+	{
+		cl := geom_key_fixture()
+		for i in 0 ..< int(Render_Geom_Prop._COUNT) {
+			cl.geom_modified |= 1 << uint(i)
+		}
+		geom_key_check(
+			geom_key_pending_count(cl) == int(Render_Geom_Prop._COUNT),
+			"fixture: all %v lanes must be pending, got %v",
+			int(Render_Geom_Prop._COUNT),
+			geom_key_pending_count(cl),
+		)
+		// Every lane's short name must exist and be non-empty, which is the
+		// exhaustiveness the positional table lacked.
+		for i in 0 ..< int(Render_Geom_Prop._COUNT) {
+			sn := render_geom_short_name(Render_Geom_Prop(i))
+			geom_key_check(len(sn) > 0, "lane %v has no short name", i)
+		}
+		labels := geom_key_pending_labels(cl, true)
+		geom_key_check(
+			labels == "X, Y, Scale, L, R, T, B, Opac, Zoom, PanX, PanY",
+			"pending-lane summary must name all %v lanes, got %q",
+			int(Render_Geom_Prop._COUNT),
+			labels,
+		)
+		// And it must fit the fixed buffer with room to spare, since a silent
+		// truncation here would look like a correct short list.
+		geom_key_check(
+			len(labels) < len(ui_text.kf_pending_list),
+			"pending-lane summary (%d bytes) must fit kf_pending_list (%d)",
+			len(labels),
+			len(ui_text.kf_pending_list),
 		)
 	}
 
