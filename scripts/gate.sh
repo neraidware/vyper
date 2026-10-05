@@ -1401,6 +1401,39 @@ target_audio_drift_parity() {
 	echo "audio-drift-parity: ok"
 }
 
+# audio_stall_gap is the only probe that exercises the TRANSPORT rather than the
+# mixers, and it exists to demonstrate the claim the audio-master design rests on:
+# a producer stall costs the listener a GAP and no subsequent offset.
+#
+# It cannot be provoked from outside. SIGSTOP freezes the device callback too --
+# it is in-process -- so freezing the process is not a producer-only stall. So the
+# device is SIMULATED (a software ring behind audio_device_push/_queued/
+# _available/_clear) and the probe runs in real time, draining the simulation at
+# exactly the bus rate. The producer under test is the real one, and a "stall" is
+# the probe declining to call it, which is the condition being claimed about.
+#
+# Asserted every tick outside the stall: dev_pos == fed - queued; and on EVERY tick,
+# including the stall: the resync count does not move. That last one is the whole
+# claim -- a resync re-anchors, and a re-anchor is a silent shift of the playhead,
+# which is the single thing this design cannot tolerate. The probe also requires
+# that the device actually ran dry and that the queue climbed back to the cushion,
+# so it cannot pass by doing nothing.
+target_audio_stall_gap() {
+	require_fresh_binary audio-stall-gap || return 1
+	local src=target/mixparity/long.m4a
+	if [ ! -s "$src" ]; then
+		echo "audio-stall-gap: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
+		return 1
+	fi
+	VYPER_AUDIO_STALL_GAP="$PWD/$src|900" timeout 300 ./vyper 2>&1 | tail -2
+	local rc=${PIPESTATUS[0]}
+	if [ $rc -ne 0 ]; then
+		echo "audio-stall-gap: FAILED -- a stall did not produce a clean gap" >&2
+		return 1
+	fi
+	echo "audio-stall-gap: ok"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1414,7 +1447,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1447,6 +1480,7 @@ main() {
 	audio_export_audit) target_audio_export_audit ;;
 	audio_mix_parity) target_audio_mix_parity ;;
 	audio_drift_parity) target_audio_drift_parity ;;
+	audio_stall_gap) target_audio_stall_gap ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
@@ -1466,7 +1500,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

@@ -6063,14 +6063,48 @@ full gate is green (37 targets, valgrind invariants held), but the gate does not
 exercise the device feed path — `audio_probe`'s sim is mixer-only and never
 touches the device ring, which is exactly why this was unverifiable until now.
 
-**The missing piece.** A headless probe that drives the REAL feed loop against a
-simulated device: a software ring behind `audio_device_push` /
-`audio_device_queued` / `audio_device_available` / `audio_device_clear`, drained at
-exactly 48 kHz of simulated time, asserting per tick that
+**The missing piece — BUILT.** `audio_probe_stall_gap`, and it is now a member of
+`all`. It could not be provoked from outside, because `SIGSTOP` freezes the device
+callback too (it is in-process), so freezing the process is not a producer-only
+stall. So the device is **simulated** — a software ring behind
+`audio_device_push` / `_queued` / `_available` / `_clear` — and the probe runs in
+**real time**, draining the simulation at exactly the bus rate. The producer under
+test is the real `audio_producer_feed`, unmodified, and a "stall" is the probe
+declining to call it.
 
-1. `dev_pos == fed − queued` equals the timeline position,
-2. `playhead.frame == frame_at_sample(dev_pos)`,
-3. `starve_ticks == 0` and the resync count stays `0` for the whole run,
-4. and, deliberately stalling the producer, that the listener gets a gap with **no
-   subsequent offset** — which is the actual claim.
+Result over 420 ticks, with a 900 ms stall:
+
+```
+queue peak=12480 min=0 frames; device asked for 130 unwritten frames during the
+stall; resync=0 starve=3
+```
+
+- the queue fills to the cushion and **drains to zero** — the stall happened
+- the device asks for **130 sample-frames that were never written** — that is the gap
+- **`resync=0` throughout, including the stall** — no re-anchor, therefore no offset
+- the queue **climbs back** to the cushion, so the gap heals rather than persisting
+
+`resync=0` is the claim. A resync re-anchors, and a re-anchor is a silent shift of
+the playhead — the single thing this design cannot tolerate, and precisely what the
+old code reached for when the producer fell behind.
+
+**Three probe bugs found while building it, all vacuous-pass shaped:**
+
+- It called `audio_update`, which is the **UI side** and explicitly does no work in
+  steady state ("the producer runs on its own clock"). So nothing was ever fed, and
+  the probe reported a gap — and success — for a run in which no audio existed.
+- `audio_device_ready` gated on `rb_ready`, which a simulated device never sets, so
+  the producer returned before feeding. Same vacuous pass, one layer down.
+- The simulation ring was sized like the real one (32768), so it overflowed and
+  aborted on a fact about the **probe's** drain rate rather than about the design.
+
+And two assertions of my own were wrong before the run was right: `dev_frame` is
+published **on a feed pass**, so it is legitimately stale while the producer is
+stalled — comparing it against a live target reported ordinary advance as a stall
+artefact. And the starvation counter legitimately fires while the queue refills
+from zero after the gap, so it has to be allowed to move until the refill settles
+and is then required to stop.
+
+The probe also refuses to pass by doing nothing: it requires the device to have run
+dry AND the queue to have ended back at the cushion.
 

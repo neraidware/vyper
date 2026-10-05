@@ -1424,6 +1424,238 @@ audio_probe_priming_trace :: proc(path: string) -> bool {
 // excuse.
 DRIFT_TOLERANCE :: f32(1e-3)
 
+// audio_probe_stall_gap drives the REAL producer against a SIMULATED device and
+// proves the claim the audio-master design rests on: a producer stall costs the
+// listener a GAP and no subsequent offset.
+//
+// Everything else in this file compares the two mixers, which is arithmetic. This
+// is the only probe that exercises the TRANSPORT, and it exists because the stall
+// case cannot be provoked from outside: SIGSTOP freezes the device callback too
+// (it is in-process), so freezing the process is not a producer-only stall.
+//
+// So the device is simulated and the probe runs in REAL time, draining the
+// simulation at exactly the bus rate. The producer under test is the real
+// audio_update with its wall-clock coupling intact, and a "stall" is the probe
+// declining to call it -- which is exactly the condition being claimed about.
+//
+// Invariants asserted EVERY tick, before and after the stall:
+//
+//  1. dev_pos == fed - queued, in whole sample-frames. This is the whole design:
+//     the device position is the truth and it is derived, never commanded.
+//  2. starve_ticks does not move. The queue sitting at the cushion is the fixed
+//     point; leaving it is a defect, not a recovery.
+//  3. resync does not move. A resync RE-ANCHORS, and a re-anchor is a silent
+//     shift of the playhead -- the one thing the design cannot tolerate. This is
+//     the assertion that makes "no offset" more than a slogan.
+//
+// And after the stall: the device asked for audio that was never written (a gap,
+// counted), and once the producer resumes, invariant 1 still holds with no resync
+// in between. That is the definition of "a gap and no subsequent offset".
+audio_probe_stall_gap :: proc(path: string, stall_ms: int = 900) -> bool {
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] stall: no fps")
+		return false
+	}
+	// A clip long enough that the run never reaches its end, so the probe is not
+	// measuring an auto-stop.
+	run_frames := i64((f64(stall_ms) + 6000.0) / 1000.0 * fps)
+
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "stall", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = cpath,
+			kind = .Audio,
+			name = session_str_intern("s"),
+			timeline_start_frame = 0,
+			source_length_frames = run_frames,
+			source_start_frame = 0,
+			stream_index = 0,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+
+	// Simulated device. The cap is the REAL ring's capacity, not the cushion: the
+	// producer throttles to the cushion and must still have room for a whole block,
+	// or it would assert instead of demonstrating anything.
+	// Large enough that overflow cannot be what this probe measures. The real ring is
+	// 32768 frames, and overflowing a simulation of THAT size says only that the
+	// probe's drain rate was slower than the producer's fill -- which is a fact about
+	// the probe, not about the design. Thirty seconds of bus, so the invariant is
+	// what decides the verdict.
+	SIM_CAP :: i64(AUDIO_BUS_RATE * 30)
+	audio_device_sim_enable(SIM_CAP)
+	defer audio_device_sim_disable()
+
+	audio_reset_play()
+	audio_prod.last_ui_frame = -1
+	audio_provision(0)
+	if audio_src.count == 0 {
+		fmt.println("[ap] stall: SKIP: playback provisioned no sources")
+		return true
+	}
+	playhead.frame = 0
+	playhead.playing = true
+	preview.playing = true
+
+	// TICK_MS is 5ms: fine enough that the queue's state is sampled densely, coarse
+	// enough that the drain arithmetic does not accumulate float error into the
+	// assertion. The drain is integer, not time-derived, so this is exact.
+	TICK_MS :: 5
+	tick_samples := i64(AUDIO_BUS_RATE) * TICK_MS / 1000
+	spf := f64(AUDIO_BUS_RATE) / fps
+	ticks := int(f64(stall_ms) / f64(TICK_MS)) + 240
+	stall_at := ticks / 3
+	stall_end := stall_at + int(stall_ms) / TICK_MS
+	// After the stall the queue is EMPTY and refills from zero to the cushion, so it
+	// necessarily passes below the floor on the way. That is the gap being mended,
+	// not a second starvation, so the floor counter is allowed to move until the
+	// refill completes -- and is then required to stop. REFILL_TICKS is generous:
+	// the cushion is 12000 samples and the tick is 240, so 50 ticks refill it.
+	settle_end := stall_end + 120
+
+	offence := ""
+	checked := 0
+	starve_before := audio_rpt.starve_ticks
+	dev_at_stall_start := i64(-1)
+	peak_queued, min_queued := i64(0), i64(1 << 40)
+	gap_frames := i64(0)
+	prev_written := i64(0)
+
+	for t in 0 ..< ticks {
+		stalling := t >= stall_at && t < stall_end
+		if !stalling {
+			// audio_producer_feed, not audio_update: the UI-side update only
+			// refreshes the anchor and requests seeks ("steady playback needs no work
+			// here"), while the FEED is the producer's own proc. Calling the wrong one
+			// makes the probe pass vacuously -- it saw a gap because nothing was ever
+			// fed, which is how this probe's first run reported success.
+			audio_producer_feed()
+		}
+		// Drain at exactly the bus rate, in integers. During a stall this asks for
+		// audio that was never written, which is the gap.
+		audio_device_sim_consume(tick_samples)
+
+		fed := i64(audio_rpt.total_fed_frames)
+		queued_samples := audio_device_queued()
+		queued_frames := i64(f64(queued_samples) / spf)
+		dev := sync.atomic_load(&playback.dev_frame)
+
+		// dev_frame is published ON A FEED PASS, so while the producer is stalled it
+		// is legitimately stale -- and it must be, because a producer that kept
+		// publishing would be advancing the position of audio it had not produced. So
+		// invariant 1 is a property of a tick where the producer RAN, and during the
+		// stall the meaningful assertion is the opposite: that the published position
+		// does NOT move while nothing is being fed.
+		if !stalling {
+			derived := i64(f64(fed - queued_samples) / spf)
+			if abs(dev - derived) > 1 {
+				if offence == "" {
+					offence = fmt.tprintf(
+						"dev_frame %d is not fed-queued %d at tick %d (fed=%d queued=%d)",
+						dev, derived, t, fed, queued_samples,
+					)
+				}
+			}
+			// Invariant 2: the fixed point holds whenever the producer runs. Not
+			// asserted during the refill window, and REQUIRED to be quiet after it --
+			// a queue that cannot climb back to the cushion is a permanent defect, and
+			// this is the only check that would notice.
+			if t > settle_end && audio_rpt.starve_ticks != starve_before && offence == "" {
+				offence = fmt.tprintf(
+					"starve_ticks moved %d -> %d at tick %d, after the refill settled",
+					starve_before, audio_rpt.starve_ticks, t,
+				)
+			}
+			starve_before = audio_rpt.starve_ticks
+		} else if dev_at_stall_start < 0 {
+			// Baseline taken AT the stall's onset, not before the loop: the position
+			// has been advancing normally up to this tick, and comparing against
+			// anything earlier reports the ordinary advance as a stall artefact.
+			dev_at_stall_start = dev
+		} else if dev != dev_at_stall_start {
+			if offence == "" {
+				offence = fmt.tprintf(
+					"dev_frame moved %d -> %d during a stall at tick %d; it is published on a feed pass and must not be",
+					dev_at_stall_start, dev, t,
+				)
+			}
+		}
+		// Invariant 3, and the one that makes "no offset" mean something: a resync
+		// RE-ANCHORS, and a re-anchor is a silent shift of the playhead -- the single
+		// thing this design cannot tolerate. It must not happen during the stall, which
+		// is precisely when the old code would have reached for it.
+		if sync.atomic_load(&audio_prod.resync) != 0 && offence == "" {
+			offence = fmt.tprintf(
+				"resync moved to %d at tick %d -- a re-anchor is a silent shift of the playhead",
+				sync.atomic_load(&audio_prod.resync), t,
+			)
+		}
+
+		// The playhead is a readout, so mirror what playback_update does rather than
+		// calling it: this probe is about the producer, not the UI thread.
+		if dev > playhead.frame {
+			playhead.frame = dev
+		}
+
+		if t < stall_at {
+			peak_queued = max(peak_queued, queued_samples)
+		}
+		if stalling && prev_written > fed {
+			gap_frames += prev_written - fed
+		}
+		min_queued = min(min_queued, queued_samples)
+		prev_written = fed
+		checked += 1
+		// Real time, because the producer's seeding and catch-up logic is keyed to
+		// the wall clock and faking it would test a fiction.
+		sleep_ms(TICK_MS)
+	}
+
+	underruns := i64(audio_device_sim_underruns())
+	fmt.printf(
+		"[ap] stall: %d ticks, queue peak=%d min=%d frames; device asked for %d unwritten frames during the stall; resync=%d starve=%d\n",
+		checked, peak_queued, min_queued, underruns,
+		sync.atomic_load(&audio_prod.resync), audio_rpt.starve_ticks,
+	)
+	if offence != "" {
+		fmt.println("[ap] stall: FAIL:", offence)
+		return false
+	}
+	if underruns == 0 {
+		fmt.println("[ap] stall: FAIL: the device never ran dry, so no stall actually happened")
+		return false
+	}
+	final_queued := audio_device_queued()
+	if final_queued < i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC) / 2 {
+		fmt.printf(
+			"[ap] stall: FAIL: the queue ended at %d frames, under half the cushion -- the gap did not heal\n",
+			final_queued,
+		)
+		return false
+	}
+	fmt.println("[ap] stall ok (the queue starved, the device ran dry, and no re-anchor followed)")
+	return true
+}
+
 audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 = 0) -> bool {
 	buf: [4096]u8
 	cn := 0

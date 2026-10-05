@@ -1943,6 +1943,19 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
+	// VYPER_AUDIO_STALL_GAP=<path>|<stall_ms> -- drives the real producer against a
+	// simulated device and proves a stall costs a GAP and no subsequent offset.
+	if sg, _ := os.lookup_env_alloc("VYPER_AUDIO_STALL_GAP", context.temp_allocator); sg != "" {
+		parts := strings.split(sg, "|")
+		stall_ms := 900
+		if len(parts) >= 2 {
+			if v, ok := strconv.parse_i64(strings.trim_space(parts[1])); ok {
+				stall_ms = int(v)
+			}
+		}
+		ok: bool = audio_probe_stall_gap(strings.trim_space(parts[0]), stall_ms)
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_DRIFT_PARITY=<path>|<seconds>|<fps> -- the same comparison run
 	// continuously over a LONG span, which is the only way an ACCUMULATED position
 	// error becomes visible: locally correct, globally wrong. fps is optional and
