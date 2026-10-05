@@ -908,6 +908,20 @@ Audio_Report :: struct {
 	mix_us:       u64, // time spent inside audio_mix_frame (decode + resample + mix)
 	feed_us:      u64, // time spent in audio_producer_feed outside mix
 	min_q:        i64, // smallest queue depth (frames) seen in the window
+	// starve_ticks counts producer passes that found the device queue below a
+	// quarter of the cushion while playing, and starve_frames sums how far below.
+	// This is the invariant the whole audio-master design rests on: if the queue
+	// never starves and nothing re-anchors, the offset between the content FED and
+	// the content HEARD is zero forever -- not small, not bounded, zero.
+	//
+	// It was unmeasurable, because a starvation was silently REPAIRED: the wedge
+	// watchdog drops the backlog and the forward-skip re-anchors the producer to
+	// the extrapolated playhead. Those repairs are why the engine needs a skew
+	// alarm at all, and they are what lets a drift bug survive -- the symptom stops
+	// and the pressure to find its cause goes with it. Counting FIRST, before
+	// changing any behaviour, is what says whether the invariant already holds.
+	starve_ticks:  u64,
+	starve_frames: i64,
 	max_q:        i64, // largest queue depth (frames) seen in the window
 	// Log/env toggles. VYPER_AUDIO_LOG=ms overrides the report interval
 	// (default 1000 ms); VYPER_AUDIO_FULL=1 adds per-source fifo lines and
@@ -2005,6 +2019,9 @@ audio_producer_feed :: proc() {
 		sync.atomic_store(&audio_prod.jump_frame, 0)
 	}
 	max_queue := i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC)
+	// A quarter of the cushion: deep enough that an ordinary producer hiccup does
+	// not trip it, shallow enough to catch a real stall before the device runs dry.
+	queue_floor := max_queue / 4
 	cushion_frames := i64(AUDIO_CUSHION_SEC * f64(fps) * want_ratio + 1)
 	// The device consumes 48k stream-samples/sec regardless of rate: atempo
 	// compresses content to spf/rate output samples per frame, so queued bytes
@@ -2140,6 +2157,10 @@ audio_producer_feed :: proc() {
 		}
 		audio_rpt.push += 1
 		qnow := audio_device_queued()
+		if playhead.playing && qnow < queue_floor {
+			audio_rpt.starve_ticks += 1
+			audio_rpt.starve_frames += queue_floor - qnow
+		}
 		audio_rpt.min_q = min(audio_rpt.min_q, qnow)
 		audio_rpt.max_q = max(audio_rpt.max_q, qnow)
 		if audio_dump.pcm != nil {
@@ -2271,7 +2292,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				}
 				q_min := min(audio_rpt.min_q, queued)
 				q_max := max(audio_rpt.max_q, queued)
-				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) resync=%d rec=%d(k%d/s%d/o%d/d%d) dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
+				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) starve=%d(+%.1fms) resync=%d rec=%d(k%d/s%d/o%d/d%d) dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
 					f64(now-audio_rpt.thread_start_ns)/1e9,
 					playhead.frame, f64(playhead.frame)/fps, playhead.playing,
 					sync.atomic_load(&audio_rpt.ph_src) == 1 ? "mouse" : sync.atomic_load(&audio_rpt.ph_src) == 2 ? "auto" : "?",
@@ -2287,6 +2308,8 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					f64(audio_rpt.mix_us)/1e6, f64(audio_rpt.feed_us)/1e6,
 					cover ? 1 : 0,
 					holes_delta, holes,
+					audio_rpt.starve_ticks,
+					f64(audio_rpt.starve_frames) / f64(AUDIO_BUS_RATE) * 1000,
 					resync,
 					audio_rpt.reconciles,
 					audio_rpt.dec_kept,
