@@ -1154,28 +1154,15 @@ Render_Video_Src :: struct {
 	// blit_slots[(N-1) & 1], overlapped via the produced/consumed atomics
 	// (render_dec_pipe). Buffer lifetime: job arena, both filled per frame.
 	blit_slots:           [2]Render_Blit_Slot, // fw*fh*4 scaled frame each
-	// Crop-inset resample (P4): crop_l/r/t/b select a source sub-rect of the
-	// full-box blit that fills the display box. That resample is one RGBA→RGBA
-	// sws.scale into a fixed scratch (SIMD bilinear), not a per-pixel scalar
-	// loop. ctx is worker-owned, built at setup, freed via sws.freeContext;
-	// scratch lives in the job arena (v.rw*v.rh*4).
-	crop_ctx:             ^sws.Context,
-	crop_scratch:         []u8,
-	crop_sx, crop_sy:     c.int, // quantized source sub-rect origin (in blit px)
-	crop_sw, crop_sh:     c.int, // sws source dims (== ctx src dims)
 }
 
 // Render_Blit_Slot is one frame's worth of decode output. The producer writes
-// the full box + the geometry the worker needs to place it (crop region + dst),
-// so the worker composite never reads the decoder (v.dec) — decoder structs are
-// single-writer, owned by the producer thread alone.
+// the clip's window + the geometry the worker needs to place it, so the worker
+// composite never reads the decoder (v.dec) — decoder structs are single-writer,
+// owned by the producer thread alone.
 Render_Blit_Slot :: struct {
-	blit:   []u8, // fw*fh*4 scaled frame (crop region placed at fit_ox/oy)
-	ok:     bool, // decode+scale succeeded this round; worker skips if false
-	crop_w: c.int, // dec.crop_px_w the producer resolved (0 = no render crop)
-	crop_h: c.int, // dec.crop_px_h
-	fit_ox: c.int, // dec.fit_ox (dst placement inside the box)
-	fit_oy: c.int, // dec.fit_oy
+	blit: []u8, // fw*fh*4 scaled window
+	ok:   bool, // decode+scale succeeded this round; worker skips if false
 }
 
 // Render_Text_Src snapshots a .Text generator clip for the worker. It carries
@@ -1551,10 +1538,380 @@ Render_Audio_Src :: struct {
 	// export cannot drift from playback (it previously applied no gain at all,
 	// so a rendered file ignored the slider and its automation entirely).
 	gain:                 Audio_Gain_Snapshot,
+	// muted is true when this source contributed nothing to the previous mixed
+	// block, or has not contributed yet. It is what makes a resume-after-shortfall
+	// fade in rather than appear at full amplitude: the output has a step there
+	// whether or not the block boundary is a clip boundary, and without this the
+	// only thing that ramps is a clip edge.
+	muted:                bool,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
 	fifo:                 Audio_Ring, // converted stereo f32, content-relative
 	first48:              i64, // content 48 kHz frame of fifo's head
 	have48:               i64, // content frames produced so far (next un-produced)
+}
+
+// AUDIO_MIX_BLOCK is the mixer's fixed block, in sample-frames (512 = 10.67ms at
+// 48 kHz, and the block size REAPER, Resolve and JUCE hosts all expose as a
+// setting).
+//
+// The point is that the mixer's unit of work is NOT the video grid's. A frame is
+// 1601/1602 samples at 29.97 and 400 at 120fps, so a frame-sized mixer cannot
+// precompute anything and cannot be fed a fixed-size buffer. Mixing in blocks
+// and handing the result to a ring lets the consumer take whatever range its
+// frame covers -- including a range that straddles two blocks, which is the
+// normal case rather than an edge case.
+AUDIO_MIX_BLOCK :: 512
+
+// AUDIO_DECLICK_SAMPLES is the fade length at a source's contribution edges, in
+// sample-frames (256 = 5.3ms at 48kHz). Long enough that the derivative of the
+// fade is small next to the signal it is fading, short enough to be inaudible as
+// a fade: a click is a step, and what removes it is spreading the step over
+// enough samples that no single step is large.
+AUDIO_DECLICK_SAMPLES :: 256
+
+// render_declick is the fade SHAPE: a raised cosine, so the gain AND its slope go
+// to zero at both ends. A linear ramp would leave a slope discontinuity at each
+// end, which is itself audible on a bright signal -- it converts a click into a
+// tick. Evaluated only inside the fade, at a source's edges, so the cost is
+// O(clip boundaries) and not O(audio samples): the steady interior of a block
+// never calls it.
+render_declick :: proc(t: f32) -> f32 {
+	return (1.0 - math.cos(math.PI * t)) * 0.5
+}
+
+// render_declick_fade_in is how many of a block's n sample-frames need the fade
+// at the front, given `from_edge`: the distance in samples from the block's first
+// sample to the contribution's start edge, 0 when the block opens on the edge.
+render_declick_fade_in :: proc(from_edge: Sample_Pos, n: int) -> int {
+	if from_edge >= Sample_Pos(AUDIO_DECLICK_SAMPLES) {
+		return 0
+	}
+	return clamp(int(Sample_Pos(AUDIO_DECLICK_SAMPLES) - from_edge), 0, n)
+}
+
+// render_declick_fade_out is render_declick_fade_in at the other end: how many
+// of a block's n sample-frames need the fade before its end, given `to_edge` --
+// the distance from the block's last sample to the contribution's end edge.
+render_declick_fade_out :: proc(to_edge: Sample_Pos, n: int) -> int {
+	return render_declick_fade_in(to_edge, n)
+}
+
+// render_declick_gain is sample `s` of a block's `n`: the automation gain, faded
+// in over the first fade_in samples and out over the last fade_out.
+//
+// Named rather than written inline because the shape appears TWICE when it is
+// inline -- once ascending, once descending, with mirrored expressions -- and two
+// copies of a ramp that must agree is the kind of thing that drifts.
+//
+// Each fade is normalised by its OWN length and stepped so the ramp's argument
+// runs 1/fade .. 1 INCLUSIVE, which puts the gain at exactly g on the last faded
+// sample. Two things depend on that. A block shorter than the fade still completes
+// it rather than leaving the contribution permanently attenuated, which is what
+// measuring against the fixed AUDIO_DECLICK_SAMPLES does; and the hand-off from
+// faded to unfaded carries no step of its own. (Normalising to fade/(fade+1)
+// instead reaches only 0.99996 -- inaudible, but it makes the ramp's endpoint a
+// lie in the comment, and a probe asserting the invariant caught exactly that.)
+render_declick_gain :: proc(g: f32, s, n, fade_in, fade_out: int) -> f32 {
+	if fade_in > 0 && s < fade_in {
+		return g * render_declick(f32(s+1) / f32(fade_in))
+	}
+	if fade_out > 0 && s >= n-fade_out {
+		return g * render_declick(f32(n-s) / f32(fade_out))
+	}
+	return g
+}
+
+// RENDER_MIX_CUSHION_FRAMES is how far ahead of the consumer the mix producer
+// runs, in video frames -- the render's answer to the question playback already
+// answers with AUDIO_CUSHION_SEC. The export had none: the composite thread mixed
+// whatever the current frame needed, one frame at a time, so a decode that ran
+// late dropped that source for the whole frame and the next one started from
+// silence. 12 frames is 0.5s at 24fps and 0.1s at 120fps, both far more than
+// mixing one AUDIO_MIX_BLOCK of a few sources costs.
+RENDER_MIX_CUSHION_FRAMES :: 12
+
+// render_mix_bus_frames is the bus capacity in sample-frames, which IS the
+// cushion: the producer keeps the bus full to capacity and stalls when it is
+// full, so the depth of the cushion is the depth of the buffer and there is no
+// second number to keep in agreement with it. One extra frame so a frame still
+// fits when the bus is sitting at exactly the cushion.
+render_mix_bus_frames :: proc() -> int {
+	return (RENDER_MIX_CUSHION_FRAMES + 1) * MAX_AUDIO_FRAME_SAMPLES
+}
+
+// Render_Mix_Bus is the handover from the mix producer to the composite worker:
+// single-producer single-consumer, no mutex, no lock, no condvar.
+//
+// The position lives in exactly one place per side. `write` belongs to the
+// producer and `read` to the consumer; each is published with a release store
+// and loaded with an acquire load, and the depth is their difference. That is the
+// whole point: the previous shape kept an Audio_Ring (head/count) AND a
+// Sample_Pos pos/end beside it -- two representations of one position, which is
+// the duplicated-state-that-drifts class this repo has paid for seven times, and
+// the S2 probe could only avoid testing content because hand-seeding that ring
+// meant hand-rolling the fill beside it.
+//
+// The counters count sample-frames from the job's first frame, so they index the
+// buffer modulo its capacity and never need wrapping. A count's bus POSITION is
+// start + count, and the consumer converts once, when it computes a frame's
+// range.
+Render_Mix_Bus :: struct {
+	buf:    []f32, // interleaved stereo, frames*2 samples
+	frames: int,   // capacity in sample-frames
+	write:  i64,   // atomic: sample-frames published by the producer
+	read:   i64,   // atomic: sample-frames consumed by the worker
+}
+
+render_mix_bus_init :: proc(b: ^Render_Mix_Bus, frames: int) {
+	b.buf = make([]f32, frames * 2)
+	b.frames = frames
+	b.write = 0
+	b.read = 0
+}
+
+render_mix_bus_destroy :: proc(b: ^Render_Mix_Bus) {
+	delete(b.buf)
+	b.buf = nil
+	b.frames = 0
+}
+
+// render_mix_bus_room is producer-side only: only the producer can stall, and
+// only the consumer frees room, so this needs no lock even though `read` moves
+// underneath it.
+render_mix_bus_room :: proc(b: ^Render_Mix_Bus) -> int {
+	return b.frames - int(b.write - sync.atomic_load(&b.read))
+}
+
+// render_mix_bus_publish copies one mixed block onto the bus and releases it.
+// Producer only. Split across the wrap rather than assuming the block is
+// contiguous, because a block CAN straddle the end of the buffer.
+render_mix_bus_publish :: proc(b: ^Render_Mix_Bus, pcm: []f32, n: int) {
+	w := b.write
+	off := int(w % i64(b.frames))
+	head := min(n, b.frames - off)
+	copy(b.buf[off*2:], pcm[:head*2])
+	if head < n {
+		copy(b.buf, pcm[head*2:n*2])
+	}
+	// Release: the block above is visible to the consumer's acquire load.
+	sync.atomic_store(&b.write, w + i64(n))
+}
+
+// render_mix_bus_consume copies the n sample-frames at count `from` and advances
+// the consumer. `from` must be the consumer's own position: it walks the bus in
+// order and never skips, so a mismatch is a bug in the caller, not a recoverable
+// condition -- hence the assert rather than a hole. Returns false only when the
+// producer has not published that far yet, which is the one legitimate wait.
+render_mix_bus_consume :: proc(b: ^Render_Mix_Bus, from: i64, n: int, out: []f32) -> bool {
+	r := b.read
+	w := sync.atomic_load(&b.write)
+	assert(r == from, "mix bus consumed out of order")
+	if w - r < i64(n) {
+		return false
+	}
+	off := int(r % i64(b.frames))
+	head := min(n, b.frames - off)
+	copy(out[:head*2], b.buf[off*2:(off+head)*2])
+	if head < n {
+		copy(out[head*2:n*2], b.buf[:(n-head)*2])
+	}
+	sync.atomic_store(&b.read, r + i64(n))
+	return true
+}
+
+// Render_Mix is the export's mix bus and the producer's state. Only the mix
+// producer touches bus, holes or blocks_mixed after setup: the composite worker
+// reads the bus and nothing else, and owns the per-source audio DECODERS not at
+// all. Decoders are single-writer, so this split is also what makes it safe for
+// the producer to run ahead -- it is the only thread that can decode.
+Render_Mix :: struct {
+	bus:         Render_Mix_Bus,
+	start:       Sample_Pos, // bus position of sample-frame 0
+	num, den:    i64,
+	// holes counts blocks a source could not fill: a decode that did not keep
+	// pace with the block it was asked for. Producer-written, read after the
+	// join. It is a SAMPLE-domain count -- the frame-domain counter that shipped
+	// alongside complete distortion (`1a38d78`) could not see this class of
+	// defect at all.
+	holes:        i64,
+	blocks_mixed: i64,
+}
+
+// render_mix_step mixes as many whole blocks as the bus has room for, up to the
+// job's audio span, and returns false once the span is complete.
+//
+// It does NOT wait. Full bus and finished job are different answers, and only
+// the caller knows which one to give: the thread loop turns "full" into a yield,
+// and a probe that drives the producer and the consumer alternately turns it into
+// "let the consumer have a frame". Collapsing the two is what produced the first
+// version of this, where the producer stalled on a full bus inside a step and a
+// caller that had not yet consumed anything could never make progress -- the
+// probe deadlocked against code that works in the render, because running the
+// producer to completion and then consuming is not a sequence the render performs.
+render_mix_step :: proc(m: ^Render_Mix, job_end: Sample_Pos) -> bool {
+	block: [AUDIO_MIX_BLOCK * 2]f32
+	for {
+		cur := m.start + Sample_Pos(sync.atomic_load(&m.bus.write))
+		if cur >= job_end {
+			return false
+		}
+		room := render_mix_bus_room(&m.bus)
+		if room < AUDIO_MIX_BLOCK {
+			return true
+		}
+		n := min(AUDIO_MIX_BLOCK, room, int(job_end - cur))
+		render_mix_block(m, block[:], cur, n)
+		render_mix_bus_publish(&m.bus, block[:], n)
+	}
+}
+
+// render_mix_proc is the mix producer thread. It mixes the job's whole audio span
+// in fixed AUDIO_MIX_BLOCK blocks, keeping the bus full to its capacity, and exits
+// once it has published the last frame -- it never waits on the consumer, so the
+// worker's wait for a frame is always bounded by work the producer has already
+// been given.
+//
+// Mixed into a fixed stack block, never an allocation: this is a hot loop and a
+// surprise allocation here is the same defect as one per frame in the mixer it
+// replaces. The decode path allocates only inside FFmpeg.
+render_mix_proc :: proc(m: ^Render_Mix) {
+	block: [AUDIO_MIX_BLOCK * 2]f32
+	job_end := sample_pos_from_frames(
+		render_job.start + render_job.nframes,
+		m.num,
+		m.den,
+	)
+	for render_mix_step(m, job_end) {
+		// The bus is full: the consumer is the slow one now, which is the whole
+		// point of the cushion. Yield rather than sleep -- the wait is one frame of
+		// composite work, and a futex round trip here would cost more than the
+		// mixing it is waiting for.
+		if sync.atomic_load(&render_pipe.mix_stop) {
+			return
+		}
+		thread.yield()
+	}
+}
+
+render_mix_thread :: proc(t: ^thread.Thread) {
+	render_mix_proc(&render_mix)
+}
+
+render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
+	for i in 0 ..< n * 2 {
+		out[i] = 0
+	}
+	m.blocks_mixed += 1
+	for &a in render_job.audios {
+		if !a.dec.opened {
+			continue
+		}
+		clip_t0 := sample_pos_from_frames(a.timeline_start_frame, m.num, m.den)
+		clip_t1 := sample_pos_from_frames(a.timeline_start_frame + a.source_length_frames, m.num, m.den)
+		if at + Sample_Pos(n) <= clip_t0 || at >= clip_t1 {
+			continue // outside this clip's timeline span
+		}
+		// Clip the block to the clip's own span: a block that straddles a clip
+		// boundary contributes only the part inside it, which is what a
+		// per-frame mixer got for free by never straddling anything.
+		blk_lo := max(at, clip_t0)
+		blk_hi := min(at + Sample_Pos(n), clip_t1)
+		content := (blk_lo - clip_t0) +
+			audio_source_start_sample(a.source_start_frame, a.source_start_rate)
+		want := blk_hi - blk_lo
+		render_audio_pull(&a, i64(content + want))
+		if a.first48 > i64(content) || a.have48 < i64(content + want) {
+			// The fifo cannot cover this block. Silence for the span, counted --
+			// and NOT a silent `continue`, because the rest of the block belongs
+			// to this source and dropping it would punch a hole shaped like the
+			// source list rather than like the shortfall. The source is marked
+			// muted so that its return fades in instead of arriving at full level.
+			m.holes += 1
+			a.muted = true
+			continue
+		}
+		base := int(content - a.first48)
+		// Gain automation is keyed in timeline FRAMES, so this is the one thing
+		// that still needs a frame index -- resolved once per block, not per
+		// sample, and exactly (frame_at_sample).
+		rel := i32(frame_at_sample(blk_lo - clip_t0, m.num, m.den) - a.timeline_start_frame)
+		g := audio_gain_linear(&a.gain, rel)
+		// Where this contribution FADES. Two edges, and they are not the same
+		// thing: the clip's own span ends are the edits a listener hears, and a
+		// resume after a shortfall is an edge too even though no clip changed.
+		// Taking the earlier of the two as the start edge means a block that both
+		// resumes and opens a clip gets ONE fade, not two multiplied together.
+		fade_from := clip_t0
+		if a.muted {
+			fade_from = blk_lo
+		}
+		fade_in := render_declick_fade_in(blk_lo - fade_from, int(want))
+		fade_out := render_declick_fade_out(clip_t1 - blk_hi, int(want))
+		for s in 0 ..< int(want) {
+			l, r := ring_at(&a.fifo, base + s)
+			off := int(blk_lo - at) * 2
+			f := render_declick_gain(g, s, int(want), fade_in, fade_out)
+			out[off + s * 2 + 0] += l * f
+			out[off + s * 2 + 1] += r * f
+		}
+		a.muted = false
+		// Drop what this block consumed so the fifo stays forward-only and a long
+		// render does not accumulate whole clips.
+		drop := base + int(want)
+		if drop > 0 {
+			a.first48 += i64(drop)
+			ring_drop(&a.fifo, drop)
+		}
+	}
+}
+
+// render_mix_init points the bus at the job's rate and its first sample.
+// render_mix_depth is how many sample-frames the bus holds right now. Either
+// side may call it: depth is the difference of two published counters, so it is a
+// reading, not a mutation.
+render_mix_depth :: proc(m: ^Render_Mix) -> int {
+	return int(sync.atomic_load(&m.bus.write) - sync.atomic_load(&m.bus.read))
+}
+
+render_mix_init :: proc(m: ^Render_Mix, num, den: c.int, start: Sample_Pos) {
+	m.start = start
+	m.num = i64(num)
+	m.den = i64(den)
+	m.holes = 0
+	m.blocks_mixed = 0
+	render_mix_bus_init(&m.bus, render_mix_bus_frames())
+}
+
+// render_mix_serve_frame hands the consumer the samples for one video frame.
+//
+// The bus is already filled to the cushion by the producer, so this is a wait
+// that normally does not wait: the frame it needs was mixed long before the
+// composite got here. The wait is bounded because the producer publishes the
+// whole job's span without waiting on the consumer -- so this can only be
+// unbounded if the producer was stopped or failed, which is what mix_stop and
+// mix_fail are for. Returns the sample-frames written to `out`, or 0 when the
+// frame could not be had, which the caller must treat as a hole rather than as
+// stale audio.
+render_mix_serve_frame :: proc(
+	m: ^Render_Mix,
+	frame: i64,
+	num, den: i64,
+	out: []f32,
+) -> int {
+	b0 := sample_pos_from_frames(frame, num, den)
+	b1 := sample_pos_from_frames(frame + 1, num, den)
+	n := int(min(b1 - b0, Sample_Pos(MAX_AUDIO_FRAME_SAMPLES)))
+	if n <= 0 {
+		return 0
+	}
+	from := i64(b0 - m.start)
+	for !render_mix_bus_consume(&m.bus, from, n, out) {
+		if sync.atomic_load(&render_pipe.mix_stop) {
+			return 0
+		}
+		thread.yield()
+	}
+	return n
 }
 
 // render_audio_src_from_chip copies one committed geometry chip into the job's
@@ -1635,6 +1992,73 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 		src.geom.base[int(Render_Geom_Prop.Crop_T)],
 		src.geom.base[int(Render_Geom_Prop.Crop_B)],
 	)
+}
+
+// render_static_src_geom sizes one static clip's decode buffers (fw/fh, the
+// display rect rw/rh/ox/oy) and sets its decoder crop. A fully off-canvas clip
+// comes back with fw == 0 and nothing to decode. Pure pixel math on the clip's
+// own snapshot -- pinned by VYPER_RENDER_KF_PROBE.
+render_static_src_geom :: proc(v: ^Render_Video_Src, canvas_w, canvas_h: c.int) {
+	l, t, r, b := render_display_rect(v, canvas_w, canvas_h)
+	// Fully off-canvas: never drawn, so no decode at all.
+	if c.int(r) <= 0 || c.int(l) >= canvas_w ||
+	   c.int(b) <= 0 || c.int(t) >= canvas_h {
+		v.fw = 0
+		v.fh = 0
+		v.rw = 0
+		v.rh = 0
+	}
+	// A clip's box is `source x scale`, which for a scaled-up clip is far
+	// larger than anything it draws -- at 27x on a 1920x1082 source it is
+	// 53332x30055, and every buffer sized from that box is 6.4 GB to draw the
+	// 1920x1082 pixels actually on screen (FFmpeg refuses the size outright,
+	// which is how this reached a failed export).
+	//
+	// So the buffer is the region the clip can actually draw: the crop window
+	// (the display rect) clipped to the canvas. The crop insets are already
+	// resolved into the display rect by cropped_box_edges, and render_blit
+	// copies the buffer 1:1 onto the canvas, so the source region decoded and
+	// its mapping are the same as a full box would give -- the only thing
+	// gone is the part that was never drawn. There is no threshold and no
+	// second path: a clip whose box happens to fit the canvas gets the same
+	// numbers it always did, because the window IS the box then.
+	win_left := max(l, 0.0)
+	win_top := max(t, 0.0)
+	win_right := min(r, f32(canvas_w))
+	win_bottom := min(b, f32(canvas_h))
+	v.ox = c.int(win_left + 0.5)
+	v.oy = c.int(win_top + 0.5)
+	// Extent from the rounded window edges, then trimmed to the canvas:
+	// rounding can push it a pixel past the edge, and a column that is never
+	// drawn is not worth decoding or allocating.
+	v.rw = max(1, min(px_extent(win_right - win_left), canvas_w - v.ox))
+	v.rh = max(1, min(px_extent(win_bottom - win_top), canvas_h - v.oy))
+	v.fw = v.rw
+	v.fh = v.rh
+
+	// The window in box fractions is what the decoder crops to, and crop_dst is
+	// 0 because the allocated box IS the window: the decoded region starts at
+	// its own origin. crop_full is the window too, so there is no full-box
+	// buffer left to be the uncropped fallback.
+	cw, ch := full_box_dims(
+		v.source_w,
+		v.source_h,
+		v.geom.base[int(Render_Geom_Prop.Scale)],
+		f32(canvas_w),
+		f32(canvas_h),
+	)
+	box_left := v.geom.base[int(Render_Geom_Prop.Trans_X)] - cw / 2
+	box_top := v.geom.base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
+	v.dec.crop_fx0 = (f32(v.ox) - box_left) / cw
+	v.dec.crop_fy0 = (f32(v.oy) - box_top) / ch
+	v.dec.crop_fw = f32(v.fw) / cw
+	v.dec.crop_fh = f32(v.fh) / ch
+	v.dec.crop_dst_x = 0
+	v.dec.crop_dst_y = 0
+	v.dec.crop_dst_w = v.fw
+	v.dec.crop_dst_h = v.fh
+	v.dec.crop_full_w = v.fw
+	v.dec.crop_full_h = v.fh
 }
 
 // render_kf_geom_rect evaluates a keyed clip's animation at clip offset `off`
@@ -1736,7 +2160,15 @@ Render_Enc :: struct {
 	// every 30 fps render).
 	audio_pending:   [MAX_AUDIO_FRAME_SAMPLES * 2 + AAC_FRAME_SIZE * 2]f32,
 	audio_pending_n: int,
-	audio_sent:      i64, // total 48k samples pushed so far (pts basis)
+	audio_sent:      i64, // total 48k samples handed to the encoder (pts basis)
+	// audio_real counts only the samples the MIX produced, so it excludes the
+	// silence the flush pads the tail with. The difference is what the audio track
+	// claims as its duration, and it is not a cosmetic number: FFmpeg derives a
+	// container's duration from the LONGEST stream, so without this the padded
+	// tail makes the file claim more audio than it has and longer than its own
+	// video. Counting only the sent samples is what makes the container report the
+	// frame grid.
+	audio_real:      i64,
 }
 
 enc_cleanup :: proc(e: ^Render_Enc) {
@@ -1802,6 +2234,35 @@ enc_drain :: proc(
 		pkt.pts = avutil.rescale_q(pkt.pts, ctx.time_base, stream.time_base)
 		pkt.dts = avutil.rescale_q(pkt.dts, ctx.time_base, stream.time_base)
 		pkt.duration = avutil.rescale_q(pkt.duration, ctx.time_base, stream.time_base)
+		// Clamp the audio packet carrying flush padding to the real sample count.
+		//
+		// This has to be done HERE, on the packet, and not on AVStream.duration
+		// afterwards: the mp4 muxer ACCUMULATES packet durations into the track
+		// duration and then overwrites AVStream.duration with the result. Setting it
+		// afterwards writes to a field the muxer has already recomputed; setting it
+		// beforehand does nothing, because packets overwrite it.
+		//
+		// It matters because a container's duration comes from its LONGEST stream.
+		// With every packet claiming a whole 1024-sample AAC frame, the padded tail
+		// claimed audio that is not there -- ~/sallyface.vyproj reported 29.781333s
+		// of audio against 29.766667s of video, so the file outlasted its own
+		// picture by exactly the padding. Before the padding existed the same
+		// mismatch pointed the other way and DROPPED 320 real samples, which is
+		// worse. This makes the duration exact in both directions.
+		if stream == e.astream && e.audio_real > 0 {
+			pts_samples := avutil.rescale_q(pkt.pts, stream.time_base, {num = 1, den = 48000})
+			// The packet that CONTAINS audio_real, not the one after it: the
+			// padding sits inside the last encoded frame, so its PTS is still below
+			// the real sample count. Testing pts >= audio_real therefore never fires,
+			// which is the version that looked right and clamped nothing.
+			if pts_samples + AAC_FRAME_SIZE > e.audio_real {
+				pkt.duration = avutil.rescale_q(
+					e.audio_real - pts_samples,
+					{num = 1, den = 48000},
+					stream.time_base,
+				)
+			}
+		}
 		if ret := avfmt.interleaved_write_frame(e.fmt_ctx, pkt); ret < 0 {
 			fmt.println("interleaved_write_frame:", ff_err_str(ret))
 			avcodec.packet_unref(pkt)
@@ -2323,14 +2784,10 @@ rend_enc_video_frame_nv12 :: proc(
 	return rend_enc_send_video(e, &data, &ls, width, height, frame_index)
 }
 
-// enc_push_audio_stereo stages an interleaved stereo chunk and flushes full AAC
-// frames to the encoder.
-rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
-	// Copy into pending, converting zeros already in place.
-	for s in mix {
-		e.audio_pending[e.audio_pending_n] = s
-		e.audio_pending_n += 1
-	}
+// enc_send_pending_audio sends every WHOLE AAC frame currently staged in
+// audio_pending. Split out of rend_enc_push_audio because the tail of the export
+// needs the same loop doing a different job -- see render_enc_flush.
+enc_send_pending_audio :: proc(e: ^Render_Enc) -> bool {
 	ok := true
 	for e.audio_pending_n >= AAC_FRAME_SIZE * 2 {
 		// De-interleave the first 1024 stereo frames into the planar frame.
@@ -2362,6 +2819,18 @@ rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
 	return ok
 }
 
+// rend_enc_push_audio stages an interleaved stereo chunk and flushes full AAC
+// frames to the encoder.
+rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
+	e.audio_real += i64(len(mix) / 2)
+	// Copy into pending, converting zeros already in place.
+	for s in mix {
+		e.audio_pending[e.audio_pending_n] = s
+		e.audio_pending_n += 1
+	}
+	return enc_send_pending_audio(e)
+}
+
 // ---------------------------------------------------------------------------
 // Audio source pull (forward-only decode, 48 kHz stereo f32).
 // ---------------------------------------------------------------------------
@@ -2383,41 +2852,86 @@ render_audio_pull :: proc(a: ^Render_Audio_Src, up_to48: i64) {
 }
 
 render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> bool {
+	// Nothing of this source has reached the mix yet, so its first contribution
+	// is a fade-in from silence rather than an arrival at full level. Set here
+	// rather than defaulted, because the zero value of Render_Audio_Src has to
+	// stay useful and a struct that means "unopened" should not read as
+	// "contributed last block".
+	a.muted = true
 	overlap_start := max(a.timeline_start_frame, render_start)
-	content_sec := audio_content_sec(overlap_start - a.timeline_start_frame, a.source_start_frame, a.source_start_rate, fps)
 	if !open_audio_decoder_resampled(&a.dec, a.path, a.stream_index, RENDER_AUDIO_RATE, 2) {
 		return false
 	}
-	if !seek_audio(&a.dec, content_sec) {
+	// Where this clip's content actually begins, as an exact 48 kHz sample
+	// (audio_source_start_sample, the S1 integer path -- no float seconds).
+	content := i64(
+		audio_source_start_sample(
+			a.source_start_frame + (overlap_start - a.timeline_start_frame),
+			a.source_start_rate,
+		),
+	)
+	// Preroll: seek EARLY and decode forward, exactly as playback's
+	// audio_src_seek_anchor does.
+	//
+	// Seeking to the asked position and then labelling the fifo with wherever the
+	// decoder landed fixes the LABEL but not the CONTENT, and the export had only
+	// the label. A seek lands on a keyframe, which can be after the ask: the
+	// audio_probe fixture lands +43ms late, and that is 43ms of every clip's opening
+	// simply absent from the fifo. The mix then asks for content it does not have,
+	// `a.first48 > content` is true, and the clip's first block comes out a
+	// shortfall -- silent, counted, and audible as a gap at every cut.
+	//
+	// The label still comes from the decoder's real landing PTS rather than the
+	// asked time: labelling with the asked time compounds the seek's error over the
+	// whole render (playground's audio_provision fix, same reason).
+	if !seek_audio(&a.dec, max(0.0, f64(content)/f64(RENDER_AUDIO_RATE) - AUDIO_SEEK_PREROLL_SEC)) {
 		return false
 	}
-	// Align the fifo base to the decoder's real landing PTS, not the asked
-	// position: an AAC seek can land tens of ms off, and labeling the fifo with
-	// the asked time compounds that offset over the whole render. Same fix
-	// playback applied (audio.odin audio_provision).
-	n := decode_audio_chunk(&a.dec, content_sec)
+	n := decode_audio_chunk(&a.dec, -1.0)
 	if n <= 0 {
 		return false
 	}
 	src := &a.dec
-	real_sec :=
-		f64(
-			avutil.rescale_q(
-				src.first_ts,
-				src.stream.time_base,
-				avutil.Rational{num = 1, den = 1_000_000},
-			),
-		) /
-		1e6
-	a.first48 = i64(real_sec * f64(RENDER_AUDIO_RATE))
+	a.first48 = i64(decoder_pts_sample(src.first_ts, src.stream.time_base))
 	a.have48 = a.first48 + i64(n)
 	ring_push_pcm(&a.fifo, a.dec.s16[:n * 2], n)
+	// Decode forward until the fifo covers the clip's first content sample plus a
+	// block, so the mix's opening request is satisfied from real audio rather than
+	// from a hole the preroll was supposed to prevent.
+	render_audio_pull(a, content + AUDIO_MIX_BLOCK)
+
+	// Reaching here with the fifo starting past the content means the source cannot
+	// supply the clip's beginning at all -- the decoder's first decodable audio is
+	// after the clip's first sample. Counted and logged rather than left to become
+	// a silent hole per block: the mix will treat every one of those blocks as a
+	// shortfall, and the export ends up with a gap at every cut of that clip with
+	// nothing in the log to connect the two.
+	if a.first48 > content {
+		render_pipe.audio_preroll_miss += 1
+		if !render_preroll_logged {
+			render_preroll_logged = true
+			fmt.printf(
+				"[render] audio: %s opens %.1fms after its first clip sample; preroll could not cover it\n",
+				a.path,
+				f64(a.first48 - content) * 1000.0 / f64(RENDER_AUDIO_RATE),
+			)
+		}
+	}
 	return true
 }
 
 // ---------------------------------------------------------------------------
 // Main worker.
 // ---------------------------------------------------------------------------
+
+// render_mix is the export's mix bus. Worker-owned for the life of the job and
+// freed with the job arena, like everything else the worker allocates.
+render_mix: Render_Mix
+
+// render_preroll_logged keeps the "decoder opens after its clip's first sample"
+// warning to one line per render rather than one per clip: every clip of an
+// affected file reports it, and a project with twenty of them should say so once.
+render_preroll_logged: bool
 
 // Render_Enc_Slot is one entry of the encode ring.
 RENDER_ENC_SLOTS :: 4
@@ -2486,6 +3000,34 @@ Render_Pipeline :: struct {
 	// Encoder-thread timing, written before it exits and read after the join.
 	enc_video_ns:      i64,
 	enc_audio_ns:      i64,
+	// A3 mix producer: render_mix_proc mixes the job's whole audio span in fixed
+	// AUDIO_MIX_BLOCK blocks and keeps render_mix.bus full to
+	// RENDER_MIX_CUSHION_FRAMES, so the composite thread consumes finished audio
+	// instead of mixing whatever the current frame happens to need. Same shape as
+	// the decode producer: one atomic stop flag, one thread, joined before the
+	// audio decoders it owns are reset. The producer owns the audio decoders
+	// outright -- they are single-writer, and after this split the worker touches
+	// none of their fields.
+	mix:              ^thread.Thread,
+	mix_stop:         bool, // atomic: worker sets at EOF/cancel; producer polls
+	// mix_faulted is the producer's own panic/stop escape: if it cannot finish
+	// the span, the consumer's wait must not become unbounded, and a frame the
+	// bus never got is a hole counted rather than a render that hangs.
+	mix_faulted:      bool, // atomic: producer set
+	mix_ns:           i64, // producer-side wall time: decode + mix
+	mix_wait_ns:      i64, // ...of which was stalled waiting for the consumer
+	// audio_holes counts video frames the mix bus could not cover, plus the
+	// producer's own count of source shortfalls. Read by the render-test summary
+	// after the join. Sample-domain by construction: the bus knows in samples, so
+	// this counts the thing that actually got dropped rather than a frame-shaped
+	// proxy for it.
+	audio_holes:       i64,
+	// audio_preroll_miss counts clips whose decoder opens AFTER the clip's first
+	// sample, so the opening could not be covered by preroll and every block of it
+	// is a shortfall. Worker-written, read after the join. In samples, like every
+	// other audio number here: a frame-domain count of this is a count of the wrong
+	// thing, since the damage is a span of time inside the first frame.
+	audio_preroll_miss: i64,
 	// Sub-split of enc_video_ns for the hw-upload path probe: how much is CPU
 	// RGB->NV12 sws, how much is the sw->hw surface transfer, and how much is
 	// send+drain (encoder wait).
@@ -2602,13 +3144,6 @@ slot_idx := int(frame_idx & 1)
 			decode_into_buffer(&v.dec, slot.blit, v.fw, v.fh)
 			render_pipe.dec_scale_ns += time.now()._nsec - t_scale
 			slot.ok = true
-			// Publish the crop geometry the worker's render_blit needs; the
-			// resolution is decoder-side (can change on the first hardware
-			// frame when the crop is dropped), so it rides out with the data.
-			slot.crop_w = v.dec.crop_px_w
-			slot.crop_h = v.dec.crop_px_h
-			slot.fit_ox = v.dec.fit_ox
-			slot.fit_oy = v.dec.fit_oy
 		}
 		// Release: the slot writes above are visible to the worker's acquire
 		// load of produced before it composites frame frame_idx.
@@ -2666,6 +3201,28 @@ render_enc_flush :: proc(e: ^Render_Enc) -> bool {
 		return false
 	}
 	if render_pipe.enc_has_audio {
+		// The export's audio has to cover the WHOLE video, and the grid's last
+		// frame is almost never a whole number of AAC frames. At 60fps this
+		// project's grid is 1786*800 = 1428800 samples, which is 1395 AAC frames
+		// plus 320 -- and those 320 were staged in audio_pending and then
+		// dropped, because nothing between the last video frame and this flush
+		// ever sends a PARTIAL frame. Every export therefore came out 6.7ms short
+		// with its audio ending before its video, and the shortfall scaled with
+		// the frame rate rather than being a constant.
+		//
+		// Pad the tail to a frame boundary with silence. Silence is the right
+		// filler: it is what a decoder expects past the last real sample, it is
+		// inside the coded stream rather than a claim about the timeline, and it
+		// costs nothing -- the video track's duration is what defines the file's
+		// length, so this closes the audio to the grid instead of inventing time.
+		for e.audio_pending_n > 0 && e.audio_pending_n < AAC_FRAME_SIZE * 2 {
+			e.audio_pending[e.audio_pending_n] = 0
+			e.audio_pending_n += 1
+		}
+		if !enc_send_pending_audio(e) {
+			render_enc_fail_set("sending the padded audio tail failed")
+			return false
+		}
 		avcodec.send_frame(e.acodec_ctx, nil)
 		if !enc_drain(e, e.acodec_ctx, e.astream, e.apkt) {
 			render_enc_fail_set("audio flush failed")
@@ -2791,12 +3348,20 @@ render_worker_run :: proc() {
 				err_msg = string(render_pipe.enc_err[:render_pipe.enc_err_len])
 			}
 		}
+		// Stop+join the mix producer BEFORE the audio decoders are reset: it owns
+		// them outright (they are single-writer and the worker no longer touches
+		// them), so a reset while it is mid-decode is a use-after-free. It exits on
+		// its own once it has published the last frame, so this join is immediate
+		// on the normal path and only waits on a cancel.
+		if render_pipe.mix != nil {
+			sync.atomic_store(&render_pipe.mix_stop, true)
+			thread.destroy(render_pipe.mix)
+			render_pipe.mix = nil
+		}
+		render_pipe.audio_holes += render_mix.holes
+		render_mix_bus_destroy(&render_mix.bus)
 		enc_cleanup(&e)
 		for &v in render_job.videos {
-			if v.crop_ctx != nil {
-				sws.freeContext(v.crop_ctx)
-				v.crop_ctx = nil
-			}
 			clip_decoder_reset(&v.dec)
 		}
 		for &a in render_job.audios {
@@ -2976,101 +3541,45 @@ render_worker_run :: proc() {
 			}
 			continue
 		}
-		l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
-		v.rw = px_extent(r - l)
-		v.rh = px_extent(b - t)
-		v.ox = c.int(l + 0.5)
-		v.oy = c.int(t + 0.5)
-		// Decode the frame at the full (pre-crop) box size so the cropped
-		// region can be sampled out of it (render_blit).
-		cw, ch := full_box_dims(
-			v.source_w,
-			v.source_h,
-			v.geom.base[int(Render_Geom_Prop.Scale)],
-			f32(render_job.width),
-			f32(render_job.height),
-		)
-		v.fw = px_extent(cw)
-		v.fh = px_extent(ch)
+		render_static_src_geom(v, render_job.width, render_job.height)
 		// Fully off-canvas: never drawn, so no decode at all. The frame loop
 		// skips v.fw <= 0 before touching the decoder.
-		if c.int(r) <= 0 || c.int(l) >= render_job.width ||
-		   c.int(b) <= 0 || c.int(t) >= render_job.height {
-			v.fw = 0
-			v.fh = 0
+		if v.fw <= 0 {
 			continue
 		}
-		// Static clips decode only their visibility-cropped region, so their
-		// stage is small by construction; recording it anyway keeps the
-		// reported max meaningful for a job with no keyed clips at all.
+		// Static clips decode only the region they can draw, so their stage is
+		// canvas-sized by construction; recording it anyway keeps the reported
+		// max meaningful for a job with no keyed clips at all.
 		if v.fw > render_max_stage_w {
 			render_max_stage_w = v.fw
 		}
 		if v.fh > render_max_stage_h {
 			render_max_stage_h = v.fh
 		}
-		// Visible rect = canvas-clipped display rect. Decode and sws-scale
-		// only this region (render.odin perf brief P3) so resample work tracks
-		// the pixels that are actually drawn; the region maps 1:1 to itself
-		// because the box is the full frame at uniform scale. Each blit slot
-		// stays the full box size so the decoder's crop-dropped fallback and
-		// the uncrop paths keep working, and the crop lives in v.dec (cleared
-		// by the decoder's reset when zero).
-		vis_left := max(0, c.int(l + 0.5))
-		vis_top := max(0, c.int(t + 0.5))
-		vis_right := min(render_job.width, c.int(r + 0.5))
-		vis_bottom := min(render_job.height, c.int(b + 0.5))
-		box_left := v.geom.base[int(Render_Geom_Prop.Trans_X)] - cw / 2
-		box_top := v.geom.base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
-		box_ox := c.int(box_left + 0.5)
-		box_oy := c.int(box_top + 0.5)
-		visible_covers_box := vis_left <= box_ox && vis_top <= box_oy &&
-			vis_right >= box_ox + v.fw && vis_bottom >= box_oy + v.fh
-		if vis_right > vis_left && vis_bottom > vis_top && !visible_covers_box {
-			v.dec.crop_fx0 = (f32(vis_left) - box_left) / cw
-			v.dec.crop_fy0 = (f32(vis_top) - box_top) / ch
-			v.dec.crop_fw = (f32(vis_right) - box_left) / cw - v.dec.crop_fx0
-			v.dec.crop_fh = (f32(vis_bottom) - box_top) / ch - v.dec.crop_fy0
-			v.dec.crop_dst_x = vis_left - box_ox
-			v.dec.crop_dst_y = vis_top - box_oy
-			v.dec.crop_dst_w = vis_right - vis_left
-			v.dec.crop_dst_h = vis_bottom - vis_top
-			v.dec.crop_full_w = v.fw
-			v.dec.crop_full_h = v.fh
-		}
 		for &slot in &v.blit_slots {
 			slot.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
-		}
-		// P4: build the crop-inset resampler once. crop insets select a source
-		// sub-rect of the full-box blit that fills the display box (rw x rh).
-		// The near-identity crop is one SIMD bilinear sws.scale into a fixed
-		// scratch, replacing the old per-pixel nearest-neighbor loop. Source
-		// rect is quantized to whole blit pixels; bilinear filtering makes the
-		// sub-pixel remainder a quality improvement, not a bug.
-		crop_l := v.geom.base[int(Render_Geom_Prop.Crop_L)]
-		crop_r := v.geom.base[int(Render_Geom_Prop.Crop_R)]
-		crop_t := v.geom.base[int(Render_Geom_Prop.Crop_T)]
-		crop_b := v.geom.base[int(Render_Geom_Prop.Crop_B)]
-		if crop_l != 0 || crop_r != 0 || crop_t != 0 || crop_b != 0 {
-			// The same crop_src_rect the GPU staging path uses, over the full-box
-			// blit (which holds the same pixels the stage does). keyed_export
-			// scores the GPU result against this path, so "same crop" has to mean
-			// the same rect here, not merely a similar one.
-			csr := crop_src_rect(int(v.fw), int(v.fh), crop_l, crop_r, crop_t, crop_b)
-			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(csr.x), c.int(csr.y), c.int(csr.w), c.int(csr.h)
-			v.crop_ctx = sws.getContext(
-				c.int(csr.w), c.int(csr.h), avutil.PixelFormat.RGBA,
-				v.rw, v.rh, avutil.PixelFormat.RGBA,
-				sws.Flags{.Bilinear}, nil, nil, nil,
-			)
-			if v.crop_ctx != nil {
-				v.crop_scratch = make([]u8, int(v.rw) * int(v.rh) * 4)
-			}
 		}
 		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
 			err_msg = "failed to open video source"
 			fail = true
 			return
+		}
+		// A frame format the decoder cannot crop leaves it with no way to
+		// honor the window: the fallback decodes the WHOLE source, which would
+		// be scaled into the window and draw the entire frame squashed into
+		// this clip's slice of the canvas. Drop the clip with the reason rather
+		// than render it wrong. Every format these decoders produce is in the
+		// crop table, so this is the defensive arm.
+		if v.dec.crop_dropped {
+			fmt.printf(
+				"[render] video source %d omitted: %s cannot be cropped, so it cannot be clipped to the canvas\n",
+				i,
+				v.path,
+			)
+			v.fw = 0
+			v.fh = 0
+			v.rw = 0
+			v.rh = 0
 		}
 	}
 
@@ -3137,6 +3646,7 @@ render_worker_run :: proc() {
 	// match.
 	rfps_num, rfps_den := render_job.fps_num, render_job.fps_den
 	rfps := render_job.fps
+	mnum, mden := i64(rfps_num), i64(rfps_den)
 	spf := int(MAX_AUDIO_FRAME_SAMPLES)
 	if rfps > 0 {
 		spf = min(MAX_AUDIO_FRAME_SAMPLES, max(0, int(math.round(48000.0 / rfps))))
@@ -3144,12 +3654,24 @@ render_worker_run :: proc() {
 
 	has_audio := len(render_job.audios) > 0
 	if has_audio {
+		// The mix bus starts at the job's first sample, and its capacity IS the
+		// cushion (render_mix_bus_frames).
+		render_mix_init(
+			&render_mix,
+			rfps_num,
+			rfps_den,
+			sample_pos_from_frames(render_job.start, mnum, mden),
+		)
 		for i in 0 ..< len(render_job.audios) {
 			a := &render_job.audios[i]
 			if !render_audio_open(a, render_job.start, rfps) {
 				a.dec.opened = false
 			}
 		}
+		// Started only once every audio decoder is open: the producer owns them
+		// from here, and opening one underneath it would be a use-after-free.
+		render_pipe.mix = thread.create(render_mix_thread)
+		thread.start(render_pipe.mix)
 	}
 
 	if !render_open_output(
@@ -3220,19 +3742,13 @@ render_worker_run :: proc() {
 	//   * drawing static 1:1 clips as quads instead of CPU region copies.
 	// The CPU canvas is the drop-in fallback. It is selected (not merely the
 	// consequence of a failed create) when anything the quad path cannot yet
-	// reproduce byte-for-byte would be on the stack: a text clip, a subtitle
-	// clip, or a static clip whose crop insets need swscale bilinear (its
-	// kernel differs from blit_box on sub-pixel crops). VYPER_KEYED_GPU=0
-	// pins the CPU composite for the A/B.
+	// reproduce byte-for-byte would be on the stack: a text clip or a subtitle
+	// clip. VYPER_KEYED_GPU=0 pins the CPU composite for the A/B.
+	//
+	// Static video clips no longer disqualify the GPU path: their buffer is the
+	// canvas-clipped window and the blit is a 1:1 copy of it (render_blit), so
+	// blit_box reproduces the same pixels.
 	gpu_frame_ok := keyed_gpu_enabled && len(render_job.texts) == 0 && len(render_job.subs) == 0
-	if gpu_frame_ok {
-		for &vv in render_job.videos {
-			if !vv.geom.keyed && vv.crop_ctx != nil {
-				gpu_frame_ok = false
-				break
-			}
-		}
-	}
 	if gpu_frame_ok && gpu_resample_get() == nil {
 		gpu_frame_ok = false
 	}
@@ -3527,60 +4043,29 @@ render_worker_run :: proc() {
 
 		eslot.spf = 0
 		if has_audio && spf > 0 {
-			mix := eslot.mix
-			mem.zero(raw_data(mix), len(mix) * size_of(f32))
-			// Exact per-frame sample count: difference of consecutive 48 kHz
-			// frame boundaries, not a fixed rounded 48000/fps. For fps that
-			// don't evenly divide 48000 (23.976/29.97/59.94) this alternates
-			// (e.g. 1601/1602 at 29.97) and averages to the true rate, so the
-			// rendered audio length matches the video instead of drifting.
-			cur_spf := spf
-			if rfps > 0 {
-				b0 := audio_frame_boundary48(timeline_frame, rfps)
-				b1 := audio_frame_boundary48(timeline_frame + 1, rfps)
-				cur_spf = min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
+			// The frame's bus range, exactly. What fills it is no longer this
+			// loop's business: the mixer works in fixed AUDIO_MIX_BLOCK blocks
+			// and the bus hands back the samples this frame covers, whether that
+			// range is one block, part of three, or three and a bit. So a decode
+			// that ran late costs the bus a block's worth of work once, instead
+			// of a frame-shaped hole in the output every time it happened.
+			cur_spf := render_mix_serve_frame(
+				&render_mix,
+				timeline_frame,
+				mnum,
+				mden,
+				eslot.mix,
+			)
+			if cur_spf > 0 {
+				eslot.spf = cur_spf
+			} else {
+				// The bus could not cover this frame. Silence for it -- the
+				// alternative is feeding a stale buffer, which is how a hole
+				// becomes a burst of the previous frame's audio. The shortfall
+				// itself is already counted inside the fill.
+				mem.zero(raw_data(eslot.mix), len(eslot.mix) * size_of(f32))
+				render_pipe.audio_holes += 1
 			}
-			for aa in 0 ..< len(render_job.audios) {
-				a := &render_job.audios[aa]
-				if !a.dec.opened {
-					continue
-				}
-				if !clip_visible_at(timeline_frame, a.timeline_start_frame, a.source_length_frames) {
-					continue
-				}
-				start48 := i64(
-					audio_content_sec(timeline_frame - a.timeline_start_frame, a.source_start_frame, a.source_start_rate, rfps) *
-					f64(RENDER_AUDIO_RATE),
-				)
-				render_audio_pull(a, start48 + i64(cur_spf))
-				if start48 < a.first48 || a.have48 < start48 + i64(cur_spf) {
-					continue
-				}
-				base := int(start48 - a.first48)
-				// Per-clip gain re-evaluated at this timeline frame, so a keyed
-				// gain track automates the export exactly as it does playback
-				// (one audio_gain_linear call per source per frame; the value is
-				// constant across the frame's samples). audio_gain_linear carries
-				// the dB→linear conversion, so the slider is in dB here too.
-				g := audio_gain_linear(&a.gain, i32(timeline_frame - a.timeline_start_frame))
-				for s in 0 ..< cur_spf {
-					l, r := ring_at(&a.fifo, base + s)
-					mix[s * 2 + 0] += l * g
-					mix[s * 2 + 1] += r * g
-				}
-				// Trim the consumed fifo head so decode stays forward-only and
-				// long renders don't accumulate the whole clip in memory
-				// (mirrors playback's per-frame trim). O(1) head move, not a
-				// per-frame mem.copy of the whole queue.
-				drop := base + cur_spf
-				if drop > 0 {
-					a.first48 += i64(drop)
-					ring_drop(&a.fifo, drop)
-				}
-			}
-			// Publish the mixed PCM for the encoder thread; it owns the AAC
-			// encoder + muxer, so no encode call happens here anymore.
-			eslot.spf = cur_spf
 		}
 		if split_timing {
 			audio_ns += time.now()._nsec - loop_start
@@ -3968,6 +4453,11 @@ blend_row :: proc(dst, src: []u8, cols: int, opacity: f32) {
 	}
 }
 
+// render_blit copies a static clip's decoded window onto the canvas, clipped to
+// bounds. The window is the region the clip can draw -- the crop window clipped
+// to the canvas (render_static_src_geom) -- so it maps 1:1 onto the display
+// rect and this is one region copy with no sampling. gpu, when non-nil, draws
+// the same pixels into the GPU canvas.
 render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, slot: ^Render_Blit_Slot, gpu: ^GPU_Composite) {
 	top := max(v.oy, 0)
 	bottom := min(v.oy + v.rh, draw_h)
@@ -3976,22 +4466,13 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 	if bottom <= top || right <= left {
 		return
 	}
+	rows := bottom - top
+	cols := right - left
 	if gpu != nil {
-		rows := bottom - top
-		cols := right - left
-		srow, scol: int
-		if slot.crop_w > 0 && slot.crop_h > 0 {
-			// Decoder pre-scaled the visible region into the full box at
-			// fit_ox/oy; the clipped dst maps 1:1 back onto it.
-			srow, scol = int(slot.fit_oy), int(slot.fit_ox)
-		} else {
-			srow, scol = int(top - v.oy), int(left - v.ox)
-		}
 		if !gpu_composite_draw(
-
 			gpu,
 			raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
-			scol, srow, int(cols), int(rows),
+			0, 0, int(cols), int(rows),
 			int(left), int(top), int(cols), int(rows),
 			v.opacity,
 		) {
@@ -3999,72 +4480,8 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		}
 		return
 	}
-	if slot.crop_w > 0 && slot.crop_h > 0 {
-		// Render-path P3: the decoder already scaled only the visible region
-		// into the full box at fit_ox/oy (see Render_Video_Src setup), so this
-		// is a straight region copy — no sampling, matching the sws bilinear
-		// crop 1:1 on the region.
-		scol := slot.fit_ox
-		srow := slot.fit_oy
-		rows := bottom - top
-		cols := right - left
-		for row in 0 ..< rows {
-			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
-			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-			blend_row(dst, src, int(cols), v.opacity)
-		}
-		return
-	}
-	crop_any :=
-		v.geom.base[int(Render_Geom_Prop.Crop_L)] != 0 ||
-		v.geom.base[int(Render_Geom_Prop.Crop_R)] != 0 ||
-		v.geom.base[int(Render_Geom_Prop.Crop_T)] != 0 ||
-		v.geom.base[int(Render_Geom_Prop.Crop_B)] != 0
-	if !crop_any {
-		scol := left - v.ox
-		srow := top - v.oy
-		rows := bottom - top
-		cols := right - left
-		for row in 0 ..< rows {
-			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
-			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-			blend_row(dst, src, int(cols), v.opacity)
-		}
-		return
-	}
-	// Cropped (P4): crop insets select source sub-rect
-	// [crop_sx, crop_sy) -> [crop_sx+crop_sw, crop_sy+crop_sh) of the full-box
-	// blit, scaled to fill the display box. One SIMD bilinear sws.scale into
-	// the fixed scratch replaces the old per-pixel nearest-neighbor sampler;
-	// bilinear order is the intended quality upgrade. The dst is the canvas-
-	// clipped intersection copied out of the full display-box scratch.
-	if v.crop_ctx == nil {
-		// Degenerate crop: insets collapse the region (clip invisible).
-		return
-	}
-	src_ptr := cast([^]u8)(uintptr(raw_data(slot.blit)) +
-		uintptr((int(v.crop_sy) * int(v.fw) + int(v.crop_sx)) * 4))
-	dst_ptr := raw_data(v.crop_scratch)
-	sln: [1][^]u8 = {src_ptr}
-	ls:  [4]c.int = {c.int(v.fw) * 4, 0, 0, 0}
-	dln: [4]c.int = {c.int(v.rw) * 4, 0, 0, 0}
-	dsln: [1][^]u8 = {dst_ptr}
-	if ret := sws.scale(
-		v.crop_ctx,
-		cast([^][^]u8)&sln[0],
-		cast([^]c.int)&ls[0],
-		0, v.crop_sh,
-		cast([^][^]u8)&dsln[0],
-		cast([^]c.int)&dln[0],
-	); ret < 0 {
-		return
-	}
-	scol := left - v.ox
-	srow := top - v.oy
-	rows := bottom - top
-	cols := right - left
 	for row in 0 ..< rows {
-		src := v.crop_scratch[uint(srow + row) * uint(v.rw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+		src := slot.blit[uint(row) * uint(v.fw) * 4:][:uint(cols) * 4]
 		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
 		blend_row(dst, src, int(cols), v.opacity)
 	}

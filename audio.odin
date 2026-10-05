@@ -542,6 +542,80 @@ Play_Src :: struct {
 	seg_count:    int,
 }
 
+// Reconcile_Action is what a reconcile decided to do with one source's decoder.
+// A closed set of three, so the switch is exhaustive and a fourth case cannot be
+// added without the compiler noticing every site that handles the existing ones.
+Reconcile_Action :: enum {
+	// Keep: the decoder is still anchored to the right content, so it and its
+	// content-relative fifo carry on untouched. The overwhelmingly common case
+	// for an edit that lands away from what is playing.
+	Keep,
+	// Seek: same stream, but the content position moved, so re-anchor the
+	// existing decoder. Cheaper than Open by the cost of the file open, and the
+	// common case when the playhead is inside the clip that moved.
+	Seek,
+	// Open: a stream the producer does not have a decoder for at all.
+	Open,
+}
+
+// Reconcile_Report is what one reconcile did, per run. Read for the report line
+// and by the probe; the counts are the only honest answer to "is this thing
+// actually helping", because a design that is supposed to avoid reopens and
+// quietly reopens anyway looks exactly like one that works until it doesn't.
+Reconcile_Report :: struct {
+	kept, sought, opened, dropped: int,
+	// touched_window is true when any source's segments -- old or new -- overlap
+	// the frames the device queue still holds. That, and not the reopen count, is
+	// what decides whether the QUEUE has to be dropped: a decoder can be reused
+	// while the already-mixed audio sitting in the queue is wrong.
+	touched_window: bool,
+}
+
+// Play_Src_Snap is one provisioned source as it was BEFORE the new geometry was
+// folded in. Snapshotting first is what makes the decision possible at all: pass 1
+// of provisioning overwrites seg_count in place, so without this the old segment
+// list is gone by the time anything could ask whether the decoder still fits.
+Play_Src_Snap :: struct {
+	had_decoder:   bool,
+	old_content:   i64, // content 48 kHz sample the decoder was anchored for, -1 if none
+	action:        Reconcile_Action,
+	touched_window: bool,
+}
+
+// play_src_content_at is the 48 kHz CONTENT sample a decoder must sit at to play
+// timeline frame f, given the segment that covers it.
+//
+// This is the number a reconcile compares, and comparing it is the whole design:
+// a decoder is a forward-only stream over content positions, so it remains valid
+// exactly when this value is unchanged. Everything else about a source -- where
+// its segments start and end in the timeline, how long they are, their gains -- is
+// metadata the mix re-reads every frame, so changing any of it costs nothing as
+// long as the content the decoder is sitting on has not moved.
+play_src_content_at :: proc(seg: ^Play_Seg, f: i64) -> i64 {
+	if seg == nil {
+		return -1
+	}
+	seek_frame := max(f, seg.start_a)
+	return i64(
+		audio_content_sec(seek_frame - seg.start_a, seg.start_s, seg.start_s_rate, timeline_fps()) *
+			48000.0,
+	)
+}
+
+// play_src_touches_window reports whether any of s's segments overlap the frames
+// the device queue still holds. The queue covers roughly [playhead, next_frame],
+// so a segment inside it means already-mixed audio that this edit invalidates --
+// a decoder may be perfectly reusable while the queue in front of it is wrong.
+play_src_touches_window :: proc(s: ^Play_Src, from, to: i64) -> bool {
+	for i in 0 ..< s.seg_count {
+		sg := &s.seg[i]
+		if sg.start_a < to && sg.start_a + sg.len_a > from {
+			return true
+		}
+	}
+	return false
+}
+
 // Audio_Sources is the producer's live decoder set: one slot per source
 // stream (bounded by MAX_PLAY_AUDIO), the live count, and a one-shot overflow
 // log so silent clip-drop on that path is never invisible.
@@ -624,6 +698,31 @@ Audio_Report :: struct {
 	// is the cost of telling the engine "the timeline changed". A burst of
 	// edits that produces one provision per edit is the audio-restart storm.
 	provisions: u64,
+	// reconciles counts edits folded into the live decoder set instead of
+	// re-provisioning it, with what each one did: dec_kept decoders were left
+	// running because their content position had not moved, dec_seek were
+	// re-anchored, dec_open were opened, dec_drop released. provisions counts the
+	// from-zero opens. A design meant to avoid reopens that quietly reopens anyway
+	// is indistinguishable from one that works until it does not, which is why
+	// these are on the report line rather than in a comment.
+	reconciles: u64,
+	dec_kept:   u64,
+	dec_seek:   u64,
+	dec_open:   u64,
+	dec_drop:   u64,
+	// queue_clears counts reconciles that had to drop the device queue, i.e. the
+	// ones a user hears as a gap. It is deliberately separate from dec_open: a
+	// reconcile can keep every decoder and still have to clear, because the queue
+	// holds audio mixed for the old geometry.
+	queue_clears: u64,
+	// slots_new counts slots allocated FRESH during a build, i.e. groups that did
+	// not land in a slot already holding a decoder for that stream. It is the
+	// direct measure of the reclaim path, and the reason it exists: a reconcile
+	// that keeps a decoder is only really keeping it if the new segments landed in
+	// the slot that decoder is in. Building into a fresh slot instead leaves the
+	// real one empty and dropped, which reports as an Open for every source and
+	// looks from the outside exactly like the re-provision it replaced.
+	slots_new:   u64,
 	wedge_heal:   u64, // backlog drops when prod was queue-capped short of target
 	mix_us:       u64, // time spent inside audio_mix_frame (decode + resample + mix)
 	feed_us:      u64, // time spent in audio_producer_feed outside mix
@@ -992,8 +1091,14 @@ play_src_first_seg_at :: proc(s: ^Play_Src, f: i64) -> ^Play_Seg {
 // exactly (same path/stream, contiguous with its last segment in both timeline
 // and source), or nil when chip must start a new group. A split produces the
 // contiguous case; everything else keeps a forward-only fifo correct.
-audio_provision_find_group :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chip) -> ^Play_Src {
+audio_provision_find_group :: proc(
+	slot: ^Audio_Geom_Slot,
+	chip: ^Audio_Geom_Chip,
+	reclaim: ^[MAX_PLAY_AUDIO]bool,
+) -> ^Play_Src {
 	chip_path := audio_chip_path(slot, chip)
+	// First: continue a group this pass has already started. A split's second half
+	// lands here, which is what keeps a linked group on ONE forward-only decoder.
 	for k in 0 ..< audio_src.count {
 		g := &audio_src.slots[k]
 		if g.seg_count == 0 || g.stream_index != chip.stream_index {
@@ -1008,13 +1113,145 @@ audio_provision_find_group :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chi
 			return g
 		}
 	}
+	// Second: reclaim a slot this pass emptied that already holds a live decoder
+	// for this stream.
+	//
+	// This is load-bearing, and its absence is invisible until measured. A
+	// reconcile clears every seg_count before rebuilding, so the loop above --
+	// which requires seg_count > 0 -- cannot match anything, and the group is built
+	// in a FRESH slot at the end. The slot holding the real decoder is then left
+	// empty and dropped, and the stream that was already open gets opened again.
+	// The reconcile then reports Open for every source and looks, from the outside,
+	// exactly like the re-provision it replaced. Only one group per stream may
+	// claim a reclaimed slot; a second non-contiguous group needs its own decoder.
+	for k in 0 ..< audio_src.count {
+		if !reclaim[k] {
+			continue
+		}
+		g := &audio_src.slots[k]
+		if g.path == nil || g.stream_index != chip.stream_index {
+			continue
+		}
+		if string(g.path) != chip_path {
+			continue
+		}
+		reclaim[k] = false
+		return g
+	}
 	return nil
 }
 
-// audio_provision (re)opens one decoder per source stream, anchored so
-// play_frame is covered by that stream's first segment at or after it.
-// Producer-thread only; reads the committed double-buffered geometry slab
-// instead of live timeline memory, so it never waits on the UI thread's edits.
+// audio_build_groups folds the committed chips into one group per contiguous run
+// of a source stream, APPENDING into audio_src.slots and growing audio_src.count.
+// Every split of a linked group lands in one group, so a project with N tracks and
+// any number of splits needs N decoders.
+//
+// It opens nothing, seeks nothing, and resets nothing: it is the metadata half,
+// split out of audio_provision precisely so a reconcile can run it over a live
+// decoder set and decide afterwards what to keep. Callers must leave every slot's
+// seg_count at 0 on entry.
+//
+// A slot's decoder, fifo and cloned path are left alone -- that is the point.
+audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]bool) {
+	for i in 0 ..< slot.n {
+		chip := &slot.chip[i]
+		g := audio_provision_find_group(slot, chip, reclaim)
+		if g == nil {
+			if audio_src.count >= MAX_PLAY_AUDIO {
+				if !audio_src.overflow {
+					fmt.printf(
+						"[audio] provision: %d source streams exceed MAX_PLAY_AUDIO=%d; later clips are muted\n",
+						audio_src.count + 1,
+						MAX_PLAY_AUDIO,
+					)
+					audio_src.overflow = true
+				}
+				continue
+			}
+			audio_rpt.slots_new += 1
+			g = &audio_src.slots[audio_src.count]
+			if g.path != nil {
+				// Defensive: cloning a path over a live one would leak the
+				// cstring. A slot past the provisioned range cannot be in this
+				// state, so this should be unreachable -- which is why it is an
+				// assert on the invariant rather than a silent overwrite.
+				assert(g.path == nil, "fresh group slot already owns a path")
+			}
+			g.path = strings.clone_to_cstring(audio_chip_path(slot, chip))
+			g.stream_index = chip.stream_index
+			audio_src.count += 1
+		}
+		if g.seg_count >= MAX_PLAY_SEGMENTS {
+			continue
+		}
+		g.seg[g.seg_count] = Play_Seg{
+			start_a      = chip.timeline_start,
+			start_s      = chip.source_start,
+			start_s_rate = chip.source_rate,
+			len_a        = chip.source_len,
+			gain         = chip.gain,
+		}
+		g.seg_count += 1
+	}
+}
+
+// audio_anchor_sources resolves every group in audio_src.slots according to
+// snap[slot].action -- keep, seek or open -- then compacts out the groups with
+// nothing left to play. Producer-thread only.
+//
+// Compaction happens after every decision is made, so the decisions can be indexed
+// by the slot the snapshot was taken from; the decoder and fifo travel with the
+// struct when a slot moves.
+audio_anchor_sources :: proc(play_frame: i64, fps: f64, snap: ^[MAX_PLAY_AUDIO]Play_Src_Snap) {
+	w := 0
+	for r in 0 ..< audio_src.count {
+		s := &audio_src.slots[r]
+		seg := play_src_first_seg_at(s, play_frame)
+		if seg == nil {
+			// The whole stream is behind the playhead: no future content.
+			audio_src_reset(s)
+			continue
+		}
+		seek_frame := max(play_frame, seg.start_a)
+		content_sec := audio_content_sec(seek_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
+		switch snap[r].action {
+		case .Keep:
+			// Nothing to do. The decoder is anchored to the right content and its
+			// fifo is content-relative, so both remain correct as they are -- in
+			// particular the audio already sitting in that fifo must NOT be dropped,
+			// because it is the audio for exactly the position we are keeping.
+		case .Seek:
+			if !audio_src_seek_anchor(s, content_sec) {
+				audio_src_reset(s)
+				continue
+			}
+		case .Open:
+			if !audio_src_open(s, content_sec) {
+				audio_src_reset(s)
+				continue
+			}
+		}
+		if w != r {
+			audio_src.slots[w] = audio_src.slots[r]
+			audio_src.slots[r] = {}
+		}
+		w += 1
+	}
+	audio_src.count = w
+	sync.atomic_store(&audio_prod.src_count_ui, i64(audio_src.count))
+}
+
+// audio_provision opens one decoder per source stream from scratch, anchored so
+// play_frame is covered by that stream's first segment at or after it. This is
+// the from-zero path, for a seek or a fresh start: it throws away every decoder
+// and pays for all of them, which is correct when there is no reason to believe
+// any of them is still aimed at the right content.
+//
+// For an EDIT use audio_reconcile, which reaches the same end state while keeping
+// every decoder whose content position did not move.
+//
+// Producer-thread only; reads the committed double-buffered geometry slab instead
+// of live timeline memory, so it never waits on the UI thread's edits.
 audio_provision :: proc(play_frame: i64) {
 	sync.atomic_store(&audio_prod.provisioning, true)
 	defer sync.atomic_store(&audio_prod.provisioning, false)
@@ -1029,66 +1266,118 @@ audio_provision :: proc(play_frame: i64) {
 	// exists for. Released on every exit below.
 	slot := audio_geom_acquire()
 	defer audio_geom_release()
-	// Pass 1: fold the committed chips into one group per contiguous run of a
-	// source stream. Every split of a linked group lands in one group, so a
-	// project with N tracks and any number of splits needs N decoders.
-	for i in 0 ..< slot.n {
-		chip := &slot.chip[i]
-		g := audio_provision_find_group(slot, chip)
-		if g == nil {
-			if audio_src.count >= MAX_PLAY_AUDIO {
-				if !audio_src.overflow {
-					fmt.printf(
-						"[audio] provision: %d source streams exceed MAX_PLAY_AUDIO=%d; later clips are muted\n",
-						audio_src.count + 1, MAX_PLAY_AUDIO,
-					)
-					audio_src.overflow = true
-				}
-				continue
+	// audio_reset_play cleared every slot, so there is nothing to reclaim.
+	no_reclaim: [MAX_PLAY_AUDIO]bool
+	audio_build_groups(slot, &no_reclaim)
+	snap: [MAX_PLAY_AUDIO]Play_Src_Snap
+	for i in 0 ..< audio_src.count {
+		snap[i] = {action = .Open}
+	}
+	audio_anchor_sources(play_frame, fps, &snap)
+}
+
+// audio_reconcile folds a new geometry into the LIVE decoder set, keeping every
+// decoder whose content position is unchanged and re-anchoring only what moved.
+// Producer-thread only, on the resync generation.
+//
+// This is the answer to the cost audio_note_edit used to pay: a clip move or trim
+// went through audio_seek, which cleared the device queue and re-provisioned, and
+// re-provisioning reopens EVERY decoder synchronously -- its own comment prices
+// that at hundreds of milliseconds once several streams are open, all of it on the
+// path between the user finishing a drag and hearing the result. Gain had already
+// been given this treatment (gain_epoch / audio_gain_fold); edits had not.
+//
+// The decision is one comparison per source. A decoder is a forward-only stream
+// over content positions, so it stays valid exactly when the content position it
+// sits at is the same one it was anchored to. When it is, the decoder, its fifo
+// and the audio already in that fifo are all still correct, and nothing is opened,
+// sought, or dropped.
+//
+// Returns what it did. The caller uses touched_window to decide about the device
+// queue -- see the note there, because that is the half of a resync a user hears.
+audio_reconcile :: proc(play_frame: i64) -> Reconcile_Report {
+	rep: Reconcile_Report
+	sync.atomic_store(&audio_prod.provisioning, true)
+	defer sync.atomic_store(&audio_prod.provisioning, false)
+	audio_rpt.dbg_budget = 8
+	fps := timeline_fps()
+	slot := audio_geom_acquire()
+	defer audio_geom_release()
+
+	// Snapshot each decoder's anchor BEFORE the segment lists are rebuilt.
+	queued_to := audio_src.next_frame
+	snap: [MAX_PLAY_AUDIO]Play_Src_Snap
+	reclaim: [MAX_PLAY_AUDIO]bool
+	for i in 0 ..< audio_src.count {
+		src := &audio_src.slots[i]
+		snap[i].had_decoder = src.dec.opened
+		snap[i].old_content = play_src_content_at(play_src_first_seg_at(src, play_frame), play_frame)
+		snap[i].touched_window = play_src_touches_window(src, play_frame, queued_to)
+		src.seg_count = 0
+		// Offered back to the builder: this slot's decoder is a candidate to keep,
+		// and it has to be the slot the new segments land in for that to happen.
+		reclaim[i] = true
+	}
+	audio_build_groups(slot, &reclaim)
+
+	for i in 0 ..< audio_src.count {
+		src := &audio_src.slots[i]
+		// The segments the edit ADDS invalidate queued audio too, not just the
+		// ones it removed.
+		snap[i].touched_window =
+			snap[i].touched_window || play_src_touches_window(src, play_frame, queued_to)
+		rep.touched_window = rep.touched_window || snap[i].touched_window
+		if src.seg_count == 0 {
+			// This stream is gone from the geometry. Drop its decoder -- it is
+			// holding a file open for nothing -- but keep the count honest.
+			if snap[i].had_decoder {
+				audio_src_reset(src)
+				rep.dropped += 1
 			}
-			g = &audio_src.slots[audio_src.count]
-			g.path = strings.clone_to_cstring(audio_chip_path(slot, chip))
-			g.stream_index = chip.stream_index
-			audio_src.count += 1
-		}
-		if g.seg_count >= MAX_PLAY_SEGMENTS {
 			continue
 		}
-		g.seg[g.seg_count] = Play_Seg{
-			start_a     = chip.timeline_start,
-			start_s     = chip.source_start,
-			start_s_rate = chip.source_rate,
-			len_a       = chip.source_len,
-			gain        = chip.gain,
-		}
-		g.seg_count += 1
-	}
-	// Pass 2: open + anchor each group, compacting out any that failed. A group
-	// whose whole stream is behind the playhead has no future content and is
-	// dropped.
-	w := 0
-	for r in 0 ..< audio_src.count {
-		s := &audio_src.slots[r]
-		anchored := false
-		if seg := play_src_first_seg_at(s, play_frame); seg != nil {
-			seek_frame := max(play_frame, seg.start_a)
-			content_sec := audio_content_sec(seek_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
-			if audio_src_open(s, content_sec) {
-				anchored = true
-			}
-		}
-		if !anchored {
-			audio_src_reset(s)
+		new_content := play_src_content_at(play_src_first_seg_at(src, play_frame), play_frame)
+		if new_content < 0 {
+			// Segments exist but none covers or follows the playhead, so this
+			// source has no future content and its decoder is holding a file open
+			// for nothing. Dropped HERE rather than left to the anchor pass with a
+			// meaningless action, so that every branch below assigns an action the
+			// anchor pass will actually carry out.
+			audio_src_reset(src)
+			rep.dropped += 1
 			continue
 		}
-		if w != r {
-			audio_src.slots[w] = audio_src.slots[r]
-			audio_src.slots[r] = {}
+		if !snap[i].had_decoder {
+			// A stream this pass created: its slot index is past the ones snapshotted,
+			// so had_decoder is false and there is no decoder to keep or seek.
+			snap[i].action = .Open
+			rep.opened += 1
+		} else if new_content == snap[i].old_content {
+			snap[i].action = .Keep
+			rep.kept += 1
+		} else {
+			snap[i].action = .Seek
+			rep.sought += 1
 		}
-		w += 1
 	}
-	audio_src.count = w
-	sync.atomic_store(&audio_prod.src_count_ui, i64(audio_src.count))
+
+	// The rate graph's window holds samples mixed for the PREVIOUS geometry. It
+	// is only stale if something was re-anchored; when every decoder was kept the
+	// samples in it are the samples the kept decoders just produced.
+	if rep.sought > 0 || rep.opened > 0 {
+		atempo_reset(&audio_atempo)
+	}
+	audio_anchor_sources(play_frame, fps, &snap)
+
+	// The queue is the audible half of a resync. If it held audio this edit
+	// invalidated, those frames have to be re-fed, and the producer has to rewind
+	// to the playhead rather than carry on from next_frame -- otherwise it would
+	// skip exactly the range that was just thrown away.
+	if rep.touched_window {
+		audio_src.next_frame = play_frame
+		sync.atomic_store(&audio_prod.prod_frame, play_frame)
+	}
+	return rep
 }
 
 // audio_src_append converts n interleaved S16 frames from dec.s16 into
@@ -1140,6 +1429,21 @@ audio_src_pull :: proc(s: ^Play_Src, up_to48: i64) {
 // audio_src_open opens s's decoder and anchors it at content second
 // `content_sec` (see audio_src_seek_anchor). Returns false on open/seek failure
 // so the caller can drop the group.
+// decoder_pts_sample converts a decoded frame's PTS into a bus Sample_Pos.
+//
+// Rescaled straight from the stream's own time base into 1/48000, so it is exact
+// integer arithmetic. It replaces `i64(real_sec * 48000)` where real_sec was
+// microseconds-as-f64 divided by 1e6 -- and that is not a cosmetic change: the
+// fifo base it produces is compared against a demand that is now computed in
+// exact samples (audio_content_sample), so the two had to be brought onto the
+// same arithmetic or an off-by-one that moves with position reappears at the
+// comparison instead of at the conversion. Pinned by parity_probe property 5.
+decoder_pts_sample :: proc(ts: c.int64_t, time_base: avutil.Rational) -> Sample_Pos {
+	return Sample_Pos(
+		avutil.rescale_q(ts, time_base, avutil.Rational{num = 1, den = AUDIO_BUS_RATE}),
+	)
+}
+
 audio_src_open :: proc(s: ^Play_Src, content_sec: f64) -> bool {
 	if !open_audio_decoder_resampled(&s.dec, s.path, s.stream_index, 48000, 2) {
 		return false
@@ -1161,8 +1465,7 @@ audio_src_seek_anchor :: proc(s: ^Play_Src, content_sec: f64) -> bool {
 	if n <= 0 {
 		return false
 	}
-	real_sec := f64(avutil.rescale_q(s.dec.first_ts, s.dec.stream.time_base, avutil.Rational{num = 1, den = 1_000_000})) / 1e6
-	s.first48 = i64(real_sec * 48000)
+	s.first48 = i64(decoder_pts_sample(s.dec.first_ts, s.dec.stream.time_base))
 	s.have48 = s.first48 + i64(n)
 	audio_src_dump_dec(s, n)
 	audio_src_append(s, n)
@@ -1213,13 +1516,21 @@ clip_gain_db_at_playhead :: proc(clip: ^Clip) -> f32 {
 	return clip.gain
 }
 
-// audio_frame_boundary48 returns the exact (fractional, floor-truncated) 48kHz
-// sample index at which timeline frame `frame` begins, relative to the start
-// of the timeline (frame 0). Used to derive the true per-frame sample count
-// as a difference of boundaries, instead of a single rounded 48000/fps
-// constant that drifts over time whenever fps doesn't evenly divide 48000.
+// audio_frame_boundary48 returns the 48kHz sample index at which timeline frame
+// `frame` begins, relative to the start of the timeline (frame 0). Used to derive
+// the true per-frame sample count as a difference of boundaries, instead of a
+// single rounded 48000/fps constant that drifts over time whenever fps doesn't
+// evenly divide 48000.
+//
+// Takes the rate rather than reading project_fps() because the render path
+// passes the job's rate and the probes pass a fixture's; both must be able to
+// place a boundary at a rate that is not the live project's. The arithmetic is
+// sample_pos_from_frames -- integer, against the exact num/den -- and not
+// `i64(frame * 48000.0 / fps)`, which loses a sample on the first frame of a
+// 23.976 project (see parity_probe property 7).
 audio_frame_boundary48 :: proc(frame: i64, fps: f64) -> i64 {
-	return i64(f64(frame) * 48000.0 / fps)
+	num, den := fps_rational(fps)
+	return i64(sample_pos_from_frames(frame, i64(num), i64(den)))
 }
 
 // audio_mix_frame zeros mix[0..spf*2) and sums every covering segment's window,
@@ -1244,7 +1555,7 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if seg == nil {
 			continue
 		}
-		demand48 := i64(audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
+		demand48 := i64(audio_content_sample(frame - seg.start_a, seg.start_s, seg.start_s_rate))
 		// The fifo sits somewhere other than where this frame needs samples.
 		// Both distances are re-anchored with a seek, because a decode only
 		// substitutes when it is cheaper:
@@ -1647,14 +1958,40 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 			if evt != last_evt || !had_evt {
 				last_evt = evt
 				open_start := monotonic_ns()
-				// Drop the queue and the resampler history together, then open
-				// the gate. The gate, not a device stop/start, is what starts
-				// and stops output: the device runs for the process lifetime.
-				audio_device_clear()
+				anchor := sync.atomic_load(&audio_prod.anchor_frame)
+				if had_evt {
+					// An EDIT: reconcile, so every decoder whose content position did
+					// not move keeps running. This is the path that used to cost a
+					// full re-provision -- clearing the queue and reopening every
+					// decoder -- for a single clip move or trim.
+					rep := audio_reconcile(anchor)
+					audio_rpt.reconciles += 1
+					audio_rpt.dec_kept += u64(rep.kept)
+					audio_rpt.dec_seek += u64(rep.sought)
+					audio_rpt.dec_open += u64(rep.opened)
+					audio_rpt.dec_drop += u64(rep.dropped)
+					// The queue is the half of a resync a user actually hears, and
+					// dropping it is what a re-provision used to do
+					// unconditionally. It is only wrong when the edit invalidated
+					// audio already mixed into it -- which the reconcile knows,
+					// because it compared the segments on both sides of the change
+					// against the range the queue covers.
+					if rep.touched_window {
+						audio_device_clear()
+						audio_rpt.queue_clears += 1
+					}
+				} else {
+					// First event of the run: nothing exists to reconcile, so this
+					// is the from-zero provision.
+					audio_rpt.provisions += 1
+					// Drop the queue and the resampler history together, then open
+					// the gate. The gate, not a device stop/start, is what starts
+					// and stops output: the device runs for the process lifetime.
+					audio_device_clear()
+					audio_provision(anchor)
+				}
 				had_evt = true
 				audio_device_set_active(true)
-				audio_rpt.provisions += 1
-				audio_provision(sync.atomic_load(&audio_prod.anchor_frame))
 				// Provisioning reopens every decoder synchronously -- hundreds
 				// of ms once several sources are open. Video runs on the wall
 				// clock the whole time, so the playhead has moved past the
@@ -1711,7 +2048,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				}
 				q_min := min(audio_rpt.min_q, queued)
 				q_max := max(audio_rpt.max_q, queued)
-				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) resync=%d dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
+				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) resync=%d rec=%d(k%d/s%d/o%d/d%d) dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
 					f64(now-audio_rpt.thread_start_ns)/1e9,
 					playhead.frame, f64(playhead.frame)/fps, playhead.playing,
 					sync.atomic_load(&audio_rpt.ph_src) == 1 ? "mouse" : sync.atomic_load(&audio_rpt.ph_src) == 2 ? "auto" : "?",
@@ -1728,6 +2065,11 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					cover ? 1 : 0,
 					holes_delta, holes,
 					resync,
+					audio_rpt.reconciles,
+					audio_rpt.dec_kept,
+					audio_rpt.dec_seek,
+					audio_rpt.dec_open,
+					audio_rpt.dec_drop,
 					audio_device_rate(), audio_device_channels(), audio_device_bits(),
 					audio_device_underruns(), audio_device_clears(), audio_rpt.wedge_heal)
 				if audio_rpt.log_full {

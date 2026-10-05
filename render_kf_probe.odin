@@ -3,6 +3,7 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:math"
+import "core:sync"
 
 // Headless probe for render_kf_geom_rect (render.odin:586) — the pure
 // per-frame keyed-geometry math the compositor worker calls in
@@ -48,6 +49,86 @@ render_kf_probe_check_near :: proc(got, want, eps: f32, msg: string) {
 render_kf_fill_flat :: proc(clip: ^Clip, p: Render_Geom_Prop) -> (flat: Render_Kf_Flat) {
 	flat.n, _ = kf_geom_fill_snapshot(clip, render_geom_name(p), flat.keys[:])
 	return
+}
+
+// Static_Window_Case is one render_static_src_geom fixture. The spread matters
+// more than any single case: the invariant is that a clip's decode buffer is
+// bounded by the CANVAS whatever its scale, and the cases that catch a
+// regression are the extremes -- a huge box, a box far off-canvas, a degenerate
+// crop that collapses the region -- not the nominal one.
+Static_Window_Case :: struct {
+	name:      string,
+	src_w:     c.int,
+	src_h:     c.int,
+	canvas_w:  c.int,
+	canvas_h:  c.int,
+	scale:     f32,
+	tx, ty:    f32,
+	crop:      f32,
+}
+
+// static_window_cases returns the fixtures case I runs. The first three are the
+// project that failed (scale 27.777 far off-canvas, a 2.6x with a heavy crop, a
+// 1x filling the canvas); the rest are the edges: entirely off-canvas, a crop
+// that collapses the region, and a source larger than the canvas.
+static_window_cases :: proc() -> [6]Static_Window_Case {
+	return {
+		{
+			name = "27.777x off-canvas (the project that failed)",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 27.777141571044922, tx = 12216.802734375, ty = -6945.94140625,
+			crop = 0.610849142074585,
+		},
+		{
+			name = "2.594x with a heavy crop",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 2.593743324279785, tx = 1749.2490234375, ty = -36.69744873046875,
+			crop = 0.46571266651153564,
+		},
+		{
+			name = "1x filling the canvas",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 1.0, tx = 960, ty = 541, crop = 0,
+		},
+		{
+			name = "1x hanging off the right edge",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 1.0, tx = 2600, ty = 541, crop = 0,
+		},
+		{
+			name = "degenerate crop collapsing the region",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 1.0, tx = 960, ty = 541, crop = 0.999,
+		},
+		{
+			name = "4K source on a 1080p canvas",
+			src_w = 3840, src_h = 2160, canvas_w = 1920, canvas_h = 1080,
+			scale = 1.0, tx = 960, ty = 540, crop = 0,
+		},
+	}
+}
+
+// Mix_Bus_Case is one frame rate for the mix-bus probe, named by what it does to
+// the block/frame relationship.
+Mix_Bus_Case :: struct {
+	name:   string,
+	num:    c.int,
+	den:    c.int,
+}
+
+// mix_bus_cases spans a frame below, at, and above AUDIO_MIX_BLOCK, because the
+// only interesting rates for a fixed-block mixer are the ones where the two sizes
+// have an awkward relationship: at 120fps a frame is 400 samples and a block
+// straddles two boundaries, at 60 it is 800 and a block is smaller than a frame,
+// at 12 it is 4000 and a block never comes close.
+mix_bus_cases :: proc() -> [5]Mix_Bus_Case {
+	return {
+		{"120fps (400-sample frames, block straddles boundaries)", 120, 1},
+		{"60fps (800-sample frames)", 60, 1},
+		{"30fps (1600-sample frames)", 30, 1},
+		{"24fps (2000-sample frames)", 24, 1},
+		{"12fps (4000-sample frames)", 12, 1},
+	}
 }
 
 render_kf_probe_run :: proc() -> int {
@@ -227,7 +308,7 @@ render_kf_probe_run :: proc() -> int {
 		render_kf_probe_check_near(opBase, 0.375, 0.001, "F un-keyed opacity falls back to base")
 	}
 
-	// Case G — one evaluator, two sources. geom_sample_clip (preview, live) and
+	// Case 1.0 — one evaluator, two sources. geom_sample_clip (preview, live) and
 	// geom_sample_flat (export, the job's flat snapshot) must agree on EVERY
 	// Render_Geom_Prop lane, for a clip that keys every lane — including a crop
 	// that lives in a PACKED section (the grouped form the flat snapshot has to
@@ -282,7 +363,7 @@ render_kf_probe_run :: proc() -> int {
 			for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 				render_kf_probe_check(
 					math.abs(flat[pi] - live[pi]) <= 0.0001,
-					"G lane %s: flat export %.4f != live preview %.4f",
+					"1.0 lane %s: flat export %.4f != live preview %.4f",
 					render_geom_name(Render_Geom_Prop(pi)),
 					flat[pi],
 					live[pi],
@@ -358,6 +439,342 @@ render_kf_probe_run :: proc() -> int {
 		)
 		render_job.width, render_job.height = saved_w, saved_h
 	}
+
+	// Case I — static sizing: a clip's decode buffer is the region it can draw,
+	// not its box. These are the real numbers from the project that could not be
+	// exported at all: a 1920x1082 source at 27.777x on a 1920x1082 canvas, i.e.
+	// a 53332x30055 box (6.4 GB per RGBA buffer) to draw 1920x1082 pixels. The
+	// invariant is structural -- buffer within the canvas -- so it is pinned for
+	// a spread of scales rather than for one case.
+	for tc in static_window_cases() {
+		src := Render_Video_Src{
+			source_w = tc.src_w,
+			source_h = tc.src_h,
+			geom      = {base = kf_probe_base(1.0)},
+		}
+		src.geom.base[int(Render_Geom_Prop.Trans_X)] = tc.tx
+		src.geom.base[int(Render_Geom_Prop.Trans_Y)] = tc.ty
+		src.geom.base[int(Render_Geom_Prop.Scale)] = tc.scale
+		src.geom.base[int(Render_Geom_Prop.Crop_R)] = tc.crop
+		render_static_src_geom(&src, tc.canvas_w, tc.canvas_h)
+		label := fmt.tprintf("I %s", tc.name)
+		render_kf_probe_check(
+			src.fw > 0,
+			"%s: clip must be drawable, got fw=%d",
+			label,
+			src.fw,
+		)
+		render_kf_probe_check(
+			src.fw <= tc.canvas_w && src.fh <= tc.canvas_h,
+			"%s: buffer must fit the canvas, got %dx%d for a %dx%d canvas",
+			label,
+			src.fw,
+			src.fh,
+			tc.canvas_w,
+			tc.canvas_h,
+		)
+		render_kf_probe_check(
+			src.ox >= 0 && src.oy >= 0 &&
+				src.ox + src.rw <= tc.canvas_w && src.oy + src.rh <= tc.canvas_h,
+			"%s: display rect (%d,%d %dx%d) must sit inside the canvas",
+			label,
+			src.ox,
+			src.oy,
+			src.rw,
+			src.rh,
+		)
+		render_kf_probe_check(
+			src.dec.crop_full_w == src.fw && src.dec.crop_full_h == src.fh,
+			"%s: allocation must be the window, got crop_full %dx%d vs buffer %dx%d",
+			label,
+			src.dec.crop_full_w,
+			src.dec.crop_full_h,
+			src.fw,
+			src.fh,
+		)
+		// The decoded source region must be a real sub-rect of the source frame:
+		// fractions past 1 would read off the end of it.
+		render_kf_probe_check(
+			src.dec.crop_fx0 >= 0 && src.dec.crop_fy0 >= 0 &&
+				src.dec.crop_fx0 + src.dec.crop_fw <= 1.0 + 0.0001 &&
+				src.dec.crop_fy0 + src.dec.crop_fh <= 1.0 + 0.0001,
+			"%s: crop region must lie inside the source frame, got f=(%.4f %.4f %.4f %.4f)",
+			label,
+			src.dec.crop_fx0,
+			src.dec.crop_fy0,
+			src.dec.crop_fw,
+			src.dec.crop_fh,
+		)
+	}
+
+	// Case K — the mix bus, driven through the REAL serve path
+	// (render_mix_serve_frame: fill, take, trim).
+	//
+	// What it pins is the bus's COVERAGE and BOUNDEDNESS, which is what the
+	// exporter depends on and what the ring can get wrong on its own:
+	//   - every frame the worker asks for is covered, at any frame rate;
+	//   - the bus is TRIMMED as it is served, so it holds a cushion instead of
+	//     growing with the length of the render;
+	//   - filling stops at WHOLE blocks, so the block size stays a free choice
+	//     rather than being cut to the consumer's frame edge.
+	//
+	// Deliberately NOT pinning which sample comes back. Doing that needs the bus
+	// pre-seeded with known content AND the fill suppressed, and the attempt
+	// exposed something worth naming rather than working around: Render_Mix keeps
+	// `pos`/`end` beside Audio_Ring's `head`/`count`, which is two representations
+	// of one fact -- the "duplicated state that drifted" class this codebase has
+	// already paid for seven times. It is listed for S3, where the mix moves to
+	// its own thread and the position should live in one place. Until then, that
+	// the right pixels come out is pinned where it cannot drift: end to end on a
+	// real project (TODO.md Active 22, S2).
+	//
+	// Two things, because the S3 split made a value test possible where before it
+	// was not: publishing and consuming are now separate steps on separate
+	// threads, so the bus can be filled with KNOWN samples and read back without
+	// hand-seeding the ring -- which is exactly what was impossible while the fill
+	// and the take shared one struct's position bookkeeping, and why this case was
+	// coverage-only in S2.
+	//
+	// K1 geometry and ownership: the producer publishes the job's span and STOPS,
+	// the bus never holds more than its capacity, and every frame is served with
+	// its exact sample count.
+	//
+	// K2 the wrap, with real samples in the bus. Buffer indexing that is only
+	// right for a block which happens not to straddle the end is the failure a
+	// block-based mixer is specifically supposed to make rare -- "the bus is a
+	// ring" is an invariant to test, not a shape to assume.
+	//
+	// Rates are the ones where block and frame sizes relate awkwardly: 120fps is
+	// 400-sample frames so a block straddles two boundaries, 60 is 800, 12 is 4000.
+	// Long enough that the cushion BINDS at every rate in the table: the bus is
+	// (12+1)*MAX_AUDIO_FRAME_SAMPLES = 53248 sample-frames, and 200 frames is
+	// 80000 samples even at 120fps. A shorter render fits inside the cushion
+	// entirely, and then "the bus holds the whole span" is the correct answer --
+	// which is why this started at 20 and failed on correct code.
+	frames: i64 = 200
+	for tc in mix_bus_cases() {
+		m: Render_Mix
+		render_mix_init(&m, tc.num, tc.den, 0)
+		span := sample_pos_from_frames(frames, i64(tc.num), i64(tc.den))
+		cap := render_mix_bus_frames()
+
+		// K1: run the producer to completion first -- it mixes the whole span and
+		// returns, bounded by capacity rather than by the consumer.
+		render_job.start = 0
+		render_job.nframes = frames
+		served := 0
+		depth_max := 0
+		for f: i64 = 0; f < frames; f += 1 {
+			out := make([]f32, MAX_AUDIO_FRAME_SAMPLES * 2)
+			// Alternate producer and consumer, which is what the two threads do
+			// concurrently. Producing the whole span first is NOT a sequence the
+			// render performs: the producer fills to capacity and waits, so a
+			// caller that has consumed nothing yet gets no further audio and
+			// deadlocks. Driving both sides here keeps the probe deterministic
+			// without standing up a thread to race.
+			render_mix_step(&m, span)
+			depth_max = max(depth_max, render_mix_depth(&m))
+			// No sources: every block mixes to silence. This part is about the
+			// handoff's geometry, and K2 covers what comes back.
+			n := render_mix_serve_frame(&m, f, i64(tc.num), i64(tc.den), out)
+			want_n := int(
+				sample_pos_from_frames(f + 1, i64(tc.num), i64(tc.den)) -
+				sample_pos_from_frames(f, i64(tc.num), i64(tc.den)),
+			)
+			if n != want_n {
+				render_kf_probe_check(
+					false, "K1 %s frame %d: served %d samples, want %d", tc.name, f, n, want_n,
+				)
+				break
+			}
+			served += n
+		}
+		// Served exactly the span, sample for sample, and the bus is drained --
+		// the consumer's position and the producer's meet at the end.
+		render_kf_probe_check(
+			Sample_Pos(served) == span,
+			"K1 %s: served %d samples over %d frames, want exactly %d",
+			tc.name, served, frames, span,
+		)
+		render_kf_probe_check(
+			sync.atomic_load(&m.bus.read) == sync.atomic_load(&m.bus.write),
+			"K1 %s: bus not drained: read %d, write %d",
+			tc.name, sync.atomic_load(&m.bus.read), sync.atomic_load(&m.bus.write),
+		)
+		// Bounded by the cushion, not by the span: this is the assertion that
+		// would fail if the producer ran away from the consumer.
+		render_kf_probe_check(
+			Sample_Pos(depth_max) <= Sample_Pos(cap),
+			"K1 %s: bus peaked at %d samples, over its %d-sample capacity",
+			tc.name, depth_max, cap,
+		)
+		render_kf_probe_check(
+			Sample_Pos(depth_max) < span,
+			"K1 %s: bus peaked at %d samples, holding the whole %d-sample span",
+			tc.name, depth_max, span,
+		)
+		render_mix_bus_destroy(&m.bus)
+	}
+
+	// K2: the wrap, with values. Capacity 8, and the sequence runs 1..12 so the
+	// counters lap the buffer twice and a publication, a read, and both at once
+	// each straddle the end at least once.
+	b: Render_Mix_Bus
+	render_mix_bus_init(&b, 8)
+	out := make([]f32, 64)
+	blk: [6]f32
+
+	seq := proc(vals: ..f32) -> ([6]f32) {
+		r: [6]f32
+		for v, i in vals {
+			r[i * 2 + 0] = v
+			r[i * 2 + 1] = v
+		}
+		return r
+	}
+	expect := proc(out: []f32, first: f32, n: int, label: string) {
+		for s in 0 ..< n {
+			want := first + f32(s)
+			render_kf_probe_check(
+				out[s * 2 + 0] == want && out[s * 2 + 1] == want,
+				"%s: sample %d came back %g,%g, want %g,%g",
+				label, int(first) + s, out[s * 2 + 0], out[s * 2 + 1], want, want,
+			)
+		}
+	}
+
+	blk = seq(1, 2, 3)
+	render_mix_bus_publish(&b, blk[:], 3)
+	render_kf_probe_check(
+		render_mix_bus_consume(&b, 0, 2, out), "K2: first consume refused",
+	)
+	expect(out, 1, 2, "K2 read 1..2")
+	// 4..6 lands across the write boundary: capacity 8, so frames 6 and 7 of the
+	// buffer are the tail and frame 0 is the head.
+	blk = seq(4, 5, 6)
+	render_mix_bus_publish(&b, blk[:], 3)
+	blk = seq(7, 8, 9)
+	render_mix_bus_publish(&b, blk[:], 3)
+	// One read of 7 frames from count 2: starts at offset 2 and wraps to 0.
+	render_kf_probe_check(
+		render_mix_bus_consume(&b, 2, 7, out), "K2: wrapping consume refused",
+	)
+	expect(out, 3, 7, "K2 read 3..9")
+	// And a read that starts wrapped.
+	blk = seq(10, 11, 12)
+	render_mix_bus_publish(&b, blk[:], 3)
+	render_kf_probe_check(
+		render_mix_bus_consume(&b, 9, 3, out), "K2: wrapped consume refused",
+	)
+	expect(out, 10, 3, "K2 read 10..12")
+	render_kf_probe_check(
+		sync.atomic_load(&b.read) == sync.atomic_load(&b.write),
+		"K2: bus not drained after reading 1..12: read %d write %d",
+		sync.atomic_load(&b.read), sync.atomic_load(&b.write),
+	)
+	render_mix_bus_destroy(&b)
+
+	// Case L -- the declick envelope. What the exporter depends on is not that
+	// the ramp exists but that a contribution ARRIVES AND LEAVES AT ZERO: every
+	// step into or out of a source is a step in the output, and a step is a click.
+	// So the property pinned is the envelope's endpoints, and that it is monotonic
+	// between them -- a ramp with a bump in the middle is not a declick.
+	//
+	// The fade LENGTHS are arithmetic on a Sample_Pos distance, so they are
+	// testable here; the mixer's use of them is pinned end to end, because pinning
+	// it here would need a source with a decoder and a ring of known content, and
+	// that is the synthetic fixture trap this probe already fell into once.
+	// The shape itself: 0 at the ends, 1 in the middle, rising throughout.
+	render_kf_probe_check(render_declick(0.0) == 0.0, "L: ramp at 0 is %g, want 0", render_declick(0.0))
+	render_kf_probe_check(render_declick(1.0) == 1.0, "L: ramp at 1 is %g, want 1", render_declick(1.0))
+	prev := f32(-1)
+	for i in 0 ..= 64 {
+		v := render_declick(f32(i) / 64.0)
+		if v < prev {
+			render_kf_probe_check(false, "L: ramp is not monotonic, dipped at t=%g", f32(i)/64.0)
+			break
+		}
+		prev = v
+	}
+
+	// Fade lengths: a block opening on the edge gets the full fade, one further in
+	// gets the remainder, and one past it gets none. A block SHORTER than the fade
+	// is the case that matters most -- the ramp must fit, not be truncated.
+	render_kf_probe_check(
+		render_declick_fade_in(0, 1024) == AUDIO_DECLICK_SAMPLES,
+		"L: fade_in at the edge is %d, want the full %d",
+		render_declick_fade_in(0, 1024), AUDIO_DECLICK_SAMPLES,
+	)
+	render_kf_probe_check(
+		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES/2), 1024) == AUDIO_DECLICK_SAMPLES/2,
+		"L: fade_in halfway in is %d, want %d",
+		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES/2), 1024), AUDIO_DECLICK_SAMPLES/2,
+	)
+	render_kf_probe_check(
+		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES), 1024) == 0,
+		"L: fade_in one fade past the edge is %d, want 0",
+		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES), 1024),
+	)
+	render_kf_probe_check(
+		render_declick_fade_in(0, 16) == 16,
+		"L: fade_in in a block shorter than the fade is %d, want the block's 16",
+		render_declick_fade_in(0, 16),
+	)
+
+	// The property the whole change exists for: a whole block that is one
+	// contribution fades in at the front and out at the back, and is untouched in
+	// between.
+	n := 1024
+	fi, fo := render_declick_fade_in(0, n), render_declick_fade_out(0, n)
+	render_kf_probe_check(
+		render_declick_gain(1.0, 0, n, fi, fo) < 0.01,
+		"L: contribution starts at gain %g, want ~0",
+		render_declick_gain(1.0, 0, n, fi, fo),
+	)
+	render_kf_probe_check(
+		render_declick_gain(1.0, n-1, n, fi, fo) < 0.01,
+		"L: contribution ends at gain %g, want ~0",
+		render_declick_gain(1.0, n-1, n, fi, fo),
+	)
+	render_kf_probe_check(
+		render_declick_gain(1.0, n/2, n, fi, fo) == 1.0,
+		"L: contribution is %g mid-block, want the automation gain exactly",
+		render_declick_gain(1.0, n/2, n, fi, fo),
+	)
+	// Reaches full gain exactly at the fade's last sample, so a fade cannot leave
+	// the signal attenuated for the rest of the block.
+	render_kf_probe_check(
+		render_declick_gain(1.0, fi-1, n, fi, fo) == 1.0,
+		"L: gain at the last faded sample is %g, want exactly %g",
+		render_declick_gain(1.0, fi-1, n, fi, fo), 1.0,
+	)
+	// A fade at only one end must not touch the other.
+	render_kf_probe_check(
+		render_declick_gain(1.0, n-1, n, fi, 0) == 1.0,
+		"L: a front-only fade reached the block's end at %g, want %g",
+		render_declick_gain(1.0, n-1, n, fi, 0), 1.0,
+	)
+	// Why raised cosine and not linear: both are monotonic with the same
+	// endpoints, so the checks above cannot tell them apart -- but a linear ramp
+	// STOPS at full slope at its ends, and a slope discontinuity is itself an
+	// audible tick on a bright signal. So pin the slope: the step at the very
+	// first sample must be far smaller than the step in the middle. For a linear
+	// ramp these two are equal, which is the mutation this catches.
+	first_step := render_declick_gain(1.0, 1, n, fi, 0) - render_declick_gain(1.0, 0, n, fi, 0)
+	// The middle OF THE FADE, not of the block: past the fade every sample is
+	// unfaded and the step is zero, which passes any comparison against it.
+	mid_step := render_declick_gain(1.0, fi/2, n, fi, 0) - render_declick_gain(1.0, fi/2-1, n, fi, 0)
+	render_kf_probe_check(
+		first_step < mid_step * 0.3,
+		"L: fade starts at full slope (first step %g vs middle %g) -- that is a linear ramp",
+		first_step, mid_step,
+	)
+	// Automation gain scales the envelope rather than being replaced by it.
+	render_kf_probe_check(
+		render_declick_gain(0.25, n/2, n, fi, fo) == 0.25,
+		"L: envelope overrode the automation gain: %g, want 0.25",
+		render_declick_gain(0.25, n/2, n, fi, fo),
+	)
 
 	if render_kf_probe_fail {
 		fmt.println("[render-kf-probe] failed")

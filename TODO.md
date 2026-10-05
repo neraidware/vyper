@@ -93,6 +93,64 @@ Steps (each lands + probe + vet before the next):
       throughout `import_bg.odin`, `proxy.odin`. No `run_capture` of
       ffmpeg/ffprobe left; no `"ffmpeg"`/`"ffprobe"` string literals remain in
       the binary. Vet clean.
+- [x] S4. **A4** — declick. Shipped.
+
+      A source's contribution entering or leaving is a STEP in the mixed output,
+      and a step is a click. This applies to more than clip edges: a source that
+      comes back after a shortfall is an edge too, even though no clip changed,
+      which is why the envelope is driven by a per-source `muted` flag rather than
+      by geometry alone.
+
+      `AUDIO_DECLICK_SAMPLES = 256` (5.3ms), raised cosine, applied per source in
+      the sample domain at the contribution's edges -- fade in from the clip's span
+      start (or from the resume point, whichever is later), fade out to its span
+      end. The shape and both fade lengths live in one named proc
+      (`render_declick_gain`) because inline the shape appears twice, ascending
+      and descending, with mirrored expressions; two copies of a ramp that must
+      agree is the kind of thing that drifts.
+
+      Each fade is normalised by its OWN length and stepped so the argument runs
+      1/fade .. 1 INCLUSIVE, so the gain lands on exactly `g` at the last faded
+      sample. The probe caught the first version reaching only 0.99996 -- inaudible,
+      but it made the comment's claim a lie, and the fix is one character. It also
+      means a block shorter than the fade still completes it instead of leaving the
+      contribution permanently attenuated.
+
+      **This project cannot show the improvement, and saying so is part of the
+      result.** `~/sallyface.vyproj`'s clips TILE continuously on the timeline, so
+      there is no edit discontinuity to declick; the four places where the SOURCE
+      jumps (frames 367/1351/1513/1699, where the edit skips forward in the
+      recording) land in quiet passages, with steps of 800-1200 against a local
+      signal of 11000 and a music slew of 15209, and its only true edge -- the
+      render start -- is in silence. So the acceptance is the probe plus a direct
+      measurement, not a before/after on this project, and manufacturing a
+      synthetic project to manufacture an improvement would be the fixture trap this
+      probe already fell into once.
+
+      **Probe case L** pins the envelope's contract: it reaches 0 at both ends,
+      exactly `g` in the middle and at the last faded sample, is monotonic, scales
+      the automation gain rather than replacing it, does not reach across the block
+      when only one end is faded, and fits inside a block shorter than the fade.
+      Mutations, all caught: fade never applied, fade_in ignored, fade_out never
+      applied, ramp does not reach 1, and linear substituted for raised cosine. That
+      last one needed a slope check rather than an endpoint check -- both ramps are
+      monotonic with identical endpoints, and what distinguishes them is that a
+      linear ramp stops at full slope at its ends, which is itself an audible tick.
+      Two of those assertions failed against correct code first: one measured the
+      middle of the BLOCK rather than the middle of the FADE, where every sample is
+      unfaded and the step is zero.
+
+      **End-to-end**, `scripts/audio-verify.sh` now excludes the declick bands from
+      the correlation and checks them separately: a contribution must arrive from
+      silence, not at full level. Disabling the ramps makes it report 3 clips
+      starting at 6-13% of their level. With them, `~/sallyface.vyproj` is 10 of 10
+      regions at lag 0 with correlation 0.9996-1.0001 (it was 1.0000 against a naive
+      N x source before the ramps existed, which is precisely what the ramps are for),
+      0 holes where sound was due, -6.7ms against the frame grid (S6).
+
+      Gates: check build parity audio_probe keyed_export render_kf_probe
+      timeline_probe render_live_probe yuv_exact probe smoke render_valgrind.
+
 - [x] S4. HW decode in `Clip_Decoder`: enumerate the codec's hw configs
       (`get_hw_config`) for one with an `HW_Device_Ctx` method, create the
       device (`hwdevice_ctx_create`), attach it via `hw_device_ctx`; the decoder
@@ -109,6 +167,224 @@ Steps (each lands + probe + vet before the next):
       first because `find_decoder` returns libdav1d (sw-only) for AV1 by id —
       corrected later via `find_hw_decoder` resolving the native 'av1' decoder
       which does carry VAAPI (see note at ACCEPT, 2026-09-16).
+- [x] S6a. **A6** — AAC tail padding. Shipped.
+
+      Every export was missing its last audio samples. `rend_enc_push_audio` only
+      ever sends WHOLE 1024-sample AAC frames, and nothing between the last video
+      frame and the encoder flush sends a partial one, so whatever was staged in
+      `audio_pending` at the end was silently dropped. `~/sallyface.vyproj` at
+      60fps: the grid is 1786*800 = 1428800 samples = 1395 AAC frames + 320, and
+      the 320 were discarded -- the file's audio ended 6.7ms BEFORE its video, and
+      the shortfall scaled with the frame rate rather than being a constant.
+
+      `render_enc_flush` now pads `audio_pending` to a frame boundary with silence
+      before flushing. Silence is the right filler: it is what a decoder expects
+      past the last real sample, it lives inside the coded stream rather than being
+      a claim about the timeline, and it costs nothing -- the video track's
+      duration defines the file's length, so this closes the audio to the grid
+      instead of inventing time.
+
+      **Padding alone was not the fix, and shipping it as though it was would have
+      been a regression dressed as a repair.** With the tail padded, the track held
+      1396 AAC frames = 1429504 samples, and a container's duration comes from its
+      LONGEST stream -- so the file reported 29.781333s of audio against
+      29.766667s of video and outlasted its own picture by exactly the padding. The
+      audio had stopped being short and become long, which a player shows as a
+      frozen last frame and an encoder that ends on silence.
+
+      The duration is therefore clamped to the samples the MIX produced:
+      `e.audio_real` counts real sample-frames (never the flush padding), and
+      `enc_drain` shortens the one packet that straddles `audio_real` to the real
+      remainder. It has to be done on the packet: the mp4 muxer ACCUMULATES packet
+      durations into the track duration and overwrites `AVStream.duration` with the
+      result, so setting the stream afterwards writes to a field already recomputed
+      and setting it beforehand does nothing.
+
+      Two attempts are worth not repeating. Clamping `pts >= audio_real` looks right
+      and clamps nothing, because the padding sits INSIDE the last encoded frame --
+      that packet's PTS is still below the real sample count, so the test never
+      fires. The condition is `pts + AAC_FRAME_SIZE > audio_real`: the packet that
+      CONTAINS the boundary.
+
+      Measured on `~/sallyface.vyproj`, 60fps, grid 1786*800 = 1428800 samples:
+
+      | | before | padded only | now |
+      |---|---|---|---|
+      | audio stream duration | 29.760000s | 29.781333s | **29.766667s** |
+      | video stream duration | 29.766667s | 29.766667s | 29.766667s |
+      | container duration | 29.760000s | 29.781333s | **29.766667s** |
+      | samples vs grid | -320 | +704 | **0** |
+
+      Exact in both directions: no real sample dropped, no phantom sample claimed,
+      and every stream agrees with the frame grid. An eleventh clip region became
+      checkable when the truncation stopped eating it -- the one at frame 1699 --
+      and all 11 sit at lag 0 with 0 holes where sound is due.
+
+- [x] S6b. **A6** — render preroll. Shipped. Active 22 is now complete.
+
+      The export sought to the clip's content position and then labelled its fifo
+      from wherever the decoder landed. That fixes the LABEL and not the CONTENT,
+      and it had only the label. A seek lands on a keyframe, which can be AFTER the
+      ask -- `audio_probe` measures its own fixture landing +43ms late -- so the
+      clip's opening samples were simply not in the fifo. The mix then asked for
+      content it did not have, `a.first48 > content` was true, and the clip's first
+      block came out a shortfall: silent, counted as a hole, and audible as a gap at
+      every cut. Playback has solved this since forever in `audio_src_seek_anchor`
+      by seeking EARLY (`AUDIO_SEEK_PREROLL_SEC`) and decoding forward; the export
+      now does the same.
+
+      The content position is computed with S1's integer `audio_source_start_sample`,
+      not seconds, so the preroll target is exact rather than approximately right.
+
+      **Measured**, on a project whose clip starts 1.0s into a file whose decoder
+      seeks late (the `audio_probe` fixture, reproduced by building a one-clip
+      `.vyproj` against `target/audio_probe/src.mp4`):
+
+      | | first 10ms rms | near-silent samples of the first 480 |
+      |---|---|---|
+      | source | 2846.5 | - |
+      | with preroll | **1624.1** | 41 |
+      | without preroll | 266.7 | 141 |
+
+      Without it the clip's opening is silence. With it, the opening is present and
+      the residual near-silent samples are the S4 declick fade-in, which is supposed
+      to be there.
+
+      **The residual case is now visible instead of silent.** Preroll cannot always
+      win -- if the decoder's first decodable audio is after the clip's first sample,
+      every block of that clip is a shortfall. `render_pipe.audio_preroll_miss`
+      counts those clips in SAMPLES and logs the offset once per render, so a gap at
+      every cut of one clip connects to a cause instead of appearing as an
+      unexplained run of `audio_holes`. The measurement above shows the detector
+      working: with preroll disabled it printed `opens 2.7ms after its first clip
+      sample`.
+
+      **Sample-domain counters.** `audio_holes`, `blocks_mixed` and now
+      `audio_preroll_miss` are all sample counts. The frame-domain counter that
+      shipped alongside complete distortion (`1a38d78`) could not see this class of
+      defect: the damage is a span of time INSIDE the first frame, so a per-frame
+      tally reports it as one frame either way.
+
+- [x] S5. **A5** — edit generations: reconcile instead of re-provision. Shipped.
+
+      What it was: `audio_note_edit` -> `audio_seek` -> `resync` made the producer
+      call `audio_device_clear()` and `audio_provision`, and provisioning calls
+      `audio_reset_play()` and reopens EVERY decoder synchronously. Its own comment
+      prices that at "hundreds of ms once several sources are open". So moving or
+      trimming ONE clip restarted the whole audio stream. That is the reopen-cost
+      class that dominates the 37-commit history (10 of 37 commits), and it is the
+      single largest responsiveness defect left in playback.
+
+      Gain already had this treatment (`gain_epoch` / `audio_gain_fold`, which fold
+      new gains into provisioned segments in place so a knob drag needs no reopen).
+      Edits did not. S5 gives geometry the same mechanism.
+
+      **The whole design is one comparison.** A decoder is a forward-only stream over
+      CONTENT positions, so it stays valid exactly when the content position it sits
+      at is unchanged (`play_src_content_at`). Everything else about a source --
+      where its segments start and end in the timeline, how long they are, their
+      gains -- is metadata the mix re-reads every frame. So `audio_reconcile`
+      snapshots each decoder's anchor, rebuilds the segment lists, and picks one of
+      three actions per source: `Keep` (content unmoved -- decoder, its fifo and the
+      audio already in that fifo are all still correct), `Seek` (same stream, wrong
+      content -- re-anchor the existing decoder), `Open` (a stream with no decoder).
+
+      **The queue clear is the half a user hears, and it is now separate.** A
+      reconcile can keep every decoder and still have to drop the device queue,
+      because the queue holds audio mixed for the OLD geometry. So the clear is
+      driven by `touched_window` -- whether any source's segments, old or new,
+      overlap the frames the queue covers -- rather than by the reopen happening.
+      That is the one piece of behaviour that genuinely changed for the worse in
+      shape and better in cost: before, the clear was unconditional.
+
+      **The bug worth recording.** `audio_build_groups` has always matched a chip to
+      a group by (path, stream) plus contiguity with that group's LAST SEGMENT. A
+      reconcile clears every `seg_count` before rebuilding, so that match finds
+      nothing and each group was built in a FRESH slot at the end -- leaving the slot
+      holding the real decoder empty and dropped. The reconcile then reported `Open`
+      for every source and looked, from the outside, exactly like the re-provision it
+      replaced. `find_group` now also RECLAIMS a slot the pass emptied that already
+      holds a decoder for that stream, and the probe pins the mechanism with a
+      fresh-allocation counter rather than trusting the Keep/Open counts, which read
+      correctly by accident when there was only one source.
+
+      **Probe** (`audio_probe`, on the real producer thread, real decoders):
+        - the burst of 8 edits now costs **0** re-provisions (it asserted <= 1);
+        - an edit outside the queued window that moves no content: `kept +2,
+          opened +0, new-slots +0` -- and a second, non-contiguous group is what
+          makes that observable, since with one source a fresh allocation lands on
+          the decoder's own slot and the counts look right even when reclaim is
+          deleted;
+        - an edit that moves the content under the playhead: `sought +1,
+          opened +0` -- seeked, never reopened, which is the point of having three
+          actions instead of two;
+        - `play_src_touches_window` pinned directly on a segment spanning
+          [200,440): ahead / covering / behind / abutting.
+      Mutations, all caught: always-Keep, reclaim loop deleted, window predicate
+      forced false, content compared against a constant.
+
+      **What the probe does NOT cover, stated rather than implied.** The
+      queue-clear counter is asserted by the pure predicate rather than live,
+      because whether the queue holds anything is the audio DEVICE's business and
+      `audio_probe` runs without one -- the producer never fills, `next_frame`
+      never leaves 0, and a live assertion there would pass for the wrong reason.
+      And an earlier version of this probe asserted the queue clear live and
+      failed: not because the engine was wrong but because moving the playhead
+      without calling `audio_seek` leaves the reconcile anchoring at a stale
+      `anchor_frame`. Worth knowing before writing the next probe against this
+      path.
+
+- [ ] S6b. **A6** — render preroll + sample-domain counters.
+      Not started. `AUDIO_SEEK_PREROLL_SEC` is still 0 for the export: the first
+      block of a clip can begin at a sample the AAC seek did not land on exactly,
+      so the opening samples of every clip are whatever the decoder happened to
+      return there.
+
+- [ ] S5. **A5** — edit generations. **Not started, deliberately.**
+
+      What it is: today `audio_note_edit` -> `audio_seek` -> `resync` makes the
+      producer call `audio_device_clear()` and re-provision, and `audio_provision`
+      calls `audio_reset_play()` and reopens EVERY decoder synchronously. Its own
+      comment puts the cost at "hundreds of ms once several sources are open", and
+      notes the playhead moves past the anchor during the open. So moving or
+      trimming ONE clip restarts the whole audio stream -- a guaranteed audible
+      gap, and the cause of the reopen-cost class that dominates the 37-commit
+      history (10 of 37 commits).
+
+      The precedent to follow already exists in the same file: `gain_epoch` and
+      `audio_gain_fold` do exactly this for gain changes, folding new gains into
+      provisioned segments IN PLACE so a knob drag is audible within the cushion
+      with no reopen. Gain got a generation counter and a reconcile; edits did not.
+
+      The design, for whoever picks it up:
+        - Add `geom_epoch` to `Audio_Geom`, published after the slot swap exactly
+          as `gain_epoch` is.
+        - Split `audio_provision`'s pass 1 (fold chips into contiguous groups) from
+          its pass 2 (open + anchor). Pass 1 is pure metadata and can run against
+          a temporary group list without touching a decoder.
+        - Reconcile per source stream: a new group whose (path, stream_index)
+          matches a provisioned source, whose segments are a forward continuation
+          of that source's, and whose segment covering the playhead sits at the
+          same CONTENT position, keeps its decoder and swaps in the new segment
+          metadata. Everything else reopens as today.
+        - Make the `audio_device_clear()` conditional on the reconcile actually
+          having changed something. That clear is the audible part; the reopen is
+          the expensive part, and today they always happen together.
+      Only the decoder's CONTENT position has to stay valid. Everything else in
+      `Play_Seg` -- `start_a`, `len_a`, gain -- is metadata the mix re-reads per
+      frame, which is why a forward continuation is enough to keep the decoder.
+
+      **Why it is not started here.** This is the interactive playback path, it is
+      the highest-risk item in the section, and it cannot be validated by the
+      render gates at all -- `render_valgrind`, `parity` and `audio-verify` do not
+      exercise it. `audio_probe` synthesises media and does drive the resync path,
+      which helps, but a playback glitch is timing-dependent and a partial
+      reconcile that is subtly wrong is worse than the guaranteed gap it replaces:
+      it would desync some edits and not others, intermittently, under a load only
+      a user reproduces. Landing that needs the probe work and a review pass of its
+      own, and cutting it short would leave exactly the kind of half-migration
+      §3b forbids.
+
 - [x] S5. Original-rate preview: when decoder throughput sustains source fps,
       `proxy_pick_for_frame` resolves the original path (decode from original,
       GPU-or-sws scale to canvas). Deadline: one CPU core of air left on a
@@ -4678,6 +4954,437 @@ Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
 
+## Active 21 — A clip scaled past the canvas asked the export for a multi-gigabyte box
+
+**Why:** rendering a project with a clip at `scale = 27.777` on a 1920x1082
+canvas died at setup with
+
+```
+[IMGUTILS] Picture size 53332x30055 is invalid
+av_image_alloc failed
+```
+
+`1920 * 27.777 = 53332` and `1082 * 27.777 = 30055` — the numbers are the
+clip's own box. `full_box_dims` returns `source * scale`, and every per-clip
+buffer in the static path was sized from that box: two `blit_slots` at
+`fw*fh*4`, the decoder's RGBA box, and the crop-inset resample scratch. ~19 GB
+to draw the 1920x1082 pixels actually on screen. FFmpeg refuses the size
+outright, so the export failed on a perfectly valid clip — the user could not
+render the project at all.
+
+It is NOT a Clip-POD regression, which was the first suspicion: the value is in
+the project bytes (CBOR, track 1 clip 5), save and load both copy `scale`
+verbatim (`project_file.odin`), and `git diff 2423686~1 0592ccc --
+project_file.odin` has no hunk touching any numeric clip field.
+
+**Fix — one rule, no threshold.** A static clip's decode buffer is the region
+it can actually draw: the crop window (the display rect, which
+`cropped_box_edges` has already resolved the crop insets into) clipped to the
+canvas. `render_static_src_geom` computes it, the decoder crops to it
+(`crop_dst` at 0,0 because the allocated box IS the window), and `render_blit`
+copies it 1:1.
+
+Nothing scales with the box any more, and there is no bound to tune: the 27.777x
+clip decodes a 69x39 source region into a 1920x1082 buffer, which is exactly
+what 27.777x of a 1920x1082 source shows on a 1920x1082 canvas. When the box
+happens to fit the canvas the window IS the box, so ordinary clips get the same
+numbers they always had — not "a second path that mostly agrees", just the same
+arithmetic.
+
+Two things this deleted rather than added:
+
+- **The crop-inset resample** (`crop_ctx` / `crop_scratch` / `crop_sx..sh` and
+  its `sws.scale` in `render_blit`). It existed to sample a crop window out of a
+  full-box buffer; the buffer is now the crop window, so the resample was a
+  1:1 copy wearing a bilinear kernel. `render_blit` is one region copy, and
+  `Render_Blit_Slot` no longer carries `crop_w/h` / `fit_ox/oy` to describe a
+  placement that is always the origin.
+- **The GPU-composite disqualification for cropped static clips.** It existed
+  because the sws bilinear kernel differs from `blit_box` on sub-pixel crops.
+  With no resample there is no kernel to disagree about, so static clips no
+  longer force the CPU canvas.
+
+The first attempt at this was wrong in shape and is worth recording: it gated
+windowing behind a `RENDER_CLIP_BUFFER_FACTOR = 4` threshold and, for keyed
+clips (whose stage is sampled per frame and so cannot be windowed), capped the
+stage scale instead — trading sharpness for memory behind a policy constant,
+with a second sizing path to keep it honest. The clip never had a memory
+*policy* problem; it had a buffer that was sized from the wrong rectangle. A
+threshold is also the tell that the invariant had not been found yet: it needed
+a carve-out for the case where the rule does not hold.
+
+**Steps.**
+- [x] S1. Characterization: decoded the project with `cbor2`, confirmed
+      `scale = 27.777141571044922` is stored rather than computed on load, and
+      confirmed the load path copies it verbatim with the POD commits never
+      touching numeric clip fields.
+- [x] S2. Fix. `render_static_src_geom` extracted from the worker's inline
+      setup (the sizing was otherwise unreachable from a probe at all).
+- [x] S3. Probe. `render_kf_probe` case I runs six `static_window_cases`
+      fixtures — the failing project clip, a 2.594x with a heavy crop, a 1x
+      filling the canvas, a clip hanging off an edge, a degenerate crop, and a
+      4K source on a 1080p canvas — asserting the buffer fits the canvas, the
+      display rect sits inside it, the allocation IS the window, and the crop
+      region lies within the source frame. The spread is the point: the
+      single-case version of this probe passed three of the four ways the old
+      sizing was wrong, because a 1x clip is the one case where box == window.
+
+**Probe / mutation.** `render_kf_probe`: ok. Restoring the box-sized allocation
+fails four of the six fixtures, the first with the user's exact numbers
+(`buffer must fit the canvas, got 53332x30055`). End to end on the real
+project: trimmed to frames 180..248 and then the full 1786 frames, both
+`Render complete`; the 27.777x clip logs `[dec] crop-render src(520,791 69x39)
+dst 1920x1082` where the old code asked for 53332x30055.
+
+**Accept.** `check build render_kf_probe keyed_export zorder parity timeline_probe
+render_live_probe dnd_probe gpu_probe opacity yuv_exact probe smoke
+render_valgrind` pass (valgrind 0 definitely/indirectly lost). Output is
+byte-identical to the previous fix on the trimmed range (716275 bytes both).
+
+## Active 22 — The audio engine: a sample clock, a fixed block, and one mixer
+
+**Why:** three user-reported symptoms — the engine "dies", it "desyncs
+frequently", and "the rendered audio is literally popping". Measured on
+`~/sallyface.vyproj` (1786 frames, 12 video sources, 5 stacked audio tracks):
+
+| measurement | result |
+|---|---|
+| digital-silence runs >4ms in the exported audio | **136**, totalling **2922 ms** of 29.76s |
+| of those, at a clip boundary | 3 |
+| **mid-clip dropouts** | **133 runs, 1961 ms = 6.6% of the timeline** |
+| single-clip export length | 479232 samples emitted vs 480000 expected (exactly 468x1024) |
+| audio mix cost | 0.59 ms/frame average (9.2% of frame time) |
+
+A step from signal to digital zero and back is two clicks, not one, so 133
+dropouts is 266 clicks. The popping is measured, not inferred.
+
+**Not the cause, and cleared:** AAC priming is handled — FFmpeg's encoder emits
+`AV_PKT_DATA_SKIP_SAMPLES` and the file carries it (first packet pts -1024). A
+single clean clip with no edits exports correctly apart from lossy-codec
+differences. So the encoder and the muxer are innocent.
+
+### The class of bug
+
+37 commits touch the audio engine; ~29 distinct bugs. The recurrences, counted:
+
+- **Reopen cost paid on the audio thread — 10 commits.** `audio_seek` was
+  treated as "move the playhead" for three weeks. Every symptom was a different
+  *timing* of that one cost: `801026f` (282 resyncs/83s re-open storm),
+  `e69afb5` (a scrub queued seeks faster than the producer retired them, audio
+  dead for the session), `9df668b` (a no-move click armed a drag that reopened
+  every decoder per held frame), `bddbcd2`, `5d90eba`.
+- **Clock authority rewritten — 8 commits.** "What does the producer target?"
+  changed five times (`b668cb3` device-consumed clock, `599e562`
+  `max(dev_pos, ph)`, `7ffa667` seqlock playback clock, `5d90eba`, `96d058d`).
+- **Assuming the decoder is where we asked — 7 commits.** Landing PTS != asked
+  time (`599e562`, `bddbcd2`), project fps != file fps (`f0b721b`),
+  `frame_count` == 1 for audio-only (`a877c43`), `frame_rate` == 0 before any
+  video import (`5488701`).
+- **Diagnostics that lie — 8 commits.** Every counter is frame-domain; complete
+  distortion once shipped with every counter green (`1a38d78`).
+- **Silence or zero-fill used to paper a hole — 6 sites.**
+
+Three generations of self-heal now exist (`1c5eb2e`, `801026f`, `886357b`),
+each masking the defect it was added to catch. That is the shape of the problem:
+the engine has no owner for "where am I" and no owner for "what is playing", so
+every fix negotiated between two subsystems that both think they own it.
+
+### What the reference systems do differently
+
+- **REAPER publishes two positions.** `GetPlayPosition()` is "the time the user
+  is hearing"; `GetPlayPosition2()` is "the time of the audio block that is
+  being processed by the host… **this may be behind where your plug-in is
+  processing**". Any engine with one position is guessing which one a reader
+  wants. Documented defaults: 1200ms media prebuffer, 200ms render-ahead.
+  <https://cockos.com/reaper/sdk/vst/vst_ext.php>
+- **Unity makes DSP time the master clock.** VideoPlayer's clock options include
+  "DSP Time — use the same clock source that processes audio", and sync is
+  corrected by dropping *video* frames. Audio is never dropped to fix sync.
+  <https://docs.unity3d.com/Manual/class-VideoPlayer.html>
+- **Every one of them mixes on a fixed sample block** (64–2048), never per video
+  frame. At 48kHz/29.97 a frame is 1601.6 samples — non-integer, and not a whole
+  number of 512-sample blocks. JUCE: "variable-sized blocks can be expected from
+  some hosts… you're going to get clicks and crashes".
+  <https://docs.juce.com/master/classAudioProcessor.html>
+- **Every edit-created edge gets a ramp.** Vegas Quick Fade: "a rapid fade is
+  applied to the edges of audio events to soften potentially harsh transitions
+  that can result from cutting data or splitting events". REAPER auto-crossfades
+  razor edits, with configurable shape and curvature.
+- **Playback and render are two graphs over one model.** REAPER's audio
+  accessors (`GetAudioAccessorSamples`, offline-safe, main thread) exist
+  alongside the realtime path; JUCE has `setNonRealtime`; Premiere has a
+  conformed media cache for preview and defers rate conformance to export.
+- **Buffer depth is measured, not guessed.** Android: "lowering it after each
+  write() call until the audio glitches… then the buffer size can be increased
+  until there are no glitches."
+
+### The plan
+
+Six items. The first three are the redesign; the last three are small and exist
+because they are cheap and they stop specific measured defects. Ordered
+biggest-first, and each item states how it is proved.
+
+**A1 — The sample clock (the foundation everything else stands on).**
+One integer 48kHz sample counter owns position, and nothing else owns one.
+Today position is re-derived per video frame from
+`audio_frame_boundary48(frame, fps)`, so audio is a slave of video framing and
+every fix that needed a rate-independent position (`f0b721b`) had to bolt one on.
+Concretely: a `Sample_Pos` (i64, 48kHz) is the only currency between the
+timeline, the mixers, the source fifos and the encoder. Timeline code converts
+frame<->sample once, in one place, with exact rational arithmetic
+(`frame * 48000 * fps_den / (fps_num)`), never by dividing then rounding.
+Video becomes the elastic element: it asks for the frame covering sample N and
+drops/holds/resamples to suit, which is what Unity's `canSetSkipOnDrop` does.
+
+**A2 — A fixed-block mixer with a mix ring, shared by preview and render.**
+`AUDIO_BLOCK :: 512` (10.67ms). One `Audio_Engine` owns: the source list, one
+decode ring + one gain-ramp state per source, the mix output ring, and the mix
+position. It exposes exactly two consumer-shaped operations:
+`mix_fill(target_depth)` and `mix_take(n)`. Playback's consumer is the miniaudio
+callback; the render worker's consumer is the video frame loop. That is REAPER's
+shape (one engine, two accessors) and it deletes the duplication TODO.md Active
+11 already names: "decode | `audio_src_pull`/`audio_src_seek_anchor` |
+`render_audio_pull` (a reimplementation; it even dropped the seek preroll)".
+The render consumer takes exactly `boundary48(f+1) - boundary48(f)` samples per
+frame — still frame-sized, because the muxer wants it — but the *mixing* that
+produced them happened on fixed blocks, so a decode hiccup no longer punches a
+frame-shaped hole in the waveform.
+
+**A3 — The mix runs on its own thread, ahead of its consumer.**
+The 133 holes are the measured defect and the cause is structural: render audio
+decode runs in demand on the composite worker thread (`render.odin:3243`) with
+the fifo trimmed to the exact consumed point every frame, so there is no
+cushion at all — playback has `AUDIO_CUSHION_SEC = 0.25`, render has zero. One
+spike over budget and `if start48 < a.first48 || a.have48 < start48 + cur_spf {
+continue }` drops the source for a whole video frame. Audio average is only
+0.59 ms/f, so this is spikes, not sustained load. Fix: the mix ring is filled by
+a producer thread to a named cushion, mirroring playback, and the composite
+thread only ever *takes* from it. Decode stops competing with video composite
+for the same core.
+
+**A4 — Declick: a ramp generator on every source enter, exit and discontinuity.**
+This is what removes the *class* rather than the instances, and it is cheap.
+The mixer already knows the gain it wants; it ramps to it over
+`AUDIO_DECLICK_SAMPLES` (256 = 5.3ms, linear) instead of stepping. Three sites
+become ramps rather than steps: a source entering coverage, a source leaving, and
+the `continue` hole. After A3 there should be no holes left, so A4 is belt-and-
+braces for the boundaries A3 cannot remove — but boundaries are where every
+remaining click lives, and a cut with no ramp is a click by construction.
+
+**A5 — Edits publish a generation; the engine reconciles at a block boundary.**
+This is the 10-commit class. Today `audio_seek`/`audio_note_edit` means "clear
+the device and reopen every decoder synchronously", and it is called from the
+UI, from scrub, from a gain commit, from a rate change. Instead: an edit bumps
+`audio_geom_state.generation` and the engine diffs generations at the top of a
+block — sources whose coverage changed are ramped out and back in, sources whose
+*content* changed get their decoder pointed at a new position with a ramp, and
+nothing is ever reopened on the thread that mixes. A seek becomes "the mix
+position is now N", which is a store, not a teardown.
+
+**A6 — Small, measured, do last.** (a) Pad the final partial AAC block instead
+of dropping it: 480000 samples in, 479232 out, 16ms silently lost plus a hard
+truncation click at the end of every export. (b) Give `render_audio_open` the
+`AUDIO_SEEK_PREROLL_SEC` preroll playback has had since `bddbcd2` — "every split
+opened with ~0.1s of silence". (c) Frame-domain counters → sample-domain, so a
+future regression cannot hide behind green telemetry the way `1a38d78` did.
+
+### Steps
+
+- [x] S0. Measure. Reproduce the popping on the real project, decompose it into
+      boundary holes vs mid-clip holes, and clear AAC priming and the muxer as
+      suspects. Result: 133 mid-clip dropouts, 6.6% of the timeline, cause is
+      the zero-cushion in-demand pull on the composite thread.
+- [x] S1. **A1** — `Sample_Pos` as the only position currency. Shipped.
+
+      `Sample_Pos` (i64, 48kHz) in state.odin, with one frame→sample
+      conversion (`sample_pos_from_frames`) over an exact num/den from the
+      existing `fps_rational`, and two derived uses: `timeline_frame_sample` and
+      `audio_content_sample` (timeline boundary + pinned source offset, kept as
+      separate terms). Both mixers' fifo bases now come from
+      `decoder_pts_sample` — a `rescale_q` straight from the stream's time base
+      into 1/48000 — instead of `i64(real_sec * 48000)` via float microseconds.
+      Five float round-trips became integer arithmetic.
+
+      **What it was worth, measured:** the float form is wrong at 23.976, where a
+      frame is exactly 2002 samples. `24000*48000.0/23.976023976023978` evaluates
+      to 2001.9999999999998, so the OLD code lost a sample on the very first
+      frame of a 23.976 project and wandered from there. At 29.97/59.94 the
+      samples-per-frame is non-integral (1601.6) and the float form happened to
+      agree, which is why this survived: the one rate with a whole samples-per-
+      frame is the one the float form breaks, and 23.976 is not a rate anyone
+      tests by ear at frame 0.
+
+      **Probe / mutation.** `parity_probe_check_sample_clock`, seven properties.
+      Getting this probe right took three attempts and the failures are the
+      useful part:
+        - v1 asserted "exact over a long span" and a mutation back to the float
+          form PASSED it. The float form's error is per-call (±1) and not
+          cumulative, so "exactness over a span" is not a property it breaks.
+        - v2 asserted "adjacent frames differ by exactly one frame" and failed
+          the CORRECT code: at 29.97 a frame legitimately advances 1601 then
+          1602. Asserting that away would have removed the alternation the
+          mixers depend on.
+        - v3 computed its expected values with the function under test, so any
+          mutation applied to both sides passed. The properties that have teeth
+          derive the expectation from the RATE alone (`num` frames at `num/den`
+          is exactly one second; a whole samples-per-frame is constant), with no
+          call into the code being checked.
+        - Also: the first expectation used `i64(num)/i64(den)` for
+          frames-per-second, which silently turns 23.976 into 23. The mutation
+          run caught that in the probe, not the code.
+
+      All 7 mutations now caught: float form, NTSC denominator dropped, floor
+      became round-up, pinned term refolded into fps, floor dropped (early
+      truncation), pts rescale via float microseconds, source rate not
+      NTSC-snapped.
+
+      Neutral on the 60fps export by construction — frames*48000/60 is exact
+      either way, and the single-clip export is byte-for-byte the same length
+      (479232 samples, 469 packets, AAC skip-samples intact). The win is at the
+      rates where the arithmetic was wrong.
+- [x] S2. **A2** — fixed-block mixer + mix ring, render consumer first. Shipped.
+
+      `Render_Mix`: the export's bus is a ring in the SAMPLE domain (reusing
+      `Audio_Ring`, not a second ring type) carrying `pos`/`end` beside it, the
+      job's exact rate, and a hole counter. `AUDIO_MIX_BLOCK = 512`.
+      `render_mix_serve_frame` owns fill -> take -> trim as ONE proc, because the
+      order of those three is the whole invariant and it is invisible at a call
+      site; the worker is now a three-line call.
+
+      The payoff is a consequence of S1 rather than a separate mechanism: with a
+      sample clock, the content position of a clip at an arbitrary bus sample is
+      just `bus - clip_start_sample + source_start_sample`, because one sample of
+      bus elapsed IS one sample of content elapsed. So the mixer needs no frame
+      lookup to place content at all -- the frame grid only decides what the
+      CONSUMER asks for.
+
+      **Measured on `~/sallyface.vyproj`, the defect this section exists for:**
+
+      | | before | after |
+      |---|---|---|
+      | mid-content holes (sound was due) | **133 runs / 1961 ms** | **0** |
+      | clip regions misaligned | not measured | **0 of 10** |
+      | correlation vs source | not measured | **0.9988 - 1.0000** |
+      | export length vs frame grid | -6.7 ms | -6.7 ms (S6) |
+
+      Content fidelity was verified against the SOURCE, not inferred: each clip
+      region of the export is correlated against N x source (N = the 5 audio
+      tracks carrying it), at lags of +/- one frame. Every region lands at lag 0.
+      That is the check a hole counter cannot do -- "correct audio with a gap" and
+      "the wrong audio" look identical to a counter.
+
+      **Probe, and its two limits.** `render_kf_probe` case K drives the real
+      `render_mix_serve_frame` at 12/24/30/60/120fps and pins coverage, whole
+      blocks, and that the bus is trimmed rather than growing. Mutation: "serve
+      never trims" is caught. Three limits, stated rather than papered over:
+        - "trim to the frame's START" is NOT caught, because it leaves the content
+          intact and only under-trims. A near-equivalent mutant, not a live bug.
+        - "take skips the pos offset" is NOT caught, because the probe mixes no
+          sources and therefore has no content to misplace. It is exactly the bug
+          the real-project correlation check DOES catch, which is why that check is
+          the primary gate for this and the probe is secondary.
+        - Attempting to pin sample values in the probe required hand-rolling the
+          fill, and hand-rolling the fill means testing the probe's copy of it --
+          the first version passed a mutation of the worker's own trim call site.
+          The duplicate proc that workaround needed is also the "duplicated state
+          that drifted" class this repo has paid for seven times, in
+          `Render_Mix.pos/end` beside `Audio_Ring.head/count`. Resolving that
+          belongs to S3, where the mix moves to its own thread and the position
+          should live in one place.
+
+      **`scripts/audio-verify.sh <project.vyproj>`** (not a gate -- it needs a real
+      project and its media) exports a project and checks it against its sources:
+      per-region lag and correlation, export length against the frame grid, and
+      mid-content holes where sound was due. Counting a silence run only where
+      the expected signal is audible matters: the recording has a genuine 696ms
+      quiet passage at 85.4s, and a hole counter that counted it would report the
+      same number forever and then get ignored.
+- [x] S3. **A3** — mix on its own thread with a cushion. Shipped.
+
+      The export had no cushion at all: the composite thread mixed whatever the
+      current frame needed, one frame at a time, so a decode that ran late dropped
+      that source for the whole frame and the next frame started from silence.
+      Playback has `AUDIO_CUSHION_SEC = 0.25`; the export's answer was zero.
+
+      `render_mix_proc` mixes the job's whole audio span in fixed blocks on its own
+      thread and keeps `render_mix.bus` full to `RENDER_MIX_CUSHION_FRAMES` (12
+      frames -- 0.5s at 24fps, 0.1s at 120fps). The bus's CAPACITY is the cushion,
+      so there is no second number to keep in agreement with it. The producer never
+      waits on the consumer: it publishes the entire span, exiting once it has
+      published the last frame, which is what makes the worker's wait bounded by
+      work the producer has already been given.
+
+      **The bus is a lock-free SPSC ring, and the position now lives in one place.**
+      `Render_Mix_Bus` has `write` (producer-owned) and `read` (consumer-owned),
+      each published with a release store and loaded with an acquire load; depth is
+      their difference. That replaces S2's `Audio_Ring` (head/count) sitting beside
+      a `Sample_Pos` pos/end -- two representations of one fact, which is the
+      duplicated-state-that-drifted class this repo has paid for seven times, and
+      the reason S2's probe could not pin content. Counters count sample-frames from
+      the job's first frame, so they index modulo capacity and never wrap
+      arithmetically.
+
+      **Decoder ownership moved with the mixing.** The audio decoders are
+      single-writer, so they now belong to the producer outright; the composite
+      thread touches none of their fields, and teardown joins the producer BEFORE
+      resetting them. A reset underneath a running producer is a use-after-free.
+
+      **Two design bugs the probe found, both in the producer's contract:**
+
+      - The first `render_mix_proc` stalled on a full bus *inside* the mixing step.
+        In the render that works -- producer and consumer run concurrently -- but
+        "produce the whole span, then consume" deadlocked, because a caller that
+        has consumed nothing can never make the producer proceed. That is not a
+        usage the render performs, but it is a usage a probe wants, and the code
+        had no way to express the difference. Split into `render_mix_step`, which
+        mixes what fits and RETURNS when full (the caller decides whether that means
+        yield or "your turn"), and a thread loop that yields.
+      - The bus-boundedness assertion failed on correct code: at 20 frames the whole
+        render fits inside the 12-frame cushion, so "the bus holds the whole span"
+        was the right answer. The probe now runs 200 frames, long enough that the
+        cushion binds at every rate in the table.
+
+      **Probe: values, not just geometry.** The S3 split is what made a value test
+      possible -- publishing and consuming are separate steps on separate threads,
+      so the bus can be filled with KNOWN samples and read back, with no
+      hand-seeded ring and no hand-rolled fill beside the real one.
+        - K1 alternates producer and consumer for 200 frames at 12/24/30/60/120fps:
+          every frame served with its exact sample count, the span served exactly,
+          the bus drained at the end, and depth bounded by capacity rather than by
+          the span. `read == write` at the end is also what catches a producer that
+          runs past the job's end.
+        - K2 publishes and consumes the sequence 1..12 through an 8-frame buffer, so
+          a publication, a read, and a read that starts wrapped each straddle the
+          end. Buffer indexing that is only correct for a block which happens not to
+          straddle is the exact failure a block-based mixer exists to make rare.
+      Mutation: "publish ignores the wrap" and "consume ignores the wrap" are both
+      caught, with the sample index and the value that came back
+      (`sample 9 came back 1,1, want 9,9`). These are the mutations S2's probe
+      structurally could not catch.
+
+      `~/sallyface.vyproj`, unchanged from S2: 0 holes where sound was due, 10 of 10
+      clip regions at lag 0, correlation 0.9988-1.0000, export -6.7ms against the
+      frame grid (S6). Same output, now produced a frame ahead of time on a thread
+      that owns the decoders.
+      Gates: check build parity audio_probe keyed_export render_kf_probe
+      timeline_probe render_live_probe yuv_exact probe smoke render_valgrind.
+
+- [ ] S3. **A3** — mix on its own thread with a cushion. Probe: the export's
+      silence-run count goes to zero on `~/sallyface.vyproj`, which is the
+      measured defect this whole section exists to close.
+- [ ] S4. **A4** — declick ramps. Probe: assert no inter-sample step exceeds the
+      local peak across a clip boundary or a simulated hole.
+- [ ] S5. **A5** — edit generations. Probe: a burst of N edits produces O(1)
+      decoder reopens, not O(N) — the direct analogue of `e69afb5`.
+- [ ] S6. **A6** — AAC tail padding, render preroll, sample-domain counters.
+
+### Accept
+
+- The export of `~/sallyface.vyproj` has **zero** mid-clip silence runs (was
+  133) and no step discontinuities at clip boundaries.
+- `audio_probe`, `audio_rate_probe`, `atempo_probe`, `keyed_export`, `parity`,
+  `render_live_probe`, `render_valgrind` all pass.
+- A 10s single-clip export is 480000 samples, not 479232.
 ## Active 23 — A keyed clip snapped back to its resting pose after its last keyframe
 
 **Why:** keyframing a clip's transform looked correct up to the final keyframe
