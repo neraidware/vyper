@@ -6495,8 +6495,71 @@ against a frame the app never displays — a test that passes by checking the wr
 thing, which is how the stale-window bug would have survived a green run. They now
 route through `clip_source_frame` with the slot's pin.
 
+**Clip EXTENT is derived from source duration, and the timeline reflows on a rate
+change.** Reported after the conform fix as "baby still doesn't match between 60fps
+and 12fps — the content should be exactly the same, not slower nor faster, just
+with less frames".
+
+Conform alone did not deliver that, because it fixed SPEED and left LENGTH alone. A
+clip's extent on the timeline was its source frame count (`Clip.source_length_frames`
+= `asset.frame_count` used directly as the extent), which is correct only while the
+project rate equals the source rate. So a 219-frame 12fps clip occupied 219 frames at
+12fps and still 219 at 60fps — 18.25 seconds of content in 3.65 seconds of
+timeline, showing a fifth of the material at the right speed. The two previews
+cannot match, and no conform work changes that.
+
+This was mine to catch the first time. The user described clip duration; I mapped it
+onto a global-timeline decision, recorded it as settled, and shipped the half that
+fixes speed while visibly not delivering the stated outcome.
+
+The model now:
+
+- `clip_duration_sec` — a clip's wall-clock time, a property of its SOURCE,
+  measured from the asset (`frame_count / video_fps`), falling back to the stored
+  extent divided by the rate it was AUTHORED at.
+- `clip_timeline_len` — that duration quantized to the current rate: the extent
+  every reader should use.
+- `clip_src_len_frames` — the inverse through the conform, for the decoder and
+  proxy machinery that needs a source count.
+- `Clip.source_length_frames` KEEPS its meaning as the stored timeline extent, so
+  its ~117 existing readers are unchanged and correct. That was the load-bearing
+  decision: redefining the field as a source count would have put every one of
+  those readers in scope for no benefit, since the source count is *derivable* from
+  the extent.
+- `set_project_fps` reflows: new length from duration at the new rate, new start
+  from the previous clip's new end plus the old gap re-quantized, keyframe offsets
+  rescaled with the clip.
+
+**Two bugs the reflow probes caught, both of which pass every other check:**
+
+- **Gaps silently shrank.** The obvious implementation — shift each clip by the
+  previous clip's length delta — is wrong, because the gap was measured in frames
+  and only the clip grew. A 2s gap became 0.4s at 60fps. Every content, duration and
+  speed check still passed; only comparing two clips' relative timing catches it.
+- **Every asset-less clip silently shrank too.** `clip_duration_sec`'s fallback
+  divides the stored extent by a rate it is *given*, and during a reflow the project
+  rate has already moved. Dividing a 12-frame one-second still by 60 instead of 12
+  turns it into 0.2s — still images, text generators and clips whose file is gone
+  all quietly lose `rate_ratio` of their duration. Nothing about the result looks
+  wrong; the clip still plays, just short and fast.
+
+Both revert-to-fail:
+`the gap must keep its real-world size — 0.4000s, want ~2s`,
+`a one-second still must stay one second across a reflow — got 12 frames at 60fps,
+want 60`.
+
+The keyframe case is separate and worth its own: a keyframe's `frame_off` is
+clip-relative in TIMELINE frames, so an extent growing fivefold slides every key to
+a fifth of its position unless rescaled with it. The keys survive and land on the
+wrong content, which is worse than losing them because nothing about it looks wrong.
+Offsets are re-ascending-strict, since a shrinking reflow folds keys together and a
+duplicate offset breaks every interpolating sampler's sorted-ascending invariant.
+Reverting fails at `offset 109 at 219 frames, want 545 at 1095`.
+
+
 **Accept.** `check build probe transform_probe geom_key_probe render_kf_probe
 keyframe_probe timeline_probe opacity zorder subtitle_probe keyed_export parity
-render_live_probe` pass; `render_valgrind parity_valgrind` clean. New span cases
+render_live_probe decode_repeat` pass; `render_valgrind parity_valgrind
+undo_valgrind` clean. New span cases
 assert both directions separately, because a span test that only checks the
 permissive direction passes a helper that is off by one in the restrictive one.

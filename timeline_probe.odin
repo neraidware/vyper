@@ -1543,7 +1543,216 @@ test_pin_src_fps :: proc() {
 	tl_probe_check(ok, "src_fps pin: probed rate, old-project derive, unmeasurable fallback, no re-pin [%s]", fail_msg)
 }
 
+
+// tl_fps_scene builds two clips on one track with a real GAP between them, from a
+// 12fps source of 219 frames (18.25s of content) — the shape of ~/baby.vyproj, and
+// the case the user reported as "5 times faster" at 60fps.
+tl_fps_scene :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset{id = 9101, kind = .Video, frame_count = 219, dur_us = 18250000, video_fps = 12.0},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 1, kind = .Video, asset_id = 9101,
+			timeline_start_frame = 0, source_length_frames = 219, src_fps = 12.0,
+		},
+	)
+	// Second clip starts 2s (24 frames at 12fps) after the first ends, so a reflow
+	// that preserves the GAP is distinguishable from one that pins positions.
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 2, kind = .Video, asset_id = 9101,
+			timeline_start_frame = 243, source_length_frames = 219, src_fps = 12.0,
+		},
+	)
+}
+
+// test_fps_reflow covers the acceptance criterion directly: the same project must
+// show the same CONTENT at 12fps and at 60fps, at the same speed, differing only
+// in how finely it is sampled.
+//
+// It is stated on wall-clock CONTENT, not on frame counts, because frame counts
+// are exactly what legitimately differs and asserting them would pin the bug back
+// in: at 60fps the clip has five times the frames and must show five times fewer
+// new source frames each.
+test_fps_reflow :: proc() {
+	tl_fps_scene()
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+
+	// Baseline at the source's own rate: 219 frames, 18.25s.
+	project.frame_rate = 12.0
+	len12 := clip_timeline_len(&timeline.tracks[0].clips[0])
+	content12 := f64(clip_src_len_frames(&timeline.tracks[0].clips[0])) / 12.0
+	gap12 := f64(
+		timeline.tracks[0].clips[1].timeline_start_frame -
+		(timeline.tracks[0].clips[0].timeline_start_frame + len12),
+	) / 12.0
+
+	// Now the user's case: switch to 60 and reflow, as the preset button does.
+	set_project_fps(60)
+	c0 := &timeline.tracks[0].clips[0]
+	c1 := &timeline.tracks[0].clips[1]
+	len60 := clip_timeline_len(c0)
+	content60 := f64(clip_src_len_frames(c0)) / 12.0
+	gap60 := f64(c1.timeline_start_frame - (c0.timeline_start_frame + len60)) / 60.0
+
+	// Same CONTENT, to within the frame quantization it has to survive: a 12fps
+	// source can only be sampled at 12fps, so 60fps is inherently a coarser view of
+	// the same 18.25s. The tolerance is one source frame.
+	ok := math.abs(content60 - content12) <= 1.0 / 12.0 + 0.001
+	tl_probe_check(
+		ok,
+		"fps reflow: content must match across rates — %.4fs at 12fps vs %.4fs at 60fps (tolerance one source frame)",
+		content12, content60,
+	)
+
+	// Same WALL CLOCK, which is what "not slower nor faster" means.
+	ok = math.abs(f64(len60)/60.0 - f64(len12)/12.0) <= 1.0 / 60.0 + 0.001
+	tl_probe_check(
+		ok,
+		"fps reflow: wall clock must match — %.4fs at 12fps vs %.4fs at 60fps",
+		f64(len12)/12.0, f64(len60)/60.0,
+	)
+
+	// And the extent really did re-derive rather than staying pinned: five times
+	// the frames at five times the rate.
+	tl_probe_check(
+		len60 == 1095 && len12 == 219,
+		"fps reflow: extent must re-derive from source duration — 219 frames at 12fps, want 1095 at 60fps, got %d",
+		len60,
+	)
+
+	// The GAP keeps its real-world size. This is what distinguishes preserving gaps
+	// from pinning positions: the second clip moved from frame 243 to 1140, so a
+	// pin-everything implementation fails here while passing the content checks.
+	tl_probe_check(
+		math.abs(gap60 - gap12) <= 1.0 / 60.0 + 0.001 && math.abs(gap12 - 2.0) < 0.01,
+		"fps reflow: the gap must keep its real-world size — %.4fs, want ~2s",
+		gap60,
+	)
+	tl_probe_check(
+		c1.timeline_start_frame == 1095 + 120,
+		"fps reflow: the trailing clip must shift by the length delta — start %d, want 1215",
+		c1.timeline_start_frame,
+	)
+
+	// Round trip: back to 12 must restore the original layout exactly. A reflow
+	// that only ever grows is not a reflow.
+	set_project_fps(12)
+	tl_probe_check(
+		timeline.tracks[0].clips[0].source_length_frames == 219 &&
+		timeline.tracks[0].clips[1].timeline_start_frame == 243,
+		"fps reflow: 60 -> 12 must restore the layout — len %d, second start %d",
+		timeline.tracks[0].clips[0].source_length_frames,
+		timeline.tracks[0].clips[1].timeline_start_frame,
+	)
+}
+
+// test_fps_reflow_keyframes: keyframes are clip-relative in TIMELINE frames, so
+// an extent that grows fivefold slides every key to a fifth of its position unless
+// they are rescaled with it. The keys survive either way — nothing about a
+// misplaced key looks wrong, which is why this needs its own case.
+test_fps_reflow_keyframes :: proc() {
+	tl_fps_scene()
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 12.0
+
+	c := &timeline.tracks[0].clips[0]
+	kf_set_key(c, "transform.x", 109, 5.0)
+	kf_set_key(c, "transform.x", 218, 9.0)
+	tr := session_trk_view(c.keyframe_tracks, 0)
+	before := session_kf_at(tr.keys, 0).frame_off
+
+	set_project_fps(60)
+	tr = session_trk_view(c.keyframe_tracks, 0)
+	after := session_kf_at(tr.keys, 0).frame_off
+
+	// 109 of 219 is the clip's midpoint; it must still be the midpoint at 1095.
+	tl_probe_check(
+		before == 109 && after == 545,
+		"keyframes must stay on their content across a reflow — offset %d at 219 frames, want %d at 1095",
+		after, 545,
+	)
+	// Strictly ascending: a shrinking reflow folds keys together, and a duplicate
+	// offset breaks every interpolating sampler's sorted-ascending assumption.
+	set_project_fps(12)
+	set_project_fps(60)
+	set_project_fps(12)
+	tr = session_trk_view(c.keyframe_tracks, 0)
+	asc := true
+	prev := i32(-1)
+	for ki in 0 ..< tr.keys.n {
+		off := session_kf_at(tr.keys, ki).frame_off
+		if off <= prev {
+			asc = false
+			break
+		}
+		prev = off
+	}
+	tl_probe_check(asc, "keyframes must stay strictly ascending through repeated reflows")
+}
+
+
+// test_fps_reflow_assetless: a clip whose asset is gone (a still image, a text
+// generator, a deleted file) has no measured duration — its length comes from the
+// stored extent divided by the rate it was authored at.
+//
+// This is a trap rather than a detail. clip_duration_sec's fallback divides by a
+// rate it is GIVEN, and during a reflow the project rate has already moved to the
+// new one. Dividing a 12-frame one-second still by 60 instead of by 12 turns it
+// into 0.2s, so every asset-less clip on the project silently shrinks by the rate
+// ratio. Nothing about the result looks wrong — the clip still plays, just fast
+// and short.
+test_fps_reflow_assetless :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip{
+			clip_id = 3, kind = .Video, is_still = true, asset_id = 9999,
+			timeline_start_frame = 0, source_length_frames = 12, src_fps = 12.0,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+
+	project.frame_rate = 12.0
+	set_project_fps(60)
+	c := &timeline.tracks[0].clips[0]
+	tl_probe_check(
+		c.source_length_frames == 60,
+		"a one-second still must stay one second across a reflow — got %d frames at 60fps, want 60",
+		c.source_length_frames,
+	)
+	set_project_fps(12)
+	tl_probe_check(
+		timeline.tracks[0].clips[0].source_length_frames == 12,
+		"and return to 12 frames at 12fps — got %d",
+		timeline.tracks[0].clips[0].source_length_frames,
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
+	tl_scene()
+	test_fps_reflow()
+	fmt.println("[tl-probe] fps-reflow ok")
+	tl_scene()
+	test_fps_reflow_assetless()
+	fmt.println("[tl-probe] fps-reflow-assetless ok")
+	tl_scene()
+	test_fps_reflow_keyframes()
+	fmt.println("[tl-probe] fps-reflow-keyframes ok")
 	tl_scene()
 	test_pin_src_fps()
 	fmt.println("[tl-probe] pin-src-fps ok")

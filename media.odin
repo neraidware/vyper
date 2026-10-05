@@ -33,8 +33,33 @@ set_project_resolution_auto :: proc() {
 // set_project_fps applies an explicit project frame rate (preset button). The
 // timeline grid, playhead cadence, and audio producer all remap to this rate;
 // later imports no longer override it.
+//
+// Changing the rate REFLOWS the timeline. A clip's length on the timeline is its
+// source duration quantized to the current rate (clip_timeline_len), so a 12fps
+// clip of 219 frames occupies 219 frames at 12fps and 1095 at 60fps. Without the
+// reflow the stored extents stay at the rate they were authored at, and every clip
+// covers less and less of its source as the rate goes up: the same project shows a
+// fifth of its content at 60fps, at the right speed but the wrong length. That was
+// the state after the conform fix on its own.
+//
+// Positions shift by each clip's length DELTA so the gaps between clips keep their
+// real-world size. Clips on different tracks are independent, so this is per track:
+// a track is a list of clips in order, and each clip's new start is the old start
+// plus the sum of the length deltas of everything before it.
+//
+// keyframe tracks are rescaled by the same ratio. A keyframe's offset is in
+// TIMELINE frames from its clip's start, so an extent that grows five times would
+// otherwise slide every key to a fifth of its original position in the clip — the
+// keys would survive and silently land on the wrong content, which is worse than
+// losing them.
 set_project_fps :: proc(fps: f64) {
+	old_rate := project_fps()
 	project.frame_rate = fps
+	new_rate := project_fps()
+	if !(old_rate > 0) || !(new_rate > 0) || old_rate == new_rate {
+		return
+	}
+	reflow_timeline_for_fps(old_rate, new_rate)
 }
 
 // set_project_orientation forces the given canvas orientation (landscape when

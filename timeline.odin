@@ -96,6 +96,81 @@ clip_source_frame :: proc(
 	return source_start + i64(math.round(f64(off) * (rate / proj)))
 }
 
+// clip_duration_sec is how much wall-clock time a clip occupies, which is a
+// property of its SOURCE and not of the timeline.
+//
+// It is the quantity that makes a project fps-independent. A clip's extent on the
+// timeline is this duration quantized to the current rate, so the same clip
+// occupies 219 frames at 12fps and 1095 at 60fps while showing the same 18.26
+// seconds of content at the same speed. Reading the extent instead — which is
+// what the code did, because the extent was set from the source frame count and
+// the two happened to be equal at import — pins a clip's length to the rate in
+// force when it was placed, so the same project shows less and less of every clip
+// as the rate goes up.
+//
+// Preference order:
+//
+//  1. the asset's own duration, which is measured rather than counted and so is
+//     correct however the extent was last written;
+//  2. the extent divided by the current rate — right for a clip whose asset is
+//     gone, and wrong only for a project whose rate has already been changed
+//     without a reflow, which is the case this whole change exists to end.
+clip_duration_sec :: proc(clip: ^Clip, fallback_rate: f64) -> f64 {
+	if as := find_asset(clip.asset_id); as != nil && as.video_fps > 0 && as.frame_count > 0 {
+		return f64(as.frame_count) / as.video_fps
+	}
+	if clip.kind == .Audio {
+		if as := find_asset(clip.asset_id); as != nil && as.audio_rate > 0 && as.audio_frames > 0 {
+			return f64(as.audio_frames) / as.audio_rate
+		}
+	}
+	// Still images and generators, and any clip whose asset is gone: the stored
+	// extent was authored at `fallback_rate`, so that is the rate to divide by.
+	//
+	// It MUST be the authoring rate and not project_fps(). During a reflow the
+	// project rate has already moved to the new one, and dividing a 12-frame
+	// one-second still by 60 would turn it into 0.2s — the fallback silently
+	// shrinking every asset-less clip on the project by exactly the rate ratio.
+	if !(fallback_rate > 0) {
+		return 0
+	}
+	return f64(clip.source_length_frames) / fallback_rate
+}
+
+// clip_timeline_len is how many timeline FRAMES a clip occupies at the current
+// project rate: its source duration quantized to that rate.
+//
+// This is the extent every reader should use. `Clip.source_length_frames` is that
+// same number, but it is a stored value, so it is only as good as the reflow that
+// last ran — which is why it read as the source frame count and why every one of
+// its ~117 readers was correct only while the rate matched the source.
+clip_timeline_len :: proc(clip: ^Clip) -> i64 {
+	rate := project_fps()
+	sec := clip_duration_sec(clip, rate)
+	if !(rate > 0) || !(sec > 0) {
+		return clip.source_length_frames
+	}
+	// At least one frame: a source shorter than one timeline frame still has to
+	// occupy a frame, or it is invisible and unselectable.
+	return max(1, i64(math.round(sec * rate)))
+}
+
+// clip_src_len_frames is how many SOURCE frames a clip carries — the inverse of
+// the extent through the conform, and the number a decoder or proxy segment
+// needs. Distinct from the extent by exactly the conform ratio.
+clip_src_len_frames :: proc(clip: ^Clip) -> i64 {
+	rate := clip.src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	proj := project_fps()
+	extent := f64(clip_timeline_len(clip))
+	if !(rate > 0) || !(proj > 0) {
+		return clip.source_length_frames
+	}
+	return max(1, i64(math.round(extent * (rate / proj))))
+}
+
 // clip_source_span is the half-open range of SOURCE frames a clip can display
 // across its whole timeline extent, under conform.
 //
@@ -133,6 +208,132 @@ clip_source_span :: proc(
 		hi = lo + 1
 	}
 	return lo, hi
+}
+
+// reflow_timeline_for_fps re-derives every clip's extent for a new project rate
+// and shifts positions so the gaps between clips keep their real-world size.
+//
+// Per track, because tracks are independent lanes: a clip's new length is its
+// source duration at the new rate, and a clip's new start is its old start plus
+// the length deltas of the clips before it on the SAME track. Clips on other
+// tracks do not move, which is what makes a multi-track sequence keep its
+// relationships: a clip starting 2s after another clip on a different lane stays
+// 2s after it, because both extents and both positions scale by the same ratio.
+//
+// The ratio is the RATE ratio, not each clip's own, and that is the point: the
+// whole timeline is being re-quantized to a new timebase, uniformly. A clip's
+// conform ratio (src_fps/project_fps) is a separate thing and is deliberately not
+// applied here — it governs which source frame each timeline frame shows, not how
+// long the clip is.
+//
+// Keyframes are rescaled by the same ratio, per clip, by that clip's extent delta.
+// A keyframe's frame_off is clip-relative in TIMELINE frames, so an extent that
+// grows fivefold slides every key to a fifth of its position in the clip. The keys
+// would survive and land on the wrong content, which is a worse failure than
+// losing them because nothing about it looks wrong.
+//
+// Returns the total length delta applied, for the probe.
+reflow_timeline_for_fps :: proc(old_rate, new_rate: f64) -> i64 {
+	if !(old_rate > 0) || !(new_rate > 0) || old_rate == new_rate {
+		return 0
+	}
+	total_delta := i64(0)
+	rate_ratio := new_rate / old_rate
+	for &track in timeline.tracks {
+		// Each clip's new start is the previous clip's new end plus the OLD gap
+		// re-quantized to the new rate. Shifting by the length delta alone — the
+		// obvious implementation — silently shrinks every gap by the rate ratio,
+		// because the gap was measured in frames and only the clip grew. That
+		// passes any check on content and fails the moment two clips are compared.
+		prev_new_start := i64(0)
+		prev_new_len := i64(0)
+		prev_old_end := i64(0)
+		have_prev := false
+		for &clip in track.clips {
+			old_start := clip.timeline_start_frame
+			old_len := clip.source_length_frames
+			// Measured against the OLD rate: this is the clip's real duration, and
+			// the new length is that duration re-quantized. Deriving the length by
+			// scaling the old one would be wrong for a clip whose source rate
+			// differs from the project's, which is most of them.
+			sec := clip_duration_sec(&clip, old_rate)
+			new_len := old_len
+			if sec > 0 && new_rate > 0 {
+				new_len = max(1, i64(math.round(sec * new_rate)))
+			}
+			if have_prev {
+				gap_old := old_start - prev_old_end
+				clip.timeline_start_frame =
+					prev_new_start + prev_new_len + i64(math.round(f64(gap_old) * rate_ratio))
+			} else {
+				// A leading gap is real time too, so it is re-quantized as well.
+				clip.timeline_start_frame = i64(math.round(f64(old_start) * rate_ratio))
+			}
+			if new_len != old_len {
+				rescale_clip_keyframes(&clip, old_len, new_len)
+				total_delta += new_len - old_len
+			}
+			clip.source_length_frames = new_len
+			prev_new_start = clip.timeline_start_frame
+			prev_new_len = new_len
+			prev_old_end = old_start + old_len
+			have_prev = true
+		}
+	}
+	return total_delta
+}
+
+// rescale_clip_keyframes moves every key on a clip from the old extent's frame
+// space to the new one's, so each key stays on the same CONTENT.
+//
+// Offsets are rounded and then forced strictly ascending. Two keys can collide
+// when the clip SHRINKS (a 60fps clip's five-times-denser keys folded into a 12fps
+// extent), and a track's invariant is sorted-ascending offsets — equal offsets
+// would break every interpolating sampler's assumption about ordering. Colliding
+// keys keep the later one's value, which is the one the shrink moved onto the same
+// frame.
+rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
+	if old_len <= 0 || new_len <= 0 || old_len == new_len {
+		return
+	}
+	ratio := f64(new_len) / f64(old_len)
+	// Rebuilt rather than edited in place, the same shape kf_trim_head uses: the
+	// key store is a session window, so replacing the range wholesale is what keeps
+	// a shared range (two clips aliasing one set of keys) from having its offsets
+	// rewritten under the other clip.
+	out := Kf_Track_Range{}
+	for si in 0 ..< clip.keyframe_tracks.n {
+		st := session_trk_view(clip.keyframe_tracks, si)
+		r := Kf_Keys_Range{}
+		prev := i32(-1)
+		for ki in 0 ..< st.keys.n {
+			k := session_kf_at(st.keys, ki)
+			off := i32(math.round(f64(k.frame_off) * ratio))
+			off = clamp(off, 0, i32(new_len - 1))
+			// Enforce strict ascent. A shrinking clip folds keys together, and a
+			// duplicate offset breaks the sorted-ascending invariant every
+			// interpolating sampler depends on; equal offsets would make the
+			// interpolation between them a zero-length span.
+			if off <= prev {
+				off = prev + 1
+			}
+			if i64(off) >= new_len {
+				off = i32(new_len - 1)
+			}
+			prev = off
+			// mask, value and interp ride along untouched: a packed section key
+			// keeps its own curve and its lane mask through the rescale.
+			session_kf_push(&r, Keyframe{frame_off = off, mask = k.mask, value = k.value, interp = k.interp})
+		}
+		if r.n > 0 {
+			session_trk_push(&out, Kf_Track{name = st.name, keys = r})
+		} else {
+			session_kf_release(r)
+		}
+	}
+	old := clip.keyframe_tracks
+	clip.keyframe_tracks = out
+	kf_free_tracks(old)
 }
 
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
