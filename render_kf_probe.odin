@@ -315,18 +315,17 @@ render_kf_probe_run :: proc() -> int {
 		v.timeline_start_frame = 0
 		v.source_w = probe_w
 		v.source_h = probe_h
-		v.geom_base = geom_sample_resting(&clipH)
-		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
-			p := Render_Geom_Prop(pi)
-			v.kf_geom[pi] = render_kf_fill_flat(&clipH, p)
-		}
+		// The production writer, not a hand-assembled carrier: this case exists
+		// to pin the seeded alpha, and a probe that filled the struct its own way
+		// would keep passing if the writer changed.
+		render_geom_snap_fill(&v.geom, &clipH)
 		// Unit scale on a source the size of the canvas, no crop: the display
 		// rect and the stage sub-rect coincide, so the composite takes its
 		// fixed-scale 1:1 path with no resampler to configure.
 		v.stage_scale = 1.0
 		v.fw = probe_w
 		v.fh = probe_h
-		v.opacity = v.geom_base[int(Render_Geom_Prop.Opacity)]
+		v.opacity = v.geom.base[int(Render_Geom_Prop.Opacity)]
 
 		stage: [probe_w * probe_h * 4]u8
 		frame: [probe_w * probe_h * 4]u8

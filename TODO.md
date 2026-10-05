@@ -4675,3 +4675,79 @@ Steps:
 Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
+
+## Active 21 — Keyframed text/subtitle transform exported at its resting pose
+
+**Why:** a text clip's transform keyframes previewed correctly and exported
+frozen. Not an interpolation or sampling bug: the keyframes never crossed the
+UI->worker thread hop. `Render_Text_Src` carried three plain copies of the
+clip's RESTING fields (`transform_x`, `transform_y`, `scale`), filled once at
+`render_start`, and the worker composited those three numbers on every frame.
+The tracks stayed on the UI thread. `Render_Sub_Src` had the identical omission
+plus an `anchor_x/y` box center derived from those resting values at setup, so a
+keyed subtitle was frozen too. Separately, text opacity was absent from the
+export entirely — `render_text_blit` took no alpha and neither text struct
+carried an opacity field — so a text clip set to 50% previewed translucent and
+exported fully opaque, keyed or not.
+
+The deeper cause was that the snapshot was HAND-WRITTEN PER CLIP KIND.
+`Render_Video_Src` got `geom_base` + `kf_geom` + `geom_keyed`; the text structs,
+written later, got a shorter list and nothing failed. The evaluators were
+already shared (`geom_sample_clip` / `geom_sample_flat` both bottom out in
+`kf_sample_keys`), so the two sinks were never two systems — only the CARRIER
+was, and it was a convention rather than a type. `parity_probe_frame` took a
+`^Render_Video_Src`, so the per-lane preview-vs-export check could not see the
+path that was broken: a parity check pointed at the path that was already wired
+correctly is not a parity check. `render_kf_probe` contained no reference to
+text at all.
+
+Steps:
+- [x] S1. `Render_Geom_Snap` — one carrier (`base`, `keys[Render_Geom_Prop]`,
+      `keyed`, `scale_keyed`, `opacity_keyed`) embedded in all three source
+      structs, written by one `render_geom_snap_fill`, read through one
+      `geom_snap_eval`. As a FIELD the animation is not optional: a new clip
+      kind cannot forget it, because there is nothing to forget. The lane loop
+      is the enum, so a new `Render_Geom_Prop` rides across with no second list.
+- [x] S2. Text and subtitle composites sample per frame through that carrier, so
+      transform/scale/opacity animate exactly as a video clip's do. crop lanes
+      are cleared for text at the DRAW site (`geom_clear_crop`, the rule the
+      preview already applied) rather than baked into the carrier, where zeroing
+      them would silently disarm a video clip's crop.
+- [x] S3. `render_text_blit` gained an alpha parameter and folds it into the
+      glyph coverage, matching `blend_row` and the GPU preview's
+      SRC_ALPHA/ONE_MINUS_SRC_ALPHA. This is not a keyframe fix — it also
+      repairs unkeyed text opacity, which never worked.
+- [x] S4. Animated scale re-bakes the raster (`text_job_rescale`, and the same
+      gate on a subtitle's cue cache) instead of rescaling the blit. Scale is
+      BAKED into the raster's font size, so unlike transform it cannot be
+      applied per frame — the one place the unified carrier does not give parity
+      for free. Mirrors the preview's own `text_font_px` re-bake, so both sinks
+      converge on the same ink at the same scale. `TEXT_REBAKE_EPS` keeps eased
+      rounding from churning a rasterize per frame.
+- [x] S5. `render_clip_sink` — one classifier for "which job array does this clip
+      go in", used by BOTH `render_start`'s walk and the parity probe. The probe
+      previously re-derived that mapping itself, and a divergence there compares
+      the wrong clip to the wrong snapshot: a parity check that silently stops
+      checking. This also collapsed three near-identical `Render_Sub_Src`
+      constructions into `snapshot_sub_src`.
+- [x] S6. The parity probe's lane check is now `parity_probe_lanes(clip, snap)`,
+      scoped to the CARRIER rather than to a clip kind, and runs for text and
+      subtitle sources too. Box PIXELS stay video-shaped in `parity_probe_frame`
+      (a text box comes from its raster's measured ink, not source_w/h), but the
+      lane VALUES — the thing that was wrong — are kind-agnostic.
+- [x] S7. The parity fixture gains a KEYED TEXT CLIP (`parity_probe_add_keyed_text`)
+      with a packed whole-transform section and a scalar opacity lane, on its own
+      top track. Without it the widened check had nothing to say about text: the
+      fixture held no text clip, so a text source that lost every keyframe on the
+      way to the worker still passed.
+
+**Probe / mutation.** `scripts/gate.sh parity` on a build with the text fill
+removed (negative control) fails on 19 consecutive frames, naming the clip and
+every diverging lane — `snapshot text KEYEDTEXT ... keyed false ... kf_keys 0`
+and then `FAIL clip KEYEDTEXT frame 12 scale +1.0000; trans_x +40.0000; trans_y
++60.0000; opacity +1.0000` onward. With the fix: `keyed true opacity_keyed true
+kf_keys 6`, no FAIL, and `compared 140 clip-frames` (up from the video-only
+count).
+
+**Accept.** `check build keyframe_probe geom_key_probe render_kf_probe parity
+parity_valgrind` pass.
