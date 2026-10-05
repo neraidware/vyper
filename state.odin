@@ -657,6 +657,21 @@ Clip_Move_State :: struct {
 	// (track, start, length) of every linked clip (see Drag_Group_Orig).
 	group_delta:  i64,
 	group_orig:   [dynamic]Drag_Group_Orig,
+	// ripple is the Alt modifier latched at PRESS time: the gesture is a ripple
+	// move, so every clip that starts at or after the anchor (plus the anchor's
+	// whole link group and the Shift multi-selection) shifts by the same delta.
+	// Latched, not sampled per frame — a modifier pressed mid-drag would change
+	// what the gesture MEANS halfway through, moving clips the live apply had
+	// never captured.
+	ripple:       bool,
+	// ripple_delta is the last delta apply_ripple_drag actually wrote, so the
+	// release can tell a real ripple from a click that happened to hold Alt.
+	ripple_delta: i64,
+	// ripple_orig is the COMPLETE set the ripple shifts, anchor FIRST (the
+	// delta is measured from ripple_orig[0].start). Same record as
+	// Drag_Group_Orig — a captured original (track, start, length) — because
+	// it is the same fact about the same clip, at a wider scope.
+	ripple_orig:  [dynamic]Drag_Group_Orig,
 }
 clip_move: Clip_Move_State = {
 	source_track = -1,
@@ -680,6 +695,9 @@ track_drag: Track_Drag_State = {idx = -1, hover_row = -1}
 // sharing the dragged/resized clip's link_id, so a linked-group edit applies one
 // shared delta to all members (each clamped to its own lane). Invariant: when
 // non-empty its FIRST entry is the anchor clip (the one the user grabbed).
+// clip_move.ripple_orig reuses the same record for the wider Alt+drag set; the
+// FIRST-entry-is-the-anchor invariant holds there too, which is why one type
+// serves both rather than a near-identical second struct.
 Drag_Group_Orig :: struct {
 	clip_id: u64,
 	track:   int,

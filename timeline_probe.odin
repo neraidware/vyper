@@ -966,6 +966,390 @@ test_audio_resize_source_bound :: proc() {
 	clear(&media_bin.assets)
 }
 
+// tl_ripple_scene builds the Alt+drag scene. Two lanes, laid out left to right,
+// with every clip on a distinct id so a test can name what moved and what must
+// not have:
+//
+//	track 0: 8100 [0,50)   8200 [100,150)  8300 [200,250)  8400 [300,350)  8500 [400,450)
+//	track 1: 7100 [0,40)   7200 [50,90)                              7300 [100,140)  7400 [200,240)
+//
+// The anchor is 8200 (track 0, start 100), so the threshold is 100 and the
+// ripple is everything at or after it PLUS 7200, which starts at 50 and is only
+// in the set because it shares the anchor's link. 8100 and 7100 start before
+// the threshold and are in no group, so they are the two clips that must hold
+// still and the two walls a leftward ripple parks against.
+tl_ripple_scene :: proc() {
+	timeline = Timeline {
+		tracks = make([dynamic]Track, 0, 2, context.temp_allocator),
+	}
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 6, context.temp_allocator)})
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	append(&timeline.tracks[0].clips, mk_tl_clip(8100, 0, 0, 50, 0, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(8200, 8800, 0, 50, 100, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(8300, 0, 0, 50, 200, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(8400, 0, 0, 50, 300, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(8500, 0, 0, 50, 400, .Video))
+	append(&timeline.tracks[1].clips, mk_tl_clip(7100, 0, 0, 40, 0, .Audio))
+	append(&timeline.tracks[1].clips, mk_tl_clip(7200, 8800, 0, 40, 50, .Audio))
+	append(&timeline.tracks[1].clips, mk_tl_clip(7300, 0, 0, 40, 100, .Audio))
+	append(&timeline.tracks[1].clips, mk_tl_clip(7400, 0, 0, 40, 200, .Audio))
+	selection.track = 0
+	selection.index = 1
+	// clear, not make: extra_set is a process-lifetime global in the app and the
+	// Shift+click path resets it the same way. A fresh map on context.allocator
+	// per scene would orphan one map per call for no reason.
+	clear(&selection.extra_set)
+	timeline_view.start = 0
+	clip_move.group_delta = 0
+	clear(&clip_move.group_orig)
+	clip_move.ripple = false
+	clip_move.ripple_delta = 0
+	clear(&clip_move.ripple_orig)
+	active_interaction = .None
+}
+
+// tl_start_of returns the live timeline start of the clip with the given id.
+tl_start_of :: proc(cid: u64) -> i64 {
+	for &tr in timeline.tracks {
+		for &c in tr.clips {
+			if c.clip_id == cid {
+				return c.timeline_start_frame
+			}
+		}
+	}
+	return -1
+}
+
+// Ripple_Want is one expected (clip id, timeline start) pair in a table.
+Ripple_Want :: struct {
+	clip_id: u64,
+	start:   i64,
+}
+
+// tl_assert_starts checks a whole clip->start table, so a failure names every
+// clip that landed wrong rather than only the first.
+tl_assert_starts :: proc(what: string, want: ..Ripple_Want) {
+	for w in want {
+		got := tl_start_of(w.clip_id)
+		tl_probe_check(
+			got == w.start,
+			"%s: clip %d at %d, want %d",
+			what,
+			w.clip_id,
+			got,
+			w.start,
+		)
+	}
+}
+
+// tl_spans records every clip's [start, end) BEFORE the drag. Both halves of
+// each compared pair are looked up, because "did this pair overlap before" is a
+// fact about the PAIR: recording only one side would let a pre-existing overlap
+// look newly created (and the straddler case is exactly that).
+tl_spans :: proc() -> map[u64][2]i64 {
+	out := make(map[u64][2]i64, context.temp_allocator)
+	for &tr in timeline.tracks {
+		for &c in tr.clips {
+			out[c.clip_id] = [2]i64{c.timeline_start_frame, c.timeline_start_frame + c.source_length_frames}
+		}
+	}
+	return out
+}
+
+// tl_assert_no_new_overlap fails if any same-lane pair overlaps NOW that did not
+// overlap in `before`. This is the property the whole ripple rests on: every
+// member shifts by the SAME delta, so relative geometry inside the set is
+// preserved and the only possible new collision is member-vs-non-member.
+tl_assert_no_new_overlap :: proc(before: map[u64][2]i64) {
+	for &tr in timeline.tracks {
+		for i in 0 ..< len(tr.clips) {
+			for j in i + 1 ..< len(tr.clips) {
+				a, b := tr.clips[i], tr.clips[j]
+				if a.timeline_start_frame >= b.timeline_start_frame + b.source_length_frames ||
+				   b.timeline_start_frame >= a.timeline_start_frame + a.source_length_frames {
+					continue
+				}
+				wa, oka := before[a.clip_id]
+				wb, okb := before[b.clip_id]
+				// A clip absent from the snapshot was added after it was taken,
+				// so this pair has no "before" to be judged against.
+				if !oka || !okb {
+					continue
+				}
+				tl_probe_check(
+					wa[0] < wb[1] && wb[0] < wa[1],
+					"ripple created an overlap: clip %d [%d,%d) vs clip %d [%d,%d)",
+					a.clip_id,
+					a.timeline_start_frame,
+					a.timeline_start_frame + a.source_length_frames,
+					b.clip_id,
+					b.timeline_start_frame,
+					b.timeline_start_frame + b.source_length_frames,
+				)
+			}
+		}
+	}
+}
+
+// tl_assert_link_offset fails unless every other member of `link` sits the same
+// distance from the anchor as it did at capture. An OFFSET link pair is legal —
+// a partner may start before its anchor — so this, not tl_assert_aligned, is
+// the alignment invariant a ripple must hold: tl_assert_aligned demands equal
+// ABSOLUTE starts and would report a correct ripple as a desync.
+tl_assert_link_offset :: proc(link, anchor_id: u64, want: i64) {
+	base := tl_start_of(anchor_id)
+	for &tr in timeline.tracks {
+		for &c in tr.clips {
+			if c.link_id != link || c.clip_id == anchor_id {
+				continue
+			}
+			tl_probe_check(
+				c.timeline_start_frame - base == want,
+				"link %d: clip %d sits %d from the anchor, want %d",
+				link,
+				c.clip_id,
+				c.timeline_start_frame - base,
+				want,
+			)
+		}
+	}
+}
+
+// test_ripple_set_capture: the captured set is the anchor, its link partner
+// (which starts BEFORE the threshold), and everything at or after the anchor —
+// and nothing else. Anchor-first matters: the delta is measured from
+// ripple_orig[0].start, so a set whose head is not the grabbed clip rips from
+// the wrong frame.
+test_ripple_set_capture :: proc() {
+	tl_ripple_scene()
+	capture_link_group(&timeline.tracks[0].clips[1], 0)
+	capture_ripple_set(&timeline.tracks[0].clips[1], 0)
+	tl_probe_check(
+		len(clip_move.ripple_orig) == 7,
+		"ripple set must hold 7 clips (anchor + link + 5 at/after), got %d",
+		len(clip_move.ripple_orig),
+	)
+	if len(clip_move.ripple_orig) == 0 {
+		return
+	}
+	tl_probe_check(
+		clip_move.ripple_orig[0].clip_id == 8200,
+		"ripple set head must be the grabbed clip 8200, got %d",
+		clip_move.ripple_orig[0].clip_id,
+	)
+	held_back := []u64{8100, 7100}
+	for cid in held_back {
+		tl_probe_check(
+			!ripple_moves_clip(cid),
+			"clip %d starts before the anchor and is in no group: must NOT be in the ripple set",
+			cid,
+		)
+	}
+	moving := []u64{8200, 7200, 8300, 8400, 8500, 7300, 7400}
+	for cid in moving {
+		tl_probe_check(
+			ripple_moves_clip(cid),
+			"clip %d must be in the ripple set",
+			cid,
+		)
+	}
+}
+
+// test_ripple_moves_everything_downstream: the whole point of the gesture. One
+// shared delta moves every lane's tail and leaves every head exactly where it
+// was, and the link pair keeps its offset so the A/V glue survives.
+test_ripple_moves_everything_downstream :: proc() {
+	tl_ripple_scene()
+	before := tl_spans()
+	capture_link_group(&timeline.tracks[0].clips[1], 0)
+	capture_ripple_set(&timeline.tracks[0].clips[1], 0)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clip_move.ripple = true
+	// frame 130 with the anchor captured at 100 -> delta +30.
+	drag_move_in_place(f32(130))
+	tl_probe_check(clip_move.ripple_delta == 30, "delta must be +30, got %d", clip_move.ripple_delta)
+	tl_assert_starts(
+		"ripple +30",
+		Ripple_Want{8100, 0},
+		Ripple_Want{7100, 0},
+		Ripple_Want{8200, 130},
+		Ripple_Want{7200, 80},
+		Ripple_Want{8300, 230},
+		Ripple_Want{8400, 330},
+		Ripple_Want{8500, 430},
+		Ripple_Want{7300, 130},
+		Ripple_Want{7400, 230},
+	)
+	tl_assert_no_new_overlap(before)
+	tl_assert_link_offset(8800, 8200, -50)
+
+	// Dragging back to where it started must land EXACTLY on the original
+	// geometry: the apply writes from the captured originals, not from the live
+	// position, so a long slide out and back cannot accumulate a frame of drift.
+	drag_move_in_place(f32(100))
+	tl_assert_starts(
+		"ripple back to 0",
+		Ripple_Want{8100, 0},
+		Ripple_Want{7100, 0},
+		Ripple_Want{8200, 100},
+		Ripple_Want{7200, 50},
+		Ripple_Want{8300, 200},
+		Ripple_Want{8400, 300},
+		Ripple_Want{8500, 400},
+		Ripple_Want{7300, 100},
+		Ripple_Want{7400, 200},
+	)
+	tl_probe_check(clip_move.ripple_delta == 0, "returning home must be delta 0, got %d", clip_move.ripple_delta)
+}
+
+// test_ripple_clamps_flush_on_one_wall: a leftward ripple is bounded by the
+// tightest non-member tail, and the WHOLE set shifts by that clamped delta. The
+// binding wall here is 7100's tail at 40 against 7200's start at 50, so the set
+// parks at delta -10: 7200 lands flush on 7100, and 8200 stops 40 frames short
+// of 8100 rather than being allowed to drive through it. A per-clip clamp would
+// put 8200 at 50 and 7200 at 40 — the link pair desynced by 10 frames, which is
+// the A/V drift this editor has already been bitten by.
+test_ripple_clamps_flush_on_one_wall :: proc() {
+	tl_ripple_scene()
+	before := tl_spans()
+	capture_link_group(&timeline.tracks[0].clips[1], 0)
+	capture_ripple_set(&timeline.tracks[0].clips[1], 0)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clip_move.ripple = true
+	drag_move_in_place(f32(0))
+	tl_probe_check(
+		clip_move.ripple_delta == -10,
+		"leftward ripple must clamp to -10 (7100's tail), got %d",
+		clip_move.ripple_delta,
+	)
+	tl_assert_starts(
+		"ripple clamped",
+		Ripple_Want{8100, 0},
+		Ripple_Want{7100, 0},
+		Ripple_Want{8200, 90},
+		Ripple_Want{7200, 40},
+		Ripple_Want{8300, 190},
+		Ripple_Want{8400, 290},
+		Ripple_Want{8500, 390},
+		Ripple_Want{7300, 90},
+		Ripple_Want{7400, 190},
+	)
+	tl_assert_no_new_overlap(before)
+	tl_assert_link_offset(8800, 8200, -50)
+	// 7200 is exactly flush against 7100's tail — the wall, not short of it.
+	tl_probe_check(
+		tl_start_of(7200) == tl_start_of(7100) + 40,
+		"the binding member must park flush against its wall (7100@%d 7200@%d)",
+		tl_start_of(7100),
+		tl_start_of(7200),
+	)
+}
+
+// test_ripple_stops_at_the_left_edge: with nothing but empty timeline to the
+// left, a clip captured at frame 0 bounds the ripple at delta 0. The set cannot
+// shift left past the origin, and it shifts by NOTHING rather than partially.
+test_ripple_stops_at_the_left_edge :: proc() {
+	tl_ripple_scene()
+	before := tl_spans()
+	// Re-lay lane 1 so a member sits at frame 0 with empty timeline before it,
+	// which is the only wall that can exist there.
+	clear(&timeline.tracks[1].clips)
+	append(&timeline.tracks[1].clips, mk_tl_clip(7200, 8800, 0, 40, 0, .Audio))
+	append(&timeline.tracks[1].clips, mk_tl_clip(7300, 0, 0, 40, 100, .Audio))
+	capture_link_group(&timeline.tracks[0].clips[1], 0)
+	capture_ripple_set(&timeline.tracks[0].clips[1], 0)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clip_move.ripple = true
+	drag_move_in_place(f32(10))
+	tl_probe_check(
+		clip_move.ripple_delta == 0,
+		"a member at frame 0 must floor the ripple at delta 0, got %d",
+		clip_move.ripple_delta,
+	)
+	tl_assert_starts("ripple at the left edge", Ripple_Want{7200, 0}, Ripple_Want{8200, 100}, Ripple_Want{8300, 200})
+	tl_assert_no_new_overlap(before)
+}
+
+// test_ripple_carries_the_shift_selection: a clip the user explicitly
+// Shift-clicked into the group joins the ripple even when it starts BEFORE the
+// anchor's threshold, and moves by the shared delta. This is the "select both,
+// alt-drag one" case from the request: without it the other selected clip stays
+// behind and the selection is a lie by the time the drag ends.
+test_ripple_carries_the_shift_selection :: proc() {
+	tl_ripple_scene()
+	before := tl_spans()
+	// 8100 starts at 0, before the threshold of 100, and is in no link group.
+	selection.extra_set[8100] = true
+	capture_link_group(&timeline.tracks[0].clips[1], 0)
+	capture_ripple_set(&timeline.tracks[0].clips[1], 0)
+	tl_probe_check(
+		ripple_moves_clip(8100),
+		"a Shift-clicked clip must join the ripple even when it starts before the anchor",
+	)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clip_move.ripple = true
+	drag_move_in_place(f32(120))
+	tl_assert_starts(
+		"ripple carries the extra",
+		Ripple_Want{8100, 20},
+		Ripple_Want{7100, 0},
+		Ripple_Want{8200, 120},
+		Ripple_Want{7200, 70},
+		Ripple_Want{8500, 420},
+		Ripple_Want{7400, 220},
+	)
+	tl_assert_no_new_overlap(before)
+}
+
+// test_ripple_ignores_a_straddler: a clip that already overlaps a member stays
+// where it is and the ripple does not try to resolve the overlap. This timeline
+// permits same-lane overlap for stacked clips, so a straddler is a legitimate
+// state; treating it as a wall would freeze the whole set on the strength of an
+// overlap the user never asked about, and treating it as movable would silently
+// pull a clip the gesture was never scoped to.
+test_ripple_ignores_a_straddler :: proc() {
+	tl_ripple_scene()
+	// 7150 starts at 20 and runs to 130, so it already overlaps 7300's
+	// [100,140) and 7200's [50,90). It must not move, and it must not act as a
+	// wall for the rest of the set. Added BEFORE the snapshot, because the
+	// overlap it creates is the pre-existing overlap the test is about.
+	append(&timeline.tracks[1].clips, mk_tl_clip(7150, 0, 0, 110, 20, .Audio))
+	before := tl_spans()
+	capture_link_group(&timeline.tracks[0].clips[1], 0)
+	capture_ripple_set(&timeline.tracks[0].clips[1], 0)
+	tl_probe_check(
+		!ripple_moves_clip(7150),
+		"a straddler starting before the anchor must not join the ripple set",
+	)
+	clip_move.clip = &timeline.tracks[0].clips[1]
+	clip_move.source_track = 0
+	clip_move.source_index = 1
+	clip_move.hover_track = 0
+	clip_move.ripple = true
+	drag_move_in_place(f32(200))
+	tl_assert_starts(
+		"ripple over a straddler",
+		Ripple_Want{7150, 20},
+		Ripple_Want{8200, 200},
+		Ripple_Want{7200, 150},
+		Ripple_Want{7300, 200},
+		Ripple_Want{7400, 300},
+	)
+	tl_assert_no_new_overlap(before)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_cut_resolves_playhead()
@@ -1028,6 +1412,25 @@ timeline_probe_run :: proc(_: string) {
 	tl_split_scene()
 	test_split_halves_own_their_payload()
 	fmt.println("[tl-probe] split-ownership ok")
+
+	tl_ripple_scene()
+	test_ripple_set_capture()
+	fmt.println("[tl-probe] ripple-capture ok")
+	tl_ripple_scene()
+	test_ripple_moves_everything_downstream()
+	fmt.println("[tl-probe] ripple-downstream ok")
+	tl_ripple_scene()
+	test_ripple_clamps_flush_on_one_wall()
+	fmt.println("[tl-probe] ripple-wall ok")
+	tl_ripple_scene()
+	test_ripple_stops_at_the_left_edge()
+	fmt.println("[tl-probe] ripple-left-edge ok")
+	tl_ripple_scene()
+	test_ripple_carries_the_shift_selection()
+	fmt.println("[tl-probe] ripple-shift-selection ok")
+	tl_ripple_scene()
+	test_ripple_ignores_a_straddler()
+	fmt.println("[tl-probe] ripple-straddler ok")
 
 	if tl_probe_fail {
 		fmt.println("[tl-probe] FAILED")

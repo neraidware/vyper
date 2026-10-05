@@ -291,6 +291,9 @@ undo_restore :: proc(idx: i32) {
 	clip_move.hover_track = -1
 	clip_move.group_delta = 0
 	clear(&clip_move.group_orig)
+	clip_move.ripple = false
+	clip_move.ripple_delta = 0
+	clear(&clip_move.ripple_orig)
 	clip_resize.edge = -1
 	clip_resize.moved = false
 	invalidate_preview_slots()

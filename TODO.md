@@ -4675,3 +4675,89 @@ Steps:
 Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
+
+## Active 21 — Alt+drag is a ripple move: every clip at or after the anchor moves with it
+
+**Why:** dragging a clip in the middle of the timeline moved that clip and
+nothing else. Shifting a clip and everything downstream of it is one gesture in
+every NLE, and here it took a ripple-delete, N separate drags, or an undo. The
+report: "Alt + Move clip should move also all clips that start at that clip's
+start or after the main selected clip."
+
+**The set, and why each source is in it** (`capture_ripple_set`,
+timeline.odin). Anchor first — the delta is measured from `ripple_orig[0].start`,
+so a set whose head is not the grabbed clip rips from the wrong frame. Then:
+
+- the anchor's whole link group, from the `group_orig` already captured by the
+  press. A partner left behind is the desync every group move exists to prevent,
+  and a partner may legitimately start BEFORE the anchor (`test_drag_same_track_
+  leftedge` is built on exactly that shape).
+- the Shift multi-selection (`selection.extra_set`). This is the "select both,
+  alt-drag one" case from the report: without it the other selected clip stays
+  behind and the selection is a lie by the time the drag ends.
+- every remaining clip on every track whose start is `>=` the ANCHOR's start.
+  The threshold is the anchor rather than the earliest member, so moving a late
+  clip on an early-starting group does not drag the whole tail with it.
+
+Alt is latched at PRESS, not sampled per frame: a modifier pressed mid-drag
+would change what the gesture MEANS halfway through, moving clips the live apply
+had never captured.
+
+**Why the collision problem is smaller than it looks, and where it is not.**
+Every member shifts by the SAME delta, so relative geometry inside the set is
+preserved and no two members can ever collide. That reduces the walls to a
+moving clip vs a clip that does not move — and a non-member's start is by
+definition before the anchor's threshold, hence before every member's start, so
+it can only ever sit to a member's LEFT. `ripple_clamp_delta` therefore computes
+a lower bound and nothing else; a right-hand bound would be code that can never
+fire, so it is not written. The bound is the tightest of the timeline's left edge
+(no member before frame 0) and each non-member's tail, so the set parks FLUSH
+against the binding wall. A per-clip clamp would put the lane-0 anchor at its own
+wall and the lane-1 partner at a different one — the A/V drift this editor has
+already been bitten by. `apply_ripple_drag` writes from the captured ORIGINALS,
+not the live position, so a long slide out and back lands exactly where it
+started instead of compounding one frame of sampling error per frame.
+
+**Straddlers are left alone on purpose.** This timeline permits same-lane
+overlap for stacked clips, so a clip that starts before the anchor and runs past
+it is a legitimate state, not a defect. It contributes no wall and does not join
+the set: freezing the whole ripple on the strength of an overlap the user never
+mentioned is worse than leaving the overlap exactly as deep as it already was.
+
+**Cross-lane drops need nothing.** A vertical Alt+drop relocates the group
+through the existing `move_linked_group` / `move_clip_to_track`, and their
+feasibility checks read the destination lane's LIVE positions — which the ripple
+has already shifted by the same delta the anchor is landing by. So the anchor's
+relative slot is unchanged and a legal drop still passes. The downstream clips
+stay on their own lanes, shifted horizontally.
+
+Steps:
+- [x] S1. Model first (`Clip_Move_State` gains `ripple` / `ripple_delta` /
+      `ripple_orig`, reusing the existing `Drag_Group_Orig` record — it is the
+      same fact about the same clip, just at a wider scope, and duplicating the
+      struct would have bought nothing).
+- [x] S2. `capture_ripple_set` / `ripple_clamp_delta` / `apply_ripple_drag` in
+      timeline.odin; `ripple_moves_clip` is a linear scan on the clip id alone
+      rather than the membership map the group helpers build, so the per-frame
+      path stays allocation-free.
+- [x] S3. Wired into the press (latch + capture), `drag_move_in_place` (one
+      branch ahead of the group and single-clip paths), the release (`moved` off
+      the applied delta, because a vertical drop has already relocated the anchor
+      by then so its live start says nothing), and the two gesture resets.
+      Undo label is "Ripple move", not "Move clip": the node covers every clip
+      the ripple carried.
+- [x] S4. Probe: six cases in timeline_probe.odin, in the existing `timeline_probe`
+      gate. Set membership and anchor-first; the downstream shift on both lanes
+      plus the out-and-back drift check; the flush wall (binding member exactly
+      on its wall, not short of it); the frame-0 left edge; the Shift extra; the
+      straddler. Every case asserts "no new overlap vs the pre-drag snapshot"
+      over BOTH clips of each pair.
+
+**Probe / mutation.** Five mutations, each red on the gate: `>=` threshold made
+exclusive (7300 left behind, and it then overlapped 7200); `max(delta, lo)`
+turned into `return delta` (the whole set drove to -100 and past frame 0);
+`selection.extra_set` emptied (the Shift extra stayed at 0); the absolute apply
+turned relative (out-and-back landed at 130, not 100); the link-member loop
+deleted (7200 left behind, link 8800 desynced to -80).
+
+**Accept.** `check build probe timeline_probe valgrind` pass.

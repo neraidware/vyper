@@ -771,6 +771,14 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 						inp.x -
 						clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox.x
 					capture_link_group(clip_move.clip, track_idx)
+					// Alt at PRESS latches the gesture as a ripple move: every
+					// clip at or after the anchor shifts with it. Captured here,
+					// before any frame of live movement, so the set is the
+					// timeline as the user saw it when they grabbed the clip.
+					clip_move.ripple = inp.alt
+					if clip_move.ripple {
+						capture_ripple_set(clip_move.clip, track_idx)
+					}
 					return true
 				}
 			}
@@ -840,14 +848,32 @@ end_track_drag :: proc() {
 	track_drag.hover_row = -1
 }
 
-// drag_move_in_place advances the dragged clip (or whole linked group) to
-// `frame` on its source lane, clamped so it never overlaps a neighbor. Shared
-// by the plain same-lane drag and the dwell frames of a potential vertical
-// drop: a fast flick that skitters across a lane boundary must keep the clip
-// glued to the cursor, so the horizontal follow can't live inside the
-// hover==source branch alone.
+// drag_move_in_place advances the dragged clip (or whole linked group, or the
+// whole Alt+drag ripple set) to `frame` on its source lane, clamped so it never
+// overlaps a neighbor. Shared by the plain same-lane drag and the dwell frames
+// of a potential vertical drop: a fast flick that skitters across a lane
+// boundary must keep the clip glued to the cursor, so the horizontal follow
+// can't live inside the hover==source branch alone.
 drag_move_in_place :: proc(frame: f32) {
 	if clip_move.clip == nil {
+		return
+	}
+	if clip_move.ripple {
+		// Ripple move: one shared delta for the whole captured set, measured
+		// from the ANCHOR's original start so the grabbed clip's head stays
+		// under the cursor exactly as a plain drag keeps it, and clamped to
+		// the band every member can hold (see ripple_clamp_delta).
+		want := i64(max(frame, 0)) - clip_move.ripple_orig[0].start
+		clip_move.ripple_delta = ripple_clamp_delta(want)
+		if vyper_trace {
+			fmt.printf(
+				"[tl] drag ripple clips=%d delta=%d (want %d)\n",
+				len(clip_move.ripple_orig),
+				clip_move.ripple_delta,
+				want,
+			)
+		}
+		apply_ripple_drag(clip_move.ripple_delta)
 		return
 	}
 	if len(clip_move.group_orig) > 1 {
@@ -1167,7 +1193,17 @@ interaction_release :: proc(inp: Mouse_Input) {
 		// against the capture-time snapshot.
 		{
 			moved := false
-			if len(clip_move.group_orig) > 1 {
+			if clip_move.ripple {
+				// The applied delta IS the change: a ripple that clamped to
+				// delta 0 moved nothing, and a vertical staging that ended on
+				// the source lane moved nothing. Read it rather than the
+				// anchor's live start — a vertical drop has already relocated
+				// the anchor by the time this runs, so its start no longer
+				// says anything about what the drag did.
+				moved =
+					clip_move.ripple_delta != 0 ||
+					(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
+			} else if len(clip_move.group_orig) > 1 {
 				moved =
 					clip_move.group_delta != 0 ||
 					(clip_move.hover_track >= 0 &&
@@ -1179,7 +1215,16 @@ interaction_release :: proc(inp: Mouse_Input) {
 					(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
 			}
 			if moved {
-				label := len(clip_move.group_orig) > 1 ? "Move clip(s)" : "Move clip"
+				label := "Move clip"
+				if clip_move.ripple {
+					// Named apart from a plain move because it is a different
+					// edit: the undo node covers every clip the ripple carried,
+					// and "Move clip" on that node reads as though it undoes
+					// one clip.
+					label = "Ripple move"
+				} else if len(clip_move.group_orig) > 1 {
+					label = "Move clip(s)"
+				}
 				undo_push(.Move, label)
 				// The drag applied live; this is the one commit the audio
 				// engine gets for it. audio_note_edit (not a bare seek)
@@ -1277,6 +1322,9 @@ interaction_release :: proc(inp: Mouse_Input) {
 	clip_move.lane_dwell = 0
 	clip_move.group_delta = 0
 	clear(&clip_move.group_orig)
+	clip_move.ripple = false
+	clip_move.ripple_delta = 0
+	clear(&clip_move.ripple_orig)
 	clip_resize.edge = -1
 	clip_resize.moved = false
 }

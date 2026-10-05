@@ -1232,6 +1232,17 @@ clip_index_by_id :: proc(track: ^Track, id: u64) -> int {
 	return -1
 }
 
+// drag_orig_of snapshots one clip's drag-time geometry into the record both
+// capture paths (link group, ripple set) store.
+drag_orig_of :: proc(clip: ^Clip, track: int) -> Drag_Group_Orig {
+	return Drag_Group_Orig {
+		clip_id = clip.clip_id,
+		track = track,
+		start = clip.timeline_start_frame,
+		length = clip.source_length_frames,
+	}
+}
+
 // capture_link_group snapshots the original (track, start, length) of every clip
 // sharing clip's link_id into clip_move.group_orig, anchor first. Non-linked clips
 // leave the array empty (len 0 = single-clip edit; len 1 = linked clip that is
@@ -1243,28 +1254,12 @@ capture_link_group :: proc(clip: ^Clip, track: int) {
 	if clip.link_id == 0 {
 		return
 	}
-	append(
-		&clip_move.group_orig,
-		Drag_Group_Orig {
-			clip_id = clip.clip_id,
-			track = track,
-			start = clip.timeline_start_frame,
-			length = clip.source_length_frames,
-		},
-	)
+	append(&clip_move.group_orig, drag_orig_of(clip, track))
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
 			c := &timeline.tracks[t].clips[i]
 			if c.link_id == clip.link_id && c.clip_id != clip.clip_id {
-				append(
-					&clip_move.group_orig,
-					Drag_Group_Orig {
-						clip_id = c.clip_id,
-						track = t,
-						start = c.timeline_start_frame,
-						length = c.source_length_frames,
-					},
-				)
+				append(&clip_move.group_orig, drag_orig_of(c, t))
 			}
 		}
 	}
@@ -1296,6 +1291,121 @@ apply_group_drag_to_members :: proc(anchor_delta: i64) {
 			continue
 		}
 		track.clips[idx].timeline_start_frame = m.start + anchor_delta
+	}
+}
+
+// capture_ripple_set snapshots every clip an Alt+drag will shift into
+// clip_move.ripple_orig, anchor FIRST. Three sources, in capture order so the
+// anchor is provably entry 0:
+//
+//	1. the anchor's whole link group (from group_orig, already captured);
+//	2. the Shift multi-selection (selection.extra_set);
+//	3. every remaining clip on every track whose start is at or after the
+//	   ANCHOR's own start — that is the ripple proper.
+//
+// (1) and (2) join outright even when they start earlier than the threshold: a
+// link partner left behind is the desync every group move exists to prevent,
+// and a clip the user explicitly Shift-clicked into the group is not theirs to
+// strand. The threshold is the ANCHOR rather than the earliest member, so
+// moving a late clip on an early-starting group does not drag the whole tail
+// of the timeline with it.
+//
+// Call at gesture start, before any mutation, right after capture_link_group.
+capture_ripple_set :: proc(clip: ^Clip, track: int) {
+	clear(&clip_move.ripple_orig)
+	threshold := clip.timeline_start_frame
+	append(&clip_move.ripple_orig, drag_orig_of(clip, track))
+	for m in clip_move.group_orig {
+		if m.clip_id != clip.clip_id {
+			append(&clip_move.ripple_orig, m)
+		}
+	}
+	for id in selection.extra_set {
+		if id == clip.clip_id {
+			continue
+		}
+		if tr, c, ok := find_clip_by_id(id); ok {
+			append(&clip_move.ripple_orig, drag_orig_of(c, track_index_of(tr)))
+		}
+	}
+	for t := 0; t < len(timeline.tracks); t += 1 {
+		for &c in timeline.tracks[t].clips {
+			if c.timeline_start_frame >= threshold && !ripple_moves_clip(c.clip_id) {
+				append(&clip_move.ripple_orig, drag_orig_of(&c, t))
+			}
+		}
+	}
+}
+
+// ripple_moves_clip reports whether the clip is part of the captured ripple set.
+// Clip ids are unique across the whole timeline (find_clip_by_id resolves on the
+// id alone), so one linear scan of the set is the whole answer — and skipping
+// the membership map the group helpers build keeps the per-frame path
+// allocation-free.
+ripple_moves_clip :: proc(id: u64) -> bool {
+	for &m in clip_move.ripple_orig {
+		if m.clip_id == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ripple_clamp_delta bounds the ripple's shared delta from below. Because ALL
+// the captured clips shift by the same delta, every pair inside the set keeps
+// its relative geometry and can never collide — so the only walls are between a
+// moving clip and a clip that does NOT move, and there is only ever ONE side of
+// them: a non-member starts before the anchor's threshold by definition, hence
+// before every member's start, so it can only ever sit to a member's LEFT.
+// There is no right-hand wall to compute, and writing one would be code that
+// can never fire.
+//
+// The floor is the tightest of two things: the timeline's left edge (no member
+// may start before frame 0 — the same left-edge rule group_delta_feasible
+// enforces, expressed as a bound instead of a refusal because every member of a
+// ripple shares one delta by construction), and each non-member's tail, so the
+// set parks FLUSH against the binding wall instead of driving through it.
+//
+// Walls are read off each pair's CURRENT relationship, the same rule
+// group_clamp_delta uses, and a pair that ALREADY overlaps contributes nothing.
+// That is not a gap in the rule, it is the point: this timeline permits
+// same-track overlap for stacked clips, so a straddler is a legitimate state.
+// The ripple neither deepens an overlap that was already there nor tries to
+// resolve one the user did not ask it to.
+ripple_clamp_delta :: proc(delta: i64) -> i64 {
+	if len(clip_move.ripple_orig) == 0 {
+		return delta
+	}
+	lo := -(i64(1) << 40)
+	for m in clip_move.ripple_orig {
+		lo = max(lo, -m.start)
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			continue
+		}
+		for &c in timeline.tracks[m.track].clips {
+			if ripple_moves_clip(c.clip_id) {
+				continue
+			}
+			cend := c.timeline_start_frame + c.source_length_frames
+			if cend <= m.start {
+				lo = max(lo, cend - m.start)
+			}
+		}
+	}
+	return max(delta, lo)
+}
+
+apply_ripple_drag :: proc(delta: i64) {
+	for m in clip_move.ripple_orig {
+		if m.track < 0 || m.track >= len(timeline.tracks) {
+			continue
+		}
+		t := &timeline.tracks[m.track]
+		i := clip_index_by_id(t, m.clip_id)
+		if i < 0 {
+			continue
+		}
+		t.clips[i].timeline_start_frame = m.start + delta
 	}
 }
 
