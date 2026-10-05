@@ -1918,6 +1918,18 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		flash_probe_run(fp)
 		return
 	}
+	// Standalone, and NOT dispatched from audio_probe: this one currently FAILS,
+	// which is the finding rather than a nuisance (see TODO.md Active 30 S2). It has
+	// its own gate target so the failure is named and runnable instead of either
+	// breaking `all` or being quietly skipped.
+	if mp, _ := os.lookup_env_alloc("VYPER_AUDIO_MIX_PARITY", context.temp_allocator); mp != "" {
+		parts := strings.split(mp, "|")
+		ok := audio_probe_mix_parity(strings.trim_space(parts[0]))
+		if !ok {
+			os.exit(1)
+		}
+		os.exit(0)
+	}
 	if atp, _ := os.lookup_env_alloc("VYPER_ATEMPO_PROBE", context.temp_allocator); atp != "" {
 		atempo_probe_run(atp)
 		return

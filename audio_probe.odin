@@ -1,5 +1,6 @@
 package main
 
+import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:os"
@@ -1270,6 +1271,196 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 		"[ap] declick ok (%.5f at the boundary against an interior peak of %.5f, largest step %.5f)\n",
 		at_edge, interior_peak, step,
 	)
+	return true
+}
+
+
+// audio_probe_mix_parity drives BOTH mixers over the SAME timeline span and
+// asserts they produce IDENTICAL samples.
+//
+// This is the audio analogue of the geometry parity_probe, and it exists for the
+// same reason. `render_mix_block` (export) and `audio_mix_frame` (playback) are
+// near-identical copies of one loop that differ in the struct they read, the
+// granularity they iterate and how they resolve a clip's span. Nothing compared
+// them, so they could have drifted for as long as both were "correct" -- the same
+// one-fact-two-copies shape the geometry carrier fixed in Active 24, one level down
+// and in the engine that has to be right about time.
+//
+// It also answers a question nothing currently answers: do the two mixers agree
+// TODAY? They are meant to, they were never checked, and the answer decides whether
+// collapsing them onto one node (Active 30 S3) is a refactor of something
+// equivalent or a bug fix in disguise.
+//
+// How they are driven. Playback gets `frame` and mixes that frame's sample count.
+// Export gets an absolute `Sample_Pos` range and mixes it. The probe hands each
+// the same range -- audio_mix_frame for the frame, render_mix_block for
+// [frame_start, frame_end) -- and compares the buffers. Same input, same numbers,
+// one pipeline to change later.
+audio_probe_mix_parity :: proc(path: string) -> bool {
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] mix-parity: SKIP: no project fps")
+		return true
+	}
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	// A clean timeline: one clip, then a second lane of the same content, then a
+	// THIRD clip that starts partway in. The third is the interesting one -- a
+	// boundary inside the range, where the two mixers resolve a span and a content
+	// offset by different routes and can legitimately disagree.
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "parity", clips = make([dynamic]Clip, 0, 3)}
+	append(&track.clips, Clip {
+		clip_id = new_clip_id(), path = cpath, kind = .Audio,
+		name = session_str_intern("a"), timeline_start_frame = 0,
+		source_length_frames = 90, source_start_frame = 0, stream_index = 0,
+	})
+	append(&track.clips, Clip {
+		clip_id = new_clip_id(), path = cpath, kind = .Audio,
+		name = session_str_intern("b"), timeline_start_frame = 40,
+		source_length_frames = 50, source_start_frame = 0, stream_index = 0,
+	})
+	append(&track.clips, Clip {
+		clip_id = new_clip_id(), path = cpath, kind = .Audio,
+		name = session_str_intern("c"), timeline_start_frame = 95,
+		source_length_frames = 30, source_start_frame = 0, stream_index = 0,
+	})
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+
+	// Playback side: provision exactly as audio_probe_gain_check does -- reset,
+	// then provision, with no commit of its own and NO reset after (that call
+	// clears every source slot, which is why the first two attempts at this case
+	// reported an empty timeline).
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_provision(0)
+	if audio_src.count == 0 {
+		fmt.println("[ap] mix-parity: SKIP: playback provisioned no sources")
+		return true
+	}
+
+	// Export side: the SAME clips, snapshotted through the production path from
+	// the committed slab, so the gain snapshot is the one the real export would
+	// carry rather than a hand-built one.
+	fnum, fden := fps_rational(fps)
+	num, den := i64(fnum), i64(fden)
+	// A LOCAL dynamic array: render_job.audios is a slice, and assigning a dynamic
+	// array into it would hand the job a pointer into this proc's stack. The slice
+	// is set for the duration of the comparison and cleared in the defer below.
+	export_audios: [dynamic]Render_Audio_Src
+	defer delete(export_audios)
+	slot := audio_geom_acquire()
+	defer audio_geom_release()
+	for i in 0 ..< min(int(slot.n), 8) {
+		append(&export_audios, render_audio_src_from_chip(slot, &slot.chip[i]))
+	}
+	// render_mix_block walks render_job.audios, so point the job at the probe's
+	// array for the duration. The cloned paths are ours and go with it.
+	render_job.audios = export_audios[:]
+	defer {
+		for &a in export_audios {
+			if a.path != nil {
+				delete(a.path)
+			}
+		}
+		render_job.audios = nil
+	}
+	render_mix: Render_Mix
+	render_mix_init(&render_mix, c.int(num), c.int(den), sample_pos_from_frames(0, num, den))
+	defer render_mix_bus_destroy(&render_mix.bus)
+	opened := 0
+	for &a in export_audios {
+		if render_audio_open(&a, 0, fps) {
+			opened += 1
+		} else {
+			a.dec.opened = false
+		}
+	}
+	if opened == 0 {
+		fmt.println("[ap] mix-parity: SKIP: export opened no sources")
+		return true
+	}
+
+	// Compare frame by frame. Both mixers see the same [frame_start, frame_end)
+	// range; playback as a frame, export as absolute samples.
+	LAST_FRAME :: 140
+	mix_play: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	mix_exp: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	worst := f32(0)
+	worst_frame := i64(-1)
+	mismatches := 0
+	for frame in i64(0) ..= LAST_FRAME {
+		f0 := sample_pos_from_frames(frame, num, den)
+		f1 := sample_pos_from_frames(frame + 1, num, den)
+		n := int(f1 - f0)
+		if n <= 0 || n > MAX_AUDIO_FRAME_SAMPLES {
+			continue
+		}
+		audio_src.next_frame = frame
+		audio_mix_frame(mix_play[:], frame, n)
+		// The export at its NATURAL granularity. Its real producer mixes
+		// AUDIO_MIX_BLOCK (512) at a time and the consumer takes whatever range
+		// its frame covers; driving it with a whole frame at once would be the
+		// probe inventing a path the export never takes, and if the shift moved
+		// with the block size the finding would be about the probe.
+		for i in 0 ..< n * 2 {
+			mix_exp[i] = 0
+		}
+		off := 0
+		for off < n {
+			k := min(AUDIO_MIX_BLOCK, n - off)
+			render_mix_block(&render_mix, mix_exp[off * 2:], f0 + Sample_Pos(off), k)
+			off += k
+		}
+		bad := false
+		for i in 0 ..< n * 2 {
+			d := abs(mix_play[i] - mix_exp[i])
+			if d > worst {
+				worst = d
+				worst_frame = frame
+			}
+			// One part in ten thousand of full scale: both mixers are f32
+			// through the same evaluator, so this catches a different DECISION,
+			// not a rounding wobble.
+			if d > 0.0001 {
+				bad = true
+			}
+		}
+		if bad {
+			mismatches += 1
+			if mismatches <= 3 {
+				fmt.printf("[ap] mix-parity: frame %d differs (worst so far %.6f)\n", frame, worst)
+			}
+		}
+	}
+	at := ""
+	if worst_frame >= 0 {
+		at = fmt.aprintf(" at frame %d", worst_frame)
+	}
+	fmt.printf(
+		"[ap] mix-parity: %d frames, %d mismatching, worst delta %.6f%s\n",
+		LAST_FRAME + 1,
+		mismatches,
+		worst,
+		at,
+	)
+	if mismatches > 0 {
+		fmt.println("[ap] FAIL: the playback and export mixers do not agree")
+		return false
+	}
+	fmt.println("[ap] mix-parity ok (both mixers produced identical samples)")
 	return true
 }
 

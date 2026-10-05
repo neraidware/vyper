@@ -5839,3 +5839,136 @@ DC has no phase to hide behind.
 **Accept.** `check build probe audio_probe audio_rate keyed_export parity
 subtitle_probe render_kf_probe zorder` pass; `audio_export_audit` reports 0
 dropouts and exact length.
+
+## Active 30 — One mix engine with declared latency: Resolve's model, REAPER-swappable
+
+**Why:** Active 29 closed the two measured desync defects, and the honest answer
+to "can it still desync" was: the two mixers are separate implementations and
+neither accounts for pipeline latency. Both are structural, not incidental.
+
+`render_mix_block` (export) and `audio_mix_frame` (playback) are near-identical
+copies of the same loop. `render_audio_pull` and `audio_src_pull` have the same
+body — decode forward until the ring covers `up_to48`, push, advance — and
+`audio_src_append` is a one-line wrapper over the same `ring_push_pcm` the export
+calls directly. They differ in the struct they read (`Render_Audio_Src` vs
+`Play_Src`), in the granularity they iterate (a fixed 512-sample block vs one video
+frame), and in how they resolve a clip's span. Two copies of a mixer, one fact per
+copy: the Active 26 defect shape, one level down and in the engine that has to be
+right about time.
+
+And there is no latency compensation anywhere: grepping `audio.odin`,
+`audio_device.odin` and `atempo.odin` for latency/priming/compensation/SKIP_SAMPLES
+returns nothing. Meanwhile the pipeline has THREE things that add delay before a
+sample reaches the canvas — `swr` resampling on every clip not already at the bus
+rate, the `atempo` lookahead graph, and the device resampler. `audio.odin` even
+notes a measured "~0.1s AFTER the requested time" absorbed per-seek by
+`AUDIO_SEEK_PREROLL_SEC`. That may well cancel out. Nothing proves it does, and
+"no defect observed" is not "cannot occur" — which is the distinction this section
+is about.
+
+### What Resolve does, and what we copy
+
+From Blackmagic's own material (Resolve 18 manual, the Fairlight Audio Guide, the
+Fairlight tech specs), the reference model has four parts:
+
+- **One cursor, two units.** The playhead "indicates the current frame (and can
+  display the sample)". We have this: `Sample_Pos` with one `sample_pos_from_frames`.
+- **One bus rate.** Resolve defaults project audio to 48 kHz and resamples
+  imported audio to the timeline rate. We have this: `AUDIO_BUS_RATE` 48000.
+- **Block mixing to a device boundary.** Fixed block, ring, cushion. We have this.
+- **Latency compensation.** Fairlight lists it beside track/bus/plugin count as a
+  managed quantity, and devotes a chapter to click removal at the sample level.
+  **This is the part we do not have**, and it is the part that makes the rest
+  safe: a node's delay is a NUMBER the engine accounts for, so a chain's total
+  latency does not slide content against the timeline.
+
+### What we add so a REAPER-shaped engine is replaceable, not rewritten
+
+The point of the model is not fidelity to Resolve. It is that the mix core becomes
+a replaceable backend. That needs exactly two things Resolve has and we lack:
+
+**1. A node type, not a per-sink struct.** One `Mix_Src` carrying decoder, ring,
+content offset, timeline span, gain snapshot and `muted` — the union of
+`Play_Src` and `Render_Audio_Src`. ONE proc produces a source's gained, declicked
+samples for a block. Both mixers call it. A DAW version adds node TYPES and a UI;
+it does not touch a second mixer.
+
+**2. Latency as a declared, compensated quantity.** Every node declares
+`latency_samples`. The graph sums it and the engine compensates, so
+timeline→content mapping and timeline→output mapping differ by a known constant
+rather than by an observation. This is what makes an FX chain safe to add at all:
+in a DAW, each plugin delays audio, and Fairlight's compensation is why stacking
+them does not walk the audio off the picture.
+
+**3. Granularity becomes an argument, not a fork.** The export mixes 512-sample
+blocks; playback mixes one video frame. Both are "a range of `Sample_Pos`", so one
+mixer serves both and the block size is a parameter. This is the Resolve property
+we already have in the export (`render_mix_serve_frame` takes whatever range its
+frame covers, including one straddling two blocks) and playback has not caught up.
+
+### Steps
+
+- [x] S1. Declick unified (Active 29) — the two mixers now share their only
+      identical *policy*.
+- [x] S2. `mix_parity_probe`: drive BOTH mixers over the same timeline span and
+      compare them sample for sample. **BUILT, AND IT FAILS.** 120 of 141 frames
+      disagree, worst delta 0.192, and the disagreement is a constant **520-sample
+      (10.8 ms) content SHIFT** — cross-correlating one frame's export output
+      against the same frame's playback output peaks at +520 samples, not at 0.
+      See "The finding" below.
+- [ ] S3. `Mix_Src` node + one `mix_src_block`, both mixers onto it. Pure
+      deletion: the two pull procs and the duplicated gain/declick/span math
+      collapse into one.
+- [ ] S4. Latency: every node declares it, the graph sums it, both sinks
+      compensate. Measured and reported, not asserted by comment.
+- [ ] S5. Granularity as a parameter — playback asks for a frame's range and the
+      same mixer serves it.
+- [x] S6a. `atempo_probe` wired into `gate.sh` and `all`. It had an entry point
+      and passed, but was wired into neither, so playback rate changes were
+      verified by hand, once, and `all` could not catch a regression in the
+      pitch-preserving path.
+- [ ] S6b. Nothing exercises 29.97 (every rate measured so far is 60 or 30
+      exactly, and NTSC is where the 1601/1602 alternation lives).
+- [ ] S6c. Nothing measures drift beyond 30 s.
+
+### The finding (S2)
+
+The two mixers are **not** sample-equivalent, and nothing had ever compared them.
+They differ by a constant ~520 samples (10.8 ms): one of them reads the source
+from a position the other does not. That is the desync class Active 30 exists to
+close, found by the measurement added to enable the refactor — before any of the
+refactor, which is the order that matters.
+
+Three things were ruled out while finding it, each a plausible-looking wrong
+answer:
+
+- **It is not the probe driving the export at the wrong granularity.** The first
+  version handed `render_mix_block` a whole video frame at once; the real producer
+  mixes `AUDIO_MIX_BLOCK` (512) and the consumer takes whatever range its frame
+  covers. Re-driven at the natural 512 block size the shift is unchanged, so the
+  export's content mapping does not depend on how it is chopped.
+- **It is not an amplitude or ordering bug.** Cross-correlating the two frames
+  gives a clean non-zero best shift rather than a zero shift with a wrong gain, so
+  the same audio is present in both, 520 samples apart.
+- **It is not the correlation window silently measuring nothing.** The first
+  correlation used an offset past the end of the frame, so every shift was skipped
+  and the "best shift" printed as 0 — which reads as proof of alignment when
+  nothing had been compared.
+
+The 520 samples are the right size to be the missing LATENCY COMPENSATION this
+section is about: `swr` resampling, the `atempo` graph and the AAC encoder's
+priming each delay audio by a bounded amount, and the two sinks anchor their
+decoders against that differently. `audio.odin` already notes a measured "~0.1s
+AFTER the requested time" that `AUDIO_SEEK_PREROLL_SEC` absorbs per-seek for
+playback; the export has no equivalent correction. **Which of the two is correct
+has not been established** — the probe proves they disagree, not which one is
+right, and S4 is where that gets answered rather than assumed.
+
+`audio_mix_parity` is a GATE TARGET, not a case inside `audio_probe`, precisely
+because it fails: a red line inside `all` gets disabled, and a check nobody runs
+proves nothing. It is named, runnable, and currently red.
+
+**Not started.** S2 is measurement only and is the prerequisite for the rest: S3
+is a rewrite of the engine's hot path, and doing it before something can PROVE the
+two mixers agreed beforehand would be the exact discipline failure this file keeps
+recording.

@@ -1295,6 +1295,37 @@ target_audio_export_audit() {
 	python3 scripts/audio_silence_audit.py "$proj" "$dir/out.raw" "$dir/out.mp4" "$grid" || return 1
 }
 
+# atempo_probe. It has an entry point and it passes, but it was wired into
+# NEITHER gate.sh NOR `all` until now -- so playback rate changes were verified by
+# hand, once, and `all` could not catch a regression in the pitch-preserving path.
+# Every other audio target here synthesizes its own fixture, so this costs nothing
+# but a few seconds of CPU.
+target_atempo_probe() {
+	require_fresh_binary atempo-probe || return 1
+	VYPER_ATEMPO_PROBE=ALL timeout 600 ./vyper 2>&1 | tail -1
+}
+
+# audio_mix_parity drives the playback mixer and the export mixer over the same
+# timeline span and compares them sample for sample. It CURRENTLY FAILS, by about
+# 520 samples (10.8 ms) -- see TODO.md Active 30 S2. It is a target rather than a
+# case inside audio_probe precisely because it fails: a red line inside `all` gets
+# disabled, and a check nobody runs proves nothing. Named, runnable, and honest.
+target_audio_mix_parity() {
+	require_fresh_binary audio-mix-parity || return 1
+	local src=target/audio_probe/src.mp4
+	if [ ! -s "$src" ]; then
+		echo "audio-mix-parity: no fixture at $src -- run scripts/gate.sh audio_probe first" >&2
+		return 1
+	fi
+	VYPER_AUDIO_MIX_PARITY="$src" timeout 600 ./vyper 2>&1 | tail -3
+	local rc=${PIPESTATUS[0]}
+	if [ $rc -ne 0 ]; then
+		echo "audio-mix-parity: FAILED -- the two mixers disagree (known; TODO.md Active 30 S2)" >&2
+		return 1
+	fi
+	echo "audio-mix-parity: ok (both mixers produced identical samples)"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1339,6 +1370,8 @@ main() {
 	parity) target_parity ;;
 	audio_rate) target_audio_rate ;;
 	audio_export_audit) target_audio_export_audit ;;
+	audio_mix_parity) target_audio_mix_parity ;;
+	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
 	yuv_exact) target_yuv_exact ;;
@@ -1357,7 +1390,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac
