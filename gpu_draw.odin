@@ -584,7 +584,29 @@ draw_timeline_resize_focus :: proc(
 	if !ok {
 		return
 	}
-	edge := -1
+	if active_interaction == .Clip_Resize && clip_resize.edge == .Roll {
+		if clip_resize.roll_track < 0 || clip_resize.roll_track >= len(timeline.tracks) {
+			return
+		}
+		track := &timeline.tracks[clip_resize.roll_track]
+		left := clip_index_by_id(track, clip_resize.roll_left_id)
+		right := clip_index_by_id(track, clip_resize.roll_right_id)
+		if left < 0 || right != left+1 { return }
+		box := clay.GetElementData(
+			clay.ID("TimelineClip", u32(clip_resize.roll_track*1000+left)),
+		).boundingBox
+		render_sdf_rect(
+			renderer,
+			command_buffer,
+			pass,
+			clay.BoundingBox{x=box.x+box.width-1.5, y=box.y, width=3, height=box.height},
+			BUTTON_BORDER_HOVER,
+			0,
+			0,
+		)
+		return
+	}
+	edge := Clip_Resize_Edge.None
 	if active_interaction == .Clip_Resize {
 		edge = clip_resize.edge
 	} else {
@@ -600,7 +622,7 @@ draw_timeline_resize_focus :: proc(
 			}
 		}
 	}
-	if edge < 0 {
+	if edge == .None {
 		return
 	}
 	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
@@ -612,7 +634,7 @@ draw_timeline_resize_focus :: proc(
 			box :=
 				clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
 			color := BUTTON_BORDER_HOVER
-			if edge == 0 {
+			if edge == .Left {
 				render_sdf_rect(
 					renderer,
 					command_buffer,

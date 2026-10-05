@@ -4676,7 +4676,9 @@ Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
 
-## Active 21 — Alt+drag is a ripple move: every clip at or after the anchor moves with it
+---
+
+## Active 22 — Alt+drag is a ripple move: every clip at or after the anchor moves with it
 
 **Why:** dragging a clip in the middle of the timeline moved that clip and
 nothing else. Shifting a clip and everything downstream of it is one gesture in
@@ -4761,3 +4763,30 @@ turned relative (out-and-back landed at 130, not 100); the link-member loop
 deleted (7200 left behind, link 8800 desynced to -80).
 
 **Accept.** `check build probe timeline_probe valgrind` pass.
+
+---
+
+## Active 21 — Roll a selected shared clip boundary
+
+**Why:** With two touching clips selected, dragging shared seam handle currently
+resized only anchor clip. The other clip's edge stayed fixed, creating a gap or
+overlap. Treat seam as one roll edit: both handles follow pointer in same
+direction; preserve outer endpoints and clamp each source to valid first/last
+frame.
+
+Steps:
+- [x] Detect adjacent, touching clips both in current selection; resolve either
+      clip's seam edge to one `.Roll` gesture. Preserve plain left/right trim and
+      linked-group resizing outside paired selection.
+- [x] Apply common seam with bounds from both clip lengths, left source tail,
+      and right source head. Right source_start follows seam delta; both outer
+      timeline/source endpoints remain fixed.
+- [x] Add `timeline_probe` coverage for left/right handle targeting, both handles
+      moving together, and clamps at right source frame 0 and left source end.
+
+**Probe / mutation.** `timeline_probe` exercises touching selected pairs, checks
+seam movement in both directions and asserts both source/timeline boundaries
+remain valid at clamps.
+
+**Accept.** `check build timeline_probe` pass; single-clip and linked-group
+resize probe cases remain green.

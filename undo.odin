@@ -294,8 +294,11 @@ undo_restore :: proc(idx: i32) {
 	clip_move.ripple = false
 	clip_move.ripple_delta = 0
 	clear(&clip_move.ripple_orig)
-	clip_resize.edge = -1
+	clip_resize.edge = .None
 	clip_resize.moved = false
+	clip_resize.roll_track = -1
+	clip_resize.roll_left_id = 0
+	clip_resize.roll_right_id = 0
 	invalidate_preview_slots()
 	audio_note_edit()
 }

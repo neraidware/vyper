@@ -426,6 +426,44 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	return c.source_length_frames
 }
 
+// resize_clip_seam rolls a shared boundary between adjacent clips: left tail
+// and right head move together, while left head and right tail remain fixed.
+// Clamp to one frame per clip, the left source's last frame, and the right
+// source's first frame. Stills have no varying-source bound.
+resize_clip_seam :: proc(track: ^Track, left_idx, right_idx: int, new_seam: i64) -> i64 {
+	assert(left_idx >= 0 && right_idx == left_idx+1 && right_idx < len(track.clips),
+		"resize_clip_seam: clips must be adjacent on one track")
+	left := &track.clips[left_idx]
+	right := &track.clips[right_idx]
+	old_seam := clip_timeline_end(left^)
+	assert(old_seam == right.timeline_start_frame, "resize_clip_seam: clips do not touch")
+	left_start := left.timeline_start_frame
+	right_end := clip_timeline_end(right^)
+	lo := left_start + 1
+	hi := right_end - 1
+	if right.is_still {
+		lo = max(lo, 0)
+	} else {
+		lo = max(lo, old_seam-right.source_start_frame)
+	}
+	if !left.is_still {
+		if source_total := asset_source_frames(left.asset_id, left.kind); source_total > 0 {
+			max_left_len := max(1, source_total-left.source_start_frame)
+			hi = min(hi, left_start+max_left_len)
+		}
+	}
+	assert(lo <= hi, "resize_clip_seam: no valid frame boundary remains")
+	seam := clamp(new_seam, lo, hi)
+	delta := seam - old_seam
+	left.source_length_frames = seam - left_start
+	right.timeline_start_frame = seam
+	if !right.is_still {
+		right.source_start_frame += delta
+	}
+	right.source_length_frames = right_end - seam
+	return seam
+}
+
 timeline_duration :: proc() -> i64 {
 	dur := i64(0)
 	for track in timeline.tracks {

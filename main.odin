@@ -150,24 +150,67 @@ timeline_track_hit_test :: proc(mx, my: f32) -> int {
 	return -1
 }
 
-// timeline_resize_edge_at returns 0/1 if (mx,my) is inside the grab area on the
-// clip's left/right edge, else -1. The grab band is a fixed few pixels wide on
-// each side; the pointer must be over this specific clip.
-timeline_resize_edge_at :: proc(track_idx, index: int, mx, my: f32) -> int {
+// timeline_resize_edge_at returns which clip edge the pointer grabs. The band
+// is fixed-width, and the pointer must be over this specific clip.
+timeline_resize_edge_at :: proc(track_idx, index: int, mx, my: f32) -> Clip_Resize_Edge {
 	if !clay.PointerOver(clay.ID("TimelineClip", u32(track_idx * 1000 + index))) {
-		return -1
+		return .None
 	}
 	box := clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox
 	if my < box.y || my > box.y + box.height {
-		return -1
+		return .None
 	}
 	if mx >= box.x && mx <= box.x + CLIP_GRAB {
-		return 0
+		return .Left
 	}
 	if mx >= box.x + box.width - CLIP_GRAB && mx <= box.x + box.width {
-		return 1
+		return .Right
 	}
-	return -1
+	return .None
+}
+
+timeline_resize_pair_edge_at :: proc(mx, my: f32) -> (track_idx, left_idx, right_idx: int, ok: bool) {
+	for ti in 0..<len(timeline.tracks) {
+		track := &timeline.tracks[ti]
+		for li := 0; li+1 < len(track.clips); li += 1 {
+			ri := li + 1
+			left_edge := timeline_resize_edge_at(ti, li, mx, my)
+			right_edge := timeline_resize_edge_at(ti, ri, mx, my)
+			if left_edge == .Right {
+				if left, right, ok := timeline_resize_pair_for_edge(ti, li, .Right); ok {
+					return ti, left, right, true
+				}
+			}
+			if right_edge == .Left {
+				if left, right, ok := timeline_resize_pair_for_edge(ti, ri, .Left); ok {
+					return ti, left, right, true
+				}
+			}
+		}
+	}
+	return -1, -1, -1, false
+}
+
+timeline_resize_pair_for_edge :: proc(
+	track_idx, index: int,
+	edge: Clip_Resize_Edge,
+) -> (left_idx, right_idx: int, ok: bool) {
+	if track_idx < 0 || track_idx >= len(timeline.tracks) { return -1, -1, false }
+	track := &timeline.tracks[track_idx]
+	left_idx, right_idx = index, index+1
+	if edge == .Left {
+		left_idx, right_idx = index-1, index
+	} else if edge != .Right {
+		return -1, -1, false
+	}
+	if left_idx < 0 || right_idx >= len(track.clips) { return -1, -1, false }
+	if !is_clip_selected(track_idx, left_idx) || !is_clip_selected(track_idx, right_idx) {
+		return -1, -1, false
+	}
+	if clip_timeline_end(track.clips[left_idx]) != track.clips[right_idx].timeline_start_frame {
+		return -1, -1, false
+	}
+	return left_idx, right_idx, true
 }
 
 // timeline_resize_hover reports whether a duration resize is in progress or the
@@ -176,12 +219,15 @@ timeline_resize_hover :: proc(mx, my: f32) -> bool {
 	if active_interaction == .Clip_Resize {
 		return true
 	}
+	if _, _, _, paired := timeline_resize_pair_edge_at(mx, my); paired {
+		return true
+	}
 	if tr, cl, ok := selected_clip(); ok {
 		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 			track := &timeline.tracks[track_idx]
 			for index := 0; index < len(track.clips); index += 1 {
 				if &track.clips[index] == cl {
-					return timeline_resize_edge_at(track_idx, index, mx, my) >= 0
+					return timeline_resize_edge_at(track_idx, index, mx, my) != .None
 				}
 			}
 		}
