@@ -570,13 +570,23 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		return false
 	},
-	// Resizing the selected clip's duration: grab its left/right edge. Takes
-	// precedence over selecting/dragging a clip, and only the currently
-	// selected clip can be resized.
+	// Resize a selected edge. A touching selected neighbor turns that edge grab
+	// into a paired seam roll.
 	proc(inp: Mouse_Input) -> bool {
 		sel_tr, sel_cl, ok := selected_clip()
 		if !ok {
 			return false
+		}
+		if track_idx, left, right, paired := timeline_resize_pair_edge_at(inp.x, inp.y); paired {
+			undo_begin()
+			active_interaction = .Clip_Resize
+			clip_resize.edge = .Roll
+			clip_resize.moved = false
+			clip_resize.roll_track = track_idx
+			clip_resize.roll_left_id = timeline.tracks[track_idx].clips[left].clip_id
+			clip_resize.roll_right_id = timeline.tracks[track_idx].clips[right].clip_id
+			clear(&clip_move.group_orig)
+			return true
 		}
 		for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
 			track := &timeline.tracks[track_idx]
@@ -584,12 +594,16 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				if &track.clips[index] != sel_cl {
 					continue
 				}
-				if edge := timeline_resize_edge_at(track_idx, index, inp.x, inp.y); edge >= 0 {
+				if edge := timeline_resize_edge_at(track_idx, index, inp.x, inp.y); edge != .None {
 					selection.track = track_idx
 					selection.index = index
 					undo_begin()
 					active_interaction = .Clip_Resize
 					clip_resize.edge = edge
+					clip_resize.moved = false
+					clip_resize.roll_track = -1
+					clip_resize.roll_left_id = 0
+					clip_resize.roll_right_id = 0
 					capture_link_group(&track.clips[index], track_idx)
 					return true
 				}
@@ -743,9 +757,9 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				// reselect and for a Shift+click multi-toggle.
 				kf_clear()
 
-					selection.track = track_idx
-					selection.index = index
 					if inp.shift {
+						selection.track = track_idx
+						selection.index = index
 						// Shift+click toggles the clip into/out of the
 						// multi-selection (for U linking) without dragging.
 						cid := track.clips[index].clip_id
@@ -756,9 +770,9 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 						}
 						return true
 					}
-					// Plain click = single selection: drop any earlier
-					// Shift+clicked extras and grab the clip.
-					clear(&selection.extra_set)
+					// Plain click = sole selection. Keep the anchor in extra_set
+					// so the next Shift+click preserves it when changing anchor.
+					select_clip(track_idx, index)
 					clip_move.group_delta = 0
 					clip_move.lane_dwell = 0
 					clip_move.clip = &track.clips[index]
@@ -1193,7 +1207,13 @@ interaction_release :: proc(inp: Mouse_Input) {
 		// Resize is applied live during the drag; capture the gesture as one
 		// undo node on release.
 		if clip_resize.moved {
-			undo_push(.Resize, len(clip_move.group_orig) > 1 ? "Resize clip(s)" : "Resize clip")
+			label := "Resize clip"
+			if clip_resize.edge == .Roll {
+				label = "Roll clip seam"
+			} else if len(clip_move.group_orig) > 1 {
+				label = "Resize clip(s)"
+			}
+			undo_push(.Resize, label)
 			// The drag applied live; this is the one commit the audio engine
 			// gets for it. audio_note_edit (not a bare seek) because the
 			// clip's new geometry must reach the producer's slab before it
@@ -1277,8 +1297,11 @@ interaction_release :: proc(inp: Mouse_Input) {
 	clip_move.lane_dwell = 0
 	clip_move.group_delta = 0
 	clear(&clip_move.group_orig)
-	clip_resize.edge = -1
+	clip_resize.edge = .None
 	clip_resize.moved = false
+	clip_resize.roll_track = -1
+	clip_resize.roll_left_id = 0
+	clip_resize.roll_right_id = 0
 }
 
 // Live move path, driven every frame while the button is held. Each case
@@ -1351,20 +1374,19 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		   selection.index < len(timeline.tracks[selection.track].clips) {
 			track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 			frame := max(f32(0), (inp.x - track_start) / timeline_view.zoom + timeline_view.start)
-			// Clip→playhead toggle applies to edge drags too: the dragged edge
-			// (head on clip_resize.edge 0, tail on 1) latches onto the playhead
-			// within the snap margin, like a clip move.
+			// Clip→playhead toggle applies to trim and roll drags too.
 			if editor_flags.snap_clips_to_playhead {
 				frame = f32(snap_to_playhead(i64(frame)))
 			}
-			if clip_resize.edge == 0 {
+			if clip_resize.edge == .Left {
 				if len(clip_move.group_orig) > 0 {
 					// Linked group: shift every member's head by the same delta.
 					resize_group_left(&timeline.tracks[selection.track], selection.index, i64(frame))
 				} else {
 					resize_clip_left(&timeline.tracks[selection.track], selection.index, i64(frame))
 				}
-			} else if clip_resize.edge == 1 {
+				clip_resize.moved = true
+			} else if clip_resize.edge == .Right {
 				if len(clip_move.group_orig) > 0 {
 					// Linked group: move every member's tail by the same delta.
 					resize_group_right(
@@ -1375,8 +1397,19 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 				} else {
 					resize_clip_right(&timeline.tracks[selection.track], selection.index, i64(frame))
 				}
+				clip_resize.moved = true
+			} else if clip_resize.edge == .Roll &&
+			          clip_resize.roll_track >= 0 &&
+			          clip_resize.roll_track < len(timeline.tracks) {
+				track := &timeline.tracks[clip_resize.roll_track]
+				left := clip_index_by_id(track, clip_resize.roll_left_id)
+				right := clip_index_by_id(track, clip_resize.roll_right_id)
+				if left >= 0 && right == left+1 {
+					old_seam := clip_timeline_end(track.clips[left])
+					applied := resize_clip_seam(track, left, right, i64(frame))
+					clip_resize.moved = clip_resize.moved || applied != old_seam
+				}
 			}
-			clip_resize.moved = true
 			// No audio_note_edit() here: it is a full re-provision per frame
 			// of the drag. The release commits it once.
 		}

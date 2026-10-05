@@ -613,20 +613,28 @@ Panel_Layout :: struct {
 }
 panel_layout: Panel_Layout = {upper_area_height = 560}
 
-// Clip_Resize_State is the whole clip-duration-edge gesture: which edge is
-// grabbable (edge 0 = left trim/extend head, 1 = right trim/extend tail),
-// whether the gesture actually resized (an edge CLICK with no drag commits no
-// undo node), and the two lazily-created SDL cursors the edge shows (the
-// horizontal-resize one while dragging/hovering an edge; the arrow is
-// explicitly restored the rest of the time -- SDL doesn't reliably reset to the
-// default pointer from SetCursor(nil)).
+Clip_Resize_Edge :: enum {
+	None,
+	Left,
+	Right,
+	Roll,
+}
+
+// Clip_Resize_State is the whole clip-duration gesture: trim left/right edge or
+// roll a shared seam, whether it actually resized, and its SDL cursors.
+// An edge click without a drag commits no undo node. The resize cursor is used
+// while dragging/hovering; the arrow is explicitly restored because SDL does
+// not reliably reset to the default pointer from SetCursor(nil).
 Clip_Resize_State :: struct {
-	edge:          int,
+	edge:          Clip_Resize_Edge,
 	moved:         bool,
+	roll_track:    int,
+	roll_left_id:  u64,
+	roll_right_id: u64,
 	resize_cursor: ^sdl.Cursor,
 	arrow_cursor:  ^sdl.Cursor,
 }
-clip_resize: Clip_Resize_State = {edge = -1}
+clip_resize: Clip_Resize_State = {edge = .None, roll_track = -1}
 
 // Clip_Move_State is the whole clip-drag gesture (moving a timeline clip along
 // its track or onto another, plus linked-group drags): the clip being dragged,

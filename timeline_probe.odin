@@ -704,6 +704,88 @@ test_resize_alignment :: proc() {
 	tl_assert_aligned("resize")
 }
 
+test_adjacent_seam_roll :: proc() {
+	clear(&media_bin.assets)
+	append(&media_bin.assets, Media_Asset{id=8101, kind=.Video, frame_count=200})
+	append(&media_bin.assets, Media_Asset{id=8102, kind=.Video, frame_count=100})
+	timeline = Timeline{tracks=make([dynamic]Track, 1)}
+	timeline.tracks[0].clips = make([dynamic]Clip, 0, 2)
+	left := mk_tl_clip(8101, 0, 0, 20, 0, .Video)
+	left.asset_id = 8101
+	left.source_start_frame = 160
+	right := mk_tl_clip(8102, 0, 10, 60, 20, .Video)
+	right.asset_id = 8102
+	right.source_start_frame = 10
+	append(&timeline.tracks[0].clips, left)
+	append(&timeline.tracks[0].clips, right)
+	select_clip(0, 0)
+	selection.extra_set[right.clip_id] = true
+
+	li, ri, paired := timeline_resize_pair_for_edge(0, 0, .Right)
+	tl_probe_check(paired && li == 0 && ri == 1, "selected right edge resolves touching pair")
+	li, ri, paired = timeline_resize_pair_for_edge(0, 1, .Left)
+	tl_probe_check(paired && li == 0 && ri == 1, "selected left edge resolves same touching pair")
+	delete_key(&selection.extra_set, right.clip_id)
+	_, _, paired = timeline_resize_pair_for_edge(0, 0, .Right)
+	tl_probe_check(!paired, "a seam is not paired when neighbor is not selected")
+	selection.extra_set[right.clip_id] = true
+
+	seam := resize_clip_seam(&timeline.tracks[0], 0, 1, 30)
+	lc, rc := timeline.tracks[0].clips[0], timeline.tracks[0].clips[1]
+	tl_probe_check(seam == 30 && clip_timeline_end(lc) == 30 && rc.timeline_start_frame == 30,
+		"rightward roll moves both handles +10 to seam 30")
+	tl_probe_check(lc.source_start_frame+lc.source_length_frames == 190 &&
+		rc.source_start_frame == 20 && rc.source_length_frames == 50 &&
+		rc.timeline_start_frame+rc.source_length_frames == 80,
+		"rightward roll preserves source tails")
+
+	// Right clip cannot reveal source frames before frame 0.
+	seam = resize_clip_seam(&timeline.tracks[0], 0, 1, 0)
+	lc, rc = timeline.tracks[0].clips[0], timeline.tracks[0].clips[1]
+	tl_probe_check(seam == 10 && clip_timeline_end(lc) == 10 && rc.timeline_start_frame == 10,
+		"leftward roll clamps at right source's first frame")
+	tl_probe_check(rc.source_start_frame == 0 && rc.source_length_frames == 70,
+		"leftward roll keeps right source start at zero")
+
+	// Left clip cannot extend past its source's last frame.
+	seam = resize_clip_seam(&timeline.tracks[0], 0, 1, 999)
+	lc, rc = timeline.tracks[0].clips[0], timeline.tracks[0].clips[1]
+	tl_probe_check(seam == 40 && lc.source_start_frame+lc.source_length_frames == 200,
+		"rightward roll clamps at left source's last frame")
+	tl_probe_check(rc.timeline_start_frame == 40 && rc.source_start_frame == 30 &&
+		rc.source_length_frames == 40 && rc.timeline_start_frame+rc.source_length_frames == 80,
+		"paired roll preserves right tail and adjacency")
+
+	// A wider source interval reaches both one-frame endpoints: left cannot
+	// collapse to zero, and right cannot collapse to zero either.
+	clear(&media_bin.assets)
+	append(&media_bin.assets, Media_Asset{id=8103, kind=.Video, frame_count=1000})
+	append(&media_bin.assets, Media_Asset{id=8104, kind=.Video, frame_count=100})
+	clear(&timeline.tracks[0].clips)
+	left = mk_tl_clip(8103, 0, 0, 20, 0, .Video)
+	left.asset_id = 8103
+	right = mk_tl_clip(8104, 0, 19, 10, 20, .Video)
+	right.asset_id = 8104
+	right.source_start_frame = 19
+	append(&timeline.tracks[0].clips, left)
+	append(&timeline.tracks[0].clips, right)
+	select_clip(0, 0)
+	selection.extra_set[timeline.tracks[0].clips[1].clip_id] = true
+	seam = resize_clip_seam(&timeline.tracks[0], 0, 1, 0)
+	lc, rc = timeline.tracks[0].clips[0], timeline.tracks[0].clips[1]
+	tl_probe_check(seam == 1 && lc.source_length_frames == 1 &&
+		rc.source_start_frame == 0 && rc.source_length_frames == 29,
+		"roll lower clamp: seam=%d left_len=%d right_start=%d right_len=%d",
+		seam, lc.source_length_frames, rc.source_start_frame, rc.source_length_frames)
+	seam = resize_clip_seam(&timeline.tracks[0], 0, 1, 999)
+	lc, rc = timeline.tracks[0].clips[0], timeline.tracks[0].clips[1]
+	tl_probe_check(seam == 29 && lc.source_length_frames == 29 &&
+		rc.source_length_frames == 1 && rc.timeline_start_frame+rc.source_length_frames == 30,
+		"roll clamps at right's last frame and keeps right nonempty")
+	clear(&selection.extra_set)
+	clear(&media_bin.assets)
+}
+
 // tl_order_equals asserts the visual stack equals the given storage sequence.
 tl_order_equals :: proc(storage: []int) {
 	sync_track_order()
@@ -991,6 +1073,8 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_resize_alignment()
 	fmt.println("[tl-probe] resize ok")
+	test_adjacent_seam_roll()
+	fmt.println("[tl-probe] adjacent seam roll ok")
 
 	test_still_resize_free()
 	fmt.println("[tl-probe] still-resize ok")
