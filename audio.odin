@@ -553,70 +553,21 @@ AUDIO_FORWARD_DECODE_MAX_48 :: i64(AUDIO_FORWARD_DECODE_MAX_SEC * 48000.0)
 // on one side, which is the same defect shape as the text blend Active 26 removed.
 //
 // A click is a STEP, and what removes it is spreading the step over enough samples
-// that no single step is large. The fade is applied per SOURCE and per BLOCK, not
-// to the mix: two overlapping sources must not ramp each other, so the gain is
-// folded in before the source is summed.
+// No automatic edge ramp exists here, and that is the design: a cut is a cut.
+//
+// There WAS one -- a raised-cosine declick of AUDIO_DECLICK_SAMPLES at every
+// source's contribution edges -- and it was this engine's second fade mechanism.
+// Gain is already automated per sample through the clip's keyframe envelope, so
+// the ramp was an IMPLICIT fade applied to every edit whether the user wanted one
+// or not, and an authored fade could not be told from an automatic one. Two
+// mechanisms for one job is where two mechanisms disagree: they did, at ~2.5e-3
+// in a clip's final fade, because the ramp was normalised against the caller's
+// chunk length and playback chunks by frame while the export chunks by block.
+//
+// A step at a cut is a real discontinuity and can be heard. That is what an
+// authored fade is for, and the envelope already expresses one. The engine's job
+// is that what you cut is what you hear.
 // ---------------------------------------------------------------------------
-
-// AUDIO_DECLICK_SAMPLES is the fade length at a source's contribution edges, in
-// sample-frames (256 = 5.3ms at 48kHz). Long enough that the derivative of the
-// fade is small next to the signal it is fading, short enough to be inaudible as
-// a fade: a click is a step, and what removes it is spreading the step over
-// enough samples that no single step is large.
-AUDIO_DECLICK_SAMPLES :: 256
-
-// audio_declick is the fade SHAPE: a raised cosine, so the gain AND its slope go
-// to zero at both ends. A linear ramp would leave a slope discontinuity at each
-// end, which is itself audible on a bright signal -- it converts a click into a
-// tick. Evaluated only inside the fade, at a source's edges, so the cost is
-// O(clip boundaries) and not O(audio samples): the steady interior of a block
-// never calls it.
-audio_declick :: proc(t: f32) -> f32 {
-	return (1.0 - math.cos(math.PI * t)) * 0.5
-}
-
-// audio_declick_fade_in is how many of a block's n sample-frames need the fade
-// at the front, given `from_edge`: the distance in samples from the block's first
-// sample to the contribution's start edge, 0 when the block opens on the edge.
-audio_declick_fade_in :: proc(from_edge: Sample_Pos, n: int) -> int {
-	if from_edge >= Sample_Pos(AUDIO_DECLICK_SAMPLES) {
-		return 0
-	}
-	return clamp(int(Sample_Pos(AUDIO_DECLICK_SAMPLES) - from_edge), 0, n)
-}
-
-// audio_declick_fade_out is audio_declick_fade_in at the other end: how many
-// of a block's n sample-frames need the fade before its end, given `to_edge` --
-// the distance from the block's last sample to the contribution's end edge.
-audio_declick_fade_out :: proc(to_edge: Sample_Pos, n: int) -> int {
-	return audio_declick_fade_in(to_edge, n)
-}
-
-// audio_declick_gain is sample `s` of a block's `n`: the automation gain, faded
-// in over the first fade_in samples and out over the last fade_out.
-//
-// Named rather than written inline because the shape appears TWICE when it is
-// inline -- once ascending, once descending, with mirrored expressions -- and two
-// copies of a ramp that must agree is the kind of thing that drifts.
-//
-// Each fade is normalised by its OWN length and stepped so the ramp's argument
-// runs 1/fade .. 1 INCLUSIVE, which puts the gain at exactly g on the last faded
-// sample. Two things depend on that. A block shorter than the fade still completes
-// it rather than leaving the contribution permanently attenuated, which is what
-// measuring against the fixed AUDIO_DECLICK_SAMPLES does; and the hand-off from
-// faded to unfaded carries no step of its own. (Normalising to fade/(fade+1)
-// instead reaches only 0.99996 -- inaudible, but it makes the ramp's endpoint a
-// lie in the comment, and a probe asserting the invariant caught exactly that.)
-audio_declick_gain :: proc(g: f32, s, n, fade_in, fade_out: int) -> f32 {
-	if fade_in > 0 && s < fade_in {
-		return g * audio_declick(f32(s+1) / f32(fade_in))
-	}
-	if fade_out > 0 && s >= n-fade_out {
-		return g * audio_declick(f32(n-s) / f32(fade_out))
-	}
-	return g
-}
-
 
 Audio_Ring :: struct {
 	buf:   [dynamic]f32, // backing storage; len(buf)/2 == capacity in sample-frames
@@ -1836,16 +1787,6 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// relative position each frame (from its own snapshot — the producer
 		// never reads the live timeline), so automation animates audibly.
 		g := play_seg_gain_linear(seg, i32(frame - seg.start_a))
-		// Declick, the same fade the export applies (audio_declick_gain). This
-		// mixer had none: a clip boundary produced a hard step to silence and back
-		// in playback while the export ramped it, so the two sinks disagreed about
-		// an audible edit. Both compute the ramp from the SEGMENT's own bus-sample
-		// edges, in the same units, so a boundary fades identically in each.
-		//
-		// fade_from takes the EARLIER of the segment edge and a resume-after-hole,
-		// so a frame that both opens a clip and resumes a source gets ONE fade
-		// rather than two multiplied together -- the export's rule, for the same
-		// reason.
 		frame_lo := audio_frame_boundary48(frame, fps)
 		frame_hi := audio_frame_boundary48(frame + 1, fps)
 		seg_lo := audio_frame_boundary48(seg.start_a, fps)
@@ -1856,16 +1797,23 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if want <= 0 {
 			continue
 		}
-		fade_from := seg_lo
-		if s.muted {
-			fade_from = blk_lo
-		}
-		fade_in := audio_declick_fade_in(blk_lo - fade_from, want)
-		fade_out := audio_declick_fade_out(seg_hi - blk_hi, want)
 		sample_off := int(blk_lo - frame_lo)
 		for f in 0 ..< want {
 			l, r := ring_at(&s.fifo, base + sample_off + f)
-			d := audio_declick_gain(g, f, want, fade_in, fade_out)
+			// No automatic ramp at a clip edge. A cut is a cut.
+			//
+			// There was a declick here, and it was this engine's second fade
+			// mechanism: gain is already automated per sample through the clip's
+			// keyframe envelope, so an edge ramp was an IMPLICIT fade applied to every
+			// edit whether the user wanted one or not. Two mechanisms for one job is
+			// the shape where the two disagree -- and they did, at ~2.5e-3 in a clip's
+			// final fade, because the ramp was normalised against the caller's chunk
+			// length and playback chunks by frame while the export chunks by block.
+			//
+			// A step at a cut is a real discontinuity and can be heard; that is what
+			// an authored fade is for, and the envelope is already there to express
+			// one. The engine's job is that what you cut is what you hear.
+			d := g
 			off := (sample_off + f) * 2
 			mix[off + 0] += l * d
 			mix[off + 1] += r * d

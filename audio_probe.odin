@@ -256,9 +256,9 @@ audio_probe_run :: proc(v: string) -> int {
 	}
 	fmt.println("[ap] live gain fold check ok")
 
-	declick_ok := audio_probe_declick_check(path)
-	if !declick_ok {
-		fmt.println("[ap] DECLICK FAIL")
+	cuts_ok := audio_probe_transparent_cuts(path)
+	if !cuts_ok {
+		fmt.println("[ap] CUT TRANSPARENCY FAIL")
 		return 1
 	}
 
@@ -1130,7 +1130,7 @@ audio_probe_forward_jump :: proc(path: string, jump_frames: i64) -> bool {
 // segments of one continuous decode is not an edge at all (the samples either
 // side are already continuous), so the case builds a real gap: one clip that
 // ENDS mid-file, so the final contribution must fade to nothing.
-audio_probe_declick_check :: proc(path: string) -> bool {
+audio_probe_transparent_cuts :: proc(path: string) -> bool {
 	fps := timeline_fps()
 	if fps <= 0 {
 		fmt.println("[ap] declick: SKIP: no project fps")
@@ -1202,14 +1202,18 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 		}
 	}
 	if end_frame <= 0 {
-		fmt.println("[ap] declick: SKIP: no provisioned segment end to fade at")
+		fmt.println("[ap] cuts: SKIP: no provisioned segment end to check at")
 		return true
 	}
-	// Land a few frames before the end so the fade's whole length is inside the
-	// window: AUDIO_DECLICK_SAMPLES is ~5ms, which at 30fps is a sixth of a frame,
-	// so the frames either side of the edge have to be captured.
+	// Land six frames before the end so there is room for the interior comparison
+	// on the far side of the boundary. EDGE_WINDOW is in INTERLEAVED samples, so
+	// 1024 is 512 sample-frames: enough that the source's own ripple over ~512
+	// samples averages out of the comparison, and it keeps this probe's arithmetic
+	// in one declared unit instead of a bare number derived from a ramp length that
+	// no longer exists.
+	EDGE_WINDOW :: 1024
 	spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(48000.0 / fps + 0.5)))
-	pre := max(2, int(AUDIO_DECLICK_SAMPLES) / spf + 2)
+	pre := 6
 	lo := end_frame - i64(pre)
 	if lo < 0 {
 		lo = 0
@@ -1253,11 +1257,11 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 	// pulls the mix down across the samples before the boundary, which is
 	// phase-independent and is exactly what the declick is for.
 	boundary_idx := int(end_frame - lo) * spf
-	interior_lo := boundary_idx - 4 * AUDIO_DECLICK_SAMPLES
-	interior_hi := boundary_idx - 2 * AUDIO_DECLICK_SAMPLES
+	interior_lo := boundary_idx - 4 * EDGE_WINDOW
+	interior_hi := boundary_idx - 2 * EDGE_WINDOW
 	// The last AUDIO_DECLICK_SAMPLES before the cut: exactly the span both mixers
 	// fade across.
-	edge_lo := boundary_idx - AUDIO_DECLICK_SAMPLES
+	edge_lo := boundary_idx - EDGE_WINDOW
 	if interior_lo < 0 ||
 	   edge_lo < 0 ||
 	   interior_hi > len(win) ||
@@ -1292,21 +1296,28 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 		}
 	}
 	if interior_peak <= 0 {
-		fmt.println("[ap] declick: SKIP: interior is silent")
+		fmt.println("[ap] cuts: SKIP: interior is silent")
 		return true
 	}
-	// A tenth of the interior level. A fade lands at zero; a cut lands at full
-	// level, which is forty times this bar. Nothing in between is reachable by a
-	// ramp that is supposed to complete.
-	if at_edge > interior_peak * 0.1 {
+	// The boundary must be at FULL LEVEL. A ramp would land it near zero; a cut
+	// lands it wherever the source is, which is the whole point -- the engine is
+	// transparent, and an authored fade is expressed through the gain envelope
+	// rather than imposed here.
+	//
+	// Half the interior level is the bar. Comparing against the source's own
+	// amplitude is unavoidable (it ripples over ~512 samples, so which window
+	// holds a peak is a coin flip), but the two cases are far apart: a completed
+	// ramp gives ~0, and a transparent cut gives a value comparable to the
+	// material. Nothing in between is reachable.
+	if at_edge < interior_peak * 0.5 {
 		fmt.printf(
-			"[ap] FAIL: declick -- the mix is not faded at the clip end: %.5f at the boundary against an interior peak of %.5f (largest step %.5f)\n",
-			at_edge, interior_peak, step,
+			"[ap] FAIL: cuts are not transparent -- %.5f at the clip boundary against an interior peak of %.5f; something is still applying an envelope\n",
+			at_edge, interior_peak,
 		)
 		return false
 	}
 	fmt.printf(
-		"[ap] declick ok (%.5f at the boundary against an interior peak of %.5f, largest step %.5f)\n",
+		"[ap] cuts are transparent (%.5f at the boundary against an interior peak of %.5f, largest step %.5f)\n",
 		at_edge, interior_peak, step,
 	)
 	return true

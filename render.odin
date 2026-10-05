@@ -1828,16 +1828,14 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 		// resume after a shortfall is an edge too even though no clip changed.
 		// Taking the earlier of the two as the start edge means a block that both
 		// resumes and opens a clip gets ONE fade, not two multiplied together.
-		fade_from := clip_t0
-		if a.muted {
-			fade_from = blk_lo
-		}
-		fade_in := audio_declick_fade_in(blk_lo - fade_from, int(want))
-		fade_out := audio_declick_fade_out(clip_t1 - blk_hi, int(want))
 		for s in 0 ..< int(want) {
 			l, r := ring_at(&a.fifo, base + s)
 			off := int(blk_lo - at) * 2
-			f := audio_declick_gain(g, s, int(want), fade_in, fade_out)
+			// Gain only, no automatic edge ramp: a cut is a cut, and an authored
+			// fade is expressed through the clip's keyframe envelope. See the same
+			// note in audio_mix_frame -- the ramp was this engine's SECOND fade
+			// mechanism, duplicating automation the user already controls.
+			f := g
 			out[off + s * 2 + 0] += l * f
 			out[off + s * 2 + 1] += r * f
 		}

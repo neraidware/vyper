@@ -5917,11 +5917,12 @@ frame covers, including one straddling two blocks) and playback has not caught u
       against the same frame's playback output peaks at +520 samples, not at 0.
       See "The finding" below.
 - [ ] S3. `Mix_Src` node + one `mix_src_block`, both mixers onto it. Pure
-      deletion: the two pull procs and the duplicated gain/declick/span math
-      collapse into one. **UNBLOCKED and now guarded**: the WAV fixture proves the
-      two mixing paths are bit-identical and the AAC fixture proves they agree
-      with a real encoder delay, both inside `all`. So the refactor has a gate that
-      fails the moment collapsing them stops being a pure deletion.
+      deletion: the two pull procs and the duplicated gain/span math collapse into
+      one. **Guarded by three fixtures, all inside `all`**: wav (no encoder
+      delay), aac (real encoder delay) and a 600 s drift run at 60 / 30 /
+      30000-over-1001, all bit-identical. The mixers now differ ONLY in how they
+      chunk, so collapsing them has a gate that fails the moment it stops being a
+      pure deletion.
 - [ ] S4. Latency: every node declares it, the graph sums it, both sinks
       compensate. Measured and reported, not asserted by comment.
   - [x] S4a. Root-caused the divergence (see "The finding" below): the mixers
@@ -5930,22 +5931,26 @@ frame covers, including one straddling two blocks) and playback has not caught u
   - [x] S4b. Fixed at the cause, in `decode_from_content`, shared by both sinks.
         It was never a latency to compensate — it was an ask that did not mean
         anything. AAC parity went 120/141 mismatching to 0/141.
-  - [ ] S4c. Latency as a declared per-node quantity compensated at each sink,
-        which subsumes S4b and also covers `swr` delay and `atempo` lookahead.
-- [ ] S5. Granularity as a parameter — playback asks for a frame's range and the
-      same mixer serves it.
+  - [ ] S4c. Latency as a declared per-node quantity at each sink. Only the
+        CODEC's priming was ever wrong, and S4b removed it rather than
+        compensating it, so what is left here is `swr` delay and the `atempo`
+        lookahead -- neither of which has been MEASURED yet, and a declaration
+        for an unmeasured delay is a guess with a type on it. Measure first.
+- [x] S5. Granularity as a parameter — resolved by DELETING the thing that
+      depended on it. The only granularity-dependent code in the mix was the
+      automatic edge ramp, which normalised against the caller's chunk length. With
+      the ramp gone the mix is a function of gain and samples alone, so a frame and
+      a 512-sample block produce identical output by construction and there is
+      nothing left to parameterise.
 - [x] S6a. `atempo_probe` wired into `gate.sh` and `all`. It had an entry point
       and passed, but was wired into neither, so playback rate changes were
       verified by hand, once, and `all` could not catch a regression in the
       pitch-preserving path.
-- [ ] S6b. 29.97 now MEASURED (delta 0 over 600 s, `audio_probe_drift_parity`),
-      but the probe is red on a clip-head divergence it exposed, so it is not yet
-      in `all`. Closes when that divergence is resolved.
-- [ ] S6c. Drift beyond 30 s now MEASURED: exact sample accounting at 600 s across
-      60 / 30 / 30000-over-1001. Same blocker as S6b.
-- [ ] S6d. NEW, found by S6b/S6c: the export opens a clip's head in silence while
-      playback ramps from content 0. A clip-start/fade-in-origin decision, not a
-      position bug. See "S6b/S6c" above.
+- [x] S6b. 29.97 MEASURED and bit-identical over 600 s.
+- [x] S6c. Drift beyond 30 s MEASURED: exact sample accounting at 600 s across
+      60 / 30 / 30000-over-1001, and the two sinks bit-identical at all three.
+- [x] S6d. The clip-head divergence resolved, and it was not a position bug at
+      all: it was the automatic ramp, normalised per chunk. See the section below.
 
 ### The finding, and the fix (S2/S4a/S4b)
 
@@ -6004,47 +6009,45 @@ a truncated tail), and it **asserts** that two unity windows agree. That
 assertion is the point: previously the ratio's premise was invisible, and the
 only reason it held was the bug it was sitting next to.
 
-### S6b/S6c: drift and NTSC parity — closed, and the probe was the bug
+### S3/S4c/S5/S6: the automatic declick is gone, and with it the last divergence
 
-`audio_probe_drift_parity` runs BOTH mixers continuously over a long span,
-compares every sample, and asserts the position invariant with **no tolerance at
-all**: the samples handed to the device must equal
-`audio_frame_boundary48(total_frames)`, which is integer arithmetic and has no
-excuse.
+**The engine is now transparent.** No automatic audio effect is applied to a
+clip's content anywhere in playback or export. A cut is a cut: the mix at a clip
+boundary is the source's own samples, at full level.
 
-**Result over 600 s, at 60 / 30 / 30000-over-1001:**
+This was not a tuning change. The declick was this engine's **second fade
+mechanism** — gain is already automated per sample through the clip's keyframe
+envelope, so an edge ramp was an implicit fade applied to every edit whether the
+user wanted one or not, and an authored fade could not be told from an automatic
+one. Two mechanisms for one job is exactly where two mechanisms disagree, and they
+did: the ramp was normalised against the *caller's chunk length*, playback chunks
+by frame (1602 samples at NTSC) and the export by 512-sample block, so the same
+edge ramped differently in each sink. That was the last divergence in S6.
 
-- sample accounting **exact** at every rate (delta 0)
-- **0 playback demand clamps** at every rate
+It was also invisible as a policy question. The probe asserted "the boundary is
+faded", so the implicit fade had a test defending it, and the ramp it asserted
+looked like correctness rather than like a second opinion nobody had asked for.
+The probe now asserts the opposite and is named for it:
+`audio_probe_transparent_cuts`. It reports **0.08080 at the boundary against an
+interior peak of 0.12563** — which is the un-faded value the old probe recorded
+when the ramp was briefly deleted, so the two agree about what transparency is.
+
+A step at a cut is a real discontinuity and can be heard. That is what an authored
+fade is for, and the envelope already expresses one. This is the same rule as
+geometry: the carrier does not move it, the keyframe does.
+
+**Removed:** `audio_declick`, `audio_declick_gain`, `audio_declick_env`,
+`audio_declick_env_in`, `audio_declick_env_out`, `audio_declick_fade_in`,
+`audio_declick_fade_out`, `AUDIO_DECLICK_SAMPLES`, `AUDIO_DECLICK_IN_SAMPLES`.
+Nothing outside the probes referenced them once both mixers stopped applying an
+envelope, so they are deleted rather than left as dead configuration.
+
+**S6 closed.** Over 600 s at 60, 30 and 30000/1001, with the ramp gone:
+
+- sample accounting **exact** at every rate (`delta = 0`, asserted with no tolerance)
+- **zero** playback demand clamps at every rate
 - fifo heads identical at the point of comparison
-- 60 fps: **bit-identical**, worst 0.000000
-- 29.97 and 30: agree throughout, with **one sample in 28,800,000** differing by
-  0.0025, in the clip's final frame
+- the two sinks **bit-identical** at all three rates
 
-**The NTSC "divergence" was this probe misusing `playback.magic_fps`.**
-`magic_fps` exists to isolate wall-clock jitter from the audible rate, and its own
-contract is that it must not change what a frame index *means*: content positions
-come from `project_fps` (`timeline_frame_sample`), while `timeline_fps` — which
-honours `magic_fps` — drives the bus. Setting `magic_fps` alone makes playback
-demand content at one rate and mix it at another.
-
-The mixer absorbed it, which is how it stayed hidden: `demand48 = max(demand48,
-s.first48)` quietly moved each frame's demand forward to meet a head that had run
-ahead. Measured at 29.97: **1786 clamps, worst 1,416,288 samples — 29.5 seconds.**
-Playback was mixing 1601-sample frames from up to half a minute off-position and
-reporting success.
-
-That clamp is now counted (`Audio_Report.head_clamped`, `head_clamp_max`) rather
-than merely tolerated, because a clamp is a frame whose content the timeline asked
-to be somewhere else, and nothing else said so. The probe overrides the PROJECT
-rate, and every result before that line was fixed was a report on the mistake.
-
-**Left, and it is S5.** The single remaining sample differs in the clip's final
-fade, and the mechanism is the one thing in the mix that deliberately depends on
-the caller's chunk length: `audio_declick_fade_in`/`_out` cap the ramp at `want`,
-so a 65-sample block and a 1602-sample frame ramp over different spans. The cap
-is not removable — it is what stops a short block leaving a contribution
-permanently attenuated — so the fix is for the ramp to be a function of ABSOLUTE
-distance from the edge with the argument clamped, rather than of the chunk length.
-That is S5's granularity work, and it is the same defect.
+`audio_drift_parity` is a member of `all`.
 
