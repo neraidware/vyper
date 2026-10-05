@@ -2493,14 +2493,10 @@ rend_enc_video_frame_nv12 :: proc(
 	return rend_enc_send_video(e, &data, &ls, width, height, frame_index)
 }
 
-// enc_push_audio_stereo stages an interleaved stereo chunk and flushes full AAC
-// frames to the encoder.
-rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
-	// Copy into pending, converting zeros already in place.
-	for s in mix {
-		e.audio_pending[e.audio_pending_n] = s
-		e.audio_pending_n += 1
-	}
+// enc_send_pending_audio sends every WHOLE AAC frame currently staged in
+// audio_pending. Split out of rend_enc_push_audio because the tail of the export
+// needs the same loop doing a different job -- see render_enc_flush.
+enc_send_pending_audio :: proc(e: ^Render_Enc) -> bool {
 	ok := true
 	for e.audio_pending_n >= AAC_FRAME_SIZE * 2 {
 		// De-interleave the first 1024 stereo frames into the planar frame.
@@ -2530,6 +2526,17 @@ rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
 		e.audio_pending_n = rem
 	}
 	return ok
+}
+
+// rend_enc_push_audio stages an interleaved stereo chunk and flushes full AAC
+// frames to the encoder.
+rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
+	// Copy into pending, converting zeros already in place.
+	for s in mix {
+		e.audio_pending[e.audio_pending_n] = s
+		e.audio_pending_n += 1
+	}
+	return enc_send_pending_audio(e)
 }
 
 // ---------------------------------------------------------------------------
@@ -2852,6 +2859,28 @@ render_enc_flush :: proc(e: ^Render_Enc) -> bool {
 		return false
 	}
 	if render_pipe.enc_has_audio {
+		// The export's audio has to cover the WHOLE video, and the grid's last
+		// frame is almost never a whole number of AAC frames. At 60fps this
+		// project's grid is 1786*800 = 1428800 samples, which is 1395 AAC frames
+		// plus 320 -- and those 320 were staged in audio_pending and then
+		// dropped, because nothing between the last video frame and this flush
+		// ever sends a PARTIAL frame. Every export therefore came out 6.7ms short
+		// with its audio ending before its video, and the shortfall scaled with
+		// the frame rate rather than being a constant.
+		//
+		// Pad the tail to a frame boundary with silence. Silence is the right
+		// filler: it is what a decoder expects past the last real sample, it is
+		// inside the coded stream rather than a claim about the timeline, and it
+		// costs nothing -- the video track's duration is what defines the file's
+		// length, so this closes the audio to the grid instead of inventing time.
+		for e.audio_pending_n > 0 && e.audio_pending_n < AAC_FRAME_SIZE * 2 {
+			e.audio_pending[e.audio_pending_n] = 0
+			e.audio_pending_n += 1
+		}
+		if !enc_send_pending_audio(e) {
+			render_enc_fail_set("sending the padded audio tail failed")
+			return false
+		}
 		avcodec.send_frame(e.acodec_ctx, nil)
 		if !enc_drain(e, e.acodec_ctx, e.astream, e.apkt) {
 			render_enc_fail_set("audio flush failed")

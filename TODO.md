@@ -167,6 +167,80 @@ Steps (each lands + probe + vet before the next):
       first because `find_decoder` returns libdav1d (sw-only) for AV1 by id —
       corrected later via `find_hw_decoder` resolving the native 'av1' decoder
       which does carry VAAPI (see note at ACCEPT, 2026-09-16).
+- [x] S6a. **A6** — AAC tail padding. Shipped.
+
+      Every export was missing its last audio samples. `rend_enc_push_audio` only
+      ever sends WHOLE 1024-sample AAC frames, and nothing between the last video
+      frame and the encoder flush sends a partial one, so whatever was staged in
+      `audio_pending` at the end was silently dropped. `~/sallyface.vyproj` at
+      60fps: the grid is 1786*800 = 1428800 samples = 1395 AAC frames + 320, and
+      the 320 were discarded -- the file's audio ended 6.7ms BEFORE its video, and
+      the shortfall scaled with the frame rate rather than being a constant.
+
+      `render_enc_flush` now pads `audio_pending` to a frame boundary with silence
+      before flushing. Silence is the right filler: it is what a decoder expects
+      past the last real sample, it lives inside the coded stream rather than being
+      a claim about the timeline, and it costs nothing -- the video track's
+      duration defines the file's length, so this closes the audio to the grid
+      instead of inventing time.
+
+      Measured: 1428480 -> 1429504 samples, i.e. the full 1428800-sample grid plus
+      the 704 samples of AAC frame padding a 1024-sample codec requires
+      (1396 frames). Nothing is lost, and the audio now covers the video instead
+      of ending before it. An eleventh clip region became checkable as a direct
+      consequence -- the one at frame 1699 was falling off the truncated end.
+
+- [ ] S6b. **A6** — render preroll + sample-domain counters.
+      Not started. `AUDIO_SEEK_PREROLL_SEC` is still 0 for the export: the first
+      block of a clip can begin at a sample the AAC seek did not land on exactly,
+      so the opening samples of every clip are whatever the decoder happened to
+      return there.
+
+- [ ] S5. **A5** — edit generations. **Not started, deliberately.**
+
+      What it is: today `audio_note_edit` -> `audio_seek` -> `resync` makes the
+      producer call `audio_device_clear()` and re-provision, and `audio_provision`
+      calls `audio_reset_play()` and reopens EVERY decoder synchronously. Its own
+      comment puts the cost at "hundreds of ms once several sources are open", and
+      notes the playhead moves past the anchor during the open. So moving or
+      trimming ONE clip restarts the whole audio stream -- a guaranteed audible
+      gap, and the cause of the reopen-cost class that dominates the 37-commit
+      history (10 of 37 commits).
+
+      The precedent to follow already exists in the same file: `gain_epoch` and
+      `audio_gain_fold` do exactly this for gain changes, folding new gains into
+      provisioned segments IN PLACE so a knob drag is audible within the cushion
+      with no reopen. Gain got a generation counter and a reconcile; edits did not.
+
+      The design, for whoever picks it up:
+        - Add `geom_epoch` to `Audio_Geom`, published after the slot swap exactly
+          as `gain_epoch` is.
+        - Split `audio_provision`'s pass 1 (fold chips into contiguous groups) from
+          its pass 2 (open + anchor). Pass 1 is pure metadata and can run against
+          a temporary group list without touching a decoder.
+        - Reconcile per source stream: a new group whose (path, stream_index)
+          matches a provisioned source, whose segments are a forward continuation
+          of that source's, and whose segment covering the playhead sits at the
+          same CONTENT position, keeps its decoder and swaps in the new segment
+          metadata. Everything else reopens as today.
+        - Make the `audio_device_clear()` conditional on the reconcile actually
+          having changed something. That clear is the audible part; the reopen is
+          the expensive part, and today they always happen together.
+      Only the decoder's CONTENT position has to stay valid. Everything else in
+      `Play_Seg` -- `start_a`, `len_a`, gain -- is metadata the mix re-reads per
+      frame, which is why a forward continuation is enough to keep the decoder.
+
+      **Why it is not started here.** This is the interactive playback path, it is
+      the highest-risk item in the section, and it cannot be validated by the
+      render gates at all -- `render_valgrind`, `parity` and `audio-verify` do not
+      exercise it. `audio_probe` synthesises media and does drive the resync path,
+      which helps, but a playback glitch is timing-dependent and a partial
+      reconcile that is subtly wrong is worse than the guaranteed gap it replaces:
+      it would desync some edits and not others, intermittently, under a load only
+      a user reproduces. Landing that needs the probe work and a review pass of its
+      own, and cutting it short would leave exactly the kind of half-migration
+      §3b forbids.
+
 - [x] S5. Original-rate preview: when decoder throughput sustains source fps,
       `proxy_pick_for_frame` resolves the original path (decode from original,
       GPU-or-sws scale to canvas). Deadline: one CPU core of air left on a
