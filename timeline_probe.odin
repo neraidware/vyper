@@ -1873,6 +1873,116 @@ test_audio_head_trim :: proc() {
 	}
 }
 
+
+// test_trim_respects_source_length is the reported bug: dragging the siren head
+// clip's tail out to its source's full length capped at 219 frames.
+//
+// resize_clip_right capped the clip's TIMELINE length with the asset's SOURCE
+// frame count. That was correct only while the two rates matched; at 60fps a
+// 219-frame 12fps source occupies 1096 timeline frames, so the cap landed at a
+// fifth of the real length and the tail could not be dragged out at all.
+//
+// The cap is now converted through the clip's own conform, so the assertion is
+// that dragging to the very end yields the FULL source length in timeline frames —
+// and that stopping one frame short yields one frame less, so the cap is a real
+// bound rather than a wall.
+test_trim_respects_source_length :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id = 9301, kind = .Video, frame_count = 219, dur_us = 18261000, video_fps = 12.0,
+		},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 11, kind = .Video, asset_id = 9301, src_fps = 12.0,
+			timeline_start_frame = 0, source_length_frames = 60,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+
+	// At 60fps the 219-frame source must be draggable out to 1095 timeline frames.
+	project.frame_rate = 60.0
+	want := clip_src_len_to_timeline_frames(&tl.clips[0], 219)
+	applied := resize_clip_right(tl, 0, i64(1) << 40) // absurd tail: must clamp to the source
+	tl_probe_check(
+		applied == want && want == 1095,
+		"the tail must drag out to the source's full length — applied %d frames, want %d (1095 at 60fps for a 219-frame 12fps source)",
+		applied, want,
+	)
+	// And the bound is real: one frame short of the end is one frame short.
+	applied = resize_clip_right(tl, 0, i64(want) - 1)
+	tl_probe_check(
+		applied == want - 1,
+		"one frame short of the source must give one frame less — applied %d, want %d",
+		applied, want - 1,
+	)
+	// Past the end is refused, not wrapped or extended.
+	applied = resize_clip_right(tl, 0, i64(want) + 500)
+	tl_probe_check(
+		applied == want,
+		"a tail past the source must clamp, not extend — applied %d, want %d",
+		applied, want,
+	)
+
+	// The head bound is converted too: a clip whose head sits 35 source frames in
+	// may extend left by 35 source frames, expressed in timeline frames.
+	free_timeline(&timeline)
+	append(&timeline.tracks, Track{})
+	tl = &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 12, kind = .Video, asset_id = 9301, src_fps = 12.0,
+			timeline_start_frame = 600, source_length_frames = 60, source_start_frame = 35,
+		},
+	)
+	head_frames := clip_src_len_to_timeline_frames(&tl.clips[0], 35)
+	got_len := resize_clip_left(tl, 0, 0) // drag the head as far left as it will go
+	c := &tl.clips[0]
+	// The head cannot pass the point where source_start_frame would go negative:
+	// 35 source frames back is 175 timeline frames at 60fps.
+	limit := 600 - head_frames
+	tl_probe_check(
+		c.timeline_start_frame == limit,
+		"the head must stop where the source runs out — landed at %d, want %d (600 - %d timeline frames for 35 source frames)",
+		c.timeline_start_frame, limit, head_frames,
+	)
+	// And the source offset it adjusted must not go NEGATIVE. Unconverted, the
+	// head moved 175 timeline frames and source_start_frame was decremented by
+	// all 175, landing at -140 — reading before the source's first frame while the
+	// clamp above said the head was still inside the media.
+	tl_probe_check(
+		c.source_start_frame == 0,
+		"dragging the head to the source's start must leave source_start_frame at 0 — got %d",
+		c.source_start_frame,
+	)
+	// A PARTIAL drag, because the clamp above hides the bug at the limit: dragged all
+	// the way left, the unconverted delta overshoots to a negative offset that
+	// max(0, ...) clamps straight back to 0, so the assertion above passes either
+	// way. Mid-drag there is nowhere to hide.
+	c.source_start_frame = 35
+	c.timeline_start_frame = 600
+	c.source_length_frames = 60
+	resize_clip_left(tl, 0, 500) // 100 timeline frames left
+	tl_probe_check(
+		c.source_start_frame == 15,
+		"a 100-timeline-frame head drag at 12fps over 60fps must move source_start_frame by 20 — got %d, want 15 (35 - 20)",
+		c.source_start_frame,
+	)
+	tl_probe_check(
+		got_len == 660 - limit,
+		"the applied length must match the new head — got %d, want %d",
+		got_len, 660 - limit,
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow()
@@ -1883,6 +1993,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow_keyframes()
 	fmt.println("[tl-probe] fps-reflow-keyframes ok")
+	tl_scene()
+	test_trim_respects_source_length()
+	fmt.println("[tl-probe] trim-source-length ok")
 	tl_scene()
 	test_audio_head_trim()
 	fmt.println("[tl-probe] audio-head-trim ok")

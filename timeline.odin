@@ -266,6 +266,47 @@ clip_src_len_frames :: proc(clip: ^Clip) -> i64 {
 // Derived through clip_source_frame so there is one conform policy rather than a
 // second restatement of it here. The `+ 1` makes it half-open at the far end: the
 // last timeline frame displays source frame hi-1, not hi.
+// clip_src_len_to_timeline_frames converts a count of SOURCE frames into the
+// TIMELINE length that many source frames occupy for this clip — the inverse of
+// clip_src_len_frames.
+//
+// It has to be a conversion and not a constant ratio, because the factor is the
+// clip's own conform (src_fps over project_fps) and every caller is holding a
+// timeline length on the other side of the comparison.
+// clip_timeline_to_src_frames is the inverse: a distance in TIMELINE frames
+// expressed in SOURCE frames.
+//
+// Needed wherever a drag moves the head, because the distance the pointer travelled
+// is a timeline distance while the field being adjusted (Clip.source_start_frame)
+// counts source frames. Under conform those differ by exactly the clip's ratio, so
+// `source_start_frame += delta` walks the head off the front of the file: dragging
+// a 35-source-frame head left by its full 175 timeline frames decremented
+// source_start_frame by 175 and left it at -140, reading before the first frame.
+clip_timeline_to_src_frames :: proc(clip: ^Clip, timeline_frames: i64) -> i64 {
+	rate := clip.src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	proj := project_fps()
+	if !(rate > 0) || !(proj > 0) {
+		return timeline_frames
+	}
+	return i64(math.round(f64(timeline_frames) * (rate / proj)))
+}
+
+clip_src_len_to_timeline_frames :: proc(clip: ^Clip, src_frames: i64) -> i64 {
+	rate := clip.src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	proj := project_fps()
+	if !(rate > 0) || !(proj > 0) {
+		return max(1, src_frames)
+	}
+	return max(1, i64(math.round(f64(src_frames) * (proj / rate))))
+
+}
+
 clip_source_span :: proc(
 	source_start, timeline_start, length: i64,
 	src_fps: f64,
@@ -826,7 +867,24 @@ resize_clip_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 	max_len := i64(1) << 50
 	if !c.is_still {
 		if src_total := asset_source_frames(c.asset_id, c.kind); src_total > 0 {
-			max_len = max(1, src_total - c.source_start_frame)
+			// SOURCE frames available after the head, converted to the TIMELINE
+			// length the caller is clamping.
+			//
+			// These were compared directly before conform, which was correct only
+			// while the two rates were equal. `new_tail - start` is a TIMELINE
+			// length, so capping it with a SOURCE frame count caps a 60fps clip at
+			// 219 frames — a fifth of the 1096 its source actually occupies — and
+			// the user cannot drag the tail out to the source's full length. That is
+			// exactly the report: "dragging the end of the siren head clip to its
+			// full length caps at 219 frames".
+			//
+			// The conversion goes through clip_src_len_frames, so the cap tracks the
+			// clip's own conform rather than restating the ratio here.
+			head_frames := src_total - c.source_start_frame
+			if head_frames < 1 {
+				head_frames = 1
+			}
+			max_len = clip_src_len_to_timeline_frames(c, head_frames)
 		}
 	}
 	next := clip_next_start(track, idx)
@@ -853,7 +911,10 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	ssrc := c.source_start_frame
 	end := start + c.source_length_frames
 	// The head may extend left only as far as source frames precede the head.
-	min_start := start - ssrc
+	// Converted, because `start` is a TIMELINE frame and `ssrc` a SOURCE frame:
+	// subtracting them directly lets the head run `ssrc` frames too far left on any
+	// clip whose conform ratio is not 1.
+	min_start := start - clip_src_len_to_timeline_frames(c, ssrc)
 	if c.is_still {
 		min_start = 0
 	}
@@ -864,9 +925,12 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 		lo = hi
 	}
 	head := clamp(new_head, lo, hi)
-	delta := head - start
+	// The head moved by a TIMELINE distance; source_start_frame counts SOURCE
+	// frames. Converting is what keeps the clamp above and this adjustment in
+	// agreement — unconverted, the head lands exactly where the source runs out
+	// and source_start_frame is already far past it.
 	if !c.is_still {
-		c.source_start_frame += delta
+		c.source_start_frame = max(0, c.source_start_frame + clip_timeline_to_src_frames(c, head-start))
 	}
 	c.timeline_start_frame = head
 	c.source_length_frames = end - head
@@ -891,21 +955,26 @@ resize_clip_seam :: proc(track: ^Track, left_idx, right_idx: int, new_seam: i64)
 	if right.is_still {
 		lo = max(lo, 0)
 	} else {
-		lo = max(lo, old_seam-right.source_start_frame)
+		// TIMELINE minus SOURCE, so converted. Same reason as resize_clip_left's
+		// min_start, and wrong in the same direction.
+		lo = max(lo, old_seam-clip_src_len_to_timeline_frames(right, right.source_start_frame))
 	}
 	if !left.is_still {
 		if source_total := asset_source_frames(left.asset_id, left.kind); source_total > 0 {
-			max_left_len := max(1, source_total-left.source_start_frame)
+			max_left_len := clip_src_len_to_timeline_frames(left, max(1, source_total-left.source_start_frame))
 			hi = min(hi, left_start+max_left_len)
 		}
 	}
 	assert(lo <= hi, "resize_clip_seam: no valid frame boundary remains")
 	seam := clamp(new_seam, lo, hi)
-	delta := seam - old_seam
 	left.source_length_frames = seam - left_start
 	right.timeline_start_frame = seam
 	if !right.is_still {
-		right.source_start_frame += delta
+		// TIMELINE distance into a SOURCE count; see resize_clip_left.
+		right.source_start_frame = max(
+			0,
+			right.source_start_frame + clip_timeline_to_src_frames(right, seam-old_seam),
+		)
 	}
 	right.source_length_frames = right_end - seam
 	return seam
