@@ -15,12 +15,22 @@ import "core:mem"
 
 kf_probe_fail := false
 
+// kf_approx compares source-fraction lane arithmetic, tightly. For a comparison
+// in PIXELS use kf_approx_px: the same quantity scaled by a box width amplifies
+// f32 rounding by ~10^5, so this tolerance is below the noise floor there and
+// rejects cases that are in fact exact.
 kf_approx :: proc(a, b: f32) -> bool {
+	return kf_approx_px(a, b, 0.0001)
+}
+
+// kf_approx_px is the pixel-space bar: half a pixel of 1920, which is far tighter
+// than the rounding (~1e-2 px) and far looser than it.
+kf_approx_px :: proc(a, b: f32, tol: f32 = 0.5) -> bool {
 	d := a - b
 	if d < 0 {
 		d = -d
 	}
-	return d < 0.0001
+	return d <= tol
 }
 
 kf_probe_check :: proc(cond: bool, msg: string, args: ..any) {

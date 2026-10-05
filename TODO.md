@@ -5691,3 +5691,247 @@ it is the only remaining duplication I would argue for keeping.
 **Accept.** `check build probe transform_probe subtitle_probe geom_key_probe
 render_kf_probe keyframe_probe opacity gpu_probe parity keyed_export` pass;
 `parity_valgrind render_valgrind` clean.
+
+## Active 29 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
+
+**Why:** Alt+wheel and Alt+middle-drag magnified and slid a clip's content
+correctly, and neither wrote anything called zoom or pan. Each gesture rewrote
+**seven fields across three properties** to hold the visible box still: the four
+crop insets to move the window, `Scale` to absorb the box-size change the new
+window implied, and both transforms to re-anchor the box center under the new
+crop asymmetry.
+
+That compensation WAS the hack. Seven coupled values had to stay in step by
+hand; any one of them drifting moved the box a pixel; and every consequence was
+invisible in the model, because "the clip's content is magnified" had no property
+to name. Two costs followed:
+
+- **"Keyframe all modified" animated six lanes the user never touched.** A single
+  Alt+drag left crop.l/r/t/b and transform.x/y all pending, so the button minted
+  a packed `crop` knot AND a packed `transform` knot — animating both the window
+  and the position, because the gesture could not express itself in one property.
+  `geom_key_probe` pinned that count at 6, which meant the probe was *protecting*
+  the coupling rather than catching it.
+- **The window math existed in two sinks with different inputs.** The preview
+  read sampled lanes and the export read `geom_base`, so this is precisely the
+  class that made keyed text export at its resting pose (Active 24).
+
+**What it is now.** Three properties: `zoom` (uniform magnification of the
+content) and `pan.x` / `pan.y` (the window's offset, as a fraction of its own
+size). `crop` stays — it is the underlying window model, describing HOW MUCH of
+the source a clip shows; zoom and pan are modifiers applied to that window
+before it becomes a source rect. Only the two gestures moved.
+
+`geom_source_window` resolves all three into the four normalized insets every
+consumer already speaks, so nothing downstream knows zoom and pan exist, and
+`geom_crop_insets` is the only way to get them. Both sinks route through it:
+the preview's box (clip_image_bounds_geom) and crop UVs (gpu_draw), and the
+export's static path (render_display_rect) and keyed path (render_kf_geom_rect).
+That last one mattered — reading the four crop lanes out of `sampled` there
+would have animated crop while silently freezing zoom and pan, which is the
+static/keyed split that has bitten twice.
+
+**Two windows, not one — and the distinction is the whole invariant.** Zoom and
+pan select CONTENT. Only crop trims the BOX. Those are different consumers and
+routing both through the same resolved window moves the clip:
+
+`cropped_box_edges` reads an inset as a box TRIM (`l` pulls the box's left edge
+inward), so an ASYMMETRIC inset pair moves the box. Both zoom and pan produce
+asymmetric insets exactly when they must not move anything — a pan slides the
+window off-center on purpose, and a zoom about an ASYMMETRIC crop window's center
+inherits that window's offset. Measured with the first implementation, which fed
+the resolved window to both:
+
+| case | box centre | should be |
+|---|---|---|
+| symmetric crop + zoom 2 | 500.00 | 500.00 ✓ |
+| symmetric crop + **pan 0.25** | **450.00** | 500.00 ✗ |
+| **asymmetric crop (l=0.2) + zoom 2** | **600.00** | 500.00 ✗ |
+
+So there are two accessors, named for what they are FOR rather than which lanes
+they read: `geom_box_insets` (crop only; every box path) and
+`geom_content_insets` (crop + zoom + pan; `crop_src_rect`, the preview's crop UVs,
+and the static path's decoder window). The keyed path needs both and computes
+both — `cropped_box_edges` from the box insets, `crop_src_rect` from the content
+ones.
+
+The static export path also stopped deriving its decoder window from where the box
+landed on canvas. Those fractions were derived from the box rect, which cannot
+express a pan at all; they are now source fractions read from the content window,
+and the buffer's size and placement stay governed by the box. So a 2x zoom fetches
+half the source and fills the box with it, and a pan fetches a different half —
+which is precisely "operate on the content, never on the box".
+
+**The probe had the same bug as the code, which is why it passed.** Its
+stationarity check built the reference by calling `clip_image_bounds_geom` with
+the ZOOMED sample — the same code path under test — so it agreed by construction
+and stayed green while the box was moving a fifth of its width. The reference is
+now the same clip with zoom and pan NEUTRALISED. A reference that shares the code
+under test cannot see that code's bug; that is the one lesson from this that is
+worth more than the feature.
+
+**Consumed before the box, not after.** Ordering zoom relative to scale is
+mathematically a wash (scales commute). It is load-bearing because
+`crop_src_rect` picks an INTEGER rect inside the decoded stage and the display
+box maps to it 1:1 — that is what lets a keyed clip region-copy per frame with
+no resampling. A post-transform zoom would destroy the 1:1 mapping and force a
+resample every frame. Zoom is therefore folded into the window, which keeps the
+fast path.
+
+Zoom is UNIFORM by necessity, not taste: it scales the window about its center,
+so per-axis factors would change the box's aspect ratio, contradicting the
+invariant these gestures have always had — the box never moves or resizes. Pan
+is per-axis because sliding a window does not distort it.
+
+**Zero is a usable value, so the file needs no migration.** `geom_source_window`
+reads a non-positive zoom as 1 and pan 0 as centered. A project saved before
+this change has no `zoom` field, which decodes to 0, which means exactly the
+right thing — every clip opens unzoomed and unpanned with nothing to detect.
+That is why zoom/pan get no `has_` presence flag while opacity above them does:
+opacity's absent value (0) means fully transparent, which is not a sane default,
+so it needed one. The asymmetry is the reason, and it is now said in the file.
+
+**Probe / mutation.** `geom_key_probe` gains the invariant that was previously
+impossible to state, because the box no longer moves: zoom and pan must leave
+the clip's box **exactly** where it was, asserted as a property over a sweep of
+4 zooms x 3 pans x 2 axes rather than a baked rectangle. Plus the window
+arithmetic itself (zoom halves both axes and keeps the center; pan slides by a
+fraction of the window's own width; a far pan PINS at the edge instead of running
+off the source; a zero zoom leaves crop alone).
+
+Mutation, both directions:
+
+- making `clip_zoom_by` nudge `Trans_X` alongside the zoom — the old hack's
+  coupling — fails with `Alt+wheel must not write transform.x (was 960, now 968)`
+- routing the box back through `geom_content_insets` — the bug above — fails 36
+  assertions, e.g. `zoom=1.00 pan=(-0.30,-0.20): box moved (576.00,324.00) vs
+  (528.00,297.00)`
+- inverting the pan sign back fails both direction cases: `dragging right must
+  move the sampled window toward the source's LEFT (l 0.3875 -> 0.5125)` and
+  `a 120px drag must move the content 120px (got -120.00)`
+
+**Pan speed scaled with zoom: 4.4x too fast at zoom 4.** `clip_pan_by` divided the
+drag by the sampled WINDOW's width in project px (`nw * cw`) where the correct
+divisor is the BOX width (`cw`). The derivation is one line —
+
+```
+sx(u) = box_x + (u - nl)/nw * cw,   nl = nl0 - pan * nw
+      = const + pan * cw
+```
+
+— so one unit of pan moves the content `cw` project px, INDEPENDENT of `nw`:
+zoom and crop cancel, because they enlarge the source displacement a pan implies
+while shrinking the window by the same factor. Dividing by the window width gave
+a screen motion of `dx/nw`, so a 120px drag moved the content 120px at zoom 1
+uncropped and 533px at zoom 4 over a 10% crop. **The two divisors are identical
+exactly when `nw == 1`**, i.e. zoom 1 with no crop — which is why it read as
+correct until anything was zoomed, and why every hand-check made at default zoom
+agreed with the code.
+
+The comment claiming "zoom is already folded into the window, so this tracks it
+for free" was the load-bearing error: folding zoom into the window is what makes
+it cancel, not what makes the window width the right divisor.
+
+**The probe that should have caught it asserted a tautology.** It checked
+`(Δnl) * cw == 120` — a source fraction times a box width. Since `Δnl = dx/nw`,
+the `nw` cancels and the expression is *algebraically* 120 at every zoom. It
+passed against the real bug and could not have failed. The replacement measures
+what the user sees: the screen motion of a fixed source point,
+`(u - nl)/nw * cw`, which is only screen space if divided by `nw`, plus a
+zoom-invariance case (same drag at zoom 4 must move the content the same 120px).
+Reverting the divisor now fails both: `got 533.33`.
+
+The replacement case was itself wrong on arrival — it nested a second
+`geom_key_fixture()` inside the direction case, and the fixture calls
+`free_timeline`, so the second call freed the clips array the first case's `cl`
+pointed into. The y-axis check then read freed memory, which valgrind reported as
+76 invalid-read contexts inside `clip_pan_by`. The fixture now states its
+one-live-pointer contract at the definition; the zoom-invariance case is a
+sibling, not a nested block. Context count 76 -> 39, the remainder being Odin
+runtime internals with no frame in this change. Worth recording because a probe
+that cannot fail is worse than no probe: the tautology above and this crash both
+came from the same case, and the second would have shipped as "tested".
+
+That needed a second tolerance. `kf_approx` is a 1e-4 bar on source-fraction lane
+arithmetic; a source fraction scaled by a box width amplifies f32 rounding by
+~10^5, so 1e-4 px is below the noise floor (~1e-2 px) and rejected a case that
+was in fact exact — a check that read "got 120.00" and failed. Added
+`kf_approx_px` for the pixel-space bar rather than loosening the shared one.
+
+**The pan value could run away from the pan the clip showed.** The window clamp
+lived only in `geom_source_window`, so it bounded the CONTENT while the lane kept
+being incremented: dragging into an edge pinned the picture and moved the number
+forever. The inspector showed a pan that was not the pan on screen, and a key
+taken from it recorded a pan the clip would never display. Same class as the
+sign bug and the opposite failure: there the lane moved the wrong way, here it
+moved too far.
+
+**A window clamp is not a value bound.** They are different quantities, and
+bounding only the rendered one is what let the stored one drift — the writer has
+to be bounded, not just the reader of what the writer wrote. Fixed by
+`geom_pan_range`, which returns the pan values for which the window clamp is NOT
+binding, derived by inverting the window's own clamp against the same
+`source_window_parts` the window uses. `clip_pan_by` and the typed inspector both
+clamp through it, and the resolver keeps its clamp as the belt to that suspenders:
+a value can still arrive out of range from a hand-edited file, but nothing that
+writes a pan can produce one.
+
+`source_window_parts` was split out because the range needs the zoomed window's
+center and size, and re-deriving them from the insets would have been a second
+answer to "how far can this axis slide". `cl_geom_all` exists for the same reason
+at the clip boundary: `geom_pan_range` needs the crop and zoom lanes, so a caller
+holding a Clip cannot bound a pan against a partial sample — a range from the
+resting crop while the playhead sits on a keyed one would admit pans the window
+refuses.
+
+The probe drags a zoomed clip 12 steps past a border and asserts the lane stops at
+`x_hi`, that the stored value is one the window does not clamp (a lane parked on
+a clamped value would be the original bug, not a fix), and that panning back
+immediately moves the content again — a bound, not a dead end. Reverting to
+window-only clamping reproduces the report exactly:
+
+- `a drag into the border must stop the lane at the achievable limit (11.111111,
+  limit 1.7222222)`
+- `the stored pan must land inside the window's clamp (-2.1124997 of 0..0.775)`
+
+**The pan direction was inverted, and nothing caught it.** `clip_pan_by` negated the
+drag delta on the reasoning that "the gesture drags content the other way" —
+which is true of the WINDOW and not of the thing the user is dragging. So a
+rightward drag moved the CONTENT leftward. Two things had to be true to miss it:
+every existing case asserted only that pan CHANGED, never which way, and pan is
+defined as the window's offset, which is the opposite quantity to the one the
+user actually sees. `geom_source_window` and `Clip.pan_x` both stated the
+semantics backwards, so the wrong thing read as the documented thing.
+
+Fixed by inverting the delta. The semantics are now stated the same way in both
+places: **pan is the WINDOW's offset** (positive slides the sampled region toward
+the source's left/top), **so the content travels the other way**, which is what
+makes a rightward drag move the image rightward — the grab-the-content
+convention the gesture had before it had a property.
+
+The probe now pins the direction end to end, which is the part that was missing.
+It zooms in FIRST, because at zoom 1 the window fills the source and every pan
+clamps to a no-op, so a direction check there passes for the wrong reason. Then it
+drags right and asserts the sampled window moved toward the source's left. It
+also asserts the content tracks the CURSOR one-for-one — a 120px drag must move
+the content 120px — because moving the right way at a zoom-dependent speed is the
+same feel bug the win_w conversion exists to prevent.
+
+**Two more real bugs were found by the new cases rather than by inspection:**
+
+- **`clip_pan_by` wrote both pan lanes unconditionally**, so a horizontal drag
+  marked `pan.y` pending with its own value and "key all modified" would mint a
+  key for something the user never moved. Now per-axis, and only when that axis
+  moved — the same rule `clip_geom_drag` already followed for an untouched lane.
+- **The probe's own window math read `r - l` as a width.** `Source_Window`
+  carries INSETS, so the width is `1 - l - r`; the assertion passed for the
+  unzoomed case only because both insets are equal there.
+
+The old probe cases that PINNED the coupling (`n == 6`, and two packed section
+knots from one pan) were inverted rather than deleted, so the decoupling is now
+the thing under test.
+
+**Accept.** `check build probe keyframe_probe geom_key_probe render_kf_probe
+transform_probe timeline_probe opacity zorder render_live_probe subtitle_probe
+parity keyed_export` pass; `geom_key_valgrind render_valgrind parity_valgrind
+undo_valgrind` clean.

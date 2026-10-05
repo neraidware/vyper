@@ -147,3 +147,188 @@ text_box_dims :: proc(base_w, base_h: c.int, scale, pw: f32) -> (f32, f32) {
 	f := text_pixels_to_project(1, pw)
 	return f32(base_w) * f * scale, f32(base_h) * f * scale
 }
+
+// ---------------------------------------------------------------------------
+// The content window: crop, then zoom, then pan.
+//
+// Crop says HOW MUCH of the source a clip shows; Zoom says how magnified that
+// window is; Pan says WHERE it sits within the source. This proc resolves the
+// three into the four normalized insets that every downstream consumer already
+// speaks, so nothing downstream has to know the three exist.
+//
+// One resolver, both sinks. The preview needs the window for its crop UVs and
+// the export needs it for crop_src_rect, and they used to be derived by
+// different code from different inputs -- the preview from sampled lanes, the
+// export from `geom_base` -- which is exactly the shape of bug that made keyed
+// text export at its resting pose (TODO.md Active 24). Resolving here, from a
+// Geom_Sample, means a caller cannot pick the wrong one.
+// ---------------------------------------------------------------------------
+
+// Zoom_Floor is the smallest window Zoom may shrink to, as a fraction of the
+// source. Below this the window has no meaningful content left and, more
+// practically, the integer source rect crop_src_rect derives stops resolving to
+// anything drawable.
+Zoom_Floor :: 0.05
+
+// Source_Window is the resolved window as normalized insets, the same shape and
+// units as clip.crop_l/r/t/b — so the result drops straight into every existing
+// crop consumer without conversion.
+Source_Window :: struct {
+	l, r, t, b: f32,
+}
+
+// geom_source_window resolves `geom`'s crop, zoom and pan into one window.
+//
+// `zoom` is uniform (see Render_Geom_Prop.Zoom): both axes share it, because
+// scaling them differently would change the box's aspect ratio. A zoom of 1
+// leaves the crop window exactly as crop describes it, and a zoom of 0 — which
+// is what a bare `Clip{}` carries — means 1, so the zero value is useful and a
+// clip constructed by a probe or a loader is not silently invisible.
+//
+// `pan_x`/`pan_y` are fractions of the ZOOMED window's own width and height, so
+// a pan of 0.5 always slides by half a window regardless of zoom, and the
+// gesture that produces them does not have to rescale itself when zoom changes.
+// Positive slides the WINDOW toward the source's LEFT/top, so the content
+// appears to move right/down -- which is what makes a rightward drag move the
+// image rightward. Pan is the window's offset, not the content's; conflating the
+// two is what inverted the gesture once.
+//
+// Every stage clamps to the source. A window that ran off an edge would ask
+// crop_src_rect for a rect it cannot address, and the export's stage-clamping
+// would silently substitute the wrong pixels — the "box moves a pixel" class of
+// bug, one stage further from its cause.
+// Source_Window_Parts is the window's geometry BEFORE pan: where it sits and how
+// big it is. Split out because the clamp rule needs it too, and a pan range
+// re-derived from the insets instead would be a second answer to "how far can
+// this axis slide".
+Source_Window_Parts :: struct {
+	cx, cy: f32, // the ZOOMED window's center (the crop window's, when centered)
+	nw, nh: f32, // the zoomed window's size, as fractions of the source
+}
+
+source_window_parts :: proc(geom: Geom_Sample) -> Source_Window_Parts {
+	wl := geom[int(Render_Geom_Prop.Crop_L)]
+	wr := 1 - geom[int(Render_Geom_Prop.Crop_R)]
+	wt := geom[int(Render_Geom_Prop.Crop_T)]
+	wb := 1 - geom[int(Render_Geom_Prop.Crop_B)]
+	// A degenerate crop (insets summing past the edge) would give a negative
+	// width and every clamp below would invert. Fall back to the full frame, which
+	// is what an unset crop means.
+	wx := wr - wl
+	wy := wb - wt
+	if !(wx > 0.0) || !(wy > 0.0) {
+		wl, wr, wt, wb = 0, 1, 0, 1
+		wx, wy = 1, 1
+	}
+	zoom := geom[int(Render_Geom_Prop.Zoom)]
+	if !(zoom > 0.0) {
+		zoom = 1.0 // the zero value means "no magnification"
+	}
+	// About the crop window's center, so zoom leaves a centered crop centered.
+	return {
+		cx = (wl + wr) * 0.5,
+		cy = (wt + wb) * 0.5,
+		nw = min(max(wx / zoom, Zoom_Floor), 1.0),
+		nh = min(max(wy / zoom, Zoom_Floor), 1.0),
+	}
+}
+
+geom_source_window :: proc(geom: Geom_Sample) -> Source_Window {
+	p := source_window_parts(geom)
+	nl := p.cx - p.nw * 0.5 - geom[int(Render_Geom_Prop.Pan_X)] * p.nw
+	nt := p.cy - p.nh * 0.5 - geom[int(Render_Geom_Prop.Pan_Y)] * p.nh
+	// Clamp as a whole: shifting one edge and re-deriving the other keeps the
+	// window's SIZE, so a pan past the border pins instead of shrinking — which
+	// is what the Alt+middle gesture has always done.
+	nl = clamp(nl, 0, 1 - p.nw)
+	nt = clamp(nt, 0, 1 - p.nh)
+	return {l = nl, r = 1 - (nl + p.nw), t = nt, b = 1 - (nt + p.nh)}
+}
+
+// Source_Pan_Range is the set of pan values an axis can actually take: the ones
+// for which the window clamp above is not binding.
+Source_Pan_Range :: struct {
+	x_lo, x_hi: f32,
+	y_lo, y_hi: f32,
+}
+
+// geom_pan_range returns the achievable pan values for both axes.
+//
+// This exists because clamping the WINDOW is not the same as bounding the VALUE,
+// and only the second one keeps the property honest. With the clamp living solely
+// in geom_source_window, dragging toward an edge kept incrementing pan_x forever
+// while the content sat pinned — the number ran away from the picture, and the
+// inspector and any keyframe taken from it recorded a pan the clip was never
+// showing. A gesture can reach a pan the window refuses, so the bound has to be
+// available to whoever writes the value, not just to whoever renders it.
+//
+// Derived from the same parts the window is, inverted:
+//
+//	pan in [ (cx - nw/2 - (1-nw)) / nw , (cx - nw/2) / nw ]
+//
+// which is just `nl` at each end of its clamp, divided by nw. Zoom_Floor keeps nw
+// away from zero, so the division is always safe.
+geom_pan_range :: proc(geom: Geom_Sample) -> Source_Pan_Range {
+	p := source_window_parts(geom)
+	return {
+		x_lo = (p.cx - p.nw * 0.5 - (1 - p.nw)) / p.nw,
+		x_hi = (p.cx - p.nw * 0.5) / p.nw,
+		y_lo = (p.cy - p.nh * 0.5 - (1 - p.nh)) / p.nh,
+		y_hi = (p.cy - p.nh * 0.5) / p.nh,
+	}
+}
+
+// clamp_pan_x / clamp_pan_y bound a pan value to what the window can show, so a
+// stored value and the visible window cannot disagree. The gesture routes its
+// writes through these; so should anything else that writes a pan.
+clamp_pan_x :: proc(geom: Geom_Sample, v: f32) -> f32 {
+	r := geom_pan_range(geom)
+	return clamp(v, r.x_lo, r.x_hi)
+}
+
+clamp_pan_y :: proc(geom: Geom_Sample, v: f32) -> f32 {
+	r := geom_pan_range(geom)
+	return clamp(v, r.y_lo, r.y_hi)
+}
+
+// geom_content_insets is the CONTENT window's four normalized insets — crop, then
+// zoom, then pan. This is what selects WHICH SOURCE PIXELS are drawn: the export's
+// crop_src_rect and the preview's crop UVs.
+//
+// It is NOT what sizes or places the clip's box. Those read clip.crop_l/r/t/b
+// directly, and the distinction is load-bearing rather than cosmetic:
+//
+// cropped_box_edges treats insets as box TRIMS — `l` pulls the box's left edge
+// inward — so an asymmetric inset pair moves the box. Zoom and pan produce
+// asymmetric insets exactly when they should not move anything: a pan slides the
+// window off-center on purpose, and a zoom about an ASYMMETRIC crop window's
+// center inherits that window's offset. Feeding these insets to the box moves the
+// clip by 0.1 of its width on a quarter pan, and by a fifth of it on an
+// asymmetric crop at 2x — which is precisely the "zoom must not touch placement"
+// rule. Zoom and pan select content; only crop trims the box.
+geom_content_insets :: proc(geom: Geom_Sample) -> (l, r, t, b: f32) {
+	w := geom_source_window(geom)
+	return w.l, w.r, w.t, w.b
+}
+
+// geom_box_insets is the clip's BOX insets — the crop lanes and nothing else.
+// The one accessor for the box side, so a caller cannot reach for the content
+// window by mistake; that mistake is invisible until a clip drifts under the
+// pointer.
+geom_box_insets :: proc(geom: Geom_Sample) -> (l, r, t, b: f32) {
+	return geom[int(Render_Geom_Prop.Crop_L)],
+	       geom[int(Render_Geom_Prop.Crop_R)],
+	       geom[int(Render_Geom_Prop.Crop_T)],
+	       geom[int(Render_Geom_Prop.Crop_B)]
+}
+
+// cl_geom_all samples EVERY lane of a live clip at the playhead — the whole
+// Geom_Sample, not one lane. geom_pan_range needs the crop and zoom lanes to
+// bound a pan, so a caller holding only a Clip cannot clamp a pan against a
+// partial sample: a range computed from a resting crop while the playhead is on a
+// keyed one would admit pan values the window refuses.
+//
+// The one place the preview and export evaluators both take this shape.
+cl_geom_all :: proc(clip: ^Clip) -> Geom_Sample {
+	return geom_sample_clip(clip, playhead.frame)
+}

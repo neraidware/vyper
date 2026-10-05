@@ -2538,10 +2538,10 @@ draw_preview :: proc(
 			v_base := f32(foy) / f32(PREVIEW_H)
 			u_span := f32(fw) / f32(PREVIEW_W)
 			v_span := f32(fh) / f32(PREVIEW_H)
-			ins_l := slot.geom[int(Render_Geom_Prop.Crop_L)]
-			ins_r := slot.geom[int(Render_Geom_Prop.Crop_R)]
-			ins_t := slot.geom[int(Render_Geom_Prop.Crop_T)]
-			ins_b := slot.geom[int(Render_Geom_Prop.Crop_B)]
+			// The CONTENT window — crop, zoom and pan — because these UVs select
+			// which source pixels are drawn. This is the correct side for zoom and
+			// pan: a pan slides the sampled region without moving the quad.
+			ins_l, ins_r, ins_t, ins_b := geom_content_insets(slot.geom)
 			u0 = u_base + ins_l * u_span
 			u1 = u_base + (1 - ins_r) * u_span
 			v0 = v_base + ins_t * v_span

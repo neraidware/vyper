@@ -19,7 +19,7 @@ package main
 //
 // That made the routing a per-call-site responsibility: every geometry write
 // had to remember to funnel through kf_auto_key, and the two preview gestures
-// (crop_viewport_zoom for Alt+wheel, crop_viewport_pan for Alt+middle-drag)
+// (clip_zoom_by for Alt+wheel, clip_pan_by for Alt+middle-drag)
 // did not. The result was a drag that changed the inspector's numbers, moved
 // nothing under the pointer, and made the clip jump when the playhead left the
 // keyed span. geom_key_probe.odin gates exactly that.
@@ -51,6 +51,12 @@ clip_geom_resting :: proc(clip: ^Clip, prop: Render_Geom_Prop) -> f32 {
 		return clip.crop_b
 	case .Opacity:
 		return clip.opacity
+	case .Zoom:
+		return clip.zoom
+	case .Pan_X:
+		return clip.pan_x
+	case .Pan_Y:
+		return clip.pan_y
 	case ._COUNT:
 		unreachable()
 	}
@@ -78,6 +84,12 @@ clip_geom_set_resting :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) {
 		clip.crop_b = v
 	case .Opacity:
 		clip.opacity = v
+	case .Zoom:
+		clip.zoom = v
+	case .Pan_X:
+		clip.pan_x = v
+	case .Pan_Y:
+		clip.pan_y = v
 	case ._COUNT:
 		unreachable()
 	}

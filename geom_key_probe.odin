@@ -8,7 +8,7 @@ import clay "clay-odin"
 // VYPER_GEOM_KEY_PROBE — headless check that a geometry edit made through the
 // PREVIEW GESTURES reaches the keyframe track.
 //
-// The defect this gates: crop_viewport_zoom / crop_viewport_pan (Alt+wheel and
+// The defect this gates: clip_zoom_by / clip_pan_by (Alt+wheel and
 // Alt+middle-drag) wrote the clip's seven RESTING fields directly and never
 // called kf_auto_key, while every OTHER geometry write path funnels through it.
 // So on a clip whose crop/transform is already keyed, the edit landed in a
@@ -53,6 +53,12 @@ geom_key_check :: proc(cond: bool, msg: string, args: ..any) {
 // `base` (the resting field) is ignored. That is what made the old edit
 // invisible, so the fixture must be inside the span or it proves nothing.
 geom_key_fixture :: proc() -> (cl: ^Clip) {
+	// ONE live fixture pointer at a time. free_timeline below deletes the clips
+	// array, so a pointer from an earlier call is dangling the moment this one
+	// returns — cases that need a second clip must be siblings, not nested, or
+	// they read freed memory. (Valgrind found exactly that: 76 invalid-read
+	// contexts inside clip_pan_by, from a nested fixture call.)
+	//
 	// Each case gets its own single-track timeline. free_timeline (not clear)
 	// because a Track owns a dynamic Clip array, and its Clips hold session range
 	// reservations — clear would orphan those slots and appending a fresh track
@@ -138,6 +144,19 @@ geom_key_lanes :: [int(Render_Geom_Prop._COUNT)]struct{lane: Render_Geom_Prop, b
 	{Render_Geom_Prop.Crop_T, 0.05},
 	{Render_Geom_Prop.Crop_B, 0.05},
 	{Render_Geom_Prop.Opacity, 1.0},
+	// Zoom's base must differ from the clip's DEFAULT (1 = no magnification) so a
+	// probe reading a resting field by mistake is caught rather than agreeing by
+	// luck. Pan's base is 0 — which IS its default, unavoidably, since 0 is
+	// "centered" and there is no other neutral value.
+	//
+	// Pan at 0 is also what keeps the rest of this probe honest: a non-zero pan
+	// OFFSETS THE BOX CENTER from the transform (that is what pan does), so a
+	// fixture panned off-center would make every box-geometry assertion in the
+	// file disagree for a reason that has nothing to do with what it is testing.
+	// The pan tests below key their own values where they need a non-zero one.
+	{Render_Geom_Prop.Zoom, 2.0},
+	{Render_Geom_Prop.Pan_X, 0.0},
+	{Render_Geom_Prop.Pan_Y, 0.0},
 }
 
 // geom_key_sample reads the value the USER SEES at the playhead. It mirrors
@@ -170,6 +189,12 @@ geom_key_resting :: proc(cl: ^Clip, lane: Render_Geom_Prop) -> f32 {
 		return cl.crop_b
 	case .Opacity:
 		return cl.opacity
+	case .Zoom:
+		return cl.zoom
+	case .Pan_X:
+		return cl.pan_x
+	case .Pan_Y:
+		return cl.pan_y
 	case ._COUNT:
 		unreachable()
 	}
@@ -190,77 +215,114 @@ geom_key_probe_run :: proc() -> int {
 		{handler = clay_probe_error},
 	)
 
-	// --- Alt+wheel: crop-zoom must move the crop, not just the resting field
+	// --- Alt+wheel: zoom must move the ZOOM lane where it is sampled, and must
+	// not touch crop, scale or the transform. The gesture used to write all three
+	// to fake a content zoom; asserting they are UNTOUCHED is what stops that
+	// coupling from creeping back.
 	{
 		cl := geom_key_fixture()
+		kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Zoom), 0, 1.0)
+		kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Zoom), 300, 1.0)
+		before_z, _ := geom_key_sample(cl, .Zoom)
 		before_l, _ := geom_key_sample(cl, .Crop_L)
-		before_t, _ := geom_key_sample(cl, .Crop_T)
 		before_s, _ := geom_key_sample(cl, .Scale)
-		geom_key_check(before_l > 0, "fixture: crop.l must sample active inside the keyed span, got %v", before_l)
+		before_x, _ := geom_key_sample(cl, .Trans_X)
 		geom_key_check(
-			crop_viewport_zoom(cl, 2.0, true),
+			kf_approx(before_z, 1.0),
+			"fixture: zoom must sample active inside the keyed span, got %v",
+			before_z,
+		)
+		geom_key_check(
+			clip_zoom_by(cl, 2.0, true),
 			"Alt+wheel: zoom-in must be accepted inside the keyed span",
 		)
+		after_z, _ := geom_key_sample(cl, .Zoom)
+		geom_key_check(
+			kf_approx(after_z, 2.0),
+			"Alt+wheel: zoom must change WHERE IT IS SAMPLED (was %v, now %v) — an edit that only moves the resting field is invisible between keys",
+			before_z,
+			after_z,
+		)
+		// The decoupling, stated as an assertion. This is the point of the change:
+		// the gesture writes ONE lane, so crop / scale / transform are not
+		// collateral.
 		after_l, _ := geom_key_sample(cl, .Crop_L)
-		after_t, _ := geom_key_sample(cl, .Crop_T)
 		after_s, _ := geom_key_sample(cl, .Scale)
+		after_x, _ := geom_key_sample(cl, .Trans_X)
 		geom_key_check(
-			abs(after_l - before_l) > 0.0001,
-			"Alt+wheel: crop.l must change WHERE IT IS SAMPLED (was %v, now %v) — an edit that only moves the resting field is invisible between keys",
-			before_l,
-			after_l,
+			kf_approx(after_l, before_l),
+			"Alt+wheel must not write crop.l (was %v, now %v)",
+			before_l, after_l,
 		)
 		geom_key_check(
-			abs(after_t - before_t) > 0.0001,
-			"Alt+wheel: crop.t must change where it is sampled (was %v, now %v)",
-			before_t,
-			after_t,
+			kf_approx(after_s, before_s),
+			"Alt+wheel must not write scale (was %v, now %v)",
+			before_s, after_s,
 		)
 		geom_key_check(
-			abs(after_s - before_s) > 0.0001,
-			"Alt+wheel: scale must change where it is sampled (was %v, now %v)",
-			before_s,
-			after_s,
+			kf_approx(after_x, before_x),
+			"Alt+wheel must not write transform.x (was %v, now %v)",
+			before_x, after_x,
 		)
-		// The playhead key now carries the edit, so the value must be
-		// DISTINCT from the untouched baseline key. Reading the baseline back
-		// here would mean the edit went somewhere the curve does not reach.
-		// (Frame 299 rather than 300 deliberately: the fixture's end key sits
-		// at 300, and a key applies ON its own frame, so 300 would read the
-		// key rather than the interpolation approaching it.)
+		// The playhead key carries the edit, so the curve must reach a DIFFERENT
+		// value between keys. Frame 299, not 300: the end key sits at 300 and a
+		// key applies ON its own frame.
 		playhead.frame = 299
-		off_span, _ := geom_key_sample(cl, .Crop_L)
+		off_span, _ := geom_key_sample(cl, .Zoom)
 		geom_key_check(
-			abs(off_span - 0.05) > 0.0001,
+			abs(off_span - 1.0) > 0.0001,
 			"Alt+wheel: the neighbouring key must be reached by the curve (got %v) — the edit went to a key the timeline never interpolates to",
 			off_span,
 		)
 		playhead.frame = 0
-		at_start, _ := geom_key_sample(cl, .Crop_L)
+		at_start, _ := geom_key_sample(cl, .Zoom)
 		geom_key_check(
-			kf_approx(at_start, 0.05),
-			"Alt+wheel: the clip's FIRST key must still hold its original baseline, got %v — a gesture rewrote keys the user never touched",
+			kf_approx(at_start, 1.0),
+			"Alt+wheel: the clip's FIRST key must still hold its original value, got %v — a gesture rewrote keys the user never touched",
 			at_start,
 		)
 		playhead.frame = 150
 	}
 
-	// --- Alt+middle drag: crop-pan must move the crop where it is sampled
+	// --- Alt+middle drag: pan must move the PAN lanes where they are sampled,
+	// on both axes, and must not write crop or the transform.
 	{
 		cl := geom_key_fixture()
+		kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_X), 0, 0.0)
+		kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_X), 300, 0.0)
+		kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_Y), 0, 0.0)
+		kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_Y), 300, 0.0)
+		before_x, _ := geom_key_sample(cl, .Pan_X)
 		before_l, _ := geom_key_sample(cl, .Crop_L)
-		crop_viewport_pan(cl, 60, 0)
+		clip_pan_by(cl, 60, 40)
+		after_x, _ := geom_key_sample(cl, .Pan_X)
+		after_y, _ := geom_key_sample(cl, .Pan_Y)
+		geom_key_check(
+			abs(after_x - before_x) > 0.0001,
+			"Alt+drag: pan.x must change where it is sampled (was %v, now %v) — the pan landed only in the resting field",
+			before_x, after_x,
+		)
+		geom_key_check(
+			abs(after_y) > 0.0001,
+			"Alt+drag: a diagonal pan must move pan.y too (got %v)",
+			after_y,
+		)
 		after_l, _ := geom_key_sample(cl, .Crop_L)
 		geom_key_check(
-			abs(after_l - before_l) > 0.0001,
-			"Alt+drag: crop.l must change where it is sampled (was %v, now %v) — the pan landed only in the resting field",
-			before_l,
-			after_l,
+			kf_approx(after_l, before_l),
+			"Alt+drag must not write crop.l (was %v, now %v)",
+			before_l, after_l,
+		)
+		after_tx, _ := geom_key_sample(cl, .Trans_X)
+		geom_key_check(
+			kf_approx(after_tx, 960),
+			"Alt+drag must not write transform.x (got %v)",
+			after_tx,
 		)
 		playhead.frame = 299
-		off_span, _ := geom_key_sample(cl, .Crop_L)
+		off_span, _ := geom_key_sample(cl, .Pan_X)
 		geom_key_check(
-			abs(off_span - 0.05) > 0.0001,
+			abs(off_span) > 0.0001,
 			"Alt+drag: the neighbouring key must be reached by the curve (got %v)",
 			off_span,
 		)
@@ -284,11 +346,9 @@ geom_key_probe_run :: proc() -> int {
 			session_trk_erase(&cl.keyframe_tracks, ti)
 		}
 		geom_key_check(cl.keyframe_tracks.n == 0, "fixture: the un-keyed case must start with no tracks")
-		cl.crop_l = 0.1
-		cl.crop_r = 0.1
-		before, _ := geom_key_sample(cl, .Crop_L)
-		crop_viewport_pan(cl, 60, 0)
-		after, _ := geom_key_sample(cl, .Crop_L)
+		before, _ := geom_key_sample(cl, .Pan_X)
+		clip_pan_by(cl, 60, 0)
+		after, _ := geom_key_sample(cl, .Pan_X)
 		geom_key_check(
 			abs(after - before) > 0.0001,
 			"un-keyed clip: Alt+drag must still move the value the preview shows (was %v, now %v)",
@@ -301,9 +361,9 @@ geom_key_probe_run :: proc() -> int {
 			cl.keyframe_tracks.n,
 		)
 		geom_key_check(
-			abs(cl.crop_l - 0.1) > 0.0001,
-			"un-keyed clip: Alt+drag must write the resting crop_l, got %v",
-			cl.crop_l,
+			abs(cl.pan_x) > 0.0001,
+			"un-keyed clip: Alt+drag must write the resting pan_x, got %v",
+			cl.pan_x,
 		)
 	}
 
@@ -317,9 +377,9 @@ geom_key_probe_run :: proc() -> int {
 	{
 		cl := geom_key_fixture()
 		editor_flags.auto_keyframe = false
-		before, _ := geom_key_sample(cl, .Crop_L)
-		crop_viewport_pan(cl, 60, 0)
-		after, _ := geom_key_sample(cl, .Crop_L)
+		before, _ := geom_key_sample(cl, .Pan_X)
+		clip_pan_by(cl, 60, 0)
+		after, _ := geom_key_sample(cl, .Pan_X)
 		geom_key_check(
 			abs(after - before) > 0.0001,
 			"auto-key off: a keyed clip's visible value must still respond to Alt+drag (was %v, now %v)",
@@ -548,7 +608,7 @@ geom_key_probe_run :: proc() -> int {
 		geom_key_check(
 			kf_approx(cl.crop_l, 0.4),
 			"an off-clip edit must still be VISIBLE, as the resting write (got %v)",
-			cl.crop_l,
+			cl.pan_x,
 		)
 		geom_key_check(
 			clip_geom_key_modified(cl, .Crop_L),
@@ -634,18 +694,22 @@ geom_key_probe_run :: proc() -> int {
 	{
 		cl := geom_key_unkeyed_fixture()
 
-		crop_viewport_pan(cl, 60, 0)
+		clip_pan_by(cl, 60, 0)
 		geom_key_check(
-			clip_geom_key_modified(cl, .Crop_L),
-			"an Alt+drag on an un-keyed clip must leave crop.l pending for the button",
+			clip_geom_key_modified(cl, .Pan_X),
+			"an Alt+drag on an un-keyed clip must leave pan.x pending for the button",
 		)
 		geom_key_check(
-			clip_geom_key_modified(cl, .Crop_R),
-			"an Alt+drag on an un-keyed clip must leave crop.r pending for the button",
+			!clip_geom_key_modified(cl, .Pan_Y),
+			"a purely horizontal pan must not leave pan.y pending",
 		)
 		geom_key_check(
-			!clip_geom_key_modified(cl, .Trans_X) || true,
-			"pending set is per-lane",
+			!clip_geom_key_modified(cl, .Trans_X),
+			"a pan must not leave the transform pending -- it writes no transform",
+		)
+		geom_key_check(
+			!clip_geom_key_modified(cl, .Crop_L),
+			"a pan must not leave crop.l pending -- it writes no crop",
 		)
 		// The crop lanes are what the pan touched; the button must key those
 		// and nothing else, so a later "keyframe all" cannot silently animate
@@ -656,68 +720,40 @@ geom_key_probe_run :: proc() -> int {
 			!clip_geom_any_modified(cl),
 			"keying every pending lane must clear the pending set",
 		)
-		// One crop pan writes all four crop edges and both transform lanes
-		// (preview_transform.odin), and clip_geom_set marks a lane pending
-		// whenever it is written, so the pending set is all six. Grouped, that
-		// is TWO section keys, not six lane tracks: the pan touched whole
-		// structs, so the animation reads back as the whole structs it came
-		// from.
+		// The pan writes exactly ONE lane. It used to write six (four crop edges
+		// plus both transforms) to fake the slide, and "key all modified" turned
+		// that into six keys the user never asked for -- animating crop AND
+		// transform because the gesture could not express itself in one
+		// property. That coupling is gone, so the pending set is one lane.
 		geom_key_check(
-			n == 6,
-			"a crop pan leaves six lanes pending, so six lanes must be keyed (got %d)",
+			n == 1,
+			"a horizontal pan writes one lane, so one lane must be keyed (got %d)",
 			n,
 		)
+		geom_key_check(
+			kf_track_index(cl^, "pan.x") >= 0,
+			"the panned lane must be keyed",
+		)
 		for name in ([]string{
-			"crop.l", "crop.r", "crop.t", "crop.b", "transform.x", "transform.y",
+			"crop.l", "crop.r", "crop.t", "crop.b", "transform.x", "transform.y", "pan.y",
 		}) {
 			geom_key_check(
 				kf_track_index(cl^, name) < 0,
-				"a grouped key must not mint a per-lane track (%q exists)",
+				"a pan must not mint a track for a lane it did not touch (%q exists)",
 				name,
 			)
 		}
-		// The expected mask and lane 0 come from kf_geom_sections, the same
-		// table the writer reads, so this case cannot drift into asserting a
-		// hand-copied lane list.
-		defs := kf_geom_sections
+		// No section may exist for the groups the pan no longer touches. This is
+		// the observable consequence of the decoupling: before, the pan wrote whole
+		// crop and transform structs, so "key all modified" minted two PACKED
+		// section knots the user never asked for. Pan writes one scalar lane, so
+		// there is nothing to group.
 		for name in ([]string{"crop", "transform"}) {
-			sec_index, is_sec := kf_geom_section_index(name)
-			geom_key_check(is_sec, "probe: %q must be a real section", name)
-			if !is_sec {
-				continue
-			}
-			ti := kf_track_index(cl^, name)
 			geom_key_check(
-				ti >= 0,
-				"a grouped key must create the %q section track, not per-lane tracks",
+				kf_track_index(cl^, name) < 0,
+				"a pan must not create the %q section (it writes no crop or transform)",
 				name,
 			)
-			if ti < 0 {
-				continue
-			}
-			keys := session_trk_view(cl.keyframe_tracks,ti).keys
-			geom_key_check(
-				keys.n == 1,
-				"one gesture at one playhead => one key on the section (got %d)",
-				keys.n,
-			)
-			if keys.n == 1 {
-				if v, is_pack := session_kf_at(keys,0).value.([KF_PACK_MAX]f32); is_pack {
-					geom_key_check(
-						session_kf_at(keys,0).mask == kf_geom_full_mask(name),
-						"the %q knot must key every lane the pan wrote (mask %d)",
-						name,
-					session_kf_at(keys,0).mask,
-					)
-					geom_key_check(
-						kf_approx(v[0], clip_geom_get(cl, defs[sec_index].lanes[0])),
-						"the %q knot must hold lane 0's value ON SCREEN, not a stale slot",
-						name,
-					)
-				} else {
-					geom_key_check(false, "the %q section key must be packed, not scalar", name)
-				}
-			}
 		}
 		// Scale and opacity were never touched by a pan, so the shortcut must
 		// not have keyed them — keying either would start animating a property
@@ -1036,6 +1072,312 @@ geom_key_probe_run :: proc() -> int {
 			!kf_approx(at_rest_key.width, moved.width),
 			"a new scale key under the playhead must resize the box (was %v, now %v)",
 			at_rest_key.width, moved.width,
+		)
+	}
+
+	// --- THE INVARIANT: zoom and pan change what the clip SHOWS and never where
+	// it is. This is what the old seven-write gestures had to fake, by computing a
+	// new box center under a new crop asymmetry and re-anchoring the transform
+	// against it. Asserted as a property over a sweep of values rather than one
+	// baked rectangle, so it holds for any transform, scale and canvas.
+	//
+	// Before this change a zoom at 2x on a clip with a symmetric crop produced the
+	// right pixels only because the arithmetic compensated; any drift in that
+	// compensation moved the box. Now the box is derived from the window and
+	// transform/scale are never written, so "the box does not move" is structural
+	// and this check can only fail if someone reintroduces the coupling.
+	{
+		canvas := probe_canvas()
+		box_stable := true
+		for &z in ([]f32{1.0, 1.5, 2.0, 4.0}) {
+			for &px in ([]f32{-0.3, 0.0, 0.25}) {
+				for &py in ([]f32{-0.2, 0.0, 0.4}) {
+					cl := geom_key_fixture()
+					geom: Geom_Sample
+					for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+						geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+					}
+					geom[int(Render_Geom_Prop.Zoom)] = z
+					geom[int(Render_Geom_Prop.Pan_X)] = px
+					geom[int(Render_Geom_Prop.Pan_Y)] = py
+					ref: clay.BoundingBox
+
+					// The same clip with zoom and pan actually WRITTEN, which is
+					// the path a gesture takes.
+					cl2 := geom_key_fixture()
+					for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+						clip_geom_set(cl2, Render_Geom_Prop(pi), geom[pi])
+					}
+					got := clip_image_bounds(canvas, cl2)
+
+					// The REFERENCE is the SAME clip with zoom and pan neutralised --
+					// not a second computation of the zoomed one. An earlier draft of
+					// this case built the reference by calling clip_image_bounds_geom
+					// with the zoomed sample, which is the same path under test, so it
+					// agreed by construction and passed while the box was moving a
+					// fifth of its width on a quarter pan. A reference that shares the
+					// code under test cannot see that code's bug.
+					base := geom
+					base[int(Render_Geom_Prop.Zoom)] = 1.0
+					base[int(Render_Geom_Prop.Pan_X)] = 0.0
+					base[int(Render_Geom_Prop.Pan_Y)] = 0.0
+					ref = clip_image_bounds_geom(canvas, .Video, base, cl2.source_w, cl2.source_h)
+
+					if abs(got.x - ref.x) > 0.01 || abs(got.y - ref.y) > 0.01 {
+						box_stable = false
+						fmt.printf(
+							"[geom-key-probe] FAIL zoom=%.2f pan=(%.2f,%.2f): box moved (%.2f,%.2f) vs (%.2f,%.2f)\n",
+							z, px, py, got.x, got.y, ref.x, ref.y,
+						)
+					}
+				}
+			}
+		}
+		geom_key_check(box_stable, "zoom and pan must not move the clip's box")
+	}
+
+	// --- zoom must actually change the window, or the invariant above would pass
+	// for a no-op. Asserted on the WINDOW, not the pixels: the box is unchanged by
+	// design, so the only observable effect is a wider or narrower window.
+	//
+	// Source_Window carries INSETS (l is the trim off the left EDGE, not the left
+	// edge's coordinate), so window width is 1 - l - r. Reading `r - l` as a width
+	// is the mistake an earlier draft of this case made, and it fails for the
+	// unzoomed case only because the two insets happen to be equal there.
+	win_w :: proc(w: Source_Window) -> f32 { return 1 - w.l - w.r }
+	win_h :: proc(w: Source_Window) -> f32 { return 1 - w.t - w.b }
+	{
+		geom: Geom_Sample
+		geom[int(Render_Geom_Prop.Zoom)] = 1.0
+		full := geom_source_window(geom)
+		geom[int(Render_Geom_Prop.Zoom)] = 2.0
+		half := geom_source_window(geom)
+		geom_key_check(
+			kf_approx(win_w(half), win_w(full) / 2),
+			"zoom 2 must halve the window width (%v -> %v)",
+			win_w(full), win_w(half),
+		)
+		// Uniform: both axes share the factor, or the box's aspect would change.
+		geom_key_check(
+			kf_approx(win_h(half), win_h(full) / 2),
+			"zoom must be uniform across axes (%v -> %v)",
+			win_h(full), win_h(half),
+		)
+		// Centered: a centered window stays centered under zoom.
+		geom_key_check(
+			kf_approx((1 + half.l - half.r) / 2, (1 + full.l - full.r) / 2),
+			"zoom must not move the window's center",
+		)
+		// Pan slides the WINDOW by a fraction of its OWN width, toward the source's
+		// left for a positive value — so the CONTENT travels the other way, which is
+		// what makes a rightward drag move the image rightward.
+		geom[int(Render_Geom_Prop.Zoom)] = 2.0
+		geom[int(Render_Geom_Prop.Pan_X)] = 0.0
+		before := geom_source_window(geom)
+		geom[int(Render_Geom_Prop.Pan_X)] = 0.25
+		after := geom_source_window(geom)
+		geom_key_check(
+			kf_approx(before.l - after.l, 0.25 * win_w(before)),
+			"pan 0.25 must slide the window left by a quarter of its width (%v of %v)",
+			before.l - after.l, win_w(before),
+		)
+		// Clamped: a pan far past the border pins at the edge instead of running
+		// the window off the source, where crop_src_rect would ask for a rect it
+		// cannot address.
+		geom[int(Render_Geom_Prop.Pan_X)] = 50.0
+		far := geom_source_window(geom)
+		geom_key_check(
+			far.l >= -0.0001 && far.r <= 1.0001,
+			"a pan past the border must stay inside the source (l=%v r=%v)",
+			far.l, far.r,
+		)
+		geom_key_check(
+			kf_approx(win_w(far), win_w(before)),
+			"a far pan pins to an edge rather than resizing the window (%v vs %v)",
+			win_w(far), win_w(before),
+		)
+	}
+
+	// --- the pan gesture's DIRECTION. It regressed once: the sign was read as
+	// "the window goes the other way", which is true of the window and not of the
+	// thing the user is dragging, so a rightward drag moved the CONTENT leftward.
+	// Nothing above catches it — those cases test the resolver, not the gesture —
+	// so the gesture is asserted end to end: drag right, and the window the clip
+	// samples must move toward the source's LEFT.
+	{
+		cl := geom_key_fixture()
+		// Zoom in first, or the window fills the source and any pan is clamped to
+		// no-op — which would make this case pass for the wrong reason.
+		geom_key_check(
+			clip_zoom_by(cl, 2.0, true),
+			"fixture: the pan-direction case needs room to pan",
+		)
+		geom: Geom_Sample
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		before := geom_source_window(geom)
+		clip_pan_by(cl, 120, 0) // drag RIGHT
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		after := geom_source_window(geom)
+		geom_key_check(
+			after.l < before.l,
+			"dragging right must move the sampled window toward the source's LEFT (l %v -> %v), so the content moves right with the cursor",
+			before.l, after.l,
+		)
+		// The content must track the CURSOR one-for-one, not merely move the right
+		// way. Measured as SCREEN motion of a fixed source point, because that is
+		// the quantity the user sees and the only one that can catch a zoom-
+		// dependent pan speed:
+		//
+		//	sx(u) = (u - nl)/nw * cw     [offset from the box's left edge]
+		//
+		// The previous version of this case asserted `(Δnl) * cw == 120`, which is
+		// a source-fraction times a box width — algebraically 120 at EVERY zoom,
+		// since Δnl = dx/nw and the nw cancels. It asserted a tautology and passed
+		// against the real bug. Anything here must divide by nw to be screen space.
+		cw, _ := clip_full_box_dims(cl, clip_geom_get(cl, .Scale))
+		u: f32 = 0.5 // some source point that is inside the window
+		sx0 := (u - before.l) / win_w(before) * cw
+		sx1 := (u - after.l) / win_w(after) * cw
+		geom_key_check(
+			kf_approx_px(sx1 - sx0, 120),
+			"a 120px drag at zoom %.2f must move the content 120px on screen (got %.2f)",
+			clip_geom_get(cl, .Zoom), sx1 - sx0,
+		)
+		// And the y axis agrees rather than being wired backwards.
+		clip_pan_by(cl, 0, 120) // drag DOWN
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		geom_key_check(
+			geom_source_window(geom).t < after.t,
+			"dragging down must move the sampled window toward the source's TOP (t %v -> %v)",
+			after.t, geom_source_window(geom).t,
+		)
+	}
+
+	// --- pan SPEED must not depend on zoom. Sibling case, never nested inside
+	// another: geom_key_fixture frees the timeline, so a second call invalidates
+	// the first case's `cl`. Nesting these made the y-axis check above read freed
+	// memory — valgrind caught it as 76 contexts of invalid read in clip_pan_by.
+	{
+		cl := geom_key_fixture()
+		geom_key_check(clip_zoom_by(cl, 4.0, true), "fixture: the zoom-invariance case needs a clip")
+		clip_geom_set(cl, .Zoom, 4.0)
+		clip_geom_set(cl, .Pan_X, 0.0)
+		geom: Geom_Sample
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		before := geom_source_window(geom)
+		clip_pan_by(cl, 120, 0)
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		after := geom_source_window(geom)
+		cw, _ := clip_full_box_dims(cl, clip_geom_get(cl, .Scale))
+		u: f32 = 0.5
+		sx0 := (u - before.l) / win_w(before) * cw
+		sx1 := (u - after.l) / win_w(after) * cw
+		geom_key_check(
+			kf_approx_px(sx1 - sx0, 120),
+			"the SAME 120px drag at zoom 4 must move the content 120px (got %.2f) — pan speed must not scale with zoom",
+			sx1 - sx0,
+		)
+	}
+
+	// --- the pan VALUE must stay inside what the window can show. Dragging into
+	// an edge used to pin the content while the lane kept climbing, so the
+	// number ran away from the picture and a key taken from it recorded a pan the
+	// clip was never showing. Asserted as: after a drag far past any border, the
+	// stored lane is a value geom_source_window does not clamp, and re-panning
+	// from there moves the content again.
+	{
+		cl := geom_key_fixture()
+		geom_key_check(clip_zoom_by(cl, 2.0, true), "fixture: the pan-bound case needs room")
+		geom: Geom_Sample
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		r := geom_pan_range(geom)
+		geom_key_check(
+			r.x_hi > 0 && r.x_lo < 0,
+			"fixture: a zoomed clip must be able to pan both ways (%v..%v)",
+			r.x_lo, r.x_hi,
+		)
+		// Drag far past the right-hand border, in several steps, as a real drag does.
+		for _ in 0 ..< 12 {
+			clip_pan_by(cl, 200, 0)
+		}
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		stored := clip_geom_get(cl, .Pan_X)
+		geom_key_check(
+			kf_approx(stored, r.x_hi),
+			"a drag into the border must stop the lane at the achievable limit (%v, limit %v)",
+			stored, r.x_hi,
+		)
+		// And the stored value must be one the window does NOT clamp — a lane
+		// parked on a clamped value is the original bug, not a fixed version of it.
+		// At x_hi the window sits at 0 (the far-left of the source), which is the
+		// bound the drag reached.
+		p := source_window_parts(geom)
+		unclamped := p.cx - p.nw * 0.5 - stored * p.nw
+		geom_key_check(
+			unclamped >= -0.0001 && unclamped <= 1 - p.nw + 0.0001,
+			"the stored pan must land inside the window's clamp (%v of 0..%v)",
+			unclamped, 1 - p.nw,
+		)
+		geom_key_check(
+			kf_approx(unclamped, 0),
+			"the x_hi bound must put the window at the source's left edge (got %v)",
+			unclamped,
+		)
+		// Panning back must immediately move the content again — the signature of a
+		// BOUND rather than a dead end. Dragging left moves the content left, so
+		// the window's left edge moves RIGHT.
+		w0 := geom_source_window(geom)
+		clip_pan_by(cl, -200, 0)
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		w1 := geom_source_window(geom)
+		geom_key_check(
+			w1.l > w0.l,
+			"panning back from the bound must move the content again (%v -> %v)",
+			w0.l, w1.l,
+		)
+		// The y axis is bounded the same way.
+		for _ in 0 ..< 12 {
+			clip_pan_by(cl, 0, 200)
+		}
+		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+			geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
+		}
+		geom_key_check(
+			kf_approx(clip_geom_get(cl, .Pan_Y), geom_pan_range(geom).y_hi),
+			"the y lane must stop at its own limit (got %v)",
+			clip_geom_get(cl, .Pan_Y),
+		)
+	}
+
+	// --- zoom of ZERO must mean "no magnification", not "infinitely magnified".
+	// A bare Clip{} carries 0, and geom_key_fixture is built from Clip{}: if the
+	// resolver divided by it the window would collapse to Zoom_Floor and every
+	// un-keyed clip would open zoomed to its limit.
+	{
+		geom: Geom_Sample // all zero, i.e. Clip{}'s geometry
+		geom[int(Render_Geom_Prop.Crop_L)] = 0.1
+		geom[int(Render_Geom_Prop.Crop_R)] = 0.1
+		w := geom_source_window(geom)
+		geom_key_check(
+			kf_approx(1 - w.l - w.r, 0.8),
+			"a zero zoom must leave the crop window alone (width %v)",
+			1 - w.l - w.r,
 		)
 	}
 

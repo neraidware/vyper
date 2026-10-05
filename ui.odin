@@ -54,6 +54,10 @@ UI_Text_Buffers :: struct {
 	r:           [64]u8,
 	t:           [64]u8,
 	b:           [64]u8,
+	// zoom and the two pan axes, formatted as percents for the inspector row.
+	z:           [64]u8,
+	px:          [64]u8,
+	py:          [64]u8,
 	out:         [128]u8,
 	rate:        [64]u8,
 	hint:        [512]u8,
@@ -520,6 +524,32 @@ group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
 	}
 }
 
+// caption_row is a group caption with NO keyframe diamond, for a property group
+// that has no section to key as a unit. Zoom and Pan are that: pan.x and pan.y
+// are independent (a horizontal slide is not half of a vertical one), so a single
+// diamond would either key a combination nobody asked for or need a packed
+// section that duplicates the lanes it groups.
+//
+// Passing a button id to group_caption_row and simply not handling it would draw a
+// diamond that does nothing when clicked, which is worse than having none.
+caption_row :: proc(caption_id, spacer_id, label: string) {
+	if clay.UI(clay.ID(caption_id))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+				layoutDirection = .LeftToRight,
+				childGap = BUTTON_ROW_GAP,
+				childAlignment = {x = .Left, y = .Center},
+			},
+		},
+	) {
+		clay.Text(label, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL})
+		if clay.UI(clay.ID(spacer_id))( // stretch: keeps the caption flush left
+			{layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}}},
+		) {}
+	}
+}
+
 // project_card is the "Project" inspector card: canvas resolution presets,
 // orientation, frame rate, and the render range. These controls are always
 // reachable (not gated behind an empty timeline).
@@ -938,6 +968,42 @@ clip_card :: proc() {
 				kf_add_button("KfAddCropT")
 				prop_field("PropCropB", "B", b_val, edit_state.field == .Crop_B)
 				kf_add_button("KfAddCropB")
+			}
+			// Zoom and Pan: the content window's magnification and offset. Their own
+			// row rather than more crop fields, because they are a different
+			// operation — crop trims the box edges and reveals background, these
+			// change what the box SHOWS while the box stays exactly put.
+			caption_row("ZoomPanCaption", "ZoomPanCaptionSpacer", "Zoom / Pan")
+			z_buf := ui_text.z[:]
+			z_val := fmt.bprintf(z_buf[:], "%.0f%%", clip_geom_get(cl, .Zoom) * 100)
+			if edit_state.field == .Zoom {
+				z_val = string(edit_state.chars[:edit_state.len])
+			}
+			px_buf := ui_text.px[:]
+			px_val := fmt.bprintf(px_buf[:], "%.0f%%", clip_geom_get(cl, .Pan_X) * 100)
+			if edit_state.field == .Pan_X {
+				px_val = string(edit_state.chars[:edit_state.len])
+			}
+			py_buf := ui_text.py[:]
+			py_val := fmt.bprintf(py_buf[:], "%.0f%%", clip_geom_get(cl, .Pan_Y) * 100)
+			if edit_state.field == .Pan_Y {
+				py_val = string(edit_state.chars[:edit_state.len])
+			}
+			if clay.UI(clay.ID("ZoomPanRow"))(
+			{
+				layout = {
+					sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+					layoutDirection = .LeftToRight,
+					childGap = BUTTON_ROW_GAP,
+				},
+			},
+			) {
+				prop_field("PropFieldZoom", "Z", z_val, edit_state.field == .Zoom)
+				kf_add_button("KfAddZoom")
+				prop_field("PropFieldPanX", "X", px_val, edit_state.field == .Pan_X)
+				kf_add_button("KfAddPanX")
+				prop_field("PropFieldPanY", "Y", py_val, edit_state.field == .Pan_Y)
+				kf_add_button("KfAddPanY")
 			}
 			geom_key_all_modified_row(cl)
 		} else {

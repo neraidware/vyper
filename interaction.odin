@@ -76,7 +76,7 @@ interaction_pre_build :: proc(inp: Mouse_Input) {
 			canvas := preview_canvas(pb)
 			lcx, lcy := pixel_to_project_unclamped(canvas, crop_pan.last_x, crop_pan.last_y)
 			ccx, ccy := pixel_to_project_unclamped(canvas, inp.x, inp.y)
-			crop_viewport_pan(sel, ccx - lcx, ccy - lcy)
+			clip_pan_by(sel, ccx - lcx, ccy - lcy)
 			crop_pan.last_x = inp.x
 			crop_pan.last_y = inp.y
 		} else {
@@ -333,6 +333,23 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			clip_geom_add_group_key(sel, "crop")
 			return true
 		}
+		// Zoom and Pan get per-lane diamonds only, no group caption diamond:
+		// they group with no section (kf_geom_sections has no "zoom" section),
+		// for the same reason Opacity has none -- there is no packed form to
+		// key together, because pan.x and pan.y are genuinely independent
+		// (a horizontal slide is not half of a vertical one).
+		if clay.PointerOver(clay.ID("KfAddZoom")) {
+			clip_geom_add_lane_key(sel, .Zoom)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddPanX")) {
+			clip_geom_add_lane_key(sel, .Pan_X)
+			return true
+		}
+		if clay.PointerOver(clay.ID("KfAddPanY")) {
+			clip_geom_add_lane_key(sel, .Pan_Y)
+			return true
+		}
 		if clay.PointerOver(clay.ID("KfAddY")) {
 			clip_geom_add_lane_key(sel, .Trans_Y)
 			return true
@@ -411,6 +428,18 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		}
 		if clay.PointerOver(clay.ID("PropCropB")) {
 			edit_begin(.Crop_B, clip_geom_get(sel, .Crop_B) * 100)
+			return true
+		}
+		if clay.PointerOver(clay.ID("PropFieldZoom")) {
+			edit_begin(.Zoom, clip_geom_get(sel, .Zoom) * 100)
+			return true
+		}
+		if clay.PointerOver(clay.ID("PropFieldPanX")) {
+			edit_begin(.Pan_X, clip_geom_get(sel, .Pan_X) * 100)
+			return true
+		}
+		if clay.PointerOver(clay.ID("PropFieldPanY")) {
+			edit_begin(.Pan_Y, clip_geom_get(sel, .Pan_Y) * 100)
 			return true
 		}
 		return false

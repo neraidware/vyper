@@ -432,7 +432,7 @@ corner_snap_scale :: proc(
 // centered). The cropped source fills it, so it matches the output.
 //
 // Every input is read with clip_geom_get, never off the resting fields, for the
-// reason crop_viewport_zoom below documents: on a clip whose geometry is keyed
+// reason clip_zoom_by documents: on a clip whose geometry is keyed
 // the resting fields are not what the preview is drawing. The image itself is
 // drawn from the sampled preview slot, so a bounds box computed from resting
 // state disagrees with the pixels inside it — and this box is what the
@@ -516,16 +516,12 @@ clip_image_bounds_geom :: proc(
 	// way. The extent is derived from the edges rather than recomputed as
 	// sw*(1-crop_l-crop_r): the export rounds these edges, and a width formed
 	// any other way can differ from it by a pixel.
-	l, t, r, b := cropped_box_edges(
-		cx,
-		cy,
-		sw,
-		sh,
-		geom[int(Render_Geom_Prop.Crop_L)],
-		geom[int(Render_Geom_Prop.Crop_R)],
-		geom[int(Render_Geom_Prop.Crop_T)],
-		geom[int(Render_Geom_Prop.Crop_B)],
-	)
+	// The BOX insets — crop only. Zoom and pan select CONTENT and must never
+	// reach here: cropped_box_edges reads an inset as a box trim, so an
+	// asymmetric pair moves the box, and both zoom-about-an-offset-crop and pan
+	// produce exactly that. See geom_box_insets vs geom_content_insets.
+	cl, cr, ct, cb := geom_box_insets(geom)
+	l, t, r, b := cropped_box_edges(cx, cy, sw, sh, cl, cr, ct, cb)
 	return {x = l, y = t, width = r - l, height = b - t}
 }
 
@@ -534,144 +530,123 @@ clip_image_bounds_geom :: proc(
 // the render math divides by zero.
 CROP_MIN_VISIBLE_FRAC :: 0.05
 
-// crop_viewport_zoom magnifies or reduces the selected clip's source window
-// about its box center while the visible (cropped) box keeps its exact position
-// and size: the clip's uniform scale absorbs the box-size change the crop
-// insets would otherwise cause, and the transform re-anchors the crop-symmetric
-// center offset. zoom > 1 magnifies content; zoom < 1 reveals more. With
-// apply=false it only reports whether the edit would change anything (the
-// wheel-at-floor no-op guard), so the caller can capture the pre-edit state
-// before mutating.
+// clip_zoom_by multiplies the selected clip's Zoom lane by `factor`, so
+// factor > 1 magnifies the content and factor < 1 reveals more of the source.
+//
+// ONE lane, ONE write. This gesture used to write seven fields across three
+// properties — the four crop insets, Scale, and both transforms — recomputing the
+// box center each time to keep the visible box exactly where it was. That
+// compensation WAS the hack: seven coupled values had to stay in step by hand,
+// any one of them drifting moved the box a pixel, and it is why the gesture
+// needed a probe of its own (TODO.md Active 3, geom_key_probe's keyed-drag case).
+// Now the box is untouched by construction, because Zoom is resolved INSIDE the
+// window and the box is derived from the window's center.
 //
 // Geometry is read with clip_geom_get and written with clip_geom_set, never off
-// the resting fields directly: on a clip whose crop is keyed the resting fields
-// are not what the preview is showing, so computing from them and writing to
-// them both reads and stores a value the sampler ignores. Reads and writes go
-// through the same accessor for the same reason — the gesture operates on what
-// is on screen.
-crop_viewport_zoom :: proc(clip: ^Clip, zoom: f32, apply: bool) -> bool {
-	if clip.kind == .Text || clip.source_w <= 0 {
+// the resting fields: on a clip whose zoom is keyed the resting field is not
+// what the preview is showing, so computing from it and writing to it both reads
+// and stores a value the sampler ignores.
+//
+// With apply=false it only reports whether the edit would change anything (the
+// wheel-at-floor no-op guard), so the caller can capture the pre-edit state
+// before mutating.
+clip_zoom_by :: proc(clip: ^Clip, factor: f32, apply: bool) -> bool {
+	if clip.kind == .Text || clip.source_w <= 0 || !(factor > 0.0) {
 		return false
 	}
-	cur_l := clip_geom_get(clip, .Crop_L)
-	cur_r := clip_geom_get(clip, .Crop_R)
-	cur_t := clip_geom_get(clip, .Crop_T)
-	cur_b := clip_geom_get(clip, .Crop_B)
-	cur_s := clip_geom_get(clip, .Scale)
-	cur_x := clip_geom_get(clip, .Trans_X)
-	cur_y := clip_geom_get(clip, .Trans_Y)
-	fx := 1 - cur_l - cur_r
-	fy := 1 - cur_t - cur_b
-	if fx <= 0 || fy <= 0 {
-		return false
+	cur := clip_geom_get(clip, .Zoom)
+	// The zero value means "no magnification" (geom_source_window), so a bare
+	// Clip{} zooms from 1 rather than from 0 — which would divide the window to
+	// nothing on the first wheel tick.
+	if !(cur > 0.0) {
+		cur = 1.0
 	}
-	// The window may grow until it fills the source entirely (never beyond: an
-	// edge coming out of the frame would clamp and the real window would
-	// diverge from the ratio the scale compensation assumes). Both axes share
-	// one k per step, so box width and height are scaled by the same factor and
-	// the box keeps its size. Zoom-in is floored so the window never collapses
-	// below CROP_MIN_VISIBLE_FRAC.
-	k := min(1 / zoom, 1 / fx, 1 / fy)
-	k = max(k, CROP_MIN_VISIBLE_FRAC / max(fx, fy))
-	if k == 1 {
+	next := cur * factor
+	// Clamp rather than reject: the window shrinks as 1/zoom, so an unbounded
+	// zoom asks the source rect for a region below one pixel. The far end is
+	// bounded by the resolver, which will not grow the window past the frame.
+	if next <= 0.0 || next == cur {
 		return false
 	}
 	if !apply {
 		return true
 	}
-	cw0, ch0 := clip_full_box_dims(clip, cur_s)
-	wx := fx * k
-	wy := fy * k
-	// Place each axis' new window at the current center when an edge still has
-	// room; when the growth step would cross a source border the window slides
-	// off-center instead, so zooming out past a panned pin keeps revealing
-	// (toward the full frame) rather than stopping.
-	hs := clamp((cur_l + 1 - cur_r) * 0.5 - wx * 0.5, 0, 1 - wx)
-	vs := clamp((cur_t + 1 - cur_b) * 0.5 - wy * 0.5, 0, 1 - wy)
-	sl := cur_l - cur_r
-	st := cur_t - cur_b
-	vis_cx := cur_x + sl * cw0 / 2
-	vis_cy := cur_y + st * ch0 / 2
-	// The new scale has to be known before the box dims that re-anchor the
-	// transform, so it is computed here rather than written early: a keyed
-	// clip's scale write lands on a keyframe, and reading it back through
-	// clip_geom_get mid-gesture would be correct but indirect.
-	next_s := clamp(cur_s / k, 0.05, 100.0)
-	next_l := hs
-	next_r := 1 - hs - wx
-	next_t := vs
-	next_b := 1 - vs - wy
-	cw1, ch1 := clip_full_box_dims(clip, next_s)
-	next_x := vis_cx - (next_l - next_r) * cw1 / 2
-	next_y := vis_cy - (next_t - next_b) * ch1 / 2
-	// Seven writes, all routed: a keyed clip records the whole gesture as
-	// keys at the playhead, an un-keyed one records resting values and marks
-	// them pending so the inspector can offer to key them.
-	clip_geom_set(clip, .Crop_L, next_l)
-	clip_geom_set(clip, .Crop_R, next_r)
-	clip_geom_set(clip, .Crop_T, next_t)
-	clip_geom_set(clip, .Crop_B, next_b)
-	clip_geom_set(clip, .Scale, next_s)
-	clip_geom_set(clip, .Trans_X, next_x)
-	clip_geom_set(clip, .Trans_Y, next_y)
+	clip_geom_set(clip, .Zoom, next)
 	return true
 }
 
-// crop_viewport_pan slides the source window inside the clip while the visible
-// box stays exactly where it is on the canvas. dx/dy are project-space deltas
-// in the grab-the-content direction (drag right -> content shifts right), so
-// the window edges move opposite the pointer. The window is clamped as a whole
-// (length invariant): once either edge reaches the source border, further pan
-// pins the window there instead of cropping the region smaller.
+// clip_pan_by slides the clip's content by a project-space delta, leaving the
+// box exactly where it is. dx/dy are in the grab-the-content direction (drag
+// right -> content shifts right), matching what the pointer does.
 //
-// Routed through clip_geom_get / clip_geom_set for the same reason as
-// crop_viewport_zoom above: on a keyed clip the resting fields are not what is
-// on screen, so both the arithmetic and the store have to go through the
-// playhead's value.
-crop_viewport_pan :: proc(clip: ^Clip, dx, dy: f32) {
+// Writes the two Pan lanes and nothing else. The old gesture rewrote all four
+// crop insets plus both transforms to achieve the same slide; see
+// clip_zoom_by for why that coupling was the defect.
+//
+// The delta is converted to pan units — a fraction of the ZOOMED window's own
+// size — so the same pointer travel moves the same visual distance regardless of
+// how far the clip is zoomed, and a zoom that lands mid-drag does not make the
+// pan jump.
+clip_pan_by :: proc(clip: ^Clip, dx, dy: f32) {
 	if clip.kind == .Text || clip.source_w <= 0 || (dx == 0 && dy == 0) {
 		return
 	}
-	cur_l := clip_geom_get(clip, .Crop_L)
-	cur_r := clip_geom_get(clip, .Crop_R)
-	cur_t := clip_geom_get(clip, .Crop_T)
-	cur_b := clip_geom_get(clip, .Crop_B)
-	cur_s := clip_geom_get(clip, .Scale)
-	cur_x := clip_geom_get(clip, .Trans_X)
-	cur_y := clip_geom_get(clip, .Trans_Y)
-	cw, ch := clip_full_box_dims(clip, cur_s)
-	dxn := dx / max(cw, 0.0001)
-	dyn := dy / max(ch, 0.0001)
-	// In normalized source coords the window is [wl, wr] = [l, 1 - r] (and
-	// [wt, wb] = [t, 1 - b]): its length is invariant under translation, so
-	// clamping the leading edge to [0, 1-window] keeps both edges on-frame.
-	wl := cur_l - dxn
-	wr := 1 - cur_r - dxn
-	w := wr - wl
-	wl = clamp(wl, 0, 1 - w)
-	wr = wl + w
-	wt := cur_t - dyn
-	wb := 1 - cur_b - dyn
-	h := wb - wt
-	wt = clamp(wt, 0, 1 - h)
-	wb = wt + h
-
-	// The visible box is anchored: the transform re-centers under the new crop
-	// asymmetry so the box nobody is dragging never moves.
-	sl := cur_l - cur_r
-	st := cur_t - cur_b
-	vis_cx := cur_x + sl * cw / 2
-	vis_cy := cur_y + st * ch / 2
-	next_l := wl
-	next_r := 1 - wr
-	next_t := wt
-	next_b := 1 - wb
-	clip_geom_set(clip, .Crop_L, next_l)
-	clip_geom_set(clip, .Crop_R, next_r)
-	clip_geom_set(clip, .Crop_T, next_t)
-	clip_geom_set(clip, .Crop_B, next_b)
-	clip_geom_set(clip, .Trans_X, vis_cx - (next_l - next_r) * cw / 2)
-	clip_geom_set(clip, .Trans_Y, vis_cy - (next_t - next_b) * ch / 2)
+	geom: Geom_Sample
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		geom[pi] = clip_geom_get(clip, Render_Geom_Prop(pi))
+	}
+	cw, ch := clip_full_box_dims(clip, geom[int(Render_Geom_Prop.Scale)])
+	if cw <= 0.0 || ch <= 0.0 {
+		return
+	}
+	// The pointer direction is grab-the-content, the same convention the gesture
+	// had before this property existed: drag right and the CONTENT moves right,
+	// because you are dragging the image rather than sliding a viewport past it.
+	//
+	// So the window moves LEFT, which means pan_x RISES. Pan_x is the window's
+	// offset, not the content's: geom_source_window places the window at
+	// `center - pan*nw`, so a positive pan_x shifts the sampled region toward the
+	// source's left and the content appears to travel right.
+	//
+	// This was inverted once — the negation read as "the drag goes the other way",
+	// which is true of the WINDOW and not of the thing the user is dragging. The
+	// symptom was content sliding opposite the cursor.
+	//
+	// Per-axis, and only when that axis actually moved. Writing a lane its own
+	// current value is not a no-op: clip_geom_set marks every lane it touches
+	// pending, so a purely horizontal drag would leave pan.y pending and "key
+	// all modified" would then mint a key for a value the user never changed --
+	// the "stamps keys nobody asked for" failure clip_geom_drag exists to avoid.
+	// Bounded by what the window can actually show, so the stored value and the
+	// visible window cannot disagree. Clamping in geom_source_window alone was not
+	// enough: it pinned the CONTENT while this kept incrementing the lane, so
+	// dragging into an edge moved a number forever while the picture stayed put —
+	// and the inspector, and any key taken from it, recorded a pan the clip was
+	// never showing. The bound depends on zoom and crop, so it cannot be a
+	// constant here; geom_pan_range derives it from the same parts the window is.
+	//
+	// The divisor is the BOX width, not the sampled WINDOW width, and the two
+	// differ by exactly the zoom and crop factor `nw` — which is the whole bug.
+	// Tracking a fixed source point u through the window:
+	//
+	//	sx(u) = box_x + (u - nl)/nw * cw,  nl = nl0 - pan * nw
+	//	      = const + pan * cw
+	//
+	// so one unit of pan moves the content `cw` project px, INDEPENDENT of nw.
+	// Zoom and crop cancel: they enlarge the source displacement a pan implies,
+	// and the window shrinks by the same factor. Hence `dx / cw`.
+	//
+	// Dividing by the window's width instead (`nw * cw`) made a drag move the
+	// content dx/nw px, so pan speed grew with zoom — 2.2x at zoom 2 over a 10%
+	// crop, 4.4x at zoom 4 — and the content outran the cursor. It was invisible
+	// at zoom 1 uncropped, where nw is exactly 1 and the two divisors coincide,
+	// which is why it read as correct until anything was zoomed.
+	if dx != 0 {
+		clip_geom_set(clip, .Pan_X, clamp_pan_x(geom, clip_geom_get(clip, .Pan_X) + dx / cw))
+	}
+	if dy != 0 {
+		clip_geom_set(clip, .Pan_Y, clamp_pan_y(geom, clip_geom_get(clip, .Pan_Y) + dy / ch))
+	}
 }
 
 // crop_pan_begin captures the pre-pan transform/crop and opens the undo node
@@ -683,13 +658,8 @@ crop_pan_begin :: proc(clip: ^Clip, x, y: f32) {
 	crop_pan.active = true
 	crop_pan.last_x = x
 	crop_pan.last_y = y
-	crop_pan.start_scale = clip_geom_get(clip, .Scale)
-	crop_pan.start_x = clip_geom_get(clip, .Trans_X)
-	crop_pan.start_y = clip_geom_get(clip, .Trans_Y)
-	crop_pan.start_l = clip_geom_get(clip, .Crop_L)
-	crop_pan.start_r = clip_geom_get(clip, .Crop_R)
-	crop_pan.start_t = clip_geom_get(clip, .Crop_T)
-	crop_pan.start_b = clip_geom_get(clip, .Crop_B)
+	crop_pan.start_pan_x = clip_geom_get(clip, .Pan_X)
+	crop_pan.start_pan_y = clip_geom_get(clip, .Pan_Y)
 	undo_begin()
 }
 
@@ -705,13 +675,8 @@ crop_pan_end :: proc() {
 	}
 	crop_pan.active = false
 	if sel, ok := transformable_selected(); ok && sel.kind != .Text {
-		if clip_geom_get(sel, .Scale) != crop_pan.start_scale ||
-		   clip_geom_get(sel, .Trans_X) != crop_pan.start_x ||
-		   clip_geom_get(sel, .Trans_Y) != crop_pan.start_y ||
-		   clip_geom_get(sel, .Crop_L) != crop_pan.start_l ||
-		   clip_geom_get(sel, .Crop_R) != crop_pan.start_r ||
-		   clip_geom_get(sel, .Crop_T) != crop_pan.start_t ||
-		   clip_geom_get(sel, .Crop_B) != crop_pan.start_b {
+		if clip_geom_get(sel, .Pan_X) != crop_pan.start_pan_x ||
+		   clip_geom_get(sel, .Pan_Y) != crop_pan.start_pan_y {
 			undo_push(.Transform, "Pan clip")
 			return
 		}

@@ -528,6 +528,22 @@ Clip :: struct {
 	crop_r:               f32,
 	crop_t:               f32,
 	crop_b:               f32,
+	// Zoom: uniform magnification of the clip's CONTENT, 1 = show the crop
+	// window at its natural size. Above 1 the window shrinks toward the crop
+	// window's center (magnify); below 1 it grows (reveal more of the source),
+	// clamped at the source border. NOT the same as Scale: Scale resizes the
+	// box, Zoom changes what the box shows while the box itself stays exactly
+	// where it is. Uniform across both axes by necessity — a per-axis zoom
+	// would change the box's aspect ratio.
+	zoom:                 f32,
+	// Pan_X/Pan_Y: slide the source window within the source, as a fraction of the
+	// zoomed window's own width/height (0 = centered). Positive pans the WINDOW
+	// left/up, so the content appears to move right/down — a rightward drag moves
+	// the image rightward, which is the grab-the-content convention the gesture had
+	// before this property existed. Clamped so the window stays inside the source.
+	// Orthogonal to crop: crop says HOW MUCH, pan says WHERE.
+	pan_x:                f32,
+	pan_y:                f32,
 	// Opacity: global alpha this clip composites with, 0..1 (1 = fully opaque).
 	// A resting field like scale/gain, not a geometry lane -- it changes how the
 	// clip is blended, not where it sits. Read directly by preview and render.
@@ -554,7 +570,13 @@ Clip :: struct {
 	// edits the user made long ago and never intended to animate. A clip that
 	// needs keys gets them from the button; the file stays a description of
 	// the timeline, not of the session.
-	geom_modified:        u8,
+	//
+	// u16, not u8: the mask is indexed by Render_Geom_Prop, and the Zoom/Pan_X/
+	// Pan_Y lanes took it past eight. The comment at render.odin's Render_Geom_Prop
+	// said a ninth property needed this widened first, which is what happened.
+	// u16 rather than u32 because the enum is u8 and a Clip's size is on the hot
+	// path (one per timeline slot, read by the preview every frame).
+	geom_modified:        u16,
 }
 
 Track :: struct {
@@ -988,6 +1010,12 @@ Edit_Field :: enum {
 	Crop_B,
 	Gain,
 	Opacity,  // clip opacity, edited as a percent
+	// Zoom and Pan: the content window's magnification (edited as a percent, so
+	// 100% is the crop window at natural size) and its per-axis offset (also a
+	// percent of the window, so 0 is centered).
+	Zoom,
+	Pan_X,
+	Pan_Y,
 	Kf_Value, // selected keyframe's value (Clip inspector keyframe readout)
 }
 
@@ -1503,21 +1531,21 @@ Handle_Drag :: struct {
 }
 handle_drag: Handle_Drag = {kind = .None}
 
-// Crop_Pan drives the Alt+Middle crop-pan gesture (crop_viewport_pan): the
-// source window slides inside a stationary visible box. Every start_* field is
-// the pre-gesture state the release step compares against to decide between
-// committing a "Pan clip" node and discarding a no-move press (undo_cancel).
+// Crop_Pan drives the Alt+Middle pan gesture (clip_pan_by): the source window
+// slides inside a stationary visible box. Every start_* field is the pre-gesture
+// state the release step compares against to decide between committing a
+// "Pan clip" node and discarding a no-move press (undo_cancel).
+//
+// Two lanes, not eight. The gesture used to track Scale, both transforms and all
+// four crop insets because it rewrote them together; it now writes Pan_X/Pan_Y
+// and nothing else, so that is all there is to compare. A snapshot of fields the
+// gesture cannot change was comparison surface that could only ever agree.
 Crop_Pan :: struct {
-	active:       bool,
-	last_x:       f32,
-	last_y:       f32,
-	start_scale:  f32,
-	start_x:      f32,
-	start_y:      f32,
-	start_l:      f32,
-	start_r:      f32,
-	start_t:      f32,
-	start_b:      f32,
+	active:      bool,
+	last_x:      f32,
+	last_y:      f32,
+	start_pan_x: f32,
+	start_pan_y: f32,
 }
 crop_pan: Crop_Pan
 

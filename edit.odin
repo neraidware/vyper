@@ -22,6 +22,11 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 		prec = 1
 	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 		scaled = value * 100
+	case .Zoom, .Pan_X, .Pan_Y:
+		// Stored as a multiplier / window fraction, shown and typed as a
+		// percent -- the inverse of the commit's `/100`, so the two ends of the
+		// edit cannot drift apart.
+		scaled = value * 100
 	case .Opacity:
 		// Stored 0..1, shown and typed as a percentage.
 		scaled = value * 100
@@ -70,6 +75,12 @@ edit_field_over :: proc() -> bool {
 		return clay.PointerOver(clay.ID("PropFieldGain"))
 	case .Opacity:
 		return clay.PointerOver(clay.ID("PropFieldOpacity"))
+	case .Zoom:
+		return clay.PointerOver(clay.ID("PropFieldZoom"))
+	case .Pan_X:
+		return clay.PointerOver(clay.ID("PropFieldPanX"))
+	case .Pan_Y:
+		return clay.PointerOver(clay.ID("PropFieldPanY"))
 	case .Kf_Value:
 		return clay.PointerOver(clay.ID("PropFieldKf"))
 	case .None:
@@ -202,6 +213,35 @@ edit_commit :: proc() {
 		name = "gain"
 	// Keyframe value edits are committed by the early return above, so this
 	// case is unreachable — but the switch must stay exhaustive over the enum.
+	case .Zoom:
+		// Edited as a percent, so 100% is the crop window at natural size.
+		// Clamped well below 1 rather than at 1: a typed 0% would collapse the
+		// window, and the resolver reads a non-positive zoom as "no
+		// magnification", so 0 is not a reachable state worth writing.
+		if cl.kind == .Audio {
+			return
+		}
+		geom = .Zoom
+		val = max(val / 100, 0.01)
+		label = "Set clip zoom"
+	case .Pan_X:
+		if cl.kind == .Audio {
+			return
+		}
+		geom = .Pan_X
+		// Bounded by the achievable range, not by a constant ±1: a value outside
+		// it renders clamped, so accepting one would store a pan the clip does not
+		// show -- the same value/content disagreement the gesture is bounded
+		// against, just typed rather than dragged.
+		val = clamp_pan_x(cl_geom_all(cl), val / 100)
+		label = "Set clip pan"
+	case .Pan_Y:
+		if cl.kind == .Audio {
+			return
+		}
+		geom = .Pan_Y
+		val = clamp_pan_y(cl_geom_all(cl), val / 100)
+		label = "Set clip pan"
 	case .Kf_Value, .None:
 		return
 	}

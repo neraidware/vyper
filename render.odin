@@ -481,9 +481,34 @@ Render_Geom_Prop :: enum u8 {
 	// routing (clip_geom.odin), the same pending-bit bookkeeping, and the same
 	// per-lane Key button. It groups with no section, exactly like Scale.
 	//
-	// This is the last lane that fits geom_modified's u8 bitmask; a ninth
-	// property needs that field widened before it can be added.
+	// Opacity was the last lane that fit geom_modified's u8 bitmask; Zoom and Pan
+	// took it past eight, so that field is u16 now.
 	Opacity,
+	// Zoom and Pan are the CONTENT window, as distinct from Crop.
+	//
+	// Crop stays the underlying model — four insets naming a window in the source
+	// — and Zoom/Pan are modifiers applied to that window before it becomes a
+	// source rect. What they replace is the Alt+wheel and Alt+middle gestures,
+	// which used to FAKE a window change by writing seven fields across three
+	// properties (four crop lanes plus Scale plus both transforms) to hold the box
+	// still. That compensation is the hack: it has to be kept in step by hand, and
+	// it is why those gestures needed their own probe.
+	//
+	// Zoom is UNIFORM across both axes by necessity, not taste: it scales the
+	// window about its center, so per-axis factors would change the box's aspect
+	// ratio — which contradicts the invariant the gesture has always had, that the
+	// visible box never moves or resizes. Pan is per-axis because sliding a window
+	// within a source does not distort it.
+	//
+	// Consumed at the source-window stage, BEFORE the box is placed, not as a
+	// post-transform pass over rendered pixels. That ordering is load-bearing for
+	// the export: crop_src_rect picks an INTEGER rect inside the decoded stage and
+	// the display box maps to it 1:1, which is what lets a keyed clip region-copy
+	// per frame with no resampling. A post-transform zoom would destroy the 1:1
+	// mapping and force a resample every frame.
+	Zoom,
+	Pan_X,
+	Pan_Y,
 	_COUNT,
 }
 
@@ -505,6 +530,12 @@ render_geom_name :: proc(p: Render_Geom_Prop) -> string {
 		return "crop.b"
 	case .Opacity:
 		return "opacity"
+	case .Zoom:
+		return "zoom"
+	case .Pan_X:
+		return "pan.x"
+	case .Pan_Y:
+		return "pan.y"
 	case ._COUNT:
 		unreachable()
 	}
@@ -1013,7 +1044,7 @@ render_geom_snap_fill :: proc(snap: ^Render_Geom_Snap, clip: ^Clip) {
 				snap.scale_keyed = true
 			case .Opacity:
 				snap.opacity_keyed = true
-			case .Trans_X, .Trans_Y, .Crop_L, .Crop_R, .Crop_T, .Crop_B, ._COUNT:
+			case .Trans_X, .Trans_Y, .Crop_L, .Crop_R, .Crop_T, .Crop_B, .Zoom, .Pan_X, .Pan_Y, ._COUNT:
 			}
 		}
 	}
@@ -1051,15 +1082,23 @@ geom_sample_clip :: proc(clip: ^Clip, timeline_frame: i64) -> Geom_Sample {
 	return s
 }
 
-// geom_clear_crop zeroes the four crop lanes of a sample in place. A text clip
-// has no source frame to crop (its raster is already sized to the ink), so its
-// crop must read 0 even if the clip carries crop keys.
+// geom_clear_crop zeroes the CROP lanes of a sample in place, and neutralizes
+// zoom. A text clip has no source frame to crop (its raster is already sized to
+// the ink), so its window must read as the whole frame even if the clip carries
+// crop keys or a keyed zoom.
+//
+// Zoom is folded in here rather than left alone because it is the same
+// statement: crop and zoom both describe a window in a source, so a clip with no
+// source has neither. Pan is a pure offset of a window and needs no
+// neutralization — with no window to offset, it is read by nothing.
 geom_clear_crop :: proc(s: ^Geom_Sample) {
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		switch Render_Geom_Prop(pi) {
 		case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 			s[pi] = 0
-		case .Trans_X, .Trans_Y, .Scale, .Opacity, ._COUNT:
+		case .Zoom:
+			s[pi] = 1
+		case .Trans_X, .Trans_Y, .Scale, .Opacity, .Pan_X, .Pan_Y, ._COUNT:
 		}
 	}
 }
@@ -1949,15 +1988,19 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	// the preview has been reading the shared version the whole time, which is
 	// precisely the drift B existed to stop. render_kf_geom_rect below was
 	// already migrated; this is the static path.
+	// The BOX insets — crop only. The window that selects source pixels is the
+	// content one (crop_src_rect, below); this is the box, and zoom and pan have no
+	// business moving it.
+	l0, r0, t0, b0 := geom_box_insets(src.geom.base)
 	return cropped_box_edges(
 		src.geom.base[int(Render_Geom_Prop.Trans_X)],
 		src.geom.base[int(Render_Geom_Prop.Trans_Y)],
 		cw,
 		ch,
-		src.geom.base[int(Render_Geom_Prop.Crop_L)],
-		src.geom.base[int(Render_Geom_Prop.Crop_R)],
-		src.geom.base[int(Render_Geom_Prop.Crop_T)],
-		src.geom.base[int(Render_Geom_Prop.Crop_B)],
+		l0,
+		r0,
+		t0,
+		b0,
 	)
 }
 
@@ -2003,23 +2046,26 @@ render_static_src_geom :: proc(v: ^Render_Video_Src, canvas_w, canvas_h: c.int) 
 	v.fw = v.rw
 	v.fh = v.rh
 
-	// The window in box fractions is what the decoder crops to, and crop_dst is
-	// 0 because the allocated box IS the window: the decoded region starts at
-	// its own origin. crop_full is the window too, so there is no full-box
-	// buffer left to be the uncropped fallback.
-	cw, ch := full_box_dims(
-		v.source_w,
-		v.source_h,
-		v.geom.base[int(Render_Geom_Prop.Scale)],
-		f32(canvas_w),
-		f32(canvas_h),
-	)
-	box_left := v.geom.base[int(Render_Geom_Prop.Trans_X)] - cw / 2
-	box_top := v.geom.base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
-	v.dec.crop_fx0 = (f32(v.ox) - box_left) / cw
-	v.dec.crop_fy0 = (f32(v.oy) - box_top) / ch
-	v.dec.crop_fw = f32(v.fw) / cw
-	v.dec.crop_fh = f32(v.fh) / ch
+	// WHICH SOURCE PIXELS the decoder fetches is a CONTENT decision, so it reads
+	// the content window -- crop, zoom and pan -- and not the box edges above.
+	// The buffer's size and placement stay governed by the BOX (that part is
+	// placement, which zoom and pan must not touch), so the content window's
+	// pixels are simply scaled to fill it: a 2x zoom fetches half the source and
+	// fills the box with it, a pan fetches a different half. That is the whole
+	// effect of both properties on the static path.
+	//
+	// These are SOURCE fractions, which is why they no longer come from the
+	// canvas rect the way crop's did: the old form re-derived the window from where
+	// the box happened to land, which cannot express a pan at all.
+	//
+	// crop_dst is 0 because the allocated box IS where the content lands: the
+	// decoded region starts at its own origin. crop_full is the window too, so
+	// there is no full-box buffer left to be the uncropped fallback.
+	wl, wr, wt, wb := geom_content_insets(v.geom.base)
+	v.dec.crop_fx0 = wl
+	v.dec.crop_fy0 = wt
+	v.dec.crop_fw = 1 - wl - wr
+	v.dec.crop_fh = 1 - wt - wb
 	v.dec.crop_dst_x = 0
 	v.dec.crop_dst_y = 0
 	v.dec.crop_dst_w = v.fw
@@ -2057,10 +2103,10 @@ render_kf_geom_rect :: proc(
 	tx = sampled[int(Render_Geom_Prop.Trans_X)]
 	ty = sampled[int(Render_Geom_Prop.Trans_Y)]
 	s = sampled[int(Render_Geom_Prop.Scale)]
-	cl = sampled[int(Render_Geom_Prop.Crop_L)]
-	cr = sampled[int(Render_Geom_Prop.Crop_R)]
-	ct = sampled[int(Render_Geom_Prop.Crop_T)]
-	cb = sampled[int(Render_Geom_Prop.Crop_B)]
+	// The BOX insets — crop only. See geom_box_insets: cropped_box_edges reads an
+	// inset as a box trim, so handing it the content window would move a panned or
+	// offset-crop clip on the keyed path alone.
+	cl, cr, ct, cb = geom_box_insets(sampled)
 	opacity = sampled[int(Render_Geom_Prop.Opacity)]
 	cw, ch := full_box_dims(source_w, source_h, s, f32(draw_w), f32(draw_h))
 	// The shared geometry (project_geom.odin), so a crop lands identically in
@@ -2072,7 +2118,14 @@ render_kf_geom_rect :: proc(
 	rh = px_extent(b - t)
 	// Which source pixels the crop selects in the STAGED texture (the shared
 	// geometry, so this and the CPU sws path below pick the same pixels).
-	csr := crop_src_rect(int(stage_w), int(stage_h), cl, cr, ct, cb)
+	// The CONTENT window for the source rect, which is the other half of the
+	// split: this is where zoom and pan belong. It is computed HERE rather than
+	// reusing cl..cb because those are the box insets -- feeding them to
+	// crop_src_rect would select the crop window's pixels and silently drop a
+	// zoom or a pan on the keyed path only, which is the keyed/static split that
+	// has bitten twice (TODO.md Active 24).
+	wl, wr2, wt, wb := geom_content_insets(sampled)
+	csr := crop_src_rect(int(stage_w), int(stage_h), wl, wr2, wt, wb)
 	srcx = c.int(csr.x)
 	srcy = c.int(csr.y)
 	srcw = c.int(csr.w)

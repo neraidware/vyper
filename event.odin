@@ -414,9 +414,9 @@ handle_mouse_wheel :: proc(wheel: sdl.MouseWheelEvent) {
 			if sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods {
 				if sel, ok := transformable_selected(); ok && sel.kind != .Text {
 					factor := 1 + 0.1 * wheel.y
-					if crop_viewport_zoom(sel, factor, false) {
+					if clip_zoom_by(sel, factor, false) {
 						undo_begin()
-						crop_viewport_zoom(sel, factor, true)
+						clip_zoom_by(sel, factor, true)
 						undo_push(.Transform, "Zoom clip")
 					}
 					return

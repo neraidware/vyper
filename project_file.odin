@@ -103,6 +103,18 @@ Saved_Clip :: struct {
 	crop_r:               f32,
 	crop_t:               f32,
 	crop_b:               f32,
+	// zoom/pan: the content window's magnification and offset. No presence flag,
+	// unlike opacity below, and the asymmetry is deliberate. A missing f32 decodes
+	// to 0, which for opacity means "fully transparent" and so had to be
+	// distinguished from absent; for zoom 0 means "no magnification"
+	// (geom_source_window reads a non-positive zoom as 1) and for pan 0 means
+	// "centered". So an absent field decodes to exactly the right value and a
+	// pre-zoom project opens with every clip unzoomed and unpanned, with nothing
+	// to detect and nothing to migrate. That is the zero-value convention paying
+	// for itself at the format boundary.
+	zoom:                 f32,
+	pan_x:                f32,
+	pan_y:                f32,
 	// opacity plus an explicit presence flag. A project written before opacity
 	// existed has no such field, and a missing f32 decodes to 0 -- which would
 	// load every old clip fully transparent. The flag distinguishes "absent"
@@ -250,6 +262,9 @@ project_to_file :: proc() -> Project_File {
 				crop_r               = c.crop_r,
 				crop_t               = c.crop_t,
 				crop_b               = c.crop_b,
+				zoom                 = c.zoom,
+				pan_x                = c.pan_x,
+				pan_y                = c.pan_y,
 				opacity              = c.opacity,
 				has_opacity          = true,
 				markers              = saved_markers(&c),
@@ -438,6 +453,9 @@ session_rebuild :: proc(pf: ^Project_File) {
 				crop_r               = sc.crop_r,
 				crop_t               = sc.crop_t,
 				crop_b               = sc.crop_b,
+				zoom                 = sc.zoom,
+				pan_x                = sc.pan_x,
+				pan_y                = sc.pan_y,
 				opacity              = 1.0,
 			}
 			// Absent (pre-opacity project) loads fully opaque; a stored 0% is real.
