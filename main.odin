@@ -1927,13 +1927,30 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		ok: bool = audio_probe_priming_trace(pt)
 		os.exit(ok ? 0 : 1)
 	}
-	// Standalone, and NOT dispatched from audio_probe: this one currently FAILS,
-	// which is the finding rather than a nuisance (see TODO.md Active 30 S2). It has
-	// its own gate target so the failure is named and runnable instead of either
-	// breaking `all` or being quietly skipped.
+	// VYPER_AUDIO_MIX_PARITY=<path> -- playback vs export over a short span.
 	if mp, _ := os.lookup_env_alloc("VYPER_AUDIO_MIX_PARITY", context.temp_allocator); mp != "" {
 		parts := strings.split(mp, "|")
 		ok: bool = audio_probe_mix_parity(strings.trim_space(parts[0]))
+		if !ok {
+			os.exit(1)
+		}
+		os.exit(0)
+	}
+	// VYPER_AUDIO_DRIFT_PARITY=<path>|<seconds>|<fps> -- the same comparison run
+	// continuously over a LONG span, which is the only way an ACCUMULATED position
+	// error becomes visible: locally correct, globally wrong. fps is optional and
+	// defaults to the project's, so the NTSC run passes 30000/1001.
+	if dp, _ := os.lookup_env_alloc("VYPER_AUDIO_DRIFT_PARITY", context.temp_allocator); dp != "" {
+		parts := strings.split(dp, "|")
+		secs := 60.0
+		fps_override := f64(0)
+		if len(parts) >= 2 {
+			secs, _ = strconv.parse_f64(strings.trim_space(parts[1]))
+		}
+		if len(parts) >= 3 {
+			fps_override, _ = strconv.parse_f64(strings.trim_space(parts[2]))
+		}
+		ok: bool = audio_probe_drift_parity(strings.trim_space(parts[0]), secs, fps_override)
 		if !ok {
 			os.exit(1)
 		}

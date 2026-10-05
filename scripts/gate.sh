@@ -1346,6 +1346,48 @@ target_audio_mix_parity() {
 	echo "audio-mix-parity: ok"
 }
 
+# audio_drift_parity is the LONG version of audio_mix_parity: it runs both mixers
+# continuously over a span long enough for an ACCUMULATED position error to show,
+# at a fractional frame rate as well as an exact one.
+#
+# It covers the two holes Active 30 S6b/S6c named. Every rate measured until now
+# was 60 or 30 EXACTLY, where a mixer that rounds per frame instead of per position
+# is indistinguishable from one that does not -- at 30000/1001 a frame is 1601 or
+# 1602 samples, alternating forever, so per-frame rounding drifts without ever
+# showing a single-frame error. And nothing ran longer than 30 s, which is too
+# short for drift to accumulate past a frame boundary.
+#
+# The fixture is generated rather than committed: a multi-minute AAC file is
+# megabytes of binary for a test that only needs it to be long and 48 kHz.
+target_audio_drift_parity() {
+	require_fresh_binary audio-drift-parity || return 1
+	local wav=target/mixparity/long.wav
+	local aac=target/mixparity/long.m4a
+	local src=$aac
+	local secs=600
+	local rc=0
+	mkdir -p target/mixparity
+	if [ ! -s "$wav" ] || [ ! -s "$aac" ]; then
+		echo "audio-drift-parity: synthesizing a ${secs}s fixture" >&2
+		ffmpeg -v error -f lavfi -i "sine=frequency=997:sample_rate=48000:duration=$secs" \
+			-ac 2 -c:a pcm_s16le "$wav" -y || return 1
+		ffmpeg -v error -i "$wav" -c:a aac -b:a 128k "$aac" -y || return 1
+	fi
+	# 997 Hz is deliberate: it is coprime with 60, with 30000/1001 and with 48000,
+	# so a rounded boundary shows up as a phase error instead of cancelling out
+	# over the window the way 440 or 1000 Hz would.
+	for spec in "600|60" "600|29.97" "600|30"; do
+		printf '[gate] drift %ss at %s fps\n' "${spec%%|*}" "${spec##*|}"
+		VYPER_AUDIO_DRIFT_PARITY="$PWD/$src|${spec%%|*}|${spec##*|}" timeout 1800 ./vyper 2>&1 | tail -2
+		[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
+	done
+	if [ $rc -ne 0 ]; then
+		echo "audio-drift-parity: FAILED" >&2
+		return 1
+	fi
+	echo "audio-drift-parity: ok"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1359,7 +1401,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1391,6 +1433,7 @@ main() {
 	audio_rate) target_audio_rate ;;
 	audio_export_audit) target_audio_export_audit ;;
 	audio_mix_parity) target_audio_mix_parity ;;
+	audio_drift_parity) target_audio_drift_parity ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
@@ -1410,7 +1453,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

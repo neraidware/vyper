@@ -1378,6 +1378,205 @@ audio_probe_priming_trace :: proc(path: string) -> bool {
 	return true
 }
 
+// audio_probe_drift_parity runs the playback and export mixers over a LONG span
+// and compares them continuously, so any accumulated position error shows up as a
+// mismatch that grows with time rather than as a constant offset.
+//
+// The short mix-parity probe answers "do they agree here". This answers "do they
+// still agree after ten minutes", which is the promise actually being made: one
+// sample clock, exact boundaries, no drift. Two failure modes it exists for:
+//
+//   - FRACTIONAL RATES. At 30000/1001 fps a frame is 1601 or 1602 samples,
+//     alternating forever. A mixer that rounds per frame instead of per position
+//     accumulates error silently, and every rate measured until now was 60 or 30
+//     EXACTLY, where that bug is invisible.
+//   - ACCUMULATED POSITION ERROR. A fifo that is refilled from a decoder whose
+//     position drifts will stay locally correct and end up globally wrong.
+//
+// Returns true when the two agree for the whole span.
+audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 = 0) -> bool {
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	saved_fps := playback.magic_fps
+	if fps_override > 0 {
+		playback.magic_fps = fps_override
+	}
+	defer playback.magic_fps = saved_fps
+
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] drift: no fps")
+		return false
+	}
+	total_frames := i64(seconds * fps)
+	fmt.printf(
+		"[ap] drift: %.1fs at %.6f fps (%d frames, %.2f samples/frame avg)\n",
+		seconds,
+		fps,
+		total_frames,
+		48000.0 / fps,
+	)
+
+	// One clip spanning the whole span: this probe is about position over time,
+	// and overlapping clips would make a divergence ambiguous between "drifted"
+	// and "resolved a different span".
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "drift", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = cpath,
+			kind = .Audio,
+			name = session_str_intern("d"),
+			timeline_start_frame = 0,
+			source_length_frames = total_frames,
+			source_start_frame = 0,
+			stream_index = 0,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_provision(0)
+	if audio_src.count == 0 {
+		fmt.println("[ap] drift: SKIP: playback provisioned no sources")
+		return true
+	}
+
+	export_audios: [dynamic]Render_Audio_Src
+	defer delete(export_audios)
+	slot := audio_geom_acquire()
+	defer audio_geom_release()
+	for i in 0 ..< min(int(slot.n), 4) {
+		append(&export_audios, render_audio_src_from_chip(slot, &slot.chip[i]))
+	}
+	if len(export_audios) == 0 {
+		fmt.println("[ap] drift: SKIP: no export sources")
+		return true
+	}
+	// render_mix_block walks render_job.audios, so point the job at the probe's
+	// array for the duration; the cloned paths go with it.
+	render_job.audios = export_audios[:]
+	defer {
+		for &a in export_audios {
+			if a.path != nil {
+				delete(a.path)
+			}
+		}
+		render_job.audios = nil
+	}
+	// The export's bus is a real ring, so it has to be initialised for the span
+	// rather than defaulted -- a zero-value Render_Mix would mix into a bus with
+	// no room and every block would read as a hole.
+	render_mix: Render_Mix
+	fnum, fden := fps_rational(fps)
+	render_mix_init(&render_mix, c.int(i64(fnum)), c.int(i64(fden)), sample_pos_from_frames(0, i64(fnum), i64(fden)))
+	defer render_mix_bus_destroy(&render_mix.bus)
+
+	// Walk the timeline once, mixing each frame through BOTH paths and comparing
+	// as we go. Export is driven at its own natural AUDIO_MIX_BLOCK granularity,
+	// because the consumer of that stream takes whatever range its frame covers.
+	mix_play: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	mix_exp: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	worst, worst_frame := f32(0), i64(-1)
+	first_bad := i64(-1)
+	exp_have := i64(0)
+	mixed_samples := i64(0)
+	for f in 0 ..< total_frames {
+		b0 := audio_frame_boundary48(f, fps)
+		b1 := audio_frame_boundary48(f + 1, fps)
+		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(b1 - b0)))
+		if !audio_mix_frame(mix_play[:], f, spf) {
+			fmt.printf("[ap] drift: playback hole at frame %d (%.2fs)\n", f, f64(f)/fps)
+			return false
+		}
+		for exp_have < b1 {
+			blk := min(AUDIO_MIX_BLOCK, b1 - exp_have)
+			render_mix_block(&render_mix, mix_exp[:], exp_have, int(blk))
+			exp_have += i64(blk)
+		}
+		mixed_samples += i64(spf)
+		for i in 0 ..< spf * 2 {
+			d := math.abs(mix_play[i] - mix_exp[i])
+			if d > worst {
+				worst = d
+				worst_frame = f
+			}
+			if d > 0.0001 {
+				if first_bad < 0 {
+					first_bad = f
+				}
+				break
+			}
+		}
+	}
+	// The position invariant, stated as a number rather than trusted: the samples
+	// handed to the device must be exactly the span the timeline describes.
+	want_samples := audio_frame_boundary48(total_frames, fps)
+	fmt.printf(
+		"[ap] drift: mixed=%d samples, timeline requires=%d, delta=%d; worst=%.6f at frame %d\n",
+		mixed_samples, want_samples, mixed_samples - want_samples, worst, worst_frame,
+	)
+	if mixed_samples != want_samples {
+		fmt.println("[ap] drift: FAIL: sample accounting does not match the timeline")
+		return false
+	}
+	if first_bad >= 0 {
+		// Say WHICH kind of disagreement this is. A constant content SHIFT means
+		// one side is reading from a different position; a gain difference with no
+		// shift means one side is applying different gain or a declick; silence on
+		// one side means a source never reached the mix. They have nothing in
+		// common as fixes, and "the mixers disagree" does not distinguish them.
+		fmt.printf(
+			"[ap] drift: FAIL: the two mixers first disagree at frame %d (%.2fs)\n",
+			first_bad, f64(first_bad)/fps,
+		)
+		b0 := audio_frame_boundary48(first_bad, fps)
+		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(first_bad+1, fps) - b0)))
+		fmt.printf("[ap] drift:   play[0:4]=%v\n", mix_play[:4])
+		fmt.printf("[ap] drift:   exp[0:4]=%v\n", mix_exp[:4])
+		best, best_shift := f32(1e30), 0
+		for sh in -4096 ..< 4096 {
+			acc := f32(0)
+			cnt := 0
+			for i in 0 ..< spf {
+				j := i + sh
+				if j < 0 || j >= spf {
+					continue
+				}
+				acc += mix_exp[i * 2] * mix_play[j * 2]
+				cnt += 1
+			}
+			if cnt < spf / 2 {
+				continue
+			}
+			e := math.abs(acc)
+			if e < best {
+				best = e
+				best_shift = sh
+			}
+		}
+		fmt.printf("[ap] drift:   best content shift=%d samples\n", best_shift)
+		return false
+	}
+	fmt.println("[ap] drift ok (no divergence over the whole span)")
+	return true
+}
+
 audio_probe_mix_parity :: proc(path: string) -> bool {
 	fps := timeline_fps()
 	if fps <= 0 {

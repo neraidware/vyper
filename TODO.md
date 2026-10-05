@@ -5938,9 +5938,14 @@ frame covers, including one straddling two blocks) and playback has not caught u
       and passed, but was wired into neither, so playback rate changes were
       verified by hand, once, and `all` could not catch a regression in the
       pitch-preserving path.
-- [ ] S6b. Nothing exercises 29.97 (every rate measured so far is 60 or 30
-      exactly, and NTSC is where the 1601/1602 alternation lives).
-- [ ] S6c. Nothing measures drift beyond 30 s.
+- [ ] S6b. 29.97 now MEASURED (delta 0 over 600 s, `audio_probe_drift_parity`),
+      but the probe is red on a clip-head divergence it exposed, so it is not yet
+      in `all`. Closes when that divergence is resolved.
+- [ ] S6c. Drift beyond 30 s now MEASURED: exact sample accounting at 600 s across
+      60 / 30 / 30000-over-1001. Same blocker as S6b.
+- [ ] S6d. NEW, found by S6b/S6c: the export opens a clip's head in silence while
+      playback ramps from content 0. A clip-start/fade-in-origin decision, not a
+      position bug. See "S6b/S6c" above.
 
 ### The finding, and the fix (S2/S4a/S4b)
 
@@ -5998,6 +6003,51 @@ audio (frames [0,200) — it is silence after that, so a window outside it measu
 a truncated tail), and it **asserts** that two unity windows agree. That
 assertion is the point: previously the ratio's premise was invisible, and the
 only reason it held was the bug it was sitting next to.
+
+### S6b/S6c: drift — measured, and a new divergence it exposed
+
+`audio_probe_drift_parity` runs BOTH mixers continuously over a long span and
+compares every sample, and asserts the position invariant as a number rather
+than trusting it: the samples handed to the device must equal
+`audio_frame_boundary48(total_frames)`.
+
+**No drift, at any rate, over 600 s.** 28,800,000 samples mixed, 28,800,000
+required, delta 0 — identically at 60, at 30, and at **30000/1001** (29.97).
+That closes the S6b hole honestly: 29.97 is a frame of 1601 or 1024*1.5648
+samples alternating forever, so per-frame rounding would drift while never
+showing a single-frame error, and it does not.
+
+The fixture is 997 Hz on purpose. It is coprime with 60, with 30000/1001 and with
+48000, so a rounded boundary shows as a phase error instead of cancelling over
+the window the way 440 or 1000 Hz would.
+
+**But it is red, on a divergence the old fixture was hiding.** At frame 0 of a
+single long clip:
+
+```
+play[0:4] = [0.0592, 0.0592, 0.0501, 0.0501]
+exp[0:4]  = [0,      0,      0,      0     ]
+```
+
+The export is **silent** for the head of a clip while playback is not. The short
+`mix_parity` fixture passed because its 440 Hz sine starts at a zero crossing, so
+both paths were ~0 there and matched by accident — the fixture masked the
+difference, not the code.
+
+This is a clip-START question, not a position question: the export's
+`render_mix_block` opens a source with `muted`, and mutes the head into a
+declick ramp from the block's own start, while playback ramps from the clip's
+content 0. So the two disagree about *where a fade-in begins* — the same
+one-fact-two-copies shape as everything else here.
+
+**Open, and deliberately not guessed.** Whether a clip head should be silent,
+ramped from content 0, or ramped from the block boundary is a decision about what
+a cut is SUPPOSED to sound like, and the answer changes what the fix is. It is not
+tucked in behind the drift fix.
+
+`audio_drift_parity` stays OUT of `all` while it is red, for the reason
+`audio_mix_parity` was: a failing member gets disabled, and a check nobody runs
+proves nothing. It is a named, runnable target.
 
 ### Three measurement mistakes, each of which read as proof
 
