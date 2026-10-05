@@ -1743,6 +1743,52 @@ test_fps_reflow_assetless :: proc() {
 	)
 }
 
+
+// test_pin_src_fps_kind_mismatch: the pin must key off the ASSET, not Clip.kind.
+//
+// ~/baby.vyproj stores an AV1 webm as a clip of kind .Audio over an asset of kind
+// .Video. Both pf_pin_src_fps and clip_duration_sec used to filter on the clip's
+// kind, so this clip matched no rung: it kept src_fps=0, resolved to the project
+// rate, and a 12fps source played at 60fps speed — the "5 times faster" report,
+// still live after the conform fix because the pin never ran on it.
+//
+// The fixture mirrors the real file: kind .Audio, asset kind .Video, no probed
+// rate, a frame count and a duration to derive from.
+test_pin_src_fps_kind_mismatch :: proc() {
+	tl_pin_scene(0.0, 219, 18250000)
+	// Overwrite the scene's clip and asset to the real shape.
+	timeline.tracks[0].clips[0].kind = .Audio
+	media_bin.assets[0].kind = .Video
+	media_bin.assets[0].video_fps = 0 // a project saved before the field existed
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 60.0
+
+	pf_pin_src_fps()
+	c := &timeline.tracks[0].clips[0]
+	tl_probe_check(
+		c.src_fps > 0 && math.abs(c.src_fps - 12.0) < 0.2,
+		"the pin must key off the asset's kind — a .Audio clip over a .Video asset pinned src_fps=%.4f, want ~12",
+		c.src_fps,
+	)
+	// And the observable consequence: one second of a 12fps source is 12 frames,
+	// not the 60 an unpinned clip would advance.
+	advanced := f64(clip_source_frame(0, 0, 60, false, c.src_fps))
+	tl_probe_check(
+		math.abs(advanced - 12.0) <= 0.2,
+		"a clip whose kind disagrees with its asset must still conform — one second advanced %.3f source frames, want 12",
+		advanced,
+	)
+	// The duration has to come from the same place, or the extent is derived from
+	// the wrong quantity and the clip is the wrong length.
+	sec := clip_duration_sec(c, 12.0)
+	tl_probe_check(
+		math.abs(sec - 18.25) < 0.1,
+		"duration must come from the asset too — got %.4fs, want ~18.25s",
+		sec,
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow()
@@ -1753,6 +1799,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow_keyframes()
 	fmt.println("[tl-probe] fps-reflow-keyframes ok")
+	tl_scene()
+	test_pin_src_fps_kind_mismatch()
+	fmt.println("[tl-probe] pin-kind-mismatch ok")
 	tl_scene()
 	test_pin_src_fps()
 	fmt.println("[tl-probe] pin-src-fps ok")

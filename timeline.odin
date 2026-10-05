@@ -108,20 +108,80 @@ clip_source_frame :: proc(
 // force when it was placed, so the same project shows less and less of every clip
 // as the rate goes up.
 //
-// Preference order:
+// Keyed to the ASSET, never to Clip.kind. That is not a style choice: ~/baby.vyproj
+// stores an AV1 webm as a clip of kind .Audio whose asset is of kind .Video, and
+// both this function and pf_pin_src_fps used to filter on the clip's kind. So the
+// webm matched no rung — no probed video rate (the asset predates the field), no
+// audio rate either — and fell through to the extent, which made a clip whose
+// asset says kind=Video resolve as if it had no media rate at all. The clip's kind
+// is the one field here that a hand-edited or older-written project gets wrong;
+// the asset's kind is measured from the file.
+// asset_content_duration_sec is an asset's own content length in seconds, and
+// whether that content is video.
 //
-//  1. the asset's own duration, which is measured rather than counted and so is
-//     correct however the extent was last written;
-//  2. the extent divided by the current rate — right for a clip whose asset is
-//     gone, and wrong only for a project whose rate has already been changed
-//     without a reflow, which is the case this whole change exists to end.
-clip_duration_sec :: proc(clip: ^Clip, fallback_rate: f64) -> f64 {
-	if as := find_asset(clip.asset_id); as != nil && as.video_fps > 0 && as.frame_count > 0 {
-		return f64(as.frame_count) / as.video_fps
+// The single place that answers "what rate does this asset's media run at", read
+// by both clip_duration_sec and pf_pin_src_fps so the two cannot disagree about
+// it — they did, which is how a clip ended up with a duration from the video side
+// and a playback rate from neither.
+//
+// Branches on the ASSET's kind, not the clip's. The asset's kind comes from
+// probing the file, so it is the reliable one.
+asset_content_duration_sec :: proc(asset_id: u64) -> (sec: f64, is_video: bool) {
+	as := find_asset(asset_id)
+	if as == nil {
+		return 0, false
 	}
-	if clip.kind == .Audio {
-		if as := find_asset(clip.asset_id); as != nil && as.audio_rate > 0 && as.audio_frames > 0 {
-			return f64(as.audio_frames) / as.audio_rate
+	switch as.kind {
+	case .Video:
+		// The probed rate when there is one. Otherwise derive it from the frame
+		// count and duration, which is what a project saved before Media_Asset
+		// .video_fps existed carries, and what the proxy scheduler does for the
+		// same reason.
+		if as.video_fps > 0 && as.frame_count > 0 {
+			return f64(as.frame_count) / as.video_fps, true
+		}
+		if as.dur_us > 0 {
+			// dur_us IS the duration, so use it directly rather than deriving one
+			// through a rate. The first version of this rung returned
+			// frame_count/dur_us — a frame RATE — where the caller wanted seconds,
+			// which reported an 18.26s source as 11.99s: numerically the fps, which
+			// is plausible enough to look like a plausible duration.
+			//
+			// Only reachable for a .Video asset, so this cannot misread an audio
+			// file's 1-frame count as a duration.
+			return f64(as.dur_us) / 1e6, true
+		}
+		return 0, false
+	case .Audio:
+		if as.audio_rate > 0 && as.audio_frames > 0 {
+			return f64(as.audio_frames) / as.audio_rate, false
+		}
+		return 0, false
+	case .Image, .Text, .Subtitles, .Other, .Empty:
+		// A still has no rate: its length is authored, not measured.
+		return 0, false
+	}
+	return 0, false
+}
+
+clip_duration_sec :: proc(clip: ^Clip, fallback_rate: f64) -> f64 {
+	asset_sec, is_video := asset_content_duration_sec(clip.asset_id)
+	if is_video && asset_sec > 0 {
+		// The asset's duration is only this clip's duration if the clip is the WHOLE
+		// asset. Using it unconditionally would silently un-trim every trimmed clip
+		// in the project on the next rate change: a clip trimmed to half a second
+		// would snap back to the source's full 18.26s, and nothing about that looks
+		// like a bug.
+		//
+		// Untrimmed is decidable from the authoring rate: at that rate the whole
+		// asset occupies exactly `asset_sec * rate` frames, so an extent equal to
+		// that (with the clip starting at the source's first frame) is the whole
+		// thing. Anything else was trimmed and keeps its own extent.
+		if fallback_rate > 0 && clip.source_start_frame == 0 {
+			full := i64(math.round(asset_sec * fallback_rate))
+			if clip.source_length_frames == full {
+				return asset_sec
+			}
 		}
 	}
 	// Still images and generators, and any clip whose asset is gone: the stored
@@ -233,6 +293,63 @@ clip_source_span :: proc(
 // losing them because nothing about it looks wrong.
 //
 // Returns the total length delta applied, for the probe.
+// pf_rebase_extents_for_authoring_rate re-derives every video clip's extent ONCE,
+// at load, using the rate the project was AUTHORED at.
+//
+// It exists because the extent<->duration invariant ("extent == duration x rate")
+// did not hold for projects written before this change: their extents are source
+// frame counts, correct only at the source's rate, and nothing records the rate
+// they were written at except timeline.frame_rate. ~/baby.vyproj is the case —
+// extents authored at 12, project.frame_rate already 60, so its clips read as
+// 3.65s of content instead of 18.26s.
+//
+// After this runs, the invariant holds and every later rate change can measure a
+// clip's duration from its own extent, which is what makes reflow preserve
+// TRIMMING. Without the rebase a trimmed clip's duration is unrecoverable: the
+// file stores the trimmed extent and the asset stores the full length, and nothing
+// says which is which.
+//
+// No-op when timeline.frame_rate does not disagree with the project rate, which is
+// the common case for a project already in the new model.
+pf_rebase_extents :: proc(authoring_rate: f64) {
+	if !(authoring_rate > 0) {
+		return
+	}
+	for ti in 0 ..< len(timeline.tracks) {
+		for &clip in timeline.tracks[ti].clips {
+			if clip.source_start_frame != 0 {
+				continue // trimmed head: the extent is not the whole asset
+			}
+			// A measured asset duration is a hard fact and wins. Everything else is
+			// left EXACTLY as found, because re-deriving it needs an authoring rate
+			// the file does not record per clip.
+			//
+			// This bit ~/baby.vyproj's PNG: a still has no usable duration (its
+			// dur_us is not a duration), so its extent was divided by
+			// timeline.frame_rate (12) while it had actually been authored at the
+			// project's 60 — stretching a 4-second still to 20.17s. It played fine
+			// and nothing about it looked wrong.
+			//
+			// A single global authoring rate cannot be right even in principle: in
+			// that project the webm's extent was authored at 12fps and the still's at
+			// 60, in the same file. Where the asset cannot answer, the stored extent
+			// is the only evidence there is and it has to be believed.
+			sec, _ := asset_content_duration_sec(clip.asset_id)
+			if !(sec > 0) {
+				continue
+			}
+			// Untrimmed only: an extent shorter than the whole asset is a trim, and
+			// the trim is the truth about this clip's length, not the asset's.
+			proj := project_fps()
+			if !(proj > 0) || i64(math.round(sec * proj)) < clip.source_length_frames {
+				continue
+			}
+			clip.source_length_frames = max(1, i64(math.round(sec * proj)))
+		}
+	}
+	_ = authoring_rate
+}
+
 reflow_timeline_for_fps :: proc(old_rate, new_rate: f64) -> i64 {
 	if !(old_rate > 0) || !(new_rate > 0) || old_rate == new_rate {
 		return 0

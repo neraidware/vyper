@@ -509,6 +509,11 @@ session_rebuild :: proc(pf: ^Project_File) {
 	copy(timeline.track_order[:], pf.track_order[:])
 	timeline.playhead_frame = pf.playhead_frame
 	timeline.frame_rate = pf.timeline_frame_rate
+	// Order matters. The rebase re-derives extents from durations measured at the
+	// AUTHORING rate, which needs nothing pinned; the pins then read assets, which
+	// is independent. But the rebase is what makes the extent<->duration invariant
+	// hold, and every later rate change depends on it.
+	pf_rebase_extents(pf.timeline_frame_rate)
 	pf_pin_audio_src_rates()
 	pf_pin_src_fps()
 
@@ -574,8 +579,8 @@ pf_pin_audio_src_rates :: proc() {
 	}
 }
 
-// pf_pin_src_fps pins the rate of every video clip that has none — a project
-// saved before Clip.src_fps existed.
+// pf_pin_src_fps pins the rate of every clip that has none — a project saved before
+// Clip.src_fps existed.
 //
 // The video half of pf_pin_audio_src_rates, and it has to run HERE, at load,
 // while the project's own rate is still the one the frame numbers were written
@@ -600,11 +605,24 @@ pf_pin_src_fps :: proc() {
 	for ti in 0 ..< len(timeline.tracks) {
 		for ci in 0 ..< len(timeline.tracks[ti].clips) {
 			c := &timeline.tracks[ti].clips[ci]
-			if c.kind == .Audio || c.kind == .Text || c.src_fps > 0 {
+			// NOT filtered on c.kind. See below: ~/baby.vyproj stores an AV1 webm
+			// as a .Audio clip over a .Video asset, and the kind filter this
+			// replaces skipped exactly the clip the user was looking at.
+			if c.src_fps > 0 || c.is_still {
 				continue
 			}
 			pinned := rate
-			if as := find_asset(c.asset_id); as != nil {
+			// Keyed to the ASSET, not to c.kind. ~/baby.vyproj stores an AV1 webm
+			// as a .Audio clip over a .Video asset, so a kind filter here skipped
+			// exactly the clip the user was looking at: it kept src_fps=0, resolved
+			// to the project rate, and played a 12fps source at 60fps speed — the
+			// "5 times faster" report, still live after the conform fix because the
+			// pin never ran on it.
+			//
+			// src_fps is only ever read by the video frame mapping, so pinning a
+			// genuine audio clip's rate here is inert; not pinning a video-content
+			// clip is not.
+			if as := find_asset(c.asset_id); as != nil && as.kind == .Video {
 				if as.video_fps > 0 {
 					pinned = as.video_fps
 				} else if as.frame_count > 0 && as.dur_us > 0 {
