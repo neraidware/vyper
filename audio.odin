@@ -1178,10 +1178,12 @@ db_to_linear :: proc(db: f32) -> f32 {
 
 // kf_gain_linear evaluates a gain keyframe track — authored in dB, the unit the
 // inspector shows — to a LINEAR amplitude multiplier at clip-relative frame
-// `rel`. `base_dB` is the clip's static level (also dB) and rules wherever the
-// track has no key (empty, before the first, past the last). Both the playback
-// mixer and the export mixer go through here, so a key's dB value can never
-// again be mistaken for the multiplier itself (a -40 dB key is 0.01, not -40).
+// `rel`. `base_dB` is the clip's static level (also dB) and rules where the
+// track has no key yet (empty, or before the first key); past the last key the
+// track holds its final dB, so a fade that ends sustains its end level instead
+// of snapping back to the clip's static gain. Both the playback mixer and the
+// export mixer go through here, so a key's dB value can never again be mistaken
+// for the multiplier itself (a -40 dB key is 0.01, not -40).
 kf_gain_linear :: proc(keys: []Keyframe, rel: i32, base_dB: f32) -> f32 {
 	if len(keys) == 0 {
 		return db_to_linear(base_dB)

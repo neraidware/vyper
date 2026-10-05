@@ -4751,3 +4751,64 @@ count).
 
 **Accept.** `check build keyframe_probe geom_key_probe render_kf_probe parity
 parity_valgrind` pass.
+
+## Active 22 — A keyed clip snapped back to its resting pose after its last keyframe
+
+**Why:** keyframing a clip's transform looked correct up to the final keyframe
+and then reverted — the clip jumped back to the pose it had before any key
+existed and stayed there for the rest of its span. A fade-to-nothing opacity
+track did the same, so a clip faded out and then came back at full strength.
+This was the sampler contract itself, not a display bug: `kf_sample_keys`
+returned the caller's `base` and `active = false` once the frame was past the
+last key, and `kf_sample_packed_lane` did the same per lane.
+
+**The rule now:** before the first key the property is inactive and the
+resting/base value rules; from the first key onward the track owns the
+property — interpolating between keys and HOLDING its final value past the last
+one. The asymmetry is the point. A track that has not begun has no end state to
+hold, so a direct edit there is what the user is looking at; a track that has
+finished has an end state, and that is where the clip stays.
+
+This also fixes a write-routing consequence rather than adding one.
+`clip_geom_set` routes a write to a KEY whenever the sampler is reading one at
+the playhead (`clip_geom_keyed_at`), and that predicate is the sampler's own
+`active`. With the tail holding, a drag past the last key now extends the
+animation instead of writing a resting value the sampler would ignore — the
+"a write goes wherever the sampler READS" invariant in clip_geom.odin holds for
+the new tail with no change to the routing code. The flip side: a lane can no
+longer become "pending" past its last key, because there is no longer a resting
+edit visible there. `geom_key_probe`'s packed-section case therefore moved its
+playhead AHEAD of the animation (keys at 100/200, playhead 50) — the only
+region where a packed lane can still be pending.
+
+Audio rides the same evaluator (`kf_gain_linear` -> `kf_sample_keys`), so a
+keyed fade that ends now sustains its final dB instead of snapping to the clip's
+static gain. That is the audible version of the same defect.
+
+Steps:
+- [x] S1. `kf_sample_keys` holds `active_key`'s value with `active = true` past
+      the last key.
+- [x] S2. `kf_sample_packed_lane` holds the last COVERING knot's lane value. The
+      subtlety: a knot that does not mask the lane is not a breakpoint for it,
+      so it must not end that lane's hold early — only a knot that masks the
+      lane continues its curve.
+- [x] S3. Contract comments updated at every site that stated the old rule
+      (`kf_sample_keys`, `kf_sample`, `kf_sample_packed_lane`, the
+      `evaluation (...)` banner, `clip_geom.odin`'s module header and its
+      `clip_geom_set` case 2, `kf_gain_linear`).
+
+**Probe / mutation.** `keyframe_probe` pins both ends on the scalar path, the
+packed path, the flat/worker sampler, and the inspector gain readout (with a
+-12 dB final key so a hold cannot coincide with the static 0 dB), plus the
+unmasked-knot case above. Reverting the scalar tail fails 13 assertions;
+reverting only the packed tail fails 5, including "an unmasked knot must not end
+a lane's hold". `render_kf_probe` cases A, F and H were inverted to pin the hold
+— H's original purpose (catching `v.opacity` retaining the previous frame's
+sample) survives, and the hold makes it a stronger check, because 0.625 and the
+correct 0.25 now differ instead of the wrong answer coinciding with the right
+one.
+
+**Accept.** `check build probe keyframe_probe geom_key_probe render_kf_probe
+audio_probe timeline_probe transform_probe opacity zorder render_live_probe
+keyed_export subtitle_probe parity parity_valgrind render_valgrind undo_valgrind`
+pass.
