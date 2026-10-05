@@ -50,6 +50,63 @@ render_kf_fill_flat :: proc(clip: ^Clip, p: Render_Geom_Prop) -> (flat: Render_K
 	return
 }
 
+// Static_Window_Case is one render_static_src_geom fixture. The spread matters
+// more than any single case: the invariant is that a clip's decode buffer is
+// bounded by the CANVAS whatever its scale, and the cases that catch a
+// regression are the extremes -- a huge box, a box far off-canvas, a degenerate
+// crop that collapses the region -- not the nominal one.
+Static_Window_Case :: struct {
+	name:      string,
+	src_w:     c.int,
+	src_h:     c.int,
+	canvas_w:  c.int,
+	canvas_h:  c.int,
+	scale:     f32,
+	tx, ty:    f32,
+	crop:      f32,
+}
+
+// static_window_cases returns the fixtures case I runs. The first three are the
+// project that failed (scale 27.777 far off-canvas, a 2.6x with a heavy crop, a
+// 1x filling the canvas); the rest are the edges: entirely off-canvas, a crop
+// that collapses the region, and a source larger than the canvas.
+static_window_cases :: proc() -> [6]Static_Window_Case {
+	return {
+		{
+			name = "27.777x off-canvas (the project that failed)",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 27.777141571044922, tx = 12216.802734375, ty = -6945.94140625,
+			crop = 0.610849142074585,
+		},
+		{
+			name = "2.594x with a heavy crop",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 2.593743324279785, tx = 1749.2490234375, ty = -36.69744873046875,
+			crop = 0.46571266651153564,
+		},
+		{
+			name = "1x filling the canvas",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 1.0, tx = 960, ty = 541, crop = 0,
+		},
+		{
+			name = "1x hanging off the right edge",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 1.0, tx = 2600, ty = 541, crop = 0,
+		},
+		{
+			name = "degenerate crop collapsing the region",
+			src_w = 1920, src_h = 1082, canvas_w = 1920, canvas_h = 1082,
+			scale = 1.0, tx = 960, ty = 541, crop = 0.999,
+		},
+		{
+			name = "4K source on a 1080p canvas",
+			src_w = 3840, src_h = 2160, canvas_w = 1920, canvas_h = 1080,
+			scale = 1.0, tx = 960, ty = 540, crop = 0,
+		},
+	}
+}
+
 render_kf_probe_run :: proc() -> int {
 	// Case A — transform.x keyed 0 @1 -> 100 @30; everything else rests at
 	// its base (tx/ty baseline 0, scale 1, no crops). Box == full stage.
@@ -349,6 +406,73 @@ render_kf_probe_run :: proc() -> int {
 			"H past the last key falls back to the resting base, not the last sample",
 		)
 		render_job.width, render_job.height = saved_w, saved_h
+	}
+
+	// Case I — static sizing: a clip's decode buffer is the region it can draw,
+	// not its box. These are the real numbers from the project that could not be
+	// exported at all: a 1920x1082 source at 27.777x on a 1920x1082 canvas, i.e.
+	// a 53332x30055 box (6.4 GB per RGBA buffer) to draw 1920x1082 pixels. The
+	// invariant is structural -- buffer within the canvas -- so it is pinned for
+	// a spread of scales rather than for one case.
+	for tc in static_window_cases() {
+		src := Render_Video_Src{
+			source_w = tc.src_w,
+			source_h = tc.src_h,
+			geom_base = kf_probe_base(1.0),
+		}
+		src.geom_base[int(Render_Geom_Prop.Trans_X)] = tc.tx
+		src.geom_base[int(Render_Geom_Prop.Trans_Y)] = tc.ty
+		src.geom_base[int(Render_Geom_Prop.Scale)] = tc.scale
+		src.geom_base[int(Render_Geom_Prop.Crop_R)] = tc.crop
+		render_static_src_geom(&src, tc.canvas_w, tc.canvas_h)
+		label := fmt.tprintf("I %s", tc.name)
+		render_kf_probe_check(
+			src.fw > 0,
+			"%s: clip must be drawable, got fw=%d",
+			label,
+			src.fw,
+		)
+		render_kf_probe_check(
+			src.fw <= tc.canvas_w && src.fh <= tc.canvas_h,
+			"%s: buffer must fit the canvas, got %dx%d for a %dx%d canvas",
+			label,
+			src.fw,
+			src.fh,
+			tc.canvas_w,
+			tc.canvas_h,
+		)
+		render_kf_probe_check(
+			src.ox >= 0 && src.oy >= 0 &&
+				src.ox + src.rw <= tc.canvas_w && src.oy + src.rh <= tc.canvas_h,
+			"%s: display rect (%d,%d %dx%d) must sit inside the canvas",
+			label,
+			src.ox,
+			src.oy,
+			src.rw,
+			src.rh,
+		)
+		render_kf_probe_check(
+			src.dec.crop_full_w == src.fw && src.dec.crop_full_h == src.fh,
+			"%s: allocation must be the window, got crop_full %dx%d vs buffer %dx%d",
+			label,
+			src.dec.crop_full_w,
+			src.dec.crop_full_h,
+			src.fw,
+			src.fh,
+		)
+		// The decoded source region must be a real sub-rect of the source frame:
+		// fractions past 1 would read off the end of it.
+		render_kf_probe_check(
+			src.dec.crop_fx0 >= 0 && src.dec.crop_fy0 >= 0 &&
+				src.dec.crop_fx0 + src.dec.crop_fw <= 1.0 + 0.0001 &&
+				src.dec.crop_fy0 + src.dec.crop_fh <= 1.0 + 0.0001,
+			"%s: crop region must lie inside the source frame, got f=(%.4f %.4f %.4f %.4f)",
+			label,
+			src.dec.crop_fx0,
+			src.dec.crop_fy0,
+			src.dec.crop_fw,
+			src.dec.crop_fh,
+		)
 	}
 
 	if render_kf_probe_fail {

@@ -4676,6 +4676,93 @@ Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
 
+## Active 21 — A clip scaled past the canvas asked the export for a multi-gigabyte box
+
+**Why:** rendering a project with a clip at `scale = 27.777` on a 1920x1082
+canvas died at setup with
+
+```
+[IMGUTILS] Picture size 53332x30055 is invalid
+av_image_alloc failed
+```
+
+`1920 * 27.777 = 53332` and `1082 * 27.777 = 30055` — the numbers are the
+clip's own box. `full_box_dims` returns `source * scale`, and every per-clip
+buffer in the static path was sized from that box: two `blit_slots` at
+`fw*fh*4`, the decoder's RGBA box, and the crop-inset resample scratch. ~19 GB
+to draw the 1920x1082 pixels actually on screen. FFmpeg refuses the size
+outright, so the export failed on a perfectly valid clip — the user could not
+render the project at all.
+
+It is NOT a Clip-POD regression, which was the first suspicion: the value is in
+the project bytes (CBOR, track 1 clip 5), save and load both copy `scale`
+verbatim (`project_file.odin`), and `git diff 2423686~1 0592ccc --
+project_file.odin` has no hunk touching any numeric clip field.
+
+**Fix — one rule, no threshold.** A static clip's decode buffer is the region
+it can actually draw: the crop window (the display rect, which
+`cropped_box_edges` has already resolved the crop insets into) clipped to the
+canvas. `render_static_src_geom` computes it, the decoder crops to it
+(`crop_dst` at 0,0 because the allocated box IS the window), and `render_blit`
+copies it 1:1.
+
+Nothing scales with the box any more, and there is no bound to tune: the 27.777x
+clip decodes a 69x39 source region into a 1920x1082 buffer, which is exactly
+what 27.777x of a 1920x1082 source shows on a 1920x1082 canvas. When the box
+happens to fit the canvas the window IS the box, so ordinary clips get the same
+numbers they always had — not "a second path that mostly agrees", just the same
+arithmetic.
+
+Two things this deleted rather than added:
+
+- **The crop-inset resample** (`crop_ctx` / `crop_scratch` / `crop_sx..sh` and
+  its `sws.scale` in `render_blit`). It existed to sample a crop window out of a
+  full-box buffer; the buffer is now the crop window, so the resample was a
+  1:1 copy wearing a bilinear kernel. `render_blit` is one region copy, and
+  `Render_Blit_Slot` no longer carries `crop_w/h` / `fit_ox/oy` to describe a
+  placement that is always the origin.
+- **The GPU-composite disqualification for cropped static clips.** It existed
+  because the sws bilinear kernel differs from `blit_box` on sub-pixel crops.
+  With no resample there is no kernel to disagree about, so static clips no
+  longer force the CPU canvas.
+
+The first attempt at this was wrong in shape and is worth recording: it gated
+windowing behind a `RENDER_CLIP_BUFFER_FACTOR = 4` threshold and, for keyed
+clips (whose stage is sampled per frame and so cannot be windowed), capped the
+stage scale instead — trading sharpness for memory behind a policy constant,
+with a second sizing path to keep it honest. The clip never had a memory
+*policy* problem; it had a buffer that was sized from the wrong rectangle. A
+threshold is also the tell that the invariant had not been found yet: it needed
+a carve-out for the case where the rule does not hold.
+
+**Steps.**
+- [x] S1. Characterization: decoded the project with `cbor2`, confirmed
+      `scale = 27.777141571044922` is stored rather than computed on load, and
+      confirmed the load path copies it verbatim with the POD commits never
+      touching numeric clip fields.
+- [x] S2. Fix. `render_static_src_geom` extracted from the worker's inline
+      setup (the sizing was otherwise unreachable from a probe at all).
+- [x] S3. Probe. `render_kf_probe` case I runs six `static_window_cases`
+      fixtures — the failing project clip, a 2.594x with a heavy crop, a 1x
+      filling the canvas, a clip hanging off an edge, a degenerate crop, and a
+      4K source on a 1080p canvas — asserting the buffer fits the canvas, the
+      display rect sits inside it, the allocation IS the window, and the crop
+      region lies within the source frame. The spread is the point: the
+      single-case version of this probe passed three of the four ways the old
+      sizing was wrong, because a 1x clip is the one case where box == window.
+
+**Probe / mutation.** `render_kf_probe`: ok. Restoring the box-sized allocation
+fails four of the six fixtures, the first with the user's exact numbers
+(`buffer must fit the canvas, got 53332x30055`). End to end on the real
+project: trimmed to frames 180..248 and then the full 1786 frames, both
+`Render complete`; the 27.777x clip logs `[dec] crop-render src(520,791 69x39)
+dst 1920x1082` where the old code asked for 53332x30055.
+
+**Accept.** `check build render_kf_probe keyed_export zorder parity timeline_probe
+render_live_probe dnd_probe gpu_probe opacity yuv_exact probe smoke
+render_valgrind` pass (valgrind 0 definitely/indirectly lost). Output is
+byte-identical to the previous fix on the trimmed range (716275 bytes both).
+
 ## Active 22 — The audio engine: a sample clock, a fixed block, and one mixer
 
 **Why:** three user-reported symptoms — the engine "dies", it "desyncs
