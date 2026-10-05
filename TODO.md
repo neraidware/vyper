@@ -6453,6 +6453,41 @@ at the boundary pass. Caught by asserting the identity case, which is the one th
 has to hold for every pre-conform project; `span: unpinned and rate-equal clips
 keep the identity window` fails on the revert.
 
+**The pin did not survive a save, so the fix did not work on any existing project.**
+Reported as `~/baby.vyproj` at auto vs 60fps being "completely different, 5 times
+faster". The source is a 12fps AV1 webm (ffprobe: `r_frame_rate=12/1`), so 60/12
+= 5 exactly — the conform was simply not applied, and the clip played at the
+project rate as before.
+
+The cause was not the conform. `Media_Asset.video_fps` was never added to the
+project file DTO, so every asset arrived at load with no rate, `pf_pin_src_fps`
+found nothing to pin from, and fell through to its last rung: the project rate.
+That is the 1:1 conform is defined against — so the pin silently degraded to
+precisely the thing it exists to override. `Media_Asset.audio_rate` IS persisted,
+for the same reason on the audio side; the new field was simply missing where its
+counterpart was not. A pin whose fallback is the defect is worse than no pin,
+because it looks like it is working.
+
+Two fixes:
+
+  - `video_fps` is persisted (DTO, save, load), so a project saved from now on
+    carries the exact probed rate.
+  - `pf_pin_src_fps` derives `frame_count / dur_us` as a middle rung, which is what
+    a project saved BEFORE the field exists carries — `frame_count` and `dur_us`
+    are both already in the file. The proxy scheduler derives its rate the same
+    way for exactly this reason. On `~/baby.vyproj` that yields 11.9928 against a
+    true 12: 0.06% fast, so a 219-frame clip drifts ~13ms over its whole length,
+    which is far below the frame quantization it has to survive anyway. Without
+    this rung every project already on disk keeps playing at the project rate.
+
+`timeline_probe` asserts the three rungs separately, because the middle one is
+the one that was missing and a test of the outer two passes while it is absent.
+The assertion is BEHAVIOURAL — one second of playback at 60fps must advance 12
+source frames — because a pin value can be correct while the mapping ignores it,
+and because the derived rate is not exactly 12, so pinning an index pair would be
+asserting the derived number instead of the speed. Reverting the middle rung
+fails with `one second at 60fps advanced 60.000 source frames, want 12`.
+
 **Also conformed: the probes that compute `expected` from the identity.** Five
 sites in `preview_probe_run` and `boundary_probe_run` derived the frame a slot
 "should" hold as `source_start + f - timeline_start`. They would have compared

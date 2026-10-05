@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:os"
 import sdl "vendor:sdl3"
 import "core:strings"
@@ -1432,7 +1433,120 @@ test_ripple_ignores_a_straddler :: proc() {
 	tl_assert_no_new_overlap(before)
 }
 
+// tl_pin_scene builds a one-video-clip project whose asset carries a probed rate
+// and a frame count, so pf_pin_src_fps has something to choose between. A probed
+// rate of 0 is the OLD-project case: frame_count and dur_us present, no rate.
+tl_pin_scene :: proc(probed: f64, frames, dur_us: i64) {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id = 9001, kind = .Video, frame_count = frames, dur_us = dur_us, video_fps = probed,
+		},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(&tl.clips, Clip{kind = .Video, asset_id = 9001, source_length_frames = frames})
+}
+
+// test_pin_src_fps covers the pin that decides a clip's SPEED on load.
+//
+// It exists because a saved project loaded with every clip at the PROJECT's
+// speed — a 12fps source in a 60fps project played 5x too fast, which is the
+// defect conform removes, reproduced exactly. The cause was not the conform: it
+// was Media_Asset.video_fps never being persisted, so every asset arrived at
+// load with no rate and pf_pin_src_fps fell through to the project rate, which
+// is the 1:1 that conform is defined against. A pin that silently degrades to
+// the thing it exists to override is worse than no pin.
+//
+// So the three rungs are asserted separately, and the middle one is the one that
+// was missing: a project saved before the field existed carries frame_count and
+// dur_us but no rate, and must still pin to the source rather than the project.
+test_pin_src_fps :: proc() {
+	ok := true
+	fail_msg := ""
+
+	saved_rate := project.frame_rate
+	saved_tracks := timeline.tracks
+	saved_assets := media_bin.assets
+	saved_order := timeline.track_order
+	defer {
+		project.frame_rate = saved_rate
+		timeline.tracks = saved_tracks
+		media_bin.assets = saved_assets
+		timeline.track_order = saved_order
+	}
+
+	// Rung 1: the probed rate, when the project has one.
+	project.frame_rate = 60.0
+	tl_pin_scene(12.0, 219, 18261000)
+	pf_pin_src_fps()
+	got := timeline.tracks[0].clips[0].src_fps
+	if math.abs(got - 12.0) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("probed rate ignored: pinned %v, want 12", got)
+	}
+
+	// Rung 2: an OLD project — frame_count/dur_us, no probed rate. This is the
+	// regression: it used to fall through to the project rate (60), which is a
+	// ratio of 1 and replays the 12fps source at 5x speed.
+	tl_pin_scene(0.0, 219, 18261000)
+	pf_pin_src_fps()
+	got = timeline.tracks[0].clips[0].src_fps
+	derived := 219.0 * 1e6 / 18261000.0
+	if math.abs(got - derived) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("old project pinned %v (project rate would be 60, derived %v)", got, derived)
+	}
+	// And the thing the user actually saw. Asserted as BEHAVIOUR over one second
+	// of playback rather than as a pair of frame indices: one second at 60fps is
+	// 60 timeline frames, and one second of a 12fps source is 12 source frames, so
+	// the clip must advance 12. A derived rate is 11.9928 rather than 12 (it comes
+	// from frame_count/dur_us), which is 0.06% fast, so the tolerance is a
+	// fraction of a frame rather than zero — pinning an exact index pair here
+	// would be asserting the derived value, not the speed.
+	if math.abs(derived - 12.0) / 12.0 > 0.005 {
+		ok = false
+		fail_msg = fmt.tprintf("derived rate %v is not within 0.5%% of the source's 12", derived)
+	}
+	advanced := f64(clip_source_frame(0, 0, 60, false, got))
+	if math.abs(advanced - 12.0) > 0.2 {
+		ok = false
+		fail_msg = fmt.tprintf(
+			"one second at 60fps advanced %.3f source frames, want 12 — the 5x-too-fast defect",
+			advanced,
+		)
+	}
+
+	// Rung 3: nothing characterisable — the project rate, reproducing 1:1 so a
+	// project we cannot measure behaves as it did before.
+	tl_pin_scene(0.0, 0, 0)
+	pf_pin_src_fps()
+	got = timeline.tracks[0].clips[0].src_fps
+	if math.abs(got - 60.0) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("unmeasurable source pinned %v, want the project rate 60", got)
+	}
+
+	// An ALREADY-pinned clip is left alone: re-pinning must not move a clip whose
+	// rate the file recorded, or every reload would rewrite authored speeds.
+	tl_pin_scene(0.0, 219, 18261000)
+	timeline.tracks[0].clips[0].src_fps = 24.0
+	pf_pin_src_fps()
+	got = timeline.tracks[0].clips[0].src_fps
+	if math.abs(got - 24.0) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("re-pin overwrote an authored rate: %v, want 24", got)
+	}
+
+	tl_probe_check(ok, "src_fps pin: probed rate, old-project derive, unmeasurable fallback, no re-pin [%s]", fail_msg)
+}
+
 timeline_probe_run :: proc(_: string) {
+	tl_scene()
+	test_pin_src_fps()
+	fmt.println("[tl-probe] pin-src-fps ok")
 	tl_scene()
 	test_cut_resolves_playhead()
 	fmt.println("[tl-probe] cut-resolves ok")

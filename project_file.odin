@@ -53,6 +53,13 @@ Saved_Asset :: struct {
 	metadata:      string,
 	frame_count:   i64,
 	dur_us:        i64,
+	// video_fps persists the asset's probed source rate. Not optional bookkeeping:
+	// Clip.src_fps is pinned from it at load, so an asset arriving without one
+	// pins its clips to the PROJECT rate and they go back to playing at the
+	// project's speed — the exact defect conform removes. audio_rate is persisted
+	// for the same reason on the audio side; this field being absent while that
+	// one exists is what let a saved project load with every clip 5x too fast.
+	video_fps:     f64,
 	src_w:         c.int,
 	src_h:         c.int,
 	audio_streams: c.int,
@@ -220,6 +227,7 @@ project_to_file :: proc() -> Project_File {
 			metadata      = a.metadata,
 			frame_count   = a.frame_count,
 			dur_us        = a.dur_us,
+			video_fps     = a.video_fps,
 			src_w         = a.src_w,
 			src_h         = a.src_h,
 			audio_streams = a.audio_streams,
@@ -392,6 +400,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				metadata      = strings.clone(sa.metadata),
 				frame_count   = sa.frame_count,
 				dur_us        = sa.dur_us,
+				video_fps     = sa.video_fps,
 				src_w         = sa.src_w,
 				src_h         = sa.src_h,
 				audio_streams = sa.audio_streams,
@@ -574,9 +583,18 @@ pf_pin_audio_src_rates :: proc() {
 // unrecoverable, so a project that does not pin here is a project whose clips
 // silently change speed the first time the user touches the frame rate.
 //
-// Preference order: the asset's own probed rate (exact — it is the rate the
-// source actually has), else the project's effective rate at load, which
-// reproduces the pre-pin 1:1 exactly and so leaves such projects as they were.
+// Preference order, most to least trustworthy:
+//
+//  1. the asset's probed rate — exact, and what a project saved with the field
+//     carries;
+//  2. frame_count / dur_us — what a project saved BEFORE the field existed
+//     carries. The proxy scheduler already derives its rate this way for exactly
+//     this reason (proxy.odin). It is the difference between a project that
+//     conforms and one that does not: without this rung every project already on
+//     disk pins to the project rate and plays at the project's speed, which is
+//     the defect conform exists to remove;
+//  3. the project's effective rate — reproduces the pre-pin 1:1 exactly, for a
+//     source that cannot be characterised at all.
 pf_pin_src_fps :: proc() {
 	rate := project_fps()
 	for ti in 0 ..< len(timeline.tracks) {
@@ -586,8 +604,12 @@ pf_pin_src_fps :: proc() {
 				continue
 			}
 			pinned := rate
-			if as := find_asset(c.asset_id); as != nil && as.video_fps > 0 {
-				pinned = as.video_fps
+			if as := find_asset(c.asset_id); as != nil {
+				if as.video_fps > 0 {
+					pinned = as.video_fps
+				} else if as.frame_count > 0 && as.dur_us > 0 {
+					pinned = f64(as.frame_count) * 1e6 / f64(as.dur_us)
+				}
 			}
 			c.src_fps = pinned
 		}
