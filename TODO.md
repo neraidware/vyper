@@ -184,11 +184,41 @@ Steps (each lands + probe + vet before the next):
       duration defines the file's length, so this closes the audio to the grid
       instead of inventing time.
 
-      Measured: 1428480 -> 1429504 samples, i.e. the full 1428800-sample grid plus
-      the 704 samples of AAC frame padding a 1024-sample codec requires
-      (1396 frames). Nothing is lost, and the audio now covers the video instead
-      of ending before it. An eleventh clip region became checkable as a direct
-      consequence -- the one at frame 1699 was falling off the truncated end.
+      **Padding alone was not the fix, and shipping it as though it was would have
+      been a regression dressed as a repair.** With the tail padded, the track held
+      1396 AAC frames = 1429504 samples, and a container's duration comes from its
+      LONGEST stream -- so the file reported 29.781333s of audio against
+      29.766667s of video and outlasted its own picture by exactly the padding. The
+      audio had stopped being short and become long, which a player shows as a
+      frozen last frame and an encoder that ends on silence.
+
+      The duration is therefore clamped to the samples the MIX produced:
+      `e.audio_real` counts real sample-frames (never the flush padding), and
+      `enc_drain` shortens the one packet that straddles `audio_real` to the real
+      remainder. It has to be done on the packet: the mp4 muxer ACCUMULATES packet
+      durations into the track duration and overwrites `AVStream.duration` with the
+      result, so setting the stream afterwards writes to a field already recomputed
+      and setting it beforehand does nothing.
+
+      Two attempts are worth not repeating. Clamping `pts >= audio_real` looks right
+      and clamps nothing, because the padding sits INSIDE the last encoded frame --
+      that packet's PTS is still below the real sample count, so the test never
+      fires. The condition is `pts + AAC_FRAME_SIZE > audio_real`: the packet that
+      CONTAINS the boundary.
+
+      Measured on `~/sallyface.vyproj`, 60fps, grid 1786*800 = 1428800 samples:
+
+      | | before | padded only | now |
+      |---|---|---|---|
+      | audio stream duration | 29.760000s | 29.781333s | **29.766667s** |
+      | video stream duration | 29.766667s | 29.766667s | 29.766667s |
+      | container duration | 29.760000s | 29.781333s | **29.766667s** |
+      | samples vs grid | -320 | +704 | **0** |
+
+      Exact in both directions: no real sample dropped, no phantom sample claimed,
+      and every stream agrees with the frame grid. An eleventh clip region became
+      checkable when the truncation stopped eating it -- the one at frame 1699 --
+      and all 11 sit at lag 0 with 0 holes where sound is due.
 
 - [ ] S6b. **A6** — render preroll + sample-domain counters.
       Not started. `AUDIO_SEEK_PREROLL_SEC` is still 0 for the export: the first

@@ -1906,7 +1906,15 @@ Render_Enc :: struct {
 	// every 30 fps render).
 	audio_pending:   [MAX_AUDIO_FRAME_SAMPLES * 2 + AAC_FRAME_SIZE * 2]f32,
 	audio_pending_n: int,
-	audio_sent:      i64, // total 48k samples pushed so far (pts basis)
+	audio_sent:      i64, // total 48k samples handed to the encoder (pts basis)
+	// audio_real counts only the samples the MIX produced, so it excludes the
+	// silence the flush pads the tail with. The difference is what the audio track
+	// claims as its duration, and it is not a cosmetic number: FFmpeg derives a
+	// container's duration from the LONGEST stream, so without this the padded
+	// tail makes the file claim more audio than it has and longer than its own
+	// video. Counting only the sent samples is what makes the container report the
+	// frame grid.
+	audio_real:      i64,
 }
 
 enc_cleanup :: proc(e: ^Render_Enc) {
@@ -1972,6 +1980,35 @@ enc_drain :: proc(
 		pkt.pts = avutil.rescale_q(pkt.pts, ctx.time_base, stream.time_base)
 		pkt.dts = avutil.rescale_q(pkt.dts, ctx.time_base, stream.time_base)
 		pkt.duration = avutil.rescale_q(pkt.duration, ctx.time_base, stream.time_base)
+		// Clamp the audio packet carrying flush padding to the real sample count.
+		//
+		// This has to be done HERE, on the packet, and not on AVStream.duration
+		// afterwards: the mp4 muxer ACCUMULATES packet durations into the track
+		// duration and then overwrites AVStream.duration with the result. Setting it
+		// afterwards writes to a field the muxer has already recomputed; setting it
+		// beforehand does nothing, because packets overwrite it.
+		//
+		// It matters because a container's duration comes from its LONGEST stream.
+		// With every packet claiming a whole 1024-sample AAC frame, the padded tail
+		// claimed audio that is not there -- ~/sallyface.vyproj reported 29.781333s
+		// of audio against 29.766667s of video, so the file outlasted its own
+		// picture by exactly the padding. Before the padding existed the same
+		// mismatch pointed the other way and DROPPED 320 real samples, which is
+		// worse. This makes the duration exact in both directions.
+		if stream == e.astream && e.audio_real > 0 {
+			pts_samples := avutil.rescale_q(pkt.pts, stream.time_base, {num = 1, den = 48000})
+			// The packet that CONTAINS audio_real, not the one after it: the
+			// padding sits inside the last encoded frame, so its PTS is still below
+			// the real sample count. Testing pts >= audio_real therefore never fires,
+			// which is the version that looked right and clamped nothing.
+			if pts_samples + AAC_FRAME_SIZE > e.audio_real {
+				pkt.duration = avutil.rescale_q(
+					e.audio_real - pts_samples,
+					{num = 1, den = 48000},
+					stream.time_base,
+				)
+			}
+		}
 		if ret := avfmt.interleaved_write_frame(e.fmt_ctx, pkt); ret < 0 {
 			fmt.println("interleaved_write_frame:", ff_err_str(ret))
 			avcodec.packet_unref(pkt)
@@ -2531,6 +2568,7 @@ enc_send_pending_audio :: proc(e: ^Render_Enc) -> bool {
 // rend_enc_push_audio stages an interleaved stereo chunk and flushes full AAC
 // frames to the encoder.
 rend_enc_push_audio :: proc(e: ^Render_Enc, mix: []f32) -> bool {
+	e.audio_real += i64(len(mix) / 2)
 	// Copy into pending, converting zeros already in place.
 	for s in mix {
 		e.audio_pending[e.audio_pending_n] = s
