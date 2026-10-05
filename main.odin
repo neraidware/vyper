@@ -1803,6 +1803,10 @@ main :: proc() {
 		render_test_run(test_paths)
 		return
 	}
+	if pe_ok, pe_paths := render_project_export_env(); pe_ok {
+		render_project_export(pe_paths)
+		return
+	}
 	parity_probe_env()
 	if hw_probe, _ := os.lookup_env_alloc("VYPER_HW_PROBE", context.temp_allocator); hw_probe != "" {
 		preview_hw_probe_run(hw_probe)

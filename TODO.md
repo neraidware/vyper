@@ -5369,9 +5369,11 @@ future regression cannot hide behind green telemetry the way `1a38d78` did.
       Gates: check build parity audio_probe keyed_export render_kf_probe
       timeline_probe render_live_probe yuv_exact probe smoke render_valgrind.
 
-- [ ] S3. **A3** — mix on its own thread with a cushion. Probe: the export's
-      silence-run count goes to zero on `~/sallyface.vyproj`, which is the
-      measured defect this whole section exists to close.
+- [x] S3. **A3** — mix on its own thread with a cushion. **MEASURED 2026-10-05:
+      the defect is closed.** `scripts/gate.sh audio_export_audit` exports the
+      real project and counts silence runs: **0 dropouts, 4 faithful runs**
+      (was 133 mid-clip dropouts, 1961 ms). See the note below on what it took
+      to make that number re-measurable at all.
 - [ ] S4. **A4** — declick ramps. Probe: assert no inter-sample step exceeds the
       local peak across a clip boundary or a simulated hole.
 - [ ] S5. **A5** — edit generations. Probe: a burst of N edits produces O(1)
@@ -5691,3 +5693,71 @@ it is the only remaining duplication I would argue for keeping.
 **Accept.** `check build probe transform_probe subtitle_probe geom_key_probe
 render_kf_probe keyframe_probe opacity gpu_probe parity keyed_export` pass;
 `parity_valgrind render_valgrind` clean.
+
+## Active 28 — The audio defect could not be re-measured, so "closed" was unfalsifiable
+
+**Why:** Active 22's S3/A3 is the step carrying the whole audio section: 133
+mid-clip dropouts, 1961 ms, 6.6% of the timeline, 266 clicks. Its code shipped
+and merged. Its acceptance criterion — "the export's silence-run count goes to
+zero on `~/sallyface.vyproj`" — was never run, and could not be: every audio gate
+(`audio_probe`, `audio_rate_probe`, `atempo_probe`) synthesizes its own WAV and
+builds its own timeline. A synthetic timeline cannot reproduce a defect that needs
+12 video sources, 5 stacked audio tracks and 17 splits. So the one number that
+decides whether the audio rework is done had no path to being produced, which
+means "A3 shipped" and "the dropouts are gone" were the same sentence, and only
+the first was evidence of anything.
+
+This is the same shape as the text-keyframe bug found in Active 24: a defect real
+workloads hit that the suite structurally cannot see, sitting behind a checklist
+box that looked like progress.
+
+Steps:
+- [x] S1. `VYPER_PROJECT_EXPORT="<project.vyproj>|<out>"` — open a project and
+      export it unchanged. `VYPER_RENDER_TEST` only IMPORTS a media file, so it
+      can only ever export a timeline the probe builds itself, which is exactly
+      what cannot show this defect.
+- [x] S2. `scripts/audio_silence_audit.py` counts digital-silence runs in the
+      exported mix and, for each one, maps it back through the audio clips' own
+      (timeline_start, source_start) pairs into the source files and measures
+      whether THEY are silent there. A run the sources contain is FAITHFUL; a run
+      they do not is a DROPOUT and fails.
+- [x] S3. `scripts/gate.sh audio_export_audit` runs both. Advisory rather than a
+      member of `all`: the project is machine-local, so it SKIPs when absent
+      rather than breaking the suite.
+
+**The result.** 0 dropouts. 4 silence runs totalling 3319 ms, every one of them
+a passage the sources are genuinely silent through (source peaks 0/1/0/4 against a
+floor of 64) — the recording is a screen capture of a mostly-silent room, so a
+naive silence count reports the room's own quiet as engine faults. The 133-run
+defect is closed.
+
+**Why the cross-reference is the whole target.** The first version of the audit
+counted zero-sample runs and called them dropouts: 4 "failures". All four were the
+engine faithfully reproducing the source's own silence. A gate that reports a
+correct export as broken trains its reader to ignore it, and a gate that skips the
+cross-reference cannot tell a fix from a coincidence. Three things had to be right
+for the verdict to mean anything, and each was found by the audit disagreeing with
+a hand check:
+
+- **Classify by PEAK, not by zero count.** The sources are not bit-silent: they
+  carry a dither tail around -60 dBFS, so `all(samples == 0)` is false for a
+  genuinely silent stretch. The floor is 64 (-54 dBFS).
+- **Probe the run's own span from its START.** Mapping the midpoint and extending
+  by the full run length overshoots by half the run, so the probe window runs past
+  the hole into the audio after it and reports a faithful passage as a dropout.
+- **Probe the source, not an asset filter.** A screen recording is a VIDEO file
+  with five audio streams inside it. Indexing only the assets the app classifies
+  as audio drops exactly the assets under test, and every run then reports
+  "source probe unavailable" — which reads as a pass. An audit that cannot fail
+  is worse than no audit.
+
+**Still open, now measured rather than assumed.** The export emits **1428800
+samples against a 1787-frame range at 60 fps, which wants 1429600** — short by
+exactly one frame (800 samples). The original figure in this section was 468
+frames short, so this is A6's tail padding most of the way closed, with a
+one-frame remainder that the audit now reports on every run. A4 (declick) and A5
+(edit generations) are untouched and remain the real work.
+
+**Mutation.** Lowering `SILENCE_PEAK_FLOOR` below the sources' dither tail flips
+the verdict and the gate exits 1, so the "0 dropouts" is a measurement and not a
+constant.

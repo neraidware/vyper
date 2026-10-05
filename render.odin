@@ -5003,6 +5003,92 @@ render_test_env :: proc() -> (bool, [2]string) {
 	return true, res
 }
 
+// render_project_export_env reads VYPER_PROJECT_EXPORT="<project.vyproj>|<out>":
+// open a project file and export it unchanged.
+//
+// The reason this exists: VYPER_RENDER_TEST IMPORTS a media file, so it can
+// only ever export a timeline this probe builds itself, and a self-built timeline
+// is exactly what cannot show a defect that depends on the real workload. The
+// audio engine's 133 mid-clip dropouts were measured on ~/sallyface.vyproj
+// (12 video sources, 5 stacked audio tracks, splits) and no synthetic fixture
+// reproduces them -- audio_probe, audio_rate_probe and atempo_probe all build
+// their own, so the one number that decided whether the audio rework was done
+// had no way to be re-measured. That is the same shape as the text-keyframe
+// bug: a defect real workloads hit that the suite structurally cannot see.
+render_project_export_env :: proc() -> (bool, [2]string) {
+	v, _ := os.lookup_env_alloc("VYPER_PROJECT_EXPORT", context.allocator)
+	if v == "" {
+		return false, [2]string{}
+	}
+	parts := strings.split(v, "|")
+	defer delete(parts)
+	res: [2]string
+	if len(parts) >= 2 {
+		res[0] = parts[0]
+		res[1] = parts[1]
+	}
+	return true, res
+}
+
+// render_project_export opens a project and exports it, standing in for the UI
+// thread exactly as render_test_run does after its own render_start.
+render_project_export :: proc(paths: [2]string) {
+	if len(paths[0]) == 0 || len(paths[1]) == 0 {
+		fmt.println("project-export: need VYPER_PROJECT_EXPORT=\"<project.vyproj>|<out>\"")
+		os.exit(2)
+	}
+	// Same reason render_test_run loads the font: dispatched before main's
+	// load_font_data, so exporting a text clip would read out of bounds.
+	if !load_font_data() {
+		fmt.println("project-export FAIL: could not load font data")
+		os.exit(3)
+	}
+	if oerr := project_file_open(paths[0]); oerr != "" {
+		fmt.println("project-export FAIL:", oerr)
+		os.exit(3)
+	}
+	sync_track_order()
+	fmt.println("project-export: opened", paths[0])
+	// The grid rate, for the audit script. The project file saves frame_rate 0.0
+	// to mean "inherit", so it cannot be read back from the .vyproj, and
+	// deriving it from the export's sample count is circular -- the export is
+	// short by exactly the tail padding the audit also measures, so a short
+	// export reports a slightly-high grid and every frame->source lookup lands
+	// late. The app knows its own rate; say it.
+	fmt.println(
+		"project-export: grid rate",
+		project_fps(),
+		"start",
+		project.start_frame,
+		"end",
+		project.end_frame,
+	)
+	render_set_out_path(paths[1])
+	render_output.overwrite = true
+	render_start()
+	// Stand in for the UI thread: clear the "UI drew a frame" gate the live sink
+	// publishes against, then drain the mailbox so the publish path executes.
+	sync.atomic_store(&render_live.shown, true)
+	// A real consumer buffer, because the live mailbox is DROP-on-full: draining
+	// into nil would claim frames without ever copying them, and the point of
+	// standing in for the UI here is only to keep the worker from stalling on a
+	// mailbox nobody reads. Sized after render_start, which is what set the
+	// output dims. Job-arena ownership: freed before this returns.
+	buf := make([]u8, int(render_live.w) * int(render_live.h) * 4)
+	defer delete(buf)
+	for render_is_busy() {
+		time.sleep(50 * time.Millisecond)
+		_, _, _, _ = render_live_drain(buf)
+	}
+	poll_completed_thread()
+	fmt.println("project-export status:", render_status_text())
+	st := render_status()
+	if st != .Done && st != .Failed {
+		fmt.println("project-export FAIL: export did not reach a terminal state")
+		os.exit(3)
+	}
+}
+
 render_test_run :: proc(paths: [2]string) {
 	if len(paths[0]) == 0 || len(paths[1]) == 0 {
 		fmt.println("render-test: need VYPER_RENDER_TEST=\"<in>|<out>\"")
