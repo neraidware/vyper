@@ -658,6 +658,155 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 		)
 		return false
 	}
+
+	// --- the reconcile itself -----------------------------------------------------
+	//
+	// The burst above proves edits do not each tear the stream down. It cannot show
+	// that any decoder SURVIVED one, which is the whole point of the change: a
+	// reconcile that quietly reopens everything looks exactly like this from the
+	// outside. So drive the two decisions directly and count them.
+	//
+	// A clean single clip first. The burst left the timeline fragmented into several
+	// non-contiguous runs of the same file, which is several GROUPS and therefore
+	// several decoders by construction -- a fine thing for the engine to do and a
+	// useless thing to measure a single decision against.
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	recon_track := Track {
+		name = "a",
+		clips = make([dynamic]Clip, 0, 2),
+	}
+	append(&recon_track.clips, Clip {
+		clip_id = new_clip_id(),
+		path = cpath,
+		kind = .Audio,
+		name = session_str_intern("audio"),
+		timeline_start_frame = 0,
+		source_length_frames = 240,
+		source_start_frame = 0,
+		stream_index = 0,
+	})
+	// A SECOND group, non-contiguous with the first, so the timeline has two
+	// source slots rather than one. That is what makes the reclaim path
+	// observable: with a single source the builder's fresh allocation lands on
+	// the very slot holding the decoder, so a build that ignored reclaim entirely
+	// would still produce Keep/Open counts that look correct. Two slots and the
+	// fresh allocation has somewhere else to go.
+	append(&recon_track.clips, Clip {
+		clip_id = new_clip_id(),
+		path = cpath,
+		kind = .Audio,
+		name = session_str_intern("audio2"),
+		timeline_start_frame = 800,
+		source_length_frames = 240,
+		source_start_frame = 400,
+		stream_index = 0,
+	})
+	append(&timeline.tracks, recon_track)
+	sync_track_order()
+	playhead.frame = 0
+	audio_note_edit()
+	sleep_ms(300)
+
+	// Park the clip ahead of everything the queue holds, so the edits below are
+	// unambiguously OUTSIDE the queued window. Moving it there is itself an edit,
+	// and it legitimately clears the queue -- the audio already mixed for frames
+	// under the playhead came from where the clip used to be. That clear is
+	// settled here, not asserted.
+	timeline.tracks[0].clips[0].timeline_start_frame = 200
+	audio_note_edit()
+	sleep_ms(300)
+
+	// (a) An edit outside the queued window that does not move the content the
+	// decoder sits on: trim the far end of a clip the playhead is nowhere near.
+	// Right answer: Keep, and no queue clear.
+	kept0, open0, clr0 := audio_rpt.dec_kept, audio_rpt.dec_open, audio_rpt.queue_clears
+	new0 := audio_rpt.slots_new
+	timeline.tracks[0].clips[0].source_length_frames -= 10
+	audio_note_edit()
+	sleep_ms(300)
+	keep_ok := audio_rpt.dec_kept > kept0
+	no_open := audio_rpt.dec_open == open0
+	no_clear := audio_rpt.queue_clears == clr0
+	// The decoder was kept only if the new segments were built INTO ITS SLOT. A
+	// fresh allocation would leave the real decoder empty and dropped, and the
+	// counts above would still read Keep/Open correctly by accident -- so pin the
+	// mechanism, not just the outcome.
+	no_new_slot := audio_rpt.slots_new == new0
+	fmt.printf(
+		"[ap] trim outside the queued window: kept +%d opened +%d new-slots +%d queue-clears +%d\n",
+		audio_rpt.dec_kept - kept0,
+		audio_rpt.dec_open - open0,
+		audio_rpt.slots_new - new0,
+		audio_rpt.queue_clears - clr0,
+	)
+	if !keep_ok || !no_open || !no_clear || !no_new_slot {
+		if !keep_ok {
+			fmt.println("[ap] FAIL: a trim that moved no content did not keep the decoder (it re-anchored instead)")
+		}
+		if !no_open {
+			fmt.println("[ap] FAIL: a trim outside the queued window reopened a decoder")
+		}
+		if !no_clear {
+			fmt.println("[ap] FAIL: a trim outside the queued window cleared the queue")
+		}
+		if !no_new_slot {
+			fmt.println("[ap] FAIL: a kept decoder's segments were built in a FRESH slot, so the real one was dropped")
+		}
+		return false
+	}
+
+	// (b) An edit that DOES move the content under the playhead. Same stream, so
+	// Seek -- never Open, because a seek costs one reposition and an open costs a
+	// file open.
+	// Move the playhead INTO the clip and PUBLISH the anchor, not just the
+	// playhead: a reconcile anchors at audio_prod.anchor_frame, which only
+	// audio_seek sets, so moving the playhead alone leaves the engine reconciling
+	// against wherever it was last told to look.
+	playhead.frame = 200
+	audio_seek(200)
+	sleep_ms(300)
+	seek1, open1 := audio_rpt.dec_seek, audio_rpt.dec_open
+	timeline.tracks[0].clips[0].source_start_frame += 30
+	audio_note_edit()
+	sleep_ms(300)
+	seek_ok := audio_rpt.dec_seek > seek1
+	seek_no_open := audio_rpt.dec_open == open1
+	fmt.printf(
+		"[ap] edit under the playhead: sought +%d opened +%d\n",
+		audio_rpt.dec_seek - seek1,
+		audio_rpt.dec_open - open1,
+	)
+	if !seek_ok || !seek_no_open {
+		if !seek_ok {
+			fmt.println("[ap] FAIL: moving the content under the playhead kept a decoder at the old content")
+		}
+		if !seek_no_open {
+			fmt.println("[ap] FAIL: moving the content under the playhead reopened instead of seeking")
+		}
+		return false
+	}
+
+	// The queue-clear half of a resync cannot be asserted here: whether the queue
+	// holds anything is decided by the audio DEVICE, and this probe runs without
+	// one, so the producer never fills and next_frame never leaves 0. Asserting a
+	// counter that cannot move would be a test that passes for the wrong reason.
+	// The predicate that decides it is pure, so pin that directly -- and note it
+	// is half of a resync, the half a user actually hears.
+	wsrc: Play_Src
+	wsrc.seg[0] = Play_Seg{start_a = 200, len_a = 240}
+	wsrc.seg_count = 1
+	window_ok := !play_src_touches_window(&wsrc, 0, 8) &&
+		play_src_touches_window(&wsrc, 200, 208) &&
+		!play_src_touches_window(&wsrc, 440, 500) &&
+		play_src_touches_window(&wsrc, 430, 500)
+	if !window_ok {
+		fmt.println("[ap] FAIL: the queued-window predicate disagrees about a segment spanning [200,440)")
+		return false
+	}
+	fmt.println("[ap] queued-window predicate ok (ahead / covering / behind / abutting)")
+
+	fmt.printf("[ap] reconcile: kept/decisions verified on the live producer\n")
 	return true
 }
 

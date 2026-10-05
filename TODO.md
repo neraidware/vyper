@@ -196,6 +196,81 @@ Steps (each lands + probe + vet before the next):
       so the opening samples of every clip are whatever the decoder happened to
       return there.
 
+- [x] S5. **A5** — edit generations: reconcile instead of re-provision. Shipped.
+
+      What it was: `audio_note_edit` -> `audio_seek` -> `resync` made the producer
+      call `audio_device_clear()` and `audio_provision`, and provisioning calls
+      `audio_reset_play()` and reopens EVERY decoder synchronously. Its own comment
+      prices that at "hundreds of ms once several sources are open". So moving or
+      trimming ONE clip restarted the whole audio stream. That is the reopen-cost
+      class that dominates the 37-commit history (10 of 37 commits), and it is the
+      single largest responsiveness defect left in playback.
+
+      Gain already had this treatment (`gain_epoch` / `audio_gain_fold`, which fold
+      new gains into provisioned segments in place so a knob drag needs no reopen).
+      Edits did not. S5 gives geometry the same mechanism.
+
+      **The whole design is one comparison.** A decoder is a forward-only stream over
+      CONTENT positions, so it stays valid exactly when the content position it sits
+      at is unchanged (`play_src_content_at`). Everything else about a source --
+      where its segments start and end in the timeline, how long they are, their
+      gains -- is metadata the mix re-reads every frame. So `audio_reconcile`
+      snapshots each decoder's anchor, rebuilds the segment lists, and picks one of
+      three actions per source: `Keep` (content unmoved -- decoder, its fifo and the
+      audio already in that fifo are all still correct), `Seek` (same stream, wrong
+      content -- re-anchor the existing decoder), `Open` (a stream with no decoder).
+
+      **The queue clear is the half a user hears, and it is now separate.** A
+      reconcile can keep every decoder and still have to drop the device queue,
+      because the queue holds audio mixed for the OLD geometry. So the clear is
+      driven by `touched_window` -- whether any source's segments, old or new,
+      overlap the frames the queue covers -- rather than by the reopen happening.
+      That is the one piece of behaviour that genuinely changed for the worse in
+      shape and better in cost: before, the clear was unconditional.
+
+      **The bug worth recording.** `audio_build_groups` has always matched a chip to
+      a group by (path, stream) plus contiguity with that group's LAST SEGMENT. A
+      reconcile clears every `seg_count` before rebuilding, so that match finds
+      nothing and each group was built in a FRESH slot at the end -- leaving the slot
+      holding the real decoder empty and dropped. The reconcile then reported `Open`
+      for every source and looked, from the outside, exactly like the re-provision it
+      replaced. `find_group` now also RECLAIMS a slot the pass emptied that already
+      holds a decoder for that stream, and the probe pins the mechanism with a
+      fresh-allocation counter rather than trusting the Keep/Open counts, which read
+      correctly by accident when there was only one source.
+
+      **Probe** (`audio_probe`, on the real producer thread, real decoders):
+        - the burst of 8 edits now costs **0** re-provisions (it asserted <= 1);
+        - an edit outside the queued window that moves no content: `kept +2,
+          opened +0, new-slots +0` -- and a second, non-contiguous group is what
+          makes that observable, since with one source a fresh allocation lands on
+          the decoder's own slot and the counts look right even when reclaim is
+          deleted;
+        - an edit that moves the content under the playhead: `sought +1,
+          opened +0` -- seeked, never reopened, which is the point of having three
+          actions instead of two;
+        - `play_src_touches_window` pinned directly on a segment spanning
+          [200,440): ahead / covering / behind / abutting.
+      Mutations, all caught: always-Keep, reclaim loop deleted, window predicate
+      forced false, content compared against a constant.
+
+      **What the probe does NOT cover, stated rather than implied.** The
+      queue-clear counter is asserted by the pure predicate rather than live,
+      because whether the queue holds anything is the audio DEVICE's business and
+      `audio_probe` runs without one -- the producer never fills, `next_frame`
+      never leaves 0, and a live assertion there would pass for the wrong reason.
+      And an earlier version of this probe asserted the queue clear live and
+      failed: not because the engine was wrong but because moving the playhead
+      without calling `audio_seek` leaves the reconcile anchoring at a stale
+      `anchor_frame`. Worth knowing before writing the next probe against this
+      path.
+
+- [ ] S6b. **A6** — render preroll + sample-domain counters.
+      Not started. `AUDIO_SEEK_PREROLL_SEC` is still 0 for the export: the first
+      block of a clip can begin at a sample the AAC seek did not land on exactly,
+      so the opening samples of every clip are whatever the decoder happened to
+      return there.
+
 - [ ] S5. **A5** — edit generations. **Not started, deliberately.**
 
       What it is: today `audio_note_edit` -> `audio_seek` -> `resync` makes the
