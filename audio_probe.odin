@@ -1511,6 +1511,9 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	mix_exp: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	worst, worst_frame := f32(0), i64(-1)
 	first_bad := i64(-1)
+	first_bad_i := -1
+	bad_play, bad_exp := f32(0), f32(0)
+	bad_run := 0
 	mixed_samples := i64(0)
 	for f in 0 ..< total_frames {
 		b0 := audio_frame_boundary48(f, fps)
@@ -1570,10 +1573,26 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 				worst = d
 				worst_frame = f
 			}
-			if d > 0.0001 {
-				if first_bad < 0 {
-					first_bad = f
+			if d > 0.0001 && first_bad < 0 {
+				first_bad = f
+				// WHERE inside the frame, and what the two actually hold there. The
+				// index is the whole diagnosis in one number: 0 means the block
+				// ORIGIN is wrong, a large index means the origin was right and the
+				// content drifted partway through, and a value pair that is the
+				// same waveform offset by a whole frame means one sink is a frame
+				// behind rather than misaligned.
+				first_bad_i = i
+				bad_play = mix_play[i]
+				bad_exp = mix_exp[i]
+				// How far does the disagreement RUN? One sample is a rounding
+				// boundary; a run to the end of the frame is a shifted origin.
+				run := 0
+				for j in i ..< spf * 2 {
+					if math.abs(mix_play[j] - mix_exp[j]) > 0.0001 {
+						run += 1
+					}
 				}
+				bad_run = run
 				break
 			}
 		}
@@ -1601,6 +1620,16 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 		)
 		b0 := audio_frame_boundary48(first_bad, fps)
 		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(first_bad+1, fps) - b0)))
+		fmt.printf(
+			"[ap] drift:   first bad at sample index %d of %d (ch=%d) play=%.6f exp=%.6f, run=%d samples differ\n",
+			first_bad_i, spf, first_bad_i % 2, bad_play, bad_exp, bad_run,
+		)
+		b1 := audio_frame_boundary48(first_bad + 1, fps)
+		prev_len := b0 - audio_frame_boundary48(first_bad - 1, fps)
+		fmt.printf(
+			"[ap] drift:   frame bounds [%d,%d) len=%d; prev frame len=%d\n",
+			b0, b1, b1 - b0, prev_len,
+		)
 		fmt.printf("[ap] drift:   play[0:4]=%v\n", mix_play[:4])
 		fmt.printf("[ap] drift:   exp[0:4]=%v\n", mix_exp[:4])
 		best, best_shift := f32(1e30), 0

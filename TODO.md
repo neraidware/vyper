@@ -6068,6 +6068,33 @@ shift -432 and 30 with -585, against 60 fps still bit-identical.
 Ruled out along the way: the frame mix buffer is `MAX_AUDIO_FRAME_SAMPLES = 4096`,
 sized for 12 fps, so a 1601-sample NTSC frame is not being truncated.
 
+**The divergence is now located to a boundary.** At 29.97, frame 2 spans
+`[3203,4804)` (1601 samples; the previous frame was 1602), and:
+
+```
+first bad at sample index 1786 of 1601 (ch=0) play=0.149902 exp=-0.028107
+run=1415 samples differ
+```
+
+1786 is an interleaved index, so **893 sample-frames agree and everything after
+them differs**. And `3203 + 893 = 4096` — exactly `AUDIO_CHUNK`, the size of one
+decode. So the two sinks agree right up to the end of the first decode chunk and
+diverge for the remainder of the frame.
+
+That is a much sharper place to look than "the mixers disagree at NTSC": the
+interesting case is the frame that **straddles a decode-chunk boundary**, which at
+60 fps never happens (800 samples/frame, and the export's blocks are clipped to
+the frame) but at 29.97 arrives routinely because a 1601-sample frame is not a
+multiple of `AUDIO_CHUNK`.
+
+The asymmetry that makes it reachable: playback pulls once per FRAME
+(`audio_src_pull(s, start48 + spf)`) while the export pulls once per 512-sample
+BLOCK (`render_audio_pull` inside `render_mix_block`). So the two sides refill
+their fifos on different boundaries, and only the export's refill can land
+mid-frame. Whether the bug is the pull, the ring, or the declick being computed
+across a refill is not yet known — but the trigger is now a specific condition
+rather than a frame rate.
+
 Next measurement, in order: whether the divergence begins at the first frame
 whose length DIFFERS from its predecessor (1602 vs 1601 at NTSC), which would
 point at a per-frame boundary difference rather than at anything inside a block;
