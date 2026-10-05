@@ -90,6 +90,50 @@ SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.001)
 TIMELINE_MAX_ZOOM :: f32(16)
 
+// CLIP_SPEED_MIN / CLIP_SPEED_MAX bound a clip's tempo.
+//
+// The upper bound is not arbitrary: atempo is chained ATEMPO_MAX_STAGES deep and a
+// factor outside that range cannot be built, so allowing it would let a clip carry a
+// speed the engine cannot honour -- which is how a stretch ends up silently playing
+// at the wrong rate.
+CLIP_SPEED_MIN :: 0.25
+CLIP_SPEED_MAX :: 4.0
+
+// clip_speed is a clip's tempo multiplier, with the ZERO VALUE MEANING 1.0.
+//
+// A `speed` field of 0 would be a division by zero in every span calculation, and
+// there are a great many `Clip{}` literals in this codebase, so 0 cannot mean "unset"
+// by convention alone -- it has to mean something safe. Which is exactly what
+// AGENTS.md asks of a zero value: `Clip{}` should be safe to touch before anything
+// initialises it.
+//
+// So 0 reads as 1.0, and anything OUTSIDE the buildable range is an assert rather
+// than a clamp: a clamp would silently play a clip at a speed the user did not ask
+// for, which is the failure mode this whole design keeps refusing.
+clip_speed :: proc(c: ^Clip) -> f64 {
+	if c.speed == 0 {
+		return 1.0
+	}
+	// Odin's assert takes at most three arguments, so the message is formatted
+	// first rather than passed as varargs.
+	assert(
+		c.speed >= CLIP_SPEED_MIN && c.speed <= CLIP_SPEED_MAX,
+		fmt.tprintf(
+			"clip_speed: %f is outside the buildable range [%f, %f]",
+			c.speed, CLIP_SPEED_MIN, CLIP_SPEED_MAX,
+		),
+	)
+	return c.speed
+}
+
+// clip_pitch is a clip's semitone offset. Zero is genuinely zero here, so there is
+// no default to own -- but it is an accessor so the audio path has ONE place to read
+// pitch from, rather than a bare field read that a future pitch shifter would have to
+// be threaded through.
+clip_pitch :: proc(c: ^Clip) -> f64 {
+	return c.pitch
+}
+
 // project_rate_ok rejects a rate that cannot define a frame grid: zero,
 // negative, NaN, or infinite. This is a value that ARRIVES broken, not an
 // invariant -- project.frame_rate is loaded from a project file and
@@ -509,6 +553,25 @@ Clip :: struct {
 	// the per-clip audio snapshot through the mix; applies to any media kind,
 	// only audible for Audio clips.
 	gain:                 f32,
+	// speed is the clip's TEMPO: how fast its content plays, and therefore how long
+	// it lasts on the timeline. 1.0 is as-authored. Stretching a clip's edge changes
+	// this, and stretching ALWAYS pitch-corrects, because that is what a tempo change
+	// means to a listener: the same utterance, faster or slower, same pitch.
+	//
+	// SEPARATE from pitch on purpose. Conflating them is the reason NLEs feel wrong:
+	// a speed control that drags pitch with it cannot be used to fix a tempo without
+	// also ruining a take, and a pitch control that changes duration cannot be used
+	// to fix a hum. They are two properties because they are two decisions.
+	//
+	// Range is bounded because atempo's stage count is finite (ATEMPO_MAX_STAGES) and
+	// an unbounded factor would need a chain that cannot be built. The bound is the
+	// same one the transport's rate has always used.
+	speed:                f64,
+	// pitch is a SEMITONE offset, applied independently of speed. 0.0 is as-authored.
+	// This is the one that is explicitly opt-in: nothing in the engine changes pitch
+	// on its own, which is the same rule as the clip-boundary ramp that was removed --
+	// the engine does not touch what you did not ask it to touch.
+	pitch:                f64,
 	source_start_frame:   i64,
 	// audio_src_rate pins the rate an AUDIO clip's source_start_frame is
 	// counted against, so changing the project rate cannot silently re-point
