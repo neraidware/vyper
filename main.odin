@@ -1943,6 +1943,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
+	// VYPER_AUDIO_NODE_LATENCY measures the two graph delays (swr device conversion,
+	// atempo lookahead) that scrubbing and clip stretching both depend on.
+	// lookup_env_alloc, not os.getenv: getenv returns NIL when the variable is
+	// unset, and comparing nil against "" traps rather than answering the question.
+	if _, lz := os.lookup_env_alloc("VYPER_AUDIO_NODE_LATENCY", context.temp_allocator); lz {
+		ok: bool = audio_probe_node_latency()
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_STALL_GAP=<path>|<stall_ms> -- drives the real producer against a
 	// simulated device and proves a stall costs a GAP and no subsequent offset.
 	if sg, _ := os.lookup_env_alloc("VYPER_AUDIO_STALL_GAP", context.temp_allocator); sg != "" {

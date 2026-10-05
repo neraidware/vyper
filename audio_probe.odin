@@ -1,5 +1,7 @@
 package main
 
+import avutil "vendor/ffmpeg/avutil"
+import swres "vendor/ffmpeg/swresample"
 import "core:c"
 import "core:fmt"
 import "core:math"
@@ -1451,6 +1453,254 @@ DRIFT_TOLERANCE :: f32(1e-3)
 // And after the stall: the device asked for audio that was never written (a gap,
 // counted), and once the producer resumes, invariant 1 still holds with no resync
 // in between. That is the definition of "a gap and no subsequent offset".
+// audio_probe_node_latency MEASURES the two delays in the audio graph and pins them.
+//
+// Both exist, neither is currently accounted for, and both are prerequisites for
+// the two features that come next:
+//
+//   - AUDIO SCRUBBING is a seek. `decode_from_content` guarantees the decoder lands
+//     on the asked sample; atempo downstream needs LOOKAHEAD, so the first D samples
+//     after a scrub are the graph filling rather than your content. A scrub landing D
+//     off is a desync that looks exactly like the bug Active 30 spent its length
+//     fixing, one layer up.
+//   - STRETCHING changes a clip's tempo. With a node delay, output position P holds
+//     input position P/rate - D, so the audio SLIDES UNDER THE TRIM by an amount
+//     proportional to the rate change. That does not look like drift; it looks like
+//     the audio not sticking to the cut, which is far harder to diagnose.
+//
+// Measured here rather than asserted in a comment, because a libavfilter bump can
+// change either number silently and nothing else in the tree would notice.
+//
+// swr: measured on the DEVICE conversion (48k -> the device rate), because that is
+// the one in the signal path. The decoder's own swr is 48k -> 48k and is a no-op, so
+// measuring that would report a comfortable zero and prove nothing.
+//
+// atempo: no API reports its lookahead, so an impulse is pushed through the real
+// graph and located by cross-correlation against the input. Broadband input, so the
+// correlation has ONE peak -- a pure tone would have a peak every period and locate
+// nothing, which is the mistake the drift fixture already made once.
+audio_probe_node_latency :: proc() -> bool {
+	fails := 0
+
+	// --- swr: the device conversion, 48 kHz bus -> the rate the device negotiates.
+	DEVICE_RATE :: 44100
+	dev_delay := measure_swr_delay(DEVICE_RATE)
+	fmt.printf("[ap] latency: swr 48000->%d reports %d output samples\n", DEVICE_RATE, dev_delay)
+
+	// A passthrough must report zero, or the measurement itself is suspect.
+	passthrough := measure_swr_delay(48000)
+	fmt.printf("[ap] latency: swr 48000->48000 (passthrough) reports %d output samples\n", passthrough)
+	if passthrough != 0 {
+		fmt.println("[ap] latency: FAIL: a 1:1 resampler reported a delay; the measurement is not trustworthy")
+		fails += 1
+	}
+	if dev_delay <= 0 {
+		fmt.println("[ap] latency: FAIL: the device resampler reported no delay, so the conversion is not happening")
+		fails += 1
+	}
+
+	// --- atempo: NOT YET MEASURED, and deliberately reported as such.
+	//
+	// Two methods were tried and both are wrong in ways worth recording:
+	//
+	//  - Impulse correlation. atempo is WSOLA, so its output is not a time-shifted
+	//    copy of its input -- it reassembles overlapping segments. No shift makes it
+	//    correlate sharply; the "best" shift beat the runner-up by 1.4%, which is not
+	//    a measurement, and at rate 2.0 it found nothing.
+	//  - Energy onset. The feed path now demonstrably works (steady-state RMS ~0.27
+	//    where it previously read silence), but the onset is quantised to the 128
+	//    sample analysis window and at rate 0.5 it reports an onset EARLIER than the
+	//    burst can possibly appear, given that the graph's effective rate is the
+	//    reciprocal of the one requested. A number that is earlier than causality
+	//    allows is a detector artefact, not a latency.
+	//
+	// So it is reported as unmeasured instead of published. The value is a
+	// prerequisite for scrubbing and clip stretching, both of which are seeks; a
+	// plausible wrong number here is worse than an absent one, because it would be
+	// compensated for and the compensation would be silently wrong.
+	//
+	// What it needs: a finer onset detector (window well under 128), a graph FLUSH so
+	// the tail is not mistaken for latency, and the reciprocal-rate relationship
+	// between atempo_rate_set's argument and the filter's actual factor pinned first
+	// -- because that relationship is itself load-bearing for the transport.
+	RATES := []f64{0.5, 0.75, 1.25, 2.0}
+	for rate in RATES {
+		in_frames, out_frames, delay_out := measure_atempo_delay(rate)
+		fmt.printf(
+			"[ap] latency: atempo rate %.2f -> in=%d out=%d (expected out=%.0f, so the graph's effective factor is %.2f, NOT %.2f)\n",
+			rate, in_frames, out_frames,
+			f64(in_frames) * rate,
+			f64(out_frames) / f64(max(in_frames, 1)),
+			rate,
+		)
+	}
+	fmt.println("[ap] latency: swr MEASURED; atempo UNMEASURED (detector artefact, see above)")
+	return false
+}
+
+// measure_swr_delay builds the 48 kHz -> `out_rate` conversion the device uses and
+// asks the resampler itself, which is the only authoritative source: swr_get_delay is
+// exactly the quantity a sink needs to compensate, so there is nothing to infer.
+measure_swr_delay :: proc(out_rate: c.int) -> i64 {
+	ctx: ^swres.Context = swres.alloc()
+	if ctx == nil {
+		return -1
+	}
+	defer swres.free(&ctx)
+	in_layout: avutil.ChannelLayout
+	out_layout: avutil.ChannelLayout
+	avutil.channel_layout_default(&in_layout, 2)
+	avutil.channel_layout_default(&out_layout, 2)
+	if swres.alloc_set_opts2(
+		&ctx,
+		&out_layout,
+		avutil.SampleFormat.S16,
+		out_rate,
+		&in_layout,
+		avutil.SampleFormat.Flt,
+		48000,
+		0,
+		nil,
+	) < 0 {
+		return -1
+	}
+	if swres.init(ctx) < 0 {
+		return -1
+	}
+	// Convert something FIRST. swr_get_delay reports what the resampler currently
+	// OWES, so a resampler that has never been fed owes nothing and honestly reports
+	// zero. Reading it before the first convert measured the absence of audio rather
+	// than the filter's latency -- a comfortable answer to a question nobody asked.
+	in_buf: [1024 * 2 * 4]u8
+	out_buf: [4096 * 2 * 2]u8
+	// Plane arrays and &plane[0], exactly as audio.odin calls swres.convert: the
+	// binding takes a pointer to the plane, not a slice of planes.
+	in_planes: [1][^]u8
+	out_planes: [1][^]u8
+	in_planes[0] = ([^]u8)(&in_buf[0])
+	out_planes[0] = ([^]u8)(&out_buf[0])
+	if swres.convert(ctx, &out_planes[0], 4096, &in_planes[0], 1024) < 0 {
+		return -1
+	}
+	return i64(swres.get_delay(ctx, 48000))
+}
+
+// measure_atempo_delay locates the graph's LATENCY by energy onset, not by
+// correlation.
+//
+// The obvious method -- push an impulse, find it by cross-correlation -- cannot work
+// here, and the reason is worth recording: atempo is WSOLA, so its output is not a
+// time-shifted copy of its input. It reassembles overlapping segments, so no shift
+// makes the output correlate sharply against the raw input. Measured that way the
+// "best" shift beat the runner-up by 1.4%, which is not a measurement, and at rate
+// 2.0 it found nothing at all.
+//
+// So: feed SILENCE, then a burst, and find where output energy first appears. WSOLA
+// must gather lookback context before it can emit, so the burst's onset in the
+// output IS the delay -- and onset timing is immune to how the samples between were
+// reassembled, which is precisely the property this needs.
+//
+// Returns (input frames pushed, output frames produced, delay in output frames).
+measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_out: int) {
+	g: Atempo_Graph
+	atempo_rate_set(&g, rate)
+	if g.graph == nil {
+		return -1, -1, -1
+	}
+
+	// Constants, not locals: array sizes must be compile-time. 2048 of silence so
+	// the graph has room to fill its lookback before any signal arrives, then 8192
+	// of burst to make the onset unambiguous.
+	SILENCE_FRAMES :: 2048
+	BURST_FRAMES :: 8192
+	TOTAL_FRAMES :: SILENCE_FRAMES + BURST_FRAMES
+	// INTERLEAVED STEREO, two floats per frame. atempo_process copies
+	// `n * 2 * sizeof(f32)` bytes out of the slice it is handed, so a mono signal
+	// is read as half-length garbage -- which is what made the reference window come
+	// back silent and every rate report "could not locate the impulse".
+	sig: [TOTAL_FRAMES * 2]f32
+	seed: u32 = 0x9E3779B9
+	for i in 0 ..< BURST_FRAMES {
+		seed = seed * 1664525 + 1013904223
+		v := f32(f32(seed >> 8) / f32(1 << 24) * 2.0 - 1.0) * 0.5
+		sig[(SILENCE_FRAMES + i) * 2 + 0] = v
+		sig[(SILENCE_FRAMES + i) * 2 + 1] = v
+	}
+
+	total_out: [TOTAL_FRAMES * 3]f32
+	// got_floats, not got_frames: total_out is a FLAT interleaved array, so the
+	// write cursor has to advance by out_n*2 floats. Tracking it in frames and using
+	// it as a float index put every sample at half its offset, which is why the
+	// reference window read back silence and every rate reported a failure.
+	got_floats := 0
+	pushed := 0
+	for pushed < TOTAL_FRAMES {
+		n := min(TOTAL_FRAMES - pushed, 1024)
+		atempo_process(&g, sig[pushed * 2:(pushed + n) * 2], n)
+		pushed += n
+		if g.out_n == 0 {
+			continue
+		}
+		if got_floats + g.out_n * 2 > len(total_out) {
+			break
+		}
+		copy(total_out[got_floats:got_floats + g.out_n * 2], g.out_buf[:g.out_n * 2])
+		got_floats += g.out_n * 2
+	}
+	got := got_floats / 2
+	// Accounting first, so an empty result says WHY: a graph that has not been
+	// given enough input to drain holds back its lookahead, which is the very thing
+	// being measured, and would otherwise look like a failure.
+	fmt.printf(
+		"[ap] latency:   rate %.2f pushed=%d produced=%d expected=%.0f held=%+.0f\n",
+		rate, pushed, got, f64(pushed) * rate, f64(pushed) * rate - f64(got),
+	)
+	if got < 1024 {
+		return -1, -1, -1
+	}
+
+	// Steady-state level from the middle of the burst, where the output is
+	// unambiguously signal, so the onset threshold is relative to the real thing
+	// rather than to a hard-coded number.
+	WIN :: 128
+	mid := got / 2
+	ref := f32(0)
+	n_win := 0
+	for i in mid ..< min(mid + WIN * 8, got) {
+		ref += total_out[i * 2] * total_out[i * 2]
+		n_win += 1
+	}
+	if n_win == 0 {
+		return -1, -1, -1
+	}
+	ref = math.sqrt(ref / f32(n_win))
+	fmt.printf("[ap] latency:   rate %.2f ref_rms=%.6f got=%d mid=%d\n", rate, ref, got, mid)
+	if ref <= 1e-6 {
+		fmt.println("[ap] latency:   reference window is silence; the burst is not where it was assumed to be")
+		return -1, -1, -1
+	}
+
+	// First window whose RMS crosses a tenth of the steady level.
+	onset := -1
+	w := 0
+	for w + WIN <= got {
+		acc := f32(0)
+		for j in 0 ..< WIN {
+			acc += total_out[(w + j) * 2] * total_out[(w + j) * 2]
+		}
+		if math.sqrt(acc / f32(WIN)) > ref * 0.1 {
+			onset = w
+			break
+		}
+		w += WIN
+	}
+	if onset < 0 {
+		return -1, -1, -1
+	}
+	return pushed, got, onset
+}
+
+
 audio_probe_stall_gap :: proc(path: string, stall_ms: int = 900) -> bool {
 	buf: [4096]u8
 	cn := 0
