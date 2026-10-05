@@ -125,7 +125,42 @@ parity_probe_report :: proc(clip: ^Clip, timeline_frame, off: i64, diffs: [PARIT
 	)
 }
 
-// parity_probe_frame compares one output frame across the two evaluators.
+// parity_probe_lanes cross-checks the two evaluators on a clip's LANE VALUES,
+// for ANY clip kind.
+//
+// This is the check that would have caught the text-keyframe defect, and it is
+// deliberately scoped to the Render_Geom_Snap carrier rather than to a clip
+// kind. It used to live inside parity_probe_frame, which took a
+// ^Render_Video_Src -- so the text and subtitle paths, which reached the worker
+// carrying only their resting transform, were never compared against anything.
+// A parity check that can only see the path that was already wired correctly
+// is not a parity check.
+//
+// Box pixels stay in parity_probe_frame because they are genuinely video-shaped
+// (a text clip's box comes from its raster's measured ink, not from source_w/h),
+// but the VALUES are what both sinks must agree on, and those are kind-agnostic.
+parity_probe_lanes :: proc(clip: ^Clip, snap: ^Render_Geom_Snap, timeline_frame: i64) {
+	pv := geom_sample_clip(clip, timeline_frame)
+	off := geom_snap_offset(snap, clip.timeline_start_frame, timeline_frame)
+	ev := geom_snap_eval(snap, off)
+	diffs: [PARITY_PROBE_LANES + 1]f32
+	diffs[0] = pv[int(Render_Geom_Prop.Scale)] - ev[int(Render_Geom_Prop.Scale)]
+	diffs[1] = pv[int(Render_Geom_Prop.Trans_X)] - ev[int(Render_Geom_Prop.Trans_X)]
+	diffs[2] = pv[int(Render_Geom_Prop.Trans_Y)] - ev[int(Render_Geom_Prop.Trans_Y)]
+	diffs[3] = pv[int(Render_Geom_Prop.Opacity)] - ev[int(Render_Geom_Prop.Opacity)]
+	diffs[4] = pv[int(Render_Geom_Prop.Crop_L)] - ev[int(Render_Geom_Prop.Crop_L)]
+	diffs[5] = pv[int(Render_Geom_Prop.Crop_R)] - ev[int(Render_Geom_Prop.Crop_R)]
+	diffs[6] = pv[int(Render_Geom_Prop.Crop_T)] - ev[int(Render_Geom_Prop.Crop_T)]
+	diffs[7] = pv[int(Render_Geom_Prop.Crop_B)] - ev[int(Render_Geom_Prop.Crop_B)]
+	// The box columns belong to parity_probe_frame, which owns the box math;
+	// zero here so they read as "not checked" rather than as a pass.
+	diffs[8] = 0
+	diffs[9] = 0
+	diffs[10] = 0
+	parity_probe_report(clip, timeline_frame, i64(off), diffs)
+}
+
+// parity_probe_frame compares one output frame's BOX across the two evaluators.
 //
 // Preview side: geom_sample_clip(clip, timeline_frame) -- the absolute frame,
 // the live clip, the live evaluator.
@@ -134,11 +169,12 @@ parity_probe_report :: proc(clip: ^Clip, timeline_frame, off: i64, diffs: [PARIT
 //
 // The box lanes compare rounded output pixels, because that is what each side
 // composites: the worker draws ox/oy/rw/rh, the preview hands the GPU a quad
-// derived from the same edges.
+// derived from the same edges. Lane VALUES are checked by parity_probe_lanes,
+// which every clip kind goes through.
 parity_probe_frame :: proc(clip: ^Clip, v: ^Render_Video_Src, timeline_frame: i64, pw, ph: f32) {
 	pv := geom_sample_clip(clip, timeline_frame)
-	off := i32(timeline_frame - v.timeline_start_frame)
-	ev := geom_sample_flat(v.geom_base, &v.kf_geom, off)
+	off := geom_snap_offset(&v.geom, v.timeline_start_frame, timeline_frame)
+	ev := geom_snap_eval(&v.geom, off)
 	cw_e, ch_e := full_box_dims(v.source_w, v.source_h, ev[int(Render_Geom_Prop.Scale)], pw, ph)
 	el, et, er, eb := cropped_box_edges(
 		ev[int(Render_Geom_Prop.Trans_X)],
@@ -471,18 +507,36 @@ parity_probe_exit :: proc(code: int) {
 	os.exit(code)
 }
 
-parity_probe_live_visuals :: proc() -> [dynamic]^Clip {
-	out: [dynamic]^Clip
+// parity_probe_live_visuals collects the live clips behind the job's sources in
+// job order, one slice per job array, so an index into the result lines up with
+// an index into render_job.videos / .texts / .subs.
+//
+// The classification is render_clip_sink — the same proc render_start walked
+// with — not a second statement of "which array does this kind go in". Two
+// hand-written classifications that happen to agree produce a probe that
+// compares the wrong clip to the wrong snapshot and reports nothing wrong.
+parity_probe_live_visuals :: proc(
+	videos, texts, subs: ^[dynamic]^Clip,
+) {
 	sync_track_order()
 	for w := 0; w < len(timeline.track_order); w += 1 {
 		tr := &timeline.tracks[timeline.track_order[w]]
 		for i := 0; i < len(tr.clips); i += 1 {
-			if tr.clips[i].kind == .Video || tr.clips[i].kind == .Image {
-				append(&out, &tr.clips[i])
+			clip := &tr.clips[i]
+			sink, ok := render_clip_sink(clip)
+			if !ok {
+				continue
+			}
+			switch sink {
+			case .Video:
+				append(videos, clip)
+			case .Text:
+				append(texts, clip)
+			case .Sub:
+				append(subs, clip)
 			}
 		}
 	}
-	return out
 }
 
 parity_probe_dump_state :: proc() {
@@ -551,14 +605,26 @@ parity_probe_dump_state :: proc() {
 // either, since a hand-copied formula would agree with itself by construction
 // and prove nothing.
 parity_probe_compare :: proc() {
-	vis := parity_probe_live_visuals()
-	// Caller owns the slice (stated on the proc), so the caller frees it. It is a
-	// dynamic array of POINTERS into the timeline's clip storage, so deleting it
-	// releases the index array only -- no clip is touched.
-	defer delete(vis)
+	vis_v, vis_t, vis_s: [dynamic]^Clip
+	parity_probe_live_visuals(&vis_v, &vis_t, &vis_s)
+	// Caller owns the slices (stated on the proc), so the caller frees them. They
+	// are dynamic arrays of POINTERS into the timeline's clip storage, so
+	// deleting them releases the index arrays only -- no clip is touched.
+	defer delete(vis_v)
+	defer delete(vis_t)
+	defer delete(vis_s)
 	pw := f32(render_job.width)
 	ph := f32(render_job.height)
 	compared := 0
+	// Every source's lane VALUES are compared, for every clip kind: this is the
+	// check that used to cover only video, which is why a text clip could carry
+	// no animation across the thread hop without anything going red.
+	assert(
+		len(vis_v) == len(render_job.videos) &&
+			len(vis_t) == len(render_job.texts) &&
+			len(vis_s) == len(render_job.subs),
+		"parity probe: live clip walk and the job's source arrays disagree in length",
+	)
 	for frame := render_job.start; frame <= render_job.end; frame += 1 {
 		for vi in 0 ..< len(render_job.videos) {
 			v := &render_job.videos[vi]
@@ -566,7 +632,24 @@ parity_probe_compare :: proc() {
 				continue
 			}
 			compared += 1
-			parity_probe_frame(vis[vi], v, frame, pw, ph)
+			parity_probe_lanes(vis_v[vi], &v.geom, frame)
+			parity_probe_frame(vis_v[vi], v, frame, pw, ph)
+		}
+		for ti in 0 ..< len(render_job.texts) {
+			t := &render_job.texts[ti]
+			if !clip_visible_at(frame, t.timeline_start_frame, t.source_length_frames) {
+				continue
+			}
+			compared += 1
+			parity_probe_lanes(vis_t[ti], &t.geom, frame)
+		}
+		for si in 0 ..< len(render_job.subs) {
+			s := &render_job.subs[si]
+			if !clip_visible_at(frame, s.timeline_start_frame, s.source_length_frames) {
+				continue
+			}
+			compared += 1
+			parity_probe_lanes(vis_s[si], &s.geom, frame)
 		}
 	}
 	fmt.println(
@@ -650,11 +733,15 @@ parity_probe_export :: proc(out_path: string) -> int {
 		render_job.end,
 		"] videos",
 		len(render_job.videos),
+		"texts",
+		len(render_job.texts),
+		"subs",
+		len(render_job.subs),
 	)
 	for &v in render_job.videos {
 		keys := 0
 		for p in 0 ..< int(Render_Geom_Prop._COUNT) {
-			keys += v.kf_geom[p].n
+			keys += v.geom.keys[p].n
 		}
 		fmt.println(
 			"[parity-probe] snapshot",
@@ -677,19 +764,75 @@ parity_probe_export :: proc(out_path: string) -> int {
 			"x",
 			v.rh,
 			"keyed",
-			v.geom_keyed,
+			v.geom.keyed,
 			"scale_keyed",
-			v.scale_keyed,
+			v.geom.scale_keyed,
 			"opacity_keyed",
-			v.opacity_keyed,
+			v.geom.opacity_keyed,
 			"stage_scale",
 			v.stage_scale,
 			"kf_keys",
 			keys,
 			"base_scale",
-			v.geom_base[int(Render_Geom_Prop.Scale)],
+			v.geom.base[int(Render_Geom_Prop.Scale)],
 			"base_opacity",
-			v.geom_base[int(Render_Geom_Prop.Opacity)],
+			v.geom.base[int(Render_Geom_Prop.Opacity)],
+		)
+	}
+	// Text and subtitle sources carry the same carrier, so they are dumped in the
+	// same terms. A keyed flag reading false on a text clip whose preview
+	// animates is exactly the signature of the animation not crossing the thread
+	// hop, so it has to be visible here rather than inferable.
+	for &t in render_job.texts {
+		keys := 0
+		for p in 0 ..< int(Render_Geom_Prop._COUNT) {
+			keys += t.geom.keys[p].n
+		}
+		fmt.println(
+			"[parity-probe] snapshot text",
+			t.name,
+			"tstart",
+			t.timeline_start_frame,
+			"len",
+			t.source_length_frames,
+			"keyed",
+			t.geom.keyed,
+			"scale_keyed",
+			t.geom.scale_keyed,
+			"opacity_keyed",
+			t.geom.opacity_keyed,
+			"kf_keys",
+			keys,
+			"base_scale",
+			t.geom.base[int(Render_Geom_Prop.Scale)],
+			"base_opacity",
+			t.geom.base[int(Render_Geom_Prop.Opacity)],
+		)
+	}
+	for &s in render_job.subs {
+		keys := 0
+		for p in 0 ..< int(Render_Geom_Prop._COUNT) {
+			keys += s.geom.keys[p].n
+		}
+		fmt.println(
+			"[parity-probe] snapshot sub",
+			s.srt_id,
+			"tstart",
+			s.timeline_start_frame,
+			"len",
+			s.source_length_frames,
+			"keyed",
+			s.geom.keyed,
+			"scale_keyed",
+			s.geom.scale_keyed,
+			"opacity_keyed",
+			s.geom.opacity_keyed,
+			"kf_keys",
+			keys,
+			"base_scale",
+			s.geom.base[int(Render_Geom_Prop.Scale)],
+			"base_opacity",
+			s.geom.base[int(Render_Geom_Prop.Opacity)],
 		)
 	}
 	grid := project_fps()
@@ -786,11 +929,88 @@ parity_probe_build_fixture :: proc(still_c, clip_c: cstring, out_path: string) {
 			kf_set_key(&clip, "scale", 10, 0.5)
 		}
 	}
+	// A KEYED TEXT CLIP on its own track, spanning frames the video does not, so
+	// the lane comparison covers the clip kind that used to reach the worker
+	// carrying only its resting pose.
+	//
+	// Without this the widened parity check would have nothing to say about text:
+	// the fixture held no text clip, so a text source that lost every keyframe
+	// on the way to the worker would still have passed. That is precisely how the
+	// defect shipped — the check existed and was pointed at a path that worked.
+	// Keying transform as a whole SECTION (not per-lane) is deliberate: it is the
+	// packed form, the one a user's own "keyframe transform" press mints, and the
+	// form the export's snapshot is most likely to mishandle.
+	parity_probe_add_keyed_text()
 	// Set the range so the job covers the keyed clip's whole span.
 	project.start_frame = -1
 	project.end_frame = -1
 	parity_probe_dump_state()
 	parity_probe_exit(parity_probe_export(out_path))
+}
+
+// parity_probe_add_keyed_text places one text clip with a keyed transform and a
+// keyed opacity on a fresh top track.
+//
+// Fresh track rather than an existing one so the fixture's text cannot land
+// UNDER a video clip and be invisible in the output — a text that composites to
+// nothing still has its lanes compared, but a fixture that only passed because
+// the pixels were covered would be a weaker test than it looks.
+//
+// The keys use a whole-transform section plus a per-lane opacity, so both
+// storage forms are in the snapshot: a packed section (mask != 0, which
+// kf_geom_fill_snapshot has to unpack per lane) and a scalar lane.
+parity_probe_add_keyed_text :: proc() {
+	// sync_track_order FIRST: it is what turns track_order into a permutation of
+	// the existing tracks, and injecting into a not-yet-synced order duplicates an
+	// index -- which drops a track from the export walk entirely and looks like a
+	// compositing bug rather than the stale-global read it is.
+	sync_track_order()
+	append(&timeline.tracks, Track{name = "parity-text"})
+	nt := len(timeline.tracks) - 1
+	// Injected ABOVE every existing track so the text paints last and is never
+	// hidden behind a video: a text whose pixels are covered still has its lanes
+	// compared, but the fixture reads weaker than it is if the text is invisible.
+	inject_at_elem(&timeline.track_order, 0, nt)
+	append(&timeline.tracks[nt].clips, Clip {
+		clip_id = new_clip_id(),
+		name = session_str_intern("KEYEDTEXT"),
+		kind = .Text,
+		generator = .Text,
+		timeline_start_frame = 12,
+		source_length_frames = 20,
+		scale = 1,
+		opacity = 1,
+		transform_x = 40,
+		transform_y = 60,
+		// Nominal tight ink dims at font 48; setup_text_job rasterizes the name
+		// and blits the measured rect, so these only have to be positive.
+		source_w = 320,
+		source_h = 96,
+	})
+	clip := &timeline.tracks[nt].clips[0]
+	// transform as one packed section, which is the form a user's own
+	// "keyframe transform" press mints: two lanes in a single knot, so the
+	// snapshot has to unpack it per lane.
+	packed: [KF_PACK_MAX]f32
+	packed[0] = 40
+	packed[1] = 60
+	kf_geom_set_packed(clip, "transform", 0, packed, 0b11)
+	packed[0] = 200
+	packed[1] = 140
+	kf_geom_set_packed(clip, "transform", 19, packed, 0b11)
+	// opacity as its own scalar lane, so both storage forms are in the snapshot.
+	kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 0, 1.0)
+	kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 19, 0.25)
+	// scale keyed as well, because scale is the one lane that is BAKED into the
+	// text raster rather than applied per frame: it drives text_job_rescale, which
+	// allocates a new raster and frees the stale one every frame the scale moves.
+	// That is the only per-frame alloc/free the text path has, so it is the part
+	// that most needs a gate -- and parity_valgrind only sees it if the fixture
+	// animates scale. A fixture keying only transform would leave the re-bake
+	// path entirely unexercised while still reporting a clean memcheck.
+	kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Scale), 0, 1.0)
+	kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Scale), 19, 1.8)
+	sync_track_order()
 }
 
 parity_probe_env :: proc() {

@@ -3575,11 +3575,13 @@ Details TBD when Phase 2 reaches maturity.
   stopped sampling returns 1.0 and fails — that is the silent failure ("keyed,
   but every frame fully opaque") no md5 would catch. Verified by mutation:
   stubbing the sampler to `opacity = base_op` fails F on two checks.
-  Also asserts the un-keyed lane falls back to base, which is what keeps
+  Also asserts an un-keyed lane falls back to base, which is what keeps
   un-keyed exports byte-identical.
-- Note the sampler contract: past a lane's LAST key it is inactive and the
-  resting base rules again, so a partial fade returns to the clip's own opacity
-  rather than sticking at the last key. Shared with every geometry lane.
+- Note the sampler contract: past a lane's LAST key it HOLDS that key's value
+  rather than falling back to the resting base. That was the behavior when this
+  section was written; Active 23 changed it, so the "past the last key" half of
+  case F now pins the hold (see Active 23 for the current contract and the
+  mutation evidence).
 - Gates: all 15 functional, all 3 Valgrind (0 definitely/indirectly lost), and
   all 7 export md5s match the pre-change baseline. `geom_key_probe`'s lane
   table is `[int(Render_Geom_Prop._COUNT)]`-sized, so adding a lane is a
@@ -4676,117 +4678,139 @@ Mutating the helper back to `c.int(renderer.viewport.y)` reproduces the log.
 
 **Accept.** `check build probe` pass.
 
----
+## Active 23 — A keyed clip snapped back to its resting pose after its last keyframe
 
-## Active 22 — Alt+drag is a ripple move: every clip at or after the anchor moves with it
+**Why:** keyframing a clip's transform looked correct up to the final keyframe
+and then reverted — the clip jumped back to the pose it had before any key
+existed and stayed there for the rest of its span. A fade-to-nothing opacity
+track did the same, so a clip faded out and then came back at full strength.
+This was the sampler contract itself, not a display bug: `kf_sample_keys`
+returned the caller's `base` and `active = false` once the frame was past the
+last key, and `kf_sample_packed_lane` did the same per lane.
 
-**Why:** dragging a clip in the middle of the timeline moved that clip and
-nothing else. Shifting a clip and everything downstream of it is one gesture in
-every NLE, and here it took a ripple-delete, N separate drags, or an undo. The
-report: "Alt + Move clip should move also all clips that start at that clip's
-start or after the main selected clip."
+**The rule now:** before the first key the property is inactive and the
+resting/base value rules; from the first key onward the track owns the
+property — interpolating between keys and HOLDING its final value past the last
+one. The asymmetry is the point. A track that has not begun has no end state to
+hold, so a direct edit there is what the user is looking at; a track that has
+finished has an end state, and that is where the clip stays.
 
-**The set, and why each source is in it** (`capture_ripple_set`,
-timeline.odin). Anchor first — the delta is measured from `ripple_orig[0].start`,
-so a set whose head is not the grabbed clip rips from the wrong frame. Then:
+This also fixes a write-routing consequence rather than adding one.
+`clip_geom_set` routes a write to a KEY whenever the sampler is reading one at
+the playhead (`clip_geom_keyed_at`), and that predicate is the sampler's own
+`active`. With the tail holding, a drag past the last key now extends the
+animation instead of writing a resting value the sampler would ignore — the
+"a write goes wherever the sampler READS" invariant in clip_geom.odin holds for
+the new tail with no change to the routing code. The flip side: a lane can no
+longer become "pending" past its last key, because there is no longer a resting
+edit visible there. `geom_key_probe`'s packed-section case therefore moved its
+playhead AHEAD of the animation (keys at 100/200, playhead 50) — the only
+region where a packed lane can still be pending.
 
-- the anchor's whole link group, from the `group_orig` already captured by the
-  press. A partner left behind is the desync every group move exists to prevent,
-  and a partner may legitimately start BEFORE the anchor (`test_drag_same_track_
-  leftedge` is built on exactly that shape).
-- the Shift multi-selection (`selection.extra_set`). This is the "select both,
-  alt-drag one" case from the report: without it the other selected clip stays
-  behind and the selection is a lie by the time the drag ends.
-- every remaining clip on every track whose start is `>=` the ANCHOR's start.
-  The threshold is the anchor rather than the earliest member, so moving a late
-  clip on an early-starting group does not drag the whole tail with it.
-
-Alt is latched at PRESS, not sampled per frame: a modifier pressed mid-drag
-would change what the gesture MEANS halfway through, moving clips the live apply
-had never captured.
-
-**Why the collision problem is smaller than it looks, and where it is not.**
-Every member shifts by the SAME delta, so relative geometry inside the set is
-preserved and no two members can ever collide. That reduces the walls to a
-moving clip vs a clip that does not move — and a non-member's start is by
-definition before the anchor's threshold, hence before every member's start, so
-it can only ever sit to a member's LEFT. `ripple_clamp_delta` therefore computes
-a lower bound and nothing else; a right-hand bound would be code that can never
-fire, so it is not written. The bound is the tightest of the timeline's left edge
-(no member before frame 0) and each non-member's tail, so the set parks FLUSH
-against the binding wall. A per-clip clamp would put the lane-0 anchor at its own
-wall and the lane-1 partner at a different one — the A/V drift this editor has
-already been bitten by. `apply_ripple_drag` writes from the captured ORIGINALS,
-not the live position, so a long slide out and back lands exactly where it
-started instead of compounding one frame of sampling error per frame.
-
-**Straddlers are left alone on purpose.** This timeline permits same-lane
-overlap for stacked clips, so a clip that starts before the anchor and runs past
-it is a legitimate state, not a defect. It contributes no wall and does not join
-the set: freezing the whole ripple on the strength of an overlap the user never
-mentioned is worse than leaving the overlap exactly as deep as it already was.
-
-**Cross-lane drops need nothing.** A vertical Alt+drop relocates the group
-through the existing `move_linked_group` / `move_clip_to_track`, and their
-feasibility checks read the destination lane's LIVE positions — which the ripple
-has already shifted by the same delta the anchor is landing by. So the anchor's
-relative slot is unchanged and a legal drop still passes. The downstream clips
-stay on their own lanes, shifted horizontally.
+Audio rides the same evaluator (`kf_gain_linear` -> `kf_sample_keys`), so a
+keyed fade that ends now sustains its final dB instead of snapping to the clip's
+static gain. That is the audible version of the same defect.
 
 Steps:
-- [x] S1. Model first (`Clip_Move_State` gains `ripple` / `ripple_delta` /
-      `ripple_orig`, reusing the existing `Drag_Group_Orig` record — it is the
-      same fact about the same clip, just at a wider scope, and duplicating the
-      struct would have bought nothing).
-- [x] S2. `capture_ripple_set` / `ripple_clamp_delta` / `apply_ripple_drag` in
-      timeline.odin; `ripple_moves_clip` is a linear scan on the clip id alone
-      rather than the membership map the group helpers build, so the per-frame
-      path stays allocation-free.
-- [x] S3. Wired into the press (latch + capture), `drag_move_in_place` (one
-      branch ahead of the group and single-clip paths), the release (`moved` off
-      the applied delta, because a vertical drop has already relocated the anchor
-      by then so its live start says nothing), and the two gesture resets.
-      Undo label is "Ripple move", not "Move clip": the node covers every clip
-      the ripple carried.
-- [x] S4. Probe: six cases in timeline_probe.odin, in the existing `timeline_probe`
-      gate. Set membership and anchor-first; the downstream shift on both lanes
-      plus the out-and-back drift check; the flush wall (binding member exactly
-      on its wall, not short of it); the frame-0 left edge; the Shift extra; the
-      straddler. Every case asserts "no new overlap vs the pre-drag snapshot"
-      over BOTH clips of each pair.
+- [x] S1. `kf_sample_keys` holds `active_key`'s value with `active = true` past
+      the last key.
+- [x] S2. `kf_sample_packed_lane` holds the last COVERING knot's lane value. The
+      subtlety: a knot that does not mask the lane is not a breakpoint for it,
+      so it must not end that lane's hold early — only a knot that masks the
+      lane continues its curve.
+- [x] S3. Contract comments updated at every site that stated the old rule
+      (`kf_sample_keys`, `kf_sample`, `kf_sample_packed_lane`, the
+      `evaluation (...)` banner, `clip_geom.odin`'s module header and its
+      `clip_geom_set` case 2, `kf_gain_linear`).
 
-**Probe / mutation.** Five mutations, each red on the gate: `>=` threshold made
-exclusive (7300 left behind, and it then overlapped 7200); `max(delta, lo)`
-turned into `return delta` (the whole set drove to -100 and past frame 0);
-`selection.extra_set` emptied (the Shift extra stayed at 0); the absolute apply
-turned relative (out-and-back landed at 130, not 100); the link-member loop
-deleted (7200 left behind, link 8800 desynced to -80).
+**Probe / mutation.** `keyframe_probe` pins both ends on the scalar path, the
+packed path, the flat/worker sampler, and the inspector gain readout (with a
+-12 dB final key so a hold cannot coincide with the static 0 dB), plus the
+unmasked-knot case above. Reverting the scalar tail fails 13 assertions;
+reverting only the packed tail fails 5, including "an unmasked knot must not end
+a lane's hold". `render_kf_probe` cases A, F and H were inverted to pin the hold
+— H's original purpose (catching `v.opacity` retaining the previous frame's
+sample) survives, and the hold makes it a stronger check, because 0.625 and the
+correct 0.25 now differ instead of the wrong answer coinciding with the right
+one.
 
-**Accept.** `check build probe timeline_probe valgrind` pass.
+**Accept.** `check build probe keyframe_probe geom_key_probe render_kf_probe
+audio_probe timeline_probe transform_probe opacity zorder render_live_probe
+keyed_export subtitle_probe parity parity_valgrind render_valgrind undo_valgrind`
+pass.
 
----
+## Active 24 — Keyframed text/subtitle transform exported at its resting pose
 
-## Active 21 — Roll a selected shared clip boundary
+**Why:** a text clip's transform keyframes previewed correctly and exported
+frozen. Not an interpolation or sampling bug: the keyframes never crossed the
+UI->worker thread hop. `Render_Text_Src` carried three plain copies of the
+clip's RESTING fields (`transform_x`, `transform_y`, `scale`), filled once at
+`render_start`, and the worker composited those three numbers on every frame.
+The tracks stayed on the UI thread. `Render_Sub_Src` had the identical omission
+plus an `anchor_x/y` box center derived from those resting values at setup, so a
+keyed subtitle was frozen too. Separately, text opacity was absent from the
+export entirely — `render_text_blit` took no alpha and neither text struct
+carried an opacity field — so a text clip set to 50% previewed translucent and
+exported fully opaque, keyed or not.
 
-**Why:** With two touching clips selected, dragging shared seam handle currently
-resized only anchor clip. The other clip's edge stayed fixed, creating a gap or
-overlap. Treat seam as one roll edit: both handles follow pointer in same
-direction; preserve outer endpoints and clamp each source to valid first/last
-frame.
+The deeper cause was that the snapshot was HAND-WRITTEN PER CLIP KIND.
+`Render_Video_Src` got `geom_base` + `kf_geom` + `geom_keyed`; the text structs,
+written later, got a shorter list and nothing failed. The evaluators were
+already shared (`geom_sample_clip` / `geom_sample_flat` both bottom out in
+`kf_sample_keys`), so the two sinks were never two systems — only the CARRIER
+was, and it was a convention rather than a type. `parity_probe_frame` took a
+`^Render_Video_Src`, so the per-lane preview-vs-export check could not see the
+path that was broken: a parity check pointed at the path that was already wired
+correctly is not a parity check. `render_kf_probe` contained no reference to
+text at all.
 
 Steps:
-- [x] Detect adjacent, touching clips both in current selection; resolve either
-      clip's seam edge to one `.Roll` gesture. Preserve plain left/right trim and
-      linked-group resizing outside paired selection.
-- [x] Apply common seam with bounds from both clip lengths, left source tail,
-      and right source head. Right source_start follows seam delta; both outer
-      timeline/source endpoints remain fixed.
-- [x] Add `timeline_probe` coverage for left/right handle targeting, both handles
-      moving together, and clamps at right source frame 0 and left source end.
+- [x] S1. `Render_Geom_Snap` — one carrier (`base`, `keys[Render_Geom_Prop]`,
+      `keyed`, `scale_keyed`, `opacity_keyed`) embedded in all three source
+      structs, written by one `render_geom_snap_fill`, read through one
+      `geom_snap_eval`. As a FIELD the animation is not optional: a new clip
+      kind cannot forget it, because there is nothing to forget. The lane loop
+      is the enum, so a new `Render_Geom_Prop` rides across with no second list.
+- [x] S2. Text and subtitle composites sample per frame through that carrier, so
+      transform/scale/opacity animate exactly as a video clip's do. crop lanes
+      are cleared for text at the DRAW site (`geom_clear_crop`, the rule the
+      preview already applied) rather than baked into the carrier, where zeroing
+      them would silently disarm a video clip's crop.
+- [x] S3. `render_text_blit` gained an alpha parameter and folds it into the
+      glyph coverage, matching `blend_row` and the GPU preview's
+      SRC_ALPHA/ONE_MINUS_SRC_ALPHA. This is not a keyframe fix — it also
+      repairs unkeyed text opacity, which never worked.
+- [x] S4. Animated scale re-bakes the raster (`text_job_rescale`, and the same
+      gate on a subtitle's cue cache) instead of rescaling the blit. Scale is
+      BAKED into the raster's font size, so unlike transform it cannot be
+      applied per frame — the one place the unified carrier does not give parity
+      for free. Mirrors the preview's own `text_font_px` re-bake, so both sinks
+      converge on the same ink at the same scale. `TEXT_REBAKE_EPS` keeps eased
+      rounding from churning a rasterize per frame.
+- [x] S5. `render_clip_sink` — one classifier for "which job array does this clip
+      go in", used by BOTH `render_start`'s walk and the parity probe. The probe
+      previously re-derived that mapping itself, and a divergence there compares
+      the wrong clip to the wrong snapshot: a parity check that silently stops
+      checking. This also collapsed three near-identical `Render_Sub_Src`
+      constructions into `snapshot_sub_src`.
+- [x] S6. The parity probe's lane check is now `parity_probe_lanes(clip, snap)`,
+      scoped to the CARRIER rather than to a clip kind, and runs for text and
+      subtitle sources too. Box PIXELS stay video-shaped in `parity_probe_frame`
+      (a text box comes from its raster's measured ink, not source_w/h), but the
+      lane VALUES — the thing that was wrong — are kind-agnostic.
+- [x] S7. The parity fixture gains a KEYED TEXT CLIP (`parity_probe_add_keyed_text`)
+      with a packed whole-transform section and a scalar opacity lane, on its own
+      top track. Without it the widened check had nothing to say about text: the
+      fixture held no text clip, so a text source that lost every keyframe on the
+      way to the worker still passed.
 
-**Probe / mutation.** `timeline_probe` exercises touching selected pairs, checks
-seam movement in both directions and asserts both source/timeline boundaries
-remain valid at clamps.
+**Probe / mutation.** `scripts/gate.sh parity` on a build with the text fill
+removed (negative control) fails on 19 consecutive frames, naming the clip and
+every diverging lane — `snapshot text KEYEDTEXT ... keyed false ... kf_keys 0`
+and then `FAIL clip KEYEDTEXT frame 12 scale +1.0000; trans_x +40.0000; trans_y
++60.0000; opacity +1.0000` onward. With the fix: `keyed true opacity_keyed true
+kf_keys 6`, no FAIL, and `compared 140 clip-frames` (up from the video-only
+count).
 
-**Accept.** `check build timeline_probe` pass; single-clip and linked-group
-resize probe cases remain green.
+**Accept.** `check build keyframe_probe geom_key_probe render_kf_probe parity
+parity_valgrind` pass.

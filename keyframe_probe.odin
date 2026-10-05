@@ -6,9 +6,10 @@ import "core:mem"
 // Keyframe probe (VYPER_KEYFRAME_PROBE): headless regression checks for the
 // generic keyframe store — sorted insert/replace, the linear sample (a key
 // applies on its own frame; between keys the value interpolates and reaches
-// the next key's value exactly on its frame; before the first key and past
-// the last key the property is inactive and the base/resting value rules), the
-// split/trim remaps, the deep-clone round-trip through clone_timeline,
+// the next key's value exactly on its frame; before the first key the
+// property is inactive and the base/resting value rules, past the last key it
+// HOLDS that key's value), the split/trim remaps, the deep-clone round-trip
+// through clone_timeline,
 // empty-track deletion, and zero-value Clip{} safety. Builds its own Clip
 // structs; no decode, no SDL, no timeline globals.
 
@@ -108,8 +109,8 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 
 	// --- linear sample: a key applies on its own frame; between keys the ----
 	// value interpolates and reaches the NEXT key's value exactly on its
-	// frame. Before the first key and past the last key the caller's base
-	// rules (direct edits apply there).
+	// frame. Before the first key the caller's base rules (direct edits apply
+	// there); past the last key the track holds the final key's value.
 	smp := Clip {}
 	kf_set_key(&smp, "gain", 10, 5.0)
 	kf_set_key(&smp, "gain", 20, 2.0)
@@ -156,28 +157,31 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 	kf_probe_check(v == 5.0, "second segment midpoint (got %v)", v)
 	v, _ = kf_sample(gain, 30, 7.0)
 	kf_probe_check(v == 8.0, "third key applies its value on its frame (got %v)", v)
-	// past the last key: inactive again, resting base wins (direct edits apply).
+	// Past the last key the track HOLDS its final value: a clip animated to 8.0
+	// stays there instead of snapping back to the resting 7.0.
 	v, ok = kf_sample(gain, 31, 7.0)
-	kf_probe_check(!ok && v == 7.0, "past the last key: inactive, base restored (v=%v ok=%v)", v, ok)
+	kf_probe_check(ok && v == 8.0, "past the last key: holds the final value (v=%v ok=%v)", v, ok)
 	v, _ = kf_sample(gain, 100, 7.0)
-	kf_probe_check(!ok && v == 7.0, "far past the last key: base holds (got %v)", v)
+	kf_probe_check(v == 8.0, "far past the last key: still holds (got %v)", v)
 
 	// --- lone key / no later target -----------------------------------------
-	// A single key pins its frame only; everywhere else the resting base
-	// rules, so direct edits show up even though a key exists.
-	d := Clip {}
+	// A single key pins its frame and then HOLDS: before it the resting base
+	// rules, from it onward the keyed value owns the property.
+	d := Clip{}
 	kf_set_key(&d, "x", 5, 0.0)
 	dt := kf_track_index(d, "x")
 	dx: ^Kf_Track
 	if dt >= 0 {
 		dx = session_trk_view(d.keyframe_tracks, dt)
 	}
+	v, ok = kf_sample(dx, 4, 10.0)
+	kf_probe_check(!ok && v == 10.0, "before a lone key: base rules (v=%v ok=%v)", v, ok)
 	v, ok = kf_sample(dx, 5, 10.0)
 	kf_probe_check(ok && v == 0.0, "lone key pins its frame (got %v)", v)
 	v, ok = kf_sample(dx, 6, 10.0)
-	kf_probe_check(!ok && v == 10.0, "a frame after the lone key: base restored (v=%v ok=%v)", v, ok)
+	kf_probe_check(ok && v == 0.0, "a frame after the lone key: holds its value (v=%v ok=%v)", v, ok)
 	v, _ = kf_sample(dx, 15, 10.0)
-	kf_probe_check(!ok && v == 10.0, "lone key does not hold to the end (got %v)", v)
+	kf_probe_check(v == 0.0, "a lone key holds to the end (got %v)", v)
 
 	// --- linear segment: exact arrival + deactivation ------------------------
 	s := Clip {}
@@ -195,9 +199,9 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 	v, _ = kf_sample(sx, 8, 1.0)
 	kf_probe_check(v == 0.0, "reaches the next key's value exactly on its frame (got %v)", v)
 	v, ok = kf_sample(sx, 9, 1.0)
-	kf_probe_check(!ok && v == 1.0, "past the last key: inactive again (v=%v ok=%v)", v, ok)
+	kf_probe_check(ok && v == 0.0, "past the last key: holds the final value (v=%v ok=%v)", v, ok)
 	v, _ = kf_sample(sx, 10, 1.0)
-	kf_probe_check(!ok && v == 1.0, "still base after the last key (got %v)", v)
+	kf_probe_check(v == 0.0, "still holds after the last key (got %v)", v)
 
 	// --- kf_sample_for at a timeline frame, clip-relative -------------------
 	sf := Clip {timeline_start_frame = 100}
@@ -205,7 +209,7 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 	v, ok = kf_geom_sample_lane(&sf, "gain", 100, 9.0)
 	kf_probe_check(ok && v == 4.0, "frame 100 == clip-relative off 0: the key's value applies (got %v)", v)
 	v, ok = kf_geom_sample_lane(&sf, "gain", 101, 9.0)
-	kf_probe_check(!ok && v == 9.0, "frame 101 == off 1: lone key past, base applies (got %v)", v)
+	kf_probe_check(ok && v == 4.0, "frame 101 == off 1: lone key holds past its frame (got %v)", v)
 	v, ok = kf_geom_sample_lane(&sf, "scale", 100, 9.0)
 	kf_probe_check(!ok && v == 9.0, "unknown property: base kept, inactive")
 
@@ -307,13 +311,15 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 		// Segment-relative addressing is frame - seg.start_a; the key at
 		// clip-relative 10 applies its own value at 210, then interpolates
 		// toward the next key's 2: 211 -> 7.4, 219 -> 2.6, and past the last
-		// key (225) the resting base 4 rules.
+		// key (225) the track holds that key's 2. The audio producer samples
+		// gain through this same proc, so a keyed fade that ends now sustains
+		// its final dB for the rest of the segment.
 		f10, _ := kf_sample_keys(session_kf_view(tk.keys), i32(210 - 200), 4.0)
 		f11, _ := kf_sample_keys(session_kf_view(tk.keys), i32(211 - 200), 4.0)
 		f19, _ := kf_sample_keys(session_kf_view(tk.keys), i32(219 - 200), 4.0)
 		f25, fok := kf_sample_keys(session_kf_view(tk.keys), i32(225 - 200), 4.0)
 		kf_probe_check(
-			f10 == 8.0 && kf_approx(f11, 7.4) && kf_approx(f19, 2.6) && !fok && f25 == 4.0,
+			f10 == 8.0 && kf_approx(f11, 7.4) && kf_approx(f19, 2.6) && fok && f25 == 2.0,
 			"flat sampler is clip-relative on timeline addresses (210->%v 211->%v 219->%v 225->%v ok=%v)",
 			f10, f11, f19, f25, fok,
 		)
@@ -546,8 +552,13 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 		clone_ok = no30 && keys.n == 1
 	}
 	kf_probe_check(clone_ok, "clone is unaffected by the original's new key 30 (deep copy)")
+	// off 9 is past this clip's lone scale key at off 0, whose value is 9.0, so
+	// the track holds 9.0. The base argument is 0.0 and must NOT win — that is
+	// what distinguishes "holds the key" from "fell back to resting". The point
+	// of the check is the clone's deep copy too: a shared key range would have
+	// let the clone's delete reach back here.
 	sv, _ := kf_geom_sample_lane(&base, "scale", 59, 0.0) // off 9, past the lone key
-	kf_probe_check(sv == 0.0, "original scale untouched by the clone's poke; resting base rules past the key (got %v)", sv)
+	kf_probe_check(sv == 9.0, "original scale untouched by the clone's poke; the lone key holds past its frame (got %v)", sv)
 	// teardown both timelanes
 	free_timeline(&cloned)
 	free_timeline(&src)
@@ -571,6 +582,39 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 	kf_trim_head(&z, 5)
 	kf_trim_tail(&z, 5)
 	kf_probe_check(z.keyframe_tracks.n == 0, "remaps on zero-value clip are no-ops")
+
+	// --- the two ends of a track, stated together ---------------------------
+	// The scalar and packed paths must agree on BOTH ends, and the packed path's
+	// tail has its own subtlety: a knot that does not mask the lane is not a
+	// breakpoint for it, so it must not end that lane's hold early. A lane keyed
+	// at 0 and 30, with a later knot masking only OTHER lanes, holds its 30
+	// value past frame 30 rather than dropping to base at the foreign knot.
+	{
+		pc := Clip {}
+		kf_geom_set_packed(&pc, "crop", 0, {1.0, 2.0, 3.0, 4.0, 0, 0, 0}, 0b1111)
+		kf_geom_set_packed(&pc, "crop", 30, {10.0, 20.0, 30.0, 40.0, 0, 0, 0}, 0b1111)
+		// A knot at 50 covering only lanes 0 and 1.
+		kf_geom_set_packed(&pc, "crop", 50, {99.0, 98.0, 0, 0, 0, 0, 0}, 0b0011)
+		// Lane 3's last COVERING knot is 30 (value 40), so it holds 40 past 30
+		// and past the foreign knot at 50.
+		v3, ok3 := kf_geom_sample_lane(&pc, "crop.b", 60, 7.0)
+		kf_probe_check(
+			ok3 && v3 == 40.0,
+			"an unmasked knot must not end a lane's hold (got %v ok=%v)", v3, ok3,
+		)
+		// Lane 0 IS masked at 50, so its hold ends there: 99, not its 30 value.
+		v0, ok0 := kf_geom_sample_lane(&pc, "crop.l", 60, 7.0)
+		kf_probe_check(
+			ok0 && v0 == 99.0,
+			"a masked knot continues the lane's curve past an earlier end (got %v ok=%v)", v0, ok0,
+		)
+		// Before the first key the lane is still inactive and base rules.
+		vb, okb := kf_geom_sample_lane(&pc, "crop.b", 0 - 1, 7.0)
+		kf_probe_check(
+			!okb && vb == 7.0,
+			"before the first key the lane is inactive and base rules (got %v ok=%v)", vb, okb,
+		)
+	}
 
 	// --- packed sections: grouped whole-crop/transform keys -----------------
 	// A packed key lives on a SECTION track ("crop"), n > 0 lanes. Section and
@@ -610,7 +654,9 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 	v, _ = kf_geom_sample_lane(&crop, "crop.t", 30, 0.0)
 	kf_probe_check(v == 1.0, "packed: lane 2 arrives at the next key's value (got %v)", v)
 	v, ok = kf_geom_sample_lane(&crop, "crop.b", 35, 0.0)
-	kf_probe_check(!ok && v == 0.0, "packed: past the last key a lane rests, base kept (v=%v ok=%v)", v, ok)
+	// Lane 3 (crop.b) last covers frame 30 with 9.0, so past it the lane holds
+	// 9.0 rather than the base 0.0 — the lane's own end state, not the section's.
+	kf_probe_check(ok && v == 9.0, "packed: past the last key a lane holds (v=%v ok=%v)", v, ok)
 	v, ok = kf_geom_sample_lane(&crop, "crop.l", 5, 0.0)
 	kf_probe_check(!ok && v == 0.0, "packed: before the first key, base (v=%v ok=%v)", v, ok)
 
@@ -1014,6 +1060,37 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 		kf_probe_check(
 			kf_approx(clip_gain_db_at_playhead(&gc), 0.0),
 			"gain readout on the last key must show the keyed dB",
+		)
+		// Past the last key the track holds it, so the readout keeps showing the
+		// animated value rather than falling back to the clip's static gain of 0
+		// dB. The gain row went live with this same rule (clip_gain_db_at_
+		// playhead keys off the sampler's `active`), so a clip that faded to
+		// silence showed -40 in the inspector and 0 dB everywhere else.
+		playhead.frame = 149 // rel 49, past the last key
+		kf_probe_check(
+			kf_approx(clip_gain_db_at_playhead(&gc), 0.0),
+			"gain readout past the last key holds the keyed dB, got %v",
+			clip_gain_db_at_playhead(&gc),
+		)
+		// A DIFFERENT final dB proves this reads the key rather than coinciding
+		// with the static gain: the two are 0 here, so the case above cannot on
+		// its own tell a hold from a fallback.
+		hc := Clip {timeline_start_frame = 100, source_length_frames = 50, gain = 0}
+		kf_set_key(&hc, "gain", 0, 0.0)
+		kf_set_key(&hc, "gain", 41, -12.0)
+		playhead.frame = 149 // rel 49, past the last key
+		kf_probe_check(
+			kf_approx(clip_gain_db_at_playhead(&hc), -12.0),
+			"gain readout past the last key holds -12, not the static 0, got %v",
+			clip_gain_db_at_playhead(&hc),
+		)
+		// Before the first key the track has not begun, so the static gain rules
+		// and a direct edit is what the user is looking at. The two ends differ
+		// deliberately.
+		playhead.frame = 0 // rel -100, before the first key
+		kf_probe_check(
+			clip_gain_db_at_playhead(&hc) == 0,
+			"gain readout before the first key shows the static gain",
 		)
 		// No gain track: the static value is shown.
 		uc := Clip {gain = -6.5}

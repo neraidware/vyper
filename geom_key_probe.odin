@@ -410,15 +410,17 @@ geom_key_probe_run :: proc() -> int {
 			kf_track_index(cl^, "crop") < 0,
 			"fixture: the packed case must start with no crop section",
 		)
-		// Keys span [0, 100] and the playhead sits at 150 — PAST the last key,
-		// which is the only way a lane on a packed clip becomes pending at all.
-		// Inside the span the packed section owns the value, so a resting edit
-		// there is invisible by design and clip_geom_set would have written a
-		// key instead of a pending resting value. Past the last key `base`
-		// rules, so the edit is visible and pending — and the A shortcut is what
-		// turns it into a key.
-		playhead.frame = 150
-		for off in ([]i32{0, 100}) {
+		// Keys span [100, 200] and the playhead sits at 50 — BEFORE the first
+		// key, which is the only way a lane on a packed clip becomes pending at
+		// all. Inside the span the packed section owns the value, so a resting
+		// edit there is invisible by design and clip_geom_set would have written
+		// a key instead of a pending resting value; past the last key the
+		// section now HOLDS its final knot, so that region is likewise keyed.
+		// Only ahead of the animation does the resting base rule, so the edit is
+		// visible and pending there — and the A shortcut is what turns it into a
+		// key.
+		playhead.frame = 50
+		for off in ([]i32{100, 200}) {
 			kf_geom_set_packed(
 				cl,
 				"crop",
@@ -433,14 +435,14 @@ geom_key_probe_run :: proc() -> int {
 		)
 		geom_key_check(
 			kf_approx(clip_geom_get(cl, .Crop_L), 0.1),
-			"past the last key the resting base rules (got %v)",
+			"before the first key the resting base rules (got %v)",
 			clip_geom_get(cl, .Crop_L),
 		)
-		// A pan past the last key: visible resting edit, lane marked pending.
+		// A pan ahead of the animation: visible resting edit, lane marked pending.
 		clip_geom_set(cl, .Crop_L, 0.4)
 		geom_key_check(
 			clip_geom_key_modified(cl, .Crop_L),
-			"a resting edit past the last key must leave the lane pending",
+			"a resting edit before the first key must leave the lane pending",
 		)
 		geom_key_check(
 			!clip_geom_key_modified(cl, .Crop_R),

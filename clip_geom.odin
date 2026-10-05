@@ -5,11 +5,17 @@ package main
 //
 // Why this module exists. Every geometry property has two homes: a RESTING
 // field on the Clip, and a keyframe track. Which one is authoritative depends
-// on the playhead — kf_sample_keys returns the track's value between the first
-// and last key and IGNORES the resting field there. So "write the resting
-// field" is not always a no-op, but it is *silently* a no-op exactly when the
-// property is keyed, which is the case a user reaches for when they want to
-// animate a property.
+// on the playhead — kf_sample_keys returns the track's value from the first key
+// onward (interpolating between keys, HOLDING past the last) and IGNORES the
+// resting field there. So "write the resting field" is not always a no-op, but
+// it is *silently* a no-op exactly when the property is keyed, which is the
+// case a user reaches for when they want to animate a property.
+//
+// Note the resting field still wins BEFORE a track's first key, so a clip with
+// an animation on it is editable up to the point the animation starts and
+// animated from there on. That is why the write routing below has to ask the
+// sampler rather than test "is this property keyed at all": keyed-somewhere is
+// not the same question as keyed-HERE.
 //
 // That made the routing a per-call-site responsibility: every geometry write
 // had to remember to funnel through kf_auto_key, and the two preview gestures
@@ -110,11 +116,12 @@ clip_geom_keyed_at :: proc(clip: ^Clip, prop: Render_Geom_Prop) -> bool {
 //     while the gesture was still under the pointer. A visible edit must land
 //     somewhere durable; for a property that is already animated, that
 //     somewhere is the track.
-//  2. The property is keyed but INACTIVE at the playhead (the playhead sits
-//     before its first key or past its last). Auto-key extends the animation
-//     here; without it the resting write is what the sampler reads, so the
-//     edit is visible either way. Both are non-lossy, and this keeps the
-//     toggle's meaning unchanged.
+//  2. The property is keyed but INACTIVE at the playhead. That is now ONLY the
+	//     region before the track's first key — past the last key the track HOLDS
+	//     (kf_sample_keys), so the sampler is reading a key there and case 1
+	//     applies. Auto-key extends the animation here; without it the resting
+	//     write is what the sampler reads, so the edit is visible either way. Both
+	//     are non-lossy, and this keeps the toggle's meaning unchanged.
 //  3. Not keyed. Write resting and mark the lane pending so "keyframe all
 //     modified" can offer it. Auto-key never MINTS a track, matching
 //     kf_auto_key's long-standing rule — a property nobody has keyed stays a

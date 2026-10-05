@@ -75,12 +75,13 @@ render_kf_probe_run :: proc() -> int {
 	txA, _, sA, _, _, _, _, _, oxA, _, rwA, _, _, _, _, _ :=
 		render_kf_geom_rect(&geomA, 9, kf_probe_base(1.0), 100, 100, 100, 100, 100, 100)
 
-	// Scale rests at 1 -> cw = draw_w * s = 100, ox centered on sampled tx.
-	// tx at off 9 between keys 1..7: lerp 0 -> 100 gives 133.3 past end;
-	// sampling clamps past-last to base (resting) because kf_fill_snapshot
-	// only copied keys whose range covers the frame. So tx rests at base 0.
-	render_kf_probe_check(oxA == -50 && rwA == 100,
-		"A rests past last key: got ox=%d rw=%d want -50 100", oxA, rwA)
+	// Scale rests at 1 -> cw = 100, and the box is CENTERED on sampled tx, so
+	// ox = tx - cw/2. off 9 is past the last transform.x key (7, value 100), so
+	// the track HOLDS 100 and the box sits at 100 - 50 = 50. Under the old
+	// fall-back-to-base rule it sampled the resting 0 instead and landed at -50,
+	// which is the snap-back this case now pins against.
+	render_kf_probe_check(oxA == 50 && rwA == 100,
+		"A holds past last key: got ox=%d rw=%d want 50 100", oxA, rwA)
 
 	// Case B — crop-l keyed 0.25 with scale rest and tx rest: the box trims
 	// left, src sub-rect cuts into the stage, ox/rw follow the visible rect.
@@ -208,14 +209,15 @@ render_kf_probe_run :: proc() -> int {
 		render_kf_probe_check_near(op1, 1.0, 0.001, "F opacity at first key")
 		render_kf_probe_check_near(op11, 0.625, 0.001, "F opacity interpolated")
 		render_kf_probe_check_near(op21, 0.25, 0.001, "F opacity at last key")
-		// Past the last key the lane is INACTIVE and the resting base rules
-		// (kf_sample_keys returns base past the final key), so a fade that
-		// only covers part of the clip returns to the clip's own opacity
-		// rather than sticking at the last key's value. This is the existing
-		// sampler contract, shared with every geometry lane.
+		// Past the last key the lane HOLDS its final value, so a fade covering
+		// part of a clip SUSTAINS its end opacity for the remainder instead of
+		// snapping back to the clip's resting opacity. The base passed here is
+		// 0.8 deliberately, different from both keys: if the base ever won again
+		// the check would read 0.8 and fail, rather than coincidentally matching
+		// the held 0.25.
 		_, _, _, _, _, _, _, op40, _, _, _, _, _, _, _, _ :=
 			render_kf_geom_rect(&geomF, 40, kf_probe_base(0.8), 100, 100, 100, 100, 100, 100)
-		render_kf_probe_check_near(op40, 0.8, 0.001, "F opacity past last key falls back to base")
+		render_kf_probe_check_near(op40, 0.25, 0.001, "F opacity holds past last key")
 		// An UNKEYED lane must fall back to the resting base: the base is
 		// threaded through render_eval_keyed_geom as the job's geom_base
 		// snapshot, and this is what keeps every un-keyed export
@@ -315,25 +317,23 @@ render_kf_probe_run :: proc() -> int {
 		v.timeline_start_frame = 0
 		v.source_w = probe_w
 		v.source_h = probe_h
-		v.geom_base = geom_sample_resting(&clipH)
-		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
-			p := Render_Geom_Prop(pi)
-			v.kf_geom[pi] = render_kf_fill_flat(&clipH, p)
-		}
+		// The production writer, not a hand-assembled carrier: this case exists
+		// to pin the seeded alpha, and a probe that filled the struct its own way
+		// would keep passing if the writer changed.
+		render_geom_snap_fill(&v.geom, &clipH)
 		// Unit scale on a source the size of the canvas, no crop: the display
 		// rect and the stage sub-rect coincide, so the composite takes its
 		// fixed-scale 1:1 path with no resampler to configure.
 		v.stage_scale = 1.0
 		v.fw = probe_w
 		v.fh = probe_h
-		v.opacity = v.geom_base[int(Render_Geom_Prop.Opacity)]
+		v.opacity = v.geom.base[int(Render_Geom_Prop.Opacity)]
 
 		stage: [probe_w * probe_h * 4]u8
 		frame: [probe_w * probe_h * 4]u8
 		slot := Render_Blit_Slot{blit = stage[:]}
 
-		// Inside the fade, then past its last key. Order matters: the stale-base
-		// read only shows up on the SECOND call.
+		// Inside the fade, then past its last key.
 		render_eval_keyed_geom(&v, 6, &slot, frame[:], nil)
 		render_kf_probe_check_near(
 			v.opacity,
@@ -341,12 +341,20 @@ render_kf_probe_run :: proc() -> int {
 			0.001,
 			"H keyed frame blends the interpolated alpha",
 		)
+		// The original reason for this case: v.opacity is a per-frame field, and
+		// an older version left it holding the PREVIOUS frame's sample, so a
+		// frame outside the key range blended against the last keyed value. The
+		// hold makes that failure mode visible rather than invisible — 0.625
+		// (the frame before) and 0.25 (the correct hold) differ, so a stale
+		// read now fails this check instead of coinciding with the right answer.
+		// The clip's resting opacity is 1.0, so this also confirms the base does
+		// not win past the last key.
 		render_eval_keyed_geom(&v, 40, &slot, frame[:], nil)
 		render_kf_probe_check_near(
 			v.opacity,
-			1.0,
+			0.25,
 			0.001,
-			"H past the last key falls back to the resting base, not the last sample",
+			"H past the last key holds the final alpha, not the previous frame's sample",
 		)
 		render_job.width, render_job.height = saved_w, saved_h
 	}

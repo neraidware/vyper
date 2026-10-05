@@ -920,11 +920,103 @@ kf_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n,
 }
 
 // Render_Kf_Flat is one geometry property's key track copied FLAT onto a
-// Render_Video_Src. Filled on the UI thread at render_start; the worker owns
-// it for the job and never touches the live timeline (kf_fill_snapshot).
+// Render_Geom_Snap. Filled on the UI thread at render_start; the worker owns it
+// for the job and never touches the live timeline (kf_fill_snapshot).
 Render_Kf_Flat :: struct {
 	keys: [KF_RENDER_MAX_KEYS]Keyframe,
 	n:    int,
+}
+
+// Render_Geom_Snap is ONE clip's geometry as it crosses the UI->worker thread
+// boundary: the resting values, every lane's flattened key track, and the flags
+// derived from them. EVERY visual source carries one, filled by the single proc
+// below.
+//
+// Why this is a type and not a convention. The snapshot used to be hand-written
+// per clip kind: Render_Video_Src got geom_base + kf_geom + geom_keyed, while
+// Render_Text_Src and Render_Sub_Src got three loose resting `f32`s each. Text
+// therefore exported its RESTING transform for the whole clip — the animation
+// previewed correctly and never crossed the thread hop — and the same three
+// omissions took text opacity with them, since no text field existed to lose.
+// Nothing in the type system could catch that: a missing animation is the
+// absence of a field, and an absent field is indistinguishable from an
+// intentional one.
+//
+// As a field it is no longer optional. A new clip kind gets its geometry
+// animation by having a Render_Geom_Snap, and cannot "forget" it, because there
+// is nothing to forget — the data rides along whether the consumer reads it or
+// not. That is what makes the preview/export split structural instead of a
+// discipline problem, and it is why the parity probe's per-lane check could
+// honestly claim the two sinks cannot disagree.
+//
+// Immutable for the life of the job. The worker must never read the live clip,
+// and a base that changed under it would make the same frame evaluate
+// differently on its second call.
+Render_Geom_Snap :: struct {
+	// base is the clip's RESTING geometry and opacity — what a lane samples
+	// against where no covering key applies, and the same shape the preview
+	// latch holds.
+	base: Geom_Sample,
+	// keys is every Render_Geom_Prop lane's key track, flattened. Indexed by the
+	// enum, so a lane added to Render_Geom_Prop is carried here with no second
+	// list to extend.
+	keys: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
+	// keyed is "some lane has keys", and it is what routes a source onto the
+	// per-frame animated path instead of the baked one.
+	keyed: bool,
+	// scale_keyed and opacity_keyed are the two lanes that change a DECISION
+	// made once at setup rather than a per-frame rect: a keyed scale needs a
+	// stage sized for its maximum (or a re-baked text raster), and a keyed
+	// opacity means canvas-zeroing must treat the clip as possibly translucent.
+	// Kept explicit because "some lane is keyed" cannot answer either question.
+	scale_keyed:   bool,
+	opacity_keyed: bool,
+}
+
+// geom_snap_eval is the carrier's one read path: the value of every lane at
+// clip-relative `off`. The flat counterpart of the preview's geom_sample_clip,
+// and the only way a worker composite should learn a clip's geometry.
+geom_snap_eval :: proc(snap: ^Render_Geom_Snap, off: i32) -> Geom_Sample {
+	return geom_sample_flat(snap.base, &snap.keys, off)
+}
+
+// geom_snap_offset is the clip-relative frame a source composites at. One place
+// so a consumer cannot sample at the wrong origin against a base that is
+// already clip-relative.
+geom_snap_offset :: proc(snap: ^Render_Geom_Snap, timeline_start_frame, timeline_frame: i64) -> i32 {
+	return i32(timeline_frame - timeline_start_frame)
+}
+
+// render_geom_snap_fill snapshots `clip` into `snap`. The ONE writer: every
+// visual source is filled through this, so no clip kind can take a different (or
+// narrower) route across the boundary.
+//
+// The lane loop is the enum, not a hand-listed set of properties, so a lane
+// added to Render_Geom_Prop is carried across automatically.
+//
+// crop lanes are NOT cleared here. A text clip has no source frame to crop (its
+// raster is sized to the ink), so crop must read 0 for it — but that is a
+// statement about how a text clip DRAWS, not about what its keys say, so it
+// belongs with the text consumer (geom_clear_crop) rather than being baked into
+// the shared carrier where it would silently zero a video clip's crop.
+render_geom_snap_fill :: proc(snap: ^Render_Geom_Snap, clip: ^Clip) {
+	snap^ = {}
+	snap.base = geom_sample_resting(clip)
+	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
+		p := Render_Geom_Prop(pi)
+		slot := &snap.keys[int(p)]
+		slot.n, _ = kf_geom_fill_snapshot(clip, render_geom_name(p), slot.keys[:])
+		if slot.n > 0 {
+			snap.keyed = true
+			switch p {
+			case .Scale:
+				snap.scale_keyed = true
+			case .Opacity:
+				snap.opacity_keyed = true
+			case .Trans_X, .Trans_Y, .Crop_L, .Crop_R, .Crop_T, .Crop_B, ._COUNT:
+			}
+		}
+	}
 }
 
 // Geom_Sample is the evaluated value of every animated geometry property at ONE
@@ -933,9 +1025,17 @@ Render_Kf_Flat :: struct {
 // list to drift. Preview fills it live from the clip (geom_sample_clip); export
 // fills it from the job's flat keyframe snapshot (geom_sample_flat). Both read
 // the SAME resting base (geom_resting_value / the exported resting fields) and
-// the SAME evaluator per source, so "preview shows the animation, export
-// ignores it" (or vice versa) cannot happen for one lane without the probe's
-// per-lane equals check failing.
+// the SAME evaluator per source.
+//
+// The claim this shape used to make but could not keep was that "preview shows
+// the animation, export ignores it" cannot happen for one lane without the
+// probe's per-lane equals check failing. That held only for the clip kind the
+// probe was pointed at: the transport was hand-written per kind, so text and
+// subtitle clips carried no keys across the thread hop and the check — which
+// took a video pointer — never saw them. Render_Geom_Snap is what makes the
+// claim true instead of hopeful: one carrier every source must carry, filled by
+// one proc, read through one evaluator, and a parity check scoped to the
+// carrier rather than to a clip kind.
 Geom_Sample :: [int(Render_Geom_Prop._COUNT)]f32
 
 // geom_resting_value is a clip's resting (un-keyed) value for one geometry
@@ -1023,17 +1123,15 @@ Render_Video_Src :: struct {
 	// source_start_frame (see media_is_image / Clip.is_still).
 	is_still:             bool,
 	timeline_start_frame: i64,
-	// geom_base is the clip's RESTING geometry and opacity, snapshotted flat at
-	// render_start by geom_sample_resting — the same shape the preview latch
-	// holds, and the base every lane samples against outside its keys. It is
-	// immutable for the life of the job: the worker must never read the live
-	// clip, and a base that changed under it would make the same frame evaluate
-	// differently on the second call.
-	geom_base:            Geom_Sample,
+	// geom is the clip's geometry and opacity as it crosses the thread boundary:
+	// resting base, every lane's flattened key track, and the derived flags.
+	// Written by render_geom_snap_fill and read only through geom_snap_eval, so
+	// the animated and baked paths sample the same lanes from the same base.
+	geom:                Render_Geom_Snap,
 	source_w:             c.int,
 	source_h:             c.int,
 	// opacity is the alpha THIS FRAME composites with. Seeded from
-	// geom_base[Opacity] at setup (the static path never changes it) and
+	// geom.base[Opacity] at setup (the static path never changes it) and
 	// rewritten every composite frame by render_eval_keyed_geom when the
 	// opacity lane is keyed — the same way it rewrites rw/rh/ox/oy. It is
 	// deliberately NOT where the resting value lives: the old field served as
@@ -1042,22 +1140,9 @@ Render_Video_Src :: struct {
 	// key range blended against the last keyed value instead of the resting
 	// one (pinned by render_kf_probe case H).
 	opacity:              f32,
-	// Keyed geometry (S6): when any of the lane properties is keyed,
-	// geom_keyed routes the worker through per-frame evaluation and stage
-	// sub-rect blitting. kf_geom is the UI-thread snapshot; keys ride with the
-	// job (fixed arrays, no extra ownership). blit_sx/sy are the per-frame src
-	// origin into the stage slot, recomputed by render_eval_keyed_geom each
-	// composite frame (worker-owned; the producer ignores them).
-	geom_keyed:          bool,
-	scale_keyed:         bool,
-	// opacity_keyed: the opacity lane has keys, so the RESTING opacity above
-	// is not the whole story and a frame can be translucent where render_start
-	// saw 1.0. Canvas-zeroing is a job-wide decision made once from the
-	// snapshot, so this has to be conservative: a keyed lane is treated as
-	// translucent even if every key currently reads 1.0.
-	opacity_keyed:       bool,
+	// stage_scale is the maximum scale this clip reaches, so a keyed clip's
+	// stage is sized once for its whole animation. Worker-owned.
 	stage_scale:         f32,
-	kf_geom:             [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat,
 	kres_scratch:        []u8,
 	// Compositing state (computed once at open).
 	dec:                  Clip_Decoder,
@@ -1096,13 +1181,18 @@ Render_Blit_Slot :: struct {
 // Render_Text_Src snapshots a .Text generator clip for the worker. It carries
 // the title plus the transform math needed to place it at output resolution:
 // box = text (source_w x source_h, in text px) * scale * (out_w / PREVIEW_W).
+//
+// Its geometry lives in the shared Render_Geom_Snap like every other visual
+// source, so a keyed text clip exports ANIMATED — the same lanes, sampled by
+// the same evaluator, from the same resting base as a video clip's. This struct
+// used to carry `transform_x`/`transform_y`/`scale` as plain resting copies,
+// which meant the animation stopped at the UI thread and the worker drew the
+// text at one pose for the whole clip.
 Render_Text_Src :: struct {
 	name:                 string, // owned copy, freed by the worker
 	timeline_start_frame: i64,
 	source_length_frames: i64,
-	transform_x:          f32, // top-left anchor
-	transform_y:          f32,
-	scale:                f32,
+	geom:                 Render_Geom_Snap,
 	source_w:             c.int, // text_w (tight ink width, text px)
 	source_h:             c.int, // text_h (tight ink height, text px)
 
@@ -1149,32 +1239,56 @@ Render_Text_Font :: struct {
 }
 render_text_font: Render_Text_Font
 
-// Render_Text_Job is a text clip's per-render precomputed raster + box, built
-// once in render_worker_run so each frame just blits it. Baking the clip's
-// scale into the raster (font = 48*clip_scale, clip_scale reset to 1) keeps the
-// output crisp and consistent with the preview; blit_scale is the clip's baked
-// scale (=1) so the box falls out of the tight dims times the uniform factor.
+// Render_Text_Job is a text clip's rasterized ink, baked at the scale the clip
+// was last drawn at. Baking scale into the raster (font = 48*scale) is what
+// keeps the output crisp, and it means the raster is CACHED STATE rather than a
+// sampled value — so an animated scale has to re-bake it, exactly as the
+// preview re-bakes on its text_font_px change. blit_scale stays 1 so the box
+// falls out of the tight dims times the uniform factor, with no double-scaling.
 Render_Text_Job :: struct {
 	raster:         []u8,
 	bw:             int, // raster row stride
 	ox, oy, ow, oh: int, // tight ink rect in raster
 	blit_scale:     f32,
+	// font_px is the baked font size, i.e. the scale this raster's RESOLUTION
+	// corresponds to. The per-frame gate compares the sampled scale's font
+	// against it to decide whether a re-bake is owed.
+	font_px: f32,
 }
 
-// setup_text_job rasterizes a text clip at the baked font matching its snapshot.
-// source_w/source_h are the BASE tight dims (font 48, scale-independent) and
-// scale is the multiplier, so the raster is rendered at font = 48*scale to keep
-// the output crisp (consistent with the preview). The raster therefore carries
-// the scale, and blit_scale is 1 so the box = tight_dims * uniform_factor (no
-// double-scaling). Returns the job or leaves raster empty on failure (caller
-// deletes raster via cleanup).
-setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
-	over^ = {}
-	if t.name == "" || t.source_w <= 0 || t.source_h <= 0 {
+// TEXT_REBAKE_EPS: how far a clip's scale may drift before the raster is
+// re-baked. Comparing floats exactly would re-rasterize on sub-ULP wobble
+// (an eased curve's rounding); a tolerance too loose would leave the raster
+// visibly coarser than the scale asks for. A tenth of a pixel of font height is
+// below what a glyph raster can express, so it costs nothing and stops the
+// churn.
+TEXT_REBAKE_EPS :: 0.1
+
+// setup_text_job rasterizes a text clip at `scale` (the multiplier baked into
+// the baked font = 48*scale). source_w/source_h are the BASE tight dims (font
+// 48, scale-independent).
+//
+// `rebake` says whether the existing raster may be kept: it is false only when
+// the job is already baked at this exact font, so the common unkeyed case
+// rasterizes once for the whole render. Returns with raster empty on failure.
+//
+// The caller owns the previous raster; this proc does not free it, because a
+// re-bake happens with the old ink still needed for the frame in flight. See
+// text_job_rescale.
+setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, rebake: bool) {
+	if !rebake && over.raster != nil {
 		return
 	}
-	font_px := f32(TEXT_CLIP_FONT_PIXELS) * t.scale
+	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
+	if t.name == "" || t.source_w <= 0 || t.source_h <= 0 {
+		over^ = {}
+		return
+	}
 	bw, bh := text_buf_size_for(t.name, &render_text_font.font, &render_text_font.init, font_px)
+	if bw <= 0 || bh <= 0 {
+		over^ = {}
+		return
+	}
 	buf := make([]u8, bw * bh * 4)
 	scratch := text_buf_ensure(&render_text_font.setup_scratch, text_scratch_size_for(font_px))
 	ox, oy, ow, oh := rasterize_title_into_buffer(
@@ -1189,12 +1303,111 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src) {
 	)
 	if ow <= 0 || oh <= 0 {
 		delete(buf)
+		over^ = {}
 		return
 	}
 	over.raster = buf
 	over.bw = bw
 	over.ox, over.oy, over.ow, over.oh = ox, oy, ow, oh
 	over.blit_scale = 1
+	over.font_px = font_px
+}
+
+// text_job_rescale re-bakes a text job when the clip's scale this frame no
+// longer matches the resolution its raster was drawn at, and frees the stale
+// raster. Returns true when it re-baked.
+//
+// This is the one place the animated path is NOT just a sampled value: scale is
+// baked into the raster's resolution, so unlike transform (a placement the blit
+// takes per frame) it cannot be applied by rescaling. The preview has the same
+// constraint and solves it the same way, by re-rasterizing when the baked font
+// changes (preview_state.odin's text_font_px gate) — so both sinks converge on
+// the same ink for the same scale.
+text_job_rescale :: proc(j: ^Render_Text_Job, t: Render_Text_Src, scale: f32) -> bool {
+	if !geom_scale_needs_rebake(j.font_px, scale) {
+		return false
+	}
+	// The old raster stays valid until the new one lands, and setup_text_job
+	// overwrites the fields, so hold it and free after: an allocation-free
+	// failure path would otherwise leak the previous bake.
+	stale := j.raster
+	setup_text_job(j, t, scale, true)
+	if j.raster == nil {
+		// Nothing usable came back. Restore the old bake rather than dropping
+		// the clip's text for the rest of the render (setup cleared the fields).
+		j.raster = stale
+		return false
+	}
+	delete(stale)
+	return true
+}
+
+// geom_scale_needs_rebake reports whether a raster baked at `font_px` no longer
+// matches the font size `scale` asks for. Split out so the re-bake decision is
+// stated once and the tolerance has one home.
+geom_scale_needs_rebake :: proc(font_px, scale: f32) -> bool {
+	return abs(font_px - f32(TEXT_CLIP_FONT_PIXELS) * scale) > TEXT_REBAKE_EPS
+}
+
+// snapshot_text_src builds the worker snapshot for a .Text generator clip.
+//
+// Like its video counterpart it fills the shared Render_Geom_Snap rather than
+// copying the clip's resting fields, so a keyed text clip reaches the worker
+// with its animation intact. `job_idx` is the caller's index into the job's
+// text array, which is a different ordering from the composite stack.
+snapshot_text_src :: proc(clip: ^Clip, job_idx: int) -> Render_Text_Src {
+	src := Render_Text_Src {
+		// Worker-owned: this crosses a thread hop, and the pool is freed at
+		// teardown without draining queued jobs, so it keeps its own copy.
+		name = strings.clone(clip_name(clip)),
+		timeline_start_frame = clip.timeline_start_frame,
+		source_length_frames = clip.source_length_frames,
+		source_w = clip.source_w,
+		source_h = clip.source_h,
+		job_idx = job_idx,
+	}
+	render_geom_snap_fill(&src.geom, clip)
+	return src
+}
+
+// Render_Sink is which of the render job's source arrays a clip is snapshotted
+// into. A closed set of three, so it is an enum rather than a hand-passed int.
+Render_Sink :: enum {
+	Video,
+	Text,
+	Sub,
+}
+
+// render_clip_sink classifies a clip for the render walk: which job array holds
+// its snapshot, or ok=false when the clip has no renderable content.
+//
+// This is the ONE authority for that mapping. render_start walks with it, and so
+// does the parity probe when it lines the job's arrays back up with the live
+// clips — and that pairing is exactly why it cannot be stated twice. A probe
+// that re-derived "text clips go in .texts" by walking the kinds itself would
+// agree with render_start only by coincidence, and a divergence there compares
+// the wrong clip against the wrong snapshot: a parity check that silently stops
+// checking anything.
+render_clip_sink :: proc(clip: ^Clip) -> (sink: Render_Sink, ok: bool) {
+	switch clip.kind {
+	case .Video, .Image:
+		return .Video, true
+	case .Text:
+		// A .Text clip is either a burned-in title or a subtitle generator; the
+		// generator decides which array, and .Subtitles kind is never placed on
+		// the timeline (its assets drop in as .Text).
+		if clip.generator == .Subtitles {
+			return .Sub, true
+		}
+		return .Text, true
+	case .Audio, .Other, .Empty, .Subtitles:
+		// .Audio is snapshotted from the committed geometry slab after the walk,
+		// not from the live clips: the same source the playback producer
+		// consumes, so playback and export evaluate one gain snapshot. .Other and
+		// .Empty carry no renderable content.
+		return .Video, false
+	}
+	return .Video, false
 }
 
 // Render_Sub_Src snapshots a .Subtitles generator clip (kind .Text) for the
@@ -1210,25 +1423,66 @@ Render_Sub_Src :: struct {
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
 	source_length_frames: i64,
-	transform_x:          f32, // current top-left anchor (project coords)
-	transform_y:          f32,
-	scale:                f32,
+	// geom is the same shared carrier a video or text clip carries, so a keyed
+	// subtitle clip exports animated too. This struct previously copied the
+	// three resting transform fields directly and computed a fixed box center
+	// from them at setup, which froze a subtitle's keyed motion at one pose.
+	geom:                 Render_Geom_Snap,
 	source_w:             c.int, // current cue's base ink dims (font 48)
 	source_h:             c.int,
-	// Worker-computed at setup: the fixed box center each cue stays centered on.
-	anchor_x:             f32,
-	anchor_y:             f32,
+}
+
+// sub_box_center is the box center a subtitle's cue text stays centered on:
+// the clip's top-left plus half its box, in output pixels. transform/scale come
+// in already SAMPLED, so the same proc serves an unkeyed clip (resting values)
+// and a keyed one (per-frame values) without either having its own center math.
+//
+// A clip with no measured source dims has no box to center, so it falls back to
+// the canvas center — the long-standing behavior for a subtitle whose dims have
+// not been measured yet.
+sub_box_center :: proc(
+	geom: Geom_Sample,
+	source_w, source_h: c.int,
+	factor: f32,
+	canvas_w, canvas_h: c.int,
+) -> (x, y: f32) {
+	if source_w <= 0 || source_h <= 0 {
+		return f32(canvas_w) / 2, f32(canvas_h) / 2
+	}
+	scale := geom[int(Render_Geom_Prop.Scale)]
+	return geom[int(Render_Geom_Prop.Trans_X)] + f32(source_w) * scale * factor / 2,
+	       geom[int(Render_Geom_Prop.Trans_Y)] + f32(source_h) * scale * factor / 2
+}
+
+// snapshot_sub_src builds the worker snapshot for a subtitle-generator clip.
+// One proc for both clip kinds that produce one (`.Text`/`.Subtitles` with a
+// .Subtitles generator), so the two cannot drift on what crosses the boundary.
+snapshot_sub_src :: proc(clip: ^Clip, fps: f32) -> Render_Sub_Src {
+	src := Render_Sub_Src {
+		srt_id = clip.srt_id,
+		fps = fps,
+		timeline_start_frame = clip.timeline_start_frame,
+		source_start_frame = clip.source_start_frame,
+		source_length_frames = clip.source_length_frames,
+		source_w = clip.source_w,
+		source_h = clip.source_h,
+	}
+	render_geom_snap_fill(&src.geom, clip)
+	return src
 }
 
 // Render_Sub_Cue is the worker's raster cache for one subtitle clip's ACTIVE
 // cue (keyspace is per clip). Cues play forward in population order during a
 // render, so a single slot per clip has a perfect hit rate between boundaries.
+// font_px records the resolution it was baked at, so an animated scale re-bakes
+// it rather than rescaling the blit.
 Render_Sub_Cue :: struct {
 	cue_idx:        int,
 	raster:         []u8, // baked-font (48*scale) RGBA raster
 	bw:             int, // raster row stride
 	bh:             int, // raster height
 	ox, oy, ow, oh: int, // tight ink rect in the raster
+	font_px:        f32,
 }
 
 // rasterize_subtitle_cue builds the baked-font raster for one cue's text
@@ -1361,7 +1615,7 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	cw, ch := full_box_dims(
 		src.source_w,
 		src.source_h,
-		src.geom_base[int(Render_Geom_Prop.Scale)],
+		src.geom.base[int(Render_Geom_Prop.Scale)],
 		f32(PW),
 		f32(PH),
 	)
@@ -1372,14 +1626,14 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 	// precisely the drift B existed to stop. render_kf_geom_rect below was
 	// already migrated; this is the static path.
 	return cropped_box_edges(
-		src.geom_base[int(Render_Geom_Prop.Trans_X)],
-		src.geom_base[int(Render_Geom_Prop.Trans_Y)],
+		src.geom.base[int(Render_Geom_Prop.Trans_X)],
+		src.geom.base[int(Render_Geom_Prop.Trans_Y)],
 		cw,
 		ch,
-		src.geom_base[int(Render_Geom_Prop.Crop_L)],
-		src.geom_base[int(Render_Geom_Prop.Crop_R)],
-		src.geom_base[int(Render_Geom_Prop.Crop_T)],
-		src.geom_base[int(Render_Geom_Prop.Crop_B)],
+		src.geom.base[int(Render_Geom_Prop.Crop_L)],
+		src.geom.base[int(Render_Geom_Prop.Crop_R)],
+		src.geom.base[int(Render_Geom_Prop.Crop_T)],
+		src.geom.base[int(Render_Geom_Prop.Crop_B)],
 	)
 }
 
@@ -2668,8 +2922,8 @@ render_worker_run :: proc() {
 		v := &render_job.videos[i]
 		// The static path never rewrites opacity, so seed this frame's alpha
 		// from the resting base here; the keyed path overwrites it per frame.
-		v.opacity = v.geom_base[int(Render_Geom_Prop.Opacity)]
-		if v.geom_keyed {
+		v.opacity = v.geom.base[int(Render_Geom_Prop.Opacity)]
+		if v.geom.keyed {
 			// S6 animated path: decode ONCE at a stage sized to the max scale
 			// this clip reaches (resting or keyed), then per frame the
 			// composite samples the seven properties and region-copies the
@@ -2678,8 +2932,8 @@ render_worker_run :: proc() {
 			// A keyed clip can move anywhere on the canvas, so it is never
 			// fw-zeroed, and neither the visibility crop (the WHOLE stage must
 			// be present every frame) nor the static crop resampler is built.
-			stage_scale := v.geom_base[int(Render_Geom_Prop.Scale)]
-			for k in v.kf_geom[int(Render_Geom_Prop.Scale)].keys[:v.kf_geom[int(Render_Geom_Prop.Scale)].n] {
+			stage_scale := v.geom.base[int(Render_Geom_Prop.Scale)]
+			for k in v.geom.keys[int(Render_Geom_Prop.Scale)].keys[:v.geom.keys[int(Render_Geom_Prop.Scale)].n] {
 				if k.value.(f32) > stage_scale {
 					stage_scale = k.value.(f32)
 				}
@@ -2710,7 +2964,7 @@ render_worker_run :: proc() {
 			for &slot in &v.blit_slots {
 				slot.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
 			}
-			if v.scale_keyed {
+			if v.geom.scale_keyed {
 				// Per-frame resample scratch: the animated box is at most the
 				// full stage, so one stage-sized buffer covers every frame.
 				v.kres_scratch = make([]u8, int(v.fw) * int(v.fh) * 4)
@@ -2732,7 +2986,7 @@ render_worker_run :: proc() {
 		cw, ch := full_box_dims(
 			v.source_w,
 			v.source_h,
-			v.geom_base[int(Render_Geom_Prop.Scale)],
+			v.geom.base[int(Render_Geom_Prop.Scale)],
 			f32(render_job.width),
 			f32(render_job.height),
 		)
@@ -2766,8 +3020,8 @@ render_worker_run :: proc() {
 		vis_top := max(0, c.int(t + 0.5))
 		vis_right := min(render_job.width, c.int(r + 0.5))
 		vis_bottom := min(render_job.height, c.int(b + 0.5))
-		box_left := v.geom_base[int(Render_Geom_Prop.Trans_X)] - cw / 2
-		box_top := v.geom_base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
+		box_left := v.geom.base[int(Render_Geom_Prop.Trans_X)] - cw / 2
+		box_top := v.geom.base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
 		box_ox := c.int(box_left + 0.5)
 		box_oy := c.int(box_top + 0.5)
 		visible_covers_box := vis_left <= box_ox && vis_top <= box_oy &&
@@ -2793,10 +3047,10 @@ render_worker_run :: proc() {
 		// scratch, replacing the old per-pixel nearest-neighbor loop. Source
 		// rect is quantized to whole blit pixels; bilinear filtering makes the
 		// sub-pixel remainder a quality improvement, not a bug.
-		crop_l := v.geom_base[int(Render_Geom_Prop.Crop_L)]
-		crop_r := v.geom_base[int(Render_Geom_Prop.Crop_R)]
-		crop_t := v.geom_base[int(Render_Geom_Prop.Crop_T)]
-		crop_b := v.geom_base[int(Render_Geom_Prop.Crop_B)]
+		crop_l := v.geom.base[int(Render_Geom_Prop.Crop_L)]
+		crop_r := v.geom.base[int(Render_Geom_Prop.Crop_R)]
+		crop_t := v.geom.base[int(Render_Geom_Prop.Crop_T)]
+		crop_b := v.geom.base[int(Render_Geom_Prop.Crop_B)]
 		if crop_l != 0 || crop_r != 0 || crop_t != 0 || crop_b != 0 {
 			// The same crop_src_rect the GPU staging path uses, over the full-box
 			// blit (which holds the same pixels the stage does). keyed_export
@@ -2837,10 +3091,10 @@ render_worker_run :: proc() {
 	any_keyed := false
 	any_translucent := false
 	for &v in render_job.videos {
-		if v.geom_keyed {
+		if v.geom.keyed {
 			any_keyed = true
 		}
-		if v.geom_base[int(Render_Geom_Prop.Opacity)] < 1.0 || v.opacity_keyed {
+		if v.geom.base[int(Render_Geom_Prop.Opacity)] < 1.0 || v.geom.opacity_keyed {
 			any_translucent = true
 		}
 	}
@@ -2937,29 +3191,26 @@ render_worker_run :: proc() {
 	}
 	thread.start(render_pipe.enc)
 
-	// Text compositing: each text clip gets a precomputed raster (baked font)
-	// + blit box built once below, then alpha-blitted on the canvas each frame.
-	// Built before the frame loop (titles + transforms are static for a job).
+	// Text compositing: each text clip gets a raster (baked font) + blit box,
+	// then alpha-blitted on the canvas each frame. Baked ONCE here at the
+	// clip's RESTING scale, which is all an unkeyed clip ever needs. A clip with
+	// a keyed scale lane re-bakes on the frame the sampled scale leaves the
+	// baked resolution (text_job_rescale), because the raster's font size IS the
+	// scale — it cannot be applied by rescaling the blit.
 	text_jobs := make([]Render_Text_Job, max(len(render_job.texts), 1))
 	for i in 0 ..< len(render_job.texts) {
-		setup_text_job(&text_jobs[i], render_job.texts[i])
+		t := &render_job.texts[i]
+		base := t.geom.base[int(Render_Geom_Prop.Scale)]
+		setup_text_job(&text_jobs[i], t^, base, true)
 	}
 
-	// Subtitle compositing: per-clip anchor (the box center to keep fixed across
-	// cue changes) + a one-slot active-cue raster cache. Cues play forward in
-	// population order, so a single slot per clip is a near-perfect LRU.
+	// Subtitle compositing: a one-slot active-cue raster cache per clip. Cues
+	// play forward in population order, so a single slot per clip is a
+	// near-perfect LRU. The box center each cue keeps is recomputed per frame
+	// from the sampled geometry (sub_box_center) rather than latched here, so a
+	// keyed subtitle tracks its own animation.
 	sub_cues := make([]Render_Sub_Cue, max(len(render_job.subs), 1))
 	sub_factor := f32(render_job.width) / f32(PREVIEW_W)
-	for i in 0 ..< len(render_job.subs) {
-		s := &render_job.subs[i]
-		if s.source_w > 0 && s.source_h > 0 {
-			s.anchor_x = s.transform_x + f32(s.source_w) * s.scale * sub_factor / 2
-			s.anchor_y = s.transform_y + f32(s.source_h) * s.scale * sub_factor / 2
-		} else {
-			s.anchor_x = f32(render_job.width) / 2
-			s.anchor_y = f32(render_job.height) / 2
-		}
-	}
 
 	// GPU canvas composite (S1c plumbing, part 1). A video-only job composites
 	// the whole visual stack into one GPU canvas and reads it back once per
@@ -2976,7 +3227,7 @@ render_worker_run :: proc() {
 	gpu_frame_ok := keyed_gpu_enabled && len(render_job.texts) == 0 && len(render_job.subs) == 0
 	if gpu_frame_ok {
 		for &vv in render_job.videos {
-			if !vv.geom_keyed && vv.crop_ctx != nil {
+			if !vv.geom.keyed && vv.crop_ctx != nil {
 				gpu_frame_ok = false
 				break
 			}
@@ -3075,7 +3326,7 @@ render_worker_run :: proc() {
 				if gpu_active {
 					gpu_ctx = &gpu_canvas
 				}
-				if src.geom_keyed {
+				if src.geom.keyed {
 					render_eval_keyed_geom(src, timeline_frame, slot, eslot.canvas, gpu_ctx)
 				} else {
 					render_blit(eslot.canvas, render_job.width, render_job.height, src, slot, gpu_ctx)
@@ -3089,6 +3340,20 @@ render_worker_run :: proc() {
 					continue
 				}
 				j := &text_jobs[t.job_idx]
+				// Same carrier, same evaluator as every other visual source, so a
+				// keyed text clip's pose comes from its keys rather than the
+				// resting fields the snapshot used to copy. A text clip has no
+				// source frame to crop, so its crop lanes read 0 here — the same
+				// rule the preview applies (geom_clear_crop).
+				sg := geom_snap_eval(&t.geom, geom_snap_offset(&t.geom, t.timeline_start_frame, timeline_frame))
+				geom_clear_crop(&sg)
+				// Scale is baked into the raster's font size, so an animated scale
+				// has to re-bake it rather than rescale the blit. Only the
+				// scale_keyed clips can reach here with a different scale than
+				// the bake, so the gate is free for everyone else.
+				if t.geom.scale_keyed {
+					text_job_rescale(j, t^, sg[int(Render_Geom_Prop.Scale)])
+				}
 				if j.raster == nil || j.ow <= 0 || j.oh <= 0 {
 					continue
 				}
@@ -3102,9 +3367,10 @@ render_worker_run :: proc() {
 					j.oy,
 					j.ow,
 					j.oh,
-					t.transform_x,
-					t.transform_y,
+					sg[int(Render_Geom_Prop.Trans_X)],
+					sg[int(Render_Geom_Prop.Trans_Y)],
 					j.blit_scale,
+					sg[int(Render_Geom_Prop.Opacity)],
 				)
 			}
 		}
@@ -3170,13 +3436,26 @@ render_worker_run :: proc() {
 			if ci < 0 {
 				continue
 			}
+			// Sample the same carrier a video or text clip composites from, so a
+			// keyed subtitle moves and resizes instead of holding the pose the
+			// job snapshot happened to carry.
+			sg := geom_snap_eval(&s.geom, geom_snap_offset(&s.geom, s.timeline_start_frame, timeline_frame))
+			scale := sg[int(Render_Geom_Prop.Scale)]
 			jc := &sub_cues[i]
-			if jc.raster == nil || jc.cue_idx != ci {
+			// Re-bake when EITHER the cue changed or the clip's scale moved off
+			// the resolution this raster was drawn at — scale is baked into the
+			// cue's font size, so it cannot be applied by rescaling the blit.
+			rebake :=
+				jc.raster == nil ||
+				jc.cue_idx != ci ||
+				geom_scale_needs_rebake(jc.font_px, scale)
+			if rebake {
 				if jc.raster != nil {
 					delete(jc.raster)
 				}
-				rasterize_subtitle_cue(jc, src.cues[ci].text, s.scale)
+				rasterize_subtitle_cue(jc, src.cues[ci].text, scale)
 				jc.cue_idx = ci
+				jc.font_px = f32(TEXT_CLIP_FONT_PIXELS) * scale
 				if jc.raster == nil {
 					continue
 				}
@@ -3187,9 +3466,22 @@ render_worker_run :: proc() {
 			// text stays centered while the galley bottom (a font-metric line)
 			// keeps the last line's baseline fixed when the cue gains
 			// descenders or a line — matching preview_state.odin.
+			//
+			// The center is recomputed from THIS frame's sampled geometry rather
+			// than latched at setup, which is what makes a keyed subtitle track
+			// its own animation. For an unkeyed clip the sampled values are the
+			// resting ones, so this is exactly the old setup-time anchor.
+			anchor_x, anchor_y := sub_box_center(
+				sg,
+				s.source_w,
+				s.source_h,
+				sub_factor,
+				render_job.width,
+				render_job.height,
+			)
 			w := f32(jc.ow) * sub_factor
 			h := f32(jc.bh) * sub_factor
-			bottom := s.anchor_y + f32(s.source_h) * s.scale * sub_factor / 2
+			bottom := anchor_y + f32(s.source_h) * scale * sub_factor / 2
 			if vyper_trace ||
 			   os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
 				fmt.printf(
@@ -3203,10 +3495,10 @@ render_worker_run :: proc() {
 					jc.bh,
 					w,
 					h,
-					s.anchor_x - w / 2,
+					anchor_x - w / 2,
 					bottom - h,
-					s.anchor_x,
-					s.anchor_y,
+					anchor_x,
+					anchor_y,
 					s.source_w,
 					s.source_h,
 				)
@@ -3221,9 +3513,10 @@ render_worker_run :: proc() {
 				0,
 				jc.ow,
 				jc.bh,
-				s.anchor_x - w / 2,
+				anchor_x - w / 2,
 				bottom - h,
 				1,
+				sg[int(Render_Geom_Prop.Opacity)],
 			)
 		}
 		if split_timing {
@@ -3423,12 +3716,12 @@ render_eval_keyed_geom :: proc(
 	canvas: []u8,
 	gpu: ^GPU_Composite,
 ) -> bool {
-	off := i32(timeline_frame - v.timeline_start_frame)
+	off := geom_snap_offset(&v.geom, v.timeline_start_frame, timeline_frame)
 	_, _, _, _, _, _, _, opacity, ox, oy, rw, rh, srcx, srcy, srcw, srch :=
 		render_kf_geom_rect(
-			&v.kf_geom,
+			&v.geom.keys,
 			off,
-			v.geom_base,
+			v.geom.base,
 			render_job.width, render_job.height,
 			v.source_w, v.source_h, v.fw, v.fh,
 		)
@@ -3486,7 +3779,7 @@ render_eval_keyed_geom :: proc(
 		)
 		return true
 	}
-	if v.scale_keyed {
+	if v.geom.scale_keyed {
 		// Animated scale: the box is a resample of the whole frame (the stage
 		// was decoded at max scale), so resample the crop sub-rect of the
 		// stage down to the display rect.
@@ -3723,10 +4016,10 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		return
 	}
 	crop_any :=
-		v.geom_base[int(Render_Geom_Prop.Crop_L)] != 0 ||
-		v.geom_base[int(Render_Geom_Prop.Crop_R)] != 0 ||
-		v.geom_base[int(Render_Geom_Prop.Crop_T)] != 0 ||
-		v.geom_base[int(Render_Geom_Prop.Crop_B)] != 0
+		v.geom.base[int(Render_Geom_Prop.Crop_L)] != 0 ||
+		v.geom.base[int(Render_Geom_Prop.Crop_R)] != 0 ||
+		v.geom.base[int(Render_Geom_Prop.Crop_T)] != 0 ||
+		v.geom.base[int(Render_Geom_Prop.Crop_B)] != 0
 	if !crop_any {
 		scol := left - v.ox
 		srow := top - v.oy
@@ -3778,13 +4071,16 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 }
 
 // render_text_blit alpha-blends a rasterized text clip onto the canvas. text_buf
-// holds the title rasterized at the BAKED font (font = 48*clip_scale, and
-// clip.scale is reset to 1), so the raster already carries the scale. The tight
-// ink rect [ox..ox+ow)x[oy..oy+oh) is scaled to the output box anchored at the
-// clip's top-left (tx, ty) in project pixels, matching the preview's text box
-// math: a UNIFORM factor bw0 = ow * (out_w/PREVIEW_W) scales both axes (so text
-// is never squished by the project's aspect), box = bw0*scale x bh0*scale with
-// scale=1 post-bake. bw is the buffer's row stride (the raster's own width).
+// holds the title rasterized at the BAKED font (font = 48*scale, where scale is
+// the clip's sampled Scale and the job's blit_scale stays 1), so the raster
+// already carries the scale. The tight ink rect [ox..ox+ow)x[oy..oy+oh) is
+// scaled to the output box anchored at the clip's top-left (tx, ty) in project
+// pixels, matching the preview's text box math: a UNIFORM factor
+// bw0 = ow * (out_w/PREVIEW_W) scales both axes (so text is never squished by
+// the project's aspect), box = bw0*scale x bh0*scale. bw is the buffer's row
+// stride (the raster's own width). `opacity` is the clip's sampled Opacity lane,
+// folded into the glyph coverage so a translucent text clip composites the same
+// way here as it does on the GPU preview and through blend_row on the video path.
 render_text_blit :: proc(
 	canvas: []u8,
 	draw_w, draw_h: c.int,
@@ -3792,8 +4088,17 @@ render_text_blit :: proc(
 	bw: int,
 	ox, oy, ow, oh: int,
 	tx, ty, scale: f32,
+	opacity: f32,
 ) {
 	if ow <= 0 || oh <= 0 {
+		return
+	}
+	// A global alpha of 1 is the common case (every unkeyed, fully-opaque text
+	// clip), so it takes the original integer blend below. Anything less scales
+	// the glyph's coverage, matching the video path's blend_row and the GPU
+	// preview's SRC_ALPHA/ONE_MINUS_SRC_ALPHA so all three sinks agree.
+	op := clamp(opacity, 0.0, 1.0)
+	if op <= 0.0 {
 		return
 	}
 	factor := f32(draw_w) / f32(PREVIEW_W)
@@ -3824,8 +4129,10 @@ render_text_blit :: proc(
 			scol = max(ox, min(ox + ow - 1, scol))
 			s := src_row[uint(scol) * 4:]
 			d := dst_row[uint(col) * 4:]
-			a := int(s[3])
-			if a == 0 {
+			// Effective alpha is the glyph's coverage times the clip's opacity,
+			// rounded once so a fractional opacity does not drift low.
+			a := int(f32(s[3]) * op + 0.5)
+			if a <= 0 {
 				continue
 			}
 			ia := 255 - a
@@ -4042,8 +4349,15 @@ render_start :: proc() {
 		tr := &timeline.tracks[ti]
 		for i := 0; i < len(tr.clips); i += 1 {
 			clip := &tr.clips[i]
-			switch clip.kind {
-			case .Video, .Image:
+			// Which job array a clip lands in is decided by render_clip_sink, the
+			// one classifier, so this walk and the parity probe cannot disagree
+			// about it.
+			sink, ok := render_clip_sink(clip)
+			if !ok {
+				continue
+			}
+			switch sink {
+			case .Video:
 				append(
 					&cls,
 					Render_Video_Src {
@@ -4053,98 +4367,25 @@ render_start :: proc() {
 						source_length_frames = clip.source_length_frames,
 						is_still = clip.is_still,
 						timeline_start_frame = clip.timeline_start_frame,
-						geom_base = geom_sample_resting(clip),
 						source_w = clip.source_w,
 						source_h = clip.source_h,
 					},
 				)
-				// S6: snapshot the seven geometry key tracks flat so the
-				// worker can evaluate them per frame (UI thread, safe to read
-				// the live clip). geom_keyed routes through the animated path.
-				src := &cls[len(cls) - 1]
-				for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
-					p := Render_Geom_Prop(pi)
-					slot := &src.kf_geom[int(p)]
-					slot.n, _ = kf_geom_fill_snapshot(clip, render_geom_name(p), slot.keys[:])
-					if slot.n > 0 {
-						src.geom_keyed = true
-						if p == Render_Geom_Prop.Scale {
-							src.scale_keyed = true
-						}
-						if p == Render_Geom_Prop.Opacity {
-							src.opacity_keyed = true
-						}
-					}
-				}
+				// Every visual source snapshots its geometry the same way, so a
+				// keyed text clip exports animated exactly as a keyed video clip
+				// does. Filling the carrier here — not per-kind — is what stops a
+				// clip kind from arriving at the worker with its resting pose only.
+				render_geom_snap_fill(&cls[len(cls) - 1].geom, clip)
 				// An untagged union is assigned, not compound-constructed: the tag
 				// IS the pointed-to type.
 				visual: Render_Visual = &cls[len(cls) - 1]
 				append(&vis, visual)
-			case .Audio:
-			// audio is read from the committed geometry slab after the walk,
-			// not from the live clips: the same source the playback producer
-			// consumes, so playback and export evaluate one gain snapshot.
-			case .Other:
-			// no renderable content in this clip
-			case .Empty:
-			// no renderable content in this clip (placeholder for text later)
 			case .Text:
-				if clip.generator == .Subtitles {
-					append(
-						&subs,
-						Render_Sub_Src {
-							srt_id = clip.srt_id,
-							fps = f32(render_job.fps),
-							timeline_start_frame = clip.timeline_start_frame,
-							source_start_frame = clip.source_start_frame,
-							source_length_frames = clip.source_length_frames,
-							transform_x = clip.transform_x,
-							transform_y = clip.transform_y,
-							scale = clip.scale,
-							source_w = clip.source_w,
-							source_h = clip.source_h,
-						},
-					)
-				} else {
-					append(
-						&txts,
-						Render_Text_Src {
-							// Worker-owned: this crosses a thread hop, and the pool is freed at
-							// teardown without draining queued jobs, so it keeps its own copy.
-							name = strings.clone(clip_name(clip)),
-							timeline_start_frame = clip.timeline_start_frame,
-							source_length_frames = clip.source_length_frames,
-							transform_x = clip.transform_x,
-							transform_y = clip.transform_y,
-							scale = clip.scale,
-							source_w = clip.source_w,
-							source_h = clip.source_h,
-							job_idx = len(txts),
-						},
-					)
-					visual: Render_Visual = &txts[len(txts) - 1]
-					append(&vis, visual)
-				}
-			case .Subtitles:
-				// subtitle assets drop as .Text/.Subtitles generator clips (the
-				// .Subtitles clip kind is never placed on the timeline)
-				if clip.generator == .Subtitles {
-					append(
-						&subs,
-						Render_Sub_Src {
-							srt_id = clip.srt_id,
-							fps = f32(render_job.fps),
-							timeline_start_frame = clip.timeline_start_frame,
-							source_start_frame = clip.source_start_frame,
-							source_length_frames = clip.source_length_frames,
-							transform_x = clip.transform_x,
-							transform_y = clip.transform_y,
-							scale = clip.scale,
-							source_w = clip.source_w,
-							source_h = clip.source_h,
-						},
-					)
-				}
+				append(&txts, snapshot_text_src(clip, len(txts)))
+				visual: Render_Visual = &txts[len(txts) - 1]
+				append(&vis, visual)
+			case .Sub:
+				append(&subs, snapshot_sub_src(clip, f32(render_job.fps)))
 			}
 		}
 	}

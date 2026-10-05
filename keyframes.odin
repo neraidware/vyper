@@ -367,7 +367,7 @@ kf_apply_interp :: proc(l, r: f32, t: f32, interp: Kf_Interp, m0, m1: f32, span:
 	return l
 }
 
-// --- evaluation (interpolated between keys, base outside them) -----------
+// --- evaluation (interpolated between keys, base before them, held after) --
 
 // kf_sample_keys is the keyed evaluation over a flat key slice — the same
 // algorithm kf_sample runs over a track, exposed separately so the audio
@@ -375,10 +375,15 @@ kf_apply_interp :: proc(l, r: f32, t: f32, interp: Kf_Interp, m0, m1: f32, span:
 // without touching the live timeline. A key applies ITS value on its own
 // frame; between two adjacent keys the value follows the NEXT key's
 // interpolation mode (we ease INTO it) so it reaches that key's value exactly
-// on its own frame. Before the first key and after the last key the property
-// is INACTIVE:
-// the caller keeps its own (base/resting) value, so direct edits and drags
-// apply there.
+// on its own frame.
+//
+// The two ends differ, and the difference is the point:
+//   - BEFORE the first key the property is INACTIVE and the caller keeps its
+//     own (base/resting) value, so direct edits and drags apply there. The
+//     animation has not started, so there is nothing to hold.
+//   - PAST the last key the track HOLDS its final value. A clip animated to a
+//     new position stays there for the rest of its span rather than snapping
+//     back to the pose it had before any key existed.
 kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, bool) {
 	if len(keys) == 0 {
 		return base, false
@@ -416,8 +421,24 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 		}
 		return kf_apply_interp(active_key.value.(f32), next_key.value.(f32), t, next_key.interp, m0, m1, span), true
 	}
-	// Past the last key the property is under direct control again.
-	return base, false
+	// Past the last key the track HOLDS its final value — the animation's end
+	// state is what the user keyed, and a clip that animated to a new position
+	// must stay there. Dropping back to `base` here made a keyed clip snap to its
+	// resting pose for the remainder of its span, which read as the keyframes
+	// "not working" past their last frame.
+	//
+	// `base` still rules BEFORE the first key: there the track has not begun, so
+	// the property is genuinely un-animated and a direct edit is what the user
+	// is looking at. The asymmetry is deliberate — a track that has not started
+	// has no end state to hold, one that has finished does.
+	//
+	// `active` is true, so clip_geom_set routes a write here to a KEY rather than
+	// to the resting field. That is the invariant clip_geom.odin exists to keep:
+	// a write goes wherever the sampler READS. With the tail holding, a drag
+	// past the last key extends the animation instead of writing a value the
+	// sampler would ignore.
+	_ = base
+	return active_key.value.(f32), true
 }
 
 // kf_sample_packed_lane evaluates ONE lane `idx` over a packed section track
@@ -428,7 +449,8 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 // into it, like the scalar path). Knots that don't mask the lane are no
 // breakpoint for it — the lane's curve runs straight through them, so a partial
 // fold keeps every lane's own keyframe set intact. Before the lane's first
-// covering knot and after its last, the lane is inactive and `base` rules.
+// covering knot `base` rules; after its LAST COVERING knot the lane holds, the
+// same two-ends contract the scalar path uses.
 kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: f32) -> (f32, bool) {
 	if track == nil || track.keys.n == 0 {
 		return base, false
@@ -483,7 +505,13 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 		}
 	}
 	if !have_next {
-		return base, false
+		// Past the lane's last covering knot the lane HOLDS, for the same reason
+		// kf_sample_keys holds past the last key: the keyed end state is what the
+		// user asked for. A knot that skips this lane is not an endpoint for it --
+		// it is not a breakpoint -- so "last covering knot" is the lane's true
+		// end, and a later non-covering knot must not end the hold early.
+		v, _ := kf_lane_value(prev, idx)
+		return v, true
 	}
 	span := f32(next.frame_off - prev.frame_off)
 	t := f32(frame_off - prev.frame_off) / span
@@ -511,9 +539,10 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 // A key applies ITS value on its own frame (creating or editing a keyframe is
 // visible immediately); between two adjacent keys the value follows the NEXT
 // key's interpolation mode (we ease INTO it) and arrives at that key's value
-// exactly on its own frame. Before the first key and after the last key the
-// property is inactive and the caller keeps its own value — direct edits and
-// drags apply there.
+// exactly on its own frame. Past the last key the track holds its final value;
+// before the first key the property is inactive and the caller keeps its own —
+// direct edits and drags apply there. See kf_sample_keys for why the two ends
+// differ.
 kf_sample :: proc(track: ^Kf_Track, frame_off: i32, base: f32) -> (f32, bool) {
 	if track == nil || track.keys.n == 0 {
 		return base, false
