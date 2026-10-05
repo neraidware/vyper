@@ -38,10 +38,16 @@ subtitle_render_probe_run :: proc(out: string) {
 
 	// Preview path at growing scales (the rendered font is 48*scale, so the
 	// raster buffer and per-glyph scratch grow with it).
+	//
+	// The slot's geom is seeded the way update_preview_slots seeds it, because
+	// update_subtitle_slot reads the SAMPLED geometry from the latch rather than
+	// the clip's resting fields. A probe that set only clip.scale would leave
+	// slot.geom at zero and measure a box at scale 0.
 	for scale in ([4]f32{1, 3, 6, 10}) {
 		clip.scale = scale
 		slot := new(Preview_Slot)
 		for frame in i64(0) ..< clip.source_length_frames {
+			slot.geom = geom_sample_clip(clip, frame)
 			// Mirror the app's frame loop: rasterize_lines_into_buffer backs its
 			// per-line buffers with context.temp_allocator, and the UI thread
 			// free-alls the temp arena once per frame (main.odin). The probe must
@@ -77,8 +83,16 @@ subtitle_render_probe_run :: proc(out: string) {
 	ok := true
 	for frame in ([4]i64{0, 34, 60, 80}) {
 		mem.free_all(context.temp_allocator)
+		base_slot.geom = geom_sample_clip(clip, frame)
+		geom_clear_crop(&base_slot.geom)
 		update_subtitle_slot(base_slot, clip, frame)
-		bottom := clip.transform_y + f32(clip.source_h) * clip.scale * k
+		// Read the box from the SLOT's latch, which is what the draw pass
+		// consumes and where update_subtitle_slot now re-anchors. The clip's
+		// resting transform_y is no longer written by the re-center, so reading
+		// it here would measure the pre-anchor value and pass trivially.
+		bottom :=
+			base_slot.geom[int(Render_Geom_Prop.Trans_Y)] +
+			f32(base_slot.source_h) * base_slot.geom[int(Render_Geom_Prop.Scale)] * k
 		if prev_bottom > 0 && abs(bottom - prev_bottom) > 0.01 {
 			fmt.printf(
 				"[sub-probe] baseline drift frame=%d bottom=%.2f prev=%.2f\n",
@@ -97,6 +111,70 @@ subtitle_render_probe_run :: proc(out: string) {
 	if base_slot.text_buf != nil {
 		delete(base_slot.text_buf)
 		base_slot.text_buf = {}
+	}
+
+	// --- a KEYED scale must bake the preview's raster at the SAMPLED scale ---
+	// update_subtitle_slot used to take the baked font from clip.scale, the clip's
+	// RESTING field, while the box it drew came from the sampled geometry. On a
+	// keyed-scale subtitle that previewed the text at one size and exported it at
+	// another — and unlike every other defect in this file, none of the cases
+	// above caught it, because none of them key a scale. The mutation that
+	// reintroduces the bug (font_px from clip.scale) passes every other stage.
+	//
+	// The check is that the slot's baked font tracks the SAMPLE: at the frame
+	// where the sampled scale is well clear of the resting scale, the recorded
+	// font_px must be the sampled one. bakes_at_resting below is the mutation
+	// target, so the assertion cannot pass by coincidence.
+	{
+		kclip := &timeline.tracks[0].clips[0]
+		// Park the resting scale far from the sampled one so a bake taken from
+		// the resting field is unmistakable rather than a rounding difference.
+		kclip.scale = 1.0
+		kf_geom_set_lane_key(kclip, render_geom_name(Render_Geom_Prop.Scale), 0, 4.0)
+		kf_geom_set_lane_key(kclip, render_geom_name(Render_Geom_Prop.Scale), 40, 4.0)
+		kslot := new(Preview_Slot)
+		keyed_font := f32(0)
+		keyed_sampled := f32(0)
+		for frame in i64(0) ..< kclip.source_length_frames {
+			mem.free_all(context.temp_allocator)
+			kslot.geom = geom_sample_clip(kclip, frame)
+			geom_clear_crop(&kslot.geom)
+			sampled := kslot.geom[int(Render_Geom_Prop.Scale)]
+			update_subtitle_slot(kslot, kclip, frame)
+			if kslot.text_font_px > 0 {
+				keyed_font = kslot.text_font_px
+				keyed_sampled = sampled
+				break
+			}
+		}
+		want_font := f32(TEXT_CLIP_FONT_PIXELS) * keyed_sampled
+		if abs(keyed_font - want_font) > 0.5 {
+			fmt.printf(
+				"[sub-probe] FAILED: keyed-scale subtitle baked at %.2f px, sampled scale %.2f wants %.2f\n",
+				keyed_font, keyed_sampled, want_font,
+			)
+			os.exit(1)
+		}
+		if keyed_sampled == kclip.scale {
+			fmt.println(
+				"[sub-probe] FAILED: fixture does not discriminate -- the sampled scale equals the resting one",
+			)
+			os.exit(1)
+		}
+		if kslot.text_buf != nil {
+			delete(kslot.text_buf)
+			kslot.text_buf = {}
+		}
+		if kslot.text_base_buf != nil {
+			delete(kslot.text_base_buf)
+			kslot.text_base_buf = {}
+		}
+		if kslot.text_scratch != nil {
+			delete(kslot.text_scratch)
+			kslot.text_scratch = {}
+		}
+		// Drop the keys so the export stages below run on an unkeyed clip.
+		geom_key_drop_track(kclip, render_geom_name(Render_Geom_Prop.Scale))
 	}
 
 	// Compare ink bottoms of two single-line no-descender cues at the SAME baked
@@ -167,7 +245,16 @@ subtitle_render_probe_run :: proc(out: string) {
 	clip.source_h = 0
 	mem.free_all(context.temp_allocator)
 	prep_slot := new(Preview_Slot)
+	prep_slot.geom = geom_sample_clip(clip, 80)
+	geom_clear_crop(&prep_slot.geom)
 	update_subtitle_slot(prep_slot, clip, 80)
+	// Carry the preview's measured box onto the clip, which is what the app does
+	// for an unkeyed subtitle: update_subtitle_slot re-anchors in the slot latch,
+	// and the export snapshot reads clip.source_w/h for the box center.
+	clip.transform_x = prep_slot.geom[int(Render_Geom_Prop.Trans_X)]
+	clip.transform_y = prep_slot.geom[int(Render_Geom_Prop.Trans_Y)]
+	clip.source_w = prep_slot.source_w
+	clip.source_h = prep_slot.source_h
 	render_set_out_path(out)
 	render_set_out_path(out)
 	for pass in 0 ..< 2 {

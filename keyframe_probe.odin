@@ -1101,6 +1101,15 @@ kf_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
 		)
 	}
 
+	// --- the export's composite order comes from the shared rule -----------
+	// render_order_visuals is a no-op when the stack arrives in order, which is
+	// how the export's order could depend on the SHAPE of the render_start walk
+	// instead of on draw_key and still match the preview. The probe scrambles the
+	// input so a sort that does nothing fails.
+	if !render_order_visuals_probe() {
+		kf_probe_fail = true
+	}
+
 	if kf_probe_fail {
 		fmt.println("[kf-probe] summary: FAIL")
 		return 1

@@ -958,7 +958,15 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		return changed
 	}
 
-	font_px := f32(TEXT_CLIP_FONT_PIXELS) * clip.scale
+	// The baked font follows the SAMPLED scale, exactly as the .Text path above
+	// does. It used to read clip.scale, which for a keyed lane is the resting
+	// field: the preview then baked its raster at the resting font while the box
+	// it drew used the sampled scale, so a keyed-scale subtitle previewed at one
+	// size and exported at another. The raster's font size IS the scale, so this
+	// is the same "baked, not sampled" quantity — it just has to be baked at the
+	// scale being drawn.
+	scale := slot.geom[int(Render_Geom_Prop.Scale)]
+	font_px := f32(TEXT_CLIP_FONT_PIXELS) * scale
 	if cue_changed || slot.text_font_px != font_px {
 		// Split the cue text into lines once and reuse for both the base
 		// measure and the baked raster. Temp arena: event-driven (cue/font
@@ -998,11 +1006,18 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		// source px maps to scale * PW/PREVIEW_W project px, uniform in both
 		// axes — clip_image_bounds uses the same mapping).
 		k := f32(project.width) / f32(PREVIEW_W)
-		old_w := f32(clip.source_w) * clip.scale * k
-		old_h := f32(clip.source_h) * clip.scale * k
-		had_box := clip.source_w > 0 && clip.source_h > 0 && old_w > 0 && old_h > 0
-		new_w := f32(ink_w) * clip.scale * k
-		new_h := f32(base_bh) * clip.scale * k
+		// The previous box, in SAMPLED terms, read from the latch geom_sample_clip
+		// filled. Reading clip.transform_x/y and clip.scale here instead would mix
+		// resting fields into a keyed clip's geometry — the same two-homes bug as
+		// the overwrite this proc used to end with: the box would be re-anchored
+		// from a position the sampler is not even drawing.
+		prev_x := slot.geom[int(Render_Geom_Prop.Trans_X)]
+		prev_y := slot.geom[int(Render_Geom_Prop.Trans_Y)]
+		old_w := f32(slot.source_w) * scale * k
+		old_h := f32(slot.source_h) * scale * k
+		had_box := slot.source_w > 0 && slot.source_h > 0 && old_w > 0 && old_h > 0
+		new_w := f32(ink_w) * scale * k
+		new_h := f32(base_bh) * scale * k
 		if ink_w <= 1 || ink_h <= 1 {
 			// No measurable ink (empty/whitespace-only cue text).
 			slot.has_frame = false
@@ -1011,20 +1026,41 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 			slot.tex_dirty = true
 			return true
 		}
-		if had_box {
+		// Re-anchor so a cue change moves the text, not the baseline.
+		//
+		// The anchor is PERSISTENT state — it has to survive to the next cue —
+		// so it cannot live in slot.geom, which is re-derived from the clip on
+		// every frame (preview_state.odin's `slot.geom = geom_sample_clip(...)`)
+		// and would discard it. clip.transform_x/y is the persistent home, and
+		// for an UNKEYED lane that is also what the sampler reads, so the anchor
+		// is live immediately.
+		//
+		// For a KEYED transform the animation owns the position: the sampler
+		// ignores the resting field, so writing it would move nothing and would
+		// only create a second home disagreeing with the key. Re-anchoring there
+		// would fight the user's own animation. So it is skipped, and the keyed
+		// value stands.
+		if had_box && !(clip_geom_keyed_at(clip, .Trans_X) || clip_geom_keyed_at(clip, .Trans_Y)) {
 			// Re-anchor on the previous box: keep the box CENTER in x and the
 			// box BOTTOM EDGE in y fixed. The bottom edge is the last line's
 			// metric line box bottom (font-metric), so subtitles grow upward
 			// around a stable baseline instead of floating as the cue's line
 			// count changes.
-			cx := clip.transform_x + old_w / 2
-			bottom := clip.transform_y + old_h
+			cx := prev_x + old_w / 2
+			bottom := prev_y + old_h
 			clip.transform_x = cx - new_w / 2
 			clip.transform_y = bottom - new_h
-		} else {
-			// First rendered cue: anchor at the canvas center.
+			// This frame draws the box just measured, and slot.geom was sampled
+			// BEFORE the anchor ran, so apply the anchor to the latch too.
+			slot.geom[int(Render_Geom_Prop.Trans_X)] = clip.transform_x
+			slot.geom[int(Render_Geom_Prop.Trans_Y)] = clip.transform_y
+		} else if !had_box &&
+			   !(clip_geom_keyed_at(clip, .Trans_X) || clip_geom_keyed_at(clip, .Trans_Y)) {
+			// First rendered cue on an unkeyed clip: anchor at the canvas center.
 			clip.transform_x = f32(project.width) / 2 - new_w / 2
 			clip.transform_y = f32(project.height) / 2 - new_h / 2
+			slot.geom[int(Render_Geom_Prop.Trans_X)] = clip.transform_x
+			slot.geom[int(Render_Geom_Prop.Trans_Y)] = clip.transform_y
 		}
 		clip.source_w = c.int(ink_w)
 		clip.source_h = c.int(base_bh) // metric line-box stack, text pixels
@@ -1068,13 +1104,13 @@ update_subtitle_slot :: proc(slot: ^Preview_Slot, clip: ^Clip, frame: i64) -> bo
 		changed = true
 	}
 
-	// The box may have been re-centered; keep the slot's latched geometry in
-	// sync. Resting values, not a re-sample: this whole proc places the box in
-	// resting terms (it re-centers the clip itself), so re-sampling keyed lanes
-	// here would disagree with the box it just measured.
-	slot.geom[int(Render_Geom_Prop.Trans_X)] = clip.transform_x
-	slot.geom[int(Render_Geom_Prop.Trans_Y)] = clip.transform_y
-	slot.geom[int(Render_Geom_Prop.Scale)] = clip.scale
+	// No sync write here. The re-anchor above already wrote the drawn position
+	// into the slot's own geom, and overwriting all three lanes with the clip's
+	// RESTING fields was a second home for the same three values: on a keyed
+	// clip it discarded the sample the draw pass is about to use, so a keyed
+	// subtitle previewed at its resting scale and position while export drew the
+	// sampled ones. The slot latch is the preview's single home for the geometry
+	// it draws, exactly as geom_sample_clip filled it.
 	return changed
 }
 

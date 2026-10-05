@@ -4450,13 +4450,41 @@ blend_row :: proc(dst, src: []u8, cols: int, opacity: f32) {
 		s := src[uint(col) * 4:]
 		d := dst[uint(col) * 4:]
 		a := f32(s[3]) / 255.0 * op
-		if a <= 0.0 {
-			continue
-		}
-		ia := 1.0 - a
-		for ch in 0 ..< 4 {
-			d[ch] = u8(math.round(clamp(f32(s[ch]) * a + f32(d[ch]) * ia, 0.0, 255.0)))
-		}
+		blend_pixel(d, s, a)
+	}
+}
+
+// blend_pixel is the straight-alpha composite of ONE pixel: out = src*a +
+// dst*(1-a), all four channels, with the alpha channel composited like the
+// colour ones. `a` is the effective coverage — the source alpha times whatever
+// global opacity the caller resolved.
+blend_pixel :: proc(d, s: []u8, a: f32) {
+	if a <= 0.0 {
+		return
+	}
+	ia := 1.0 - a
+	for ch in 0 ..< 4 {
+		d[ch] = u8(math.round(clamp(f32(s[ch]) * a + f32(d[ch]) * ia, 0.0, 255.0)))
+	}
+}
+
+// blend_pixel_rgb is blend_pixel over the three colour channels only, leaving
+// the destination's alpha alone.
+//
+// The text rasterizer writes white glyphs with the coverage in alpha
+// (rasterize_title_into_buffer), and the canvas is opaque, so compositing alpha
+// here would compute coverage*coverage into an alpha channel nothing reads —
+// and the old inline text blend wrote a hard 255 for the same reason. Sharing
+// the COLOUR arithmetic is what matters: it is the part that decides the
+// composite, and it is the part that used to exist twice with different
+// rounding.
+blend_pixel_rgb :: proc(d, s: []u8, a: f32) {
+	if a <= 0.0 {
+		return
+	}
+	ia := 1.0 - a
+	for ch in 0 ..< 3 {
+		d[ch] = u8(math.round(clamp(f32(s[ch]) * a + f32(d[ch]) * ia, 0.0, 255.0)))
 	}
 }
 
@@ -4502,9 +4530,16 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 // pixels, matching the preview's text box math: a UNIFORM factor
 // bw0 = ow * (out_w/PREVIEW_W) scales both axes (so text is never squished by
 // the project's aspect), box = bw0*scale x bh0*scale. bw is the buffer's row
-// stride (the raster's own width). `opacity` is the clip's sampled Opacity lane,
-// folded into the glyph coverage so a translucent text clip composites the same
-// way here as it does on the GPU preview and through blend_row on the video path.
+// stride (the raster's own width).
+//
+// `opacity` is the clip's sampled Opacity lane. It resolves the effective
+// coverage here and hands the composite to blend_pixel_rgb, the same colour
+// arithmetic blend_row uses for video. This used to carry a private copy of the
+// blend — integer alpha, a 3-channel loop, `d[ch] = (255*a + d*ia)/255` — so a
+// translucent text clip and a translucent video clip rounded differently and
+// neither matched the GPU preview. Two copies of one blend is how they came to
+// disagree, and the comment here used to CLAIM they matched without anyone
+// checking.
 render_text_blit :: proc(
 	canvas: []u8,
 	draw_w, draw_h: c.int,
@@ -4559,20 +4594,7 @@ render_text_blit :: proc(
 			scol = max(ox, min(ox + ow - 1, scol))
 			s := src_row[uint(scol) * 4:]
 			d := dst_row[uint(col) * 4:]
-			// Effective alpha is the glyph's coverage times the clip's opacity,
-			// rounded once so a fractional opacity does not drift low.
-			a := int(f32(s[3]) * op + 0.5)
-			if a <= 0 {
-				continue
-			}
-			ia := 255 - a
-			// Straight-alpha blend: out = src*a + dst*(1-a). Glyph is white
-			// (255,255,255), so keeping a the same for all channels tints the
-			// underlying frame with white by the glyph's coverage.
-			for ch in 0 ..< 3 {
-				d[ch] = u8((255 * a + int(d[ch]) * ia) / 255)
-			}
-			d[3] = 255
+			blend_pixel_rgb(d, s, f32(s[3]) / 255.0 * op)
 		}
 	}
 }
@@ -4774,9 +4796,20 @@ render_start :: proc() {
 	render_job.fps_num, render_job.fps_den = fps_rational(render_job.fps)
 	reserve(&cls, n_clips)
 	reserve(&txts, n_clips)
+	// vis_layers is the stack layer of each entry in vis, recorded during the
+	// walk and sorted alongside it by render_order_visuals. Sized from the same
+	// bound as vis itself (a clip contributes at most one entry).
+	vis_layers: [dynamic]int
+	reserve(&vis_layers, n_clips)
+	defer delete(vis_layers)
 	for w := 0; w < len(timeline.track_order); w += 1 {
 		ti := timeline.track_order[w]
 		tr := &timeline.tracks[ti]
+		// The 1-based stack position: track_order is top-to-bottom rows, the
+		// compositor walks it in reverse, so row 0 paints last (on top). Row 0 is
+		// therefore layer 1, matching the preview's `layer` (preview_state.odin
+		// assigns it from the same walk).
+		layer := w + 1
 		for i := 0; i < len(tr.clips); i += 1 {
 			clip := &tr.clips[i]
 			// Which job array a clip lands in is decided by render_clip_sink, the
@@ -4810,15 +4843,38 @@ render_start :: proc() {
 				// IS the pointed-to type.
 				visual: Render_Visual = &cls[len(cls) - 1]
 				append(&vis, visual)
+				append(&vis_layers, layer)
 			case .Text:
 				append(&txts, snapshot_text_src(clip, len(txts)))
 				visual: Render_Visual = &txts[len(txts) - 1]
 				append(&vis, visual)
+				append(&vis_layers, layer)
 			case .Sub:
 				append(&subs, snapshot_sub_src(clip, f32(render_job.fps)))
 			}
 		}
 	}
+	// Order the composite stack by the SHARED rule (render_order.odin) rather
+	// than by the order this walk happened to append in.
+	//
+	// The walk appends in track order, so sorting ascending by draw_key is a
+	// no-op TODAY — which is exactly why the dependency was invisible and why
+	// the export could silently disagree with the preview. It agreed by
+	// coincidence: `visuals` order came from the walk's shape, not from the
+	// rule, so a change to draw_key reached the preview and not this. Stating it
+	// here makes the order a function of the rule instead of the loop.
+	//
+	// Subtitles are NOT in this list: they are pinned above everything and
+	// composited in their own trailing pass (render_worker_run). draw_key is
+	// what makes that pinning expressible, and SUBTITLE_PIN_KEY sits below every
+	// track layer, so a subtitle's key sorts ahead of every item here.
+	//
+	// The layer is recorded during the walk rather than read back from the
+	// finished list: once the list is sorted, its own positions no longer say
+	// which track a clip came from, so deriving the key from them would be
+	// circular — the sort would be sorting its own output.
+	render_order_visuals(vis[:], vis_layers[:])
+
 	// Audio is snapshotted from the committed geometry slab — the same source
 	// the playback producer reads — so export and playback evaluate one gain
 	// snapshot. Commit first: a video-only edit since the last audio commit

@@ -5522,53 +5522,85 @@ count).
 **Accept.** `check build keyframe_probe geom_key_probe render_kf_probe parity
 parity_valgrind` pass.
 
-- [x] Active 25 — Text transformed about its top-left while everything else used its center
+## Active 26 — One home per fact: three preview/export paths still had two writers
 
-  **Why:** `Trans_X`/`Trans_Y` meant two different things. Video and images read
-  them as the box CENTER (`cropped_box_edges(cx, cy, ...)`, shared by preview and
-  export). Text read them as the box TOP-LEFT, in three places at once:
-  `clip_image_bounds_geom`'s text branch returned `{x = tx, y = ty}`;
-  `render_text_blit` took them as `x0`/`y0`; and `update_handle_drag` had a whole
-  separate top-left-anchored branch that existed only to undo the difference.
-  Subtitles are a third case again — see below.
+**Why:** Active 24 unified the export's geometry carrier and Active 23 fixed the
+sampler's tail, and both left the same structural hazard standing elsewhere: a
+fact with two homes, where the bug is never the copy but the second writer — one
+that disagrees, one that was forgotten, or a reader that trusts the copy and
+never re-derives. An audit of both sinks for remaining duplication found three
+live instances, all in text/subtitle handling, all the same shape.
 
-  So a keyframed text transform and a keyframed video transform animated around
-  DIFFERENT POINTS while reading the SAME TWO FIELDS, and the preview's selection
-  border, handles and hit-test measured against a different anchor than the export
-  drew with. Nothing caught it because preview and export were consistent with each
-  other in the wrong way: every gate compares them against each other, so a shared
-  wrong anchor passes all of them.
+**1. A keyed-scale subtitle previewed at one size and exported at another.**
+`update_subtitle_slot` baked its raster from `clip.scale`, the clip's RESTING
+field, while the box it drew came from the sampled geometry — and then overwrote
+all three lanes of the slot's latch with the resting values on the way out. So a
+keyed subtitle's preview ignored its own scale animation entirely while export
+(sampling the carrier, as Active 24 made it do) honored it. This is Active 24's
+defect on the one path Active 24 did not reach, and it survived because every
+probe case set `clip.scale` directly and keyed nothing.
 
-  **Fix — a deletion, not an addition.** Text no longer has its own pivot. Its box
-  is derived from the center like every other source, and `update_handle_drag`'s
-  text branch keeps its own box SIZE arithmetic (clip.source_w/h are TEXT pixels,
-  so the box needs one uniform project factor where the video path uses
-  `full_box_dims` on real source pixels) but writes the center. The snap-to-edge
-  branch got the same treatment: it was writing raw top-left values `0` / `PW-w`
-  into a field that is now a center, which is why it is compared against
-  `d_l`/`PW-d_r` now, like the video branch below it.
+The raster's font size IS the scale, so this could not be fixed by rescaling the
+blit: the bake had to move to the sampled scale. The overwrite is deleted. The
+cue-change RE-ANCHOR keeps writing `clip.transform_x/y` — deliberately, and this
+is the subtle part. The anchor has to survive to the next cue, so it cannot live
+in `slot.geom`, which `geom_sample_clip` re-derives every frame and would discard.
+`clip.transform_x/y` is the persistent home, and for an UNKEYED lane it is also
+what the sampler reads, so the anchor is live at once. For a KEYED transform the
+animation owns the position, the sampler ignores the resting field, and
+re-anchoring there would both move nothing and fight the user's key — so it is
+skipped.
 
-  **Subtitles deliberately did NOT move.** `update_subtitle_slot` documents the
-  intent: "keep the box CENTER in x and the box BOTTOM EDGE in y fixed… subtitles
-  grow upward around a stable baseline". A cue's box therefore grows around its
-  baseline as line count changes, which is typographically right and is NOT the
-  center pivot. `sub_box_center` stays the top-left-to-center conversion it always
-  was. Changing it was my first attempt here and it was wrong: it made the export
-  center-pivoted while the slot updater still wrote top-left, so subtitles would
-  have drifted by half a box on every re-anchor. The name still lies — it returns
-  a center, but the fields under it are a top-left — and that is now noted in the
-  comment rather than left for the next reader to trip over.
+**2. `render_text_blit` carried a private copy of `blend_row`.** Integer alpha,
+three channels, `d[ch] = (255*a + d*ia)/255`; `blend_row` used float and
+`math.round`. Both were correct and rounded differently at fractional opacity,
+and the text one's comment CLAIMED it matched `blend_row` — nobody had checked.
+This was introduced by Active 24, in the very change whose thesis was removing
+duplicate state: two copies of one blend, added twenty lines from the original.
+Now `blend_pixel` / `blend_pixel_rgb` carry the arithmetic once and both callers
+resolve only their effective coverage. The alpha channel stays out of the text
+blit on purpose — the canvas is opaque and the raster is white-with-coverage, so
+compositing alpha would compute coverage² into a channel nothing reads.
 
-  **Probe.** `geom_key_probe` asserts the box's own center against the transformed
-  clip position, for video AND text, at three (position, scale) pairs chosen so the
-  box is off-centre at more than one size. Asserting the property rather than a
-  baked rectangle keeps it true for any transform. Mutation: reverting the text
-  branch to top-left is caught with the numbers —
-  `box center x 2800.00, transform maps to 400.00`.
+**3. The export never called `draw_key`.** `render_order.odin` holds the one
+ordering rule and the preview sorts by it; the export relied on the shape of the
+`render_start` walk plus a trailing subtitle pass, so `SUBTITLE_PIN_KEY` appeared
+only in a comment. The two agreed by coincidence — and a no-op sort is exactly
+what preserves a coincidence, so the dependency was invisible in both directions.
 
-  No backwards compatibility: an existing text clip moves up-left by half its box,
-  which is the price of one anchor for one field.
+Steps:
+- [x] S1. Subtitle bake at the sampled scale; resting-field overwrite deleted;
+      the re-anchor kept on the clip's persistent fields but skipped when the
+      transform lane is keyed. `subtitle_probe` seeds `slot.geom` the way
+      `update_preview_slots` does and reads the baseline from the latch.
+- [x] S2. `blend_pixel` / `blend_pixel_rgb` extracted; `blend_row` and
+      `render_text_blit` both delegate.
+- [x] S3. `render_order_visuals` sorts the export's stack by `draw_key` on a
+      layer recorded DURING the walk. The layer cannot be read back from the
+      finished list — once sorted, the list's own positions no longer say which
+      track an entry came from, so deriving the key from them would be circular.
+      Subtitles stay in their own pinned pass; `SUBTITLE_PIN_KEY` is what makes
+      that expressible. The sort holds the entry being inserted across the shift
+      loop: re-reading `vis[i]` after the shift places a shifted neighbour in the
+      insertion slot, which corrupted tied layers. (Found by the probe's tie
+      check, not by inspection.)
 
-  Gates: check build parity subtitle_probe transform_probe render_kf_probe
-  audio_probe keyed_export timeline_probe geom_key_probe keyframe_probe
-  yuv_exact opacity zorder probe smoke render_live_probe render_valgrind valgrind.
+**Probe / mutation.** Two new cases, both mutation-verified:
+
+- `subtitle_probe`'s keyed-scale case fails on the old behavior with
+  `keyed-scale subtitle baked at 48.00 px, sampled scale 4.00 wants 192.00`, and
+  asserts the fixture still discriminates (sampled != resting) so it cannot pass
+  vacuously. Every PREVIOUS case in that probe passes with the bug reintroduced,
+  which is how it stayed hidden.
+- `render_order_visuals_probe` scrambles the layer order to `5,3,2,2,1` and
+  checks ascending `draw_key`, tie stability, and that a layer change actually
+  MOVED an entry. A no-op sort fails it. Feeding the list already sorted would
+  pass whether or not the sort ran — the same coincidence this change removes —
+  so the scramble is the point. Removing the sort CALL from `render_start` is NOT
+  caught by this probe, and cannot be: the walk already appends in stack order,
+  so the call is a no-op today by construction. The mutation evidence is for the
+  sort's correctness, not for its presence.
+
+**Accept.** `check build probe keyframe_probe subtitle_probe geom_key_probe
+render_kf_probe opacity parity keyed_export` pass; `parity_valgrind` clean.
+
