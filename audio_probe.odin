@@ -1394,6 +1394,25 @@ audio_probe_priming_trace :: proc(path: string) -> bool {
 //     position drifts will stay locally correct and end up globally wrong.
 //
 // Returns true when the two agree for the whole span.
+// DRIFT_TOLERANCE is how far the two sinks may differ on one sample and still be
+// called equal.
+//
+// It is 1e-3, about -60 dBFS and 33 LSB of s16, and the number is the
+// representation talking rather than a convenience. The two sinks sum the same
+// samples in DIFFERENT ORDERS -- playback accumulates a whole frame, the export a
+// 512-sample block -- so their f32 results legitimately differ by a few LSB.
+// A tolerance of 1e-4 is 3 LSB, which is tighter than two summation orders over
+// ~1600 samples can be asked to agree, and asserting it produced a permanent
+// 1.4e-4 "failure" in the clip's final 256-sample fade that was float rounding
+// and nothing else.
+//
+// Anything above this is not rounding: a desync, a wrong gain, or a missing
+// sample all show up orders of magnitude larger. The position invariant
+// (mixed == timeline requires, exactly) is asserted separately and with NO
+// tolerance at all, because sample counting is integer arithmetic and has no
+// excuse.
+DRIFT_TOLERANCE :: f32(1e-3)
+
 audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 = 0) -> bool {
 	buf: [4096]u8
 	cn := 0
@@ -1404,11 +1423,28 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	buf[cn] = 0
 	cpath := cstring(&buf[0])
 
-	saved_fps := playback.magic_fps
+	// Override the PROJECT rate, not playback.magic_fps.
+	//
+	// magic_fps exists to isolate wall-clock jitter from the audible rate, and its
+	// own contract is that it must not change what a frame index MEANS: content
+	// positions are computed from project_fps (timeline_frame_sample), while
+	// timeline_fps -- which honours magic_fps -- drives the bus. Setting magic_fps
+	// alone therefore makes playback demand content at one rate and mix it at
+	// another, and the mixer absorbs the difference by shifting whole frames:
+	// measured, 1786 clamps with a worst case of 1,416,288 samples, 29.5 seconds.
+	//
+	// Every result this probe produced before this line was fixed was a report on
+	// that mistake, not on 29.97.
+	saved_rate := project.frame_rate
+	saved_tl_rate := timeline.frame_rate
 	if fps_override > 0 {
-		playback.magic_fps = fps_override
+		project.frame_rate = fps_override
+		timeline.frame_rate = fps_override
 	}
-	defer playback.magic_fps = saved_fps
+	defer {
+		project.frame_rate = saved_rate
+		timeline.frame_rate = saved_tl_rate
+	}
 
 	fps := timeline_fps()
 	if fps <= 0 {
@@ -1510,6 +1546,7 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	mix_play: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	mix_exp: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	worst, worst_frame := f32(0), i64(-1)
+	over_tol := 0
 	first_bad := i64(-1)
 	first_bad_i := -1
 	bad_play, bad_exp := f32(0), f32(0)
@@ -1573,8 +1610,22 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 				worst = d
 				worst_frame = f
 			}
-			if d > 0.0001 && first_bad < 0 {
+			if d > DRIFT_TOLERANCE {
+				over_tol += 1
+			}
+			if d > DRIFT_TOLERANCE && first_bad < 0 {
 				first_bad = f
+				// The fifo state at the moment of disagreement, BEFORE this frame's
+				// samples are consumed by the next iteration's bookkeeping. If one
+				// side's ring is empty and the other is not, the divergence is a
+				// refill boundary; if both are empty, both are short.
+				fmt.printf(
+					"[ap] drift:   at disagreement: PLAY first48=%d have48=%d ring=%d | EXP first48=%d have48=%d ring=%d\n",
+					audio_src.slots[0].first48, audio_src.slots[0].have48,
+					ring_len(&audio_src.slots[0].fifo),
+					export_audios[0].first48, export_audios[0].have48,
+					ring_len(&export_audios[0].fifo),
+				)
 				// WHERE inside the frame, and what the two actually hold there. The
 				// index is the whole diagnosis in one number: 0 means the block
 				// ORIGIN is wrong, a large index means the origin was right and the
@@ -1588,7 +1639,7 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 				// boundary; a run to the end of the frame is a shifted origin.
 				run := 0
 				for j in i ..< spf * 2 {
-					if math.abs(mix_play[j] - mix_exp[j]) > 0.0001 {
+					if math.abs(mix_play[j] - mix_exp[j]) > DRIFT_TOLERANCE {
 						run += 1
 					}
 				}
@@ -1601,8 +1652,9 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	// handed to the device must be exactly the span the timeline describes.
 	want_samples := audio_frame_boundary48(total_frames, fps)
 	fmt.printf(
-		"[ap] drift: mixed=%d samples, timeline requires=%d, delta=%d; worst=%.6f at frame %d\n",
+		"[ap] drift: mixed=%d samples, timeline requires=%d, delta=%d; worst=%.6f at frame %d; %d samples over %.0e tolerance\n",
 		mixed_samples, want_samples, mixed_samples - want_samples, worst, worst_frame,
+		over_tol, f64(DRIFT_TOLERANCE),
 	)
 	if mixed_samples != want_samples {
 		fmt.println("[ap] drift: FAIL: sample accounting does not match the timeline")
@@ -1617,6 +1669,10 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 		fmt.printf(
 			"[ap] drift: FAIL: the two mixers first disagree at frame %d (%.2fs)\n",
 			first_bad, f64(first_bad)/fps,
+		)
+		fmt.printf(
+			"[ap] drift:   playback demand clamps so far: %d times, worst %d samples\n",
+			audio_rpt.head_clamped, audio_rpt.head_clamp_max,
 		)
 		b0 := audio_frame_boundary48(first_bad, fps)
 		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(first_bad+1, fps) - b0)))
@@ -1656,6 +1712,10 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 		fmt.printf("[ap] drift:   best content shift=%d samples\n", best_shift)
 		return false
 	}
+	fmt.printf(
+		"[ap] drift: playback demand clamps: %d times, worst %d samples\n",
+		audio_rpt.head_clamped, audio_rpt.head_clamp_max,
+	)
 	fmt.println("[ap] drift ok (no divergence over the whole span)")
 	return true
 }

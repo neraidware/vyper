@@ -1369,7 +1369,12 @@ target_audio_drift_parity() {
 	mkdir -p target/mixparity
 	if [ ! -s "$wav" ] || [ ! -s "$aac" ]; then
 		echo "audio-drift-parity: synthesizing a ${secs}s fixture" >&2
-		ffmpeg -v error -f lavfi -i "anoisesrc=color=white:sample_rate=48000:duration=$secs:amplitude=0.5:seed=7" \
+		# 5% longer than the span under test. A clip that claims exactly the whole
+		# source is asking for the encoder's padding: AAC's tail is not decodable
+		# content, so the last ~21ms is a shortfall rather than audio, and a
+		# shortfall is not what this probe is measuring.
+		local fixture_secs=$(awk "BEGIN{print $secs * 1.05}")
+		ffmpeg -v error -f lavfi -i "anoisesrc=color=white:sample_rate=48000:duration=$fixture_secs:amplitude=0.5:seed=7" \
 			-ac 2 -c:a pcm_s16le "$wav" -y || return 1
 		ffmpeg -v error -i "$wav" -c:a aac -b:a 128k "$aac" -y || return 1
 	fi

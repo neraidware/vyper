@@ -897,6 +897,18 @@ Audio_Report :: struct {
 	queued:       i64, // bus sample-frames in the device bridge at last report
 	holes:        i64,
 	fed:          u64, // total_fed_frames at last report (for true bus rate)
+	// head_clamped counts, and head_clamp_max records the largest, the times the
+	// mixer's `demand48 = max(demand48, s.first48)` had to move a frame's demand
+	// FORWARD to meet a decoder that had landed ahead of it.
+	//
+	// This used to be invisible, and it is not a neutral safety net: mixing from
+	// the head instead of from the position the timeline asked for shifts that
+	// frame's whole content, silently, with nothing counting it. Measured at
+	// 30000/1001: playback mixed a 1601-sample frame from 1786 samples past where
+	// the frame began, which is a content shift nobody would ever hear about.
+	// A count is the minimum; the fix is to stop needing it.
+	head_clamped:   i64,
+	head_clamp_max: i64,
 	// Monotonic totals, never cleared by reseeds.
 	total_fed_frames: u64,
 	// playhead-writer labels for the drift diagnostics: ph_src is the last
@@ -1797,6 +1809,14 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// A seek lands on the decoder's real PTS, which the demuxer's slack
 		// can put a sample or two either side of the demand. Mix from the fifo
 		// head when it landed ahead, so the base is never before the head.
+		if s.first48 > demand48 {
+			// See Audio_Report.head_clamped. Recorded rather than merely tolerated:
+			// this is the frame whose content the timeline asked to be somewhere
+			// else, and today nothing but this counter says so.
+			audio_rpt.head_clamped += 1
+			audio_rpt.head_clamp_max =
+				max(audio_rpt.head_clamp_max, s.first48 - demand48)
+		}
 		demand48 = max(demand48, s.first48)
 		start48 := demand48
 		audio_src_pull(s, start48 + i64(spf))
