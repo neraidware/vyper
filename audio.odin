@@ -406,6 +406,82 @@ AUDIO_FORWARD_DECODE_MAX_48 :: i64(AUDIO_FORWARD_DECODE_MAX_SEC * 48000.0)
 // buffered samples. Growth (ring_reserve) is doubling and therefore rare and
 // amortized; it's the only O(n) operation left, and it only runs when a
 // source's buffered depth reaches a new high-water mark, not every frame.
+// ---------------------------------------------------------------------------
+// Declick: fade a source's contribution in and out at its own edges.
+//
+// This lives here, with the rest of the audio engine, because BOTH sinks mix and
+// both must agree: the export (render_mix_block) and playback (audio_mix_frame).
+// It was written for the export alone and the preview mixer never called it, so
+// the same edit -- a clip moved, a fade applied -- produced a ramped boundary in
+// the export and a hard step in playback. That is one rule stated once and applied
+// on one side, which is the same defect shape as the text blend Active 26 removed.
+//
+// A click is a STEP, and what removes it is spreading the step over enough samples
+// that no single step is large. The fade is applied per SOURCE and per BLOCK, not
+// to the mix: two overlapping sources must not ramp each other, so the gain is
+// folded in before the source is summed.
+// ---------------------------------------------------------------------------
+
+// AUDIO_DECLICK_SAMPLES is the fade length at a source's contribution edges, in
+// sample-frames (256 = 5.3ms at 48kHz). Long enough that the derivative of the
+// fade is small next to the signal it is fading, short enough to be inaudible as
+// a fade: a click is a step, and what removes it is spreading the step over
+// enough samples that no single step is large.
+AUDIO_DECLICK_SAMPLES :: 256
+
+// audio_declick is the fade SHAPE: a raised cosine, so the gain AND its slope go
+// to zero at both ends. A linear ramp would leave a slope discontinuity at each
+// end, which is itself audible on a bright signal -- it converts a click into a
+// tick. Evaluated only inside the fade, at a source's edges, so the cost is
+// O(clip boundaries) and not O(audio samples): the steady interior of a block
+// never calls it.
+audio_declick :: proc(t: f32) -> f32 {
+	return (1.0 - math.cos(math.PI * t)) * 0.5
+}
+
+// audio_declick_fade_in is how many of a block's n sample-frames need the fade
+// at the front, given `from_edge`: the distance in samples from the block's first
+// sample to the contribution's start edge, 0 when the block opens on the edge.
+audio_declick_fade_in :: proc(from_edge: Sample_Pos, n: int) -> int {
+	if from_edge >= Sample_Pos(AUDIO_DECLICK_SAMPLES) {
+		return 0
+	}
+	return clamp(int(Sample_Pos(AUDIO_DECLICK_SAMPLES) - from_edge), 0, n)
+}
+
+// audio_declick_fade_out is audio_declick_fade_in at the other end: how many
+// of a block's n sample-frames need the fade before its end, given `to_edge` --
+// the distance from the block's last sample to the contribution's end edge.
+audio_declick_fade_out :: proc(to_edge: Sample_Pos, n: int) -> int {
+	return audio_declick_fade_in(to_edge, n)
+}
+
+// audio_declick_gain is sample `s` of a block's `n`: the automation gain, faded
+// in over the first fade_in samples and out over the last fade_out.
+//
+// Named rather than written inline because the shape appears TWICE when it is
+// inline -- once ascending, once descending, with mirrored expressions -- and two
+// copies of a ramp that must agree is the kind of thing that drifts.
+//
+// Each fade is normalised by its OWN length and stepped so the ramp's argument
+// runs 1/fade .. 1 INCLUSIVE, which puts the gain at exactly g on the last faded
+// sample. Two things depend on that. A block shorter than the fade still completes
+// it rather than leaving the contribution permanently attenuated, which is what
+// measuring against the fixed AUDIO_DECLICK_SAMPLES does; and the hand-off from
+// faded to unfaded carries no step of its own. (Normalising to fade/(fade+1)
+// instead reaches only 0.99996 -- inaudible, but it makes the ramp's endpoint a
+// lie in the comment, and a probe asserting the invariant caught exactly that.)
+audio_declick_gain :: proc(g: f32, s, n, fade_in, fade_out: int) -> f32 {
+	if fade_in > 0 && s < fade_in {
+		return g * audio_declick(f32(s+1) / f32(fade_in))
+	}
+	if fade_out > 0 && s >= n-fade_out {
+		return g * audio_declick(f32(n-s) / f32(fade_out))
+	}
+	return g
+}
+
+
 Audio_Ring :: struct {
 	buf:   [dynamic]f32, // backing storage; len(buf)/2 == capacity in sample-frames
 	head:  int,          // sample-frame index of the oldest buffered sample
@@ -535,9 +611,15 @@ Play_Src :: struct {
 	path:         cstring, // cloned at provision, freed on reset
 	stream_index: c.int,
 	dec:          Audio_Clip_Decoder,
-	fifo:         Audio_Ring, // content-relative stereo f32 at 48 kHz
-	first48:      i64,        // content 48 kHz sample of fifo's head
-	have48:       i64,        // content 48 kHz samples produced so far
+	fifo:  Audio_Ring, // content-relative stereo f32 at 48 kHz
+	first48: i64,       // content 48 kHz sample of fifo's head
+	have48:  i64,       // content 48 kHz samples produced so far
+	// muted records that this source's last contribution did not arrive (a
+	// shortfall the fifo could not cover), so its RETURN fades in rather than
+	// reappearing at full level. An edge a listener hears even though no clip
+	// changed, and the same state the export's Render_Audio_Src.muted holds --
+	// it is what makes a hole's recovery sound like the export's.
+	muted: bool,
 	seg:          [MAX_PLAY_SEGMENTS]Play_Seg, // in timeline order
 	seg_count:    int,
 }
@@ -1572,6 +1654,7 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if head_ahead || head_behind {
 			content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
 			if !audio_src_seek_anchor(s, content_sec) {
+				s.muted = true
 				continue
 			}
 		}
@@ -1582,6 +1665,12 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		start48 := demand48
 		audio_src_pull(s, start48 + i64(spf))
 		if s.have48 < start48 + i64(spf) {
+			// The fifo cannot cover this frame. Silence for the span, and mark the
+			// source muted so its RETURN fades in instead of arriving at full
+			// level -- the export's render_mix_block does exactly this, and a
+			// resume after a hole is an edge a listener hears even though no clip
+			// changed.
+			s.muted = true
 			continue
 		}
 		base := int(start48 - s.first48)
@@ -1591,11 +1680,41 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// relative position each frame (from its own snapshot — the producer
 		// never reads the live timeline), so automation animates audibly.
 		g := play_seg_gain_linear(seg, i32(frame - seg.start_a))
-		for f in 0 ..< spf {
-			l, r := ring_at(&s.fifo, base + f)
-			mix[f * 2 + 0] += l * g
-			mix[f * 2 + 1] += r * g
+		// Declick, the same fade the export applies (audio_declick_gain). This
+		// mixer had none: a clip boundary produced a hard step to silence and back
+		// in playback while the export ramped it, so the two sinks disagreed about
+		// an audible edit. Both compute the ramp from the SEGMENT's own bus-sample
+		// edges, in the same units, so a boundary fades identically in each.
+		//
+		// fade_from takes the EARLIER of the segment edge and a resume-after-hole,
+		// so a frame that both opens a clip and resumes a source gets ONE fade
+		// rather than two multiplied together -- the export's rule, for the same
+		// reason.
+		frame_lo := audio_frame_boundary48(frame, fps)
+		frame_hi := audio_frame_boundary48(frame + 1, fps)
+		seg_lo := audio_frame_boundary48(seg.start_a, fps)
+		seg_hi := audio_frame_boundary48(seg.start_a + seg.len_a, fps)
+		blk_lo := max(frame_lo, seg_lo)
+		blk_hi := min(frame_hi, seg_hi)
+		want := int(blk_hi - blk_lo)
+		if want <= 0 {
+			continue
 		}
+		fade_from := seg_lo
+		if s.muted {
+			fade_from = blk_lo
+		}
+		fade_in := audio_declick_fade_in(blk_lo - fade_from, want)
+		fade_out := audio_declick_fade_out(seg_hi - blk_hi, want)
+		sample_off := int(blk_lo - frame_lo)
+		for f in 0 ..< want {
+			l, r := ring_at(&s.fifo, base + sample_off + f)
+			d := audio_declick_gain(g, f, want, fade_in, fade_out)
+			off := (sample_off + f) * 2
+			mix[off + 0] += l * d
+			mix[off + 1] += r * d
+		}
+		s.muted = false
 		delivered = true
 		if audio_rpt.trace {
 			fmt.printf(

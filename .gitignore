@@ -35,3 +35,4 @@
 # gate.sh keyed_export scratch: synthetic source and A/B encodes, regenerated
 # per run and never inputs.
 target/
+__pycache__/

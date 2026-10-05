@@ -5369,14 +5369,21 @@ future regression cannot hide behind green telemetry the way `1a38d78` did.
       Gates: check build parity audio_probe keyed_export render_kf_probe
       timeline_probe render_live_probe yuv_exact probe smoke render_valgrind.
 
-- [ ] S3. **A3** — mix on its own thread with a cushion. Probe: the export's
-      silence-run count goes to zero on `~/sallyface.vyproj`, which is the
-      measured defect this whole section exists to close.
-- [ ] S4. **A4** — declick ramps. Probe: assert no inter-sample step exceeds the
-      local peak across a clip boundary or a simulated hole.
-- [ ] S5. **A5** — edit generations. Probe: a burst of N edits produces O(1)
-      decoder reopens, not O(N) — the direct analogue of `e69afb5`.
-- [ ] S6. **A6** — AAC tail padding, render preroll, sample-domain counters.
+- [x] S3. **A3** — mix on its own thread with a cushion. **MEASURED 2026-10-05:
+      the defect is closed.** `scripts/gate.sh audio_export_audit` exports the
+      real project and counts silence runs: **0 dropouts, 4 faithful runs**
+      (was 133 mid-clip dropouts, 1961 ms). See the note below on what it took
+      to make that number re-measurable at all.
+- [x] S4. **A4** — declick ramps. **The export had them and playback did not**;
+      see Active 29. Probe: `audio_probe`'s declick case, mutation-verified.
+- [x] S5. **A5** — edit generations. **Already satisfied**, and gated:
+      `resync` is a monotonic "something changed" flag rather than a queue, so a
+      producer poll consumes a whole burst at once. `audio_probe` measures it —
+      "8 edits in a burst -> 0 re-provisions", and a reconcile that moves no
+      content keeps 2 decoders and opens 0. Nothing to change.
+- [x] S6. **A6** — AAC tail padding, render preroll, sample-domain counters.
+      **Already satisfied**; the "one frame short" this section recorded was the
+      AUDIT's mistake, not the export's — see Active 29.
 
 ### Accept
 
@@ -5692,7 +5699,315 @@ it is the only remaining duplication I would argue for keeping.
 render_kf_probe keyframe_probe opacity gpu_probe parity keyed_export` pass;
 `parity_valgrind render_valgrind` clean.
 
-## Active 29 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
+## Active 28 — The audio defect could not be re-measured, so "closed" was unfalsifiable
+
+**Why:** Active 22's S3/A3 is the step carrying the whole audio section: 133
+mid-clip dropouts, 1961 ms, 6.6% of the timeline, 266 clicks. Its code shipped
+and merged. Its acceptance criterion — "the export's silence-run count goes to
+zero on `~/sallyface.vyproj`" — was never run, and could not be: every audio gate
+(`audio_probe`, `audio_rate_probe`, `atempo_probe`) synthesizes its own WAV and
+builds its own timeline. A synthetic timeline cannot reproduce a defect that needs
+12 video sources, 5 stacked audio tracks and 17 splits. So the one number that
+decides whether the audio rework is done had no path to being produced, which
+means "A3 shipped" and "the dropouts are gone" were the same sentence, and only
+the first was evidence of anything.
+
+This is the same shape as the text-keyframe bug found in Active 24: a defect real
+workloads hit that the suite structurally cannot see, sitting behind a checklist
+box that looked like progress.
+
+Steps:
+- [x] S1. `VYPER_PROJECT_EXPORT="<project.vyproj>|<out>"` — open a project and
+      export it unchanged. `VYPER_RENDER_TEST` only IMPORTS a media file, so it
+      can only ever export a timeline the probe builds itself, which is exactly
+      what cannot show this defect.
+- [x] S2. `scripts/audio_silence_audit.py` counts digital-silence runs in the
+      exported mix and, for each one, maps it back through the audio clips' own
+      (timeline_start, source_start) pairs into the source files and measures
+      whether THEY are silent there. A run the sources contain is FAITHFUL; a run
+      they do not is a DROPOUT and fails.
+- [x] S3. `scripts/gate.sh audio_export_audit` runs both. Advisory rather than a
+      member of `all`: the project is machine-local, so it SKIPs when absent
+      rather than breaking the suite.
+
+**The result.** 0 dropouts. 4 silence runs totalling 3319 ms, every one of them
+a passage the sources are genuinely silent through (source peaks 0/1/0/4 against a
+floor of 64) — the recording is a screen capture of a mostly-silent room, so a
+naive silence count reports the room's own quiet as engine faults. The 133-run
+defect is closed.
+
+**Why the cross-reference is the whole target.** The first version of the audit
+counted zero-sample runs and called them dropouts: 4 "failures". All four were the
+engine faithfully reproducing the source's own silence. A gate that reports a
+correct export as broken trains its reader to ignore it, and a gate that skips the
+cross-reference cannot tell a fix from a coincidence. Three things had to be right
+for the verdict to mean anything, and each was found by the audit disagreeing with
+a hand check:
+
+- **Classify by PEAK, not by zero count.** The sources are not bit-silent: they
+  carry a dither tail around -60 dBFS, so `all(samples == 0)` is false for a
+  genuinely silent stretch. The floor is 64 (-54 dBFS).
+- **Probe the run's own span from its START.** Mapping the midpoint and extending
+  by the full run length overshoots by half the run, so the probe window runs past
+  the hole into the audio after it and reports a faithful passage as a dropout.
+- **Probe the source, not an asset filter.** A screen recording is a VIDEO file
+  with five audio streams inside it. Indexing only the assets the app classifies
+  as audio drops exactly the assets under test, and every run then reports
+  "source probe unavailable" — which reads as a pass. An audit that cannot fail
+  is worse than no audit.
+
+**Still open, now measured rather than assumed.** The export emits **1428800
+samples against a 1787-frame range at 60 fps, which wants 1429600** — short by
+exactly one frame (800 samples). The original figure in this section was 468
+frames short, so this is A6's tail padding most of the way closed, with a
+one-frame remainder that the audit now reports on every run. A4 (declick) and A5
+(edit generations) are untouched and remain the real work.
+
+**Mutation.** Lowering `SILENCE_PEAK_FLOOR` below the sources' dither tail flips
+the verdict and the gate exits 1, so the "0 dropouts" is a measurement and not a
+constant.
+
+## Active 29 — Declick existed in the export and not in playback; A5/A6 were already done
+
+**Why:** Active 28 closed the measurement gap on A3. That left the section's three
+open steps, and checking each against the tree rather than the checklist produced
+a different answer than the boxes did: ONE of the three was a real defect, and TWO
+were already shipped with a probe proving it. Recording that plainly because the
+useful output here is the distinction — "not started" and "done but unverified"
+look identical in a tracker and need very different work.
+
+**A4 (declick) was real, and it was half-done.** The export ramped every source's
+contribution edges (`render_mix_block`: `audio_declick` shaped fade in/out, plus a
+`muted` flag so a resume after a shortfall faded in rather than arriving at full
+level). Playback's mixer — `audio_mix_frame` — called none of it. So the same edit
+produced a ramped boundary in the export and a hard step to silence in playback,
+which is the "literally popping" symptom, and the two sinks disagreed about an
+audible event. This is one rule stated once and applied on one side: the same
+defect shape as the text blend in Active 26 and the export-order derivation in
+Active 26's S3.
+
+Fixed by moving the declick out of render.odin into audio.odin (renamed
+`audio_declick*`, because a `render_` prefix is a lie once both sinks call it) and
+giving `audio_mix_frame` the same ramp plus the `Play_Src.muted` resume state. Both
+mixers now derive the ramp from the SEGMENT's own bus-sample edges in the same
+units, and both take the earlier of the segment edge and a resume-after-hole so a
+frame that opens a clip and resumes a source gets ONE fade rather than two
+multiplied.
+
+**A5 (edit generations) was already done.** `audio_prod.resync` is a monotonic
+"something changed" flag, not a queue of pending edits, so one producer poll
+consumes a whole burst — the coalescing is structural rather than something to
+build. `audio_probe` measures exactly A5's criterion and passes: "8 edits in a
+burst -> 0 re-provisions", and a reconcile that moves no content "kept +2 opened
++0 new-slots +0 queue-clears +0". Left alone.
+
+**A6 (tail padding) was already done; the AUDIT was wrong.** Active 28 reported
+the export as "one frame short" of a 1787-frame range. It is not: `render_start`
+computes `nframes = end_frame - start_frame` and sets `render_job.end =
+end_frame - 1`, so `end_frame` is EXCLUSIVE and a range of 0..1786 is 1786 frames.
+1786 frames at 60 fps is exactly the 1428800 samples the export emitted. The
+`audio_silence_audit` frame count was fixed, and the audit now prints "length
+exact". Left alone. Worth recording because the alternative was chasing a
+tail-padding bug in a flush path that is already correct.
+
+**The declick probe took four attempts, and the wrong instrument twice.** It now
+asserts the mix is FADED at a clip end — the value at the boundary sample — and is
+mutation-verified (removing the ramp: `0.08080 at the boundary against an interior
+peak of 0.12563`; with it: `0.00000` and a largest step of `0.00063`, a 128x
+reduction). What did not work, in order, and why each is worth writing down:
+
+- **Appending only delivered frames.** A mix that fades out stops being "delivered"
+  at the fade's end, so the window ended at the last loud sample and the step DOWN
+  was never captured. Removing the declick entirely still passed.
+- **Boundary at the FIRST segment end.** The fixture has several lanes of the same
+  content, so an earlier end is covered by the segments after it: the mix stays
+  continuous across it and no step ever appears. Only where every source ends
+  together does the mix reach silence.
+- **Comparing the edge window's peak against the interior's.** The source's
+  amplitude ripples over ~512 samples, so which window holds a peak is a coin flip;
+  an unfaded cut measured 0.106 against an interior of 0.126 and passed.
+- **Largest inter-sample step vs peak.** A step's measured size depends on the
+  signal's PHASE at the cut. The fixture's 440 Hz tone put the cut near a zero
+  crossing.
+
+The instrument that works is phase-independent by construction: a raised-cosine
+fade reaches exactly zero at its end (`audio_declick(1.0) == 0`) and a cut does
+not, so the last sample before the boundary separates them with no reference to
+the signal's shape. The fixture also gained a CONSTANT second audio stream, since
+DC has no phase to hide behind.
+
+**Accept.** `check build probe audio_probe audio_rate keyed_export parity
+subtitle_probe render_kf_probe zorder` pass; `audio_export_audit` reports 0
+dropouts and exact length.
+
+## Active 30 — One mix engine with declared latency: Resolve's model, REAPER-swappable
+
+**Why:** Active 29 closed the two measured desync defects, and the honest answer
+to "can it still desync" was: the two mixers are separate implementations and
+neither accounts for pipeline latency. Both are structural, not incidental.
+
+`render_mix_block` (export) and `audio_mix_frame` (playback) are near-identical
+copies of the same loop. `render_audio_pull` and `audio_src_pull` have the same
+body — decode forward until the ring covers `up_to48`, push, advance — and
+`audio_src_append` is a one-line wrapper over the same `ring_push_pcm` the export
+calls directly. They differ in the struct they read (`Render_Audio_Src` vs
+`Play_Src`), in the granularity they iterate (a fixed 512-sample block vs one video
+frame), and in how they resolve a clip's span. Two copies of a mixer, one fact per
+copy: the Active 26 defect shape, one level down and in the engine that has to be
+right about time.
+
+And there is no latency compensation anywhere: grepping `audio.odin`,
+`audio_device.odin` and `atempo.odin` for latency/priming/compensation/SKIP_SAMPLES
+returns nothing. Meanwhile the pipeline has THREE things that add delay before a
+sample reaches the canvas — `swr` resampling on every clip not already at the bus
+rate, the `atempo` lookahead graph, and the device resampler. `audio.odin` even
+notes a measured "~0.1s AFTER the requested time" absorbed per-seek by
+`AUDIO_SEEK_PREROLL_SEC`. That may well cancel out. Nothing proves it does, and
+"no defect observed" is not "cannot occur" — which is the distinction this section
+is about.
+
+### What Resolve does, and what we copy
+
+From Blackmagic's own material (Resolve 18 manual, the Fairlight Audio Guide, the
+Fairlight tech specs), the reference model has four parts:
+
+- **One cursor, two units.** The playhead "indicates the current frame (and can
+  display the sample)". We have this: `Sample_Pos` with one `sample_pos_from_frames`.
+- **One bus rate.** Resolve defaults project audio to 48 kHz and resamples
+  imported audio to the timeline rate. We have this: `AUDIO_BUS_RATE` 48000.
+- **Block mixing to a device boundary.** Fixed block, ring, cushion. We have this.
+- **Latency compensation.** Fairlight lists it beside track/bus/plugin count as a
+  managed quantity, and devotes a chapter to click removal at the sample level.
+  **This is the part we do not have**, and it is the part that makes the rest
+  safe: a node's delay is a NUMBER the engine accounts for, so a chain's total
+  latency does not slide content against the timeline.
+
+### What we add so a REAPER-shaped engine is replaceable, not rewritten
+
+The point of the model is not fidelity to Resolve. It is that the mix core becomes
+a replaceable backend. That needs exactly two things Resolve has and we lack:
+
+**1. A node type, not a per-sink struct.** One `Mix_Src` carrying decoder, ring,
+content offset, timeline span, gain snapshot and `muted` — the union of
+`Play_Src` and `Render_Audio_Src`. ONE proc produces a source's gained, declicked
+samples for a block. Both mixers call it. A DAW version adds node TYPES and a UI;
+it does not touch a second mixer.
+
+**2. Latency as a declared, compensated quantity.** Every node declares
+`latency_samples`. The graph sums it and the engine compensates, so
+timeline→content mapping and timeline→output mapping differ by a known constant
+rather than by an observation. This is what makes an FX chain safe to add at all:
+in a DAW, each plugin delays audio, and Fairlight's compensation is why stacking
+them does not walk the audio off the picture.
+
+**3. Granularity becomes an argument, not a fork.** The export mixes 512-sample
+blocks; playback mixes one video frame. Both are "a range of `Sample_Pos`", so one
+mixer serves both and the block size is a parameter. This is the Resolve property
+we already have in the export (`render_mix_serve_frame` takes whatever range its
+frame covers, including one straddling two blocks) and playback has not caught up.
+
+### Steps
+
+- [x] S1. Declick unified (Active 29) — the two mixers now share their only
+      identical *policy*.
+- [x] S2. `mix_parity_probe`: drive BOTH mixers over the same timeline span and
+      compare them sample for sample. **BUILT, AND IT FAILS.** 120 of 141 frames
+      disagree, worst delta 0.192, and the disagreement is a constant **520-sample
+      (10.8 ms) content SHIFT** — cross-correlating one frame's export output
+      against the same frame's playback output peaks at +520 samples, not at 0.
+      See "The finding" below.
+- [ ] S3. `Mix_Src` node + one `mix_src_block`, both mixers onto it. Pure
+      deletion: the two pull procs and the duplicated gain/declick/span math
+      collapse into one. **UNBLOCKED as of S4a** — the WAV fixture proves the two
+      mixing paths are already bit-identical, so there is no reconciliation to do
+      first. The duplication is real debt, not a cover for a behavioural
+      difference.
+- [ ] S4. Latency: every node declares it, the graph sums it, both sinks
+      compensate. Measured and reported, not asserted by comment.
+  - [x] S4a. Root-caused the divergence (see "The finding" below): the mixers
+        agree; the CODEC's encoder delay does not, and it silently eats the
+        opening of every clip in both sinks.
+  - [ ] S4b. Make ONE sink authoritative and fix the other. Needs a decision on
+        where priming lives, not a patch — see the finding for the two options.
+  - [ ] S4c. Latency as a declared per-node quantity compensated at each sink,
+        which subsumes S4b and also covers `swr` delay and `atempo` lookahead.
+- [ ] S5. Granularity as a parameter — playback asks for a frame's range and the
+      same mixer serves it.
+- [x] S6a. `atempo_probe` wired into `gate.sh` and `all`. It had an entry point
+      and passed, but was wired into neither, so playback rate changes were
+      verified by hand, once, and `all` could not catch a regression in the
+      pitch-preserving path.
+- [ ] S6b. Nothing exercises 29.97 (every rate measured so far is 60 or 30
+      exactly, and NTSC is where the 1601/1602 alternation lives).
+- [ ] S6c. Nothing measures drift beyond 30 s.
+
+### The finding (S2/S4a)
+
+**The two mixers are already equivalent.** On a WAV fixture they are
+BIT-IDENTICAL: 0 of 141 frames differ, worst delta 0.000000. So the duplicated
+mixing arithmetic is not the defect, and **S3 (collapse both onto one node) is
+safe to do** — there is nothing to reconcile first. That is the useful result,
+and it is the opposite of what the first run appeared to show.
+
+**What actually differs is the codecs' encoder delay, and it breaks BOTH sinks.**
+On the AAC fixture the fifo heads at timeline 0 are:
+
+```
+p0.first48=800  p1.first48=1024  p2.first48=1024
+e0.first48=1024 e1.first48=1024 e2.first48=1024
+```
+
+- Every **export** source starts at 1024 — the AAC encoder delay, 21.3 ms. The
+  first 21.3 ms of *every clip* is absent from the export: a gap at every cut.
+  `render.odin` already detects and reports this ("preroll could not cover it")
+  and then exports anyway.
+- **Playback** slot 0 starts at 800 — exactly one 60 fps frame (48000/60). Playback
+  silently drops frame 0 of the first clip, and does not report it.
+
+So there is one root cause with two symptoms: **neither sink guarantees its
+decoder's fifo covers content 0.** They differ only in how loudly they fail —
+the export logs, playback does not. This is the gap Active 30 exists to close,
+found by the measurement added to enable the refactor and before any of it.
+
+`AV_PKT_DATA_SKIP_SAMPLES` is bound (`avcodec.SkipSamples`) and is how the codec
+declares this delay, but **the fix is NOT a matter of reading that side data**:
+the drop has to happen either at the resampler's input or at the post-resample
+output, and each wrong choice is silent. Zeroing the input frame after
+`swres.convert` has already written is a no-op; advancing the destination
+pointer to skip input samples desynchronises the resampler's filter state. Both
+were tried and neither was landed, because a priming fix that is plausible and
+unverified is worse than a known-red gate.
+
+**S4b therefore stays open, and it is a design decision, not a patch.** The
+question is where priming lives: as a per-decoder constant subtracted from the
+first output (simple, assumes the side data is on the first packet) or as a
+declared per-source LATENCY the sink compensates at its boundary (general, and
+the one the Resolve model actually wants — it also covers `swr` delay and the
+`atempo` lookahead, not just AAC). The second is the real answer and it is S4c.
+
+### Probe shape (kept deliberately)
+
+`audio_mix_parity` takes the source path as an argument and the gate target runs
+it against **two** fixtures, because the difference between them IS the finding:
+
+- **wav** — uncompressed, no encoder delay. Both mixers bit-identical. This is the
+  standing regression guard on the mixing arithmetic.
+- **aac** — encoder-delayed. Currently red, because neither sink can supply
+  content 0.
+
+It also prints each sink's fifo head at frame 0 (`p0.first48=…`, `e0.first48=…`).
+That single line is the difference between "the mixers disagree" and "neither
+sink can supply content 0", which is the whole diagnosis in one number.
+
+Two measurement mistakes were made and corrected while building this, both
+worth keeping in mind because each read as proof:
+
+- Correlating with an offset past the end of the frame skips every shift, so
+  "best shift 0" printed while nothing had been compared at all.
+- Driving the export one whole video frame at a time instead of its natural
+  512-sample blocks suggested the mixers were misaligned. At 512 they are
+  identical.
+## Active 31 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
 
 **Why:** Alt+wheel and Alt+middle-drag magnified and slid a clip's content
 correctly, and neither wrote anything called zoom or pan. Each gesture rewrote

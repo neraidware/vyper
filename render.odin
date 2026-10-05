@@ -1568,65 +1568,6 @@ Render_Audio_Src :: struct {
 // normal case rather than an edge case.
 AUDIO_MIX_BLOCK :: 512
 
-// AUDIO_DECLICK_SAMPLES is the fade length at a source's contribution edges, in
-// sample-frames (256 = 5.3ms at 48kHz). Long enough that the derivative of the
-// fade is small next to the signal it is fading, short enough to be inaudible as
-// a fade: a click is a step, and what removes it is spreading the step over
-// enough samples that no single step is large.
-AUDIO_DECLICK_SAMPLES :: 256
-
-// render_declick is the fade SHAPE: a raised cosine, so the gain AND its slope go
-// to zero at both ends. A linear ramp would leave a slope discontinuity at each
-// end, which is itself audible on a bright signal -- it converts a click into a
-// tick. Evaluated only inside the fade, at a source's edges, so the cost is
-// O(clip boundaries) and not O(audio samples): the steady interior of a block
-// never calls it.
-render_declick :: proc(t: f32) -> f32 {
-	return (1.0 - math.cos(math.PI * t)) * 0.5
-}
-
-// render_declick_fade_in is how many of a block's n sample-frames need the fade
-// at the front, given `from_edge`: the distance in samples from the block's first
-// sample to the contribution's start edge, 0 when the block opens on the edge.
-render_declick_fade_in :: proc(from_edge: Sample_Pos, n: int) -> int {
-	if from_edge >= Sample_Pos(AUDIO_DECLICK_SAMPLES) {
-		return 0
-	}
-	return clamp(int(Sample_Pos(AUDIO_DECLICK_SAMPLES) - from_edge), 0, n)
-}
-
-// render_declick_fade_out is render_declick_fade_in at the other end: how many
-// of a block's n sample-frames need the fade before its end, given `to_edge` --
-// the distance from the block's last sample to the contribution's end edge.
-render_declick_fade_out :: proc(to_edge: Sample_Pos, n: int) -> int {
-	return render_declick_fade_in(to_edge, n)
-}
-
-// render_declick_gain is sample `s` of a block's `n`: the automation gain, faded
-// in over the first fade_in samples and out over the last fade_out.
-//
-// Named rather than written inline because the shape appears TWICE when it is
-// inline -- once ascending, once descending, with mirrored expressions -- and two
-// copies of a ramp that must agree is the kind of thing that drifts.
-//
-// Each fade is normalised by its OWN length and stepped so the ramp's argument
-// runs 1/fade .. 1 INCLUSIVE, which puts the gain at exactly g on the last faded
-// sample. Two things depend on that. A block shorter than the fade still completes
-// it rather than leaving the contribution permanently attenuated, which is what
-// measuring against the fixed AUDIO_DECLICK_SAMPLES does; and the hand-off from
-// faded to unfaded carries no step of its own. (Normalising to fade/(fade+1)
-// instead reaches only 0.99996 -- inaudible, but it makes the ramp's endpoint a
-// lie in the comment, and a probe asserting the invariant caught exactly that.)
-render_declick_gain :: proc(g: f32, s, n, fade_in, fade_out: int) -> f32 {
-	if fade_in > 0 && s < fade_in {
-		return g * render_declick(f32(s+1) / f32(fade_in))
-	}
-	if fade_out > 0 && s >= n-fade_out {
-		return g * render_declick(f32(n-s) / f32(fade_out))
-	}
-	return g
-}
-
 // RENDER_MIX_CUSHION_FRAMES is how far ahead of the consumer the mix producer
 // runs, in video frames -- the render's answer to the question playback already
 // answers with AUDIO_CUSHION_SEC. The export had none: the composite thread mixed
@@ -1851,12 +1792,12 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 		if a.muted {
 			fade_from = blk_lo
 		}
-		fade_in := render_declick_fade_in(blk_lo - fade_from, int(want))
-		fade_out := render_declick_fade_out(clip_t1 - blk_hi, int(want))
+		fade_in := audio_declick_fade_in(blk_lo - fade_from, int(want))
+		fade_out := audio_declick_fade_out(clip_t1 - blk_hi, int(want))
 		for s in 0 ..< int(want) {
 			l, r := ring_at(&a.fifo, base + s)
 			off := int(blk_lo - at) * 2
-			f := render_declick_gain(g, s, int(want), fade_in, fade_out)
+			f := audio_declick_gain(g, s, int(want), fade_in, fade_out)
 			out[off + s * 2 + 0] += l * f
 			out[off + s * 2 + 1] += r * f
 		}
@@ -5054,6 +4995,92 @@ render_test_env :: proc() -> (bool, [2]string) {
 		res[1] = parts[1]
 	}
 	return true, res
+}
+
+// render_project_export_env reads VYPER_PROJECT_EXPORT="<project.vyproj>|<out>":
+// open a project file and export it unchanged.
+//
+// The reason this exists: VYPER_RENDER_TEST IMPORTS a media file, so it can
+// only ever export a timeline this probe builds itself, and a self-built timeline
+// is exactly what cannot show a defect that depends on the real workload. The
+// audio engine's 133 mid-clip dropouts were measured on ~/sallyface.vyproj
+// (12 video sources, 5 stacked audio tracks, splits) and no synthetic fixture
+// reproduces them -- audio_probe, audio_rate_probe and atempo_probe all build
+// their own, so the one number that decided whether the audio rework was done
+// had no way to be re-measured. That is the same shape as the text-keyframe
+// bug: a defect real workloads hit that the suite structurally cannot see.
+render_project_export_env :: proc() -> (bool, [2]string) {
+	v, _ := os.lookup_env_alloc("VYPER_PROJECT_EXPORT", context.allocator)
+	if v == "" {
+		return false, [2]string{}
+	}
+	parts := strings.split(v, "|")
+	defer delete(parts)
+	res: [2]string
+	if len(parts) >= 2 {
+		res[0] = parts[0]
+		res[1] = parts[1]
+	}
+	return true, res
+}
+
+// render_project_export opens a project and exports it, standing in for the UI
+// thread exactly as render_test_run does after its own render_start.
+render_project_export :: proc(paths: [2]string) {
+	if len(paths[0]) == 0 || len(paths[1]) == 0 {
+		fmt.println("project-export: need VYPER_PROJECT_EXPORT=\"<project.vyproj>|<out>\"")
+		os.exit(2)
+	}
+	// Same reason render_test_run loads the font: dispatched before main's
+	// load_font_data, so exporting a text clip would read out of bounds.
+	if !load_font_data() {
+		fmt.println("project-export FAIL: could not load font data")
+		os.exit(3)
+	}
+	if oerr := project_file_open(paths[0]); oerr != "" {
+		fmt.println("project-export FAIL:", oerr)
+		os.exit(3)
+	}
+	sync_track_order()
+	fmt.println("project-export: opened", paths[0])
+	// The grid rate, for the audit script. The project file saves frame_rate 0.0
+	// to mean "inherit", so it cannot be read back from the .vyproj, and
+	// deriving it from the export's sample count is circular -- the export is
+	// short by exactly the tail padding the audit also measures, so a short
+	// export reports a slightly-high grid and every frame->source lookup lands
+	// late. The app knows its own rate; say it.
+	fmt.println(
+		"project-export: grid rate",
+		project_fps(),
+		"start",
+		project.start_frame,
+		"end",
+		project.end_frame,
+	)
+	render_set_out_path(paths[1])
+	render_output.overwrite = true
+	render_start()
+	// Stand in for the UI thread: clear the "UI drew a frame" gate the live sink
+	// publishes against, then drain the mailbox so the publish path executes.
+	sync.atomic_store(&render_live.shown, true)
+	// A real consumer buffer, because the live mailbox is DROP-on-full: draining
+	// into nil would claim frames without ever copying them, and the point of
+	// standing in for the UI here is only to keep the worker from stalling on a
+	// mailbox nobody reads. Sized after render_start, which is what set the
+	// output dims. Job-arena ownership: freed before this returns.
+	buf := make([]u8, int(render_live.w) * int(render_live.h) * 4)
+	defer delete(buf)
+	for render_is_busy() {
+		time.sleep(50 * time.Millisecond)
+		_, _, _, _ = render_live_drain(buf)
+	}
+	poll_completed_thread()
+	fmt.println("project-export status:", render_status_text())
+	st := render_status()
+	if st != .Done && st != .Failed {
+		fmt.println("project-export FAIL: export did not reach a terminal state")
+		os.exit(3)
+	}
 }
 
 render_test_run :: proc(paths: [2]string) {

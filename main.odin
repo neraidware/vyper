@@ -1803,6 +1803,10 @@ main :: proc() {
 		render_test_run(test_paths)
 		return
 	}
+	if pe_ok, pe_paths := render_project_export_env(); pe_ok {
+		render_project_export(pe_paths)
+		return
+	}
 	parity_probe_env()
 	if hw_probe, _ := os.lookup_env_alloc("VYPER_HW_PROBE", context.temp_allocator); hw_probe != "" {
 		preview_hw_probe_run(hw_probe)
@@ -1913,6 +1917,18 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		defer async_dec_shutdown()
 		flash_probe_run(fp)
 		return
+	}
+	// Standalone, and NOT dispatched from audio_probe: this one currently FAILS,
+	// which is the finding rather than a nuisance (see TODO.md Active 30 S2). It has
+	// its own gate target so the failure is named and runnable instead of either
+	// breaking `all` or being quietly skipped.
+	if mp, _ := os.lookup_env_alloc("VYPER_AUDIO_MIX_PARITY", context.temp_allocator); mp != "" {
+		parts := strings.split(mp, "|")
+		ok: bool = audio_probe_mix_parity(strings.trim_space(parts[0]))
+		if !ok {
+			os.exit(1)
+		}
+		os.exit(0)
 	}
 	if atp, _ := os.lookup_env_alloc("VYPER_ATEMPO_PROBE", context.temp_allocator); atp != "" {
 		atempo_probe_run(atp)

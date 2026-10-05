@@ -486,9 +486,17 @@ target_audio_probe() {
 	mkdir -p target/audio_probe
 	local src=target/audio_probe/src.mp4
 	if [ ! -s "$src" ]; then
+		# Stream 0 is a 440 Hz tone; stream 1 is a CONSTANT signal, which the
+		# declick case needs: a click is a step, and a step's size at the boundary
+		# depends on the signal's phase there. A sine happens to sit near a zero
+		# crossing at the cut, so an unramped cut measured as a third of the
+		# amplitude and the check passed with the declick deleted outright. DC has
+		# no phase, so the step is the full amplitude every time.
 		if ! dev ffmpeg -y -f lavfi -i \
 			"testsrc2=size=640x360:rate=30:duration=10" \
 			-f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" \
+			-f lavfi -i "aevalsrc=0.5:s=48000:d=10" \
+			-map 0:v -map 1:a -map 2:a \
 			-c:v libx264 -pix_fmt yuv420p -crf 20 -c:a aac -shortest "$src" >/dev/null 2>&1
 		then
 			echo "audio-probe: could not synthesize the source clip" >&2
@@ -1018,6 +1026,7 @@ target_proxy_probe() {
 # and the seven invalid inputs that must be rejected -- which no end-to-end path
 # can reach.
 PARITY_DIR=target/parity
+AUDIT_DIR=target/audio_audit
 AUDIO_RATE_DIR=target/audio_rate
 
 # The fixture media target_parity synthesizes, factored out because the valgrind
@@ -1241,6 +1250,102 @@ target_parity_valgrind() {
 	echo "parity-valgrind: ok (no invalid access; SDL control clean; definitely-lost within the worker-thread residue; full log: $log)"
 }
 
+# The audio engine's own acceptance measurement (TODO.md Active 22).
+#
+# Every other audio gate builds its OWN fixture — audio_probe, audio_rate_probe
+# and atempo_probe all synthesize a WAV and construct a timeline. That is right
+# for a regression suite and useless for the defect this section exists to close:
+# the 133 mid-clip dropouts were measured on a real 12-source / 5-audio-track
+# project with splits, and no synthetic timeline reproduces them. So the one
+# number that decides whether the audio rework is done had no way to be
+# re-measured after the fact. Same shape as the text-keyframe bug: a defect real
+# workloads hit that the suite structurally cannot see.
+#
+# This target exports a real project and counts digital-silence runs in the
+# RESULT, cross-referencing each one against the source recording so a run the
+# source genuinely contains is not counted as a dropout. That cross-reference is
+# the whole point: the recording is a screen capture of a mostly-silent room, so
+# a naive silence count reports its own silence as engine dropouts.
+#
+# AUDIT_PROJECT selects the project; it SKIPs (not fails) when absent, since the
+# file is machine-local and this must never break `all` on a box without it.
+target_audio_export_audit() {
+	require_fresh_binary audio-audit || return 1
+	local proj=${AUDIT_PROJECT:-$HOME/sallyface.vyproj}
+	if [ ! -s "$proj" ]; then
+		echo "audio-audit: SKIP (no project at $proj -- set AUDIT_PROJECT)"
+		return 0
+	fi
+	local dir="$AUDIT_DIR"
+	mkdir -p "$dir"
+	env VYPER_PROJECT_EXPORT="$proj|$dir/out.mp4" timeout 900 ./vyper >"$dir/export.log" 2>&1
+	if ! grep -q "project-export status: Render complete" "$dir/export.log"; then
+		echo "audio-audit: export did not complete -- see $dir/export.log" >&2
+		tail -5 "$dir/export.log" >&2
+		return 1
+	fi
+	ffmpeg -v error -i "$dir/out.mp4" -map 0:a -ac 1 -ar 48000 -f s16le "$dir/out.raw" -y || return 1
+	# The grid comes from the app's own log line, not from the sample count.
+	local grid
+	grid=$(sed -n 's/^project-export: grid rate \([0-9.]*\).*/\1/p' "$dir/export.log" | head -1)
+	if [ -z "$grid" ]; then
+		echo "audio-audit: could not read the grid rate from the export log" >&2
+		return 1
+	fi
+	python3 scripts/audio_silence_audit.py "$proj" "$dir/out.raw" "$dir/out.mp4" "$grid" || return 1
+}
+
+# atempo_probe. It has an entry point and it passes, but it was wired into
+# NEITHER gate.sh NOR `all` until now -- so playback rate changes were verified by
+# hand, once, and `all` could not catch a regression in the pitch-preserving path.
+# Every other audio target here synthesizes its own fixture, so this costs nothing
+# but a few seconds of CPU.
+target_atempo_probe() {
+	require_fresh_binary atempo-probe || return 1
+	VYPER_ATEMPO_PROBE=ALL timeout 600 ./vyper 2>&1 | tail -1
+}
+
+# audio_mix_parity drives the playback mixer and the export mixer over the same
+# timeline span and compares them sample for sample. It runs against TWO fixtures,
+# because the interesting part is the DIFFERENCE between them:
+#
+#   wav  -- uncompressed, no encoder delay. Both mixers must be BIT-IDENTICAL.
+#           This is the regression guard for the mixing arithmetic itself.
+#   aac  -- encoder-delayed. This one CURRENTLY FAILS, and it fails because
+#           neither sink can supply content 0 (see TODO.md Active 30 S4).
+#
+# It is a gate target rather than a case inside audio_probe precisely because of
+# that: a red line inside `all` gets disabled, and a check nobody runs proves
+# nothing. Run it to see the state; do not wire it into `all` until it is green.
+target_audio_mix_parity() {
+	require_fresh_binary audio-mix-parity || return 1
+	local wav=target/mixparity/src.wav
+	local aac=target/audio_probe/src.mp4
+	local rc=0
+	if [ ! -s "$wav" ]; then
+		echo "audio-mix-parity: synthesizing the no-encoder-delay fixture" >&2
+		mkdir -p target/mixparity
+		ffmpeg -v error -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" \
+			-ac 2 -c:a pcm_s16le "$wav" -y || return 1
+	fi
+	if [ ! -s "$aac" ]; then
+		echo "audio-mix-parity: no AAC fixture at $aac -- run scripts/gate.sh audio_probe first" >&2
+		return 1
+	fi
+	# The green half: identical arithmetic, no codec delay in the way.
+	VYPER_AUDIO_MIX_PARITY="$PWD/$wav" timeout 600 ./vyper 2>&1 | tail -2
+	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
+	# The red half: the encoder-delay case. Reported, not swallowed, and not
+	# allowed to hide the green half's verdict by running second.
+	VYPER_AUDIO_MIX_PARITY="$PWD/$aac" timeout 600 ./vyper 2>&1 | tail -2
+	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
+	if [ $rc -ne 0 ]; then
+		echo "audio-mix-parity: FAILED (known; TODO.md Active 30 S4)" >&2
+		return 1
+	fi
+	echo "audio-mix-parity: ok"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1284,6 +1389,9 @@ main() {
 	dnd_probe) target_dnd_probe ;;
 	parity) target_parity ;;
 	audio_rate) target_audio_rate ;;
+	audio_export_audit) target_audio_export_audit ;;
+	audio_mix_parity) target_audio_mix_parity ;;
+	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
 	yuv_exact) target_yuv_exact ;;
@@ -1302,7 +1410,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac
