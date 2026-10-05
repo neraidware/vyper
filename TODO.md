@@ -6036,13 +6036,35 @@ earlier correlation fit suggested — that fit was against an all-zero export an
 should not have been trusted, which is the second time in this work that a
 correlation over a silent signal read as a measurement.
 
-That is the whole of S6d, and it is the SAME defect S3 removes: two copies of one
-mix loop cannot agree about where a block begins, and no amount of measuring two
-implementations gets them to. One implementation has one origin by construction.
+**Two things this ruled out**, both of which looked like the answer:
 
-So S3 is not just debt cleanup here, it is the fix. `audio_drift_parity` stays
-OUT of `all` while it is red, for the reason `audio_mix_parity` was: a failing
-member gets disabled, and a check nobody runs proves nothing.
+- It is NOT float-vs-exact position arithmetic. `audio_frame_boundary48` already
+  delegates to `sample_pos_from_frames`, so both sinks compute frame boundaries
+  through the same exact integer path. They cannot disagree there.
+- It is NOT the `demand48 = max(demand48, s.first48)` clamp. That clamp IS a real
+  asymmetry -- playback silently mixes from the fifo head when the decoder lands
+  ahead, while the export calls the same condition a shortfall and silences the
+  span. But the export's counterpart branch provably does not fire here (`exp[0]`
+  moved only in the 5th decimal when it was changed to match), so it is not this
+  bug. The change was reverted rather than landed: an unverified asymmetry fix is
+  machinery for a problem that is not the one in front of us.
+
+**And the finding that reframes S6d.** The two sinks do not merely disagree at the
+clip head -- `worst` is at frame 143 with a delta of 0.163, while the head
+difference is only ~0.05. So they differ by a factor of roughly 6 THROUGHOUT the
+timeline, not by a 5-sample offset at the opening. The head is where the
+divergence becomes visible because that is where the signal is smallest, not
+where it starts. That is closer to a GAIN difference than a position difference,
+which is why the position-oriented hypotheses kept failing.
+
+Not yet root-caused. The next thing to measure is the per-source GAIN each sink
+applies -- `play_seg_gain_linear` on one side, `audio_gain_linear(&a.gain, rel)`
+on the other -- since a constant factor is what a dB/linear unit mismatch looks
+like.
+
+`audio_drift_parity` stays OUT of `all` while it is red, for the reason
+`audio_mix_parity` was: a failing member gets disabled, and a check nobody runs
+proves nothing.
 
 ## Active 31 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
 
