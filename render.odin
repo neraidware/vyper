@@ -1069,28 +1069,15 @@ Render_Video_Src :: struct {
 	// blit_slots[(N-1) & 1], overlapped via the produced/consumed atomics
 	// (render_dec_pipe). Buffer lifetime: job arena, both filled per frame.
 	blit_slots:           [2]Render_Blit_Slot, // fw*fh*4 scaled frame each
-	// Crop-inset resample (P4): crop_l/r/t/b select a source sub-rect of the
-	// full-box blit that fills the display box. That resample is one RGBA→RGBA
-	// sws.scale into a fixed scratch (SIMD bilinear), not a per-pixel scalar
-	// loop. ctx is worker-owned, built at setup, freed via sws.freeContext;
-	// scratch lives in the job arena (v.rw*v.rh*4).
-	crop_ctx:             ^sws.Context,
-	crop_scratch:         []u8,
-	crop_sx, crop_sy:     c.int, // quantized source sub-rect origin (in blit px)
-	crop_sw, crop_sh:     c.int, // sws source dims (== ctx src dims)
 }
 
 // Render_Blit_Slot is one frame's worth of decode output. The producer writes
-// the full box + the geometry the worker needs to place it (crop region + dst),
-// so the worker composite never reads the decoder (v.dec) — decoder structs are
-// single-writer, owned by the producer thread alone.
+// the clip's window + the geometry the worker needs to place it, so the worker
+// composite never reads the decoder (v.dec) — decoder structs are single-writer,
+// owned by the producer thread alone.
 Render_Blit_Slot :: struct {
-	blit:   []u8, // fw*fh*4 scaled frame (crop region placed at fit_ox/oy)
-	ok:     bool, // decode+scale succeeded this round; worker skips if false
-	crop_w: c.int, // dec.crop_px_w the producer resolved (0 = no render crop)
-	crop_h: c.int, // dec.crop_px_h
-	fit_ox: c.int, // dec.fit_ox (dst placement inside the box)
-	fit_oy: c.int, // dec.fit_oy
+	blit: []u8, // fw*fh*4 scaled window
+	ok:   bool, // decode+scale succeeded this round; worker skips if false
 }
 
 // Render_Text_Src snapshots a .Text generator clip for the worker. It carries
@@ -1381,6 +1368,73 @@ render_display_rect :: proc(src: ^Render_Video_Src, PW, PH: c.int) -> (l, t, r, 
 		src.geom_base[int(Render_Geom_Prop.Crop_T)],
 		src.geom_base[int(Render_Geom_Prop.Crop_B)],
 	)
+}
+
+// render_static_src_geom sizes one static clip's decode buffers (fw/fh, the
+// display rect rw/rh/ox/oy) and sets its decoder crop. A fully off-canvas clip
+// comes back with fw == 0 and nothing to decode. Pure pixel math on the clip's
+// own snapshot -- pinned by VYPER_RENDER_KF_PROBE.
+render_static_src_geom :: proc(v: ^Render_Video_Src, canvas_w, canvas_h: c.int) {
+	l, t, r, b := render_display_rect(v, canvas_w, canvas_h)
+	// Fully off-canvas: never drawn, so no decode at all.
+	if c.int(r) <= 0 || c.int(l) >= canvas_w ||
+	   c.int(b) <= 0 || c.int(t) >= canvas_h {
+		v.fw = 0
+		v.fh = 0
+		v.rw = 0
+		v.rh = 0
+	}
+	// A clip's box is `source x scale`, which for a scaled-up clip is far
+	// larger than anything it draws -- at 27x on a 1920x1082 source it is
+	// 53332x30055, and every buffer sized from that box is 6.4 GB to draw the
+	// 1920x1082 pixels actually on screen (FFmpeg refuses the size outright,
+	// which is how this reached a failed export).
+	//
+	// So the buffer is the region the clip can actually draw: the crop window
+	// (the display rect) clipped to the canvas. The crop insets are already
+	// resolved into the display rect by cropped_box_edges, and render_blit
+	// copies the buffer 1:1 onto the canvas, so the source region decoded and
+	// its mapping are the same as a full box would give -- the only thing
+	// gone is the part that was never drawn. There is no threshold and no
+	// second path: a clip whose box happens to fit the canvas gets the same
+	// numbers it always did, because the window IS the box then.
+	win_left := max(l, 0.0)
+	win_top := max(t, 0.0)
+	win_right := min(r, f32(canvas_w))
+	win_bottom := min(b, f32(canvas_h))
+	v.ox = c.int(win_left + 0.5)
+	v.oy = c.int(win_top + 0.5)
+	// Extent from the rounded window edges, then trimmed to the canvas:
+	// rounding can push it a pixel past the edge, and a column that is never
+	// drawn is not worth decoding or allocating.
+	v.rw = max(1, min(px_extent(win_right - win_left), canvas_w - v.ox))
+	v.rh = max(1, min(px_extent(win_bottom - win_top), canvas_h - v.oy))
+	v.fw = v.rw
+	v.fh = v.rh
+
+	// The window in box fractions is what the decoder crops to, and crop_dst is
+	// 0 because the allocated box IS the window: the decoded region starts at
+	// its own origin. crop_full is the window too, so there is no full-box
+	// buffer left to be the uncropped fallback.
+	cw, ch := full_box_dims(
+		v.source_w,
+		v.source_h,
+		v.geom_base[int(Render_Geom_Prop.Scale)],
+		f32(canvas_w),
+		f32(canvas_h),
+	)
+	box_left := v.geom_base[int(Render_Geom_Prop.Trans_X)] - cw / 2
+	box_top := v.geom_base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
+	v.dec.crop_fx0 = (f32(v.ox) - box_left) / cw
+	v.dec.crop_fy0 = (f32(v.oy) - box_top) / ch
+	v.dec.crop_fw = f32(v.fw) / cw
+	v.dec.crop_fh = f32(v.fh) / ch
+	v.dec.crop_dst_x = 0
+	v.dec.crop_dst_y = 0
+	v.dec.crop_dst_w = v.fw
+	v.dec.crop_dst_h = v.fh
+	v.dec.crop_full_w = v.fw
+	v.dec.crop_full_h = v.fh
 }
 
 // render_kf_geom_rect evaluates a keyed clip's animation at clip offset `off`
@@ -2348,13 +2402,6 @@ slot_idx := int(frame_idx & 1)
 			decode_into_buffer(&v.dec, slot.blit, v.fw, v.fh)
 			render_pipe.dec_scale_ns += time.now()._nsec - t_scale
 			slot.ok = true
-			// Publish the crop geometry the worker's render_blit needs; the
-			// resolution is decoder-side (can change on the first hardware
-			// frame when the crop is dropped), so it rides out with the data.
-			slot.crop_w = v.dec.crop_px_w
-			slot.crop_h = v.dec.crop_px_h
-			slot.fit_ox = v.dec.fit_ox
-			slot.fit_oy = v.dec.fit_oy
 		}
 		// Release: the slot writes above are visible to the worker's acquire
 		// load of produced before it composites frame frame_idx.
@@ -2539,10 +2586,6 @@ render_worker_run :: proc() {
 		}
 		enc_cleanup(&e)
 		for &v in render_job.videos {
-			if v.crop_ctx != nil {
-				sws.freeContext(v.crop_ctx)
-				v.crop_ctx = nil
-			}
 			clip_decoder_reset(&v.dec)
 		}
 		for &a in render_job.audios {
@@ -2722,101 +2765,45 @@ render_worker_run :: proc() {
 			}
 			continue
 		}
-		l, t, r, b := render_display_rect(v, render_job.width, render_job.height)
-		v.rw = px_extent(r - l)
-		v.rh = px_extent(b - t)
-		v.ox = c.int(l + 0.5)
-		v.oy = c.int(t + 0.5)
-		// Decode the frame at the full (pre-crop) box size so the cropped
-		// region can be sampled out of it (render_blit).
-		cw, ch := full_box_dims(
-			v.source_w,
-			v.source_h,
-			v.geom_base[int(Render_Geom_Prop.Scale)],
-			f32(render_job.width),
-			f32(render_job.height),
-		)
-		v.fw = px_extent(cw)
-		v.fh = px_extent(ch)
+		render_static_src_geom(v, render_job.width, render_job.height)
 		// Fully off-canvas: never drawn, so no decode at all. The frame loop
 		// skips v.fw <= 0 before touching the decoder.
-		if c.int(r) <= 0 || c.int(l) >= render_job.width ||
-		   c.int(b) <= 0 || c.int(t) >= render_job.height {
-			v.fw = 0
-			v.fh = 0
+		if v.fw <= 0 {
 			continue
 		}
-		// Static clips decode only their visibility-cropped region, so their
-		// stage is small by construction; recording it anyway keeps the
-		// reported max meaningful for a job with no keyed clips at all.
+		// Static clips decode only the region they can draw, so their stage is
+		// canvas-sized by construction; recording it anyway keeps the reported
+		// max meaningful for a job with no keyed clips at all.
 		if v.fw > render_max_stage_w {
 			render_max_stage_w = v.fw
 		}
 		if v.fh > render_max_stage_h {
 			render_max_stage_h = v.fh
 		}
-		// Visible rect = canvas-clipped display rect. Decode and sws-scale
-		// only this region (render.odin perf brief P3) so resample work tracks
-		// the pixels that are actually drawn; the region maps 1:1 to itself
-		// because the box is the full frame at uniform scale. Each blit slot
-		// stays the full box size so the decoder's crop-dropped fallback and
-		// the uncrop paths keep working, and the crop lives in v.dec (cleared
-		// by the decoder's reset when zero).
-		vis_left := max(0, c.int(l + 0.5))
-		vis_top := max(0, c.int(t + 0.5))
-		vis_right := min(render_job.width, c.int(r + 0.5))
-		vis_bottom := min(render_job.height, c.int(b + 0.5))
-		box_left := v.geom_base[int(Render_Geom_Prop.Trans_X)] - cw / 2
-		box_top := v.geom_base[int(Render_Geom_Prop.Trans_Y)] - ch / 2
-		box_ox := c.int(box_left + 0.5)
-		box_oy := c.int(box_top + 0.5)
-		visible_covers_box := vis_left <= box_ox && vis_top <= box_oy &&
-			vis_right >= box_ox + v.fw && vis_bottom >= box_oy + v.fh
-		if vis_right > vis_left && vis_bottom > vis_top && !visible_covers_box {
-			v.dec.crop_fx0 = (f32(vis_left) - box_left) / cw
-			v.dec.crop_fy0 = (f32(vis_top) - box_top) / ch
-			v.dec.crop_fw = (f32(vis_right) - box_left) / cw - v.dec.crop_fx0
-			v.dec.crop_fh = (f32(vis_bottom) - box_top) / ch - v.dec.crop_fy0
-			v.dec.crop_dst_x = vis_left - box_ox
-			v.dec.crop_dst_y = vis_top - box_oy
-			v.dec.crop_dst_w = vis_right - vis_left
-			v.dec.crop_dst_h = vis_bottom - vis_top
-			v.dec.crop_full_w = v.fw
-			v.dec.crop_full_h = v.fh
-		}
 		for &slot in &v.blit_slots {
 			slot.blit = make([]u8, int(v.fw) * int(v.fh) * 4)
-		}
-		// P4: build the crop-inset resampler once. crop insets select a source
-		// sub-rect of the full-box blit that fills the display box (rw x rh).
-		// The near-identity crop is one SIMD bilinear sws.scale into a fixed
-		// scratch, replacing the old per-pixel nearest-neighbor loop. Source
-		// rect is quantized to whole blit pixels; bilinear filtering makes the
-		// sub-pixel remainder a quality improvement, not a bug.
-		crop_l := v.geom_base[int(Render_Geom_Prop.Crop_L)]
-		crop_r := v.geom_base[int(Render_Geom_Prop.Crop_R)]
-		crop_t := v.geom_base[int(Render_Geom_Prop.Crop_T)]
-		crop_b := v.geom_base[int(Render_Geom_Prop.Crop_B)]
-		if crop_l != 0 || crop_r != 0 || crop_t != 0 || crop_b != 0 {
-			// The same crop_src_rect the GPU staging path uses, over the full-box
-			// blit (which holds the same pixels the stage does). keyed_export
-			// scores the GPU result against this path, so "same crop" has to mean
-			// the same rect here, not merely a similar one.
-			csr := crop_src_rect(int(v.fw), int(v.fh), crop_l, crop_r, crop_t, crop_b)
-			v.crop_sx, v.crop_sy, v.crop_sw, v.crop_sh = c.int(csr.x), c.int(csr.y), c.int(csr.w), c.int(csr.h)
-			v.crop_ctx = sws.getContext(
-				c.int(csr.w), c.int(csr.h), avutil.PixelFormat.RGBA,
-				v.rw, v.rh, avutil.PixelFormat.RGBA,
-				sws.Flags{.Bilinear}, nil, nil, nil,
-			)
-			if v.crop_ctx != nil {
-				v.crop_scratch = make([]u8, int(v.rw) * int(v.rh) * 4)
-			}
 		}
 		if !open_clip_decoder_ex(&v.dec, v.path, v.stream_index, v.fw, v.fh, false) {
 			err_msg = "failed to open video source"
 			fail = true
 			return
+		}
+		// A frame format the decoder cannot crop leaves it with no way to
+		// honor the window: the fallback decodes the WHOLE source, which would
+		// be scaled into the window and draw the entire frame squashed into
+		// this clip's slice of the canvas. Drop the clip with the reason rather
+		// than render it wrong. Every format these decoders produce is in the
+		// crop table, so this is the defensive arm.
+		if v.dec.crop_dropped {
+			fmt.printf(
+				"[render] video source %d omitted: %s cannot be cropped, so it cannot be clipped to the canvas\n",
+				i,
+				v.path,
+			)
+			v.fw = 0
+			v.fh = 0
+			v.rw = 0
+			v.rh = 0
 		}
 	}
 
@@ -2969,19 +2956,13 @@ render_worker_run :: proc() {
 	//   * drawing static 1:1 clips as quads instead of CPU region copies.
 	// The CPU canvas is the drop-in fallback. It is selected (not merely the
 	// consequence of a failed create) when anything the quad path cannot yet
-	// reproduce byte-for-byte would be on the stack: a text clip, a subtitle
-	// clip, or a static clip whose crop insets need swscale bilinear (its
-	// kernel differs from blit_box on sub-pixel crops). VYPER_KEYED_GPU=0
-	// pins the CPU composite for the A/B.
+	// reproduce byte-for-byte would be on the stack: a text clip or a subtitle
+	// clip. VYPER_KEYED_GPU=0 pins the CPU composite for the A/B.
+	//
+	// Static video clips no longer disqualify the GPU path: their buffer is the
+	// canvas-clipped window and the blit is a 1:1 copy of it (render_blit), so
+	// blit_box reproduces the same pixels.
 	gpu_frame_ok := keyed_gpu_enabled && len(render_job.texts) == 0 && len(render_job.subs) == 0
-	if gpu_frame_ok {
-		for &vv in render_job.videos {
-			if !vv.geom_keyed && vv.crop_ctx != nil {
-				gpu_frame_ok = false
-				break
-			}
-		}
-	}
 	if gpu_frame_ok && gpu_resample_get() == nil {
 		gpu_frame_ok = false
 	}
@@ -3675,6 +3656,11 @@ blend_row :: proc(dst, src: []u8, cols: int, opacity: f32) {
 	}
 }
 
+// render_blit copies a static clip's decoded window onto the canvas, clipped to
+// bounds. The window is the region the clip can draw -- the crop window clipped
+// to the canvas (render_static_src_geom) -- so it maps 1:1 onto the display
+// rect and this is one region copy with no sampling. gpu, when non-nil, draws
+// the same pixels into the GPU canvas.
 render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, slot: ^Render_Blit_Slot, gpu: ^GPU_Composite) {
 	top := max(v.oy, 0)
 	bottom := min(v.oy + v.rh, draw_h)
@@ -3683,22 +3669,13 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 	if bottom <= top || right <= left {
 		return
 	}
+	rows := bottom - top
+	cols := right - left
 	if gpu != nil {
-		rows := bottom - top
-		cols := right - left
-		srow, scol: int
-		if slot.crop_w > 0 && slot.crop_h > 0 {
-			// Decoder pre-scaled the visible region into the full box at
-			// fit_ox/oy; the clipped dst maps 1:1 back onto it.
-			srow, scol = int(slot.fit_oy), int(slot.fit_ox)
-		} else {
-			srow, scol = int(top - v.oy), int(left - v.ox)
-		}
 		if !gpu_composite_draw(
-
 			gpu,
 			raw_data(slot.blit), len(slot.blit), int(v.fw), int(v.fh),
-			scol, srow, int(cols), int(rows),
+			0, 0, int(cols), int(rows),
 			int(left), int(top), int(cols), int(rows),
 			v.opacity,
 		) {
@@ -3706,72 +3683,8 @@ render_blit :: proc(canvas: []u8, draw_w, draw_h: c.int, v: ^Render_Video_Src, s
 		}
 		return
 	}
-	if slot.crop_w > 0 && slot.crop_h > 0 {
-		// Render-path P3: the decoder already scaled only the visible region
-		// into the full box at fit_ox/oy (see Render_Video_Src setup), so this
-		// is a straight region copy — no sampling, matching the sws bilinear
-		// crop 1:1 on the region.
-		scol := slot.fit_ox
-		srow := slot.fit_oy
-		rows := bottom - top
-		cols := right - left
-		for row in 0 ..< rows {
-			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
-			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-			blend_row(dst, src, int(cols), v.opacity)
-		}
-		return
-	}
-	crop_any :=
-		v.geom_base[int(Render_Geom_Prop.Crop_L)] != 0 ||
-		v.geom_base[int(Render_Geom_Prop.Crop_R)] != 0 ||
-		v.geom_base[int(Render_Geom_Prop.Crop_T)] != 0 ||
-		v.geom_base[int(Render_Geom_Prop.Crop_B)] != 0
-	if !crop_any {
-		scol := left - v.ox
-		srow := top - v.oy
-		rows := bottom - top
-		cols := right - left
-		for row in 0 ..< rows {
-			src := slot.blit[uint(srow + row) * uint(v.fw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
-			dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
-			blend_row(dst, src, int(cols), v.opacity)
-		}
-		return
-	}
-	// Cropped (P4): crop insets select source sub-rect
-	// [crop_sx, crop_sy) -> [crop_sx+crop_sw, crop_sy+crop_sh) of the full-box
-	// blit, scaled to fill the display box. One SIMD bilinear sws.scale into
-	// the fixed scratch replaces the old per-pixel nearest-neighbor sampler;
-	// bilinear order is the intended quality upgrade. The dst is the canvas-
-	// clipped intersection copied out of the full display-box scratch.
-	if v.crop_ctx == nil {
-		// Degenerate crop: insets collapse the region (clip invisible).
-		return
-	}
-	src_ptr := cast([^]u8)(uintptr(raw_data(slot.blit)) +
-		uintptr((int(v.crop_sy) * int(v.fw) + int(v.crop_sx)) * 4))
-	dst_ptr := raw_data(v.crop_scratch)
-	sln: [1][^]u8 = {src_ptr}
-	ls:  [4]c.int = {c.int(v.fw) * 4, 0, 0, 0}
-	dln: [4]c.int = {c.int(v.rw) * 4, 0, 0, 0}
-	dsln: [1][^]u8 = {dst_ptr}
-	if ret := sws.scale(
-		v.crop_ctx,
-		cast([^][^]u8)&sln[0],
-		cast([^]c.int)&ls[0],
-		0, v.crop_sh,
-		cast([^][^]u8)&dsln[0],
-		cast([^]c.int)&dln[0],
-	); ret < 0 {
-		return
-	}
-	scol := left - v.ox
-	srow := top - v.oy
-	rows := bottom - top
-	cols := right - left
 	for row in 0 ..< rows {
-		src := v.crop_scratch[uint(srow + row) * uint(v.rw) * 4 + uint(scol) * 4:][:uint(cols) * 4]
+		src := slot.blit[uint(row) * uint(v.fw) * 4:][:uint(cols) * 4]
 		dst := canvas[uint(top + row) * uint(draw_w) * 4 + uint(left) * 4:][:uint(cols) * 4]
 		blend_row(dst, src, int(cols), v.opacity)
 	}
