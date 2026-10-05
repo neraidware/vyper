@@ -6004,63 +6004,45 @@ a truncated tail), and it **asserts** that two unity windows agree. That
 assertion is the point: previously the ratio's premise was invisible, and the
 only reason it held was the bug it was sitting next to.
 
-### S6b/S6c: drift — measured, and a new divergence it exposed
+### S6b/S6c/S6d: drift measured; the clip-head divergence narrowed to mix ORIGIN
 
-`audio_probe_drift_parity` runs BOTH mixers continuously over a long span and
-compares every sample, and asserts the position invariant as a number rather
-than trusting it: the samples handed to the device must equal
+`audio_probe_drift_parity` runs BOTH mixers continuously over a long span,
+compares every sample, and asserts the position invariant as a number rather than
+trusting it: the samples handed to the device must equal
 `audio_frame_boundary48(total_frames)`.
 
 **No drift, at any rate, over 600 s.** 28,800,000 samples mixed, 28,800,000
-required, delta 0 — identically at 60, at 30, and at **30000/1001** (29.97).
-That closes the S6b hole honestly: 29.97 is a frame of 1601 or 1024*1.5648
-samples alternating forever, so per-frame rounding would drift while never
-showing a single-frame error, and it does not.
+required, delta 0 — identically at 60, at 30, and at **30000/1001** (29.97). That
+closes the S6b hole honestly: a frame there is 1601 or 1602 samples alternating
+forever, so per-frame rounding drifts while never showing a single-frame error.
 
-The fixture is 997 Hz on purpose. It is coprime with 60, with 30000/1001 and with
-48000, so a rounded boundary shows as a phase error instead of cancelling over
-the window the way 440 or 1000 Hz would.
+The fixture is 997 Hz deliberately: coprime with 60, with 30000/1001 and with
+48000, so a rounded boundary shows as phase error instead of cancelling over the
+window the way 440 or 1000 Hz would.
 
-**But it is red, on a divergence the old fixture was hiding.** At frame 0 of a
-single long clip:
+**S6d, narrowed to where it can be finished.** At frame 0 of a single long clip
+the two sinks disagree, and it is NOT what the first reading suggested. Measured,
+in order:
 
-```
-play[0:4] = [0.0592, 0.0592, 0.0501, 0.0501]
-exp[0:4]  = [0,      0,      0,      0     ]
-```
+- Both fifo heads after mixing frame 0: `first48=800 have48=4096`, **identical**.
+- Both raw fifos, sample for sample: **identical**.
+  `[-0.05947876, -0.067596436, -0.07458496, -0.08029175, ...]` on both sides.
+- Mixed output at frame 0: `play[0]=0.0592` against `exp[0]=0.0099`.
 
-The export is **silent** for the head of a clip while playback is not. The short
-`mix_parity` fixture passed because its 440 Hz sine starts at a zero crossing, so
-both paths were ~0 there and matched by accident — the fixture masked the
-difference, not the code.
+So the two decoders produce the same samples at the same labelled positions, and
+the divergence is entirely in **how each mixer maps a timeline sample to a ring
+index and a gain envelope**. It is about **5 samples (0.1 ms)**, not the 18 an
+earlier correlation fit suggested — that fit was against an all-zero export and
+should not have been trusted, which is the second time in this work that a
+correlation over a silent signal read as a measurement.
 
-This is a clip-START question, not a position question: the export's
-`render_mix_block` opens a source with `muted`, and mutes the head into a
-declick ramp from the block's own start, while playback ramps from the clip's
-content 0. So the two disagree about *where a fade-in begins* — the same
-one-fact-two-copies shape as everything else here.
+That is the whole of S6d, and it is the SAME defect S3 removes: two copies of one
+mix loop cannot agree about where a block begins, and no amount of measuring two
+implementations gets them to. One implementation has one origin by construction.
 
-**Open, and deliberately not guessed.** Whether a clip head should be silent,
-ramped from content 0, or ramped from the block boundary is a decision about what
-a cut is SUPPOSED to sound like, and the answer changes what the fix is. It is not
-tucked in behind the drift fix.
-
-`audio_drift_parity` stays OUT of `all` while it is red, for the reason
-`audio_mix_parity` was: a failing member gets disabled, and a check nobody runs
-proves nothing. It is a named, runnable target.
-
-### Three measurement mistakes, each of which read as proof
-
-- Correlating with an offset past the end of the frame skipped every shift, so
-  "best shift 0" printed while nothing had been compared at all.
-- Driving the export one whole video frame at a time instead of its natural
-  512-sample blocks suggested the two mixers were misaligned. At 512 they were
-  identical.
-- Reading `Skip Samples` side data and assuming a zero-fill of the input frame
-  would drop the priming: `swres.convert` has already written by then, so it is a
-  no-op. Advancing the destination pointer instead desynchronises the
-  resampler's filter state. Neither was landed — a plausible unverified priming
-  fix is worse than a known-red gate.
+So S3 is not just debt cleanup here, it is the fix. `audio_drift_parity` stays
+OUT of `all` while it is red, for the reason `audio_mix_parity` was: a failing
+member gets disabled, and a check nobody runs proves nothing.
 
 ## Active 31 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
 

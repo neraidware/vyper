@@ -1527,6 +1527,32 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 			exp_have += i64(blk)
 		}
 		mixed_samples += i64(spf)
+		if f == 0 {
+			// Read the raw FIFOs, not the mixed output. The mix applies gain and a
+			// declick ramp; the fifo is what each sink actually decoded. Comparing
+			// mixes cannot tell "decoded different samples" from "applied different
+			// gain", and those have nothing in common as fixes.
+			//
+			// Read AFTER mixing frame 0, so the ring head is the next sample each
+			// side would serve -- the head the comparison above was served from.
+			fmt.printf(
+				"[ap] drift: frame 0 fifo heads: PLAY first48=%d have48=%d | EXP first48=%d have48=%d\n",
+				audio_src.slots[0].first48, audio_src.slots[0].have48,
+				export_audios[0].first48, export_audios[0].have48,
+			)
+			play_raw: [8]f32
+			for i in 0 ..< 8 {
+				l, rr := ring_at(&audio_src.slots[0].fifo, i)
+				play_raw[i] = l
+			}
+			exp_raw: [8]f32
+			for i in 0 ..< 8 {
+				l, rr := ring_at(&export_audios[0].fifo, i)
+				exp_raw[i] = l
+			}
+			fmt.printf("[ap] drift:   PLAY raw=%v\n", play_raw)
+			fmt.printf("[ap] drift:   EXP  raw=%v\n", exp_raw)
+		}
 		for i in 0 ..< spf * 2 {
 			d := math.abs(mix_play[i] - mix_exp[i])
 			if d > worst {
