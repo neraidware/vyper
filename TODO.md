@@ -6009,45 +6009,68 @@ a truncated tail), and it **asserts** that two unity windows agree. That
 assertion is the point: previously the ratio's premise was invisible, and the
 only reason it held was the bug it was sitting next to.
 
-### S3/S4c/S5/S6: the automatic declick is gone, and with it the last divergence
+### The clock: audio device is the clock (inverted)
 
-**The engine is now transparent.** No automatic audio effect is applied to a
-clip's content anywhere in playback or export. A cut is a cut: the mix at a clip
-boundary is the source's own samples, at full level.
+**What was there.** A wall clock on the UI thread advanced `playhead.frame`; the
+audio producer chased that guess; video presented from the playhead. A/V
+divergence was therefore possible, and it was MONITORED — the `[skew]` alarm,
+`AUDIO_DESYNC_ALERT_SEC`. `audio.odin` carried a comment saying so plainly:
+*"dev_pos is kept only as the telemetry/health signal."*
 
-This was not a tuning change. The declick was this engine's **second fade
-mechanism** — gain is already automated per sample through the clip's keyframe
-envelope, so an edge ramp was an implicit fade applied to every edit whether the
-user wanted one or not, and an authored fade could not be told from an automatic
-one. Two mechanisms for one job is exactly where two mechanisms disagree, and they
-did: the ramp was normalised against the *caller's chunk length*, playback chunks
-by frame (1602 samples at NTSC) and the export by 512-sample block, so the same
-edge ramped differently in each sink. That was the last divergence in S6.
+**Why it was detect-and-repair.** Two repair paths silently converted a
+starvation into a position shift: the wedge watchdog dropped the backlog when the
+queue capped, and the forward-skip re-anchored the producer to the extrapolated
+playhead. Those repairs are why the alarm existed, and they are what lets a drift
+bug survive: the symptom stops and the pressure to find its cause goes with it.
 
-It was also invisible as a policy question. The probe asserted "the boundary is
-faded", so the implicit fade had a test defending it, and the ramp it asserted
-looked like correctness rather than like a second opinion nobody had asked for.
-The probe now asserts the opposite and is named for it:
-`audio_probe_transparent_cuts`. It reports **0.08080 at the boundary against an
-interior peak of 0.12563** — which is the un-faded value the old probe recorded
-when the ramp was briefly deleted, so the two agree about what transparency is.
+**What it is now.**
 
-A step at a cut is a real discontinuity and can be heard. That is what an authored
-fade is for, and the envelope already expresses one. This is the same rule as
-geometry: the carrier does not move it, the keyframe does.
+- The producer fills to `dev_pos + cushion_frames`, i.e. **cushion samples ahead
+  of what the device has consumed**, instead of ahead of a wall-clock guess. Since
+  `dev_pos` is `fed − queued`, filling to `dev_pos + cushion` leaves the queue at
+  the cushion — a fixed point.
+- `playback_update` sets `playback.frame = playback.dev_frame`, a **readout**, not a
+  command. Video already reads the playhead, so video is now a pure function of
+  where the sound actually is.
+- `playback_playhead_at` is **deleted**, along with the meter's extrapolation.
+  There is no wall clock in the loop any more, so there is no second clock to
+  disagree and the skew meter is a diagnostic rather than a mechanism.
 
-**Removed:** `audio_declick`, `audio_declick_gain`, `audio_declick_env`,
-`audio_declick_env_in`, `audio_declick_env_out`, `audio_declick_fade_in`,
-`audio_declick_fade_out`, `AUDIO_DECLICK_SAMPLES`, `AUDIO_DECLICK_IN_SAMPLES`.
-Nothing outside the probes referenced them once both mixers stopped applying an
-envelope, so they are deleted rather than left as dead configuration.
+**Why drift is now structurally impossible rather than merely bounded.** Content
+fed is contiguous from one origin whatever happens upstream. A producer stall
+costs the listener a **gap**, never an offset: the device drains, `dev_pos`
+advances with it, the playhead follows, and when the producer resumes it feeds on
+from where it left off. Nothing re-anchors, so there is nothing to accumulate.
 
-**S6 closed.** Over 600 s at 60, 30 and 30000/1001, with the ramp gone:
+**Backward playback keeps the wall clock**, and that is a real asymmetry rather
+than an oversight: audio is muted going backward, so there is no device
+consumption to be a clock. Nothing can drift against a stream that does not exist.
 
-- sample accounting **exact** at every rate (`delta = 0`, asserted with no tolerance)
-- **zero** playback demand clamps at every rate
-- fifo heads identical at the point of comparison
-- the two sinks **bit-identical** at all three rates
+Also fixed here: `open_file_at` now routes a `.vyproj` to `project_file_open`
+before the media probe. It did not, so opening a project from argv was probed as
+media and failed with "Invalid data found" — a documented route (main.odin) that
+was never implemented.
 
-`audio_drift_parity` is a member of `all`.
+**Starvation is now measured** (`starve_ticks` / `starve_frames`, queue below a
+quarter of the cushion while playing, latched only after the transport is
+established so the startup fill is not counted). This is the invariant the design
+rests on: no starvation and no re-anchor means the fed-vs-heard offset is zero.
+
+**NOT YET VERIFIED AT RUNTIME.** One live attempt was made and **discarded as
+invalid**: it opened the GUI, advanced 12 s of audio in ~120 s of wall clock, and
+almost certainly had no real audio sink, so a zero skew there proves nothing. The
+full gate is green (37 targets, valgrind invariants held), but the gate does not
+exercise the device feed path — `audio_probe`'s sim is mixer-only and never
+touches the device ring, which is exactly why this was unverifiable until now.
+
+**The missing piece.** A headless probe that drives the REAL feed loop against a
+simulated device: a software ring behind `audio_device_push` /
+`audio_device_queued` / `audio_device_available` / `audio_device_clear`, drained at
+exactly 48 kHz of simulated time, asserting per tick that
+
+1. `dev_pos == fed − queued` equals the timeline position,
+2. `playhead.frame == frame_at_sample(dev_pos)`,
+3. `starve_ticks == 0` and the resync count stays `0` for the whole run,
+4. and, deliberately stalling the producer, that the listener gets a gap with **no
+   subsequent offset** — which is the actual claim.
 

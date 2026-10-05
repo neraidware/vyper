@@ -1689,34 +1689,41 @@ playback_read_snapshot :: proc() -> (frame: i64, ns: i64) {
 // calls this mid-tick, including across a UI stall, so the playhead it targets
 // is where playback really is rather than where the UI last managed to render.
 // Only forward extrapolation is meaningful -- audio is forward-only.
-playback_playhead_at :: proc(now_ns: sdl.Uint64, rate: f64) -> i64 {
-	frame, ns := playback_read_snapshot()
-	fps := timeline_fps()
-	elapsed := f64(i64(now_ns) - ns) / 1e9
-	if ns <= 0 || fps <= 0 || elapsed <= 0 {
-		return frame
-	}
-	return frame + i64(elapsed * fps * max(1.0, rate))
-}
-
 playback_update :: proc(now_ns: sdl.Uint64) {
 	if playback.last_tick_ns == 0 {
 		playback.last_tick_ns = now_ns
 	}
-	if playhead.playing {
-		// Playback is real-time: consume the true wall delta, never a clamped
-		// one. A clamp silently drops the unapplied remainder, which strands the
-		// playhead behind the wall clock permanently and desyncs it from the
-		// audio producer (which extrapolates this same clock). A long stall
-		// therefore jumps the playhead to where it should be, and audio_update's
-		// forward-skip resyncs the producer if it had fallen behind.
-		// DIAG (temporary): playback.magic_ms replaces the measured wall
-		// delta so the cadence is perfectly jitter-free (or any fixed rate).
+	if playhead.playing && playback.dir == 1 {
+		// FORWARD PLAYBACK: the audio device is the clock, and this is a READOUT of
+		// it -- not a command to it.
+		//
+		// It used to be the other way round: a wall-clock accumulator advanced the
+		// playhead, the producer chased that guess, and A/V divergence was possible
+		// and therefore MONITORED (the [skew] alarm). That is a detect-and-repair
+		// architecture; this is a cannot-drift one. The device position is
+		// `fed - queued` -- two exact integers in bus samples -- so there is no
+		// second clock to disagree, and video, which reads playhead.frame, is a pure
+		// function of where the sound actually is.
+		//
+		// Never adopted backwards: between a seek and the producer's next publish,
+		// dev_frame is stale and usually smaller, and taking it would visibly jump
+		// the playhead backwards. A seek sets the frame directly, so the stale window
+		// costs nothing.
+		dev := sync.atomic_load(&playback.dev_frame)
+		if dev > playhead.frame {
+			playhead.frame = dev
+		}
+		playback.accumulator = 0
+	} else if playhead.playing {
+		// BACKWARD PLAYBACK has to keep the wall clock, and that is a real asymmetry
+		// rather than an oversight: audio is MUTED going backward, so there is no
+		// device consumption to be a clock. Nothing can drift against a stream that
+		// does not exist, so a wall clock here cannot desync anything audible.
+		//
+		// DIAG (temporary): playback.magic_ms replaces the measured wall delta so the
+		// cadence is perfectly jitter-free (or any fixed rate).
 		dt_s :=
 			playback.magic_ms > 0 ? playback.magic_ms / 1000.0 : f64(now_ns - playback.last_tick_ns) / 1_000_000_000
-		// The playhead advances +dir frames at effective_playback_rate against
-		// the wall clock (rate * jog boost). Audio pacing at non-1x is the
-		// producer's stream frequency ratio; audio is muted going backward.
 		playback.accumulator += dt_s * max(0.0, effective_playback_rate())
 		playback_fps := timeline_fps()
 		catchup := i64(0)

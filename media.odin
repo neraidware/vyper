@@ -687,6 +687,17 @@ import_path_to_bin :: proc(path: cstring) -> u64 {
 // read -- the bin clones it (import_media_to_bin/import_srt_to_bin), so the
 // caller owns and may free its buffer as soon as this returns.
 open_file_at :: proc(path: cstring) -> (opened: bool) {
+	// A .vyproj is a PROJECT, not media. It has to be routed before the media probe,
+	// because the probe is the thing that rejects it: a project file is CBOR metadata,
+	// so avformat reports "Invalid data found" and the file silently fails to open.
+	// main.odin has documented this route since the command line grew it.
+	if project_path_is_project(string(path)) {
+		if err := project_file_open(string(path)); err != "" {
+			fmt.println("[open] project load failed:", err)
+			return false
+		}
+		return true
+	}
 	asset_id := import_path_to_bin(path)
 	if asset_id == 0 {
 		return false

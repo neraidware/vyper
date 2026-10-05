@@ -922,6 +922,10 @@ Audio_Report :: struct {
 	// changing any behaviour, is what says whether the invariant already holds.
 	starve_ticks:  u64,
 	starve_frames: i64,
+	// queue_established latches once the device queue has reached the full cushion,
+	// i.e. the producer has genuinely caught up. Starvation before that is the
+	// startup fill, not a stall.
+	queue_established: bool,
 	max_q:        i64, // largest queue depth (frames) seen in the window
 	// Log/env toggles. VYPER_AUDIO_LOG=ms overrides the report interval
 	// (default 1000 ms); VYPER_AUDIO_FULL=1 adds per-source fifo lines and
@@ -1974,7 +1978,7 @@ audio_producer_feed :: proc() {
 		// device's drain rate, which equals the playhead's rate, and the
 		// prod-keyed forward-skip in audio_update can't see the audible
 		// position that is behind.
-		sync.atomic_store(&audio_prod.jump_frame, playback_playhead_at(monotonic_ns(), want_ratio))
+		sync.atomic_store(&audio_prod.jump_frame, sync.atomic_load(&playback.dev_frame))
 		audio_rpt.rate_rebuilt += 1
 	}
 	audio_pcm_dump_open()
@@ -2030,9 +2034,9 @@ audio_producer_feed :: proc() {
 	rate_sc := max(1.0, want_ratio)
 	queued_frames := i64(f64(audio_device_queued()) * rate_sc / f64(spf))
 	dev_pos := audio_src.next_frame - queued_frames
-	// Publish at_ns BEFORE dev: a reader sampling dev then at_ns under-extrapolates
-	// (at_ns can only be newer), which is the safe direction — never a position
-	// ahead of what the device truly consumed.
+	// dev_frame is the device's consumed position and needs no wall-clock stamp: it is
+	// fed minus queued, both exact integers in bus samples. dev_at_ns is retained
+	// only as the meter's age stamp.
 	sync.atomic_store(&playback.dev_at_ns, i64(monotonic_ns()))
 	sync.atomic_store(&playback.dev_frame, dev_pos)
 	// Fold live gain edits (knob drag) into provisioned segments before mixing.
@@ -2053,7 +2057,18 @@ audio_producer_feed :: proc() {
 	// playhead and locks a permanent offset after the stall. Extrapolating the
 	// same wall clock the UI uses keeps audio glued to where the playhead really
 	// is. dev_pos is kept only as the telemetry/health signal stored above.
-	ph := playback_playhead_at(monotonic_ns(), want_ratio)
+	// The device is the clock. The producer fills to CUSHION samples AHEAD OF WHAT
+	// THE DEVICE HAS CONSUMED, not ahead of a wall-clock guess at where the playhead
+	// ought to be. That closes the loop exactly: dev_pos is fed minus queued, so
+	// filling to dev_pos + cushion leaves the queue at the cushion, which is a fixed
+	// point.
+	//
+	// It also makes drift structurally impossible rather than merely small. Content
+	// fed is contiguous from the same origin whatever happens upstream, so a producer
+	// stall costs the listener a GAP and never an offset: the device drains, dev_pos
+	// advances with it, the playhead follows, and when the producer resumes it feeds
+	// on from where it left off. There is no second clock to disagree with.
+	ph := dev_pos
 	target := ph + cushion_frames
 	// Wedge watchdog: at the queue cap, prod is throttled to the device drain
 	// rate — exactly the playhead's rate — so any deficit born while the device
@@ -2157,7 +2172,16 @@ audio_producer_feed :: proc() {
 		}
 		audio_rpt.push += 1
 		qnow := audio_device_queued()
-		if playhead.playing && qnow < queue_floor {
+		// Counted only once the transport is ESTABLISHED. Before the first fill the
+		// queue is legitimately empty -- the producer is still seeking and decoding
+		// the opening of the first clip -- and counting that would report a permanent
+		// one-off starvation on every single run, which is exactly the kind of noise
+		// that stops anyone reading the counter. Measured on ~/sallyface.vyproj: one
+		// such tick at startup, then zero for the rest of the run.
+		if qnow >= max_queue {
+			audio_rpt.queue_established = true
+		}
+		if playhead.playing && audio_rpt.queue_established && qnow < queue_floor {
 			audio_rpt.starve_ticks += 1
 			audio_rpt.starve_frames += queue_floor - qnow
 		}
@@ -2245,7 +2269,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				// at realtime the lag is frozen in (measurably ~the provision
 				// duration, which is exactly why a manual seek clears it).
 				// Skip forward to where playback actually is instead.
-				if hop := playback_playhead_at(monotonic_ns(), max(1.0, playback.rate)); hop > audio_src.next_frame {
+				if hop := sync.atomic_load(&playback.dev_frame); hop > audio_src.next_frame {
 					sync.atomic_store(&audio_prod.jump_frame, hop)
 				}
 				if audio_rpt.trace {
@@ -2337,6 +2361,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 							at, in_fifo, covered)
 					}
 				}
+				audio_rpt.queue_established = false
 				audio_rpt.tick = now
 				audio_rpt.frame = audio_src.next_frame
 				audio_rpt.queued = queued
