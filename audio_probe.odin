@@ -1468,6 +1468,23 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 		fmt.println("[ap] drift: SKIP: no export sources")
 		return true
 	}
+	// The export's sources have to be OPENED, exactly as the real export's setup
+	// does (render.odin:3627). A source that was never opened contributes nothing
+	// at all, which is indistinguishable from a source that opened and hit a hole
+	// -- and the first version of this probe forgot the open, and reported the
+	// export as silent at frame 0 as though the mixer were at fault.
+	opened := 0
+	for &a in export_audios {
+		if render_audio_open(&a, 0, fps) {
+			opened += 1
+		} else {
+			a.dec.opened = false
+		}
+	}
+	if opened == 0 {
+		fmt.println("[ap] drift: SKIP: export opened no sources")
+		return true
+	}
 	// render_mix_block walks render_job.audios, so point the job at the probe's
 	// array for the duration; the cloned paths go with it.
 	render_job.audios = export_audios[:]
