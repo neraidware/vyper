@@ -1848,6 +1848,9 @@ if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); ps
 		boundary_probe_run(bp)
 		return
 	}
+	if dr, _ := os.lookup_env_alloc("VYPER_DECODE_REPEAT_PROBE", context.temp_allocator); dr != "" {
+		decode_repeat_probe_run(dr)
+	}
 	if cp, _ := os.lookup_env_alloc("VYPER_CACHE_PROBE", context.temp_allocator); cp != "" {
 		cache_probe_run(cp)
 		return

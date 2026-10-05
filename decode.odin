@@ -123,6 +123,14 @@ Clip_Decoder :: struct {
 	last_frame:   i64,
 	// have_last reports whether last_frame is valid (decoder has produced at
 	// least one frame since the last reset/seek). Mirrors last_frame's rule.
+	// seek_count is diagnostic only, never read by the decode logic. It exists so
+	// a probe can assert that serving a request did NOT re-seek — which is
+	// otherwise unobservable, since a re-seek to the same frame lands on the same
+	// frame and leaves every visible field identical. Without it, "we no longer
+	// seek on every held frame" is a claim about performance with no way to test
+	// it, and the AV1 reference-frame failures it caused were invisible for the
+	// same reason.
+	seek_count:  i64,
 	have_last:    bool,
 	// PTS (stream time base) of the most recently produced frame; used by the
 	// frame-check probe to verify the seek path lands on the requested index.
@@ -728,6 +736,7 @@ seek_to_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 		return false
 	}
 	avcodec.flush_buffers(dec.dec_ctx)
+	dec.seek_count += 1
 	dec.decoded_ahead = 0
 	// A seek repositions the decoder; any EOF-tail frames parked by
 	// decode_one_forward belong to the OLD position and must not be served
@@ -886,6 +895,29 @@ decode_forward_to_target :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 	if !dec.opened {
 		return false
+	}
+	// The frame asked for IS the frame already decoded. This is the DOMINANT path
+	// under conform, not a rare one: any project faster than its source asks for
+	// the same source frame repeatedly (a 60fps timeline over 12fps content asks
+	// for frame 0 five times, then frame 1 five times).
+	//
+	// It has to be handled explicitly. Before conform a repeat was rare enough to
+	// fall through harmlessly; it fell through to the seek branch, because gap==0
+	// is neither last+1 nor in (1, max_gap], so every repeat paid a full
+	// seek + flush + decode-from-keyframe. On AV1 that destroys the reference
+	// frames the next unit needs, which is where
+	//
+	//	Missing reference frame needed for show_existing_frame
+	//	Failed to parse temporal unit
+	//
+	// came from: libdav1d asked for a reference the flush had thrown away. So the
+	// symptom was not slow playback, it was a decoder failing on every held frame.
+	//
+	// dec.frame already holds the right pixels and dec.last_frame already says
+	// which frame they are, so there is nothing to do but re-run the scale step —
+	// the caller reads dec.frame into its buffer either way.
+	if dec.have_last && frame_idx == dec.last_frame {
+		return scale_decoded_frame(dec)
 	}
 	// Consecutive forward request: just decode the next frame in place.
 	// SAFE ONLY because dec.last_frame mirrors the physical decoder position
