@@ -255,6 +255,12 @@ audio_probe_run :: proc(v: string) -> int {
 	}
 	fmt.println("[ap] live gain fold check ok")
 
+	declick_ok := audio_probe_declick_check(path)
+	if !declick_ok {
+		fmt.println("[ap] DECLICK FAIL")
+		return 1
+	}
+
 	slab_ok := audio_probe_geom_slab_handoff()
 	if !slab_ok {
 		fmt.println("[ap] GEOMETRY SLAB HANDOFF FAIL")
@@ -1063,6 +1069,207 @@ audio_probe_forward_jump :: proc(path: string, jump_frames: i64) -> bool {
 		return false
 	}
 	fmt.println("[ap] forward jump ok (seeked, did not decode the gap)")
+	return true
+}
+
+
+// audio_probe_declick_check asserts that a clip BOUNDARY is a ramp, not a step.
+//
+// A click is a step: a transition from one sample to the next that is as large
+// as the signal around it, which puts a discontinuity in the waveform and a
+// broadband transient in the spectrum. So the measurement is the max
+// inter-sample STEP across the boundary, compared against the local PEAK -- and
+// the property under test is the ratio, not an absolute number, so it holds at
+// any source level.
+//
+// This case existed because the export ramped its boundaries and playback did
+// not: the declick was written for render_mix_block and audio_mix_frame never
+// called it, so the same edit produced a fade in one sink and a click in the
+// other. Nothing measured it, because nothing compared the two.
+//
+// The fixture is deliberately LOUD and abruptly cut. A boundary between two
+// segments of one continuous decode is not an edge at all (the samples either
+// side are already continuous), so the case builds a real gap: one clip that
+// ENDS mid-file, so the final contribution must fade to nothing.
+audio_probe_declick_check :: proc(path: string) -> bool {
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] declick: SKIP: no project fps")
+		return true
+	}
+	// A clip of its own, LOUD and cut short, on a clean timeline. Reusing whatever
+	// the cases above left behind would make the boundary's position and the
+	// signal level incidental to which case ran last.
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+	// The IMPORTED timeline, not a fresh one: the cases after this one replace
+	// timeline.tracks wholesale, and a rebuild here fights the three-slot geometry
+	// handoff (a commit lands in one slot while a stale reader holds another, so
+	// the provision reads an empty one and the case reports "no audio on the
+	// timeline"). The imported source is a continuous 440 Hz sine -- loud, and with
+	// a real clip END to fade at, which is the edge under test.
+	// Provision exactly the way audio_probe_gain_check does: reset, then provision
+	// at frame 0, with NO commit of its own. The slab is already current from the
+	// case above, and re-committing lands the chips in a different slot than the
+	// provision then reads (three-slot handoff), which reads as an empty timeline
+	// and made this case skip silently on its first two attempts.
+	// No reset AFTER the provision: audio_reset_play clears every source slot, and
+	// the gain check above provisions without one for exactly that reason.
+	// Point every audio clip at the DC stream (stream 1). A click is a step, and a
+	// step's measured size at the boundary depends on the signal's PHASE there: a
+	// 440 Hz tone happens to sit near a zero crossing at the cut, so removing the
+	// declick outright still measured a step a third of the amplitude and this
+	// check passed. DC has no phase, so the step is the full amplitude every time.
+	for ti in 0 ..< len(timeline.tracks) {
+		for &c in timeline.tracks[ti].clips {
+			if c.kind == .Audio {
+				c.stream_index = 1
+			}
+		}
+	}
+	audio_geometry_commit()
+	audio_provision(0)
+	if audio_src.count == 0 {
+		fmt.println("[ap] declick: SKIP: nothing provisioned")
+		return true
+	}
+	// The boundary is the LAST segment END in the engine's own provisioned state,
+	// not a frame computed from the timeline: the measurement is then about the
+	// mix that actually plays, and it cannot be pointed at a segment the provision
+	// never opened.
+	//
+	// LAST, not first, and that was the first version's bug in one line. The
+	// fixture has several lanes of the same content, so an EARLIER segment end is
+	// covered by the segments after it: the mix stays continuous across it, the
+	// step never appears, and removing the declick entirely still passed. Only
+	// where every source ends together does the mix reach silence, and that is
+	// where the fade is the whole difference between a click and not one.
+	fps_v := timeline_fps()
+	end_frame := i64(-1)
+	for i in 0 ..< audio_src.count {
+		sl := &audio_src.slots[i]
+		for k in 0 ..< sl.seg_count {
+			seg := &sl.seg[k]
+			e := seg.start_a + seg.len_a
+			if e > end_frame {
+				end_frame = e
+			}
+		}
+	}
+	if end_frame <= 0 {
+		fmt.println("[ap] declick: SKIP: no provisioned segment end to fade at")
+		return true
+	}
+	// Land a few frames before the end so the fade's whole length is inside the
+	// window: AUDIO_DECLICK_SAMPLES is ~5ms, which at 30fps is a sixth of a frame,
+	// so the frames either side of the edge have to be captured.
+	spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(48000.0 / fps + 0.5)))
+	pre := max(2, int(AUDIO_DECLICK_SAMPLES) / spf + 2)
+	lo := end_frame - i64(pre)
+	if lo < 0 {
+		lo = 0
+	}
+	audio_src.next_frame = lo
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	// Collect the whole window as one contiguous signal, which is what a step is
+	// measured on: the max |x[i]-x[i-1]| across consecutive samples.
+	win: [dynamic]f32
+	defer delete(win)
+	// Append UNCONDITIONALLY. Appending only delivered frames skips the silent
+	// ones, which is precisely the transition under test: a mix that fades out
+	// stops being "delivered" at the fade's end, so the window ended at the last
+	// loud sample and the step DOWN was never captured -- which is why removing the
+	// declick entirely still passed this check.
+	for i in 0 ..< pre * 2 + 2 {
+		delivered := audio_mix_frame(mix[:], audio_src.next_frame, spf)
+		if !delivered && i > pre {
+			// Past the boundary and silent: the remainder is zeros by
+			// construction, and appending thousands of them would only make the
+			// window bigger without adding information.
+			break
+		}
+		for f in 0 ..< spf {
+			append(&win, mix[f * 2 + 0])
+		}
+		audio_src.next_frame += 1
+	}
+	if len(win) < 4 {
+		fmt.println("[ap] declick: SKIP: nothing decoded around the segment end (lo", lo, ")")
+		return true
+	}
+	// The property under test is that the boundary IS a ramp, not that the signal
+	// happens to be quiet there.
+	//
+	// "Largest inter-sample step" is the obvious instrument and the wrong one: a
+	// step's measured size depends on the signal's PHASE at the cut, and the
+	// source's own codec tail ramps too. With a 440 Hz tone the cut landed near a
+	// zero crossing, an unramped mix measured a third of the amplitude, and the
+	// check passed with the declick deleted outright. So assert the RAMP: the fade
+	// pulls the mix down across the samples before the boundary, which is
+	// phase-independent and is exactly what the declick is for.
+	boundary_idx := int(end_frame - lo) * spf
+	interior_lo := boundary_idx - 4 * AUDIO_DECLICK_SAMPLES
+	interior_hi := boundary_idx - 2 * AUDIO_DECLICK_SAMPLES
+	// The last AUDIO_DECLICK_SAMPLES before the cut: exactly the span both mixers
+	// fade across.
+	edge_lo := boundary_idx - AUDIO_DECLICK_SAMPLES
+	if interior_lo < 0 ||
+	   edge_lo < 0 ||
+	   interior_hi > len(win) ||
+	   boundary_idx > len(win) {
+		fmt.println("[ap] declick: SKIP: window too small to straddle the boundary")
+		return true
+	}
+	interior_peak := f32(0)
+	for i in interior_lo ..< interior_hi {
+		av := abs(win[i])
+		if av > interior_peak {
+			interior_peak = av
+		}
+	}
+	// The value AT the boundary, which is the whole assertion.
+	//
+	// Comparing the edge window's peak against the interior's does not work: the
+	// source's own amplitude ripples over ~512 samples, so which window happens to
+	// contain a peak is a coin flip, and an UNFADED cut measured 0.106 against an
+	// interior of 0.126 and passed with the ramp deleted outright. A raised-cosine
+	// fade reaches exactly zero at its end (audio_declick(1.0) == 0), and a cut
+	// does not, so the last sample before the boundary is where the two differ and
+	// it is where the answer does not depend on the signal's shape.
+	at_edge := abs(win[boundary_idx - 1])
+	// Kept because it is the symptom and it is free to report: a ramp spreads a
+	// transition, so no single sample-to-sample move reaches the peak.
+	step := f32(0)
+	for i in 1 ..< len(win) {
+		d := abs(win[i] - win[i - 1])
+		if d > step {
+			step = d
+		}
+	}
+	if interior_peak <= 0 {
+		fmt.println("[ap] declick: SKIP: interior is silent")
+		return true
+	}
+	// A tenth of the interior level. A fade lands at zero; a cut lands at full
+	// level, which is forty times this bar. Nothing in between is reachable by a
+	// ramp that is supposed to complete.
+	if at_edge > interior_peak * 0.1 {
+		fmt.printf(
+			"[ap] FAIL: declick -- the mix is not faded at the clip end: %.5f at the boundary against an interior peak of %.5f (largest step %.5f)\n",
+			at_edge, interior_peak, step,
+		)
+		return false
+	}
+	fmt.printf(
+		"[ap] declick ok (%.5f at the boundary against an interior peak of %.5f, largest step %.5f)\n",
+		at_edge, interior_peak, step,
+	)
 	return true
 }
 

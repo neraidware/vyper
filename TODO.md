@@ -5374,11 +5374,16 @@ future regression cannot hide behind green telemetry the way `1a38d78` did.
       real project and counts silence runs: **0 dropouts, 4 faithful runs**
       (was 133 mid-clip dropouts, 1961 ms). See the note below on what it took
       to make that number re-measurable at all.
-- [ ] S4. **A4** — declick ramps. Probe: assert no inter-sample step exceeds the
-      local peak across a clip boundary or a simulated hole.
-- [ ] S5. **A5** — edit generations. Probe: a burst of N edits produces O(1)
-      decoder reopens, not O(N) — the direct analogue of `e69afb5`.
-- [ ] S6. **A6** — AAC tail padding, render preroll, sample-domain counters.
+- [x] S4. **A4** — declick ramps. **The export had them and playback did not**;
+      see Active 29. Probe: `audio_probe`'s declick case, mutation-verified.
+- [x] S5. **A5** — edit generations. **Already satisfied**, and gated:
+      `resync` is a monotonic "something changed" flag rather than a queue, so a
+      producer poll consumes a whole burst at once. `audio_probe` measures it —
+      "8 edits in a burst -> 0 re-provisions", and a reconcile that moves no
+      content keeps 2 decoders and opens 0. Nothing to change.
+- [x] S6. **A6** — AAC tail padding, render preroll, sample-domain counters.
+      **Already satisfied**; the "one frame short" this section recorded was the
+      AUDIT's mistake, not the export's — see Active 29.
 
 ### Accept
 
@@ -5761,3 +5766,76 @@ one-frame remainder that the audit now reports on every run. A4 (declick) and A5
 **Mutation.** Lowering `SILENCE_PEAK_FLOOR` below the sources' dither tail flips
 the verdict and the gate exits 1, so the "0 dropouts" is a measurement and not a
 constant.
+
+## Active 29 — Declick existed in the export and not in playback; A5/A6 were already done
+
+**Why:** Active 28 closed the measurement gap on A3. That left the section's three
+open steps, and checking each against the tree rather than the checklist produced
+a different answer than the boxes did: ONE of the three was a real defect, and TWO
+were already shipped with a probe proving it. Recording that plainly because the
+useful output here is the distinction — "not started" and "done but unverified"
+look identical in a tracker and need very different work.
+
+**A4 (declick) was real, and it was half-done.** The export ramped every source's
+contribution edges (`render_mix_block`: `audio_declick` shaped fade in/out, plus a
+`muted` flag so a resume after a shortfall faded in rather than arriving at full
+level). Playback's mixer — `audio_mix_frame` — called none of it. So the same edit
+produced a ramped boundary in the export and a hard step to silence in playback,
+which is the "literally popping" symptom, and the two sinks disagreed about an
+audible event. This is one rule stated once and applied on one side: the same
+defect shape as the text blend in Active 26 and the export-order derivation in
+Active 26's S3.
+
+Fixed by moving the declick out of render.odin into audio.odin (renamed
+`audio_declick*`, because a `render_` prefix is a lie once both sinks call it) and
+giving `audio_mix_frame` the same ramp plus the `Play_Src.muted` resume state. Both
+mixers now derive the ramp from the SEGMENT's own bus-sample edges in the same
+units, and both take the earlier of the segment edge and a resume-after-hole so a
+frame that opens a clip and resumes a source gets ONE fade rather than two
+multiplied.
+
+**A5 (edit generations) was already done.** `audio_prod.resync` is a monotonic
+"something changed" flag, not a queue of pending edits, so one producer poll
+consumes a whole burst — the coalescing is structural rather than something to
+build. `audio_probe` measures exactly A5's criterion and passes: "8 edits in a
+burst -> 0 re-provisions", and a reconcile that moves no content "kept +2 opened
++0 new-slots +0 queue-clears +0". Left alone.
+
+**A6 (tail padding) was already done; the AUDIT was wrong.** Active 28 reported
+the export as "one frame short" of a 1787-frame range. It is not: `render_start`
+computes `nframes = end_frame - start_frame` and sets `render_job.end =
+end_frame - 1`, so `end_frame` is EXCLUSIVE and a range of 0..1786 is 1786 frames.
+1786 frames at 60 fps is exactly the 1428800 samples the export emitted. The
+`audio_silence_audit` frame count was fixed, and the audit now prints "length
+exact". Left alone. Worth recording because the alternative was chasing a
+tail-padding bug in a flush path that is already correct.
+
+**The declick probe took four attempts, and the wrong instrument twice.** It now
+asserts the mix is FADED at a clip end — the value at the boundary sample — and is
+mutation-verified (removing the ramp: `0.08080 at the boundary against an interior
+peak of 0.12563`; with it: `0.00000` and a largest step of `0.00063`, a 128x
+reduction). What did not work, in order, and why each is worth writing down:
+
+- **Appending only delivered frames.** A mix that fades out stops being "delivered"
+  at the fade's end, so the window ended at the last loud sample and the step DOWN
+  was never captured. Removing the declick entirely still passed.
+- **Boundary at the FIRST segment end.** The fixture has several lanes of the same
+  content, so an earlier end is covered by the segments after it: the mix stays
+  continuous across it and no step ever appears. Only where every source ends
+  together does the mix reach silence.
+- **Comparing the edge window's peak against the interior's.** The source's
+  amplitude ripples over ~512 samples, so which window holds a peak is a coin flip;
+  an unfaded cut measured 0.106 against an interior of 0.126 and passed.
+- **Largest inter-sample step vs peak.** A step's measured size depends on the
+  signal's PHASE at the cut. The fixture's 440 Hz tone put the cut near a zero
+  crossing.
+
+The instrument that works is phase-independent by construction: a raised-cosine
+fade reaches exactly zero at its end (`audio_declick(1.0) == 0`) and a cut does
+not, so the last sample before the boundary separates them with no reference to
+the signal's shape. The fixture also gained a CONSTANT second audio stream, since
+DC has no phase to hide behind.
+
+**Accept.** `check build probe audio_probe audio_rate keyed_export parity
+subtitle_probe render_kf_probe zorder` pass; `audio_export_audit` reports 0
+dropouts and exact length.

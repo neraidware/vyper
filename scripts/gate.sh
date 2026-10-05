@@ -486,9 +486,17 @@ target_audio_probe() {
 	mkdir -p target/audio_probe
 	local src=target/audio_probe/src.mp4
 	if [ ! -s "$src" ]; then
+		# Stream 0 is a 440 Hz tone; stream 1 is a CONSTANT signal, which the
+		# declick case needs: a click is a step, and a step's size at the boundary
+		# depends on the signal's phase there. A sine happens to sit near a zero
+		# crossing at the cut, so an unramped cut measured as a third of the
+		# amplitude and the check passed with the declick deleted outright. DC has
+		# no phase, so the step is the full amplitude every time.
 		if ! dev ffmpeg -y -f lavfi -i \
 			"testsrc2=size=640x360:rate=30:duration=10" \
 			-f lavfi -i "sine=frequency=440:sample_rate=48000:duration=10" \
+			-f lavfi -i "aevalsrc=0.5:s=48000:d=10" \
+			-map 0:v -map 1:a -map 2:a \
 			-c:v libx264 -pix_fmt yuv420p -crf 20 -c:a aac -shortest "$src" >/dev/null 2>&1
 		then
 			echo "audio-probe: could not synthesize the source clip" >&2

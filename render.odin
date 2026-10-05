@@ -1529,65 +1529,6 @@ Render_Audio_Src :: struct {
 // normal case rather than an edge case.
 AUDIO_MIX_BLOCK :: 512
 
-// AUDIO_DECLICK_SAMPLES is the fade length at a source's contribution edges, in
-// sample-frames (256 = 5.3ms at 48kHz). Long enough that the derivative of the
-// fade is small next to the signal it is fading, short enough to be inaudible as
-// a fade: a click is a step, and what removes it is spreading the step over
-// enough samples that no single step is large.
-AUDIO_DECLICK_SAMPLES :: 256
-
-// render_declick is the fade SHAPE: a raised cosine, so the gain AND its slope go
-// to zero at both ends. A linear ramp would leave a slope discontinuity at each
-// end, which is itself audible on a bright signal -- it converts a click into a
-// tick. Evaluated only inside the fade, at a source's edges, so the cost is
-// O(clip boundaries) and not O(audio samples): the steady interior of a block
-// never calls it.
-render_declick :: proc(t: f32) -> f32 {
-	return (1.0 - math.cos(math.PI * t)) * 0.5
-}
-
-// render_declick_fade_in is how many of a block's n sample-frames need the fade
-// at the front, given `from_edge`: the distance in samples from the block's first
-// sample to the contribution's start edge, 0 when the block opens on the edge.
-render_declick_fade_in :: proc(from_edge: Sample_Pos, n: int) -> int {
-	if from_edge >= Sample_Pos(AUDIO_DECLICK_SAMPLES) {
-		return 0
-	}
-	return clamp(int(Sample_Pos(AUDIO_DECLICK_SAMPLES) - from_edge), 0, n)
-}
-
-// render_declick_fade_out is render_declick_fade_in at the other end: how many
-// of a block's n sample-frames need the fade before its end, given `to_edge` --
-// the distance from the block's last sample to the contribution's end edge.
-render_declick_fade_out :: proc(to_edge: Sample_Pos, n: int) -> int {
-	return render_declick_fade_in(to_edge, n)
-}
-
-// render_declick_gain is sample `s` of a block's `n`: the automation gain, faded
-// in over the first fade_in samples and out over the last fade_out.
-//
-// Named rather than written inline because the shape appears TWICE when it is
-// inline -- once ascending, once descending, with mirrored expressions -- and two
-// copies of a ramp that must agree is the kind of thing that drifts.
-//
-// Each fade is normalised by its OWN length and stepped so the ramp's argument
-// runs 1/fade .. 1 INCLUSIVE, which puts the gain at exactly g on the last faded
-// sample. Two things depend on that. A block shorter than the fade still completes
-// it rather than leaving the contribution permanently attenuated, which is what
-// measuring against the fixed AUDIO_DECLICK_SAMPLES does; and the hand-off from
-// faded to unfaded carries no step of its own. (Normalising to fade/(fade+1)
-// instead reaches only 0.99996 -- inaudible, but it makes the ramp's endpoint a
-// lie in the comment, and a probe asserting the invariant caught exactly that.)
-render_declick_gain :: proc(g: f32, s, n, fade_in, fade_out: int) -> f32 {
-	if fade_in > 0 && s < fade_in {
-		return g * render_declick(f32(s+1) / f32(fade_in))
-	}
-	if fade_out > 0 && s >= n-fade_out {
-		return g * render_declick(f32(n-s) / f32(fade_out))
-	}
-	return g
-}
-
 // RENDER_MIX_CUSHION_FRAMES is how far ahead of the consumer the mix producer
 // runs, in video frames -- the render's answer to the question playback already
 // answers with AUDIO_CUSHION_SEC. The export had none: the composite thread mixed
@@ -1812,12 +1753,12 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 		if a.muted {
 			fade_from = blk_lo
 		}
-		fade_in := render_declick_fade_in(blk_lo - fade_from, int(want))
-		fade_out := render_declick_fade_out(clip_t1 - blk_hi, int(want))
+		fade_in := audio_declick_fade_in(blk_lo - fade_from, int(want))
+		fade_out := audio_declick_fade_out(clip_t1 - blk_hi, int(want))
 		for s in 0 ..< int(want) {
 			l, r := ring_at(&a.fifo, base + s)
 			off := int(blk_lo - at) * 2
-			f := render_declick_gain(g, s, int(want), fade_in, fade_out)
+			f := audio_declick_gain(g, s, int(want), fade_in, fade_out)
 			out[off + s * 2 + 0] += l * f
 			out[off + s * 2 + 1] += r * f
 		}

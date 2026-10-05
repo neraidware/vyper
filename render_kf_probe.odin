@@ -685,11 +685,11 @@ render_kf_probe_run :: proc() -> int {
 	// it here would need a source with a decoder and a ring of known content, and
 	// that is the synthetic fixture trap this probe already fell into once.
 	// The shape itself: 0 at the ends, 1 in the middle, rising throughout.
-	render_kf_probe_check(render_declick(0.0) == 0.0, "L: ramp at 0 is %g, want 0", render_declick(0.0))
-	render_kf_probe_check(render_declick(1.0) == 1.0, "L: ramp at 1 is %g, want 1", render_declick(1.0))
+	render_kf_probe_check(audio_declick(0.0) == 0.0, "L: ramp at 0 is %g, want 0", audio_declick(0.0))
+	render_kf_probe_check(audio_declick(1.0) == 1.0, "L: ramp at 1 is %g, want 1", audio_declick(1.0))
 	prev := f32(-1)
 	for i in 0 ..= 64 {
-		v := render_declick(f32(i) / 64.0)
+		v := audio_declick(f32(i) / 64.0)
 		if v < prev {
 			render_kf_probe_check(false, "L: ramp is not monotonic, dipped at t=%g", f32(i)/64.0)
 			break
@@ -701,58 +701,58 @@ render_kf_probe_run :: proc() -> int {
 	// gets the remainder, and one past it gets none. A block SHORTER than the fade
 	// is the case that matters most -- the ramp must fit, not be truncated.
 	render_kf_probe_check(
-		render_declick_fade_in(0, 1024) == AUDIO_DECLICK_SAMPLES,
+		audio_declick_fade_in(0, 1024) == AUDIO_DECLICK_SAMPLES,
 		"L: fade_in at the edge is %d, want the full %d",
-		render_declick_fade_in(0, 1024), AUDIO_DECLICK_SAMPLES,
+		audio_declick_fade_in(0, 1024), AUDIO_DECLICK_SAMPLES,
 	)
 	render_kf_probe_check(
-		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES/2), 1024) == AUDIO_DECLICK_SAMPLES/2,
+		audio_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES/2), 1024) == AUDIO_DECLICK_SAMPLES/2,
 		"L: fade_in halfway in is %d, want %d",
-		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES/2), 1024), AUDIO_DECLICK_SAMPLES/2,
+		audio_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES/2), 1024), AUDIO_DECLICK_SAMPLES/2,
 	)
 	render_kf_probe_check(
-		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES), 1024) == 0,
+		audio_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES), 1024) == 0,
 		"L: fade_in one fade past the edge is %d, want 0",
-		render_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES), 1024),
+		audio_declick_fade_in(Sample_Pos(AUDIO_DECLICK_SAMPLES), 1024),
 	)
 	render_kf_probe_check(
-		render_declick_fade_in(0, 16) == 16,
+		audio_declick_fade_in(0, 16) == 16,
 		"L: fade_in in a block shorter than the fade is %d, want the block's 16",
-		render_declick_fade_in(0, 16),
+		audio_declick_fade_in(0, 16),
 	)
 
 	// The property the whole change exists for: a whole block that is one
 	// contribution fades in at the front and out at the back, and is untouched in
 	// between.
 	n := 1024
-	fi, fo := render_declick_fade_in(0, n), render_declick_fade_out(0, n)
+	fi, fo := audio_declick_fade_in(0, n), audio_declick_fade_out(0, n)
 	render_kf_probe_check(
-		render_declick_gain(1.0, 0, n, fi, fo) < 0.01,
+		audio_declick_gain(1.0, 0, n, fi, fo) < 0.01,
 		"L: contribution starts at gain %g, want ~0",
-		render_declick_gain(1.0, 0, n, fi, fo),
+		audio_declick_gain(1.0, 0, n, fi, fo),
 	)
 	render_kf_probe_check(
-		render_declick_gain(1.0, n-1, n, fi, fo) < 0.01,
+		audio_declick_gain(1.0, n-1, n, fi, fo) < 0.01,
 		"L: contribution ends at gain %g, want ~0",
-		render_declick_gain(1.0, n-1, n, fi, fo),
+		audio_declick_gain(1.0, n-1, n, fi, fo),
 	)
 	render_kf_probe_check(
-		render_declick_gain(1.0, n/2, n, fi, fo) == 1.0,
+		audio_declick_gain(1.0, n/2, n, fi, fo) == 1.0,
 		"L: contribution is %g mid-block, want the automation gain exactly",
-		render_declick_gain(1.0, n/2, n, fi, fo),
+		audio_declick_gain(1.0, n/2, n, fi, fo),
 	)
 	// Reaches full gain exactly at the fade's last sample, so a fade cannot leave
 	// the signal attenuated for the rest of the block.
 	render_kf_probe_check(
-		render_declick_gain(1.0, fi-1, n, fi, fo) == 1.0,
+		audio_declick_gain(1.0, fi-1, n, fi, fo) == 1.0,
 		"L: gain at the last faded sample is %g, want exactly %g",
-		render_declick_gain(1.0, fi-1, n, fi, fo), 1.0,
+		audio_declick_gain(1.0, fi-1, n, fi, fo), 1.0,
 	)
 	// A fade at only one end must not touch the other.
 	render_kf_probe_check(
-		render_declick_gain(1.0, n-1, n, fi, 0) == 1.0,
+		audio_declick_gain(1.0, n-1, n, fi, 0) == 1.0,
 		"L: a front-only fade reached the block's end at %g, want %g",
-		render_declick_gain(1.0, n-1, n, fi, 0), 1.0,
+		audio_declick_gain(1.0, n-1, n, fi, 0), 1.0,
 	)
 	// Why raised cosine and not linear: both are monotonic with the same
 	// endpoints, so the checks above cannot tell them apart -- but a linear ramp
@@ -760,10 +760,10 @@ render_kf_probe_run :: proc() -> int {
 	// audible tick on a bright signal. So pin the slope: the step at the very
 	// first sample must be far smaller than the step in the middle. For a linear
 	// ramp these two are equal, which is the mutation this catches.
-	first_step := render_declick_gain(1.0, 1, n, fi, 0) - render_declick_gain(1.0, 0, n, fi, 0)
+	first_step := audio_declick_gain(1.0, 1, n, fi, 0) - audio_declick_gain(1.0, 0, n, fi, 0)
 	// The middle OF THE FADE, not of the block: past the fade every sample is
 	// unfaded and the step is zero, which passes any comparison against it.
-	mid_step := render_declick_gain(1.0, fi/2, n, fi, 0) - render_declick_gain(1.0, fi/2-1, n, fi, 0)
+	mid_step := audio_declick_gain(1.0, fi/2, n, fi, 0) - audio_declick_gain(1.0, fi/2-1, n, fi, 0)
 	render_kf_probe_check(
 		first_step < mid_step * 0.3,
 		"L: fade starts at full slope (first step %g vs middle %g) -- that is a linear ramp",
@@ -771,9 +771,9 @@ render_kf_probe_run :: proc() -> int {
 	)
 	// Automation gain scales the envelope rather than being replaced by it.
 	render_kf_probe_check(
-		render_declick_gain(0.25, n/2, n, fi, fo) == 0.25,
+		audio_declick_gain(0.25, n/2, n, fi, fo) == 0.25,
 		"L: envelope overrode the automation gain: %g, want 0.25",
-		render_declick_gain(0.25, n/2, n, fi, fo),
+		audio_declick_gain(0.25, n/2, n, fi, fo),
 	)
 
 	if render_kf_probe_fail {

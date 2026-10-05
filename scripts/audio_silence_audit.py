@@ -188,7 +188,13 @@ def main():
     # and every frame->source lookup lands slightly late.
     start_f = pf.get("start_frame", 0) or 0
     end_f = pf.get("end_frame", 0) or 0
-    frames = end_f - start_f + 1
+    # end_frame is EXCLUSIVE, not inclusive. render_start computes
+    # nframes = end_frame - start_frame and sets render_job.end = end_frame - 1,
+    # so a range of 0..1786 is 1786 frames. Reading it as inclusive made this
+    # script report the export as "one frame short" against a 1787-frame range and
+    # would have sent someone chasing a tail-padding defect that does not exist:
+    # 1786 frames at 60 fps is exactly the 1428800 samples the export emitted.
+    frames = end_f - start_f
     if grid_arg:
         grid_fps = float(grid_arg)
     elif container_duration > 0:
@@ -204,15 +210,18 @@ def main():
     )
     if abs(grid_fps - round(grid_fps)) > 0.01:
         print(f"[audio-audit] NOTE: grid rate is not a whole number ({grid_fps:.4f}); frame->source mapping is approximate")
-    # The tail-padding measure, reported whether or not anything else fails: a
-    # single-clip export must be exactly frames * samples-per-frame samples.
+    # The tail-padding measure, reported whether or not anything else fails: the
+    # export must be exactly frames * samples-per-frame samples, and neither short
+    # (audio ending before the picture) nor long (the file outlasting it).
     spf = 48000.0 / grid_fps
     want = int(round(frames * spf))
     if want != nsamples:
         print(
-            f"[audio-audit] NOTE: tail padding off by {nsamples - want:+d} samples "
+            f"[audio-audit] NOTE: length off by {nsamples - want:+d} samples "
             f"({(nsamples - want) / spf:+.3f} frames) against a {frames}-frame range"
         )
+    else:
+        print(f"[audio-audit] length exact: {nsamples} samples = {frames} frames")
 
     min_samples = int(DROPOUT_MS * 48)
     runs = silence_runs(samples, min_samples)
