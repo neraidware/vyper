@@ -894,12 +894,21 @@ active_interaction: Interaction
 // drag lifts the throttle so the final position decodes exactly once.
 SCRUB_DECIMATION :: 4
 // Playhead_Scrub_State is the ruler-scrub gesture's payload: whether the drag
-// actually moved the playhead. The scrub itself never touches the audio engine
-// (a seek there is a full re-provision -- see the release case in
-// interaction.odin), so this is what the release commits, and a press with no
-// motion commits nothing.
+// actually moved the playhead. The release always commits the final position.
+//
+// requested_resync is the audio_prod.resync generation of the last in-drag seek, and
+// it is what coalesces those seeks. NOT a timer: a seek bumps the generation, and the
+// producer only reconciles when it sees a generation it has not acted on, so issuing a
+// new seek while the previous one is still pending just piles up clears and starves
+// the feed. Coalescing on "the last request has been adopted" bounds that to exactly
+// one outstanding seek, which is the only policy that keeps the audio tracking the
+// pointer without the device going silent mid-drag. A timer cannot do this: measured,
+// a 40 ms interval left the playhead 26 frames ahead of the device at the end of a
+// fast drag, and seeking on every pointer move with nothing coalescing it froze the
+// device 142 frames behind for the whole gesture.
 Playhead_Scrub_State :: struct {
 	moved: bool,
+	requested_resync: i64,
 }
 playhead_scrub: Playhead_Scrub_State
 // DRAG_LANE_DWELL_FRAMES is how many consecutive frames the pointer must rest

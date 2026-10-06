@@ -231,37 +231,46 @@ click_cases := []Click_Case{
 	}, action = proc(_: Mouse_Input) { playhead_scrub_arm() } },
 }
 
-// playhead_scrub_arm begins a ruler scrub: claims the gesture, and STOPS
-// PLAYBACK.
+// playhead_scrub_arm begins a ruler scrub. It claims the gesture and nothing else:
+// playback continues, and the drag tells the audio engine where the playhead is.
 //
-// Holding the playhead stops the sound. The playhead is a forward-only transport
-// position -- the device has already consumed up to some frame, and that audio
-// cannot be un-heard -- so while the user drags, the sound is necessarily still
-// coming from the old position. The engine's only honest choices are to play the old
-// audio under a moving playhead, which is what it did, or to stop. Stopping is what
-// every NLE does, and it is the only one of the two where the picture and the sound
-// describe the same instant.
-//
-// It also makes the DRAG work, which is why this is a stop and not another guard on
-// the adoption of the device clock. While playing, the producer keeps feeding from
-// the old anchor and republishing that clock, so every frame of the drag was a frame
-// where something with authority to move the playhead disagreed with the pointer.
-// Suspending removes the disagreement instead of out-arguing it.
-//
-// The scrub leaves playback paused. Resuming automatically would re-assert the
-// position the user just navigated away from, and the release seek has already put
-// the engine where they want to start from.
+// No seek here. An arm-seek to the playhead's current frame was tried and it is
+// strictly worse than nothing: the first pointer move supersedes it one frame later,
+// so the producer begins a reconcile for a position the user has already left, and the
+// two seeks interleave. Measured: a press at frame 36 issued seeks to 74 then to 36 in
+// consecutive lines, and the producer was mid-reconcile for 74 when 36 arrived. The
+// drag's own seek carries the position, and the release commits the final one.
 playhead_scrub_arm :: proc() {
 	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = false
-	if playhead.playing {
-		playhead.playing = false
-		preview.playing = false
-		// Cleared rather than left set, so audio_update takes its stop edge this tick
-		// instead of believing the producer is already running the position the user
-		// just left.
-		audio_prod.was_playing = false
-	}
+	// Seeded with the CURRENT generation, not zero: a zero here would read as
+	// "a seek is outstanding" forever and the drag would never tell the producer
+	// anything.
+	playhead_scrub.requested_resync = sync.atomic_load(&audio_prod.resync)
+
+	// TEMPORARILY DISABLED, 2026-10-06 -- re-enable when the seek-landing work is done.
+	//
+	// Holding the playhead stops the sound. The playhead is a forward-only transport
+	// position -- the device has already consumed up to some frame, and that audio cannot
+	// be un-heard -- so while the user drags, the sound is necessarily still coming from
+	// the old position. Stopping makes picture and sound describe the same instant,
+	// which is what every NLE does, and it makes the drag work at all: while playing,
+	// the producer keeps feeding from the old anchor and republishing the device clock,
+	// so every frame of the drag was a frame where something with authority to move the
+	// playhead disagreed with the pointer.
+	//
+	// Off while that is verified, because a stop makes the drag unobservable -- with
+	// playback suspended the playhead has nothing to fight, so the symptom disappears
+	// and any remaining fault in the live path goes unseen.
+	//
+	// if playhead.playing {
+	// 	playhead.playing = false
+	// 	preview.playing = false
+	// 	// Cleared rather than left set, so audio_update takes its stop edge this tick
+	// 	// instead of believing the producer is already running the position the user
+	// 	// just left.
+	// 	audio_prod.was_playing = false
+	// }
 }
 
 // Apply a resolution preset without losing the current canvas orientation.
@@ -1761,13 +1770,45 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 				sync.atomic_load(&audio_prod.resync),
 			)
 		}
-		// No audio_seek here. A seek is not a playhead write, it is a full
-		// re-provision: the producer clears the device and reopens every
-		// decoder (tens to hundreds of ms). Asking for one on every frame of
-		// a drag queues re-provisions faster than the producer can retire
-		// them -- it never reaches the feed path, the device starves, and
-		// the audio stays dead long after the drag ends. The release
-		// commits the one position the drag landed on.
+		// SEEK DURING THE DRAG, coalesced to a minimum interval.
+		//
+		// This used to seek only on release, and the comment above it said why: at
+		// the time a seek was a full re-provision, so one per frame queued more work
+		// than the producer could retire. That is no longer true -- audio_seek now
+		// reconciles, keeping every decoder whose content position did not move -- but
+		// the cost of a seek was never the real reason to wait, and the effect was:
+		//
+		// While playing, the producer keeps feeding from the anchor it last served, so
+		// between the drag and the release the sound played from the OLD position while
+		// the playhead sat where the pointer was. On release the clock was current and
+		// ahead, and it adopted -- snapping the playhead forward to wherever the sound
+		// had actually got to. Measured on the user's run: playhead pinned at 57 while
+		// the device ran 63 -> 64 -> 65, then the release snapped it forward. That is
+		// the "drag back while playing does nothing" symptom, and no guard on clock
+		// adoption can fix it: the clock is RIGHT, the producer simply was never told
+		// the playhead moved.
+		//
+		// One outstanding seek at a time, coalesced on ADOPTION rather than on a timer.
+		//
+		// Every seek asks the device to drop its queue, and audio_producer_feed holds
+		// off feeding while a clear is pending -- so a request the producer has not
+		// adopted yet does not make the audio track the pointer any better, it just
+		// keeps the queue empty. Measured both ways:
+		//
+		//   40 ms timer: a fast drag outruns the audio. The playhead sat at 57 while
+		//   the device was at 49 and the producer still anchored at 43 -- the sound
+		//   lagged the pointer by however far you moved inside 40 ms.
+		//   every pointer move, uncoalesced: three moves in one tick requested three
+		//   clears, the producer reconciled once, and the device stayed frozen 142
+		//   frames behind for the whole gesture.
+		//
+		// Gating on `resync == requested_resync` means "the producer has caught up with
+		// my last request", which bounds it to exactly one outstanding seek and lets
+		// the drag keep making progress.
+		if frame != was && sync.atomic_load(&audio_prod.resync) == playhead_scrub.requested_resync {
+			audio_seek(frame)
+			playhead_scrub.requested_resync = sync.atomic_load(&audio_prod.resync)
+		}
 		sync.atomic_store(&audio_rpt.ph_src, 1)
 		sync.atomic_store(&audio_rpt.ph_catch, 0)
 		// The preview requests the exact new playhead frame on its next

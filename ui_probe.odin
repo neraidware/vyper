@@ -924,10 +924,10 @@ ui_probe_playhead_scrub_asserts :: proc() -> bool {
 	// reported defect. The clock is set up by hand because no producer runs in this
 	// probe, so dev_frame would otherwise hold whatever the last case left.
 	//
-	// The contract is now that ARMING STOPS PLAYBACK, so the drag happens paused and
-	// the clock is not consulted at all -- asserted rather than assumed, because a
-	// playhead that merely fails to move looks identical to one that moves and is
-	// immediately overruled.
+	// The contract is that arming does NOT stop playback. Stopping is the workaround
+	// that was removed: it makes the drag unobservable, since a suspended playhead has
+	// nothing to fight, so any fault left in the live path stays hidden. So playback
+	// keeps running through the drag, and the pointer has to win anyway.
 	playhead.playing = true
 	preview.playing = true
 	playback.dir = 1
@@ -936,25 +936,28 @@ ui_probe_playhead_scrub_asserts :: proc() -> bool {
 	sync.atomic_store(&playback.dev_resync, saved_resync)
 	sync.atomic_store(&playback.dev_frame, 400)
 	press_at(px_for_frame(ruler, 400), ry)
-	if playhead.playing {
-		fmt.eprintf("[ui-probe] holding the playhead did not stop playback\n")
+	if !playhead.playing {
+		fmt.eprintf("[ui-probe] arming a scrub stopped playback (the removed workaround)\n")
 		ok = false
 	}
 	drag_tick(px_for_frame(ruler, 120), ry)
 	if playhead.frame != 120 {
 		fmt.eprintf(
-			"[ui-probe] backward drag: playhead %d, want 120 (something still owns the playhead while paused)\n",
+			"[ui-probe] backward drag: playhead %d, want 120 (the device clock overruled the pointer mid-drag)\n",
 			playhead.frame,
 		)
 		ok = false
 	}
-	// Release commits the seek. Playback stays paused, and the clock -- still reading
-	// 400, larger than 120 -- must not drag the playhead forward on the next tick.
+	// Release commits the seek. Playback is still running, and the clock -- still
+	// reading 400, larger than 120 -- must not drag the playhead forward on the next
+	// tick. The release bumps audio_prod.resync, so dev_resync no longer matches and
+	// the reading is stale by construction; that, not a pause, is what holds the
+	// playhead.
 	release_at(px_for_frame(ruler, 120), ry)
 	playback_update(sdl.Uint64(monotonic_ns()))
 	if playhead.frame != 120 {
 		fmt.eprintf(
-			"[ui-probe] after release: playhead %d, want 120 (a device reading outranked the committed seek while paused)\n",
+			"[ui-probe] after release: playhead %d, want 120 (a stale device reading outranked the committed seek)\n",
 			playhead.frame,
 		)
 		ok = false

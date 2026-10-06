@@ -740,19 +740,22 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 		return false
 	}
 	playhead_scrub.moved = false
-	if playhead.playing {
-		fmt.println("[ap] backward scrub: FAIL: arming a scrub did not stop playback")
+	// Arming must NOT stop playback. Stopping is the workaround that was tried and
+	// removed: it makes the drag unobservable, because a suspended playhead has
+	// nothing to fight, so the live-path fault this probe exists to find goes unseen.
+	// So the contract is the opposite -- playback continues, and the drag tells the
+	// audio engine where the playhead is instead.
+	if !playhead.playing {
+		fmt.println("[ap] backward scrub: FAIL: arming a scrub stopped playback (the removed workaround)")
 		return false
 	}
-	// The stop takes effect on this tick's audio_update, so the producer is told
-	// before the drag starts writing.
 	audio_update()
 	playhead.frame = drag_to
 	playhead_scrub.moved = true
 	playback_update(sdl.Uint64(monotonic_ns()))
 	if playhead.frame != drag_to {
 		fmt.printf(
-			"[ap] backward scrub: FAIL: playhead jumped %d -> %d while paused (something still owns the playhead)\n",
+			"[ap] backward scrub: FAIL: playhead moved %d -> %d off the pointer while scrubbing\n",
 			drag_to, playhead.frame,
 		)
 		return false
@@ -2734,10 +2737,13 @@ audio_probe_seek_landing_offset :: proc(path: string) -> bool {
 	// play_trace is normally set in main(), which runs AFTER every VYPER_AUDIO_* probe
 	// is dispatched, so without this the per-frame decode trace is silently off here
 	// -- and that trace is the only way to see where a seek actually lands.
-	if os.get_env_alloc("VYPER_PLAY_TRACE", context.temp_allocator) == "1" {
-		play_trace = true
-		defer play_trace = false
-	}
+	// play_trace is normally set in main(), which runs AFTER every VYPER_AUDIO_* probe
+	// is dispatched, so the per-frame decode trace is silently off here without this.
+	// Deferred restore is deliberately NOT used: audio_probe_timeline_reset runs on
+	// return and a later probe in the same process must not inherit the flag.
+	saved_trace := play_trace
+	play_trace = os.get_env_alloc("VYPER_PLAY_TRACE", context.temp_allocator) == "1"
+	defer play_trace = saved_trace
 	fps := timeline_fps()
 	if fps <= 0 {
 		fmt.println("[ap] seek-landing: no fps")
@@ -2759,6 +2765,9 @@ audio_probe_seek_landing_offset :: proc(path: string) -> bool {
 	for target in ([]i64{CLICK_INTERVAL_FRAMES * 8, CLICK_INTERVAL_FRAMES * 16, CLICK_INTERVAL_FRAMES * 24}) {
 		// Reference: the export mixer, which is the known-correct path, rendered from
 		// the same timeline. Same geometry, same clip, same content.
+		// Render the reference from the SAME frame the playback path is mixed from.
+		// Rendering from 0 compares a pulse at frame 0 against one at frame `target`,
+		// which is not an offset measurement at all -- it is two different instants.
 		want := mix_clip_range(
 			cstring(&path_buf[0]),
 			CLICK_FRAMES,
@@ -2766,7 +2775,7 @@ audio_probe_seek_landing_offset :: proc(path: string) -> bool {
 			1.0,
 			fps,
 			0,
-			0,
+			target,
 		)
 		if len(want) == 0 {
 			delete(want)
@@ -2787,11 +2796,40 @@ audio_probe_seek_landing_offset :: proc(path: string) -> bool {
 		// Seek the LIVE slot. Play_Src is ~1.4 MB (MAX_PLAY_SEGMENTS segments plus a
 		// decoder), so a local copy is both a stack overflow and a different source
 		// from the one the mixer will read.
-		content_sec := f64(audio_content_sample_at_speed(target, 0, 1.0, 1.0)) / f64(AUDIO_BUS_RATE)
+		want48 := i64(audio_content_sample_at_speed(target, 0, 1.0, 1.0))
+		content_sec := f64(want48) / f64(AUDIO_BUS_RATE)
 		ok := audio_src_seek_anchor(&audio_src.slots[0], content_sec, audio_frame_boundary48(target, fps))
 		if !ok {
 			delete(want)
 			fmt.printf("[ap] seek-landing: FAIL: seek to frame %d failed\n", target)
+			return false
+		}
+		// The fifo must COVER the request once the seek returns, which is what
+		// audio_mix_frame reads: it mixes from start48 = max(demand48, first48), so an
+		// early label is only usable once have48 has reached the demand.
+		//
+		// The assertion used to be `first48 == want48` -- that the fifo is LABELLED at
+		// the request. Demanding the label discard the preroll instead, which is wrong:
+		// the preroll is what the tempo graph primes itself with, and the clip-alignment
+		// probe measured a 0.25x clip's opening click pushed 880 output samples late
+		// once it was gone. Coverage is the property the mixer actually depends on; the
+		// label is a decoder detail it tolerates either side of.
+		have := audio_src.slots[0].have48
+		landed := audio_src.slots[0].first48
+		if have < want48 {
+			fmt.printf(
+				"[ap] seek-landing: FAIL: after seek to frame %d the fifo covers content %d, want %d (short by %d)\n",
+				target, have, want48, want48 - have,
+			)
+			delete(want)
+			return false
+		}
+		if landed > want48 {
+			fmt.printf(
+				"[ap] seek-landing: FAIL: after seek to frame %d the fifo starts at content %d, past the request %d\n",
+				target, landed, want48,
+			)
+			delete(want)
 			return false
 		}
 		// Mix forward from the target and find the first transient in the OUTPUT. The

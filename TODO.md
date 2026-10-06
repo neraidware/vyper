@@ -6941,41 +6941,108 @@ the `[tr feed]` lines were off. The probe now reads the same env var.
 
 ### Active 37, fourth defect — the playhead could not be dragged while playing, because the sound was still coming from where it was
 
-**Fix: holding the playhead STOPS playback.** `playhead_scrub_arm` is the one place the
-ruler press claims the gesture, and it now pauses.
+**The rejected first fix, recorded because it is the wrong answer.** `playhead_scrub_arm`
+was first made to STOP playback, on the argument that a forward-only transport cannot
+show the old sound under a moving playhead, so every NLE stops. That is a workaround, and
+the user rejected it outright. It also destroys the evidence: with the playhead suspended
+there is nothing for the clock to disagree with, so the drag "works", the symptom
+disappears, and whatever is actually wrong in the live path stays hidden. The stop is
+still in the tree, commented out in `playhead_scrub_arm` and labelled TEMPORARY, and both
+probes now assert it is NOT taken. Every claim below is measured with playback RUNNING.
 
-The playhead is a forward-only transport position: the device has already consumed up to
-some frame, and that audio cannot be un-heard. So while the user drags, the sound is
-*necessarily* still coming from the old position. The engine's only honest choices were to
-play old audio under a moving playhead -- which is exactly what it did, and what the user
-reported -- or to stop. Stopping is what every NLE does, and it is the only one of the two
-where the picture and the sound describe the same instant.
+**What the live path actually got wrong.** Two things, and the second was invisible until
+the first was fixed.
 
-It is also why this is a STOP and not another guard on the adoption of the device clock.
-While playing, the producer keeps feeding from the old anchor and republishing that clock,
-so every frame of the drag was a frame where something with authority to move the playhead
-disagreed with the pointer. Four rounds of guards were spent on that disagreement. Suspending
-removes it instead of out-arguing it, and `playback_update`'s scrub guard is now redundant --
-`playhead.playing` is false for the whole drag, so that branch is never reached. It was
-deleted rather than left as dead weight.
+1. The drag never told the producer where the playhead was. `playhead_scrub_arm` claims
+   the gesture and nothing else; the seek was issued on release alone. So through the whole
+   drag the producer kept feeding from the old anchor and republishing that clock. Measured
+   from the user's own trace: playhead 36, device 62, producer 78 — the sound 26 frames from
+   where the picture said it was, and the picture could not move to it because the pointer
+   owns the playhead during a drag.
 
-The scrub leaves playback paused. Resuming automatically would re-assert the position the user
-just navigated away from, and the release seek has already put the engine where they want to
-start from.
+2. **The device queue was never actually emptied.** `audio_device_clear` cannot move the
+   read cursor — that belongs to the callback — so it raises `clear_req` and the callback
+   honours it one device period (~10 ms) later. The producer refilled during that window,
+   into the ring the callback was about to reset. Measured: reconcile reported `touched=true`
+   and requested the clear, and the queue was still `q=12320` afterwards, with `dev` frozen
+   at a stale 62. This is why the playhead appeared to SNAP FORWARD ON RELEASE even after the
+   first fix was in: the clock was not snapping, it was finally being allowed to describe
+   where the sound really was. `audio_producer_feed` now returns early while a clear is
+   pending, which also keeps `dev_frame` from publishing a position derived from
+   `audio_device_queued`'s zero-while-pending read.
+
+**In-drag seeks, and why the coalescing policy is not a timer.** The drag issues
+`audio_seek` per pointer move, but only when the previous request has been ADOPTED —
+`audio_prod.resync == playhead_scrub.requested_resync`. Not a time interval: a seek bumps
+the generation and the producer only acts on a generation it has not seen, so asking again
+while one is outstanding does not make the audio track the pointer any better, it just
+keeps the queue empty. Both alternatives were measured and both are worse:
+
+- 40 ms timer: the playhead ended a fast drag 26 frames ahead of the device.
+- every pointer move, uncoalesced: three moves in one tick requested three clears, the
+  producer reconciled once, and the device stayed frozen 142 frames behind for the gesture.
+
+`audio_seek` at arm time was tried and removed — it is superseded by the drag's own seek one
+frame later, so the producer began a reconcile for a position the user had already left.
+Measured: a press at frame 36 issued seeks to 74 then 36 in consecutive lines.
+
+**Measured outcome.** Across 18 scrub releases in a live run: the playhead moves 0 frames
+after release, and the producer resumes forward from exactly the released frame every time
+(75→94, 43→62, 148→167, 76→95). Zero is the number the user reported as broken.
+
+### Active 37, fifth defect — a seek landed late, and every state assertion said it was fine
+
+**Closed.** `audio_probe_seek_landing_offset` compares the FIRST CONTENT TRANSIENT of the
+playback producer path against the export mixer on the click fixture. It measures content,
+not state and not latency, because every state assertion in this family had already passed
+while the engine emitted the wrong samples.
+
+The fifo was labelled at the decoder's preroll LANDING rather than at the REQUEST, so
+`start48 = max(demand48, first48)` read it as a demand it could not satisfy. A seek to frame
+56 labelled the fifo at content 20800 against a demand of 44800: `next_frame` rewound, the
+queue dropped, the decoder re-anchored — all true, and the audio half a second out.
+
+**The fix, and the wrong version of it that the clip-alignment probe caught.** The obvious
+repair is to discard the preroll and append only from the request, labelling the fifo at
+`want`. That made seek landing exact and BROKE `audio_probe_clip_tempo_alignment`: a 0.25x
+clip's opening click moved 880 output samples late, because the WSOLA graph that clip reads
+through primes itself with the preroll and was being handed nothing to prime with. The
+preroll is headroom, and it is headroom for a reason.
+
+What was actually wrong is narrower: the fifo was labelled early AND left too SHORT. The
+label is fine — the mixer takes `max(demand48, first48)` and tolerates either side of the
+demand — but an early label is only usable once `have48` has reached the demand, and that
+was left to the per-frame pull, one frame per tick, while the mixer had budget. So the
+anchor now labels at the real landing, keeps the preroll, and pulls to `want +
+MAX_AUDIO_FRAME_SAMPLES` before returning: one seek leaves the fifo able to serve the frame
+that asked for it. The probe's assertion changed with it, from `first48 == want48` to
+`have48 >= want48 && first48 <= want48` — coverage is what the mixer depends on; the label
+is a decoder detail.
+
+Probe output, and it is a gate member now (`audio_seek_landing`, in `all`):
+
+```
+[ap] seek-landing: frame 56  -> playback 3200, reference 3200, offset +0 samples
+[ap] seek-landing: frame 112 -> playback  400, reference  400, offset +0 samples
+[ap] seek-landing: frame 168 -> playback 3600, reference 3600, offset +0 samples
+```
 
 **Both probes that were faking the gesture had to change,** which is the part worth recording.
-`audio_probe_edit_burst_provisions` and `ui_probe_playhead_scrub_asserts` each set
-`active_interaction = .Playhead_Scrub` by hand, bypassing the press that stops playback --
-so they were testing a state the app never enters, and both failed the moment the behaviour
-became real. They now call `playhead_scrub_arm()` (audio_probe) or the real press through
-clay (ui_probe) and assert that playback actually stopped, because a playhead that merely
-fails to move is indistinguishable from one that moves and is immediately overruled.
+`audio_probe_edit_burst_provisions` and `ui_probe_playhead_scrub_asserts` had been rewritten
+to assert that arming STOPS playback. Both now assert the opposite, and both were failing on
+the stale assertion while every other line in the run was green — `ui_probe` printed its
+success summary and still exited 1, because the summary is printed unconditionally and
+`ok` had already been set false. A probe whose pass message is not tied to its return value
+will hide exactly this.
 
-**Still open: seek landing.** `audio_probe_seek_landing_offset` measures it and it fails:
-a seek to frame 56 lands +3200 samples (0.067 s) late on the playback producer path, and the
-mechanism is isolated -- `decode_from_content` seeks `AUDIO_SEEK_PREROLL_SEC` early on purpose
-and `audio_src_seek_anchor` labels the fifo at the decoder's LANDING point rather than the
-REQUESTED sample, so `start48 = max(demand48, first48)` in the mixer shifts playback late.
-Five candidate fixes were tried and reverted; the one-shot signed trim gets frame 56 to +720
-but leaves frame 112 at +3920, and none of them is verified. The probe is committed so the
-defect is measured rather than described, and it is not in `all`.
+**Also fixed while tracing.** `audio_device_clear` on the simulated device moved only the
+read cursor up to `written`, leaving the ring permanently full — the next push tripped the
+overflow assert, so the sim device could not survive a seek at all, which is the one thing
+every backward-scrub test must do. Both cursors reset now. Found by running the probe with
+`VYPER_AUDIO_TRACE=1`, which every `VYPER_AUDIO_*` probe previously could not do: they are
+all dispatched before `audio_init`, so `audio_rpt.trace` was never set and the `[tr feed]`
+lines were off. The probe now reads the same env var.
+
+**Temporary.** The `[ui]` playhead/producer/feed trace lines and the `VYPER_PLAY_TRACE=1`
+switch are diagnostic scaffolding for this work and are still in the tree, commented as such
+in `main.odin`.

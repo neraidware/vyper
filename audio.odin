@@ -2192,14 +2192,38 @@ audio_src_seek_anchor :: proc(s: ^Play_Src, content_sec: f64, output_sample: i64
 	// One proc for the opening, shared with the export. This used to clamp the
 	// preroll seek to zero and then take whatever the decoder landed on, which
 	// silently dropped the first frame of the first clip.
-	n := decode_from_content(&s.dec, i64(content_sec * f64(s.dec.out_rate)))
+	want := i64(content_sec * f64(s.dec.out_rate))
+	n := decode_from_content(&s.dec, want)
 	if n <= 0 {
 		return false
 	}
+	// Label the fifo at the decoder's REAL landing PTS, not at the request, and keep
+	// the preroll in it. Both halves of that are load-bearing.
+	//
+	// Labelling at the request would be the obvious "fix" for a fifo read short of its
+	// demand, and it is wrong twice over: it moves content the tempo graph still needs,
+	// and it was measured. A first attempt discarded the preroll and appended only from
+	// the request; the clip-alignment probe then moved a 0.25x clip's opening click by
+	// 880 output samples, because the WSOLA graph that clip reads through had lost the
+	// input it primes itself with.
+	//
+	// Keeping the preroll is not what let the producer play half a second late. The
+	// fifo was left too SHORT: audio_mix_frame reads start48 = max(demand48, s.first48),
+	// so a fifo labelled early is only usable once have48 reaches the demand, and that
+	// was left to the per-frame pull to achieve -- one frame per tick, and only while
+	// the mixer had budget. Measured: a seek to frame 56 left the fifo labelled at
+	// content 20800 with a demand of 44800, so the mixer read it as a hole, zeroed the
+	// output, and every state assertion -- next_frame rewound, queue dropped, decoder
+	// re-anchored -- passed while the audio was half a second out.
+	//
+	// So the preroll stays AND the request is covered here, in the same call. One seek
+	// therefore leaves the fifo able to serve the frame that asked for it.
 	s.first48 = i64(decoder_pts_sample(s.dec.first_ts, s.dec.stream.time_base))
 	s.have48 = s.first48 + i64(n)
 	audio_src_dump_dec(s, n)
 	audio_src_append(s, n)
+	// One mixer frame past the request, which is the most any single frame can ask for.
+	audio_src_pull(s, want + i64(MAX_AUDIO_FRAME_SAMPLES))
 	return true
 }
 
@@ -2602,6 +2626,29 @@ audio_producer_feed :: proc() {
 	feed_t0 := monotonic_ns()
 	defer audio_rpt.feed_us += u64(monotonic_ns() - feed_t0)
 	if !audio_device_ready() {
+		return
+	}
+	// HOLD OFF UNTIL A PENDING CLEAR HAS LANDED.
+	//
+	// audio_device_clear cannot touch the ring itself -- the read cursor belongs to
+	// the callback -- so it raises a flag that the callback honours on its next pass,
+	// one device period (~10 ms) later. Refilling in that window is what makes a seek
+	// come out wrong: the producer fills the ring to a cushion, the callback then
+	// resets it, and the audio that was supposed to be discarded is either replaced by
+	// a mix made for the NEW position or played before the reset lands.
+	//
+	// Measured on a backward scrub to frame 36: the reconcile reported touched=true
+	// and asked for the clear, the producer refilled anyway (q=12320), the device
+	// reported dev=62 against a playhead of 36, and the playhead could not advance
+	// because the sound was 26 frames away from where the picture said it was. The
+	// playhead then appeared to snap forward on release -- the clock finally being
+	// allowed to describe where the sound really was.
+	//
+	// A feed pass during this window would still publish a position derived from an
+	// empty-queue read (audio_device_queued returns 0 while a clear is pending), so
+	// skipping the whole pass is also what keeps dev_frame from claiming an audible
+	// position that has not been heard.
+	if audio_device_clear_pending() {
 		return
 	}
 	fps := timeline_fps()

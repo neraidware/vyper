@@ -1769,7 +1769,15 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		dev_resync := sync.atomic_load(&playback.dev_resync)
 		resync_now := sync.atomic_load(&audio_prod.resync)
 		clock_current := dev_resync == resync_now
-		if clock_current && dev > playhead.frame {
+		// Restored 2026-10-06 with the scrub's stop (playhead_scrub_arm) disabled.
+		// While the scrub STOPS playback this branch is never reached -- the playhead is
+		// not moving and nothing is feeding -- so the guard read as dead weight and was
+		// deleted. With the stop off it is load-bearing again: the producer keeps feeding
+		// from the old anchor and republishing dev_frame, which is ahead of any backward
+		// drag, so without this the clock overrules the pointer every frame and the
+		// playhead cannot be dragged back at all. Delete this only together with the
+		// stop it depends on.
+		if clock_current && dev > playhead.frame && active_interaction != .Playhead_Scrub {
 			playhead.frame = dev
 		}
 		if play_trace {

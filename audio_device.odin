@@ -605,6 +605,15 @@ audio_device_clears :: proc() -> u64 {
 	return sync.atomic_load(&audio_dev.clears)
 }
 
+// audio_device_clear_pending reports whether a clear has been asked for and not yet
+// performed by the callback. The producer must not feed while this is true: it would
+// refill a ring the callback is about to reset, so the mix meant for the new position
+// gets discarded along with the old, or plays before the reset lands. See
+// audio_producer_feed.
+audio_device_clear_pending :: proc() -> bool {
+	return sync.atomic_load(&audio_dev.clear_req)
+}
+
 // audio_device_underruns counts callback periods the ring could not fill. A
 // steady climb means the producer is not keeping up with the device; a
 // non-zero one-off is a scheduling hiccup. Zero is the healthy state.
