@@ -470,6 +470,21 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			edit_begin(.Gain, cl.gain)
 			return true
 		}
+		// Speed and pitch, audio clips only. edit_begin takes the value in the
+		// field's DISPLAY unit, so speed is passed as a percent and the commit in
+		// edit.odin divides it back -- the two ends of that conversion live next
+		// to each other on purpose, and a second copy of "divide by 100 here"
+		// would be the kind of drift this already had once.
+		if cl.kind == .Audio {
+			if clay.PointerOver(clay.ID("PropFieldSpeed")) {
+				edit_begin(.Speed, f32(clip_speed(cl) * 100.0))
+				return true
+			}
+			if clay.PointerOver(clay.ID("PropFieldPitch")) {
+				edit_begin(.Pitch, clip_pitch_at_playhead(cl))
+				return true
+			}
+		}
 		return false
 	},
 	// Keyframe value field (Clip inspector keyframe readout): focuses for

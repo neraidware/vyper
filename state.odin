@@ -1163,6 +1163,16 @@ Edit_Field :: enum {
 	Crop_T,
 	Crop_B,
 	Gain,
+	// Speed and Pitch are the two halves of a clip's time/pitch behaviour and
+	// they are SEPARATE fields because they are separate properties: speed
+	// changes duration and corrects pitch, pitch changes pitch and preserves
+	// duration. One combined "rate" field would force a choice the model does
+	// not make.
+	//
+	// Speed edits as a percent (100% = 1.0x) and pitch in semitones, matching
+	// what the DSP actually receives.
+	Speed,
+	Pitch,
 	Opacity,  // clip opacity, edited as a percent
 	// Zoom and Pan: the content window's magnification (edited as a percent, so
 	// 100% is the crop window at natural size) and its per-axis offset (also a

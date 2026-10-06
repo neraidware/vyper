@@ -46,6 +46,10 @@ UI_Text_Buffers :: struct {
 	dur:         [128]u8,
 	io:          [128]u8,
 	gain:        [64]u8,
+	// speed and pitch are formatted into fixed buffers on the frame the inspector
+	// draws, not allocated per frame like the rest of the model asks for.
+	speed:       [64]u8,
+	pitch:       [64]u8,
 	opacity:     [64]u8,
 	x:           [64]u8,
 	y:           [64]u8,
@@ -1077,7 +1081,62 @@ clip_card :: proc() {
 				}
 				kf_add_button("KfAddGain")
 			}
+
+			// SPEED and PITCH, audio clips only. Two fields rather than one, and
+			// placed under Gain rather than beside it because they are the time
+			// properties: speed changes how long the clip is, pitch changes its
+			// frequency and not its length. Collapsing them into a single "rate"
+			// would force the user to pick which one they meant, and in this engine
+			// both can be set at once.
+			//
+			// Neither is keyframable yet, so there is no KfAdd button -- an autofill
+			// button that writes nothing is worse than no button. Both mirror the
+			// playhead-sampled value (clip_pitch_at_playhead / clip_speed) so the
+			// readout shows what playback uses, like the gain lane above.
+			if cl.kind == .Audio {
+				clay.Text(
+					"Speed",
+					clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+				)
+				sp := fmt.bprintf(ui_text.speed[:], "%.0f%%", clip_speed(cl) * 100.0)
+				if edit_state.field == .Speed {
+					sp = string(edit_state.chars[:edit_state.len])
+				}
+				ui_prop_value("PropFieldSpeed", sp, .Speed)
+
+				clay.Text(
+					"Pitch",
+					clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
+				)
+				pt := fmt.bprintf(ui_text.pitch[:], "%+.2f st", clip_pitch_at_playhead(cl))
+				if edit_state.field == .Pitch {
+					pt = string(edit_state.chars[:edit_state.len])
+				}
+				ui_prop_value("PropFieldPitch", pt, .Pitch)
+			}
 		}
+	}
+}
+
+// ui_prop_value draws an editable value box, the same shape as PropFieldGain so the
+// inspector's fields are visually identical whether they are knobs or numbers.
+ui_prop_value :: proc(id: string, text: string, field: Edit_Field) {
+	if clay.UI(clay.ID(id)) (
+	{
+		layout = {
+			sizing = {width = clay.SizingFixed(KNOB_VALUE_W), height = clay.SizingFixed(FIELD_H)},
+			childAlignment = {x = .Left, y = .Center},
+			padding = clay.PaddingAll(6),
+		},
+		backgroundColor = edit_state.field == field ? BUTTON_HOVER : BUTTON,
+		border = {
+			color = edit_state.field == field ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			width = clay.BorderOutside(edit_state.field == field ? 2 : 1),
+		},
+		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
+	},
+	) {
+		clay.Text(text, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
 	}
 }
 

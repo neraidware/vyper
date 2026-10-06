@@ -1977,19 +1977,6 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
-	// VYPER_AUDIO_CLIP_PITCH=<path>|<semitones> -- proves the pitch property SHIFTS
-	// frequency without changing duration, which is what separates it from tempo.
-	if cp, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_PITCH", context.temp_allocator); cp != "" {
-		parts := strings.split(cp, "|")
-		semi := f32(12.0)
-		if len(parts) >= 2 {
-			if v, ok := strconv.parse_f32(strings.trim_space(parts[1])); ok {
-				semi = v
-			}
-		}
-		ok: bool = audio_probe_clip_pitch(strings.trim_space(parts[0]), semi)
-		os.exit(ok ? 0 : 1)
-	}
 	// VYPER_AUDIO_BUS_PRIME=<rate> -- asserts the bus atempo is ALIGNED, i.e. that the
 	// first sample it emits is the first sample fed. The offset this catches was live
 	// in shipping code at any rate other than 1.0.

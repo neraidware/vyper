@@ -20,6 +20,13 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 		prec = 2
 	case .Gain:
 		prec = 1
+	case .Speed:
+		// Stored as a multiplier, shown and typed as a percent.
+		prec = 1
+		scaled = value * 100
+	case .Pitch:
+		// Semitones, already in the unit the user thinks in.
+		prec = 2
 	case .Crop_L, .Crop_R, .Crop_T, .Crop_B:
 		scaled = value * 100
 	case .Zoom, .Pan_X, .Pan_Y:
@@ -73,6 +80,10 @@ edit_field_over :: proc() -> bool {
 		return clay.PointerOver(clay.ID("PropCropB"))
 	case .Gain:
 		return clay.PointerOver(clay.ID("PropFieldGain"))
+	case .Speed:
+		return clay.PointerOver(clay.ID("PropFieldSpeed"))
+	case .Pitch:
+		return clay.PointerOver(clay.ID("PropFieldPitch"))
 	case .Opacity:
 		return clay.PointerOver(clay.ID("PropFieldOpacity"))
 	case .Zoom:
@@ -142,6 +153,12 @@ edit_commit :: proc() {
 	// keeps the direct write plus kf_auto_key.
 	geom := Render_Geom_Prop._COUNT
 	gain_field: ^f32
+	// speed_field and pitch_field are direct pointers to the clip's own fields,
+	// not geometry lanes: neither is keyframable today, so there is no playhead
+	// key to route through. They are still handed to the audio commit below,
+	// because changing either REPROVISIONS the graph.
+	speed_field: ^f64
+	pitch_field: ^f32
 	label := "Edit clip transform"
 	kind := Undo_Kind.Transform
 	name := ""
@@ -211,6 +228,29 @@ edit_commit :: proc() {
 		label = "Set clip gain"
 		kind = .Value
 		name = "gain"
+	case .Speed:
+		// Audio only: a video clip's length is its own length, and writing a
+		// speed onto one would store a property nothing reads.
+		if cl.kind != .Audio {
+			return
+		}
+		// Percent back to a multiplier, then bounded by what the graph can
+		// actually build. Bounding here rather than letting clip_speed assert is
+		// deliberate: an out-of-range value the user typed should CLAMP to the
+		// nearest reachable speed, not crash the program -- but it must still be
+		// a speed that exists, so the reachable range is the clamp.
+		val = clamp(val / 100, f32(CLIP_SPEED_MIN), f32(CLIP_SPEED_MAX))
+		label = "Set clip speed"
+		kind = .Value
+		speed_field = &cl.speed
+	case .Pitch:
+		if cl.kind != .Audio {
+			return
+		}
+		val = clamp(val, f32(CLIP_PITCH_MIN), f32(CLIP_PITCH_MAX))
+		label = "Set clip pitch"
+		kind = .Value
+		pitch_field = &cl.pitch
 	// Keyframe value edits are committed by the early return above, so this
 	// case is unreachable — but the switch must stay exhaustive over the enum.
 	case .Zoom:
@@ -249,13 +289,27 @@ edit_commit :: proc() {
 	// field. On a keyed property the two differ, and the field was seeded from
 	// the sampled value, so comparing the resting field made a no-op commit
 	// look like a change and wrote a key the user never asked for.
-	prev := f32(0)
-	if geom != ._COUNT {
-		prev = clip_geom_get(cl, geom)
-	} else {
-		prev = gain_field^
+	prev_val := f32(0)
+	prev_speed := 1.0
+	switch {
+	case geom != ._COUNT:
+		prev_val = clip_geom_get(cl, geom)
+	case speed_field != nil:
+		prev_speed = speed_field^
+	case pitch_field != nil:
+		prev_val = pitch_field^
+	case:
+		// Neither speed nor pitch is in play, so this is gain or a geometry lane.
+		prev_val = gain_field^
 	}
-	if prev == val {
+	// Compare in the field's OWN unit. Pitch and gain are f32 and speed is f64;
+	// folding all three through one f32 would round a 0.5x speed to a value that
+	// is not the one the user typed, so the commit would fire on a no-op.
+	if speed_field != nil {
+		if prev_speed == f64(val) {
+			return
+		}
+	} else if prev_val == val {
 		return
 	}
 	// Only gain edits touch audio; mirror them into the slab and let the
@@ -275,12 +329,18 @@ edit_commit :: proc() {
 		// sampler ignores. Same undo node as the resting write — the whole
 		// field edit is one step.
 		clip_geom_set(cl, geom, val)
+	} else if speed_field != nil {
+		speed_field^ = f64(val)
+	} else if pitch_field != nil {
+		pitch_field^ = val
 	} else {
 		gain_field^ = val
 		kf_auto_key(cl, name, val)
 	}
 	undo_push(kind, label)
-	if audio_changed {
+	if audio_changed || speed_field != nil || pitch_field != nil {
+		// Speed and pitch change the clip's LENGTH or its graph, so the allocation
+		// and every source's speed/pitch snapshot are stale. Same commit gain uses.
 		audio_geometry_commit()
 	}
 }
