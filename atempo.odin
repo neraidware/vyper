@@ -487,23 +487,42 @@ atempo_prime :: proc(g: ^Atempo_Graph) {
 		return
 	}
 	g.primed = true
-	in_frames := atempo_lookahead_samples(g.rate)
-	discard := int(f64(in_frames) / g.rate)
-	if in_frames <= 0 {
-		return
-	}
+	// A FIXED, generous prime rather than a computed one. It has to exceed any
+	// plausible lookahead, and ATEMPO_LOOKAHEAD_MAX_SAMPLES is the bound on that, so
+	// 2x the bound with room to spare. Sizing it from the measured table instead is
+	// what made this worse rather than better: the table cannot be trusted (see
+	// below), so a table-sized prime sometimes primed too little and sometimes
+	// discarded real content.
+	in_frames := ATEMPO_LOOKAHEAD_MAX_SAMPLES * 2
 	// Bounded chunk so a large lookahead does not want a large stack buffer.
 	CHUNK :: 2048
 	silence: [CHUNK * 2]f32
 	done := 0
+	// Measure the graph's ACTUAL latency rather than predicting it: however many
+	// output samples come out during the priming pass ARE the samples that belong to
+	// the warm-up, so that count is the discard.
+	//
+	// This replaces a LOOKUP TABLE, and the table is gone because it could not be
+	// trusted. atempo_lookahead_samples interpolated between four measured points and
+	// left intermediate rates off by up to 12 ms; when the measurement was made to
+	// prove convergence -- double the input and require the same answer -- almost every
+	// rate came back UNCONVERGED, swinging by hundreds of samples. So the accounting
+	// that produced the table was never authoritative, and this session's claim that it
+	// was was wrong.
+	//
+	// Self-calibration needs no model, no table and no assumption about how WSOLA's
+	// window scales with tempo. It is also correct by construction for any chain of
+	// any length, because it measures this graph rather than a model of it.
+	emitted := 0
 	for done < in_frames {
 		n := min(CHUNK, in_frames - done)
 		atempo_process(g, silence[:], n)
+		emitted += g.out_n
 		done += n
 	}
-	// Now throw away the output that corresponds to the priming region, so the first
-	// REAL sample emitted is content 0. atempo_process does this itself.
-	g.discard_next = discard
+	// Throw away the output that corresponds to the priming region, so the first REAL
+	// sample emitted is content 0. atempo_process applies it.
+	g.discard_next = emitted
 }
 
 // atempo_reset clears the graph's internal window so stale buffered samples

@@ -1524,8 +1524,19 @@ audio_probe_node_latency :: proc() -> bool {
 	// the tail is not mistaken for latency, and the reciprocal-rate relationship
 	// between atempo_rate_set's argument and the filter's actual factor pinned first
 	// -- because that relationship is itself load-bearing for the transport.
-	RATES := []f64{0.5, 0.75, 1.25, 2.0}
-	for rate in RATES {
+	// A DENSE sweep, because atempo_lookahead_samples must be EXACT at every tempo the
+	// transport can ask for -- it sizes the priming discard, and an approximate discard
+	// is exactly the 12 ms residual this measurement was built to remove.
+	//
+	// The probe already learned this the hard way: four points with interpolation
+	// between them left intermediate rates off by up to 12 ms, because WSOLA's window
+	// does not vary linearly with tempo. Sweeping finely and carrying the measured
+	// table replaces a model with data.
+	SWEEP :: []f64{
+		0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5, 1.625,
+		1.75, 1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0,
+	}
+	for rate in SWEEP {
 		in_frames, out_frames, delay_out := measure_atempo_delay(rate)
 		// Expected output is pushed/RATE, not pushed*rate: atempo's tempo= parameter
 		// is an output-length multiplier while the transport's rate is
@@ -1537,6 +1548,19 @@ audio_probe_node_latency :: proc() -> bool {
 		// 0.5 / 0.75 / 1.25 / 2.0 -- that is 1/rate to within a percent, which is
 		// exactly what the design intends.
 		delay_in := int((f64(in_frames)/rate - f64(out_frames)) * rate + 0.5)
+		// CONVERGENCE. Doubling the input must not change the answer. If it does, the
+		// graph has not drained and the number is really the push size, so it is
+		// reported as unconverged rather than entered in the table.
+		_, _, delay_long := measure_atempo_delay(rate, 384000)
+		converged := abs(delay_long - delay_in) <= 8
+		if converged {
+			fmt.printf("[ap] latency: TABLE %.6f, %d,\n", rate, delay_in)
+		} else {
+			fmt.printf(
+				"[ap] latency: UNCONVERGED at %.2f -- %d then %d as input doubles; not entered in the table\n",
+				rate, delay_in, delay_long,
+			)
+		}
 		fmt.printf(
 			"[ap] latency: atempo rate %.2f -> in=%d out=%d expected=%.0f effective=%.3f (1/rate=%.3f) lookahead=%d IN samples (%.2f ms)\n",
 			rate, in_frames, out_frames,
@@ -1640,25 +1664,30 @@ measure_swr_delay :: proc(out_rate: c.int) -> i64 {
 // rate is a number.
 //
 // Returns (input frames pushed, output frames produced, delay in INPUT samples).
-measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_in: int) {
+measure_atempo_delay :: proc(rate: f64, push_frames: int = 192000) -> (in_frames, out_frames, delay_in: int) {
 	g: Atempo_Graph
 	atempo_rate_set(&g, rate)
 	if g.graph == nil {
 		return -1, -1, -1
 	}
 
-	// Large enough that the lookahead is a small fraction of what was pushed, so
-	// "everything except the lookahead has drained" is a safe assumption rather than
-	// a hope: 4 seconds of bus against a ~3072-sample (64 ms) lookahead.
+	// The output buffer must hold pushed/tempo frames, and the slowest tempo is 0.25,
+	// so 8x the push is the smallest safe multiple. Sizing it to 4x SILENTLY truncated
+	// every rate below 1.0 -- the shortfall then looked like a larger lookahead, which
+	// is how a sweep produced the nonsense of 0.875 reporting 2282 while 0.75 reported
+	// 1722. An instrument whose buffer is too small does not fail; it lies.
 	PUSH_FRAMES :: 192000
 	CHUNK :: 256
 	sig: [CHUNK * 2]f32
-	total_out: [PUSH_FRAMES * 4]f32
+	// HEAP, not the stack: 192000*8 frames of interleaved f32 is 6 MB, which Odin
+	// warns about and which would be a real overflow under any deeper call chain. The
+	// measurement is a probe, so paying an allocation for it is free.
+	total_out: []f32 = make([]f32, PUSH_FRAMES * 16)
 	got_floats := 0
 	pushed := 0
 	seed: u32 = 0x9E3779B9
-	for pushed < PUSH_FRAMES {
-		n := min(CHUNK, PUSH_FRAMES - pushed)
+	for pushed < push_frames {
+		n := min(CHUNK, push_frames - pushed)
 		// Broadband and deterministic, so the graph does real work rather than
 		// degenerating on silence.
 		for i in 0 ..< n * 2 {
@@ -1681,6 +1710,7 @@ measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_in: int
 		return pushed, got, -1
 	}
 	delay_out := f64(pushed) / rate - f64(got)
+	_ = PUSH_FRAMES
 	return pushed, got, int(delay_out * rate + 0.5)
 }
 
@@ -2043,7 +2073,8 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 	// known position (0) and any displacement of it is the graph's latency.
 	click := int(click_samples(CLICK_MS))
 	sig: [4096 * 2]f32
-	out: [AUDIO_BUS_RATE * 4 * 2]f32
+	// Heap: 1.5 MB on the stack is the same overflow risk as the one above.
+	out: []f32 = make([]f32, AUDIO_BUS_RATE * 8 * 2)
 	got := 0
 	primed := false
 	seed: u32 = 0x1234567
@@ -2088,7 +2119,7 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 		return true
 	}
 
-	first_in := first_onset(out[:got], 8)
+	first_in := first_onset(out[:got], 4)
 	fmt.printf("[ap] bus-prime: rate %.2f, first transient at output sample %d (want 0)\n", rate, first_in)
 	if first_in != 0 {
 		fmt.printf(
@@ -2107,25 +2138,31 @@ click_samples :: proc(click_ms: int) -> i64 {
 	return i64(AUDIO_BUS_RATE) * i64(click_ms) / 1000
 }
 
-// first_onset returns the index of the first sample exceeding half the window's peak,
-// or -1. The refractory is short because a click is a single sample here, unlike the
-// tempo probe's 2 ms pulses.
-first_onset :: proc(buf: []f32, refractory: int) -> int {
+// first_onset returns the index of the first FRAME exceeding half the window's peak,
+// or -1.
+//
+// In FRAMES, not interleaved samples. Scanning the flat interleaved array treats L and
+// R as consecutive time samples, which halves every reported position and made the
+// offset look constant across rates -- atempo's latency scales with tempo, so a
+// constant reading was the clue that the probe, not the graph, was wrong. This is the
+// same interleaved/frames confusion that hit the drift probe earlier.
+first_onset :: proc(buf: []f32, refractory_frames: int) -> int {
+	frames := len(buf) / 2
 	peak := f32(0)
-	for v in buf {
-		peak = max(peak, abs(v))
+	for i in 0 ..< frames {
+		peak = max(peak, abs(buf[i * 2]))
 	}
 	if peak <= 1e-5 {
 		return -1
 	}
 	thresh := peak * 0.5
 	since := 0
-	for i in 0 ..< len(buf) {
-		if since < refractory {
+	for i in 0 ..< frames {
+		if since < refractory_frames {
 			since += 1
 			continue
 		}
-		if abs(buf[i]) > thresh {
+		if abs(buf[i * 2]) > thresh {
 			return i
 		}
 	}

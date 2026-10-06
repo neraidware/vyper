@@ -1567,7 +1567,8 @@ target_audio_bus_prime() {
 		echo "audio-bus-prime: FAILED -- worst offset $worst samples exceeds the graph's own lookahead" >&2
 		return 1
 	fi
-	echo "audio-bus-prime: worst offset $worst samples ($(awk "BEGIN{printf \"%.2f\", $worst/48.0}") ms) -- priming is approximate, not exact"
+	echo "audio-bus-prime: worst offset $worst frames ($(awk "BEGIN{printf \"%.2f\", $worst/48.0}") ms)"
+	echo "audio-bus-prime: NOT exact. The discard is self-calibrated (the graph measures its own latency during priming) but a residual remains, so the bus atempo is better aligned than it was and not yet aligned."
 }
 
 target_all() {
