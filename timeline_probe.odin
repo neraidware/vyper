@@ -1998,6 +1998,57 @@ timeline_probe_run :: proc(_: string) {
 	fmt.println("[tl-probe] trim-source-length ok")
 	tl_scene()
 	test_audio_head_trim()
+
+	// The TAIL cap on an audio clip, measured in the AUDIO clip's frame space.
+	// This is ~/baby.vyproj's opus after the tail cap was converted: the conversion
+	// used Clip.src_fps, the VIDEO rate, while the clip's frame numbers are counted
+	// against audio_src_rate. Those differ whenever a clip was imported at a
+	// different rate than the project — here 11.97 against 60 — so the cap ran 1:1
+	// where it had to run 5:1 and the tail clipped at 38 timeline frames instead of
+	// the 221 its 44 source frames occupy.
+	{
+		free_timeline(&timeline)
+		clear(&media_bin.assets)
+		append(
+			&media_bin.assets,
+			Media_Asset {
+				id = 9401, kind = .Audio, frame_count = 1, dur_us = 6600000,
+				audio_rate = 0, audio_frames = 79,
+			},
+		)
+		append(&timeline.tracks, Track{})
+		tl := &timeline.tracks[0]
+		append(
+			&tl.clips,
+			Clip {
+				clip_id = 13, kind = .Audio, asset_id = 9401,
+				timeline_start_frame = 0, source_length_frames = 44, source_start_frame = 35,
+			},
+		)
+		saved_rate := project.frame_rate
+		defer project.frame_rate = saved_rate
+		project.frame_rate = 60.0
+		pf_pin_audio_src_rates()
+		c := &tl.clips[0]
+		// 44 source frames remain after the head (79 - 35), at the audio rate.
+		want := clip_src_len_to_timeline_frames(c, 44)
+		applied := resize_clip_right(tl, 0, i64(1) << 40)
+		tl_probe_check(
+			applied == want && applied == 221,
+			"an audio clip's tail cap must convert in its OWN frame space — applied %d timeline frames, want %d (44 source frames at 11.97 over a 60fps project)",
+			applied, want,
+		)
+		// And it must exceed the source's frame count, which is the whole point: a
+		// 1:1 conversion would cap at 44 and quietly shorten the clip fivefold.
+		tl_probe_check(
+			applied > 44,
+			"the cap must not be the bare source frame count — got %d, which is the 1:1 conversion",
+			applied,
+		)
+		project.frame_rate = saved_rate
+	}
+	tl_scene()
+	test_pin_src_fps_kind_mismatch()
 	fmt.println("[tl-probe] audio-head-trim ok")
 	tl_scene()
 	test_pin_src_fps_kind_mismatch()

@@ -283,10 +283,7 @@ clip_src_len_frames :: proc(clip: ^Clip) -> i64 {
 // a 35-source-frame head left by its full 175 timeline frames decremented
 // source_start_frame by 175 and left it at -140, reading before the first frame.
 clip_timeline_to_src_frames :: proc(clip: ^Clip, timeline_frames: i64) -> i64 {
-	rate := clip.src_fps
-	if !(rate > 0) {
-		rate = project_fps()
-	}
+	rate := clip_frame_space_rate(clip)
 	proj := project_fps()
 	if !(rate > 0) || !(proj > 0) {
 		return timeline_frames
@@ -294,11 +291,29 @@ clip_timeline_to_src_frames :: proc(clip: ^Clip, timeline_frames: i64) -> i64 {
 	return i64(math.round(f64(timeline_frames) * (rate / proj)))
 }
 
-clip_src_len_to_timeline_frames :: proc(clip: ^Clip, src_frames: i64) -> i64 {
-	rate := clip.src_fps
+// clip_frame_space_rate is the rate a clip's SOURCE frame numbers are counted in,
+// which is not the same field for every clip kind.
+//
+// Clip.src_fps is the VIDEO conform rate — how many source frames one timeline
+// frame shows, for a picture. An audio clip's frames are counted against
+// Clip.audio_src_rate instead, and for a clip imported at a different rate than
+// the project those two disagree.
+//
+// Getting this wrong is not subtle. ~/baby.vyproj's opus has audio_src_rate 11.97
+// and src_fps 60, so a conversion using src_fps ran 1:1 where it had to run 5:1,
+// and trimming the clip's tail capped it at 38 timeline frames instead of the 221
+// its 44 source frames actually occupy. The audio clip was being measured in the
+// video clip's timebase.
+clip_frame_space_rate :: proc(clip: ^Clip) -> f64 {
+	rate := clip.kind == .Audio ? clip.audio_src_rate : clip.src_fps
 	if !(rate > 0) {
 		rate = project_fps()
 	}
+	return rate
+}
+
+clip_src_len_to_timeline_frames :: proc(clip: ^Clip, src_frames: i64) -> i64 {
+	rate := clip_frame_space_rate(clip)
 	proj := project_fps()
 	if !(rate > 0) || !(proj > 0) {
 		return max(1, src_frames)

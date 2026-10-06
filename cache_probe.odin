@@ -211,7 +211,56 @@ decode_repeat_probe_run :: proc(v: string) {
 			}
 		}
 	}
+	// A SCRUB walk, which is the path the forward walk above never reaches and the
+	// one AV1 actually fails on. Backward jumps force seek_to_source_frame, which
+	// calls avcodec_flush_buffers — and an AV1 stream that uses show_existing_frame
+	// (a frame that is a copy of an earlier reference) cannot survive its references
+	// being flushed. The symptom is "Missing reference frame needed for
+	// show_existing_frame", and unlike the repeat case it does not come with a
+	// visibly wrong picture: the decoder simply stops.
+	//
+	// So this asserts only that every frame the scrub asks for DECODES. A scrub that
+	// works forwards and then poisons itself on the way back is the shape of the
+	// reported failure, and nothing else in the suite seeks a conformed AV1 clip.
+	source_frames: i64 = 0
+	for probe_frame := i64(0); probe_frame < 4096; probe_frame += 1 {
+		if !decode_source_frame(&dec, probe_frame) {
+			break
+		}
+		source_frames = probe_frame + 1
+	}
+	if source_frames <= 1 {
+		fmt.println("[decode-repeat-probe] FAIL could not walk the source to find its length")
+		os.exit(2)
+	}
+	scrub_fails := 0
+	// Targets are a FRACTION of the source, not absolute frame numbers. Hardcoded
+	// indices were wrong the moment the probe ran against a shorter clip: a
+	// 90-frame fixture was asked for frame 120, decode correctly refused it, and the
+	// probe reported a decoder fault that was really a bad test.
+	jumps := ([]f64{0.0, 0.7, 0.25, 0.95, 0.05, 0.5, 0.1})
+	for frac in jumps {
+		jump := i64(frac * f64(source_frames - 1))
+		if jump < 0 {
+			jump = 0
+		}
+		if !decode_source_frame(&dec, jump) {
+			scrub_fails += 1
+			fmt.printf(
+				"[decode-repeat-probe] FAIL scrub to source frame %d of %d did not decode\n",
+				jump, source_frames,
+			)
+		}
+	}
+
 	clip_decoder_reset(&dec)
+	if scrub_fails > 0 {
+		fmt.printf(
+			"[decode-repeat-probe] FAIL %d scrub targets failed to decode — a forward-only walk passes, so this is the seek path\n",
+			scrub_fails,
+		)
+		fails += scrub_fails
+	}
 	if fails == 0 {
 		fmt.printf(
 			"[decode-repeat-probe] OK: %d timeline frames at %gfps over a %gfps source (hold %d) served every held frame without re-seeking\n",
