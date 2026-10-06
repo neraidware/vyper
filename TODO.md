@@ -3365,9 +3365,11 @@ gesture). Mutation-checked: reverting the lane resolver to the panel box fails
 three, and removing the import gate fails two.
 
 **Memory.** Each dropped file hands an SDL-owned buffer to the bin, which clones
-what it keeps — so `sdl.free` on the event buffer is the only owner that can
-release it, and `dnd_valgrind` is the gate that measures that handoff (0
-definitely lost, 0 indirectly lost, no invalid free).
+what it keeps. The clone is what makes the *bin* safe to hand the path on and
+forget it — it is **not** what makes the *event buffer* ours to free. See Active
+31: this paragraph used to claim the opposite, and that claim was the bug.
+`dnd_valgrind` is the gate that measures the handoff (0 definitely lost, 0
+indirectly lost, no invalid free).
 
 ## Active 16 — Export frame rate came from the first video source, not the frame grid
 
@@ -6112,3 +6114,128 @@ and is then required to stop.
 The probe also refuses to pass by doing nothing: it requires the device to have run
 dry AND the queue to have ended back at the cushion.
 
+
+## Active 31 — A drop freed SDL's buffer, so the feature that worked read as broken
+
+**Status: fixed 2026-10-06.** Branch `fix/dnd-drop` (base `771044b`). `dnd_probe` +
+`dnd_valgrind` were already members of `all` and both cover this.
+
+**The symptom.** Dragging a file onto the media bin or the timeline did nothing.
+
+**The defect.** `handle_file_drop_event`'s `DROP_FILE` branch called
+`sdl.free(rawptr(event.drop.data))` on the comment's authority — *"SDL owns
+`data` ... releasing it here is the only owner that can"*. That is the wrong
+reading of "SDL owns", and it is wrong twice over. SDL does own the buffer, but
+not exclusively: `SDL_SendDropFile` builds it with `SDL_CreateTemporaryString`,
+which is `SDL_FreeLater(SDL_strdup(...))` — the block goes onto SDL's own
+per-thread temporary-memory list, and `SDL_PumpEventsInternal` runs
+`SDL_FreeTemporaryMemory` over that list at the top of the *next* pump. Once per
+frame, whether or not the app ever polled the event. So the branch freed a block
+SDL still held a pointer to, and the next frame freed it again.
+
+The consequence is why this read as "nothing happened" rather than as a crash: the
+placement runs *first* (import, then `add_asset_to_timeline`), so the clip lands,
+and only then does the heap come apart underneath it. A double free is silent
+when the chunk has been handed back out in between and an abort when it has not —
+so the same defect presents as a crash or as a quietly corrupted session
+depending on what the allocator did, which is also why it survived a probe suite.
+
+`SDL_ClaimTemporaryMemory` is the API for an app that genuinely wants the block;
+it is internal to SDL and not bound here, and nothing needs it — the bin clones
+every path it keeps (`import_media_to_bin`), so the correct action was to leave
+the pointer alone. The branch now owns nothing, and says why at the site.
+
+**Why it stayed invisible for three years.** Every existing `dnd_probe` check
+stops at the *decision*: which zone a point means, whether the bin will hold the
+file, whether the gesture state is clean. None of them hands a path across the
+event boundary, so none of them could see an ownership bug there — the probe
+passed with the double free in place, and `dnd_valgrind` reported 0 definitely
+lost, because the *probe* was never the owner SDL was double-freeing. A gate can
+only measure the boundary it actually crosses.
+
+**Probe.** The probe now drives the commit, not just the decision: a real
+`DROP_POSITION` + `DROP_FILE` pair pushed through SDL's own queue and drained by
+`handle_sdl_events` (the app's only poll site), over a WAV the probe writes
+itself, so the handoff is exercised by one owner exactly as SDL has it.
+- drop on the bin → the asset appears, and the timeline is untouched
+- bin item pressed → dragged → released over the timeline → clips appear and the
+  gesture disarms (the in-app half, checked against the same laid-out geometry so
+  the two paths that must agree are compared directly)
+- drop on the timeline → clips appear, on a timeline that already has lanes
+
+Mutation-checked: putting the `sdl.free` back kills the probe with
+`free(): invalid pointer` before any assertion is reached. That is the load-bearing
+result — it is the first thing in this suite that can see the defect at all.
+
+Each test re-lays out the page before asking where the timeline is. A drop
+resolves lanes out of the layout, so a test that placed clips earlier in the run
+would otherwise read `EmptyTimeline`'s box on a timeline that now has tracks —
+a zero box, and a red test that says nothing about the code.
+
+**Second defect, found by the first.** With the commit actually running,
+`dnd_valgrind` went red on something the probe had never reached:
+`media_frame_count` (`media.odin:161`) leaked the `[]string` from
+`strings.split(rate, "/")` on every import — the same bug its own
+`strings.split_lines(metadata)` two lines above had already been fixed for, with
+the rule written in a comment right there. Every *other* import path runs through
+`open_file_at`, which no valgrind target exercises; the dnd probe was the first
+gate to import a decodable file under memcheck. `defer delete(parts)`.
+
+`dnd_valgrind`: 0 definitely lost, 0 indirectly lost, no invalid access.
+
+## Active 32 — SDL moved the app onto XWayland, and niri does not bridge desktop drags
+
+**Status: fixed 2026-10-06.** Branch `fix/dnd-drop` (base `771044b`). Found while
+fixing Active 31, on the same machine, by the user still reporting "nothing
+happens" after the double free was gone.
+
+**The defect.** Dropping a file on the bin or the timeline produced no events at
+all — not even the zone highlight, which is drawn from `DROP_POSITION`. SDL's own
+trace showed the drag never reached the window: no `wl_data_device` offer, no
+`XdndEnter`, nothing.
+
+The reason is one line in SDL, found by reading `SDL_waylandvideo.c` rather than
+guessing:
+
+```
+This compositor lacks support for the fifo-v1 protocol; falling back to XWayland
+for GPU performance reasons (set SDL_VIDEO_DRIVER=wayland to override)
+```
+
+SDL ships two Wayland bootstraps. `Wayland_preferred_bootstrap` refuses unless the
+compositor implements `wp_fifo_v1`, and on refusal SDL picks X11 instead — a
+frame-pacing trade. It is the wrong trade for an editor, and silently so: an
+XWayland client is not a Wayland surface, so **the compositor does not hand it
+desktop drags**. A drag started in a native Wayland file manager has to be
+bridged into an X11 window by the compositor, and niri's XWayland server does not
+do that. So on niri the whole feature was dead before SDL generated a single
+event, and no amount of correctness in `dnd.odin` could have reached it.
+
+**The fix.** `prefer_native_wayland` (`main.odin`), called before `sdl.Init`
+because that is where the driver is chosen: when `WAYLAND_DISPLAY` is set and
+`SDL_VIDEO_DRIVER` is not already pinned, `sdl.SetHint("SDL_VIDEO_DRIVER",
+"wayland")`. The explicit-pinned check comes first so SDL's own documented advice
+(`SDL_VIDEO_DRIVER=wayland`) still works and nothing overrides a user's choice.
+
+**The cost, stated plainly.** A session that claims Wayland but cannot reach a
+compositor no longer falls back to X11 — `SDL_Init` fails outright. That is the
+right way round: XWayland is not a working fallback for a Wayland session, it is a
+slower one that silently drops a shipped feature. And the app now runs on a
+*different backend than it did before* for anyone on a compositor without
+`wp_fifo_v1` (niri). Compositors that have it — sway, wlroots, KDE 6, GNOME —
+were already on Wayland and see no change.
+
+**Not probeable, and how it was verified instead.** A headless run cannot conjure
+a compositor, so no gate covers the driver choice. It was verified on the real
+session against a real drag, which is what found it: with the trace on
+(`SDL_LOGGING="*=error,input=trace"`) a drag that does not work shows *no*
+`wl_data_device`/`XdndEnter` trace at all, versus a working one showing
+`data_device_handle_enter` → `data_device_handle_motion` → `data_device_handle_drop`
+→ `DROP_POSITION` → `DROP_FILE` → `DROP_COMPLETE`. That difference — an empty
+trace — is the only evidence a broken drag produces, which is why "it does
+nothing" took a backend trace to tell apart from "it crashes". Note this is also
+the same evidence the X11 path gives, which is how Active 31's real defect was
+separated from Active 32's: the X11 path demonstrably delivers `DROP_BEGIN` +
+`DROP_POSITION` from a hand-built XDND gesture, and never got a `DROP_FILE`
+through — because xwayland-satellite drops the synthetic `SelectionNotify` that
+carries the path. The two failures looked identical from the outside.

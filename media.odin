@@ -159,6 +159,11 @@ media_frame_count :: proc(metadata: string) -> i64 {
 		if strings.has_prefix(line, "avg_frame_rate=") {
 			rate := line[len("avg_frame_rate="):]
 			parts := strings.split(rate, "/")
+			// Same rule as `lines` above: an allocating split is caller-owned and
+			// `for` does not free it. The dnd probe's import is what reached this
+			// line -- every earlier import of a decodable file went through
+			// open_file_at, which valgrind does not run.
+			defer delete(parts)
 			if len(parts) == 2 {
 				numerator, nok := strconv.parse_f64(parts[0])
 				denominator, dok := strconv.parse_f64(parts[1])
