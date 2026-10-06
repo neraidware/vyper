@@ -1789,6 +1789,103 @@ audio_probe_clip_stretch :: proc() -> bool {
 	return true
 }
 
+// audio_probe_scrub_exact proves a SEEK lands on the content sample the timeline says
+// belongs there -- for an unstretched clip AND a stretched one.
+//
+// Scrubbing is the one gesture that is pure seeking, so it is where a position mapping
+// is easiest to get wrong and hardest to notice: a clip that is off by a few hundred
+// samples still sounds like itself, and the drift only shows as the playhead and the
+// audio disagreeing. Nothing else in the audio suite would catch it.
+//
+// The mapping under test is audio_content_sample_at_speed: at speed S, timeline frame N
+// holds content sample N*S, plus the clip's own source offset. The factor is what a
+// stretched clip needs -- without it the mixer asks for content at 1x while the clip
+// occupies 1/S of the timeline, reads the wrong content, and runs out early.
+//
+// Asserted in three parts, because a position bug can hide in any one of them:
+//   - the mapping itself, at several speeds and offsets, against the closed form;
+//   - MONOTONICITY, so a seek can never jump backwards through the content;
+//   - the ROUND TRIP through frame_at_sample, so the seek target and the frame the mixer
+//     lands on agree to within one frame.
+audio_probe_scrub_exact :: proc() -> bool {
+	fails := 0
+	// The project's own rate, rationalised, so the round trip goes through the same
+	// conversion the renderer uses rather than an idealised 1.0.
+	n32, d32 := fps_rational(timeline_fps())
+	rn, rd := i64(n32), i64(d32)
+
+	for speed in ([]f64{0.25, 0.5, 1.0, 1.5, 2.0, 4.0}) {
+		for frames_into in ([]i64{0, 1, 30, 120, 1000}) {
+			// A source offset so a clip that does not start at content 0 is covered too:
+			// the two mistakes are additive and the offset is where the second one hides.
+			start_s := i64(48)
+			got := audio_content_sample_at_speed(frames_into, start_s, f64(rn) / f64(rd), speed)
+			base := timeline_frame_sample(frames_into)
+			want := audio_content_sample(frames_into, start_s, f64(rn) / f64(rd))
+			// speed 1.0 must be exactly the unstretched mapping, and the stretched form
+			// must be within a sample of base*speed (rounding on the multiply).
+			if speed == 1.0 {
+				if got != want {
+					fmt.printf("[ap] scrub: FAIL: speed 1.0 changed the mapping (%v vs %v)\n", got, want)
+					fails += 1
+				}
+			} else if math.abs(f64(got - want) - f64(base) * (speed - 1.0)) > 1.0 {
+				fmt.printf(
+					"[ap] scrub: FAIL: speed %.3f at frame %d -> %v, want about %v\n",
+					speed, frames_into, got, want + Sample_Pos(f64(base) * (speed - 1.0)),
+				)
+				fails += 1
+			}
+			// ROUND TRIP, and the division by speed is the point.
+			//
+			// timeline_frame_at_sample knows nothing about a clip's speed -- it is the
+			// plain timeline mapping. So mapping a speed-scaled content sample straight
+			// back gives frames_into*speed, which is CORRECT and is exactly what the
+			// clip means: at speed 2 the content at timeline frame 120 also appears at
+			// timeline frame 240 of the raw 1:1 mapping. Undoing the stretch means
+			// dividing by the speed first.
+			//
+			// Getting this wrong in the engine is the "plays at roughly 1x" bug: the
+			// mapping asks for content at 1x while the clip occupies 1/S of the
+			// timeline, reads the wrong content, and runs out early.
+			// The clip's own source offset comes off too: `got` is base*speed PLUS the
+			// offset, so dividing alone would leave the offset scaled by the speed --
+			// visible above as a round trip landing on frame 12 instead of 0.
+			off := audio_source_start_sample(start_s, f64(rn) / f64(rd))
+			back := timeline_frame_at_sample(Sample_Pos(f64(got - off) / speed))
+			if abs(back - frames_into) > 1 {
+				fmt.printf(
+					"[ap] scrub: FAIL: speed %.3f frame %d -> sample %v -> frame %d\n",
+					speed, frames_into, got, back,
+				)
+				fails += 1
+			}
+		}
+	}
+
+	// MONOTONIC. Swept densely across the whole clip range, at every speed: a mapping
+	// that ever goes backwards would let a forward seek replay audio the playhead has
+	// already passed.
+	for speed in ([]f64{0.25, 0.5, 1.0, 1.5, 2.0, 4.0}) {
+		prev := audio_content_sample_at_speed(0, 0, 1.0, speed)
+		for f in i64(1) ..< 2000 {
+			at := audio_content_sample_at_speed(f, 0, 1.0, speed)
+			if at < prev {
+				fmt.printf("[ap] scrub: FAIL: speed %.3f went BACKWARDS at frame %d (%v < %v)\n", speed, f, at, prev)
+				fails += 1
+				break
+			}
+			prev = at
+		}
+	}
+	if fails > 0 {
+		fmt.printf("[ap] scrub: FAIL (%d)\n", fails)
+		return false
+	}
+	fmt.println("[ap] scrub ok (seek lands on the timeline's content sample, monotonically)")
+	return true
+}
+
 // verdict renders a pass/fail word for the probe's single output line. A named helper
 // rather than an inline ternary so every assertion in the probe reads the same way.
 verdict :: proc(ok: bool) -> string {

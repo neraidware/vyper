@@ -1482,6 +1482,32 @@ target_audio_node_latency() {
 	echo "audio-node-latency: ok"
 }
 
+# audio_scrub_exact proves a SEEK lands on the content sample the timeline says belongs
+# there, unstretched and stretched.
+#
+# Scrubbing is the one gesture that is pure seeking, so it is where a position mapping is
+# easiest to get wrong and hardest to notice: a clip a few hundred samples out still
+# sounds like itself, and the only symptom is the playhead and the audio disagreeing.
+# Nothing else in the audio suite would catch it.
+#
+# Three assertions, because a position bug can hide in any one of them:
+#   - the mapping audio_content_sample_at_speed, against the closed form, at several
+#     speeds and with a NON-ZERO source offset (the two errors are additive, and the
+#     offset is where the second one hides);
+#   - MONOTONICITY across the whole range, since a mapping that ever goes backwards lets a
+#     forward seek replay audio the playhead has already passed;
+#   - the ROUND TRIP, which needs the speed AND the source offset divided back out.
+target_audio_scrub_exact() {
+	require_fresh_binary audio-scrub-exact || return 1
+	VYPER_AUDIO_SCRUB_EXACT=1 timeout 600 ./vyper
+	local rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "audio-scrub-exact: FAILED -- see the [ap] scrub lines above" >&2
+		return 1
+	fi
+	echo "audio-scrub-exact: ok (seek lands on the timeline's content sample)"
+}
+
 # audio_clip_stretch proves the STRETCH gesture's invariant: changing a clip's speed must
 # not move the clip on the timeline.
 #
@@ -1654,7 +1680,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_clip_stretch audio_clip_tempo audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_scrub_exact audio_clip_stretch audio_clip_tempo audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1692,6 +1718,7 @@ main() {
 	audio_node_latency) target_audio_node_latency ;;
 	audio_clip_tempo) target_audio_clip_tempo ;;
 	audio_clip_stretch) target_audio_clip_stretch ;;
+	audio_scrub_exact) target_audio_scrub_exact ;;
 	audio_bus_prime) target_audio_bus_prime ;;
 	audio_clip_pitch) target_audio_clip_pitch ;;
 	atempo_probe) target_atempo_probe ;;
@@ -1713,7 +1740,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_bus_prime|audio_clip_pitch|audio_clip_stretch|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_bus_prime|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

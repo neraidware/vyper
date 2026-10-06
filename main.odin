@@ -1995,6 +1995,12 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		ok: bool = audio_probe_clip_tempo()
 		os.exit(ok ? 0 : 1)
 	}
+	// VYPER_AUDIO_SCRUB_EXACT -- proves a seek lands on the content sample the timeline
+	// says belongs there, unstretched and stretched.
+	if se, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_EXACT", context.temp_allocator); se != "" {
+		ok: bool = audio_probe_scrub_exact()
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_CLIP_STRETCH -- proves the stretch gesture's invariant: changing speed
 	// must not move the clip on the timeline.
 	if st, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_STRETCH", context.temp_allocator); st != "" {
