@@ -198,8 +198,20 @@ snap_to_playhead :: proc(frame: i64) -> i64 {
 }
 
 // snap_playhead_to_clip_edge latches a scrubbed playhead onto the nearest clip
-// start or end frame that falls within the snap margin. Used by the
-// playhead→clip toggle.
+// edge that falls within the snap margin. Used by the playhead→clip toggle.
+//
+// Both edges target a frame the clip OWNS, which for the end means the last
+// content frame (end-1) rather than the exclusive `end`. A clip spans
+// [start, start+length) -- clip_visible_at is half-open -- so the exclusive end
+// is a frame this clip does not have. Snapping there showed the NEXT clip's
+// first frame whenever clips were contiguous, which is the common case, and it
+// only looked right when a gap followed, because a gap put the playhead in empty
+// space where "wrong frame" and "no frame" look alike.
+//
+// `end-1` is right for interior and final edges alike, so the final clip needs no
+// special case: its last content frame IS the timeline's last content frame. The
+// duration clamp below stays as the same backstop the scrub path has, not as the
+// thing that makes the final clip behave.
 snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 	best := frame
 	best_dist := f32(0)
@@ -208,7 +220,11 @@ snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 		for index := 0; index < len(timeline.tracks[track_idx].clips); index += 1 {
 			c := &timeline.tracks[track_idx].clips[index]
 			start := c.timeline_start_frame
-			end := start + c.source_length_frames
+			// A zero-length clip owns no end frame; clamp it onto its start rather
+			// than letting end-1 point before the clip. Such a clip cannot be
+			// reached by a real import (every placer clamps length to >= 1), so this
+			// is arithmetic, not a guard for a case the app can reach.
+			end := start + max(c.source_length_frames - 1, 0)
 			dist := f32(abs(frame - start))
 			if dist <= m && (best == frame || dist < best_dist) {
 				best = start
@@ -221,12 +237,9 @@ snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 			}
 		}
 	}
-	// A clip end edge is exclusive -- one frame PAST its last content frame --
-	// so snapping onto the FINAL clip's end parks the playhead in the void
-	// (timeline_duration() is that same exclusive end; frame == dur has no
-	// frame to show, and scrubbing already refuses it). Interior end edges
-	// (a following clip's start) survive the clamp because dur is the LAST
-	// clip's end: only the final edge exceeds it.
+	// Same backstop the scrub path applies (interaction.odin): timeline_duration()
+	// is the exclusive content end, so frame == dur is a sheet-empty slot past
+	// every clip with no frame to show.
 	return clamp(best, 0, max(0, timeline_duration() - 1))
 }
 
