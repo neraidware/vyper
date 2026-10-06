@@ -1455,6 +1455,12 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 			if editor_flags.snap_clips_to_playhead {
 				frame = f32(snap_to_playhead(i64(frame)))
 			}
+			if vyper_trace {
+				fmt.printf(
+					"[trim] dispatch edge=%v group=%d clip=%d idx=%d frame=%d\n",
+					clip_resize.edge, len(clip_move.group_orig), selection.index, selection.index, i64(frame),
+				)
+			}
 			if clip_resize.edge == .Left {
 				if len(clip_move.group_orig) > 0 {
 					// Linked group: shift every member's head by the same delta.
