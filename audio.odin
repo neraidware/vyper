@@ -1644,11 +1644,23 @@ audio_provision_find_group :: proc(
 		if string(g.path) != chip_path {
 			continue
 		}
-		// Same tempo test as above: a reclaimed slot carries the group it was, and
-		// that group's graph is built for ITS speed.
-		if g.speed != want_speed || g.pitch_ratio != want_pitch_ratio {
-			continue
-		}
+		// NOT the tempo test above, and the asymmetry is the point.
+		//
+		// The continue-loop check exists because two chips of DIFFERENT tempo must never
+		// end up as segments of ONE group: a group has a single atempo graph, so that
+		// mixes one clip at another's factor -- the bug this whole change is about.
+		//
+		// Reclaiming a slot is not that. It hands the LIVE DECODER to the new group, and
+		// a decoder is tempo-agnostic: it turns content samples into content samples and
+		// knows nothing about speed. The tempo lives on the GROUP, and audio_build_groups
+		// rebuilds the graph for the new one (destroy the filter, drop the derived ring,
+		// restamp speed) on the very next lines.
+		//
+		// Testing tempo here too was a real regression I introduced and then measured
+		// away: with it, a speed OR PITCH edit stopped matching the continuing group,
+		// built a fresh one with no decoder, and went down the Open path -- so every
+		// tempo edit cost a file open plus a seek instead of a filter rebuild, and the
+		// clip-tempo probe's `sought > 0` assertion failed against a correct engine.
 		reclaim[k] = false
 		return g
 	}

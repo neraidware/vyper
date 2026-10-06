@@ -7501,3 +7501,48 @@ later `git stash pop` fought a commit made in between and left `UU` markers in
 `interaction.odin`, `main.odin`, `state.odin` and `timeline.odin`. All committed work was
 intact at HEAD and verified afterwards; the two genuinely uncommitted files were copied
 out first. Path-limited stash is not a safe way to A/B a single file here.
+
+### Active 41, fourth defect — my own grouping fix turned every tempo edit into a decoder reopen
+
+Chasing the third defect turned up a regression **I introduced in 5141452**, and it is
+worth recording because the probe caught it and I initially read the probe as wrong.
+
+`audio_clip_tempo_edit_alignment` reported `sought=0` after a 1x -> 2x edit. Instrumenting
+`audio_reconcile` gave the whole story in two lines:
+
+    slot 0: old_speed=1.000 new_speed=1.000 graph_changed=false segs=0 had_decoder=true
+    slot 1: old_speed=0.000 new_speed=2.000 graph_changed=true  segs=1 had_decoder=false
+    DIAG speed edit report: kept=0 sought=0 opened=1 dropped=1 touched=true slot0.speed=2.000
+
+A clip's speed is also its TIMELINE EXTENT — 2x is half as long — so the edit moved the
+chip's `timeline_start` and halved its `timeline_len`, which breaks the segment
+CONTIGUITY that decides whether a chip continues an existing group. Nothing continued, so
+the old source was dropped and a NEW one built with a fresh decoder: `opened`, on a slot
+with `had_decoder=false`, and therefore nothing to re-seek. `sought=0` is correct.
+
+But the PITCH assertion then failed the same way, and that one was mine. I had put the
+tempo test in **both** loops of `audio_provision_find_group` — the continue loop AND the
+reclaim loop. Reclaiming a slot hands the live DECODER to the new group, and a decoder is
+tempo-agnostic: it turns content samples into content samples and knows nothing about
+speed. The tempo lives on the GROUP, and `audio_build_groups` rebuilds the graph for the
+new one three lines later. So testing tempo on reclaim meant every speed or pitch edit
+stopped matching the continuing group, built a fresh one, and went down the Open path: a
+file open plus a seek per tempo edit instead of a filter rebuild.
+
+**The asymmetry, which is the actual content of the fix.** The continue-loop tempo test
+stays, because two chips of DIFFERENT tempo must never become segments of one group — a
+group has one atempo graph, so that mixes one clip at another's factor, which is the
+Active 40 bug. The reclaim-loop test is removed, because that path is not mixing, it is
+decoder reuse. Asymmetric on purpose, and the comment says so at the site.
+
+**And the probe's assertion was still wrong.** It demanded `rep.sought > 0`, which asserts
+a MECHANISM (re-seek) rather than the OUTCOME (rebuilt at the new tempo, queue
+invalidated). Corrected to `sought > 0 || opened > 0`, with `touched_window` and the
+group's own speed still asserted strictly. PITCH keeps the strict `sought > 0` on
+purpose: pitch moves output without moving content or extent, so it must take the
+graph_changed re-seek path, and a `sought=0` there is a real bug.
+
+`audio_clip_tempo_alignment_valgrind` is green for the first time. That target has now
+been red for three different causes in a row — the wrong fixture, a stale assertion, and
+this — which is what "no gate target" costs: nothing told anyone which one they were
+looking at.

@@ -3263,10 +3263,37 @@ audio_probe_clip_tempo_edit_alignment :: proc(path: string) -> bool {
 		start_frame,
 		audio_reconcile_is_seeked(start_frame, fps, audio_rate_scale()),
 	)
-	if rep.sought == 0 || audio_src.slots[0].speed != 2.0 {
+	// The edit must REBUILD the source, and "rebuild" is `sought OR opened` -- not
+	// `sought` alone. That distinction is the whole content of this assertion, and
+	// getting it wrong is why the probe was red for a right engine.
+	//
+	// A clip's speed is also its TIMELINE EXTENT: 2x is half as long. So a 1x -> 2x
+	// edit moves the chip's timeline_start and halves its timeline_len, which breaks
+	// the segment CONTIGUITY that decides whether a chip continues an existing group.
+	// Nothing continues, so the old source is dropped and the chip builds a NEW one --
+	// `opened`, on a fresh decoder -- and there is no existing decoder to re-seek, so
+	// `sought` is legitimately 0. Measured:
+	//
+	//	kept=0 sought=0 opened=1 dropped=1 touched=true slot0.speed=2.000
+	//
+	// Demanding `sought > 0` here asserts a mechanism (re-seek) rather than the
+	// outcome (rebuilt at the new tempo, queue invalidated), so it fails on the correct
+	// behaviour and would have failed on it forever.
+	//
+	// PITCH is the other shape and is asserted the strict way below: pitch moves every
+	// output sample without moving content or the extent, so it MUST take the
+	// graph_changed re-seek path. If that one ever reports sought=0, it is a real bug.
+	if rep.sought == 0 && rep.opened == 0 {
 		fmt.printf(
-			"[ap] clip-edit-alignment: FAIL: speed edit did not rebuild source (sought=%d, speed=%.3f)\n",
-			rep.sought, audio_src.slots[0].speed,
+			"[ap] clip-edit-alignment: FAIL: speed edit rebuilt nothing (kept=%d sought=%d opened=%d dropped=%d)\n",
+			rep.kept, rep.sought, rep.opened, rep.dropped,
+		)
+		return false
+	}
+	if audio_src.slots[0].speed != 2.0 {
+		fmt.printf(
+			"[ap] clip-edit-alignment: FAIL: speed edit left the source's graph at %.3fx, want 2.000\n",
+			audio_src.slots[0].speed,
 		)
 		return false
 	}
