@@ -6692,3 +6692,52 @@ frame rate. Both exports of the file are essentially black. So the "completely
 different preview" was a still image and black rather than a retimed webm, and this
 project cannot demonstrate the fps fix visually until the classification is
 re-derived from the asset. That is the next thing to decide.
+
+## Active 36 — Clip speed and pitch were properties that nothing could set, and a tempo graph that lied about its factor
+
+**Why:** four separate gaps, all of which made the same feature look finished.
+
+1. `speed` and `pitch` were plumbed through persistence, geometry, the DSP and the
+   playhead readout, and consumed by NOTHING. No code path anywhere wrote them. The
+   inspector showed a field that could not be focused and the timeline had no
+   gesture, so the only way to retime a clip was to edit the project file.
+2. The pitch chain did not exist. `pitch = 5` played unchanged, silently.
+3. The tempo gate passed for the WRONG reason, which is worse than having no gate.
+   Pulse density moves under WSOLA's segment repetition; `content_used` is swamped
+   by the pump's chunked read-ahead and reads ~1.0x at every speed; raw sample
+   counts are swamped by ring prefetch, which at 0.25x returned 23.2 s of audio from
+   an 8 s window.
+4. The tempo GRAPH compounded its own error. Chaining atempo stages to respect a
+   [0.5, 2.0] per-stage range — an assumption from old FFmpeg — cost 0.66% at 2.5x
+   and 0.80% at 4.0x. That is 4.8 s of drift across a 10-minute clip.
+
+**Fix.**
+
+- `asetrate(48000 * ratio)` → `aresample(48000)`, ahead of atempo. Net: pitch moves,
+  duration does not. Order is the point — pitch first, because aresample's duration
+  correction assumes it is undoing a rate change it made itself; atempo ahead of it and
+  the two corrections COMPOUND, so a stretch would also transpose.
+- Speed and Pitch are two inspector fields, not one "rate" field. Typed in the unit
+  the user thinks in (percent, semitones); both clamp at the edge of the system, while
+  `clip_speed` ASSERTS out of range, because a clamp there would silently play a speed
+  nobody asked for.
+- shift-dragging an audio edge stretches, holding `timeline_len = source_length /
+  speed` constant. Captured AT PRESS: recomputing per frame compounds and the clip
+  walks across the timeline, invisibly while dragging.
+- One atempo stage instead of a chain. The vendored 9.0.2 takes tempo 4.0 directly;
+  the chain survives only as the fallback for a build that refuses.
+- Gates measure where they are not confounded: the tempo factor on an ISOLATED graph
+  by DIFFERENCE (a single run's out/in is biased low by the fixed priming discard, which
+  made every speed look 1-2% slow), the geometry as arithmetic on a Clip.
+
+**Still open.** The bus atempo residual is 0.8-6.25 ms, not zero. A DEEPER prime makes
+it worse (4x → 56/130/160/84, 8x → 472/452/384/82), because the self-calibration
+measures the graph's output during priming and WSOLA's history keeps settling after that
+window. Reaching zero means aligning against the output waveform once the graph has
+stabilised, not against the prime. `audio_bus_prime` is out of `all` for exactly that
+one reason.
+
+**No automatic audio effects.** The earlier plan in this file for automatic declick on
+every clip edge is DEAD and stays dead: cuts are hard and transparent, fades and gain
+are authored. `audio_probe_transparent_cuts` asserts a cut is not a fade (boundary
+0.08080 against an interior peak of 0.12563). Do not reintroduce it.
