@@ -7152,7 +7152,13 @@ checked the whole buffer and would have failed every correctly-letterboxed portr
 
 ### Known-open, not fixed
 
-- The "audio clip" half. Needs the user's actual file.
+- ~~The "audio clip" half. Needs the user's actual file.~~ **CLOSED 2026-10-06: there
+  was nothing to fix.** The user reported this item in error ("Audio clip was just me
+  being stupid. forget it"). The probe had already established that a plain `.jpg`
+  classifies correctly -- `kind=Video is_image=true`, placed as a `Video`+`is_still`
+  clip -- so the two symptoms that were actually real (the segfault and the failing
+  decode) are the two this section fixed, and both are closed above. Recorded so nobody
+  goes looking for a misclassification bug that does not exist.
 - A still gets `frames=60 dur=40000us`, an implied **1500 fps**, because the asset's
   duration is a placeholder. `proxy_maybe_post_build` computes `fps = frame_count*1e6/
   dur_us` from it, so the window math runs on a nonsense rate for any still. Harmless
