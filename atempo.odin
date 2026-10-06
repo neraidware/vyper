@@ -258,13 +258,14 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 		rem /= 2.0
 	}
 	// The same problem in the other direction, which is what a FAST clip asks for.
-	// `rate` here is atempo's tempo, so a clip at speed S passes 1/S -- and S = 3
-	// gives tempo 0.333, outside atempo's per-stage [0.5, 2.0]. The graph would
+	// `rate` here is atempo's TEMPO, and atempo's tempo IS the speed multiplier: a clip
+	// at speed S passes tempo=S, not 1/S. S = 4 gives tempo 4.0, outside atempo's
+	// per-stage [0.5, 2.0]. The graph would
 	// create the stage, libavfilter would refuse the option ("Numerical result out
 	// of range"), and the clip would produce NO SAMPLES AT ALL.
 	//
 	// So chain full 0.5 stages upward, exactly mirroring the 2.0 case:
-	// 0.333 = 0.5 x 0.667. Multiplying is the only composition that works -- adding
+	// 4.0 = 0.5 x 0.5 x 2.0 x 2.0. Multiplying is the only composition that works -- adding
 	// would cancel toward 1.0 and silently play the wrong speed, which is the whole
 	// failure mode this guards against.
 	n_slow := 0
@@ -277,7 +278,13 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 		atempo_graph_destroy(g)
 		return
 	}
-	prev_slow := g.src
+	// From the PITCH chain, not from the source. The chain is
+	//   src -> asetrate -> aresample -> atemslow* -> atempo(full)* -> atempo(rem) -> aformat
+	// and every stage after aresample must hang off the one before it. Starting the
+	// atempo stages back at g.src severs the chain: the slow stages are still built and
+	// still counted, but nothing plays through them, so a clip asking for >2x runs at
+	// the WRONG SPEED while every stage count and bound check looks correct.
+	prev_slow := prev_pitch
 	for s in 0 ..< n_slow {
 		name_buf: [32]u8
 		fmt.bprintf(name_buf[:], "atemslow%d", g.n_stages)
@@ -290,7 +297,8 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 		g.n_stages += 1
 		prev_slow = ctx
 	}
-	prev := prev_pitch
+	// From the slow stages, so a >2x clip actually runs through them.
+	prev := prev_slow
 	for s in 0 ..< n_full {
 		if g.n_stages >= ATEMPO_MAX_STAGES {
 			fmt.printf("[atempo] too many stages for rate %.2f\n", rate)
