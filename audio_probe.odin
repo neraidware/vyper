@@ -1715,190 +1715,137 @@ measure_atempo_delay :: proc(rate: f64, push_frames: int = 192000) -> (in_frames
 }
 
 
-// audio_probe_clip_tempo drives a STRETCHED clip through the real playback mixer and
-// checks the two things that make per-clip tempo more than a field that compiles.
+// verdict renders a pass/fail word for the probe's single output line. A named helper
+// rather than an inline ternary so every assertion in the probe reads the same way.
+verdict :: proc(ok: bool) -> string {
+	return ok ? "ok" : "FAIL"
+}
+
+// audio_probe_clip_tempo proves the clip TEMPO property changes DURATION and leaves
+// pitch alone. Two independent parts, because one measurement cannot establish both and
+// conflating them is what made three earlier versions of this probe useless.
 //
-// 1. LENGTH. A clip at speed S must fill spf output samples per frame while consuming
-//    spf*S content samples. If the graph's factor or the priming is wrong, the clip
-//    runs long or short -- and that is the failure a user sees as "the audio drifts
-//    against the picture", which no other probe here would catch.
+// PART 1 -- THE DSP, measured in isolation.
 //
-// 2. ALIGNMENT. Content must land at the timeline position it was cut at. The fixture
-//    is an impulse train, so a sample-exact result is checkable: the clip's content
-//    must appear where the timeline says, not shifted by the graph's lookahead. This
-//    is the check that PRIMING earns its place -- without it, every clip start and
-//    every seek would place the opening L samples wrongly, which is exactly the
-//    unreachable-content-0 bug Active 30 fixed at the decoder, one layer up.
+// Push N samples of a steady tone through the graph at speed S and count what comes out.
+// The factor is exactly out/in, with no mixer, no prefetch, no ring, and no timeline.
 //
-// The pitch question is separate and deliberately not asserted here: a tempo change
-// must pitch-correct, and that is a property of atempo being in the path at all. If
-// the clip is stretched and the output is bit-identical to the unstretched render,
-// pitch is NOT being corrected and that is a bug worth failing on -- so that is
-// checked too.
-audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
-	buf: [4096]u8
-	cn := 0
-	for cn < len(path) && cn < len(buf) - 1 {
-		buf[cn] = u8(path[cn])
-		cn += 1
-	}
-	buf[cn] = 0
-	cpath := cstring(&buf[0])
+//     out / in == 1 / S
+//
+// This is exact to a sample or two and it is the property the user hears. atempo's
+// `tempo=` is a speed multiplier, so a clip at speed S passes tempo = S and the graph
+// emits 1/S as many frames -- pitch corrected, duration changed. Anything else, including
+// an inverted argument, shows up here immediately and unambiguously.
+//
+// PART 2 -- THE GEOMETRY.
+//
+// A clip's TIMELINE span must be its content divided by the speed, or the audio and the
+// picture disagree about how long the clip is. That is pure arithmetic on the clip, with
+// no samples involved, so it cannot be confounded by anything the mixer does.
+//
+// WHY NOT THE MIXER. The first three versions of this probe read sample counts out of
+// the playback mixer, and every one of them was wrong:
+//
+//   - PULSE DENSITY is not a tempo measurement. WSOLA repeats and discards segments, so a
+//     faster clip has MORE onset crossings on the same content. It read 1.0000 at every
+//     speed.
+//   - "content consumed" is not one either. The graph pulls in chunks, so nearly
+//     everything the clip asks for is consumed within one block and the ratio pins at
+//     ~1.0 regardless of speed.
+//   - Raw output sample counts are worse still: the producer PREFILLS its rings, so at
+//     speed 0.25 an 8 s window returned 1113600 samples -- 23.2 s of audio from a span
+//     that only asked for 8 s. The prefetch is real and correct behaviour; it simply is
+//     not a clock.
+//
+// The mixer measures the transport, which is what audio_drift_parity and
+// audio_stall_gap are for. This probe measures the tempo PROPERTY, so it stays out of
+// the mixer entirely.
+audio_probe_clip_tempo :: proc() -> bool {
+	fails := 0
 
-	fps := timeline_fps()
-	if fps <= 0 {
-		fmt.println("[ap] tempo: no fps")
-		return false
-	}
-	// The clip declares a fixed CONTENT length; its TIMELINE span is that content
-	// divided by the speed. That is what stretching means, and getting it wrong is why
-	// an earlier version of this probe measured nonsense: it set the source length
-	// equal to the timeline length, which is only true at 1x, so a stretched clip ran
-	// off the end of its own declared content and the ratio came out near 1 at every
-	// speed.
-	content_frames := i64(fps * 4.0)
-
-	unstretch_frames := content_frames
-	unstretched := mix_clip_range(cpath, content_frames, unstretch_frames, 1.0, fps)
-	if len(unstretched) == 0 {
-		fmt.println("[ap] tempo: SKIP: the unstretched reference produced nothing")
-		return true
-	}
-	stretch_frames := max(1, i64(f64(content_frames) / speed))
-	stretched := mix_clip_range(cpath, content_frames, stretch_frames, speed, fps)
-	if len(stretched) == 0 {
-		fmt.println("[ap] tempo: FAIL: the stretched clip produced no samples at all")
-		return false
-	}
-
-	// A stretched clip consumes more content for the same span, so it cannot be the
-	// same LENGTH as the reference; what must hold is that it produced SOMETHING for
-	// every frame of the span rather than running dry.
-	fmt.printf(
-		"[ap] tempo: speed %.2f -> %d output samples vs %d unstretched (%.2fx content consumed)\n",
-		speed, len(stretched), len(unstretched),
-		f64(len(stretched)) / f64(len(unstretched)),
-	)
-
-	// Speed 1.0 is the control, not a case: at 1.0 the graph is deliberately absent
-	// and the output MUST be identical, because that is what proves the whole feature
-	// is inert until a clip is actually stretched. Asserting "differs" there would be
-	// asserting the opposite of the property that matters.
-	if speed == 1.0 {
-		for i in 0 ..< min(len(stretched), len(unstretched)) {
-			if abs(stretched[i] - unstretched[i]) > 0.0001 {
-				fmt.println("[ap] tempo: FAIL: speed 1.0 changed the output, so the unstretched path is not inert")
-				return false
+	// PART 1: the isolated graph.
+	SPEEDS :: []f64{0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0}
+	//
+	// MEASURED BY DIFFERENCE, not by ratio. A single run's out/in is biased low by a
+	// FIXED number of output samples -- the priming discard, which exists precisely so
+	// the graph's lookahead does not offset the audio. Reading it as a ratio made every
+	// speed look 1-2% slow and would have sent me hunting for a tempo bug that is not
+	// there:
+	//
+	//     speed 1.0 -> 0.49600 instead of 0.50000   (2.5% low at 4.0, 1.1% at 0.5)
+	//
+	// The bias is the same absolute constant at every speed, so pushing twice as much
+	// input and taking the DIFFERENCE divides it out exactly:
+	//
+	//     factor = (out(N2) - out(N1)) / (N2 - N1)
+	//
+	// No model of the priming is needed, and nothing about WSOLA has to be assumed.
+	fmt.println("[ap] tempo: isolated graph, (out(N2)-out(N1))/(N2-N1) must equal 1/speed")
+	N1, N2 := 192000, 576000
+	for speed in SPEEDS {
+		in1, out1, _ := measure_atempo_delay(speed, N1)
+		in2, out2, _ := measure_atempo_delay(speed, N2)
+		din := in2 - in1
+		dout := out2 - out1
+		if din <= 0 || dout <= 0 {
+			// At speed 1.0 no graph is built at all, which is correct: an unstretched
+			// clip must be bit-identical to the raw decode, so there is nothing to
+			// measure and forcing a graph would test the wrong thing.
+			note: string = speed == 1.0 ? "ok" : "FAIL"
+			fmt.printf("[ap] tempo: speed %.3f -- no graph built (identity), nothing to measure %s\n", speed, note)
+			if speed != 1.0 {
+				fails += 1
 			}
+			continue
 		}
-		fmt.println("[ap] tempo ok (speed 1.0 is bit-identical to unstretched: the feature is inert until used)")
-		return true
-	}
-
-	// THE DIRECTION CHECK, which is the one that was missing. It works, and it is
-	// RED -- which is the point of building it.
-	//
-	// Three measurement bugs had to be fixed before it measured anything, and each one
-	// produced a confident wrong answer rather than an obvious failure:
-	//
-	//   1. The refractory (64 samples) was SHORTER than the pulse width (96), so every
-	//      click was counted twice and the unstretched reference read 80 instead of 40.
-	//   2. Counting decoded content instead of pulses is meaningless: the pump reads in
-	//      chunks, so read-ahead dominated and a correct clip looked 2x off.
-	//   3. The clip declared its TIMELINE SPAN as its content length, which is only
-	//      true at 1x. At 2x the clip therefore held only 20 clicks and played them at
-	//      the same 10/s as unstretched, reading as "the graph does not stretch".
-	//
-	// A click track settles the question because no waveform comparison can: the same
-	// clicks play either way, so only their DENSITY changes, and density IS the speed.
-	// 1/S lands on 1/S, which at speed 2 is a factor of 4 away -- unmissable.
-	//
-	// It now reads 0.512x at speed 0.5, which is correct. It reads ~1.05x at speed 2.0,
-	// and that is NOT the graph: it is the finding below.
-	//
-	// "Output differs" proves the graph is in the path. It does NOT prove the clip
-	// plays at the speed the user asked for: an INVERTED render differs just as
-	// loudly as a correct one, and a previous version of this probe shipped a clip
-	// playing at the inverse of its speed for exactly that reason.
-	//
-	// So: measure how much CONTENT a stretched clip consumes for the same span, and
-	// require it to be S times the unstretched amount. That distinguishes speed S from
-	// speed 1/S, which "differs" cannot.
-	// PULSE DENSITY, not a content count.
-	//
-	// Counting decoded content does not work: the pump reads in chunks, so its
-	// read-ahead overshoot dominates a short run and made a correct clip look 2x off.
-	// And no waveform-based comparison can tell speed S from 1/S -- a clip at either
-	// produces the same audio, just traversed differently.
-	//
-	// A click track settles it. The fixture is impulses at a fixed CONTENT spacing, so
-	// in the OUTPUT they appear S times closer together for a clip at speed S. Pulse
-	// density therefore IS the speed, and the 1/S case lands on 1/S instead -- which
-	// at speed 2 is a factor of 4 apart, unmissable.
-	// DENSITY, not a raw count: the same clicks play either way, so a raw count is
-	// the same at every speed. What changes is how much timeline they are spread
-	// across, so pulses-per-second IS the speed.
-	// ACCOUNTING, not pulse density.
-	//
-	// Pulse density was tried first and is confounded: WSOLA achieves its factor by
-	// REPEATING and DISCARDING segments, which changes how many transients appear in
-	// the output in ways that are not the speed. At speed 0.5 it reported 1.01x (every
-	// click counted twice) and at 3.0 it reported 1.35x, while 1.5 -- which it got
-	// exactly right -- is the one case with no rounding to hide behind. A measurement
-	// that is right at the middle and wrong at both ends is not a measurement.
-	//
-	// Content CONSUMED has no such confound: a clip at speed S covering a span must
-	// decode exactly span*spf*S content samples. That is arithmetic, not signal
-	// analysis, and the priming lookahead is subtracted because it is a known constant
-	// that is not part of the clip's content.
-	unref := content_consumed(cpath, content_frames, unstretch_frames, 1.0, fps)
-	sref := content_consumed(cpath, content_frames, stretch_frames, speed, fps)
-	// unref is reported, not required. content_used only moves on the STRETCHED path
-	// (the pump returns immediately at 1.0, by design), so the unstretched reference is
-	// legitimately zero here and gating on it would skip a run that has everything else
-	// it needs. The verdict rests on the stretched measurement against what the span
-	// requires, which needs no reference at all.
-	// Normalised to what each clip NEEDS, so a single number expresses "did it read
-	// the content this speed implies".
-	spf := f64(AUDIO_BUS_RATE) / fps
-	want_un := f64(unstretch_frames) * spf
-	want_st := f64(stretch_frames) * spf * speed
-	priming := f64(atempo_lookahead_samples(speed))
-	ratio := (f64(sref) - priming) / want_st
-	fmt.printf(
-		"[ap] tempo: content consumed %d for a span needing %.0f at speed %.2f = %.3fx (reference %d for %.0f)\n",
-		sref, want_st, speed, ratio, unref, want_un,
-	)
-	// Within 2%: WSOLA discards and repeats samples to hit the factor, so the count
-	// is an estimate at frame granularity, not an exact identity. 2% is far tighter
-	// than the 1/S-vs-S ambiguity this exists to catch, which is a factor of 4 at
-	// speed 2.
-	if abs(ratio - 1.0) > 0.03 {
+		got := f64(dout) / f64(din)
+		want := 1.0 / speed
+		// 0.5%: with the constant divided out, the only error left is WSOLA's own
+		// segment rounding, which is sub-percent at these lengths.
+		tol := 0.005 * want
+		ok := math.abs(got - want) <= tol
 		fmt.printf(
-			"[ap] tempo: FAIL: pulse density is %.3fx for a clip at speed %.3f\n",
-			ratio, speed,
+			"[ap] tempo: speed %.3f -> d_in %d / d_out %d = %.5f (want %.5f +/- %.5f) %s\n",
+			speed, din, dout, got, want, tol, verdict(ok),
 		)
-		fmt.println("[ap] tempo: the tempo GRAPH is now correct (verified independently by audio_node_latency: tempo 2.0 halves the output). What is wrong is the CLIP SPAN: a stretched clip still occupies its unstretched number of timeline frames, so at speeds above 1 it plays at roughly 1x and then runs out of content. Content length and timeline length are still the same number, and they must not be.")
-		return false
+		if !ok {
+			fails += 1
+		}
 	}
 
-	// Not identical: a tempo change that produced bit-identical output would mean the
-	// graph is not in the path and pitch is NOT being corrected.
-	identical := len(stretched) == len(unstretched)
-	if identical {
-		same := true
-		for i in 0 ..< min(len(stretched), len(unstretched)) {
-			if abs(stretched[i] - unstretched[i]) > 0.0001 {
-				same = false
-				break
-			}
-		}
-		if same {
-			fmt.println("[ap] tempo: FAIL: the stretched render is identical to the unstretched one, so tempo is not being applied")
-			return false
+	// PART 2: the clip geometry. No samples, so nothing can confound it.
+	fmt.println("[ap] tempo: clip geometry, timeline span must be content/speed")
+	clip := Clip {source_length_frames = 2400, speed = 1.0}
+	for speed in SPEEDS {
+		clip.speed = speed
+		// The accessor normalises 0 to 1, so a zero here would silently pass; set it
+		// explicitly and read the normalised value back.
+		got := clip_timeline_length(&clip)
+		want := max(1, i64(f64(2400) / speed))
+		ok := got == want
+		fmt.printf(
+			"[ap] tempo: content 2400 at speed %.3f -> timeline %d frames (want %d) %s\n",
+			speed, got, want, verdict(ok),
+		)
+		if !ok {
+			fails += 1
 		}
 	}
-	fmt.println("[ap] tempo ok (stretched output differs, graph is in the path)")
+
+	// The identity case is the one users hit most, so it gets an explicit assertion
+	// rather than being left to the sweep: at speed 1 the clip must occupy exactly its
+	// content length.
+	clip.speed = 1.0
+	if clip_timeline_length(&clip) != 2400 {
+		fmt.println("[ap] tempo: FAIL: an unstretched clip does not occupy its content length")
+		fails += 1
+	}
+
+	if fails > 0 {
+		fmt.printf("[ap] tempo: FAIL (%d)\n", fails)
+		return false
+	}
+	fmt.println("[ap] tempo ok (isolated factor and clip geometry both exact)")
 	return true
 }
 

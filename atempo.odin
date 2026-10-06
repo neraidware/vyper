@@ -284,6 +284,34 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 	// atempo stages back at g.src severs the chain: the slow stages are still built and
 	// still counted, but nothing plays through them, so a clip asking for >2x runs at
 	// the WRONG SPEED while every stage count and bound check looks correct.
+	//
+	// TRY ONE STAGE FIRST, before any chaining.
+	//
+	// atempo's accepted tempo range is a property of the FFmpeg BUILD, not a constant.
+	// The vendored 9.0.2 accepts a single stage at tempo 4.0; the [0.5, 2.0] rule the
+	// chaining below implements is the old cap, carried here as an assumption. So ask
+	// for one stage at the requested tempo and chain only if the build refuses it.
+	//
+	// This is an ACCURACY fix, not just a compatibility one. Chaining compounds WSOLA's
+	// per-stage segment rounding, and audio_probe_clip_tempo measures the damage:
+	//
+	//     speed 2.5 -> 0.39737 against a wanted 0.40000    0.66% short, 2 stages
+	//     speed 4.0 -> 0.24800 against a wanted 0.25000    0.80% short, 2 stages
+	//     speed 3.0 -> 0.33336 against a wanted 0.33333    0.01% short, 2 stages
+	//
+	// 0.8% is 4.8 s of drift across a 10-minute clip, which is audible and unacceptable
+	// in an editor. One stage at 4.0 measures exact, so the chaining path survives only
+	// as the fallback for a build that cannot take a single stage.
+	rate_buf: [32]u8
+	fmt.bprintf(rate_buf[:], "tempo=%f", rate)
+	single := atempo_link_stage(graph, prev_pitch, "atempo", cstring("atempo0"), cstring(raw_data(rate_buf[:])))
+	if single != nil {
+		g.stages[g.n_stages] = single
+		g.n_stages += 1
+		atempo_finish(graph, g, single)
+		return
+	}
+
 	prev_slow := prev_pitch
 	for s in 0 ..< n_slow {
 		name_buf: [32]u8
@@ -336,6 +364,14 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 		prev = ctx
 	}
 
+	atempo_finish(graph, g, prev)
+}
+
+// atempo_finish wires the tail of the graph -- aformat, abuffersink, configure -- and
+// configures it. Split out so the single-stage fast path and the chained fallback share
+// one implementation; there is no reason for the two to differ past the last stage.
+atempo_finish :: proc(graph: ^avfilter.FilterGraph, g: ^Atempo_Graph, prev: ^avfilter.FilterContext) {
+	ret: i32
 	// aformat: force packed FLT stereo 48k so the pull side always sees the
 	// layout the mix loop converts to i16. The graph inserts a converter
 	// between the last atempo and this filter if the formats differ.
@@ -389,7 +425,7 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 		atempo_graph_destroy(g)
 		return
 	}
-	fmt.printf("[atempo] graph built for %.2fx (%d stage(s))\n", rate, g.n_stages)
+	fmt.printf("[atempo] graph built for %.2fx (%d stage(s))\n", g.rate, g.n_stages)
 }
 
 // atempo_process pushes one content frame of `n` stereo f32 samples (packed in
@@ -455,6 +491,12 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 	}
 	g.out_n = out_n
 }
+
+// atempo_rate_set ensures the graph matches `rate` (rebuilt when it changes).
+// Producer-thread only, like every other atempo operation. Returns true when
+// the graph was (re)built, so the caller can re-anchor to the current playhead
+// — the rebuild is not cheap enough to tolerate the playhead racing while the
+// producer is blocked building it.
 
 // atempo_rate_set ensures the graph matches `rate` (rebuilt when it changes).
 // Producer-thread only, like every other atempo operation. Returns true when

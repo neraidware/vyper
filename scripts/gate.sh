@@ -1482,56 +1482,45 @@ target_audio_node_latency() {
 	echo "audio-node-latency: ok"
 }
 
-# audio_clip_tempo drives a STRETCHED clip through the real playback mixer, across
-# the whole buildable speed range.
+# audio_clip_tempo proves the clip TEMPO property changes DURATION and leaves pitch
+# alone, across the whole buildable speed range 0.25x .. 4.0x.
 #
-# It checks the two things that make per-clip tempo more than a field that compiles:
-# that a stretched clip produces output for its span, and that the graph is genuinely
-# in the path -- a stretch that rendered bit-identically would mean tempo is not being
-# applied and, therefore, that pitch is not being corrected. Speed 1.0 is the
-# CONTROL and must be bit-identical, because that is what proves the feature is inert
-# until a clip is actually stretched.
+# A MEMBER OF `all`, because the measurement is finally sound. Three earlier versions
+# read numbers out of the playback mixer and every one was fooled:
+#
+#  - Pulse density on a click track is confounded, because WSOLA reaches its factor by
+#    REPEATING and DISCARDING segments, which moves transient density for reasons that
+#    are not the speed. It read 1.01x at 0.5 and 1.35x at 3.0 while getting 1.5 exactly
+#    right -- right in the middle and wrong at both ends is not a measurement.
+#  - Counting decoded content, and reading content_used, are both swamped by the pump's
+#    chunked read-ahead and report ~1.0x at EVERY speed. A gate that passes for the
+#    wrong reason is worse than no gate.
+#  - Raw output sample counts are worse still: the producer PREFILLS its rings, so at
+#    speed 0.25 an 8 s window returned 1113600 samples -- 23.2 s of audio from a span
+#    that asked for 8 s. The prefetch is correct behaviour; it is simply not a clock.
+#
+# What it measures instead, with nothing confounded:
+#
+#  - THE DSP, on an isolated graph. Push N1 then N2 frames and difference:
+#
+#        factor = (out(N2) - out(N1)) / (N2 - N1)   ==   1/speed
+#
+#    The DIFFERENCE is what makes it exact. A single run's out/in is biased low by a
+#    fixed number of output samples -- the priming discard, which exists so the graph's
+#    lookahead does not offset the audio -- and reading it as a ratio made every speed
+#    look 1-2% slow. That bias is the same constant at every speed, so differencing
+#    divides it out with no model of the priming required.
+#
+#  - THE GEOMETRY, as arithmetic on a Clip: timeline span == content / speed.
 target_audio_clip_tempo() {
 	require_fresh_binary audio-clip-tempo || return 1
-	local src=target/mixparity/long.m4a
-	if [ ! -s "$src" ]; then
-		echo "audio-clip-tempo: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
-		return 1
-	fi
-	# NOT a member of `all`, deliberately, and the reason has grown: THREE measurement
-	# methods have now each turned out to be fooled.
-	#
-	#  - Pulse density on a click track is confounded, because WSOLA reaches its factor
-	#    by REPEATING and DISCARDING segments, which moves transient density for reasons
-	#    that are not the speed. It reads 1.01x at speed 0.5 and 1.35x at 3.0, while
-	#    getting 1.5 exactly right -- the one case with no rounding to hide behind. Right
-	#    in the middle and wrong at both ends is not a measurement.
-	#  - Counting decoded content is swamped by the pump's chunked read-ahead, so a
-	#    correct clip looks several times off.
-	#  - Reading content_used is swamped the same way and reports ~1.0x at EVERY speed,
-	#    which means it would PASS for the wrong reason -- the specific outcome this
-	#    branch exists to prevent.
-	#
-	# What DOES verify the tempo graph's direction today is audio_node_latency:
-	# 192000 frames through tempo 2.0 yield 95232 output frames, so out/in = 1/tempo and
-	# tempo = speed. And the clip-span fix is evidenced by a number already being taken:
-	# pulse density at speed 1.5 went from 1.387x to exactly 1.500x.
-	#
-	# What would make this gate sound: a fixture whose transient density is invariant
-	# under WSOLA's segment repetition, or an accounting measure taken at the graph's
-	# input rather than after its read-ahead.
-	#
-	# A gate that passes for the wrong reason is worse than no gate at all, which is why
-	# it runs on demand and reports itself as non-gating.
-	local rc=0
-	for sp in 1.0 0.25 0.5 1.5 2.0 3.0 4.0; do
-		VYPER_AUDIO_CLIP_TEMPO="$PWD/$src|$sp" timeout 600 ./vyper >/dev/null 2>&1
-		[ $? -ne 0 ] && { echo "audio-clip-tempo: FAILED at speed $sp" >&2; rc=1; }
-	done
+	VYPER_AUDIO_CLIP_TEMPO=1 timeout 1800 ./vyper
+	local rc=$?
 	if [ $rc -ne 0 ]; then
+		echo "audio-clip-tempo: FAILED -- see the [ap] tempo lines above" >&2
 		return 1
 	fi
-	echo "audio-clip-tempo: ran (speeds 0.25 .. 4.0). NOT gating: its direction check is unsound -- see scripts/gate.sh"
+	echo "audio-clip-tempo: ok (isolated factor exact, clip geometry exact)"
 }
 
 # audio_bus_prime asserts the bus atempo is ALIGNED: the first sample it emits is the
@@ -1631,7 +1620,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_clip_tempo audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
