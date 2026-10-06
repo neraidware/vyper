@@ -22,6 +22,38 @@ vyper_trace: bool = false
 // inferred from end-state assertions. Enabled with VYPER_PLAY_TRACE=1.
 play_trace := false
 
+// repro_trace: the audio REPRODUCTION engine's own trace, with ANOMALY DETECTION.
+//
+// play_trace prints what each loop did. It does not say whether any of it was WRONG,
+// which is why it has been read four times without settling the reported symptom of
+// audio that repeats, does not match the picture, and jumps. This trace exists to name
+// the three faults as they happen, at the tick they happen, rather than leaving them to
+// be inferred from end-state assertions:
+//
+//   REPEAT -- the producer's content position moving BACKWARDS during forward playback.
+//     That is the mechanical definition of audio repeating: the engine is re-feeding
+//     content it has already played. Nothing else in the engine can produce it.
+//   JUMP -- a large single-tick advance with no user action behind it.
+//   DESYNC -- the playhead and the device clock disagreeing by more than a frame.
+//
+// The first tick after enabling re-establishes the baseline and prints nothing but a
+// BASELINE line, because the previous position is whatever the previous run left.
+repro_trace := false
+
+// REPRO_JUMP_FRAMES is the single-tick advance that counts as a jump rather than normal
+// catch-up. A forward skip can legitimately move many frames (a slow provision, a far
+// jump), so the threshold has to clear ordinary catch-up: the cushion is
+// AUDIO_CUSHION_SEC (0.25s), so a healthy tick advances on the order of one frame and a
+// full cushion refill is 15 at 60 fps. 90 is ~6 cushions in one tick, which nothing
+// legitimate does.
+REPRO_JUMP_FRAMES :: 90
+
+// REPRO_DESYNC_FRAMES is how far the playhead may sit from the device clock before it is
+// called desynced. The producer deliberately runs AUDIO_CUSHION_SEC AHEAD of the audible
+// position, so a couple of frames of skew is the design, not a fault. 30 frames is half a
+// second at 60 fps, which is well past anything the cushion explains.
+REPRO_DESYNC_FRAMES :: 30
+
 WINDOW_WIDTH :: 1280
 WINDOW_HEIGHT :: 720
 

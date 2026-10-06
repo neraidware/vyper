@@ -1845,6 +1845,43 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// drag, so without this the clock overrules the pointer every frame and the
 		// playhead cannot be dragged back at all. Delete this only together with the
 		// stop it depends on.
+		// SCRUB LOGGING: the adoption DECISION, every tick, with the reason.
+		//
+		// The pointer scrub already logs where it put the playhead, and that has been
+		// enough to see the drag work and not enough to see WHY the playhead ended up
+		// somewhere else afterwards. This is the only place a non-user agent moves the
+		// playhead during playback, so it is the only candidate for "it jumped", and it
+		// was previously invisible: a blocked adoption and an adoption are the same
+		// absence from the log.
+		//
+		// Logged under play_trace rather than a flag of its own so one switch turns on
+		// the whole story -- pointer writes, adoption decisions, producer positions --
+		// in one interleaved stream, which is the only way to read an ordering.
+		if play_trace {
+			decision := "held"
+			reason := "dev<=playhead"
+			switch {
+			case active_interaction == .Playhead_Scrub:
+				reason = "SCRUB owns the playhead"
+			case !clock_current:
+				reason = "device reading is STALE"
+			case dev <= playhead.frame:
+				reason = "device is behind the playhead"
+			case:
+				decision = "ADOPTED"
+				reason = "device is ahead and current"
+			}
+			fmt.printf(
+				"[ui]  clock ph=%d dev=%d -> %s (%s; scrub=%v resync=%d dev_resync=%d)\n",
+				playhead.frame,
+				dev,
+				decision,
+				reason,
+				active_interaction == .Playhead_Scrub,
+				resync_now,
+				dev_resync,
+			)
+		}
 		if clock_current && dev > playhead.frame && active_interaction != .Playhead_Scrub {
 			playhead.frame = dev
 		}
@@ -1915,6 +1952,12 @@ main :: proc() {
 	}
 	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
 	play_trace = os.get_env_alloc("VYPER_PLAY_TRACE", context.temp_allocator) == "1"
+	// VYPER_REPRO_TRACE=1 turns on the audio reproduction engine's own trace, which
+	// prints one line per producer feed pass and an explicit ANOMALY line for each
+	// REPEAT / JUMP / DESYNC. It is separate from play_trace because it runs on the
+	// PRODUCER thread and answers a different question: not "what did each loop do"
+	// but "was any of it wrong".
+	repro_trace = os.get_env_alloc("VYPER_REPRO_TRACE", context.temp_allocator) == "1"
 	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
 	// the audio producer reads playback.rate for its atempo graph and cushion.
@@ -2485,9 +2528,16 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		if vyper_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 		}
-		// import_media only reads this cstring (the bin clones it into session
-		// heap), so the null-terminated scratch copy dies with the frame arena.
-		import_media(strings.clone_to_cstring(autoplay))
+		// open_file_at, not import_media: it routes a .vyproj to the project loader
+		// first, and import_media probes the path as MEDIA -- which fails on CBOR and
+		// leaves the autoplay harness with an empty project and nothing to play. That
+		// made `VYPER_REPRO_TRACE=1 VYPER_AUTOPLAY=~/x.vyproj` produce no trace at all,
+		// which reads as "clean" rather than "never ran" -- the same trap the anomaly
+		// baseline exists to avoid.
+		//
+		// Only reads this cstring (the bin clones it into session heap), so the
+		// null-terminated scratch copy dies with the frame arena.
+		open_file_at(strings.clone_to_cstring(autoplay))
 		if vyper_trace {
 			fmt.printf(
 				"[autoplay] env=\"%s\" imported tracks=%d step=delay\n",

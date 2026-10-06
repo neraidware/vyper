@@ -2645,6 +2645,116 @@ timeline_has_audio_at :: proc(f: i64) -> bool {
 	return false
 }
 
+
+// repro_baseline is the previous pass's producer position, and the presence flag that
+// says whether there IS one. Package scope because a diagnostic that had to thread its
+// state through audio_producer_feed's signature would not have been written.
+repro_last_prod:  i64 = 0
+repro_have_prod: bool = false
+repro_repeats:   i64 = 0
+repro_jumps:     i64 = 0
+repro_desyncs:   i64 = 0
+
+// repro_report is the audio reproduction engine's trace: one structured line per feed
+// pass, plus an explicit ANOMALY line for each of the three faults the reported symptom
+// is made of.
+//
+// It lives here, at the end of the pass, rather than in the UI thread for one reason: the
+// producer is the only thing that knows where the AUDIO is. The playhead is a readout of
+// the device clock, so a fault that moves the producer without moving the playhead -- or
+// the reverse -- is invisible from the UI side, and that asymmetry is exactly what
+// "repeating but the playhead looks fine" is.
+//
+// Every counter is cumulative so a long run can be summarised by its totals rather than
+// by counting lines.
+repro_report :: proc(fps: f64, dev_pos: i64) {
+	// next_frame, NOT audio_prod.prod_frame, is the position this detector must watch.
+	// prod_frame is only republished on a provision or a reconcile, so it is flat
+	// across a hundred ordinary feed passes -- which means a per-tick jump is
+	// invisible in it. Measured while building this: injecting next_frame += 200
+	// produced a DESYNC line and NO JUMP line, because prod_frame had not moved at all.
+	//
+	// Safe to read next_frame here because this runs on the producer thread, at the
+	// end of that same pass -- the same thread and the same tick that just advanced it.
+	prod := audio_src.next_frame
+	dev := sync.atomic_load(&playback.dev_frame)
+	dev_resync := sync.atomic_load(&playback.dev_resync)
+	resync := sync.atomic_load(&audio_prod.resync)
+	queued := audio_device_queued()
+	sources := audio_src.count
+	playing := sync.atomic_load(&audio_prod.run)
+
+	if !repro_have_prod {
+		// First pass: establish the baseline and say so. Without this the very first
+		// tick reports a jump of whatever the previous run left behind, which is how a
+		// diagnostic talks you into a bug that is not there.
+		repro_have_prod = true
+		repro_last_prod = prod
+		fmt.printf(
+			"[repro] BASELINE next=%d published_prod=%d dev=%d resync=%d sources=%d queued=%d running=%t (anomaly counting starts now)\n",
+			prod, sync.atomic_load(&audio_prod.prod_frame), dev, resync, sources, queued, playing,
+		)
+		return
+	}
+	delta := prod - repro_last_prod
+	repro_last_prod = prod
+
+	fmt.printf(
+		"[repro] next=%d (d%+d) published_prod=%d dev=%d dev_resync=%d resync=%d srcs=%d q=%d fed=%d run=%t ph=%d\n",
+		prod, delta, sync.atomic_load(&audio_prod.prod_frame), dev, dev_resync, resync,
+		sources, queued, audio_rpt.total_fed_frames, playing, playhead.frame,
+	)
+
+	// REPEAT: the producer's content position went BACKWARDS while running forward.
+	// This is the mechanical definition of audio repeating -- content already played
+	// is being fed again -- and no other fault in the engine produces it. A single
+	// backwards tick is worth reporting even if it is small, because a rewind of one
+	// frame is audible as a stutter and a rewind of a cushion is a loop.
+	if playing && delta < 0 {
+		repro_repeats += 1
+		fmt.printf(
+			"[repro] ANOMALY REPEAT #%d: producer went BACKWARDS %d -> %d (%d frames, %.3f s) while running forward\n",
+			repro_repeats, prod - delta, prod, -delta, f64(-delta) / max(f64(fps), 1),
+		)
+	}
+	// JUMP: a large advance with no user action behind it. Read against the
+	// [repro] CAUSE line the forward-skip branch prints when IT is the cause; if no
+	// CAUSE line precedes the jump, the advance came from the fill loop and the next
+	// thing to ask is why the queue emptied.
+	if playing && delta >= REPRO_JUMP_FRAMES {
+		repro_jumps += 1
+		fmt.printf(
+			"[repro] ANOMALY JUMP #%d: producer advanced %d -> %d (+%d frames, %.2f s) in one pass\n",
+			repro_jumps, prod - delta, prod, delta, f64(delta) / max(f64(fps), 1),
+		)
+	}
+	// DESYNC: the playhead and the device clock disagree. Reported only when the
+	// reading is CURRENT (dev_resync == resync), because a stale dev_frame is a known
+	// and intended state for a few ms after every seek -- reporting that as desync
+	// would bury the real thing in noise.
+	if playing && dev_resync == resync {
+		if gap := playhead.frame - dev; gap > REPRO_DESYNC_FRAMES || -gap > REPRO_DESYNC_FRAMES {
+			repro_desyncs += 1
+			fmt.printf(
+				"[repro] ANOMALY DESYNC #%d: playhead %d vs device %d (%+d frames, %+.3f s), reading is CURRENT\n",
+				repro_desyncs, playhead.frame, dev, gap, f64(gap) / max(f64(fps), 1),
+			)
+		}
+	}
+}
+
+// repro_summary prints the totals and resets the counters, so a run can be summarised
+// without keeping the whole trace. Called by the probe harness at the end of a run.
+repro_summary :: proc() {
+	fmt.printf(
+		"[repro] SUMMARY repeats=%d jumps=%d desyncs=%d over %d passes\n",
+		repro_repeats, repro_jumps, repro_desyncs,
+		audio_rpt.total_fed_frames,
+	)
+	repro_repeats, repro_jumps, repro_desyncs = 0, 0, 0
+	repro_have_prod = false
+}
+
 // audio_producer_feed mixes whole timeline frames up to a target derived from
 // the sound device's own consumption: everything pushed minus what is still in
 // the stream queue is what the device has actually played, and that position
@@ -2771,6 +2881,16 @@ audio_producer_feed :: proc() {
 				ring_drop(&s.fifo, drop)
 			}
 		}
+		if repro_trace {
+			// This is the ONLY place in the engine that advances next_frame without a
+			// decode, so it is the only candidate for an audible jump. Naming it here
+			// means a `[repro] ANOMALY JUMP` line further down can be read against the
+			// cause instead of leaving the two to be correlated by hand.
+			fmt.printf(
+				"[repro] CAUSE jump_frame %d -> %d (+%d) trimmed %d samples, cleared the queue\n",
+				audio_src.next_frame, jmp, jmp - audio_src.next_frame, delta48,
+			)
+		}
 		audio_src.next_frame = jmp
 		audio_device_clear()
 		atempo_reset(&audio_atempo) // graph window holds pre-jump samples otherwise
@@ -2812,6 +2932,11 @@ audio_producer_feed :: proc() {
 	// scrub gets overwritten by the previous run's position on the very next
 	// tick -- which is the playhead refusing to move back.
 	sync.atomic_store(&playback.dev_resync, sync.atomic_load(&audio_prod.resync))
+	// Anomaly report LAST, so it sees the positions this pass just published rather
+	// than the ones it was about to publish.
+	if repro_trace {
+		repro_report(fps, dev_pos)
+	}
 	// Fold live gain edits (knob drag) into provisioned segments before mixing.
 	// The epoch check is cheap; folding only runs when the UI published a gain
 	// change since the last fold. No seek, so the drag is audible within the

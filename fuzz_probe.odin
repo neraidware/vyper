@@ -451,6 +451,15 @@ fuzz_probe_run :: proc(v: string) {
 	// audio clips on 5 of its 7 tracks and the producer held no source for the whole
 	// run -- which would have made "no audio bugs found" a statement about a harness
 	// that never played audio.
+	// The audio engine's anomaly detector runs alongside the randomised actions, so a
+	// REPEAT / JUMP / DESYNC caused by scrubbing -- the reported trigger -- is named at
+	// the tick it happens instead of having to be inferred afterwards. Read here because
+	// probes dispatch before main() sets it.
+	repro_trace = os.get_env_alloc("VYPER_REPRO_TRACE", context.temp_allocator) == "1"
+	if repro_trace {
+		fmt.println("[fuzz] repro trace ON -- REPEAT/JUMP/DESYNC will be reported by the producer thread")
+	}
+
 	audio_up := audio_init()
 	have_device := audio_device_ready()
 	if have_device {
@@ -616,6 +625,9 @@ fuzz_probe_run :: proc(v: string) {
 	if f.playing_ticks == 0 {
 		fmt.println("[fuzz] FAIL: no tick ran while playing -- the device-clock path was never exercised")
 		os.exit(1)
+	}
+	if repro_trace {
+		repro_summary()
 	}
 	if has_audio && have_device && !f.saw_audio_src {
 		fmt.println(

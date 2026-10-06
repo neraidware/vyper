@@ -243,6 +243,18 @@ click_cases := []Click_Case{
 playhead_scrub_arm :: proc() {
 	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = false
+	if play_trace {
+		// Arming is where the playhead stops being a readout and becomes the pointer's,
+		// so it is the one moment to record what the clock said on the way in. Without
+		// it, a jump measured after the release has no "before" to be measured against.
+		fmt.printf(
+			"[ui]  scrub ARM at ph=%d (device reads %d, current=%t, playing=%t)\n",
+			playhead.frame,
+			sync.atomic_load(&playback.dev_frame),
+			sync.atomic_load(&playback.dev_resync) == sync.atomic_load(&audio_prod.resync),
+			playhead.playing,
+		)
+	}
 	// Seeded with the CURRENT generation, not zero: a zero here would read as
 	// "a seek is outstanding" forever and the drag would never tell the producer
 	// anything.
@@ -1425,7 +1437,19 @@ interaction_release :: proc(inp: Mouse_Input) {
 		// and so re-provisions nothing.
 		if playhead_scrub.moved {
 			if play_trace {
-				fmt.printf("[ui]  scrub RELEASE at ph=%d\n", playhead.frame)
+				// The committed position, the position the engine's clock still names,
+				// and the generation gap between them. The third is the one that matters:
+				// audio_seek bumps resync, so until the producer adopts it dev_frame is
+				// STALE by construction and describes where the sound was BEFORE the
+				// scrub. If the playhead jumps forward after this line, that gap is why,
+				// and it is visible here rather than inferred afterwards.
+				fmt.printf(
+					"[ui]  scrub RELEASE commit ph=%d (device still reads %d, %d generation behind)\n",
+					playhead.frame,
+					sync.atomic_load(&playback.dev_frame),
+					sync.atomic_load(&audio_prod.resync) -
+					sync.atomic_load(&playback.dev_resync),
+				)
 			}
 			audio_seek(playhead.frame)
 		}
