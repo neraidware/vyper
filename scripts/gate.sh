@@ -1475,13 +1475,31 @@ target_audio_clip_tempo() {
 		echo "audio-clip-tempo: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
 		return 1
 	fi
-	# NOT a member of `all`, deliberately. The speed-direction check inside this probe
-	# is currently unsound -- it reports ~1.0x at every speed, so it is not measuring
-	# what it claims -- and a gate that fails for the wrong reason gets disabled, while
-	# a gate that passes for the wrong reason is worse than no gate at all.
+	# NOT a member of `all`, deliberately, and the reason has grown: THREE measurement
+	# methods have now each turned out to be fooled.
 	#
-	# What does verify the direction today is audio_node_latency: 192000 frames through
-	# tempo 2.0 yield 95232 output frames, so out/in = 1/tempo and tempo = speed.
+	#  - Pulse density on a click track is confounded, because WSOLA reaches its factor
+	#    by REPEATING and DISCARDING segments, which moves transient density for reasons
+	#    that are not the speed. It reads 1.01x at speed 0.5 and 1.35x at 3.0, while
+	#    getting 1.5 exactly right -- the one case with no rounding to hide behind. Right
+	#    in the middle and wrong at both ends is not a measurement.
+	#  - Counting decoded content is swamped by the pump's chunked read-ahead, so a
+	#    correct clip looks several times off.
+	#  - Reading content_used is swamped the same way and reports ~1.0x at EVERY speed,
+	#    which means it would PASS for the wrong reason -- the specific outcome this
+	#    branch exists to prevent.
+	#
+	# What DOES verify the tempo graph's direction today is audio_node_latency:
+	# 192000 frames through tempo 2.0 yield 95232 output frames, so out/in = 1/tempo and
+	# tempo = speed. And the clip-span fix is evidenced by a number already being taken:
+	# pulse density at speed 1.5 went from 1.387x to exactly 1.500x.
+	#
+	# What would make this gate sound: a fixture whose transient density is invariant
+	# under WSOLA's segment repetition, or an accounting measure taken at the graph's
+	# input rather than after its read-ahead.
+	#
+	# A gate that passes for the wrong reason is worse than no gate at all, which is why
+	# it runs on demand and reports itself as non-gating.
 	local rc=0
 	for sp in 1.0 0.25 0.5 1.5 2.0 3.0 4.0; do
 		VYPER_AUDIO_CLIP_TEMPO="$PWD/$src|$sp" timeout 600 ./vyper >/dev/null 2>&1
