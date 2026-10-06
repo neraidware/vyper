@@ -2035,6 +2035,12 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		proxy_bg_probe_run(xb)
 		return
 	}
+	// VYPER_FUZZ="<project.vyproj>|<iters>|<seed>" -- randomised actions over a REAL
+	// project, through the same entry points the frame loop uses. See fuzz_probe.odin.
+	if fz, _ := os.lookup_env_alloc("VYPER_FUZZ", context.temp_allocator); fz != "" {
+		fuzz_probe_run(fz)
+		return
+	}
 	if xi, _ := os.lookup_env_alloc("VYPER_IMAGE_PROBE", context.temp_allocator); xi != "" {
 		probe_image_run(xi)
 		return
@@ -2122,6 +2128,13 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// wrong samples.
 	if sl, _ := os.lookup_env_alloc("VYPER_AUDIO_SEEK_LANDING", context.temp_allocator); sl != "" {
 		ok: bool = audio_probe_seek_landing_offset(sl)
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_GROUP_ISOLATION=<path> -- adjacent same-file clips at different
+	// clip speeds must each be mixed by a graph built for their own speed. The
+	// regression test for the grouping bug the fuzz harness found.
+	if gi, _ := os.lookup_env_alloc("VYPER_AUDIO_GROUP_ISOLATION", context.temp_allocator); gi != "" {
+		ok: bool = audio_probe_group_tempo_isolation(gi)
 		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_CLIP_TEMPO_EDIT=<path> edits an already-provisioned clip from

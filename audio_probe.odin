@@ -4172,3 +4172,129 @@ find_audio_track :: proc() -> ^Track {
 	}
 	return nil
 }
+
+// audio_probe_group_tempo_isolation is the regression test for the grouping bug the
+// fuzz harness found on the user's own ~/sallyface.vyproj.
+//
+// Two audio clips cut from the SAME file and placed ADJACENTLY are contiguous in
+// both timeline and source, which is every condition audio_provision_find_group used
+// to check. Two adjacent cuts of one file are the most ordinary thing a timeline
+// contains, and nothing about the geometry distinguishes them.
+//
+// So the second was folded into the first's group and mixed through the first's
+// atempo graph -- a 0.5x clip playing at 1x. Measured as a runtime assertion on the
+// real project:
+//
+//	audio_build_groups: one atempo graph cannot serve segments with different clip speed/pitch
+//
+// which is the engine telling the truth about a decision made in the wrong place.
+//
+// The assertion is right; the grouping was wrong. This probe pins the FIX, at the
+// granularity that matters: not "it does not crash" but "each speed gets its own
+// graph, and each graph is built for its own speed".
+audio_probe_group_tempo_isolation :: proc(path: string) -> bool {
+	defer audio_probe_timeline_reset()
+	path_buf: [4096]u8
+	assert(len(path) < len(path_buf), "audio_probe_group_tempo_isolation: path buffer overflow")
+	path_n := len(path)
+	for i in 0 ..< path_n {
+		path_buf[i] = u8(path[i])
+	}
+	path_buf[path_n] = 0
+	cpath := cstring(&path_buf[0])
+
+	// Adjacent clips, SAME file, SAME stream, contiguous in both axes. The ONLY
+	// difference is speed -- so if grouping folds them together it is because it
+	// ignored the tempo, which is the defect.
+	//
+	// The first TWO are both 1.0x and they ARE contiguous, so they must SHARE a
+	// group and one decoder. That is what makes this a real test in both directions:
+	// a fix that simply refuses to continue any group would pass a "different speeds
+	// never share" assertion while breaking every ordinary multi-clip timeline, and
+	// that is the failure mode a naive guard here would have.
+	speeds := []f64{1.0, 1.0, 0.5, 2.0}
+	span := i64(150)
+	timeline.tracks = make([dynamic]Track, 0, 2)
+	timeline.track_order = make([dynamic]int, 0, 2)
+	atrack := Track {name = "a", clips = make([dynamic]Clip, 0, 8)}
+	at := i64(0)
+	src_at := i64(0)
+	for sp in speeds {
+		append(
+			&atrack.clips,
+			Clip {
+				clip_id = new_clip_id(),
+				path = cpath,
+				kind = .Audio,
+				name = session_str_intern("audio"),
+				timeline_start_frame = at,
+				source_length_frames = span,
+				// The SOURCE position advances by the clip's CONTENT length, separately
+				// from the timeline position. Contiguity is checked in BOTH axes by
+				// audio_provision_find_group, so a fixture that advanced only the
+				// timeline would fail the source test for reasons that have nothing to
+				// do with tempo -- which is exactly what the first two versions of this
+				// probe did.
+				source_start_frame = src_at,
+				stream_index = 0,
+				speed = sp,
+			},
+		)
+		// Advance by the clip's TIMELINE length, which is content length / speed.
+		// Stepping by a constant would overlap every slower clip with the next one and
+		// quietly test a different timeline than the one described.
+		at += max(1, i64(f64(span) / sp))
+		src_at += span
+	}
+	append(&timeline.tracks, atrack)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+
+	audio_provision(0)
+	defer audio_reset_play()
+
+	fmt.printf(
+		"[ap] group-isolation: %d adjacent same-file clips at speeds %v -> %d source groups\n",
+		len(speeds),
+		speeds,
+		audio_src.count,
+	)
+	// Three groups: the two contiguous 1.0x clips share one decoder, and the 0.5x
+	// and 2.0x clips each need their own graph. One group would be the bug; four
+	// would be the opposite bug, refusing to continue a group that matches.
+	want_groups := 3
+	if audio_src.count != want_groups {
+		fmt.printf(
+			"[ap] group-isolation: FAIL: %d groups, want %d -- clips sharing a file were folded across a tempo change\n",
+			audio_src.count,
+			want_groups,
+		)
+		return false
+	}
+	// And each group must be built for the tempo of the clips it holds. A count
+	// alone would pass if the right number of groups held the wrong speeds.
+	for k in 0 ..< audio_src.count {
+		g := &audio_src.slots[k]
+		if g.seg_count == 0 {
+			continue
+		}
+		// Play_Seg carries the tempo of the clip it came from, so this compares the
+		// graph against the segments it will actually mix -- not against a list the
+		// probe wrote, which could drift from what the engine built.
+		for si in 0 ..< g.seg_count {
+			if g.speed != g.seg[si].speed {
+				fmt.printf(
+					"[ap] group-isolation: FAIL: group %d holds a %.3fx segment but its graph is built for %.3fx\n",
+					k,
+					g.seg[si].speed,
+					g.speed,
+				)
+				return false
+			}
+		}
+		fmt.printf("[ap] group-isolation: group %d speed=%.3fx segs=%d\n", k, g.speed, g.seg_count)
+	}
+	fmt.println("[ap] group-isolation ok (each clip is mixed by a graph built for its own speed)")
+	return true
+}

@@ -1571,13 +1571,36 @@ play_src_first_seg_at :: proc(s: ^Play_Src, f: i64) -> ^Play_Seg {
 }
 
 // audio_provision_find_group returns the existing group that chip continues
-// exactly (same path/stream, contiguous with its last segment in both timeline
-// and source), or nil when chip must start a new group. A split produces the
-// contiguous case; everything else keeps a forward-only fifo correct.
+// exactly (same path/stream, same clip speed and pitch, contiguous with its last
+// segment in both timeline and source), or nil when chip must start a new group.
+// A split produces the contiguous case; everything else keeps a forward-only fifo
+// correct.
+//
+// SPEED AND PITCH ARE PART OF "EXACTLY", and leaving them out is the bug this
+// comment exists for. A group owns ONE atempo graph, snapshotted from the first
+// chip that created it, so folding a differently-tempoed chip into it mixes that
+// clip through the WRONG tempo factor: a 0.5x clip plays at 1x, a 1x clip plays at
+// 0.5x. That is audible as a clip that does not match its picture, and -- because
+// WSOLA running at a factor it was not built for is exactly a time-stretcher
+// hunting for match points it cannot find -- as audio that repeats.
+//
+// Contiguity alone found this pair, because two adjacent clips cut from the same
+// file ARE contiguous in both timeline and source. Nothing about the geometry
+// distinguishes them; only the tempo does.
+//
+// Measured on the user's own ~/sallyface.vyproj (85 audio clips on 5 of 7 tracks):
+// loading it with the audio device up tripped the downstream assertion
+//
+//	audio_build_groups: one atempo graph cannot serve segments with different clip speed/pitch
+//
+// which is this function's decision arriving too late. The assertion was RIGHT and
+// the grouping was wrong; the fix belongs here, where the choice is made.
 audio_provision_find_group :: proc(
 	slot: ^Audio_Geom_Slot,
 	chip: ^Audio_Geom_Chip,
 	reclaim: ^[MAX_PLAY_AUDIO]bool,
+	want_speed: f64,
+	want_pitch_ratio: f64,
 ) -> ^Play_Src {
 	chip_path := audio_chip_path(slot, chip)
 	// First: continue a group this pass has already started. A split's second half
@@ -1588,6 +1611,9 @@ audio_provision_find_group :: proc(
 			continue
 		}
 		if string(g.path) != chip_path {
+			continue
+		}
+		if g.speed != want_speed || g.pitch_ratio != want_pitch_ratio {
 			continue
 		}
 		last := &g.seg[g.seg_count - 1]
@@ -1618,6 +1644,11 @@ audio_provision_find_group :: proc(
 		if string(g.path) != chip_path {
 			continue
 		}
+		// Same tempo test as above: a reclaimed slot carries the group it was, and
+		// that group's graph is built for ITS speed.
+		if g.speed != want_speed || g.pitch_ratio != want_pitch_ratio {
+			continue
+		}
 		reclaim[k] = false
 		return g
 	}
@@ -1638,7 +1669,9 @@ audio_provision_find_group :: proc(
 audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]bool) {
 	for i in 0 ..< slot.n {
 		chip := &slot.chip[i]
-		g := audio_provision_find_group(slot, chip, reclaim)
+		// Computed before the group search because the search now REQUIRES them: the
+		// tempo is part of what makes a group continuable, not a property read off
+		// the winner afterwards.
 		want_speed := chip.speed
 		if want_speed == 0 {
 			want_speed = 1.0
@@ -1648,6 +1681,7 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 		if want_pitch_ratio <= 0 {
 			want_pitch_ratio = 1.0
 		}
+		g := audio_provision_find_group(slot, chip, reclaim, want_speed, want_pitch_ratio)
 		if g == nil {
 			if audio_src.count >= MAX_PLAY_AUDIO {
 				if !audio_src.overflow {
@@ -1693,6 +1727,11 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			audio_src.count += 1
 		}
 		if g.seg_count > 0 {
+			// Now a consequence of audio_provision_find_group's contract rather than a
+			// hope: a group is only continuable when its tempo matches, so a chip
+			// already in a group must match it. Kept because it is the invariant that
+			// makes "one graph per group" true, and it is the assertion that named the
+			// ~/sallyface.vyproj grouping bug.
 			assert(
 				g.speed == want_speed && g.pitch_ratio == want_pitch_ratio,
 				"audio_build_groups: one atempo graph cannot serve segments with different clip speed/pitch",

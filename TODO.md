@@ -7291,3 +7291,115 @@ five failures on the first viewport alone, including the two shapes the real bug
 a full-height band at non-zero y, and a lane extending past the bottom edge.
 
 Gates: probe, gpu_composite, gpu_nv12 pass. -vet clean.
+
+## Active 40 — Randomised actions over a real project found an audio grouping bug
+
+**Status: fixed 2026-10-06.** Built because the user asked for it: open their project,
+scrub randomly, do as many actions as possible, catch bugs. The harness is
+`scripts/gate.sh fuzz <project.vyproj> [iters] [seed]` (`VYPER_FUZZ`).
+
+### Active 40, first defect — two clips at different speeds shared one tempo graph
+
+The find. Running the harness over `~/sallyface.vyproj` (7 tracks, 103 clips, 359,171
+frames, 60 fps, **85 audio clips on 5 of the 7 tracks**) aborted:
+
+    audio.odin(1696:4) runtime assertion:
+      audio_build_groups: one atempo graph cannot serve segments with different clip speed/pitch
+
+`SIGILL`, exit 132, on the producer thread.
+
+**Cause.** `audio_provision_find_group` decided a chip *continues* an existing group
+from three things: same stream, same path, and contiguity in both timeline and source.
+It never looked at **speed or pitch**. A group owns one atempo graph, snapshotted from
+the first chip that created it, so the second clip was mixed through the first clip's
+tempo factor — a 0.5x clip playing at 1x.
+
+Contiguity is what found the pair, and that is the uncomfortable part: **two adjacent
+clips cut from the same file ARE contiguous in both timeline and source.** Nothing
+about the geometry distinguishes them. Only the tempo does.
+
+**Why it reads as the reported symptom.** A clip mixed at the wrong tempo factor does
+not merely shift in time — WSOLA running at a factor its graph was not built for is a
+time-stretcher hunting for match points it cannot find, which is *literally repeating*.
+And a 0.5x clip played at 1x is *not matching video*. This is the best candidate yet
+for "audio playback is literally repeating, not matching video".
+
+**Fix.** Speed and pitch are part of "exactly", enforced where the decision is made.
+`audio_provision_find_group` now takes `want_speed`/`want_pitch_ratio` and refuses to
+continue (or reclaim) a group whose tempo differs. The assertion stays: it is now a
+consequence of the contract rather than a hope, and it is the assertion that named
+this.
+
+Comparison is exact, not epsilon, and that is correct rather than lucky: a group's
+`speed`/`pitch_ratio` are computed from the same chip fields by the same expressions
+(`want_speed = chip.speed` with the 0 -> 1.0 snap; `semitones_to_ratio(
+audio_pitch_semitones(&chip.pitch, 0))`), so equal inputs give bit-equal values.
+
+### Active 40, the harness's own bugs — worth more than the finding
+
+Three of the four bugs found were in the harness, and each one produced a *clean* run
+that meant nothing. Recorded because a fuzz harness that cannot fail is worse than no
+harness.
+
+1. **It reported 600 clean iterations while arming ZERO scrubs.** Scrub targets were
+   drawn from the whole 359k-frame timeline, so at any real zoom nearly every candidate
+   mapped off the visible ruler and the press missed. It now draws from the visible
+   span, and **fails when any action counter is zero** — a run that reached nothing is a
+   broken harness, not a passing one.
+2. **It cancelled every drag.** `interaction_post_build` was handed a zeroed mouse
+   input while a gesture was in flight, which reads as "no button held"; the post-build
+   step tore the scrub down before the next move saw it. `armed` was non-zero and
+   `moved` exactly zero, which is what exposed it. Interaction now gets the same input
+   the move got (`fuzz_inp`).
+3. **It never touched the audio engine.** Probes dispatch before `main`'s `audio_init`,
+   so there was no device, `audio_producer_proc` returned on its first line, and the
+   producer held no source for the whole run. It now calls `audio_init` itself and
+   **fails if the project has audio clips and the producer never held a source** — the
+   same vacuous-pass shape, found the same way.
+4. Clay was never initialised either (`Clay_SetLayoutDimensions` segfault on iteration
+   0), and the clay viewport disagreed with the `build_page` size.
+
+The clay and audio gaps are the general lesson, and they are not specific to this
+harness: **any `VYPER_*` probe that needs Clay or audio must bring its own up**, the
+same way `ui_probe` already does for Clay.
+
+### What the harness asserts
+
+- Per tick: the playhead is inside the timeline, `playhead.frame`/`zoom`/`view.start`
+  are finite, `zoom > 0`, and `selection` addresses a track/clip that exists.
+- `release_snaps` / `max_release_snap`: a release that moves the playhead **forward**.
+  That is the reported scrub symptom verbatim, and it is a failure rather than a number
+  to look at. Measured over 900 randomised iterations on the 103-clip project, with
+  audio live: **0 release snaps, 0 over-pointer jumps.**
+- `over_pointer`: how far the playhead moved in one tick MINUS what the pointer asked
+  for. A legitimate fast drag moves the playhead a long way; only the difference is
+  wrong.
+
+### Probe for the fix, in `all`
+
+`audio_group_isolation` (`VYPER_AUDIO_GROUP_ISOLATION`). Sharp in BOTH directions: its
+four clips are 1.0x, 1.0x, 0.5x, 2.0x, and the first two are contiguous so they MUST
+share a decoder. A "different speeds never share" assertion would pass a fix that simply
+refuses to continue any group — which would break every ordinary multi-clip timeline.
+It asserts three groups and that each graph is built for the speed of the segments it
+actually holds (`Play_Seg.speed`, not a list the probe wrote).
+
+Getting this fixture right took three tries, each of which tested the wrong thing: the
+first expected 3 groups for speeds that give 4 (the last 1.0x clip is not adjacent to
+the first, so it cannot share its decoder); the second stepped the timeline position
+by a constant, which overlaps every slower clip with the next; the third left
+`source_start_frame = 0` on every clip, so contiguity failed in the SOURCE axis for
+reasons having nothing to do with tempo. All three failed while the engine was right.
+
+### Known-open, found while verifying
+
+- `VYPER_UNDO_PROBE` fails with **6 failures** — identical at HEAD, so not from this
+  work. Like `VYPER_PROXY_BG_TEST`, it has **no gate target**, which is why it is red
+  and nobody knows.
+- Under Valgrind the fuzz is clean on the four invariants (0 definitely lost, 0
+  indirectly lost, 0 invalid read/write/free). The 38 error contexts are all inside
+  Odin's runtime allocator (`heap_allocator_proc.aligned_resize` ->
+  `conditional_mem_zero`) growing `[]Keyframe`, reading struct padding during a resize
+  memcmp — the runtime's noise, not this program's. It needs the `vyper-valgrind`
+  binary; the default one dies on an AVX-512 instruction in `math_big` startup, which
+  the gate already treats as a vacuous pass.

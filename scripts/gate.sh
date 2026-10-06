@@ -1076,6 +1076,87 @@ target_silent_playback() {
 	echo "silent-playback: ok (no audio track still plays, on the wall clock)"
 }
 
+# group_isolation: adjacent same-file audio clips at different clip speeds must each
+# be mixed by a tempo graph built for their OWN speed. Found by fuzzing the user's own
+# ~/sallyface.vyproj, where loading it tripped
+#
+#	audio_build_groups: one atempo graph cannot serve segments with different clip speed/pitch
+#
+# because two clips cut from the same file are contiguous in both timeline and source,
+# which was every condition the grouping checked. The second was folded into the first's
+# group and mixed at the first clip's tempo -- a 0.5x clip playing at 1x, which is
+# audible as a clip that does not match its picture.
+#
+# The probe is sharp in BOTH directions: its first two clips are both 1.0x and
+# contiguous, so they MUST share a decoder. A "different speeds never share" assertion
+# would pass a fix that simply refuses to continue any group, breaking every ordinary
+# multi-clip timeline.
+# fuzz drives RANDOMISED actions over a REAL project through the same entry points the
+# frame loop uses -- clay pointer state, interaction_click_dispatch, interaction_move,
+# interaction_release, playback_update, interaction_post_build -- and asserts the
+# invariants that must hold at every tick (playhead in range, transforms finite,
+# selection addressable) plus the two that are the reported symptom: a release that
+# moves the playhead FORWARD, and a tick that moves it further than the pointer asked.
+#
+# Takes a project path, so it is NOT in `all`: it needs a real session (the user runs
+# it on their own). This is the tool that found the audio grouping bug, and its first
+# two versions were themselves broken in ways worth recording:
+#
+#   - it reported 600 clean iterations while arming ZERO scrubs, because it picked
+#     scrub targets from the whole 359k-frame timeline and every one of them mapped off
+#     the visible ruler. It now draws targets from the visible span, and it FAILS when
+#     any action counter is zero -- a run that reached nothing is a broken harness, not
+#     a clean one.
+#   - it cancelled every drag, because it passed a zeroed mouse input to
+#     interaction_post_build while the gesture was in flight, which reads as "no button
+#     held". Interaction now gets the same input the move did.
+#   - it never touched the audio engine, because probes dispatch before main()'s
+#     audio_init: no device, so audio_producer_proc returned on its first line. It now
+#     calls audio_init itself, and FAILS if the project has audio clips and the producer
+#     never held a source.
+target_fuzz() {
+	require_fresh_binary fuzz || return 1
+	local proj=${1:?}
+	local iters=${2:-200}
+	local seed=${3:-1}
+	local log=target/valgrind
+	mkdir -p "$log"
+	local out="$log/fuzz-$seed.log"
+	# stderr is kept, because the failures SDL reports and does not stop for -- the
+	# out-of-bounds scissor, for one -- arrive there and nowhere else.
+	if ! VYPER_FUZZ="$proj|$iters|$seed" timeout 1800 ./vyper >"$out" 2>&1; then
+		grep -E '^\[fuzz\]' "$out" >&2
+		echo "fuzz: FAILED on $proj (seed $seed) -- see $out" >&2
+		return 1
+	fi
+	grep -E '^\[fuzz\] (loaded|clips by kind|[0-9]+ iterations|ok)' "$out"
+	# The gate's half of the contract: SDL's assertions are the class of bug this
+	# harness exists to surface, and the probe cannot see them.
+	if grep -qE 'Assertion failure|runtime assertion' "$out"; then
+		grep -E 'Assertion failure|runtime assertion' "$out" | head -5 >&2
+		echo "fuzz: FAILED -- an assertion fired during the run" >&2
+		return 1
+	fi
+	echo "fuzz: ok ($iters iterations, seed $seed)"
+}
+
+target_audio_group_isolation() {
+	require_fresh_binary audio-group-isolation || return 1
+	local src=target/mixparity/tempo_clicks_125ms.wav
+	mkdir -p target/mixparity
+	if [ ! -s "$src" ]; then
+		target_audio_clip_tempo_alignment || return 1
+	fi
+	local out
+	if ! out=$(VYPER_AUDIO_GROUP_ISOLATION="$PWD/$src" timeout 300 ./vyper 2>&1); then
+		echo "$out" | grep -E '^\[ap\] group-isolation' >&2
+		echo "audio-group-isolation: FAILED -- see the [ap] group-isolation lines above" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[ap\] group-isolation'
+	echo "audio-group-isolation: ok (each clip is mixed by a graph built for its own speed)"
+}
+
 target_image_decode_probe() {
 	require_fresh_binary image-decode-probe || return 1
 	mkdir -p "$PROXY_DIR"
@@ -1926,7 +2007,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate image_probe image_decode_probe silent_playback audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1987,6 +2068,8 @@ main() {
 	proxy_probe) target_proxy_probe ;;
 	image_probe) target_image_probe ;;
 	image_decode_probe) target_image_decode_probe ;;
+	audio_group_isolation) target_audio_group_isolation ;;
+	fuzz) shift; target_fuzz "$@" ;;
 	silent_playback) target_silent_playback ;;
 	smoke) target_smoke ;;
 	footprint) target_footprint "${2:-20}" ;;
@@ -1994,7 +2077,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|silent_playback|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac
