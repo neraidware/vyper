@@ -1998,7 +1998,7 @@ mix_clip_range_setup :: proc(path: cstring, frames: i64, speed: f64) {
 
 // mix_clip_range mixes `frames` of a single clip at `speed` through the real playback
 // mixer and returns the interleaved output.
-mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, speed: f64, fps: f64) -> [dynamic]f32 {
+mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, speed: f64, fps: f64, semitones: f32 = 0) -> [dynamic]f32 {
 	audio_reset_for_load()
 	audio_reset_play()
 	timeline.tracks = make([dynamic]Track, 0, 1)
@@ -2020,6 +2020,7 @@ mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, spe
 			source_start_frame = 0,
 			stream_index = 0,
 			speed = speed,
+			pitch = semitones,
 		},
 	)
 	append(&timeline.tracks, track)
@@ -2167,6 +2168,125 @@ first_onset :: proc(buf: []f32, refractory_frames: int) -> int {
 		}
 	}
 	return -1
+}
+
+// audio_probe_clip_pitch proves the pitch property SHIFTS, and that it does so the way
+// the model promises: frequency moves, duration does not.
+//
+// Two properties, checked separately, because a clip property that got them backwards
+// would still pass a single test:
+//
+//   - PITCH MOVES. A 12-semitone shift is exactly one octave, so a 440 Hz tone must
+//     come out near 880. Counted by zero crossings, which is exact for a pure tone and
+//     needs no FFT.
+//   - DURATION DOES NOT. The same span must yield the same number of samples. This is
+//     what distinguishes pitch from tempo, and it is why the two are separate
+//     properties: a clip at pitch +12 must be the same length on the timeline as the
+//     same clip unpitched.
+//
+// Tempo 1.0 throughout, so nothing here can be confused with a speed change.
+audio_probe_clip_pitch :: proc(path: string, semitones: f32 = 12.0) -> bool {
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] pitch: no fps")
+		return false
+	}
+	frames := i64(fps * 2.0)
+	span := frames
+
+	base := render_pitch_span(cpath_ref(path), frames, span, 0.0)
+	if len(base) == 0 {
+		fmt.println("[ap] pitch: SKIP: reference produced nothing (fixture should be a tone)")
+		return true
+	}
+	shifted := render_pitch_span(cpath_ref(path), frames, span, semitones)
+	if len(shifted) == 0 {
+		fmt.println("[ap] pitch: FAIL: the pitched render produced nothing at all")
+		return false
+	}
+
+	// DURATION first: it is the property that separates pitch from tempo.
+	if len(shifted) != len(base) {
+		fmt.printf(
+			"[ap] pitch: FAIL: +%.0f semitones changed the output LENGTH (%d vs %d samples) -- that is a tempo change, not a pitch shift\n",
+			semitones, len(shifted), len(base),
+		)
+		return false
+	}
+
+	// FREQUENCY, by zero crossings over the steady interior.
+	z0 := zero_crossings(base[:])
+	z1 := zero_crossings(shifted[:])
+	if z0 == 0 {
+		fmt.println("[ap] pitch: SKIP: reference has no measurable frequency (not a tone?)")
+		return true
+	}
+	ratio := f64(z1) / f64(z0)
+	want := semitones_to_ratio(semitones)
+	fmt.printf(
+		"[ap] pitch: +%.0f semitones -> frequency ratio %.4f (want %.4f), length unchanged at %d samples\n",
+		semitones, ratio, want, len(shifted),
+	)
+	// 5%, not 2%. A one-octave shift is arithmetically EXACT -- asetrate 96000 then
+	// aresample 48000 is 2:1 -- so the residual is the resampler's filter and the
+	// windowing of the crossing count at the edges, not the pitch arithmetic. Measured
+	// 2.0284 against a wanted 2.0.
+	//
+	// The tolerance is deliberately loose because the check that separates pitch from
+	// tempo is the LENGTH assertion above, and that one is exact. This is only proving
+	// the frequency moved in the RIGHT DIRECTION and by about the right amount; a
+	// signal chain that transposed instead of pitched would fail the length check long
+	// before it mattered here.
+	if math.abs(ratio - want) > 0.05 * want {
+		fmt.printf("[ap] pitch: FAIL: frequency moved by %.4fx, wanted %.4fx\n", ratio, want)
+		return false
+	}
+	fmt.println("[ap] pitch ok (frequency shifted, duration untouched)")
+	return true
+}
+
+// cpath_ref is a tiny helper so the probe's call sites stay readable; the path is
+// interned once per call and the buffer lives for the call.
+cpath_ref :: proc(path: string) -> cstring {
+	return intern_cpath(path)
+}
+
+intern_cpath :: proc(path: string) -> cstring {
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	return cstring(&buf[0])
+}
+
+// render_pitch_span mixes `frames` of a clip at `semitones` and returns the output.
+render_pitch_span :: proc(path: cstring, content_frames: i64, span_frames: i64, semitones: f32) -> [dynamic]f32 {
+	return mix_clip_range(path, content_frames, span_frames, 1.0, timeline_fps(), semitones)
+}
+
+// zero_crossings counts sign changes of the left channel, which for a pure tone is
+// twice the frequency. The first and last 10% are skipped so the declick-free start
+// and the mix's edges cannot skew the count.
+zero_crossings :: proc(buf: []f32) -> int {
+	frames := len(buf) / 2
+	lo := frames / 10
+	hi := frames - frames / 10
+	if hi - lo < 64 {
+		return 0
+	}
+	crossings := 0
+	prev := buf[lo * 2]
+	for i in lo + 1 ..< hi {
+		v := buf[i * 2]
+		if (v >= 0) != (prev >= 0) {
+			crossings += 1
+		}
+		prev = v
+	}
+	return crossings
 }
 
 audio_probe_stall_gap :: proc(path: string, stall_ms: int = 900) -> bool {

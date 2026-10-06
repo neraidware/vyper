@@ -1571,6 +1571,42 @@ target_audio_bus_prime() {
 	echo "audio-bus-prime: NOT exact. The discard is self-calibrated (the graph measures its own latency during priming) but a residual remains, so the bus atempo is better aligned than it was and not yet aligned."
 }
 
+# audio_clip_pitch proves the pitch property SHIFTS frequency WITHOUT changing
+# duration -- which is the whole distinction between pitch and tempo, and therefore
+# between the two clip properties.
+#
+# Two assertions, separately, because a property that got them backwards would pass
+# either one alone:
+#
+#   - LENGTH must be EXACTLY unchanged. A pitched clip occupies the same timeline as the
+#     same clip unpitched. This is what stops a pitch control behaving like a speed
+#     control, and it is exact rather than approximate.
+#   - FREQUENCY must move by 2^(n/12). Counted by zero crossings, which is exact for a
+#     pure tone and needs no FFT.
+#
+# The frequency tolerance is 5% because a one-octave shift is arithmetically exact
+# (asetrate 96000 then aresample 48000 is 2:1) and the residual is the resampler's
+# filter plus the windowing of the crossing count. Measured 2.0284 against 2.0.
+target_audio_clip_pitch() {
+	require_fresh_binary audio-clip-pitch || return 1
+	local src=target/mixparity/tone.m4a
+	if [ ! -s "$src" ]; then
+		echo "audio-clip-pitch: synthesising a tone fixture" >&2
+		mkdir -p target/mixparity
+		ffmpeg -v error -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=30" \
+			-ac 2 -c:a aac -b:a 128k "$src" -y || return 1
+	fi
+	local rc=0
+	for semi in 12 -12 7 -5; do
+		VYPER_AUDIO_CLIP_PITCH="$PWD/$src|$semi" timeout 300 ./vyper >/dev/null 2>&1
+		[ $? -ne 0 ] && { echo "audio-clip-pitch: FAILED at $semi semitones" >&2; rc=1; }
+	done
+	if [ $rc -ne 0 ]; then
+		return 1
+	fi
+	echo "audio-clip-pitch: ok (frequency shifts, length never changes)"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1584,7 +1620,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1622,6 +1658,7 @@ main() {
 	audio_node_latency) target_audio_node_latency ;;
 	audio_clip_tempo) target_audio_clip_tempo ;;
 	audio_bus_prime) target_audio_bus_prime ;;
+	audio_clip_pitch) target_audio_clip_pitch ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
@@ -1641,7 +1678,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_bus_prime|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_bus_prime|audio_clip_pitch|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

@@ -723,6 +723,13 @@ Play_Src :: struct {
 	out_ring:   Audio_Ring, // post-atempo output, 1:1 with the timeline
 	out_first:  i64,        // output sample index of out_ring's head
 	speed:      f64,        // clip tempo; 1.0 means the path above is used unchanged
+	// pitch is the clip's semitone offset and pitch_ratio its frequency ratio.
+	// SEPARATE from speed, and applied by a different pair of filters: pitch moves
+	// frequency and preserves duration, tempo moves duration and preserves pitch.
+	// Nothing else in the engine touches either -- a clip that is not pitched is not
+	// transposed, and stretching a clip does not change its pitch.
+	pitch:      f32,
+	pitch_ratio: f64,
 	content_used: i64,     // content samples consumed by the graph, for the ratio
 	seg:          [MAX_PLAY_SEGMENTS]Play_Seg, // in timeline order
 	seg_count:    int,
@@ -1503,6 +1510,14 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			if g.speed == 0 {
 				g.speed = 1.0
 			}
+			// Pitch as a FREQUENCY RATIO, evaluated once here rather than per frame:
+			// it is a clip property like the tempo, and the ratio is what the graph's
+			// asetrate stage needs.
+			g.pitch = audio_pitch_semitones(&chip.pitch, 0)
+			g.pitch_ratio = semitones_to_ratio(g.pitch)
+			if g.pitch_ratio <= 0 {
+				g.pitch_ratio = 1.0
+			}
 			g.out_first = 0
 			g.content_used = 0
 			if g.tempo.graph != nil {
@@ -1771,7 +1786,9 @@ audio_src_append :: proc(s: ^Play_Src, n: int) {
 // atempo_lookahead_samples(S) output samples. After that, output sample N corresponds
 // to content sample N*S, and a scrub or a clip start lands where it should.
 audio_src_pump_tempo :: proc(s: ^Play_Src, want_out: i64) {
-	if s.speed == 1.0 {
+	// A graph is needed if EITHER the tempo or the pitch is off-identity, so the test
+	// cannot be `speed == 1.0`: a clip pitched at rate 1.0 still needs the graph.
+	if s.speed == 1.0 && s.pitch_ratio == 1.0 {
 		return
 	}
 	if s.tempo.graph == nil {
@@ -1786,7 +1803,7 @@ audio_src_pump_tempo :: proc(s: ^Play_Src, want_out: i64) {
 		// broken thing this branch exists to fix, and it is the same shape as every
 		// other measurement mistake in this work: something that proved a thing was
 		// happening, never that it was happening correctly.
-		atempo_rate_set(&s.tempo, s.speed)
+		atempo_rate_set(&s.tempo, s.speed, s.pitch_ratio)
 		if s.tempo.graph == nil {
 			return
 		}
@@ -2108,7 +2125,7 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		mix_first := s.first48
 		mix_have := s.have48
 		mix_demand := start48
-		if s.speed != 1.0 {
+		if s.speed != 1.0 || s.pitch_ratio != 1.0 {
 			mix_ring = &s.out_ring
 			mix_first = s.out_first
 			mix_have = s.out_first + i64(ring_len(&s.out_ring))
@@ -2181,8 +2198,8 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// per source, on the real-time producer thread.
 		consumed := base + spf
 		if consumed > 0 {
-			if s.speed != 1.0 {
-				// The stretched path consumes OUTPUT samples, and the content
+			if s.speed != 1.0 || s.pitch_ratio != 1.0 {
+				// The graph path consumes OUTPUT samples, and the content
 				// position follows from the speed rather than being tracked
 				// separately: content = output * speed, by construction of the
 				// primed graph. So one counter, not two.

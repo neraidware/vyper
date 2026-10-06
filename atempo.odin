@@ -64,6 +64,13 @@ Atempo_Graph :: struct {
 	stages: [ATEMPO_MAX_STAGES]^avfilter.FilterContext,
 	n_stages: int,
 	rate:  f64, // the rate the graph was built for
+	// pitch_ratio is the FREQUENCY ratio applied by the asetrate/aresample stage: 1.0
+	// means no shift. Kept beside the tempo because the two compose in a fixed order --
+	// pitch first (duration-preserving), then tempo (duration-changing) -- and getting
+	// that order wrong would make a stretch also transpose, which is the exact
+	// confusion between tempo and pitch that the two separate clip properties exist to
+	// prevent.
+	pitch_ratio: f64,
 
 	// Input staging frames, allocated once with buffer capacity
 	// MAX_AUDIO_FRAME_SAMPLES samples; nb_samples is set per push.
@@ -174,12 +181,13 @@ atempo_link_stage :: proc(
 // chain for the given rate. rate must be > 0; 1.0 leaves the graph nil
 // (bypass). On failure the graph is left nil (producer falls back to raw
 // mix); the old graph is always released first.
-atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64) {
+atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) {
 	atempo_graph_destroy(g)
 	g.rate = rate
+	g.pitch_ratio = pitch_ratio
 	g.primed = false
 	g.discard_next = 0
-	if rate <= 0.0 || rate == 1.0 {
+	if (rate <= 0.0 || rate == 1.0) && pitch_ratio == 1.0 {
 		return // identity: skip the whole graph
 	}
 
@@ -203,6 +211,39 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64) {
 		fmt.printf("[atempo] abuffer create: %s\n", ff_err_str(ret))
 		atempo_graph_destroy(g)
 		return
+	}
+
+	// PITCH, before tempo. asetrate reinterprets the stream at 48000*ratio, which
+	// shifts every frequency up by `ratio` and shortens the duration by the same
+	// factor; aresample then restores 48 kHz, which stretches the duration back while
+	// leaving the pitch shifted. Net: pitch moves by `ratio`, duration unchanged.
+	//
+	// Order matters and is the whole reason tempo and pitch are separate properties.
+	// Pitch first, because aresample's duration correction assumes it is restoring a
+	// rate change it made itself; putting atempo ahead would make the tempo stage's
+	// window see a resampler in front of it and the two corrections would compound
+	// instead of composing.
+	prev_pitch := g.src
+	ratio := pitch_ratio
+	if ratio != 1.0 {
+		arg_buf: [64]u8
+		fmt.bprintf(arg_buf[:], "%f", 48000.0 * ratio)
+		ar_ctx := atempo_link_stage(graph, prev_pitch, "asetrate", cstring("pitchin"), cstring(raw_data(arg_buf[:])))
+		if ar_ctx == nil {
+			atempo_graph_destroy(g)
+			return
+		}
+		g.stages[g.n_stages] = ar_ctx
+		g.n_stages += 1
+		prev_pitch = ar_ctx
+		res_ctx := atempo_link_stage(graph, prev_pitch, "aresample", cstring("pitchout"), cstring("48000"))
+		if res_ctx == nil {
+			atempo_graph_destroy(g)
+			return
+		}
+		g.stages[g.n_stages] = res_ctx
+		g.n_stages += 1
+		prev_pitch = res_ctx
 	}
 
 	// atempo stages. Each instance time-stretches by a multiplicative factor in
@@ -249,7 +290,7 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64) {
 		g.n_stages += 1
 		prev_slow = ctx
 	}
-	prev := prev_slow
+	prev := prev_pitch
 	for s in 0 ..< n_full {
 		if g.n_stages >= ATEMPO_MAX_STAGES {
 			fmt.printf("[atempo] too many stages for rate %.2f\n", rate)
@@ -412,13 +453,21 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 // the graph was (re)built, so the caller can re-anchor to the current playhead
 // — the rebuild is not cheap enough to tolerate the playhead racing while the
 // producer is blocked building it.
-atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
+atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) -> bool {
 	r := rate
 	if r <= 0.0 {
 		r = 1.0
 	}
-	if g.rate != r || (g.graph == nil) != (r == 1.0) {
-		atempo_graph_build(g, r)
+	pr := pitch_ratio
+	if pr <= 0.0 {
+		pr = 1.0
+	}
+	// A graph is needed if EITHER the tempo or the pitch is off-identity. Keying only on
+	// the tempo would leave a pitched clip unbuilt at rate 1.0, which is the common case
+	// for an inspector pitch control.
+	needs := r != 1.0 || pr != 1.0
+	if g.rate != r || g.pitch_ratio != pr || (g.graph == nil) != (!needs) {
+		atempo_graph_build(g, r, pr)
 		return true
 	}
 	return false
