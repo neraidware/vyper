@@ -1590,12 +1590,7 @@ Render_Audio_Src :: struct {
 	// export cannot drift from playback (it previously applied no gain at all,
 	// so a rendered file ignored the slider and its automation entirely).
 	gain:                 Audio_Gain_Snapshot,
-	// muted is true when this source contributed nothing to the previous mixed
-	// block, or has not contributed yet. It is what makes a resume-after-shortfall
-	// fade in rather than appear at full amplitude: the output has a step there
-	// whether or not the block boundary is a clip boundary, and without this the
-	// only thing that ramps is a clip edge.
-	muted:                bool,
+	pitch:                Audio_Pitch_Snapshot,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
 	fifo:                 Audio_Ring, // converted stereo f32, content-relative
 	first48:              i64, // content 48 kHz frame of fifo's head
@@ -1818,9 +1813,7 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 			// and NOT a silent `continue`, because the rest of the block belongs
 			// to this source and dropping it would punch a hole shaped like the
 			// source list rather than like the shortfall. The source is marked
-			// muted so that its return fades in instead of arriving at full level.
 			m.holes += 1
-			a.muted = true
 			continue
 		}
 		base := int(content - a.first48)
@@ -1834,20 +1827,24 @@ render_mix_block :: proc(m: ^Render_Mix, out: []f32, at: Sample_Pos, n: int) {
 		// resume after a shortfall is an edge too even though no clip changed.
 		// Taking the earlier of the two as the start edge means a block that both
 		// resumes and opens a clip gets ONE fade, not two multiplied together.
-		fade_from := clip_t0
-		if a.muted {
-			fade_from = blk_lo
+		// One mixing loop for both sinks (mix_src_block). Gain only, no automatic edge
+		// ramp: a cut is a cut, and an authored fade is expressed through the clip's
+		// keyframe envelope. See the same note in audio_mix_frame -- the ramp was this
+		// engine's SECOND fade mechanism, duplicating automation the user already
+		// controls, and the two disagreed at ~2.5e-3 in a clip's final fade because it
+		// normalised against the caller's chunk length.
+		if !mix_src_block(
+			&a.fifo,
+			a.first48,
+			a.have48,
+			i64(content),
+			int(want),
+			g,
+			out[:],
+			int(blk_lo - at),
+		) {
+			continue
 		}
-		fade_in := audio_declick_fade_in(blk_lo - fade_from, int(want))
-		fade_out := audio_declick_fade_out(clip_t1 - blk_hi, int(want))
-		for s in 0 ..< int(want) {
-			l, r := ring_at(&a.fifo, base + s)
-			off := int(blk_lo - at) * 2
-			f := audio_declick_gain(g, s, int(want), fade_in, fade_out)
-			out[off + s * 2 + 0] += l * f
-			out[off + s * 2 + 1] += r * f
-		}
-		a.muted = false
 		// Drop what this block consumed so the fifo stays forward-only and a long
 		// render does not accumulate whole clips.
 		drop := base + int(want)
@@ -1921,6 +1918,7 @@ render_audio_src_from_chip :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chi
 		source_start_rate = chip.source_rate,
 		source_length_frames = chip.source_len,
 		gain = chip.gain,
+		pitch = chip.pitch,
 	}
 }
 
@@ -2864,7 +2862,6 @@ render_audio_open :: proc(a: ^Render_Audio_Src, render_start: i64, fps: f64) -> 
 	// rather than defaulted, because the zero value of Render_Audio_Src has to
 	// stay useful and a struct that means "unopened" should not read as
 	// "contributed last block".
-	a.muted = true
 	overlap_start := max(a.timeline_start_frame, render_start)
 	if !open_audio_decoder_resampled(&a.dec, a.path, a.stream_index, RENDER_AUDIO_RATE, 2) {
 		return false

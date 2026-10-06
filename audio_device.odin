@@ -69,6 +69,25 @@ Audio_Device :: struct {
 	ctx:      ma.context_type,
 	device:   ma.device,
 	rb:       ma.pcm_rb,
+	// sim is a SIMULATED device for the headless stall probe, checked before the
+	// real ring in every entry point below. It exists because the one claim the
+	// audio-master design cannot demonstrate any other way is what happens when the
+	// PRODUCER stalls: the listener should get a gap and no subsequent offset. That
+	// cannot be provoked from outside, because SIGSTOP freezes the device callback
+	// too (it is in-process), so freezing everything is not a producer-only stall.
+	//
+	// So the device is simulated and the probe runs in REAL time, draining the
+	// simulation at exactly the bus rate. The producer under test is then the real
+	// one, unmodified, with its wall-clock coupling behaving correctly -- and a
+	// "stall" is just the probe declining to call audio_update, which is precisely
+	// the condition under test.
+	sim: struct {
+		on:      bool,
+		written: i64, // frames pushed
+		read:    i64, // frames the simulated device has consumed
+		cap:     i64,
+		underruns: u64,
+	},
 	rs:       ma.resampler,
 	ready:    bool,
 	started:  bool,
@@ -370,6 +389,13 @@ audio_device_shutdown :: proc() {
 
 // audio_device_ready reports whether a device is open and the bridge is live.
 audio_device_ready :: proc() -> bool {
+	// The simulated device counts as ready even though no miniaudio ring exists:
+	// otherwise the producer returns before feeding and the stall probe passes
+	// VACUOUSLY -- it observes a gap because nothing was ever fed. Which is exactly
+	// what the first run of that probe did, and reported success.
+	if audio_dev.sim.on {
+		return true
+	}
 	return audio_dev.ready && audio_dev.rb_ready
 }
 
@@ -386,6 +412,17 @@ audio_device_set_active :: proc(on: bool) {
 // queue ceiling precisely so the producer throttles on the ceiling rather than
 // discovering a full ring here.
 audio_device_push :: proc(pcm: []i16, frames: int) {
+	if audio_dev.sim.on {
+		if frames <= 0 {
+			return
+		}
+		assert(
+			audio_dev.sim.written + i64(frames) <= audio_dev.sim.cap,
+			"simulated device ring overflow: the producer is not throttling to the cushion",
+		)
+		audio_dev.sim.written += i64(frames)
+		return
+	}
 	if !audio_dev.rb_ready || frames <= 0 {
 		return
 	}
@@ -447,6 +484,9 @@ audio_ring_write :: proc(src: []i16, frames: int) -> int {
 // wrong. A pending clear reads as empty immediately, because the callback may
 // not have run yet to honour the flag.
 audio_device_queued :: proc() -> i64 {
+	if audio_dev.sim.on {
+		return audio_dev.sim.written - audio_dev.sim.read
+	}
 	if !audio_dev.rb_ready || sync.atomic_load(&audio_dev.clear_req) {
 		return 0
 	}
@@ -455,6 +495,9 @@ audio_device_queued :: proc() -> i64 {
 
 // audio_device_available is the free space left for the producer, in frames.
 audio_device_available :: proc() -> i64 {
+	if audio_dev.sim.on {
+		return audio_dev.sim.cap - (audio_dev.sim.written - audio_dev.sim.read)
+	}
 	if !audio_dev.rb_ready {
 		return 0
 	}
@@ -472,7 +515,51 @@ audio_device_available :: proc() -> i64 {
 // would catch that. The cost is that the drop lands within one period (~10 ms),
 // which is invisible next to a seek and far cheaper than the race would be.
 audio_device_clear :: proc() {
+	if audio_dev.sim.on {
+		// A clear drops the QUEUED audio, so the simulated device's read cursor
+		// catches up to what has been written -- the queue becomes empty
+		// immediately, which is what the real path promises too.
+		audio_dev.sim.read = audio_dev.sim.written
+		return
+	}
 	sync.atomic_store(&audio_dev.clear_req, true)
+}
+
+// audio_device_sim_enable swaps the miniaudio ring for a software one of `cap`
+// sample-frames, so the headless stall probe can drive the real producer against a
+// device whose drain rate it controls exactly. `cap` should be the real ring's
+// capacity, not the cushion: the producer throttles to the cushion and must still
+// have somewhere to put a whole block.
+audio_device_sim_enable :: proc(cap: i64) {
+	audio_dev.sim.on = true
+	audio_dev.sim.written = 0
+	audio_dev.sim.read = 0
+	audio_dev.sim.cap = cap
+	audio_dev.sim.underruns = 0
+}
+
+// audio_device_sim_disable restores the real device.
+audio_device_sim_disable :: proc() {
+	audio_dev.sim.on = false
+}
+
+// audio_device_sim_consume advances the simulated device by `frames`, and counts
+// an underrun if it is asked for audio that was never written -- which is what the
+// listener hears as silence, and is the GAP the stall is supposed to produce.
+audio_device_sim_consume :: proc(frames: i64) {
+	if !audio_dev.sim.on {
+		return
+	}
+	want := audio_dev.sim.read + frames
+	if want > audio_dev.sim.written {
+		audio_dev.sim.underruns += 1
+		want = audio_dev.sim.written
+	}
+	audio_dev.sim.read = want
+}
+
+audio_device_sim_underruns :: proc() -> u64 {
+	return audio_dev.sim.underruns
 }
 
 // audio_device_rate is the rate the backend actually negotiated, which is the

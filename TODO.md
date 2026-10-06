@@ -3365,9 +3365,11 @@ gesture). Mutation-checked: reverting the lane resolver to the panel box fails
 three, and removing the import gate fails two.
 
 **Memory.** Each dropped file hands an SDL-owned buffer to the bin, which clones
-what it keeps — so `sdl.free` on the event buffer is the only owner that can
-release it, and `dnd_valgrind` is the gate that measures that handoff (0
-definitely lost, 0 indirectly lost, no invalid free).
+what it keeps. The clone is what makes the *bin* safe to hand the path on and
+forget it — it is **not** what makes the *event buffer* ours to free. See Active
+31: this paragraph used to claim the opposite, and that claim was the bug.
+`dnd_valgrind` is the gate that measures the handoff (0 definitely lost, 0
+indirectly lost, no invalid free).
 
 ## Active 16 — Export frame rate came from the first video source, not the frame grid
 
@@ -5916,12 +5918,17 @@ frame covers, including one straddling two blocks) and playback has not caught u
       (10.8 ms) content SHIFT** — cross-correlating one frame's export output
       against the same frame's playback output peaks at +520 samples, not at 0.
       See "The finding" below.
-- [ ] S3. `Mix_Src` node + one `mix_src_block`, both mixers onto it. Pure
-      deletion: the two pull procs and the duplicated gain/declick/span math
-      collapse into one. **UNBLOCKED and now guarded**: the WAV fixture proves the
-      two mixing paths are bit-identical and the AAC fixture proves they agree
-      with a real encoder delay, both inside `all`. So the refactor has a gate that
-      fails the moment collapsing them stops being a pure deletion.
+- [x] S3. `mix_src_block` — ONE mixing loop, called by both sinks. The arithmetic
+      that existed twice now exists once; the two callers keep only what genuinely
+      differs, which is how they REFILL and how they express a position (a frame
+      index for playback, an absolute `Sample_Pos` for the export). Both are resolved
+      by the caller before the block reaches the shared core, so nothing positional
+      leaks into it.
+      It is a proc over the fields rather than a `Mix_Src` STRUCT on purpose: both
+      sources already carry a fifo, a head and a tail, and copying them into a third
+      struct per block would have reintroduced the duplication this removes.
+      **Verified as a pure refactor**: bit-identical over 600 s at 60 / 30 /
+      30000-over-1001, plus the wav and aac parity fixtures and the stall case.
 - [ ] S4. Latency: every node declares it, the graph sums it, both sinks
       compensate. Measured and reported, not asserted by comment.
   - [x] S4a. Root-caused the divergence (see "The finding" below): the mixers
@@ -5930,22 +5937,26 @@ frame covers, including one straddling two blocks) and playback has not caught u
   - [x] S4b. Fixed at the cause, in `decode_from_content`, shared by both sinks.
         It was never a latency to compensate — it was an ask that did not mean
         anything. AAC parity went 120/141 mismatching to 0/141.
-  - [ ] S4c. Latency as a declared per-node quantity compensated at each sink,
-        which subsumes S4b and also covers `swr` delay and `atempo` lookahead.
-- [ ] S5. Granularity as a parameter — playback asks for a frame's range and the
-      same mixer serves it.
+  - [ ] S4c. Latency as a declared per-node quantity at each sink. Only the
+        CODEC's priming was ever wrong, and S4b removed it rather than
+        compensating it, so what is left here is `swr` delay and the `atempo`
+        lookahead -- neither of which has been MEASURED yet, and a declaration
+        for an unmeasured delay is a guess with a type on it. Measure first.
+- [x] S5. Granularity as a parameter — resolved by DELETING the thing that
+      depended on it. The only granularity-dependent code in the mix was the
+      automatic edge ramp, which normalised against the caller's chunk length. With
+      the ramp gone the mix is a function of gain and samples alone, so a frame and
+      a 512-sample block produce identical output by construction and there is
+      nothing left to parameterise.
 - [x] S6a. `atempo_probe` wired into `gate.sh` and `all`. It had an entry point
       and passed, but was wired into neither, so playback rate changes were
       verified by hand, once, and `all` could not catch a regression in the
       pitch-preserving path.
-- [ ] S6b. 29.97 now MEASURED (delta 0 over 600 s, `audio_probe_drift_parity`),
-      but the probe is red on a clip-head divergence it exposed, so it is not yet
-      in `all`. Closes when that divergence is resolved.
-- [ ] S6c. Drift beyond 30 s now MEASURED: exact sample accounting at 600 s across
-      60 / 30 / 30000-over-1001. Same blocker as S6b.
-- [ ] S6d. NEW, found by S6b/S6c: the export opens a clip's head in silence while
-      playback ramps from content 0. A clip-start/fade-in-origin decision, not a
-      position bug. See "S6b/S6c" above.
+- [x] S6b. 29.97 MEASURED and bit-identical over 600 s.
+- [x] S6c. Drift beyond 30 s MEASURED: exact sample accounting at 600 s across
+      60 / 30 / 30000-over-1001, and the two sinks bit-identical at all three.
+- [x] S6d. The clip-head divergence resolved, and it was not a position bug at
+      all: it was the automatic ramp, normalised per chunk. See the section below.
 
 ### The finding, and the fix (S2/S4a/S4b)
 
@@ -6004,213 +6015,230 @@ a truncated tail), and it **asserts** that two unity windows agree. That
 assertion is the point: previously the ratio's premise was invisible, and the
 only reason it held was the bug it was sitting next to.
 
-### S6b/S6c: drift — measured, and a new divergence it exposed
+### The clock: audio device is the clock (inverted)
 
-`audio_probe_drift_parity` runs BOTH mixers continuously over a long span and
-compares every sample, and asserts the position invariant as a number rather
-than trusting it: the samples handed to the device must equal
-`audio_frame_boundary48(total_frames)`.
+**What was there.** A wall clock on the UI thread advanced `playhead.frame`; the
+audio producer chased that guess; video presented from the playhead. A/V
+divergence was therefore possible, and it was MONITORED — the `[skew]` alarm,
+`AUDIO_DESYNC_ALERT_SEC`. `audio.odin` carried a comment saying so plainly:
+*"dev_pos is kept only as the telemetry/health signal."*
 
-**No drift, at any rate, over 600 s.** 28,800,000 samples mixed, 28,800,000
-required, delta 0 — identically at 60, at 30, and at **30000/1001** (29.97).
-That closes the S6b hole honestly: 29.97 is a frame of 1601 or 1024*1.5648
-samples alternating forever, so per-frame rounding would drift while never
-showing a single-frame error, and it does not.
+**Why it was detect-and-repair.** Two repair paths silently converted a
+starvation into a position shift: the wedge watchdog dropped the backlog when the
+queue capped, and the forward-skip re-anchored the producer to the extrapolated
+playhead. Those repairs are why the alarm existed, and they are what lets a drift
+bug survive: the symptom stops and the pressure to find its cause goes with it.
 
-The fixture is 997 Hz on purpose. It is coprime with 60, with 30000/1001 and with
-48000, so a rounded boundary shows as a phase error instead of cancelling over
-the window the way 440 or 1000 Hz would.
+**What it is now.**
 
-**But it is red, on a divergence the old fixture was hiding.** At frame 0 of a
-single long clip:
+- The producer fills to `dev_pos + cushion_frames`, i.e. **cushion samples ahead
+  of what the device has consumed**, instead of ahead of a wall-clock guess. Since
+  `dev_pos` is `fed − queued`, filling to `dev_pos + cushion` leaves the queue at
+  the cushion — a fixed point.
+- `playback_update` sets `playback.frame = playback.dev_frame`, a **readout**, not a
+  command. Video already reads the playhead, so video is now a pure function of
+  where the sound actually is.
+- `playback_playhead_at` is **deleted**, along with the meter's extrapolation.
+  There is no wall clock in the loop any more, so there is no second clock to
+  disagree and the skew meter is a diagnostic rather than a mechanism.
 
-```
-play[0:4] = [0.0592, 0.0592, 0.0501, 0.0501]
-exp[0:4]  = [0,      0,      0,      0     ]
-```
+**Why drift is now structurally impossible rather than merely bounded.** Content
+fed is contiguous from one origin whatever happens upstream. A producer stall
+costs the listener a **gap**, never an offset: the device drains, `dev_pos`
+advances with it, the playhead follows, and when the producer resumes it feeds on
+from where it left off. Nothing re-anchors, so there is nothing to accumulate.
 
-The export is **silent** for the head of a clip while playback is not. The short
-`mix_parity` fixture passed because its 440 Hz sine starts at a zero crossing, so
-both paths were ~0 there and matched by accident — the fixture masked the
-difference, not the code.
+**Backward playback keeps the wall clock**, and that is a real asymmetry rather
+than an oversight: audio is muted going backward, so there is no device
+consumption to be a clock. Nothing can drift against a stream that does not exist.
 
-This is a clip-START question, not a position question: the export's
-`render_mix_block` opens a source with `muted`, and mutes the head into a
-declick ramp from the block's own start, while playback ramps from the clip's
-content 0. So the two disagree about *where a fade-in begins* — the same
-one-fact-two-copies shape as everything else here.
+Also fixed here: `open_file_at` now routes a `.vyproj` to `project_file_open`
+before the media probe. It did not, so opening a project from argv was probed as
+media and failed with "Invalid data found" — a documented route (main.odin) that
+was never implemented.
 
-**Open, and deliberately not guessed.** Whether a clip head should be silent,
-ramped from content 0, or ramped from the block boundary is a decision about what
-a cut is SUPPOSED to sound like, and the answer changes what the fix is. It is not
-tucked in behind the drift fix.
+**Starvation is now measured** (`starve_ticks` / `starve_frames`, queue below a
+quarter of the cushion while playing, latched only after the transport is
+established so the startup fill is not counted). This is the invariant the design
+rests on: no starvation and no re-anchor means the fed-vs-heard offset is zero.
 
-`audio_drift_parity` stays OUT of `all` while it is red, for the reason
-`audio_mix_parity` was: a failing member gets disabled, and a check nobody runs
-proves nothing. It is a named, runnable target.
+**NOT YET VERIFIED AT RUNTIME.** One live attempt was made and **discarded as
+invalid**: it opened the GUI, advanced 12 s of audio in ~120 s of wall clock, and
+almost certainly had no real audio sink, so a zero skew there proves nothing. The
+full gate is green (37 targets, valgrind invariants held), but the gate does not
+exercise the device feed path — `audio_probe`'s sim is mixer-only and never
+touches the device ring, which is exactly why this was unverifiable until now.
 
-### Three measurement mistakes, each of which read as proof
+**The missing piece — BUILT.** `audio_probe_stall_gap`, and it is now a member of
+`all`. It could not be provoked from outside, because `SIGSTOP` freezes the device
+callback too (it is in-process), so freezing the process is not a producer-only
+stall. So the device is **simulated** — a software ring behind
+`audio_device_push` / `_queued` / `_available` / `_clear` — and the probe runs in
+**real time**, draining the simulation at exactly the bus rate. The producer under
+test is the real `audio_producer_feed`, unmodified, and a "stall" is the probe
+declining to call it.
 
-- Correlating with an offset past the end of the frame skipped every shift, so
-  "best shift 0" printed while nothing had been compared at all.
-- Driving the export one whole video frame at a time instead of its natural
-  512-sample blocks suggested the two mixers were misaligned. At 512 they were
-  identical.
-- Reading `Skip Samples` side data and assuming a zero-fill of the input frame
-  would drop the priming: `swres.convert` has already written by then, so it is a
-  no-op. Advancing the destination pointer instead desynchronises the
-  resampler's filter state. Neither was landed — a plausible unverified priming
-  fix is worse than a known-red gate.
-
-## Active 31 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
-
-**Why:** Alt+wheel and Alt+middle-drag magnified and slid a clip's content
-correctly, and neither wrote anything called zoom or pan. Each gesture rewrote
-**seven fields across three properties** to hold the visible box still: the four
-crop insets to move the window, `Scale` to absorb the box-size change the new
-window implied, and both transforms to re-anchor the box center under the new
-crop asymmetry.
-
-That compensation WAS the hack. Seven coupled values had to stay in step by
-hand; any one of them drifting moved the box a pixel; and every consequence was
-invisible in the model, because "the clip's content is magnified" had no property
-to name. Two costs followed:
-
-- **"Keyframe all modified" animated six lanes the user never touched.** A single
-  Alt+drag left crop.l/r/t/b and transform.x/y all pending, so the button minted
-  a packed `crop` knot AND a packed `transform` knot — animating both the window
-  and the position, because the gesture could not express itself in one property.
-  `geom_key_probe` pinned that count at 6, which meant the probe was *protecting*
-  the coupling rather than catching it.
-- **The window math existed in two sinks with different inputs.** The preview
-  read sampled lanes and the export read `geom_base`, so this is precisely the
-  class that made keyed text export at its resting pose (Active 24).
-
-**What it is now.** Three properties: `zoom` (uniform magnification of the
-content) and `pan.x` / `pan.y` (the window's offset, as a fraction of its own
-size). `crop` stays — it is the underlying window model, describing HOW MUCH of
-the source a clip shows; zoom and pan are modifiers applied to that window
-before it becomes a source rect. Only the two gestures moved.
-
-`geom_source_window` resolves all three into the four normalized insets every
-consumer already speaks, so nothing downstream knows zoom and pan exist, and
-`geom_crop_insets` is the only way to get them. Both sinks route through it:
-the preview's box (clip_image_bounds_geom) and crop UVs (gpu_draw), and the
-export's static path (render_display_rect) and keyed path (render_kf_geom_rect).
-That last one mattered — reading the four crop lanes out of `sampled` there
-would have animated crop while silently freezing zoom and pan, which is the
-static/keyed split that has bitten twice.
-
-**Two windows, not one — and the distinction is the whole invariant.** Zoom and
-pan select CONTENT. Only crop trims the BOX. Those are different consumers and
-routing both through the same resolved window moves the clip:
-
-`cropped_box_edges` reads an inset as a box TRIM (`l` pulls the box's left edge
-inward), so an ASYMMETRIC inset pair moves the box. Both zoom and pan produce
-asymmetric insets exactly when they must not move anything — a pan slides the
-window off-center on purpose, and a zoom about an ASYMMETRIC crop window's center
-inherits that window's offset. Measured with the first implementation, which fed
-the resolved window to both:
-
-| case | box centre | should be |
-|---|---|---|
-| symmetric crop + zoom 2 | 500.00 | 500.00 ✓ |
-| symmetric crop + **pan 0.25** | **450.00** | 500.00 ✗ |
-| **asymmetric crop (l=0.2) + zoom 2** | **600.00** | 500.00 ✗ |
-
-So there are two accessors, named for what they are FOR rather than which lanes
-they read: `geom_box_insets` (crop only; every box path) and
-`geom_content_insets` (crop + zoom + pan; `crop_src_rect`, the preview's crop UVs,
-and the static path's decoder window). The keyed path needs both and computes
-both — `cropped_box_edges` from the box insets, `crop_src_rect` from the content
-ones.
-
-The static export path also stopped deriving its decoder window from where the box
-landed on canvas. Those fractions were derived from the box rect, which cannot
-express a pan at all; they are now source fractions read from the content window,
-and the buffer's size and placement stay governed by the box. So a 2x zoom fetches
-half the source and fills the box with it, and a pan fetches a different half —
-which is precisely "operate on the content, never on the box".
-
-**The probe had the same bug as the code, which is why it passed.** Its
-stationarity check built the reference by calling `clip_image_bounds_geom` with
-the ZOOMED sample — the same code path under test — so it agreed by construction
-and stayed green while the box was moving a fifth of its width. The reference is
-now the same clip with zoom and pan NEUTRALISED. A reference that shares the code
-under test cannot see that code's bug; that is the one lesson from this that is
-worth more than the feature.
-
-**Consumed before the box, not after.** Ordering zoom relative to scale is
-mathematically a wash (scales commute). It is load-bearing because
-`crop_src_rect` picks an INTEGER rect inside the decoded stage and the display
-box maps to it 1:1 — that is what lets a keyed clip region-copy per frame with
-no resampling. A post-transform zoom would destroy the 1:1 mapping and force a
-resample every frame. Zoom is therefore folded into the window, which keeps the
-fast path.
-
-Zoom is UNIFORM by necessity, not taste: it scales the window about its center,
-so per-axis factors would change the box's aspect ratio, contradicting the
-invariant these gestures have always had — the box never moves or resizes. Pan
-is per-axis because sliding a window does not distort it.
-
-**Zero is a usable value, so the file needs no migration.** `geom_source_window`
-reads a non-positive zoom as 1 and pan 0 as centered. A project saved before
-this change has no `zoom` field, which decodes to 0, which means exactly the
-right thing — every clip opens unzoomed and unpanned with nothing to detect.
-That is why zoom/pan get no `has_` presence flag while opacity above them does:
-opacity's absent value (0) means fully transparent, which is not a sane default,
-so it needed one. The asymmetry is the reason, and it is now said in the file.
-
-**Probe / mutation.** `geom_key_probe` gains the invariant that was previously
-impossible to state, because the box no longer moves: zoom and pan must leave
-the clip's box **exactly** where it was, asserted as a property over a sweep of
-4 zooms x 3 pans x 2 axes rather than a baked rectangle. Plus the window
-arithmetic itself (zoom halves both axes and keeps the center; pan slides by a
-fraction of the window's own width; a far pan PINS at the edge instead of running
-off the source; a zero zoom leaves crop alone).
-
-Mutation, both directions:
-
-- making `clip_zoom_by` nudge `Trans_X` alongside the zoom — the old hack's
-  coupling — fails with `Alt+wheel must not write transform.x (was 960, now 968)`
-- routing the box back through `geom_content_insets` — the bug above — fails 36
-  assertions, e.g. `zoom=1.00 pan=(-0.30,-0.20): box moved (576.00,324.00) vs
-  (528.00,297.00)`
-- inverting the pan sign back fails both direction cases: `dragging right must
-  move the sampled window toward the source's LEFT (l 0.3875 -> 0.5125)` and
-  `a 120px drag must move the content 120px (got -120.00)`
-
-**Pan speed scaled with zoom: 4.4x too fast at zoom 4.** `clip_pan_by` divided the
-drag by the sampled WINDOW's width in project px (`nw * cw`) where the correct
-divisor is the BOX width (`cw`). The derivation is one line —
+Result over 420 ticks, with a 900 ms stall:
 
 ```
-sx(u) = box_x + (u - nl)/nw * cw,   nl = nl0 - pan * nw
-      = const + pan * cw
+queue peak=12480 min=0 frames; device asked for 130 unwritten frames during the
+stall; resync=0 starve=3
 ```
 
-— so one unit of pan moves the content `cw` project px, INDEPENDENT of `nw`:
-zoom and crop cancel, because they enlarge the source displacement a pan implies
-while shrinking the window by the same factor. Dividing by the window width gave
-a screen motion of `dx/nw`, so a 120px drag moved the content 120px at zoom 1
-uncropped and 533px at zoom 4 over a 10% crop. **The two divisors are identical
-exactly when `nw == 1`**, i.e. zoom 1 with no crop — which is why it read as
-correct until anything was zoomed, and why every hand-check made at default zoom
-agreed with the code.
+- the queue fills to the cushion and **drains to zero** — the stall happened
+- the device asks for **130 sample-frames that were never written** — that is the gap
+- **`resync=0` throughout, including the stall** — no re-anchor, therefore no offset
+- the queue **climbs back** to the cushion, so the gap heals rather than persisting
 
-The comment claiming "zoom is already folded into the window, so this tracks it
-for free" was the load-bearing error: folding zoom into the window is what makes
-it cancel, not what makes the window width the right divisor.
+`resync=0` is the claim. A resync re-anchors, and a re-anchor is a silent shift of
+the playhead — the single thing this design cannot tolerate, and precisely what the
+old code reached for when the producer fell behind.
 
-**The probe that should have caught it asserted a tautology.** It checked
-`(Δnl) * cw == 120` — a source fraction times a box width. Since `Δnl = dx/nw`,
-the `nw` cancels and the expression is *algebraically* 120 at every zoom. It
-passed against the real bug and could not have failed. The replacement measures
-what the user sees: the screen motion of a fixed source point,
-`(u - nl)/nw * cw`, which is only screen space if divided by `nw`, plus a
-zoom-invariance case (same drag at zoom 4 must move the content the same 120px).
-Reverting the divisor now fails both: `got 533.33`.
+**Three probe bugs found while building it, all vacuous-pass shaped:**
 
+- It called `audio_update`, which is the **UI side** and explicitly does no work in
+  steady state ("the producer runs on its own clock"). So nothing was ever fed, and
+  the probe reported a gap — and success — for a run in which no audio existed.
+- `audio_device_ready` gated on `rb_ready`, which a simulated device never sets, so
+  the producer returned before feeding. Same vacuous pass, one layer down.
+- The simulation ring was sized like the real one (32768), so it overflowed and
+  aborted on a fact about the **probe's** drain rate rather than about the design.
+
+And two assertions of my own were wrong before the run was right: `dev_frame` is
+published **on a feed pass**, so it is legitimately stale while the producer is
+stalled — comparing it against a live target reported ordinary advance as a stall
+artefact. And the starvation counter legitimately fires while the queue refills
+from zero after the gap, so it has to be allowed to move until the refill settles
+and is then required to stop.
+
+The probe also refuses to pass by doing nothing: it requires the device to have run
+dry AND the queue to have ended back at the cushion.
+
+
+## Active 31 — A drop freed SDL's buffer, so the feature that worked read as broken
+
+**Status: fixed 2026-10-06.** Branch `fix/dnd-drop` (base `771044b`). `dnd_probe` +
+`dnd_valgrind` were already members of `all` and both cover this.
+
+**The symptom.** Dragging a file onto the media bin or the timeline did nothing.
+
+**The defect.** `handle_file_drop_event`'s `DROP_FILE` branch called
+`sdl.free(rawptr(event.drop.data))` on the comment's authority — *"SDL owns
+`data` ... releasing it here is the only owner that can"*. That is the wrong
+reading of "SDL owns", and it is wrong twice over. SDL does own the buffer, but
+not exclusively: `SDL_SendDropFile` builds it with `SDL_CreateTemporaryString`,
+which is `SDL_FreeLater(SDL_strdup(...))` — the block goes onto SDL's own
+per-thread temporary-memory list, and `SDL_PumpEventsInternal` runs
+`SDL_FreeTemporaryMemory` over that list at the top of the *next* pump. Once per
+frame, whether or not the app ever polled the event. So the branch freed a block
+SDL still held a pointer to, and the next frame freed it again.
+
+The consequence is why this read as "nothing happened" rather than as a crash: the
+placement runs *first* (import, then `add_asset_to_timeline`), so the clip lands,
+and only then does the heap come apart underneath it. A double free is silent
+when the chunk has been handed back out in between and an abort when it has not —
+so the same defect presents as a crash or as a quietly corrupted session
+depending on what the allocator did, which is also why it survived a probe suite.
+
+`SDL_ClaimTemporaryMemory` is the API for an app that genuinely wants the block;
+it is internal to SDL and not bound here, and nothing needs it — the bin clones
+every path it keeps (`import_media_to_bin`), so the correct action was to leave
+the pointer alone. The branch now owns nothing, and says why at the site.
+
+**Why it stayed invisible for three years.** Every existing `dnd_probe` check
+stops at the *decision*: which zone a point means, whether the bin will hold the
+file, whether the gesture state is clean. None of them hands a path across the
+event boundary, so none of them could see an ownership bug there — the probe
+passed with the double free in place, and `dnd_valgrind` reported 0 definitely
+lost, because the *probe* was never the owner SDL was double-freeing. A gate can
+only measure the boundary it actually crosses.
+
+**Probe.** The probe now drives the commit, not just the decision: a real
+`DROP_POSITION` + `DROP_FILE` pair pushed through SDL's own queue and drained by
+`handle_sdl_events` (the app's only poll site), over a WAV the probe writes
+itself, so the handoff is exercised by one owner exactly as SDL has it.
+- drop on the bin → the asset appears, and the timeline is untouched
+- bin item pressed → dragged → released over the timeline → clips appear and the
+  gesture disarms (the in-app half, checked against the same laid-out geometry so
+  the two paths that must agree are compared directly)
+- drop on the timeline → clips appear, on a timeline that already has lanes
+
+Mutation-checked: putting the `sdl.free` back kills the probe with
+`free(): invalid pointer` before any assertion is reached. That is the load-bearing
+result — it is the first thing in this suite that can see the defect at all.
+
+Each test re-lays out the page before asking where the timeline is. A drop
+resolves lanes out of the layout, so a test that placed clips earlier in the run
+would otherwise read `EmptyTimeline`'s box on a timeline that now has tracks —
+a zero box, and a red test that says nothing about the code.
+
+**Second defect, found by the first.** With the commit actually running,
+`dnd_valgrind` went red on something the probe had never reached:
+`media_frame_count` (`media.odin:161`) leaked the `[]string` from
+`strings.split(rate, "/")` on every import — the same bug its own
+`strings.split_lines(metadata)` two lines above had already been fixed for, with
+the rule written in a comment right there. Every *other* import path runs through
+`open_file_at`, which no valgrind target exercises; the dnd probe was the first
+gate to import a decodable file under memcheck. `defer delete(parts)`.
+
+`dnd_valgrind`: 0 definitely lost, 0 indirectly lost, no invalid access.
+
+## Active 32 — SDL moved the app onto XWayland, and niri does not bridge desktop drags
+
+**Status: fixed 2026-10-06.** Branch `fix/dnd-drop` (base `771044b`). Found while
+fixing Active 31, on the same machine, by the user still reporting "nothing
+happens" after the double free was gone.
+
+**The defect.** Dropping a file on the bin or the timeline produced no events at
+all — not even the zone highlight, which is drawn from `DROP_POSITION`. SDL's own
+trace showed the drag never reached the window: no `wl_data_device` offer, no
+`XdndEnter`, nothing.
+
+The reason is one line in SDL, found by reading `SDL_waylandvideo.c` rather than
+guessing:
+
+```
+This compositor lacks support for the fifo-v1 protocol; falling back to XWayland
+for GPU performance reasons (set SDL_VIDEO_DRIVER=wayland to override)
+```
+
+SDL ships two Wayland bootstraps. `Wayland_preferred_bootstrap` refuses unless the
+compositor implements `wp_fifo_v1`, and on refusal SDL picks X11 instead — a
+frame-pacing trade. It is the wrong trade for an editor, and silently so: an
+XWayland client is not a Wayland surface, so **the compositor does not hand it
+desktop drags**. A drag started in a native Wayland file manager has to be
+bridged into an X11 window by the compositor, and niri's XWayland server does not
+do that. So on niri the whole feature was dead before SDL generated a single
+event, and no amount of correctness in `dnd.odin` could have reached it.
+
+**The fix.** `prefer_native_wayland` (`main.odin`), called before `sdl.Init`
+because that is where the driver is chosen: when `WAYLAND_DISPLAY` is set and
+`SDL_VIDEO_DRIVER` is not already pinned, `sdl.SetHint("SDL_VIDEO_DRIVER",
+"wayland")`. The explicit-pinned check comes first so SDL's own documented advice
+(`SDL_VIDEO_DRIVER=wayland`) still works and nothing overrides a user's choice.
+
+**The cost, stated plainly.** A session that claims Wayland but cannot reach a
+compositor no longer falls back to X11 — `SDL_Init` fails outright. That is the
+right way round: XWayland is not a working fallback for a Wayland session, it is a
+slower one that silently drops a shipped feature. And the app now runs on a
+*different backend than it did before* for anyone on a compositor without
+`wp_fifo_v1` (niri). Compositors that have it — sway, wlroots, KDE 6, GNOME —
+were already on Wayland and see no change.
+
+**Not probeable, and how it was verified instead.** A headless run cannot conjure
+a compositor, so no gate covers the driver choice. It was verified on the real
+session against a real drag, which is what found it: with the trace on
+(`SDL_LOGGING="*=error,input=trace"`) a drag that does not work shows *no*
+`wl_data_device`/`XdndEnter` trace at all, versus a working one showing
+`data_device_handle_enter` → `data_device_handle_motion` → `data_device_handle_drop`
+→ `DROP_POSITION` → `DROP_FILE` → `DROP_COMPLETE`. That difference — an empty
+trace — is the only evidence a broken drag produces, which is why "it does
+nothing" took a backend trace to tell apart from "it crashes". Note this is also
+the same evidence the X11 path gives, which is how Active 31's real defect was
+separated from Active 32's: the X11 path demonstrably delivers `DROP_BEGIN` +
+`DROP_POSITION` from a hand-built XDND gesture, and never got a `DROP_FILE`
+through — because xwayland-satellite drops the synthetic `SelectionNotify` that
+carries the path. The two failures looked identical from the outside.
 The replacement case was itself wrong on arrival — it nested a second
 `geom_key_fixture()` inside the direction case, and the fixture calls
 `free_timeline`, so the second call freed the clips array the first case's `cl`
@@ -6348,7 +6376,7 @@ whole zoom/pan record with it. Restored from `c03c1d1`. The code was never at ri
 — only the record of it — but a stale editor buffer overwriting a merged file is
 silent, and nothing in the gate set reads TODO.md.
 
-## Active 32 — A clip plays at its own rate; the project rate is a timebase, not a speed
+## Active 33 — A clip plays at its own rate; the project rate is a timebase, not a speed
 
 **Why:** changing the project frame rate changed the playback speed of every clip
 in the project. The mapping from timeline frame to source frame was

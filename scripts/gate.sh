@@ -679,11 +679,12 @@ target_dnd_probe() {
 }
 
 # The memory gate for dnd_probe: the drop path takes an SDL-owned C string for
-# each dropped file and hands it to the bin, which clones what it keeps. The
-# clone is the whole reason sdl.free on the event buffer is safe, and this is
-# the only gate that exercises that handoff (import_path_to_bin's refusal branch
-# plus the refusal of a path SDL would have delivered). Same four invariants as
-# target_valgrind.
+# each dropped file and hands it to the bin, which clones what it keeps. So the
+# app owns nothing here -- SDL's SDL_FreeTemporaryMemory list owns the event
+# buffer and frees it at the next pump -- and the probe covers the handoff from
+# both ends: the commit it makes and the clone it makes (import_path_to_bin's
+# refusal branch plus the refusal of a path SDL would have delivered). Same four
+# invariants as target_valgrind.
 target_dnd_valgrind() {
 	require_fresh_valgrind_binary dnd-valgrind || return 1
 	mkdir -p target/valgrind
@@ -1391,13 +1392,26 @@ target_audio_drift_parity() {
 	mkdir -p target/mixparity
 	if [ ! -s "$wav" ] || [ ! -s "$aac" ]; then
 		echo "audio-drift-parity: synthesizing a ${secs}s fixture" >&2
-		ffmpeg -v error -f lavfi -i "sine=frequency=997:sample_rate=48000:duration=$secs" \
+		# 5% longer than the span under test. A clip that claims exactly the whole
+		# source is asking for the encoder's padding: AAC's tail is not decodable
+		# content, so the last ~21ms is a shortfall rather than audio, and a
+		# shortfall is not what this probe is measuring.
+		local fixture_secs=$(awk "BEGIN{print $secs * 1.05}")
+		ffmpeg -v error -f lavfi -i "anoisesrc=color=white:sample_rate=48000:duration=$fixture_secs:amplitude=0.5:seed=7" \
 			-ac 2 -c:a pcm_s16le "$wav" -y || return 1
 		ffmpeg -v error -i "$wav" -c:a aac -b:a 128k "$aac" -y || return 1
 	fi
-	# 997 Hz is deliberate: it is coprime with 60, with 30000/1001 and with 48000,
-	# so a rounded boundary shows up as a phase error instead of cancelling out
-	# over the window the way 440 or 1000 Hz would.
+	# Broadband noise, deliberately. A pure tone -- 997 Hz was the first choice --
+	# is coprime with 60, 30000/1001 and 48000, so a rounded boundary does show as
+	# phase error, but it has a 48.1-sample period at 48 kHz, which makes
+	# cross-correlation ambiguous: every shift differing by a period correlates
+	# just as well, so the "best shift" cannot localise anything within ~48
+	# samples. Chasing that produced a confident number that meant nothing.
+	#
+	# Noise has no period, so the correlation has one peak. It also exposes
+	# rounding MORE sharply than a tone: a boundary rounded by one sample moves
+	# every sample after it against uncorrelated noise, which is the largest
+	# possible error rather than a phase wobble that partly cancels.
 	for spec in "600|60" "600|29.97" "600|30"; do
 		printf '[gate] drift %ss at %s fps\n' "${spec%%|*}" "${spec##*|}"
 		VYPER_AUDIO_DRIFT_PARITY="$PWD/$src|${spec%%|*}|${spec##*|}" timeout 1800 ./vyper 2>&1 | tail -2
@@ -1408,6 +1422,91 @@ target_audio_drift_parity() {
 		return 1
 	fi
 	echo "audio-drift-parity: ok"
+}
+
+# audio_stall_gap is the only probe that exercises the TRANSPORT rather than the
+# mixers, and it exists to demonstrate the claim the audio-master design rests on:
+# a producer stall costs the listener a GAP and no subsequent offset.
+#
+# It cannot be provoked from outside. SIGSTOP freezes the device callback too --
+# it is in-process -- so freezing the process is not a producer-only stall. So the
+# device is SIMULATED (a software ring behind audio_device_push/_queued/
+# _available/_clear) and the probe runs in real time, draining the simulation at
+# exactly the bus rate. The producer under test is the real one, and a "stall" is
+# the probe declining to call it, which is the condition being claimed about.
+#
+# Asserted every tick outside the stall: dev_pos == fed - queued; and on EVERY tick,
+# including the stall: the resync count does not move. That last one is the whole
+# claim -- a resync re-anchors, and a re-anchor is a silent shift of the playhead,
+# which is the single thing this design cannot tolerate. The probe also requires
+# that the device actually ran dry and that the queue climbed back to the cushion,
+# so it cannot pass by doing nothing.
+target_audio_stall_gap() {
+	require_fresh_binary audio-stall-gap || return 1
+	local src=target/mixparity/long.m4a
+	if [ ! -s "$src" ]; then
+		echo "audio-stall-gap: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
+		return 1
+	fi
+	VYPER_AUDIO_STALL_GAP="$PWD/$src|900" timeout 300 ./vyper 2>&1 | tail -2
+	local rc=${PIPESTATUS[0]}
+	if [ $rc -ne 0 ]; then
+		echo "audio-stall-gap: FAILED -- a stall did not produce a clean gap" >&2
+		return 1
+	fi
+	echo "audio-stall-gap: ok"
+}
+
+# audio_node_latency pins the two delays in the audio graph. It is a gate target
+# because both upcoming features depend on them -- clip stretching and audio
+# scrubbing are SEEKS, and a delay is a seek that lands late -- and because a
+# libavfilter or FFmpeg bump can move either number without anything else noticing.
+#
+# swr is read from the resampler's own API, with a 1:1 passthrough as the control
+# that makes the number believable. atempo is measured by ACCOUNTING
+# (pushed/rate - produced), which needs no waveform, no threshold and no window, and
+# is remeasured and compared for repeatability.
+#
+# The two methods that do NOT work are recorded in the probe, because they are the
+# obvious ones: impulse correlation cannot locate anything in WSOLA output (which is
+# reassembled from overlapping segments, not shifted), and energy onset quantises to
+# its own analysis window. Both produced confident numbers that meant nothing.
+target_audio_node_latency() {
+	require_fresh_binary audio-node-latency || return 1
+	VYPER_AUDIO_NODE_LATENCY=1 timeout 900 ./vyper 2>&1 | tail -6
+	local rc=${PIPESTATUS[0]}
+	if [ $rc -ne 0 ]; then
+		echo "audio-node-latency: FAILED" >&2
+		return 1
+	fi
+	echo "audio-node-latency: ok"
+}
+
+# audio_clip_tempo drives a STRETCHED clip through the real playback mixer, across
+# the whole buildable speed range.
+#
+# It checks the two things that make per-clip tempo more than a field that compiles:
+# that a stretched clip produces output for its span, and that the graph is genuinely
+# in the path -- a stretch that rendered bit-identically would mean tempo is not being
+# applied and, therefore, that pitch is not being corrected. Speed 1.0 is the
+# CONTROL and must be bit-identical, because that is what proves the feature is inert
+# until a clip is actually stretched.
+target_audio_clip_tempo() {
+	require_fresh_binary audio-clip-tempo || return 1
+	local src=target/mixparity/long.m4a
+	if [ ! -s "$src" ]; then
+		echo "audio-clip-tempo: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
+		return 1
+	fi
+	local rc=0
+	for sp in 1.0 0.25 0.5 1.5 2.0 3.0 4.0; do
+		VYPER_AUDIO_CLIP_TEMPO="$PWD/$src|$sp" timeout 600 ./vyper >/dev/null 2>&1
+		[ $? -ne 0 ] && { echo "audio-clip-tempo: FAILED at speed $sp" >&2; rc=1; }
+	done
+	if [ $rc -ne 0 ]; then
+		return 1
+	fi
+	echo "audio-clip-tempo: ok (speeds 0.25 .. 4.0, with 1.0 as the inertness control)"
 }
 
 target_all() {
@@ -1423,7 +1522,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_clip_tempo atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1457,6 +1556,9 @@ main() {
 	audio_export_audit) target_audio_export_audit ;;
 	audio_mix_parity) target_audio_mix_parity ;;
 	audio_drift_parity) target_audio_drift_parity ;;
+	audio_stall_gap) target_audio_stall_gap ;;
+	audio_node_latency) target_audio_node_latency ;;
+	audio_clip_tempo) target_audio_clip_tempo ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
@@ -1476,7 +1578,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

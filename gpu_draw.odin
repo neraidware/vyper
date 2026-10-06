@@ -1690,16 +1690,21 @@ draw_preview_hud :: proc(
 	// phantom skew that is never audible. Extrapolate both off the same wall
 	// clock (the way the producer pins its queue target) — the residual is the
 	// true device-vs-playhead offset, a few ms at most.
+	// The skew meter is now a READOUT of a relationship that cannot drift, not a
+	// watchdog on one that can. dev_frame is the device's exact consumed position
+	// (fed minus queued, two integers in bus samples) and playhead.frame is derived
+	// from it, so this delta is bounded by one producer publish and carries no
+	// information about drift -- it is here to show that, and to catch the one case
+	// that would break it: a stale publish while the producer is stalled.
+	//
+	// The extrapolation that used to live here is gone. Extrapolating dev_frame off
+	// the wall clock was how a device position was turned back into a wall-clock
+	// guess, which is the thing this whole change removes.
 	now := monotonic_ns()
 	dev_at := sync.atomic_load(&playback.dev_at_ns)
-	dev_raw := sync.atomic_load(&playback.dev_frame)
+	dev := sync.atomic_load(&playback.dev_frame)
 	rate_sc := max(1.0, playback.rate)
-	dev_now := dev_raw + (dev_at > 0 ? i64(f64(now - u64(dev_at)) / 1e9 * rate_sc * f64(fps)) : 0)
-	// playhead.frame is the last UI-frame publish; extrapolate it to now like
-	// the producer does (audio.odin .feed) so both ends share the same clock.
-	dev := dev_now
-	ph_now := max(playback_playhead_at(now, rate_sc), i64(0))
-	ph := ph_now
+	ph := playhead.frame
 	label_buf: [64]u8
 	label := fmt.bprintf(
 		label_buf[:],
@@ -1737,7 +1742,7 @@ draw_preview_hud :: proc(
 			holes, holes-audio_skew_diag.prev_holes,
 			audio_rpt.skip_nocov, audio_rpt.skip_nocov-audio_skew_diag.prev_ncov,
 			audio_rpt.skip_full, audio_rpt.skip_full-audio_skew_diag.prev_full,
-			audio_rpt.wedge_heal, audio_rpt.wedge_heal-audio_skew_diag.prev_wedge,
+			audio_rpt.starve_ticks, audio_rpt.starve_ticks-audio_skew_diag.prev_wedge,
 			audio_rpt.rate_rebuilt, audio_rpt.rate_rebuilt-audio_skew_diag.prev_rebuilt,
 			playback.rate, playback.boost,
 		)
@@ -1746,7 +1751,7 @@ draw_preview_hud :: proc(
 		audio_skew_diag.prev_holes = holes
 		audio_skew_diag.prev_ncov = audio_rpt.skip_nocov
 		audio_skew_diag.prev_full = audio_rpt.skip_full
-		audio_skew_diag.prev_wedge = audio_rpt.wedge_heal
+		audio_skew_diag.prev_wedge = audio_rpt.starve_ticks
 		audio_skew_diag.prev_rebuilt = audio_rpt.rate_rebuilt
 	}
 	fs: u16 = FONT_SMALL

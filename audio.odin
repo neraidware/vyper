@@ -484,15 +484,6 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 // interface in audio_device.odin, so nothing in the engine knows what backs it.
 audio_atempo: Atempo_Graph
 
-// AUDIO_AUDIBLE_SKEW_TOL is the maximum wall-time the audible content position
-// (playback.dev_frame) may trail the playhead before audio_update forces a
-// re-anchor. Healthy steady playback keeps it at ~0; a deficit this large means
-// the producer is throttled at the queue cap and can never close the gap on its
-// own. Kept well under the ~0.25s cushion so a snappable defect is caught
-// rather than tolerated; the 200ms post-seek coalesce gate above prevents
-// firing during legitimate queue-ramp transients.
-AUDIO_AUDIBLE_SKEW_TOL :: 0.1
-
 // MAX_PLAY_AUDIO bounds simultaneous playback decoders. One decoder serves a
 // whole source stream (every contiguous split segment shares it), so this
 // bounds STREAMS, not clips.
@@ -553,70 +544,21 @@ AUDIO_FORWARD_DECODE_MAX_48 :: i64(AUDIO_FORWARD_DECODE_MAX_SEC * 48000.0)
 // on one side, which is the same defect shape as the text blend Active 26 removed.
 //
 // A click is a STEP, and what removes it is spreading the step over enough samples
-// that no single step is large. The fade is applied per SOURCE and per BLOCK, not
-// to the mix: two overlapping sources must not ramp each other, so the gain is
-// folded in before the source is summed.
+// No automatic edge ramp exists here, and that is the design: a cut is a cut.
+//
+// There WAS one -- a raised-cosine declick of AUDIO_DECLICK_SAMPLES at every
+// source's contribution edges -- and it was this engine's second fade mechanism.
+// Gain is already automated per sample through the clip's keyframe envelope, so
+// the ramp was an IMPLICIT fade applied to every edit whether the user wanted one
+// or not, and an authored fade could not be told from an automatic one. Two
+// mechanisms for one job is where two mechanisms disagree: they did, at ~2.5e-3
+// in a clip's final fade, because the ramp was normalised against the caller's
+// chunk length and playback chunks by frame while the export chunks by block.
+//
+// A step at a cut is a real discontinuity and can be heard. That is what an
+// authored fade is for, and the envelope already expresses one. The engine's job
+// is that what you cut is what you hear.
 // ---------------------------------------------------------------------------
-
-// AUDIO_DECLICK_SAMPLES is the fade length at a source's contribution edges, in
-// sample-frames (256 = 5.3ms at 48kHz). Long enough that the derivative of the
-// fade is small next to the signal it is fading, short enough to be inaudible as
-// a fade: a click is a step, and what removes it is spreading the step over
-// enough samples that no single step is large.
-AUDIO_DECLICK_SAMPLES :: 256
-
-// audio_declick is the fade SHAPE: a raised cosine, so the gain AND its slope go
-// to zero at both ends. A linear ramp would leave a slope discontinuity at each
-// end, which is itself audible on a bright signal -- it converts a click into a
-// tick. Evaluated only inside the fade, at a source's edges, so the cost is
-// O(clip boundaries) and not O(audio samples): the steady interior of a block
-// never calls it.
-audio_declick :: proc(t: f32) -> f32 {
-	return (1.0 - math.cos(math.PI * t)) * 0.5
-}
-
-// audio_declick_fade_in is how many of a block's n sample-frames need the fade
-// at the front, given `from_edge`: the distance in samples from the block's first
-// sample to the contribution's start edge, 0 when the block opens on the edge.
-audio_declick_fade_in :: proc(from_edge: Sample_Pos, n: int) -> int {
-	if from_edge >= Sample_Pos(AUDIO_DECLICK_SAMPLES) {
-		return 0
-	}
-	return clamp(int(Sample_Pos(AUDIO_DECLICK_SAMPLES) - from_edge), 0, n)
-}
-
-// audio_declick_fade_out is audio_declick_fade_in at the other end: how many
-// of a block's n sample-frames need the fade before its end, given `to_edge` --
-// the distance from the block's last sample to the contribution's end edge.
-audio_declick_fade_out :: proc(to_edge: Sample_Pos, n: int) -> int {
-	return audio_declick_fade_in(to_edge, n)
-}
-
-// audio_declick_gain is sample `s` of a block's `n`: the automation gain, faded
-// in over the first fade_in samples and out over the last fade_out.
-//
-// Named rather than written inline because the shape appears TWICE when it is
-// inline -- once ascending, once descending, with mirrored expressions -- and two
-// copies of a ramp that must agree is the kind of thing that drifts.
-//
-// Each fade is normalised by its OWN length and stepped so the ramp's argument
-// runs 1/fade .. 1 INCLUSIVE, which puts the gain at exactly g on the last faded
-// sample. Two things depend on that. A block shorter than the fade still completes
-// it rather than leaving the contribution permanently attenuated, which is what
-// measuring against the fixed AUDIO_DECLICK_SAMPLES does; and the hand-off from
-// faded to unfaded carries no step of its own. (Normalising to fade/(fade+1)
-// instead reaches only 0.99996 -- inaudible, but it makes the ramp's endpoint a
-// lie in the comment, and a probe asserting the invariant caught exactly that.)
-audio_declick_gain :: proc(g: f32, s, n, fade_in, fade_out: int) -> f32 {
-	if fade_in > 0 && s < fade_in {
-		return g * audio_declick(f32(s+1) / f32(fade_in))
-	}
-	if fade_out > 0 && s >= n-fade_out {
-		return g * audio_declick(f32(n-s) / f32(fade_out))
-	}
-	return g
-}
-
 
 Audio_Ring :: struct {
 	buf:   [dynamic]f32, // backing storage; len(buf)/2 == capacity in sample-frames
@@ -733,6 +675,7 @@ Play_Seg :: struct {
 	// per frame through audio_gain_linear, so automation animates live without
 	// the producer ever reading live timeline state.
 	gain: Audio_Gain_Snapshot,
+	pitch: Audio_Pitch_Snapshot,
 }
 
 // Play_Src is one source stream's 48 kHz stereo S16 decoder + content-relative
@@ -750,12 +693,29 @@ Play_Src :: struct {
 	fifo:  Audio_Ring, // content-relative stereo f32 at 48 kHz
 	first48: i64,       // content 48 kHz sample of fifo's head
 	have48:  i64,       // content 48 kHz samples produced so far
-	// muted records that this source's last contribution did not arrive (a
-	// shortfall the fifo could not cover), so its RETURN fades in rather than
-	// reappearing at full level. An edge a listener hears even though no clip
-	// changed, and the same state the export's Render_Audio_Src.muted holds --
-	// it is what makes a hole's recovery sound like the export's.
-	muted: bool,
+
+	// TEMPO. A clip whose speed is not 1.0 does not present its content to the mix
+	// at one content sample per output sample, so it cannot be read out of `fifo` by
+	// index -- the content that belongs at timeline position P arrives S times later.
+	// Hence a SECOND ring, filled by a streaming pump through this source's own
+	// atempo graph, holding OUTPUT samples at 1:1 with the timeline. The mix indexes
+	// that one instead, and `first48`/`have48` keep meaning content, so every
+	// existing piece of positioning logic is untouched.
+	//
+	// A source at speed 1.0 never touches any of this: no graph is built, no pump
+	// runs, no second ring is filled. That is deliberate rather than an optimisation
+	// -- it means the whole feature is provably INERT until a clip is actually
+	// stretched, so the parity, 600 s drift and stall gates keep proving the engine
+	// they were written for.
+	//
+	// The two paths do not duplicate the mixing: mix_src_block takes a ring POINTER,
+	// so choosing which ring to read is passing a different pointer, not a second
+	// copy of the loop.
+	tempo:      Atempo_Graph,
+	out_ring:   Audio_Ring, // post-atempo output, 1:1 with the timeline
+	out_first:  i64,        // output sample index of out_ring's head
+	speed:      f64,        // clip tempo; 1.0 means the path above is used unchanged
+	content_used: i64,     // content samples consumed by the graph, for the ratio
 	seg:          [MAX_PLAY_SEGMENTS]Play_Seg, // in timeline order
 	seg_count:    int,
 }
@@ -897,6 +857,18 @@ Audio_Report :: struct {
 	queued:       i64, // bus sample-frames in the device bridge at last report
 	holes:        i64,
 	fed:          u64, // total_fed_frames at last report (for true bus rate)
+	// head_clamped counts, and head_clamp_max records the largest, the times the
+	// mixer's `demand48 = max(demand48, s.first48)` had to move a frame's demand
+	// FORWARD to meet a decoder that had landed ahead of it.
+	//
+	// This used to be invisible, and it is not a neutral safety net: mixing from
+	// the head instead of from the position the timeline asked for shifts that
+	// frame's whole content, silently, with nothing counting it. Measured at
+	// 30000/1001: playback mixed a 1601-sample frame from 1786 samples past where
+	// the frame began, which is a content shift nobody would ever hear about.
+	// A count is the minimum; the fix is to stop needing it.
+	head_clamped:   i64,
+	head_clamp_max: i64,
 	// Monotonic totals, never cleared by reseeds.
 	total_fed_frames: u64,
 	// playhead-writer labels for the drift diagnostics: ph_src is the last
@@ -941,10 +913,27 @@ Audio_Report :: struct {
 	// real one empty and dropped, which reports as an Open for every source and
 	// looks from the outside exactly like the re-provision it replaced.
 	slots_new:   u64,
-	wedge_heal:   u64, // backlog drops when prod was queue-capped short of target
 	mix_us:       u64, // time spent inside audio_mix_frame (decode + resample + mix)
 	feed_us:      u64, // time spent in audio_producer_feed outside mix
 	min_q:        i64, // smallest queue depth (frames) seen in the window
+	// starve_ticks counts producer passes that found the device queue below a
+	// quarter of the cushion while playing, and starve_frames sums how far below.
+	// This is the invariant the whole audio-master design rests on: if the queue
+	// never starves and nothing re-anchors, the offset between the content FED and
+	// the content HEARD is zero forever -- not small, not bounded, zero.
+	//
+	// It was unmeasurable, because a starvation was silently REPAIRED: the wedge
+	// watchdog drops the backlog and the forward-skip re-anchors the producer to
+	// the extrapolated playhead. Those repairs are why the engine needs a skew
+	// alarm at all, and they are what lets a drift bug survive -- the symptom stops
+	// and the pressure to find its cause goes with it. Counting FIRST, before
+	// changing any behaviour, is what says whether the invariant already holds.
+	starve_ticks:  u64,
+	starve_frames: i64,
+	// queue_established latches once the device queue has reached the full cushion,
+	// i.e. the producer has genuinely caught up. Starvation before that is the
+	// startup fill, not a stall.
+	queue_established: bool,
 	max_q:        i64, // largest queue depth (frames) seen in the window
 	// Log/env toggles. VYPER_AUDIO_LOG=ms overrides the report interval
 	// (default 1000 ms); VYPER_AUDIO_FULL=1 adds per-source fifo lines and
@@ -1041,6 +1030,83 @@ audio_gain_linear :: proc(g: ^Audio_Gain_Snapshot, rel: i32) -> f32 {
 	return kf_gain_linear(g.keys[:g.n], rel, g.db)
 }
 
+// Audio_Pitch_Snapshot is a clip's pitch, committed: a static semitone offset plus
+// its keyframe track.
+//
+// It is deliberately the SAME SHAPE as Audio_Gain_Snapshot, and for the same reason
+// the two mixers agree about gain: the producer never reads live clips, so a track
+// the producer does not know about is a track that silently does nothing. One shape,
+// one path, one snapshot -- so pitch cannot drift out of step with the property it is
+// modelled on.
+Audio_Pitch_Snapshot :: struct {
+	semitones: f32,
+	keys:      [GAIN_KF_MAX_KEYS]Keyframe,
+	n:         int,
+}
+
+// audio_pitch_snapshot_from_clip snapshots a clip's pitch track into the shared
+// shape. Mirrors audio_gain_snapshot_from_clip exactly, including returning the
+// track's REAL key count so the caller can log truncation.
+audio_pitch_snapshot_from_clip :: proc(clip: ^Clip) -> (p: Audio_Pitch_Snapshot, total: int) {
+	p.semitones = clip.pitch
+	p.n, total = kf_fill_snapshot(clip, "pitch", p.keys[:])
+	return
+}
+
+// audio_pitch_semitones evaluates a committed pitch snapshot at clip-relative frame
+// `rel`.
+//
+// The one place it deliberately DIFFERS from the gain path: gain converts dB to a
+// linear multiplier, because amplitude is a multiplier. Pitch is NOT a multiplier --
+// it is a frequency ratio -- so it is returned in SEMITONES and converted to a ratio
+// once, where the ratio is actually needed (the shifter's resample factor). Converting
+// here would bake a unit into the snapshot and make the key values unreadable, which
+// is the mistake the dB comment on kf_gain_linear warns about in the other direction.
+audio_pitch_semitones :: proc(p: ^Audio_Pitch_Snapshot, rel: i32) -> f32 {
+	if p.n == 0 {
+		return p.semitones
+	}
+	v, _ := kf_sample_keys(p.keys[:p.n], rel, p.semitones)
+	return v
+}
+
+// semitones_to_ratio converts a semitone offset to the frequency ratio a pitch shifter
+// needs: 2^(n/12). The exponent is divided by 12 because an octave is 12 semitones,
+// and the base is 2 because pitch is a ratio, not a multiplier -- so +12 is exactly
+// one octave up, not 12x.
+semitones_to_ratio :: proc(semitones: f32) -> f64 {
+	return math.pow(2.0, f64(semitones) / 12.0)
+}
+
+// CLIP_PITCH_MIN / CLIP_PITCH_MAX bound a clip's pitch offset.
+//
+// Asymmetric on purpose. Downward is limited because every semitone DOWN is more
+// octave division in the shifter's resampler, and the lower it goes the more content
+// has to be discarded to do it -- so the floor is where quality is still acceptable,
+// not a round number. Upward is far more generous because shifting up is nearly free:
+// it needs resampling, not division.
+//
+// These are ASSERTED at the point of use rather than clamped, for the same reason
+// clip_speed asserts: a clamp would silently play a pitch the user did not ask for.
+CLIP_PITCH_MIN :: -24.0
+CLIP_PITCH_MAX :: 12.0
+
+// clip_pitch_at_playhead is the pitch the inspector should DISPLAY for `clip`: the
+// keyed semitone value where its pitch track is active at the playhead, else the
+// static clip.pitch.
+//
+// It exists because the gain row was the one holdout and so disagreed with what
+// playback was doing -- the readout sampled the resting field while playback used the
+// keyed curve. Without the mirror, a pitch automation would look inert in the
+// inspector while audible, which is the same class of bug and would be found the same
+// expensive way.
+clip_pitch_at_playhead :: proc(clip: ^Clip) -> f32 {
+	f := playhead.frame
+	rel := i32(f - clip.timeline_start_frame)
+	p, _ := audio_pitch_snapshot_from_clip(clip)
+	return audio_pitch_semitones(&p, rel)
+}
+
 // AUDIO_GEOM_SLOTS is how many geometry slots exist. Three, not two, and the
 // reason is the READER'S HOLD TIME: the producer does not read the slab for a
 // moment, it reads it for a whole provision (every decoder reopened, tens of
@@ -1063,6 +1129,13 @@ Audio_Geom_Chip :: struct {
 	// (see audio_source_start_sec).
 	source_rate:   f64,
 	stream_index:  c.int,
+	// speed is the clip's tempo, snapshotted here for the same reason gain is: the
+	// producer never reads live clips, so a tempo the producer does not know about is
+	// a tempo it will play at 1.0 and report no error for.
+	speed:         f64,
+	// pitch is the clip's semitone offset, snapshotted for the same reason gain and
+	// speed are: the producer never reads live clips.
+	pitch:         Audio_Pitch_Snapshot,
 	gain:          Audio_Gain_Snapshot,
 	path_off:      int, // offset into Audio_Geom_Slot.paths
 	path_len:      int,
@@ -1103,6 +1176,10 @@ Audio_Geom :: struct {
 	overflow:   bool,
 	// kf_trunc_logged logs once when a gain keyframe track is capped.
 	kf_trunc_logged: bool,
+	// pitch_kf_trunc_logged is the same for pitch. Separate flag rather than a shared
+	// one, because sharing them would mean a long gain track silences the pitch
+	// warning forever -- the second cap would look already-reported.
+	pitch_kf_trunc_logged: bool,
 }
 audio_geom_state: Audio_Geom
 
@@ -1211,11 +1288,20 @@ audio_geometry_commit :: proc() {
 			chip.source_rate = clip.audio_src_rate
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
+			// clip_speed owns the 0-means-1.0 default, so a clip that never had its
+			// speed touched snapshots as 1.0 rather than 0.
+			chip.speed = clip_speed(clip)
 			// Snapshot the clip's gain (static dB + its keyframe track) into the
 			// shared committed shape. kf_fill_snapshot renders the name; the
 			// geometry commit is UI-thread so reading the live clip is safe.
 			g, total := audio_gain_snapshot_from_clip(clip)
+			pitch_snap, pitch_total := audio_pitch_snapshot_from_clip(clip)
 			chip.gain = g
+			chip.pitch = pitch_snap
+			if pitch_total > GAIN_KF_MAX_KEYS && !audio_geom_state.pitch_kf_trunc_logged {
+				fmt.printf("[audio] pitch keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, pitch_total)
+				audio_geom_state.pitch_kf_trunc_logged = true
+			}
 			if g.n > 0 && total > GAIN_KF_MAX_KEYS && !audio_geom_state.kf_trunc_logged {
 				fmt.printf("[audio] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, g.n)
 				audio_geom_state.kf_trunc_logged = true
@@ -1397,6 +1483,18 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			}
 			g.path = strings.clone_to_cstring(audio_chip_path(slot, chip))
 			g.stream_index = chip.stream_index
+			// Snapshotted, not defaulted: a source whose speed was never set must read
+			// as 1.0 or it would take the stretched path with a speed of 0.
+			g.speed = chip.speed
+			if g.speed == 0 {
+				g.speed = 1.0
+			}
+			g.out_first = 0
+			g.content_used = 0
+			if g.tempo.graph != nil {
+				atempo_graph_destroy(&g.tempo)
+			}
+			ring_destroy(&g.out_ring)
 			audio_src.count += 1
 		}
 		if g.seg_count >= MAX_PLAY_SEGMENTS {
@@ -1408,6 +1506,7 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			start_s_rate = chip.source_rate,
 			len_a        = chip.source_len,
 			gain         = chip.gain,
+			pitch        = chip.pitch,
 		}
 		g.seg_count += 1
 	}
@@ -1633,6 +1732,107 @@ audio_src_append :: proc(s: ^Play_Src, n: int) {
 // The decoder continues sequentially from wherever it is; re-anchoring happens
 // via audio_provision (fresh group) or audio_src_seek_anchor (a jump that
 // advanced past content still needed).
+// audio_src_pump_tempo fills s's OUTPUT ring from s's content ring, through the
+// source's own atempo graph, until at least `want_out` output samples are available.
+//
+// This is the whole of per-clip tempo. The relationship it maintains:
+//
+//     a timeline frame is spf output samples
+//     a clip at speed S consumes spf * S content samples to fill it
+//     atempo's tempo factor is 1/S (its `tempo=` is an output-length multiplier,
+//     the inverse of the transport's rate -- measured to within a percent)
+//
+// PRIMING is the part that makes it land sample-exact, and it is not optional. WSOLA
+// needs `atempo_lookahead_samples(S)` content samples of context before it can emit
+// anything, so a freshly built graph's first outputs are the graph FILLING rather
+// than the clip's content. Without priming, every seek, jump or clip start would put
+// the clip's first L samples somewhere other than where they belong -- which is
+// precisely the bug class Active 30 spent its length removing at the decoder
+// (content 0 was unreachable because the seek landed late), reintroduced one layer up.
+//
+// So the graph is primed by pushing L content samples and DISCARDING the first
+// atempo_lookahead_samples(S) output samples. After that, output sample N corresponds
+// to content sample N*S, and a scrub or a clip start lands where it should.
+audio_src_pump_tempo :: proc(s: ^Play_Src, want_out: i64) {
+	if s.speed == 1.0 {
+		return
+	}
+	if s.tempo.graph == nil {
+		atempo_rate_set(&s.tempo, 1.0 / s.speed)
+		if s.tempo.graph == nil {
+			return
+		}
+		s.content_used = 0
+	}
+
+	// Chunk staging: bounded, so a long fill does not need a large stack buffer.
+	CHUNK :: 2048
+	// The priming pass asks for CHUNK plus a whole lookahead of content in one go,
+	// so the staging buffer has to hold BOTH. Sizing it at CHUNK overflowed the stack
+	// on exactly the first frame of every stretched clip -- which is why the feature
+	// crashed on its first use rather than degrading.
+	MAX_PRIME :: CHUNK + ATEMPO_LOOKAHEAD_MAX_SAMPLES
+	stage: [MAX_PRIME * 2]f32
+	priming := s.content_used == 0
+
+	for i64(ring_len(&s.out_ring)) < want_out {
+		need_content := i64(MAX_PRIME)
+		if !priming {
+			need_content = i64(CHUNK)
+		}
+		// Decode enough content to satisfy that, straight into the staging buffer.
+		got := 0
+		for i64(got) < need_content {
+			n := decode_audio_chunk(&s.dec, -1.0)
+			if n <= 0 {
+				break
+			}
+			copied := min(n, int(need_content) - got)
+			for i in 0 ..< copied * 2 {
+				stage[got * 2 + i] = f32(s.dec.s16[i]) / 32768.0
+			}
+			got += copied
+			if copied < n {
+				// Pushed only part of this decode; the rest stays in the decoder's
+				// s16 for the next pass, so nothing is lost.
+				break
+			}
+		}
+		if got == 0 {
+			break
+		}
+		s.content_used += i64(got)
+		atempo_process(&s.tempo, stage[:], got)
+		if s.tempo.out_n == 0 {
+			continue
+		}
+		discard := 0
+		if priming {
+			// The graph's own lookahead, expressed in the OUTPUT domain this time.
+			discard = int(f64(atempo_lookahead_samples(s.speed)) / s.speed)
+			priming = false
+		}
+		// Converted and pushed in bounded SLICES, not one buffer sized to out_n.
+		//
+		// out_n is not bounded by CHUNK: atempo's factor is 1/speed, so a clip at
+		// speed 4 emits FOUR output frames per input frame and a 2048-frame push
+		// produces 8192. A single CHUNK-sized staging buffer therefore overflowed the
+		// stack on exactly the fast clips the feature exists for, after the graph had
+		// built successfully -- so it crashed on use rather than degrading.
+		i16_out: [CHUNK * 2]i16
+		emitted := discard
+		for emitted < s.tempo.out_n {
+			take := min(CHUNK, s.tempo.out_n - emitted)
+			for i in 0 ..< take * 2 {
+				v := s.tempo.out_buf[emitted * 2 + i]
+				i16_out[i] = clamp(i16(v * 32767.0), -32768, 32767)
+			}
+			ring_push_pcm(&s.out_ring, i16_out[:take * 2], take)
+			emitted += take
+		}
+	}
+}
+
 audio_src_pull :: proc(s: ^Play_Src, up_to48: i64) {
 	for s.have48 < up_to48 {
 		n := decode_audio_chunk(&s.dec, -1.0)
@@ -1758,6 +1958,49 @@ audio_frame_boundary48 :: proc(frame: i64, fps: f64) -> i64 {
 // flat. Returns true if any covering segment actually delivered samples into
 // mix (false means the frame was fed to the device as silence while a segment
 // covered it — a decode/seek hole).
+// Mix_Src is what a source looks like to the mixer: a fifo of decoded content
+// samples, the content position of that fifo's head, and the clip's span on the
+// bus. It is deliberately NOT a struct -- both sinks' sources (Play_Src and
+// Render_Audio_Src) already carry these fields, and copying them into a third
+// struct per block would be the duplication this is meant to remove.
+//
+// Everything a source needs in order to be mixed is here: where its content
+// starts, how far it reaches, where its buffer begins and ends, and the pull that
+// refills it. The two sinks differ only in HOW they refill and in how they express
+// a position -- playback has a frame index, the export an absolute Sample_Pos --
+// and both of those are resolved by the caller before the block reaches
+// mix_src_block. What is left is arithmetic that must not exist twice.
+mix_src_block :: proc(
+	fifo: ^Audio_Ring,
+	first48: i64,
+	have48: i64,
+	content: i64,
+	want: int,
+	g: f32,
+	out: []f32,
+	off: int,
+) -> (mixed: bool) {
+	if want <= 0 {
+		return false
+	}
+	base := int(content - first48)
+	if base < 0 {
+		// The fifo head is PAST the content this block asks for. The caller has
+		// already decided what to do about it (the export counts it, playback clamps
+		// its demand forward); this is the backstop that keeps the index arithmetic
+		// honest, because reading a negative ring index would return whatever happens
+		// to be in the buffer rather than an error.
+		return false
+	}
+	for f in 0 ..< want {
+		l, r := ring_at(fifo, base + f)
+		o := (off + f) * 2
+		out[o + 0] += l * g
+		out[o + 1] += r * g
+	}
+	return true
+}
+
 audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 	for i in 0 ..< len(mix) {
 		mix[i] = 0
@@ -1790,42 +2033,70 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if head_ahead || head_behind {
 			content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
 			if !audio_src_seek_anchor(s, content_sec) {
-				s.muted = true
 				continue
 			}
 		}
 		// A seek lands on the decoder's real PTS, which the demuxer's slack
 		// can put a sample or two either side of the demand. Mix from the fifo
 		// head when it landed ahead, so the base is never before the head.
+		if s.first48 > demand48 {
+			// See Audio_Report.head_clamped. Recorded rather than merely tolerated:
+			// this is the frame whose content the timeline asked to be somewhere
+			// else, and today nothing but this counter says so.
+			audio_rpt.head_clamped += 1
+			audio_rpt.head_clamp_max =
+				max(audio_rpt.head_clamp_max, s.first48 - demand48)
+		}
 		demand48 = max(demand48, s.first48)
 		start48 := demand48
 		audio_src_pull(s, start48 + i64(spf))
 		if s.have48 < start48 + i64(spf) {
 			// The fifo cannot cover this frame. Silence for the span, and mark the
-			// source muted so its RETURN fades in instead of arriving at full
 			// level -- the export's render_mix_block does exactly this, and a
 			// resume after a hole is an edge a listener hears even though no clip
 			// changed.
-			s.muted = true
 			continue
 		}
-		base := int(start48 - s.first48)
+		// A STRETCHED clip reads from its own post-atempo ring instead, and consumes
+		// S times the content to fill the same number of output samples. That is the
+		// entire difference between the two paths: which ring, and how fast content
+		// flows. The mixing arithmetic below is shared -- mix_src_block takes a ring
+		// POINTER -- so this is a choice of argument, not a second implementation.
+		//
+		// speed == 1.0 takes neither branch and runs the code exactly as before,
+		// which is what keeps the feature inert until a clip is stretched.
+		base := 0
+		mix_ring := &s.fifo
+		mix_first := s.first48
+		mix_have := s.have48
+		mix_demand := start48
+		if s.speed != 1.0 {
+			mix_ring = &s.out_ring
+			mix_first = s.out_first
+			mix_have = s.out_first + i64(ring_len(&s.out_ring))
+			// Content position of this frame's first output sample. Because the graph
+			// is primed, output sample N of the ring is content N*S -- so the DEMAND is
+			// an OUTPUT position here, and the content follows from it.
+			mix_demand = s.out_first
+			need := mix_demand + i64(spf)
+			audio_src_pump_tempo(s, need - mix_first)
+			if mix_first + i64(ring_len(mix_ring)) < need {
+				// The graph cannot cover this frame -- the clip ran out of content, or
+				// the decoder has not kept pace. Silence for the span, same as the
+				// content path, so a stretched clip fails like any other source rather
+				// than quietly playing at the wrong length.
+				continue
+			}
+			base = 0
+		} else {
+			base = int(start48 - s.first48)
+		}
 		// Per-segment gain folded in as one multiply per sample; the ring
 		// already covers this frame (checked above), so gain is the only new
 		// term here. A keyed segment re-evaluates its curve at the frame-
 		// relative position each frame (from its own snapshot — the producer
 		// never reads the live timeline), so automation animates audibly.
 		g := play_seg_gain_linear(seg, i32(frame - seg.start_a))
-		// Declick, the same fade the export applies (audio_declick_gain). This
-		// mixer had none: a clip boundary produced a hard step to silence and back
-		// in playback while the export ramped it, so the two sinks disagreed about
-		// an audible edit. Both compute the ramp from the SEGMENT's own bus-sample
-		// edges, in the same units, so a boundary fades identically in each.
-		//
-		// fade_from takes the EARLIER of the segment edge and a resume-after-hole,
-		// so a frame that both opens a clip and resumes a source gets ONE fade
-		// rather than two multiplied together -- the export's rule, for the same
-		// reason.
 		frame_lo := audio_frame_boundary48(frame, fps)
 		frame_hi := audio_frame_boundary48(frame + 1, fps)
 		seg_lo := audio_frame_boundary48(seg.start_a, fps)
@@ -1836,22 +2107,30 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if want <= 0 {
 			continue
 		}
-		fade_from := seg_lo
-		if s.muted {
-			fade_from = blk_lo
-		}
-		fade_in := audio_declick_fade_in(blk_lo - fade_from, want)
-		fade_out := audio_declick_fade_out(seg_hi - blk_hi, want)
+		// One mixing loop for both sinks (mix_src_block). `base` and the shortfall
+		// checks above are the playback half; the export has its own, and the arithmetic
+		// that used to be copy-pasted between them now exists once.
+		//
+		// No automatic ramp at a clip edge -- a cut is a cut. There was a declick here
+		// and it was this engine's SECOND fade mechanism: gain is already automated per
+		// sample through the clip's keyframe envelope, so an edge ramp was an implicit
+		// fade on every edit whether the user wanted one or not. The two mechanisms
+		// disagreed at ~2.5e-3 in a clip's final fade, because the ramp normalised
+		// against the CALLER'S CHUNK LENGTH. An authored fade is expressed through the
+		// envelope; the engine's job is that what you cut is what you hear.
 		sample_off := int(blk_lo - frame_lo)
-		for f in 0 ..< want {
-			l, r := ring_at(&s.fifo, base + sample_off + f)
-			d := audio_declick_gain(g, f, want, fade_in, fade_out)
-			off := (sample_off + f) * 2
-			mix[off + 0] += l * d
-			mix[off + 1] += r * d
+		if mix_src_block(
+			mix_ring,
+			mix_first,
+			mix_have,
+			mix_demand + i64(sample_off),
+			want,
+			g,
+			mix[:],
+			sample_off,
+		) {
+			delivered = true
 		}
-		s.muted = false
-		delivered = true
 		if audio_rpt.trace {
 			fmt.printf(
 				"[tr mix] fr=%d k=%d seg0=%d start48=%d have48=%d fifo=%d del=%v\n",
@@ -1864,8 +2143,17 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// per source, on the real-time producer thread.
 		consumed := base + spf
 		if consumed > 0 {
-			ring_drop(&s.fifo, consumed)
-			s.first48 += i64(consumed)
+			if s.speed != 1.0 {
+				// The stretched path consumes OUTPUT samples, and the content
+				// position follows from the speed rather than being tracked
+				// separately: content = output * speed, by construction of the
+				// primed graph. So one counter, not two.
+				ring_drop(&s.out_ring, consumed)
+				s.out_first += i64(consumed)
+			} else {
+				ring_drop(&s.fifo, consumed)
+				s.first48 += i64(consumed)
+			}
 		}
 	}
 	return delivered
@@ -1992,7 +2280,7 @@ audio_producer_feed :: proc() {
 		// device's drain rate, which equals the playhead's rate, and the
 		// prod-keyed forward-skip in audio_update can't see the audible
 		// position that is behind.
-		sync.atomic_store(&audio_prod.jump_frame, playback_playhead_at(monotonic_ns(), want_ratio))
+		sync.atomic_store(&audio_prod.jump_frame, sync.atomic_load(&playback.dev_frame))
 		audio_rpt.rate_rebuilt += 1
 	}
 	audio_pcm_dump_open()
@@ -2037,6 +2325,9 @@ audio_producer_feed :: proc() {
 		sync.atomic_store(&audio_prod.jump_frame, 0)
 	}
 	max_queue := i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC)
+	// A quarter of the cushion: deep enough that an ordinary producer hiccup does
+	// not trip it, shallow enough to catch a real stall before the device runs dry.
+	queue_floor := max_queue / 4
 	cushion_frames := i64(AUDIO_CUSHION_SEC * f64(fps) * want_ratio + 1)
 	// The device consumes 48k stream-samples/sec regardless of rate: atempo
 	// compresses content to spf/rate output samples per frame, so queued bytes
@@ -2045,9 +2336,9 @@ audio_producer_feed :: proc() {
 	rate_sc := max(1.0, want_ratio)
 	queued_frames := i64(f64(audio_device_queued()) * rate_sc / f64(spf))
 	dev_pos := audio_src.next_frame - queued_frames
-	// Publish at_ns BEFORE dev: a reader sampling dev then at_ns under-extrapolates
-	// (at_ns can only be newer), which is the safe direction — never a position
-	// ahead of what the device truly consumed.
+	// dev_frame is the device's consumed position and needs no wall-clock stamp: it is
+	// fed minus queued, both exact integers in bus samples. dev_at_ns is retained
+	// only as the meter's age stamp.
 	sync.atomic_store(&playback.dev_at_ns, i64(monotonic_ns()))
 	sync.atomic_store(&playback.dev_frame, dev_pos)
 	// Fold live gain edits (knob drag) into provisioned segments before mixing.
@@ -2068,7 +2359,18 @@ audio_producer_feed :: proc() {
 	// playhead and locks a permanent offset after the stall. Extrapolating the
 	// same wall clock the UI uses keeps audio glued to where the playhead really
 	// is. dev_pos is kept only as the telemetry/health signal stored above.
-	ph := playback_playhead_at(monotonic_ns(), want_ratio)
+	// The device is the clock. The producer fills to CUSHION samples AHEAD OF WHAT
+	// THE DEVICE HAS CONSUMED, not ahead of a wall-clock guess at where the playhead
+	// ought to be. That closes the loop exactly: dev_pos is fed minus queued, so
+	// filling to dev_pos + cushion leaves the queue at the cushion, which is a fixed
+	// point.
+	//
+	// It also makes drift structurally impossible rather than merely small. Content
+	// fed is contiguous from the same origin whatever happens upstream, so a producer
+	// stall costs the listener a GAP and never an offset: the device drains, dev_pos
+	// advances with it, the playhead follows, and when the producer resumes it feeds
+	// on from where it left off. There is no second clock to disagree with.
+	ph := dev_pos
 	target := ph + cushion_frames
 	// Wedge watchdog: at the queue cap, prod is throttled to the device drain
 	// rate — exactly the playhead's rate — so any deficit born while the device
@@ -2080,14 +2382,20 @@ audio_producer_feed :: proc() {
 	// to prod, the fill loop re-fills against the true target, and dev lands
 	// back on the playhead. Self-limiting — after the heal prod sits at target,
 	// so the condition stops.
-	if target > audio_src.next_frame && audio_device_queued() >= max_queue && audio_src.next_frame < target-i64(AUDIO_AUDIBLE_SKEW_TOL*want_ratio*f64(fps)) {
-		audio_device_clear()
-		queued_frames = 0
-		dev_pos = audio_src.next_frame
-		sync.atomic_store(&playback.dev_at_ns, i64(monotonic_ns()))
-		sync.atomic_store(&playback.dev_frame, dev_pos)
-		audio_rpt.wedge_heal += 1
-	}
+	// There is no wedge watchdog here any more, and it is worth saying why it could
+	// not have worked even before the clock inversion. Its condition was
+	//   queued_samples >= max_queue   AND   next_frame < target - AUDIO_AUDIBLE_SKEW_TOL*fps
+	// and with target = dev_pos + cushion and dev_pos = next_frame - queued that
+	// second clause is `cushion_frames - queued_frames > 0.1*fps`. At a full queue
+	// queued_frames is exactly the cushion minus one, so the difference is 1 frame
+	// against a 6-frame bar at 60fps -- and the two clauses are in different units
+	// besides (samples against frames). It measured heal=0 for every run.
+	//
+	// It existed to drop the backlog when a full queue left the producer short,
+	// which SHIFTED THE PLAYHEAD -- the same class of silent position change the
+	// clock inversion removed. It is deleted rather than fixed: with the device as
+	// the clock there is no backlog to drop, because the producer's target IS the
+	// device position.
 	if target <= audio_src.next_frame {
 		return
 	}
@@ -2172,6 +2480,19 @@ audio_producer_feed :: proc() {
 		}
 		audio_rpt.push += 1
 		qnow := audio_device_queued()
+		// Counted only once the transport is ESTABLISHED. Before the first fill the
+		// queue is legitimately empty -- the producer is still seeking and decoding
+		// the opening of the first clip -- and counting that would report a permanent
+		// one-off starvation on every single run, which is exactly the kind of noise
+		// that stops anyone reading the counter. Measured on ~/sallyface.vyproj: one
+		// such tick at startup, then zero for the rest of the run.
+		if qnow >= max_queue {
+			audio_rpt.queue_established = true
+		}
+		if playhead.playing && audio_rpt.queue_established && qnow < queue_floor {
+			audio_rpt.starve_ticks += 1
+			audio_rpt.starve_frames += queue_floor - qnow
+		}
 		audio_rpt.min_q = min(audio_rpt.min_q, qnow)
 		audio_rpt.max_q = max(audio_rpt.max_q, qnow)
 		if audio_dump.pcm != nil {
@@ -2256,7 +2577,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				// at realtime the lag is frozen in (measurably ~the provision
 				// duration, which is exactly why a manual seek clears it).
 				// Skip forward to where playback actually is instead.
-				if hop := playback_playhead_at(monotonic_ns(), max(1.0, playback.rate)); hop > audio_src.next_frame {
+				if hop := sync.atomic_load(&playback.dev_frame); hop > audio_src.next_frame {
 					sync.atomic_store(&audio_prod.jump_frame, hop)
 				}
 				if audio_rpt.trace {
@@ -2303,7 +2624,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				}
 				q_min := min(audio_rpt.min_q, queued)
 				q_max := max(audio_rpt.max_q, queued)
-				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) resync=%d rec=%d(k%d/s%d/o%d/d%d) dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
+				fmt.printf("[audio] t=%.2fs ph=%d(%.3fs,playing=%t,src=%s,catch=%d) anchor=%d prod=%d fed=%d curs=%d skew=%+.3fs rate=%.2ffps drain=%.0fHz pace=%s(dev=%.0fHz %.2fx) q=%dfr/%dfr(min=%dfr,max=%dfr,avail=%dfr) feed(push=%d,full=%d,nocov=%d,mix=%.1fms,work=%.1fms) cov=%d holes=%+d(total %d) starve=%d(+%.1fms) resync=%d rec=%d(k%d/s%d/o%d/d%d) dev=%dHz/%dch/%dbit under=%d clr=%d heal=%d\n",
 					f64(now-audio_rpt.thread_start_ns)/1e9,
 					playhead.frame, f64(playhead.frame)/fps, playhead.playing,
 					sync.atomic_load(&audio_rpt.ph_src) == 1 ? "mouse" : sync.atomic_load(&audio_rpt.ph_src) == 2 ? "auto" : "?",
@@ -2319,6 +2640,8 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					f64(audio_rpt.mix_us)/1e6, f64(audio_rpt.feed_us)/1e6,
 					cover ? 1 : 0,
 					holes_delta, holes,
+					audio_rpt.starve_ticks,
+					f64(audio_rpt.starve_frames) / f64(AUDIO_BUS_RATE) * 1000,
 					resync,
 					audio_rpt.reconciles,
 					audio_rpt.dec_kept,
@@ -2326,7 +2649,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					audio_rpt.dec_open,
 					audio_rpt.dec_drop,
 					audio_device_rate(), audio_device_channels(), audio_device_bits(),
-					audio_device_underruns(), audio_device_clears(), audio_rpt.wedge_heal)
+					audio_device_underruns(), audio_device_clears(), 0)
 				if audio_rpt.log_full {
 					for k in 0 ..< audio_src.count {
 						s := &audio_src.slots[k]
@@ -2346,6 +2669,7 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 							at, in_fifo, covered)
 					}
 				}
+				audio_rpt.queue_established = false
 				audio_rpt.tick = now
 				audio_rpt.frame = audio_src.next_frame
 				audio_rpt.queued = queued
@@ -2469,16 +2793,24 @@ audio_update :: proc() {
 				playhead.frame, prod, sync.atomic_load(&audio_prod.anchor_frame), reason, fwd, src_name, catch)
 		}
 		audio_seek(playhead.frame)
-	} else if playhead.frame > prod + i64(AUDIO_CUSHION_SEC * fps) + 6 {
-		// Producer (or device) fell behind the playhead. Skip forward in place —
-		// never reloop, that reads as slowed/stuttering audio against a correct
-		// video. The producer trims fifos and continues decoding forward.
-		sync.atomic_store(&audio_prod.jump_frame, playhead.frame)
-		if audio_rpt.trace {
-			fmt.printf("[ph] t=%.2fs ph=%d prod=%d -> forward skip to ph (fwd=%+d)\n",
-				f64(now-audio_rpt.thread_start_ns)/1e9,
-				playhead.frame, prod, fwd)
-		}
+	// There is no forward-skip branch here any more, and its absence is the point of
+	// the clock inversion rather than a simplification.
+	//
+	// It guarded `playhead.frame > prod + cushion + 6` -- "the producer fell behind,
+	// so jump it forward". But the playhead is now READ FROM the device, and
+	// dev_pos = next_frame - queued, so that guard reduces to
+	//
+	//     -queued_frames > cushion + 6
+	//
+	// which is unsatisfiable: queued_frames is a non-negative count. The playhead
+	// cannot outrun what the producer has already fed, by construction, so the branch
+	// was unreachable -- measured resync=4 at startup, constant since.
+	//
+	// It was also the LAST way the engine could silently move the playhead during
+	// playback. A producer stall now costs the listener a gap and nothing else: the
+	// device drains, dev_pos advances with it, the playhead follows, and the producer
+	// resumes feeding on from where it stopped. That is what the branch was trying to
+	// buy, except it bought it by shifting position.
 	}
 }
 

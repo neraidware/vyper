@@ -1579,6 +1579,37 @@ is_srt_pick :: proc(path: cstring) -> bool {
 	return true
 }
 
+// prefer_native_wayland pins SDL to the Wayland backend when this session IS
+// Wayland. Called before sdl.Init, because the driver is chosen there.
+//
+// Why: SDL ships two Wayland bootstraps. The "preferred" one refuses to be used
+// unless the compositor implements wp_fifo_v1, and when it refuses, SDL falls
+// back to XWayland -- its own log line reads "falling back to XWayland for GPU
+// performance reasons". That is a frame-pacing trade, and it is silently the
+// wrong trade for an editor: an XWayland client is not a Wayland surface, so the
+// compositor does not hand it desktop drags. On niri (no wp_fifo_v1) every OS
+// file drag was therefore refused before SDL generated a single event, so the
+// drop feature was dead on that machine with nothing failing anywhere.
+//
+// The cost of pinning is that a session which claims Wayland but cannot reach a
+// compositor no longer falls back to X11, so SDL_Init fails outright. That is
+// the right way round: XWayland is not a working fallback for a Wayland session,
+// it is a slower one that silently drops a shipped feature.
+prefer_native_wayland :: proc() {
+	when ODIN_OS != .Linux {
+		return
+	}
+	// An explicit choice already wins. SDL's own advice for this case is to set
+	// SDL_VIDEO_DRIVER, so overriding it would leave no way to ask for X11.
+	if pinned := sdl.GetHint("SDL_VIDEO_DRIVER"); pinned != nil && len(pinned) > 0 {
+		return
+	}
+	if _, present := os.lookup_env("WAYLAND_DISPLAY", context.temp_allocator); !present {
+		return
+	}
+	sdl.SetHint("SDL_VIDEO_DRIVER", "wayland")
+}
+
 // pointer_over_context_menu reports whether the cursor is inside the context
 // menu popup proper or its "Add >" submenu (both are part of the same transient
 // UI). It tests the last frame's element GEOMETRY directly (not clay's
@@ -1689,34 +1720,41 @@ playback_read_snapshot :: proc() -> (frame: i64, ns: i64) {
 // calls this mid-tick, including across a UI stall, so the playhead it targets
 // is where playback really is rather than where the UI last managed to render.
 // Only forward extrapolation is meaningful -- audio is forward-only.
-playback_playhead_at :: proc(now_ns: sdl.Uint64, rate: f64) -> i64 {
-	frame, ns := playback_read_snapshot()
-	fps := timeline_fps()
-	elapsed := f64(i64(now_ns) - ns) / 1e9
-	if ns <= 0 || fps <= 0 || elapsed <= 0 {
-		return frame
-	}
-	return frame + i64(elapsed * fps * max(1.0, rate))
-}
-
 playback_update :: proc(now_ns: sdl.Uint64) {
 	if playback.last_tick_ns == 0 {
 		playback.last_tick_ns = now_ns
 	}
-	if playhead.playing {
-		// Playback is real-time: consume the true wall delta, never a clamped
-		// one. A clamp silently drops the unapplied remainder, which strands the
-		// playhead behind the wall clock permanently and desyncs it from the
-		// audio producer (which extrapolates this same clock). A long stall
-		// therefore jumps the playhead to where it should be, and audio_update's
-		// forward-skip resyncs the producer if it had fallen behind.
-		// DIAG (temporary): playback.magic_ms replaces the measured wall
-		// delta so the cadence is perfectly jitter-free (or any fixed rate).
+	if playhead.playing && playback.dir == 1 {
+		// FORWARD PLAYBACK: the audio device is the clock, and this is a READOUT of
+		// it -- not a command to it.
+		//
+		// It used to be the other way round: a wall-clock accumulator advanced the
+		// playhead, the producer chased that guess, and A/V divergence was possible
+		// and therefore MONITORED (the [skew] alarm). That is a detect-and-repair
+		// architecture; this is a cannot-drift one. The device position is
+		// `fed - queued` -- two exact integers in bus samples -- so there is no
+		// second clock to disagree, and video, which reads playhead.frame, is a pure
+		// function of where the sound actually is.
+		//
+		// Never adopted backwards: between a seek and the producer's next publish,
+		// dev_frame is stale and usually smaller, and taking it would visibly jump
+		// the playhead backwards. A seek sets the frame directly, so the stale window
+		// costs nothing.
+		dev := sync.atomic_load(&playback.dev_frame)
+		if dev > playhead.frame {
+			playhead.frame = dev
+		}
+		playback.accumulator = 0
+	} else if playhead.playing {
+		// BACKWARD PLAYBACK has to keep the wall clock, and that is a real asymmetry
+		// rather than an oversight: audio is MUTED going backward, so there is no
+		// device consumption to be a clock. Nothing can drift against a stream that
+		// does not exist, so a wall clock here cannot desync anything audible.
+		//
+		// DIAG (temporary): playback.magic_ms replaces the measured wall delta so the
+		// cadence is perfectly jitter-free (or any fixed rate).
 		dt_s :=
 			playback.magic_ms > 0 ? playback.magic_ms / 1000.0 : f64(now_ns - playback.last_tick_ns) / 1_000_000_000
-		// The playhead advances +dir frames at effective_playback_rate against
-		// the wall clock (rate * jog boost). Audio pacing at non-1x is the
-		// producer's stream frequency ratio; audio is muted going backward.
 		playback.accumulator += dt_s * max(0.0, effective_playback_rate())
 		playback_fps := timeline_fps()
 		catchup := i64(0)
@@ -1939,6 +1977,40 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
+	// VYPER_AUDIO_CLIP_TEMPO=<path>|<speed> -- proves a STRETCHED clip through the real
+	// playback mixer: that it produces output for the span, and that the graph is
+	// genuinely in the path (a stretch that rendered identically would mean tempo is
+	// not applied and pitch is not being corrected).
+	if ct, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO", context.temp_allocator); ct != "" {
+		parts := strings.split(ct, "|")
+		speed := 2.0
+		if len(parts) >= 2 {
+			speed, _ = strconv.parse_f64(strings.trim_space(parts[1]))
+		}
+		ok: bool = audio_probe_clip_tempo(strings.trim_space(parts[0]), speed)
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_NODE_LATENCY measures the two graph delays (swr device conversion,
+	// atempo lookahead) that scrubbing and clip stretching both depend on.
+	// lookup_env_alloc, not os.getenv: getenv returns NIL when the variable is
+	// unset, and comparing nil against "" traps rather than answering the question.
+	if _, lz := os.lookup_env_alloc("VYPER_AUDIO_NODE_LATENCY", context.temp_allocator); lz {
+		ok: bool = audio_probe_node_latency()
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_STALL_GAP=<path>|<stall_ms> -- drives the real producer against a
+	// simulated device and proves a stall costs a GAP and no subsequent offset.
+	if sg, _ := os.lookup_env_alloc("VYPER_AUDIO_STALL_GAP", context.temp_allocator); sg != "" {
+		parts := strings.split(sg, "|")
+		stall_ms := 900
+		if len(parts) >= 2 {
+			if v, ok := strconv.parse_i64(strings.trim_space(parts[1])); ok {
+				stall_ms = int(v)
+			}
+		}
+		ok: bool = audio_probe_stall_gap(strings.trim_space(parts[0]), stall_ms)
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_DRIFT_PARITY=<path>|<seconds>|<fps> -- the same comparison run
 	// continuously over a LONG span, which is the only way an ACCUMULATED position
 	// error becomes visible: locally correct, globally wrong. fps is optional and
@@ -2078,6 +2150,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		subtitle_render_probe_run(string(probe_out))
 		return
 	}
+	prefer_native_wayland()
 	if !sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO) {
 		fmt.println("SDL initialization failed")
 		return

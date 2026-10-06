@@ -3,6 +3,7 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
 
@@ -13,8 +14,8 @@ import sdl "vendor:sdl3"
 // was absent on every platform and nothing failed, because ignoring events is
 // not a crash -- which is exactly why it needs a probe rather than a report.
 //
-// A probe cannot synthesise a cross-process desktop drag, so this covers the
-// decisions a drop makes after delivery:
+// A probe cannot synthesise a cross-process desktop drag, so this covers what a
+// headless run CAN reach:
 //
 //   - which region a point means, against the REAL laid-out panels (a bin box
 //     that is in fact hit-testable, dead space that is in fact refused, and the
@@ -25,10 +26,18 @@ import sdl "vendor:sdl3"
 //     instead of becoming an empty bin row
 //   - the gesture state across BEGIN/POSITION/COMPLETE, so a stale position or
 //     a highlight that outlives its gesture cannot leak into the next drag
+//   - the COMMIT, end to end: real DROP_POSITION/DROP_FILE events pushed
+//     through SDL's own queue and drained by the app's only poll site, which is
+//     the only way a probe can see the handoff of `event.drop.data` at all.
 //
-// The placement itself is not probed: it is the same two calls the bin drag
-// makes (import_path_to_bin + add_asset_to_timeline) by construction rather
-// than by agreement, which is the reason the drop path shares them.
+// That last one is not decoration. The handler used to SDL_free
+// event.drop.data, which is SDL's own temporary string: the drop PLACED the
+// clip and then the next frame's pump freed the block a second time, so a
+// working feature read as "the drop does nothing" (silent when the chunk had
+// been handed back out, an abort when it had not). Every earlier check here
+// passed with that line in place, because they stop at the decision and never
+// hand a path across the boundary. The fixture is a WAV this probe writes, so
+// the handoff is exercised by one owner, exactly as SDL has it.
 
 dnd_probe_fail := false
 
@@ -271,6 +280,173 @@ test_drop_event_state :: proc() {
 	file_drag = {}
 }
 
+// The whole commit, driven the way the OS drives it: real SDL drop events
+// pushed through SDL's own queue and drained by the app's only poll site, so
+// the event plumbing, the zone resolution, the import and the placement all run
+// for real rather than being reconstructed proc by proc.
+//
+// The fixture is a WAV this probe writes, not a file in the tree: a probe that
+// only passes when some build artifact happens to exist on the machine is a
+// probe that measures the machine. Reused from the audio-rate probe rather than
+// written a second time.
+DND_PROBE_DIR  :: "/tmp/opencode/dnd_probe"
+DND_PROBE_WAV  :: DND_PROBE_DIR + "/drop.wav"
+
+// dnd_probe_seed_fixture writes the drop fixture and returns its path, or ""
+// when it could not be written (which fails every commit test below).
+dnd_probe_seed_fixture :: proc() -> string {
+	os.remove_all(DND_PROBE_DIR)
+	os.make_directory(DND_PROBE_DIR)
+	if !ar_write_fixture_wav(DND_PROBE_WAV) {
+		return ""
+	}
+	return DND_PROBE_WAV
+}
+
+// dnd_probe_relayout re-runs build_page so the element boxes the drop resolves
+// against match the document as it is NOW. A drop resolves lanes out of the
+// layout, so a test that placed clips earlier in the run has to re-lay out
+// before asking where the timeline is -- otherwise it reads the empty-timeline
+// box of a timeline that now has tracks, which is a zero box.
+dnd_probe_relayout :: proc() {
+	_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
+}
+
+// timeline_probe_point returns a point the timeline accepts a drop on, in
+// whichever state the document is in: a real lane when tracks exist, the
+// empty-timeline body when they do not.
+timeline_probe_point :: proc() -> (f32, f32) {
+	if len(timeline.tracks) > 0 {
+		lane := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox
+		dnd_probe_check(lane.width > 0, "the first clip lane must be laid out once tracks exist")
+		return lane.x + lane.width / 2, lane.y + lane.height / 2
+	}
+	empty := clay.GetElementData(clay.ID("EmptyTimeline")).boundingBox
+	dnd_probe_check(empty.width > 0, "the empty timeline must be laid out before the first clip")
+	return empty.x + empty.width / 2, empty.y + empty.height / 2
+}
+
+dnd_probe_clip_count :: proc() -> int {
+	n := 0
+	for &t in timeline.tracks {
+		n += len(t.clips)
+	}
+	return n
+}
+
+// push_drop queues the position + file pair a release is made of, in the order
+// SDL sends them on a Wayland/X11 drop. The path is cloned because on the real
+// path it belongs to SDL: this queue holds a raw pointer with no lifetime of its
+// own, so the caller frees the clone after the drain. Mirroring the shape
+// (heap, one owner) rather than the provenance is what makes a stray free in
+// the handler show up here as a double free instead of corrupting the stack.
+push_drop :: proc(path: string, px, py: f32) -> cstring {
+	pos := sdl.Event{}
+	pos.type = .DROP_POSITION
+	pos.drop.x = px
+	pos.drop.y = py
+	dnd_probe_check(sdl.PushEvent(&pos), "the DROP_POSITION must enter the real queue")
+
+	drop := sdl.Event{}
+	drop.type = .DROP_FILE
+	drop.drop.data = transmute(cstring)(strings.clone_to_cstring(path))
+	dnd_probe_check(sdl.PushEvent(&drop), "the DROP_FILE must enter the real queue")
+	return drop.drop.data
+}
+
+test_drop_file_commits_through_the_queue :: proc(fixture: string) {
+	dnd_probe_check(sdl.Init(sdl.INIT_EVENTS), "the event queue must come up for the drop commit to be drivable")
+
+	begin := sdl.Event{}
+	begin.type = .DROP_BEGIN
+	dnd_probe_check(sdl.PushEvent(&begin), "the DROP_BEGIN must enter the real queue")
+
+	bin := media_bin_box()
+	assets_before := len(media_bin.assets)
+	clips_before := dnd_probe_clip_count()
+	owned := push_drop(fixture, bin.x + bin.width / 2, bin.y + bin.height / 2)
+
+	keep_running := true
+	handle_sdl_events(&keep_running)
+	delete(owned)
+
+	dnd_probe_check(
+		len(media_bin.assets) == assets_before + 1,
+		"a real drop on the bin must import: %d -> %d assets",
+		assets_before,
+		len(media_bin.assets),
+	)
+	dnd_probe_check(
+		dnd_probe_clip_count() == clips_before,
+		"a drop on the bin must import without touching the timeline",
+	)
+}
+
+// The in-app half of the same gesture: a bin item pressed, dragged over the
+// timeline, released. Runs the three procs the pointer drives, against the same
+// laid-out geometry, so the two paths that must agree are checked together.
+test_bin_drag_onto_timeline_places_a_clip :: proc() {
+	if len(media_bin.assets) == 0 {
+		dnd_probe_check(false, "the bin must hold the fixture before a bin drag can start")
+		return
+	}
+	dnd_probe_relayout()
+	px, py := timeline_probe_point()
+
+	asset_index := len(media_bin.assets) - 1
+	clips_before := dnd_probe_clip_count()
+
+	begin_media_drag(asset_index, px, py)
+	dnd_probe_check(
+		active_interaction == .Media_Bin_Drag,
+		"pressing a bin item must arm the drag, got %v",
+		active_interaction,
+	)
+	update_media_drag_lanes(px, py)
+	dnd_probe_check(
+		media_drag.target >= 0,
+		"a bin drag over the timeline must resolve a lane, got %d",
+		media_drag.target,
+	)
+	dnd_probe_check(
+		len(media_drag.lanes) > 0,
+		"a bin drag over the timeline must compute ghost lanes",
+	)
+	end_media_drag(px, py)
+	dnd_probe_check(
+		active_interaction == .None,
+		"a finished bin drag must disarm the gesture, got %v",
+		active_interaction,
+	)
+	dnd_probe_check(
+		dnd_probe_clip_count() > clips_before,
+		"releasing a bin drag over the timeline must place clips: %d -> %d",
+		clips_before,
+		dnd_probe_clip_count(),
+	)
+}
+
+// The same file onto the timeline: import AND place. The bin half is covered
+// above, so what is new here is that the drop produced a clip -- on a timeline
+// that already has lanes, which is the state a user is actually in.
+test_drop_on_timeline_places_a_clip :: proc(fixture: string) {
+	dnd_probe_relayout()
+	px, py := timeline_probe_point()
+	clips_before := dnd_probe_clip_count()
+
+	owned := push_drop(fixture, px, py)
+	keep_running := true
+	handle_sdl_events(&keep_running)
+	delete(owned)
+
+	dnd_probe_check(
+		dnd_probe_clip_count() > clips_before,
+		"a drop on the timeline must place clips: %d -> %d",
+		clips_before,
+		dnd_probe_clip_count(),
+	)
+}
+
 dnd_probe_run :: proc() {
 	// clay must be initialized before any element data is read: drop routing
 	// resolves the bin and lane boxes out of the layout, and a GetElementData
@@ -289,6 +465,18 @@ dnd_probe_run :: proc() {
 	test_drop_zone_live_layout()
 	test_import_gate_refuses_unreadable()
 	test_drop_event_state()
+
+	// The commit tests need a real decodable file, so the fixture is written
+	// once here and shared by the two of them.
+	fixture := dnd_probe_seed_fixture()
+	if fixture == "" {
+		dnd_probe_check(false, "the drop fixture must be writable or the commit is untested")
+	} else {
+		test_drop_file_commits_through_the_queue(fixture)
+		test_bin_drag_onto_timeline_places_a_clip()
+		test_drop_on_timeline_places_a_clip(fixture)
+	}
+	os.remove_all(DND_PROBE_DIR)
 
 	if dnd_probe_fail {
 		fmt.println("[dnd-probe] FAILED")

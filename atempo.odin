@@ -195,7 +195,40 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64) {
 		n_full += 1
 		rem /= 2.0
 	}
-	prev := g.src
+	// The same problem in the other direction, which is what a FAST clip asks for.
+	// `rate` here is atempo's tempo, so a clip at speed S passes 1/S -- and S = 3
+	// gives tempo 0.333, outside atempo's per-stage [0.5, 2.0]. The graph would
+	// create the stage, libavfilter would refuse the option ("Numerical result out
+	// of range"), and the clip would produce NO SAMPLES AT ALL.
+	//
+	// So chain full 0.5 stages upward, exactly mirroring the 2.0 case:
+	// 0.333 = 0.5 x 0.667. Multiplying is the only composition that works -- adding
+	// would cancel toward 1.0 and silently play the wrong speed, which is the whole
+	// failure mode this guards against.
+	n_slow := 0
+	for rem < 0.5 {
+		n_slow += 1
+		rem /= 0.5
+	}
+	if n_slow > 0 && g.n_stages+n_slow+n_full >= ATEMPO_MAX_STAGES {
+		fmt.printf("[atempo] too many stages for rate %.3f\n", rate)
+		atempo_graph_destroy(g)
+		return
+	}
+	prev_slow := g.src
+	for s in 0 ..< n_slow {
+		name_buf: [32]u8
+		fmt.bprintf(name_buf[:], "atemslow%d", g.n_stages)
+		ctx := atempo_link_stage(graph, prev_slow, "atempo", cstring(raw_data(name_buf[:])), cstring("tempo=0.500000"))
+		if ctx == nil {
+			atempo_graph_destroy(g)
+			return
+		}
+		g.stages[g.n_stages] = ctx
+		g.n_stages += 1
+		prev_slow = ctx
+	}
+	prev := prev_slow
 	for s in 0 ..< n_full {
 		if g.n_stages >= ATEMPO_MAX_STAGES {
 			fmt.printf("[atempo] too many stages for rate %.2f\n", rate)
@@ -323,7 +356,16 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 			break
 		}
 		count := int(g.out_frame.nb_samples)
-		if out_n + count > ATEMPO_OUT_CAP {
+		// The bound is in FRAMES but out_buf is a flat float array holding
+		// count*2 floats per frame, so the capacity is ATEMPO_OUT_CAP/2 frames.
+		//
+		// Comparing frame counts against ATEMPO_OUT_CAP directly permitted TWICE the
+		// buffer. That is a real overflow, not a theoretical one -- it only triggers
+		// above 8192 output frames in a single drain, which is why nothing hit it until
+		// a clip was stretched past 2x and the graph produced that much at once. It
+		// wrote past the end of a struct field that now also exists once per audio
+		// source, so the blast radius grew with this change even though the bug did not.
+		if out_n + count > ATEMPO_OUT_CAP / 2 {
 			fmt.printf("[atempo] output overflow: %d + %d > %d (rate %.2f)\n", out_n, count, ATEMPO_OUT_CAP, g.rate)
 			break
 		}
@@ -350,6 +392,47 @@ atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
 		return true
 	}
 	return false
+}
+
+// ATEMPO_LOOKAHEAD_MAX_SAMPLES is the largest lookahead the graph holds back,
+// measured by audio_probe_node_latency at rate 0.5 (the slowest rate, and so the
+// deepest window): 2048 input samples, 42.7 ms at 48 kHz.
+//
+// It is RATE-DEPENDENT, measured 2048 / 1722 / 1350 / 1536 input samples at rates
+// 0.5 / 0.75 / 1.25 / 2.0, because WSOLA's window scales with the tempo factor. So
+// this is a BOUND, not a constant to subtract, and compensation must use the
+// per-rate value. The maximum is what a caller needs in order to size a priming
+// buffer without asking.
+//
+// Measured rather than derived, and reproducible: the probe remeasures and compares.
+// The two methods that did NOT work are recorded in the probe, because they are the
+// obvious ones: impulse correlation cannot locate anything in WSOLA output (which is
+// reassembled, not shifted), and energy onset quantises to its analysis window and
+// reported an onset earlier than causality allows. Accounting --
+// pushed/rate - produced -- needs no waveform at all.
+ATEMPO_LOOKAHEAD_MAX_SAMPLES :: 2048
+
+// atempo_lookahead_samples is the measured lookahead for a given transport rate, by
+// interpolation on the measured points. EXACT at the measured rates and linear
+// between them, because the underlying window scales with the tempo factor rather
+// than jumping.
+//
+// Sampled from measurement rather than modelled, and that is the point: a model would
+// be one more thing that can be wrong silently, and this number decides where content
+// lands after a seek.
+atempo_lookahead_samples :: proc(rate: f64) -> int {
+	pts := []f64{0.5, 0.75, 1.25, 2.0}
+	vals := []int{2048, 1722, 1350, 1536}
+	if rate <= pts[0] {
+		return vals[0]
+	}
+	for i in 0 ..< len(pts) - 1 {
+		if rate <= pts[i + 1] {
+			t := (rate - pts[i]) / (pts[i + 1] - pts[i])
+			return int(f64(vals[i]) + (f64(vals[i + 1]) - f64(vals[i])) * t + 0.5)
+		}
+	}
+	return vals[len(vals) - 1]
 }
 
 // atempo_reset clears the graph's internal window so stale buffered samples

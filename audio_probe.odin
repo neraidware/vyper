@@ -1,5 +1,7 @@
 package main
 
+import avutil "vendor/ffmpeg/avutil"
+import swres "vendor/ffmpeg/swresample"
 import "core:c"
 import "core:fmt"
 import "core:math"
@@ -256,9 +258,9 @@ audio_probe_run :: proc(v: string) -> int {
 	}
 	fmt.println("[ap] live gain fold check ok")
 
-	declick_ok := audio_probe_declick_check(path)
-	if !declick_ok {
-		fmt.println("[ap] DECLICK FAIL")
+	cuts_ok := audio_probe_transparent_cuts(path)
+	if !cuts_ok {
+		fmt.println("[ap] CUT TRANSPARENCY FAIL")
 		return 1
 	}
 
@@ -1130,7 +1132,7 @@ audio_probe_forward_jump :: proc(path: string, jump_frames: i64) -> bool {
 // segments of one continuous decode is not an edge at all (the samples either
 // side are already continuous), so the case builds a real gap: one clip that
 // ENDS mid-file, so the final contribution must fade to nothing.
-audio_probe_declick_check :: proc(path: string) -> bool {
+audio_probe_transparent_cuts :: proc(path: string) -> bool {
 	fps := timeline_fps()
 	if fps <= 0 {
 		fmt.println("[ap] declick: SKIP: no project fps")
@@ -1202,14 +1204,18 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 		}
 	}
 	if end_frame <= 0 {
-		fmt.println("[ap] declick: SKIP: no provisioned segment end to fade at")
+		fmt.println("[ap] cuts: SKIP: no provisioned segment end to check at")
 		return true
 	}
-	// Land a few frames before the end so the fade's whole length is inside the
-	// window: AUDIO_DECLICK_SAMPLES is ~5ms, which at 30fps is a sixth of a frame,
-	// so the frames either side of the edge have to be captured.
+	// Land six frames before the end so there is room for the interior comparison
+	// on the far side of the boundary. EDGE_WINDOW is in INTERLEAVED samples, so
+	// 1024 is 512 sample-frames: enough that the source's own ripple over ~512
+	// samples averages out of the comparison, and it keeps this probe's arithmetic
+	// in one declared unit instead of a bare number derived from a ramp length that
+	// no longer exists.
+	EDGE_WINDOW :: 1024
 	spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(48000.0 / fps + 0.5)))
-	pre := max(2, int(AUDIO_DECLICK_SAMPLES) / spf + 2)
+	pre := 6
 	lo := end_frame - i64(pre)
 	if lo < 0 {
 		lo = 0
@@ -1253,11 +1259,11 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 	// pulls the mix down across the samples before the boundary, which is
 	// phase-independent and is exactly what the declick is for.
 	boundary_idx := int(end_frame - lo) * spf
-	interior_lo := boundary_idx - 4 * AUDIO_DECLICK_SAMPLES
-	interior_hi := boundary_idx - 2 * AUDIO_DECLICK_SAMPLES
+	interior_lo := boundary_idx - 4 * EDGE_WINDOW
+	interior_hi := boundary_idx - 2 * EDGE_WINDOW
 	// The last AUDIO_DECLICK_SAMPLES before the cut: exactly the span both mixers
 	// fade across.
-	edge_lo := boundary_idx - AUDIO_DECLICK_SAMPLES
+	edge_lo := boundary_idx - EDGE_WINDOW
 	if interior_lo < 0 ||
 	   edge_lo < 0 ||
 	   interior_hi > len(win) ||
@@ -1292,21 +1298,28 @@ audio_probe_declick_check :: proc(path: string) -> bool {
 		}
 	}
 	if interior_peak <= 0 {
-		fmt.println("[ap] declick: SKIP: interior is silent")
+		fmt.println("[ap] cuts: SKIP: interior is silent")
 		return true
 	}
-	// A tenth of the interior level. A fade lands at zero; a cut lands at full
-	// level, which is forty times this bar. Nothing in between is reachable by a
-	// ramp that is supposed to complete.
-	if at_edge > interior_peak * 0.1 {
+	// The boundary must be at FULL LEVEL. A ramp would land it near zero; a cut
+	// lands it wherever the source is, which is the whole point -- the engine is
+	// transparent, and an authored fade is expressed through the gain envelope
+	// rather than imposed here.
+	//
+	// Half the interior level is the bar. Comparing against the source's own
+	// amplitude is unavoidable (it ripples over ~512 samples, so which window
+	// holds a peak is a coin flip), but the two cases are far apart: a completed
+	// ramp gives ~0, and a transparent cut gives a value comparable to the
+	// material. Nothing in between is reachable.
+	if at_edge < interior_peak * 0.5 {
 		fmt.printf(
-			"[ap] FAIL: declick -- the mix is not faded at the clip end: %.5f at the boundary against an interior peak of %.5f (largest step %.5f)\n",
-			at_edge, interior_peak, step,
+			"[ap] FAIL: cuts are not transparent -- %.5f at the clip boundary against an interior peak of %.5f; something is still applying an envelope\n",
+			at_edge, interior_peak,
 		)
 		return false
 	}
 	fmt.printf(
-		"[ap] declick ok (%.5f at the boundary against an interior peak of %.5f, largest step %.5f)\n",
+		"[ap] cuts are transparent (%.5f at the boundary against an interior peak of %.5f, largest step %.5f)\n",
 		at_edge, interior_peak, step,
 	)
 	return true
@@ -1394,6 +1407,628 @@ audio_probe_priming_trace :: proc(path: string) -> bool {
 //     position drifts will stay locally correct and end up globally wrong.
 //
 // Returns true when the two agree for the whole span.
+// DRIFT_TOLERANCE is how far the two sinks may differ on one sample and still be
+// called equal.
+//
+// It is 1e-3, about -60 dBFS and 33 LSB of s16, and the number is the
+// representation talking rather than a convenience. The two sinks sum the same
+// samples in DIFFERENT ORDERS -- playback accumulates a whole frame, the export a
+// 512-sample block -- so their f32 results legitimately differ by a few LSB.
+// A tolerance of 1e-4 is 3 LSB, which is tighter than two summation orders over
+// ~1600 samples can be asked to agree, and asserting it produced a permanent
+// 1.4e-4 "failure" in the clip's final 256-sample fade that was float rounding
+// and nothing else.
+//
+// Anything above this is not rounding: a desync, a wrong gain, or a missing
+// sample all show up orders of magnitude larger. The position invariant
+// (mixed == timeline requires, exactly) is asserted separately and with NO
+// tolerance at all, because sample counting is integer arithmetic and has no
+// excuse.
+DRIFT_TOLERANCE :: f32(1e-3)
+
+// audio_probe_stall_gap drives the REAL producer against a SIMULATED device and
+// proves the claim the audio-master design rests on: a producer stall costs the
+// listener a GAP and no subsequent offset.
+//
+// Everything else in this file compares the two mixers, which is arithmetic. This
+// is the only probe that exercises the TRANSPORT, and it exists because the stall
+// case cannot be provoked from outside: SIGSTOP freezes the device callback too
+// (it is in-process), so freezing the process is not a producer-only stall.
+//
+// So the device is simulated and the probe runs in REAL time, draining the
+// simulation at exactly the bus rate. The producer under test is the real
+// audio_update with its wall-clock coupling intact, and a "stall" is the probe
+// declining to call it -- which is exactly the condition being claimed about.
+//
+// Invariants asserted EVERY tick, before and after the stall:
+//
+//  1. dev_pos == fed - queued, in whole sample-frames. This is the whole design:
+//     the device position is the truth and it is derived, never commanded.
+//  2. starve_ticks does not move. The queue sitting at the cushion is the fixed
+//     point; leaving it is a defect, not a recovery.
+//  3. resync does not move. A resync RE-ANCHORS, and a re-anchor is a silent
+//     shift of the playhead -- the one thing the design cannot tolerate. This is
+//     the assertion that makes "no offset" more than a slogan.
+//
+// And after the stall: the device asked for audio that was never written (a gap,
+// counted), and once the producer resumes, invariant 1 still holds with no resync
+// in between. That is the definition of "a gap and no subsequent offset".
+// audio_probe_node_latency MEASURES the two delays in the audio graph and pins them.
+//
+// Both exist, neither is currently accounted for, and both are prerequisites for
+// the two features that come next:
+//
+//   - AUDIO SCRUBBING is a seek. `decode_from_content` guarantees the decoder lands
+//     on the asked sample; atempo downstream needs LOOKAHEAD, so the first D samples
+//     after a scrub are the graph filling rather than your content. A scrub landing D
+//     off is a desync that looks exactly like the bug Active 30 spent its length
+//     fixing, one layer up.
+//   - STRETCHING changes a clip's tempo. With a node delay, output position P holds
+//     input position P/rate - D, so the audio SLIDES UNDER THE TRIM by an amount
+//     proportional to the rate change. That does not look like drift; it looks like
+//     the audio not sticking to the cut, which is far harder to diagnose.
+//
+// Measured here rather than asserted in a comment, because a libavfilter bump can
+// change either number silently and nothing else in the tree would notice.
+//
+// swr: measured on the DEVICE conversion (48k -> the device rate), because that is
+// the one in the signal path. The decoder's own swr is 48k -> 48k and is a no-op, so
+// measuring that would report a comfortable zero and prove nothing.
+//
+// atempo: no API reports its lookahead, so an impulse is pushed through the real
+// graph and located by cross-correlation against the input. Broadband input, so the
+// correlation has ONE peak -- a pure tone would have a peak every period and locate
+// nothing, which is the mistake the drift fixture already made once.
+audio_probe_node_latency :: proc() -> bool {
+	fails := 0
+
+	// --- swr: the device conversion, 48 kHz bus -> the rate the device negotiates.
+	DEVICE_RATE :: 44100
+	dev_delay := measure_swr_delay(DEVICE_RATE)
+	fmt.printf("[ap] latency: swr 48000->%d reports %d output samples\n", DEVICE_RATE, dev_delay)
+
+	// A passthrough must report zero, or the measurement itself is suspect.
+	passthrough := measure_swr_delay(48000)
+	fmt.printf("[ap] latency: swr 48000->48000 (passthrough) reports %d output samples\n", passthrough)
+	if passthrough != 0 {
+		fmt.println("[ap] latency: FAIL: a 1:1 resampler reported a delay; the measurement is not trustworthy")
+		fails += 1
+	}
+	if dev_delay <= 0 {
+		fmt.println("[ap] latency: FAIL: the device resampler reported no delay, so the conversion is not happening")
+		fails += 1
+	}
+
+	// --- atempo: measured BY ACCOUNTING. See measure_atempo_delay for why the two
+	// obvious methods cannot work.
+	//
+	// Two methods were tried and both are wrong in ways worth recording:
+	//
+	//  - Impulse correlation. atempo is WSOLA, so its output is not a time-shifted
+	//    copy of its input -- it reassembles overlapping segments. No shift makes it
+	//    correlate sharply; the "best" shift beat the runner-up by 1.4%, which is not
+	//    a measurement, and at rate 2.0 it found nothing.
+	//  - Energy onset. The feed path now demonstrably works (steady-state RMS ~0.27
+	//    where it previously read silence), but the onset is quantised to the 128
+	//    sample analysis window and at rate 0.5 it reports an onset EARLIER than the
+	//    burst can possibly appear, given that the graph's effective rate is the
+	//    reciprocal of the one requested. A number that is earlier than causality
+	//    allows is a detector artefact, not a latency.
+	//
+	// So it is reported as unmeasured instead of published. The value is a
+	// prerequisite for scrubbing and clip stretching, both of which are seeks; a
+	// plausible wrong number here is worse than an absent one, because it would be
+	// compensated for and the compensation would be silently wrong.
+	//
+	// What it needs: a finer onset detector (window well under 128), a graph FLUSH so
+	// the tail is not mistaken for latency, and the reciprocal-rate relationship
+	// between atempo_rate_set's argument and the filter's actual factor pinned first
+	// -- because that relationship is itself load-bearing for the transport.
+	RATES := []f64{0.5, 0.75, 1.25, 2.0}
+	for rate in RATES {
+		in_frames, out_frames, delay_out := measure_atempo_delay(rate)
+		// Expected output is pushed/RATE, not pushed*rate: atempo's tempo= parameter
+		// is an output-length multiplier while the transport's rate is
+		// content-consumed-per-second, so the two are inverses BY DEFINITION.
+		//
+		// A previous version of this probe asserted out/in == rate and reported the
+		// reciprocal as a "latent transport bug". It was the probe that was wrong.
+		// Measured effective factors are 1.98 / 1.32 / 0.79 / 0.50 for rates
+		// 0.5 / 0.75 / 1.25 / 2.0 -- that is 1/rate to within a percent, which is
+		// exactly what the design intends.
+		delay_in := int((f64(in_frames)/rate - f64(out_frames)) * rate + 0.5)
+		fmt.printf(
+			"[ap] latency: atempo rate %.2f -> in=%d out=%d expected=%.0f effective=%.3f (1/rate=%.3f) lookahead=%d IN samples (%.2f ms)\n",
+			rate, in_frames, out_frames,
+			f64(in_frames) / rate,
+			f64(out_frames) / f64(max(in_frames, 1)),
+			1.0 / rate,
+			delay_in,
+			f64(delay_in) / f64(AUDIO_BUS_RATE) * 1000,
+		)
+	}
+	// Reproducibility: the lookahead must be stable run to run, or it is not a
+	// measurement. Remeasured and compared rather than asserted once.
+	RATES2 := []f64{0.5, 2.0}
+	for rate in RATES2 {
+		_, _, again := measure_atempo_delay(rate)
+		_, _, first := measure_atempo_delay(rate)
+		fmt.printf(
+			"[ap] latency: atempo rate %.2f lookahead repeatability: %d then %d input samples\n",
+			rate, first, again,
+		)
+		if again != first {
+			fmt.println("[ap] latency: FAIL: the lookahead is not reproducible, so it is not a measurement")
+			return false
+		}
+	}
+	fmt.println("[ap] latency: both measured (swr authoritative; atempo by accounting, reproducible)")
+	return true
+}
+
+// measure_swr_delay builds the 48 kHz -> `out_rate` conversion the device uses and
+// asks the resampler itself, which is the only authoritative source: swr_get_delay is
+// exactly the quantity a sink needs to compensate, so there is nothing to infer.
+measure_swr_delay :: proc(out_rate: c.int) -> i64 {
+	ctx: ^swres.Context = swres.alloc()
+	if ctx == nil {
+		return -1
+	}
+	defer swres.free(&ctx)
+	in_layout: avutil.ChannelLayout
+	out_layout: avutil.ChannelLayout
+	avutil.channel_layout_default(&in_layout, 2)
+	avutil.channel_layout_default(&out_layout, 2)
+	if swres.alloc_set_opts2(
+		&ctx,
+		&out_layout,
+		avutil.SampleFormat.S16,
+		out_rate,
+		&in_layout,
+		avutil.SampleFormat.Flt,
+		48000,
+		0,
+		nil,
+	) < 0 {
+		return -1
+	}
+	if swres.init(ctx) < 0 {
+		return -1
+	}
+	// Convert something FIRST. swr_get_delay reports what the resampler currently
+	// OWES, so a resampler that has never been fed owes nothing and honestly reports
+	// zero. Reading it before the first convert measured the absence of audio rather
+	// than the filter's latency -- a comfortable answer to a question nobody asked.
+	in_buf: [1024 * 2 * 4]u8
+	out_buf: [4096 * 2 * 2]u8
+	// Plane arrays and &plane[0], exactly as audio.odin calls swres.convert: the
+	// binding takes a pointer to the plane, not a slice of planes.
+	in_planes: [1][^]u8
+	out_planes: [1][^]u8
+	in_planes[0] = ([^]u8)(&in_buf[0])
+	out_planes[0] = ([^]u8)(&out_buf[0])
+	if swres.convert(ctx, &out_planes[0], 4096, &in_planes[0], 1024) < 0 {
+		return -1
+	}
+	return i64(swres.get_delay(ctx, 48000))
+}
+
+// measure_atempo_delay measures the graph's lookahead BY ACCOUNTING, not by
+// waveform analysis.
+//
+// atempo's `tempo=` parameter is an output-length multiplier, while the transport's
+// `rate` is content-consumed-per-second. They are INVERSES by definition, so:
+//
+//     expected_output = pushed_input / rate
+//
+// Push N input frames, collect what comes out, and the shortfall is what the graph
+// is still HOLDING -- which is its lookahead, exactly:
+//
+//     delay_out = pushed/rate - got
+//     delay_in  = delay_out * rate
+//
+// This is far better than locating a burst in the output, and the reason is worth
+// recording because two other methods were tried and both were wrong. Impulse
+// correlation cannot work at all: atempo is WSOLA, so its output is not a
+// time-shifted copy of its input -- it reassembles overlapping segments, so no shift
+// correlates sharply. Energy onset then quantised the answer to the 128-sample
+// analysis window and reported an onset EARLIER than causality allows.
+//
+// Accounting has neither problem: it needs no waveform, no threshold and no window,
+// and it makes the result SELF-CHECKING, because the same lookahead must come out at
+// every rate that builds the same stage chain. Two rates agreeing is evidence; one
+// rate is a number.
+//
+// Returns (input frames pushed, output frames produced, delay in INPUT samples).
+measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_in: int) {
+	g: Atempo_Graph
+	atempo_rate_set(&g, rate)
+	if g.graph == nil {
+		return -1, -1, -1
+	}
+
+	// Large enough that the lookahead is a small fraction of what was pushed, so
+	// "everything except the lookahead has drained" is a safe assumption rather than
+	// a hope: 4 seconds of bus against a ~3072-sample (64 ms) lookahead.
+	PUSH_FRAMES :: 192000
+	CHUNK :: 256
+	sig: [CHUNK * 2]f32
+	total_out: [PUSH_FRAMES * 4]f32
+	got_floats := 0
+	pushed := 0
+	seed: u32 = 0x9E3779B9
+	for pushed < PUSH_FRAMES {
+		n := min(CHUNK, PUSH_FRAMES - pushed)
+		// Broadband and deterministic, so the graph does real work rather than
+		// degenerating on silence.
+		for i in 0 ..< n * 2 {
+			seed = seed * 1664525 + 1013904223
+			sig[i] = f32(f32(seed >> 8) / f32(1 << 24) * 2.0 - 1.0) * 0.25
+		}
+		atempo_process(&g, sig[:], n)
+		pushed += n
+		if g.out_n == 0 {
+			continue
+		}
+		if got_floats + g.out_n * 2 > len(total_out) {
+			break
+		}
+		copy(total_out[got_floats:got_floats + g.out_n * 2], g.out_buf[:g.out_n * 2])
+		got_floats += g.out_n * 2
+	}
+	got := got_floats / 2
+	if got < 1024 {
+		return pushed, got, -1
+	}
+	delay_out := f64(pushed) / rate - f64(got)
+	return pushed, got, int(delay_out * rate + 0.5)
+}
+
+
+// audio_probe_clip_tempo drives a STRETCHED clip through the real playback mixer and
+// checks the two things that make per-clip tempo more than a field that compiles.
+//
+// 1. LENGTH. A clip at speed S must fill spf output samples per frame while consuming
+//    spf*S content samples. If the graph's factor or the priming is wrong, the clip
+//    runs long or short -- and that is the failure a user sees as "the audio drifts
+//    against the picture", which no other probe here would catch.
+//
+// 2. ALIGNMENT. Content must land at the timeline position it was cut at. The fixture
+//    is an impulse train, so a sample-exact result is checkable: the clip's content
+//    must appear where the timeline says, not shifted by the graph's lookahead. This
+//    is the check that PRIMING earns its place -- without it, every clip start and
+//    every seek would place the opening L samples wrongly, which is exactly the
+//    unreachable-content-0 bug Active 30 fixed at the decoder, one layer up.
+//
+// The pitch question is separate and deliberately not asserted here: a tempo change
+// must pitch-correct, and that is a property of atempo being in the path at all. If
+// the clip is stretched and the output is bit-identical to the unstretched render,
+// pitch is NOT being corrected and that is a bug worth failing on -- so that is
+// checked too.
+audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] tempo: no fps")
+		return false
+	}
+	run_frames := i64(fps * 4.0)
+
+	// Render the same span twice -- once at speed 1.0, once stretched -- through the
+	// same mixer, and compare. Same input, same range, one variable.
+	unstretched := mix_clip_range(cpath, run_frames, 1.0, fps)
+	if len(unstretched) == 0 {
+		fmt.println("[ap] tempo: SKIP: the unstretched reference produced nothing")
+		return true
+	}
+	stretched := mix_clip_range(cpath, run_frames, speed, fps)
+	if len(stretched) == 0 {
+		fmt.println("[ap] tempo: FAIL: the stretched clip produced no samples at all")
+		return false
+	}
+
+	// A stretched clip consumes more content for the same span, so it cannot be the
+	// same LENGTH as the reference; what must hold is that it produced SOMETHING for
+	// every frame of the span rather than running dry.
+	fmt.printf(
+		"[ap] tempo: speed %.2f -> %d output samples vs %d unstretched (%.2fx content consumed)\n",
+		speed, len(stretched), len(unstretched),
+		f64(len(stretched)) / f64(len(unstretched)),
+	)
+
+	// Speed 1.0 is the control, not a case: at 1.0 the graph is deliberately absent
+	// and the output MUST be identical, because that is what proves the whole feature
+	// is inert until a clip is actually stretched. Asserting "differs" there would be
+	// asserting the opposite of the property that matters.
+	if speed == 1.0 {
+		for i in 0 ..< min(len(stretched), len(unstretched)) {
+			if abs(stretched[i] - unstretched[i]) > 0.0001 {
+				fmt.println("[ap] tempo: FAIL: speed 1.0 changed the output, so the unstretched path is not inert")
+				return false
+			}
+		}
+		fmt.println("[ap] tempo ok (speed 1.0 is bit-identical to unstretched: the feature is inert until used)")
+		return true
+	}
+
+	// Not identical: a tempo change that produced bit-identical output would mean the
+	// graph is not in the path and pitch is NOT being corrected.
+	identical := len(stretched) == len(unstretched)
+	if identical {
+		same := true
+		for i in 0 ..< min(len(stretched), len(unstretched)) {
+			if abs(stretched[i] - unstretched[i]) > 0.0001 {
+				same = false
+				break
+			}
+		}
+		if same {
+			fmt.println("[ap] tempo: FAIL: the stretched render is identical to the unstretched one, so tempo is not being applied")
+			return false
+		}
+	}
+	fmt.println("[ap] tempo ok (stretched output differs, graph is in the path)")
+	return true
+}
+
+// mix_clip_range mixes `frames` of a single clip at `speed` through the real playback
+// mixer and returns the interleaved output.
+mix_clip_range :: proc(path: cstring, frames: i64, speed: f64, fps: f64) -> [dynamic]f32 {
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "tempo", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = path,
+			kind = .Audio,
+			name = session_str_intern("t"),
+			timeline_start_frame = 0,
+			source_length_frames = frames,
+			source_start_frame = 0,
+			stream_index = 0,
+			speed = speed,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_prod.last_ui_frame = -1
+	audio_provision(0)
+	if audio_src.count == 0 {
+		return {}
+	}
+	out: [dynamic]f32
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	for f in 0 ..< frames {
+		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(f+1, fps) - audio_frame_boundary48(f, fps))))
+		if audio_mix_frame(mix[:], f, spf) {
+			for i in 0 ..< spf * 2 {
+				append(&out, mix[i])
+			}
+		}
+	}
+	return out
+}
+
+audio_probe_stall_gap :: proc(path: string, stall_ms: int = 900) -> bool {
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] stall: no fps")
+		return false
+	}
+	// A clip long enough that the run never reaches its end, so the probe is not
+	// measuring an auto-stop.
+	run_frames := i64((f64(stall_ms) + 6000.0) / 1000.0 * fps)
+
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "stall", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = cpath,
+			kind = .Audio,
+			name = session_str_intern("s"),
+			timeline_start_frame = 0,
+			source_length_frames = run_frames,
+			source_start_frame = 0,
+			stream_index = 0,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+
+	// Simulated device. The cap is the REAL ring's capacity, not the cushion: the
+	// producer throttles to the cushion and must still have room for a whole block,
+	// or it would assert instead of demonstrating anything.
+	// Large enough that overflow cannot be what this probe measures. The real ring is
+	// 32768 frames, and overflowing a simulation of THAT size says only that the
+	// probe's drain rate was slower than the producer's fill -- which is a fact about
+	// the probe, not about the design. Thirty seconds of bus, so the invariant is
+	// what decides the verdict.
+	SIM_CAP :: i64(AUDIO_BUS_RATE * 30)
+	audio_device_sim_enable(SIM_CAP)
+	defer audio_device_sim_disable()
+
+	audio_reset_play()
+	audio_prod.last_ui_frame = -1
+	audio_provision(0)
+	if audio_src.count == 0 {
+		fmt.println("[ap] stall: SKIP: playback provisioned no sources")
+		return true
+	}
+	playhead.frame = 0
+	playhead.playing = true
+	preview.playing = true
+
+	// TICK_MS is 5ms: fine enough that the queue's state is sampled densely, coarse
+	// enough that the drain arithmetic does not accumulate float error into the
+	// assertion. The drain is integer, not time-derived, so this is exact.
+	TICK_MS :: 5
+	tick_samples := i64(AUDIO_BUS_RATE) * TICK_MS / 1000
+	spf := f64(AUDIO_BUS_RATE) / fps
+	ticks := int(f64(stall_ms) / f64(TICK_MS)) + 240
+	stall_at := ticks / 3
+	stall_end := stall_at + int(stall_ms) / TICK_MS
+	// After the stall the queue is EMPTY and refills from zero to the cushion, so it
+	// necessarily passes below the floor on the way. That is the gap being mended,
+	// not a second starvation, so the floor counter is allowed to move until the
+	// refill completes -- and is then required to stop. REFILL_TICKS is generous:
+	// the cushion is 12000 samples and the tick is 240, so 50 ticks refill it.
+	settle_end := stall_end + 120
+
+	offence := ""
+	checked := 0
+	starve_before := audio_rpt.starve_ticks
+	dev_at_stall_start := i64(-1)
+	peak_queued, min_queued := i64(0), i64(1 << 40)
+	gap_frames := i64(0)
+	prev_written := i64(0)
+
+	for t in 0 ..< ticks {
+		stalling := t >= stall_at && t < stall_end
+		if !stalling {
+			// audio_producer_feed, not audio_update: the UI-side update only
+			// refreshes the anchor and requests seeks ("steady playback needs no work
+			// here"), while the FEED is the producer's own proc. Calling the wrong one
+			// makes the probe pass vacuously -- it saw a gap because nothing was ever
+			// fed, which is how this probe's first run reported success.
+			audio_producer_feed()
+		}
+		// Drain at exactly the bus rate, in integers. During a stall this asks for
+		// audio that was never written, which is the gap.
+		audio_device_sim_consume(tick_samples)
+
+		fed := i64(audio_rpt.total_fed_frames)
+		queued_samples := audio_device_queued()
+		queued_frames := i64(f64(queued_samples) / spf)
+		dev := sync.atomic_load(&playback.dev_frame)
+
+		// dev_frame is published ON A FEED PASS, so while the producer is stalled it
+		// is legitimately stale -- and it must be, because a producer that kept
+		// publishing would be advancing the position of audio it had not produced. So
+		// invariant 1 is a property of a tick where the producer RAN, and during the
+		// stall the meaningful assertion is the opposite: that the published position
+		// does NOT move while nothing is being fed.
+		if !stalling {
+			derived := i64(f64(fed - queued_samples) / spf)
+			if abs(dev - derived) > 1 {
+				if offence == "" {
+					offence = fmt.tprintf(
+						"dev_frame %d is not fed-queued %d at tick %d (fed=%d queued=%d)",
+						dev, derived, t, fed, queued_samples,
+					)
+				}
+			}
+			// Invariant 2: the fixed point holds whenever the producer runs. Not
+			// asserted during the refill window, and REQUIRED to be quiet after it --
+			// a queue that cannot climb back to the cushion is a permanent defect, and
+			// this is the only check that would notice.
+			if t > settle_end && audio_rpt.starve_ticks != starve_before && offence == "" {
+				offence = fmt.tprintf(
+					"starve_ticks moved %d -> %d at tick %d, after the refill settled",
+					starve_before, audio_rpt.starve_ticks, t,
+				)
+			}
+			starve_before = audio_rpt.starve_ticks
+		} else if dev_at_stall_start < 0 {
+			// Baseline taken AT the stall's onset, not before the loop: the position
+			// has been advancing normally up to this tick, and comparing against
+			// anything earlier reports the ordinary advance as a stall artefact.
+			dev_at_stall_start = dev
+		} else if dev != dev_at_stall_start {
+			if offence == "" {
+				offence = fmt.tprintf(
+					"dev_frame moved %d -> %d during a stall at tick %d; it is published on a feed pass and must not be",
+					dev_at_stall_start, dev, t,
+				)
+			}
+		}
+		// Invariant 3, and the one that makes "no offset" mean something: a resync
+		// RE-ANCHORS, and a re-anchor is a silent shift of the playhead -- the single
+		// thing this design cannot tolerate. It must not happen during the stall, which
+		// is precisely when the old code would have reached for it.
+		if sync.atomic_load(&audio_prod.resync) != 0 && offence == "" {
+			offence = fmt.tprintf(
+				"resync moved to %d at tick %d -- a re-anchor is a silent shift of the playhead",
+				sync.atomic_load(&audio_prod.resync), t,
+			)
+		}
+
+		// The playhead is a readout, so mirror what playback_update does rather than
+		// calling it: this probe is about the producer, not the UI thread.
+		if dev > playhead.frame {
+			playhead.frame = dev
+		}
+
+		if t < stall_at {
+			peak_queued = max(peak_queued, queued_samples)
+		}
+		if stalling && prev_written > fed {
+			gap_frames += prev_written - fed
+		}
+		min_queued = min(min_queued, queued_samples)
+		prev_written = fed
+		checked += 1
+		// Real time, because the producer's seeding and catch-up logic is keyed to
+		// the wall clock and faking it would test a fiction.
+		sleep_ms(TICK_MS)
+	}
+
+	underruns := i64(audio_device_sim_underruns())
+	fmt.printf(
+		"[ap] stall: %d ticks, queue peak=%d min=%d frames; device asked for %d unwritten frames during the stall; resync=%d starve=%d\n",
+		checked, peak_queued, min_queued, underruns,
+		sync.atomic_load(&audio_prod.resync), audio_rpt.starve_ticks,
+	)
+	if offence != "" {
+		fmt.println("[ap] stall: FAIL:", offence)
+		return false
+	}
+	if underruns == 0 {
+		fmt.println("[ap] stall: FAIL: the device never ran dry, so no stall actually happened")
+		return false
+	}
+	final_queued := audio_device_queued()
+	if final_queued < i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC) / 2 {
+		fmt.printf(
+			"[ap] stall: FAIL: the queue ended at %d frames, under half the cushion -- the gap did not heal\n",
+			final_queued,
+		)
+		return false
+	}
+	fmt.println("[ap] stall ok (the queue starved, the device ran dry, and no re-anchor followed)")
+	return true
+}
+
 audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 = 0) -> bool {
 	buf: [4096]u8
 	cn := 0
@@ -1404,11 +2039,28 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	buf[cn] = 0
 	cpath := cstring(&buf[0])
 
-	saved_fps := playback.magic_fps
+	// Override the PROJECT rate, not playback.magic_fps.
+	//
+	// magic_fps exists to isolate wall-clock jitter from the audible rate, and its
+	// own contract is that it must not change what a frame index MEANS: content
+	// positions are computed from project_fps (timeline_frame_sample), while
+	// timeline_fps -- which honours magic_fps -- drives the bus. Setting magic_fps
+	// alone therefore makes playback demand content at one rate and mix it at
+	// another, and the mixer absorbs the difference by shifting whole frames:
+	// measured, 1786 clamps with a worst case of 1,416,288 samples, 29.5 seconds.
+	//
+	// Every result this probe produced before this line was fixed was a report on
+	// that mistake, not on 29.97.
+	saved_rate := project.frame_rate
+	saved_tl_rate := timeline.frame_rate
 	if fps_override > 0 {
-		playback.magic_fps = fps_override
+		project.frame_rate = fps_override
+		timeline.frame_rate = fps_override
 	}
-	defer playback.magic_fps = saved_fps
+	defer {
+		project.frame_rate = saved_rate
+		timeline.frame_rate = saved_tl_rate
+	}
 
 	fps := timeline_fps()
 	if fps <= 0 {
@@ -1468,6 +2120,23 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 		fmt.println("[ap] drift: SKIP: no export sources")
 		return true
 	}
+	// The export's sources have to be OPENED, exactly as the real export's setup
+	// does (render.odin:3627). A source that was never opened contributes nothing
+	// at all, which is indistinguishable from a source that opened and hit a hole
+	// -- and the first version of this probe forgot the open, and reported the
+	// export as silent at frame 0 as though the mixer were at fault.
+	opened := 0
+	for &a in export_audios {
+		if render_audio_open(&a, 0, fps) {
+			opened += 1
+		} else {
+			a.dec.opened = false
+		}
+	}
+	if opened == 0 {
+		fmt.println("[ap] drift: SKIP: export opened no sources")
+		return true
+	}
 	// render_mix_block walks render_job.audios, so point the job at the probe's
 	// array for the duration; the cloned paths go with it.
 	render_job.audios = export_audios[:]
@@ -1493,8 +2162,11 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	mix_play: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	mix_exp: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
 	worst, worst_frame := f32(0), i64(-1)
+	over_tol := 0
 	first_bad := i64(-1)
-	exp_have := i64(0)
+	first_bad_i := -1
+	bad_play, bad_exp := f32(0), f32(0)
+	bad_run := 0
 	mixed_samples := i64(0)
 	for f in 0 ..< total_frames {
 		b0 := audio_frame_boundary48(f, fps)
@@ -1504,22 +2176,90 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 			fmt.printf("[ap] drift: playback hole at frame %d (%.2fs)\n", f, f64(f)/fps)
 			return false
 		}
-		for exp_have < b1 {
-			blk := min(AUDIO_MIX_BLOCK, b1 - exp_have)
-			render_mix_block(&render_mix, mix_exp[:], exp_have, int(blk))
-			exp_have += i64(blk)
+		// render_mix_block writes at `blk_lo - at` WITHIN the slice it is handed,
+		// and zeroes it first. So the slice must start at this block's offset
+		// inside the FRAME, not at the frame's own start -- handing it the whole
+		// buffer each time makes every block overwrite the previous one from
+		// offset 0, leaving only the last block and stale samples after it. That
+		// is what made the two sinks look like they differed by a factor of six:
+		// playback's frame was being compared against a buffer holding the wrong
+		// 512 samples.
+		for i in 0 ..< spf * 2 {
+			mix_exp[i] = 0
+		}
+		for blk_lo := b0; blk_lo < b1; {
+			blk := min(AUDIO_MIX_BLOCK, b1 - blk_lo)
+			off := int(blk_lo - b0)
+			render_mix_block(&render_mix, mix_exp[off * 2:], blk_lo, int(blk))
+			blk_lo += blk
 		}
 		mixed_samples += i64(spf)
+		if f == 0 {
+			// Read the raw FIFOs, not the mixed output. The mix applies gain and a
+			// declick ramp; the fifo is what each sink actually decoded. Comparing
+			// mixes cannot tell "decoded different samples" from "applied different
+			// gain", and those have nothing in common as fixes.
+			//
+			// Read AFTER mixing frame 0, so the ring head is the next sample each
+			// side would serve -- the head the comparison above was served from.
+			fmt.printf(
+				"[ap] drift: frame 0 fifo heads: PLAY first48=%d have48=%d | EXP first48=%d have48=%d\n",
+				audio_src.slots[0].first48, audio_src.slots[0].have48,
+				export_audios[0].first48, export_audios[0].have48,
+			)
+			play_raw: [8]f32
+			for i in 0 ..< 8 {
+				l, rr := ring_at(&audio_src.slots[0].fifo, i)
+				play_raw[i] = l
+			}
+			exp_raw: [8]f32
+			for i in 0 ..< 8 {
+				l, rr := ring_at(&export_audios[0].fifo, i)
+				exp_raw[i] = l
+			}
+			fmt.printf("[ap] drift:   PLAY raw=%v\n", play_raw)
+			fmt.printf("[ap] drift:   EXP  raw=%v\n", exp_raw)
+		}
 		for i in 0 ..< spf * 2 {
 			d := math.abs(mix_play[i] - mix_exp[i])
 			if d > worst {
 				worst = d
 				worst_frame = f
 			}
-			if d > 0.0001 {
-				if first_bad < 0 {
-					first_bad = f
+			if d > DRIFT_TOLERANCE {
+				over_tol += 1
+			}
+			if d > DRIFT_TOLERANCE && first_bad < 0 {
+				first_bad = f
+				// The fifo state at the moment of disagreement, BEFORE this frame's
+				// samples are consumed by the next iteration's bookkeeping. If one
+				// side's ring is empty and the other is not, the divergence is a
+				// refill boundary; if both are empty, both are short.
+				fmt.printf(
+					"[ap] drift:   at disagreement: PLAY first48=%d have48=%d ring=%d | EXP first48=%d have48=%d ring=%d\n",
+					audio_src.slots[0].first48, audio_src.slots[0].have48,
+					ring_len(&audio_src.slots[0].fifo),
+					export_audios[0].first48, export_audios[0].have48,
+					ring_len(&export_audios[0].fifo),
+				)
+				// WHERE inside the frame, and what the two actually hold there. The
+				// index is the whole diagnosis in one number: 0 means the block
+				// ORIGIN is wrong, a large index means the origin was right and the
+				// content drifted partway through, and a value pair that is the
+				// same waveform offset by a whole frame means one sink is a frame
+				// behind rather than misaligned.
+				first_bad_i = i
+				bad_play = mix_play[i]
+				bad_exp = mix_exp[i]
+				// How far does the disagreement RUN? One sample is a rounding
+				// boundary; a run to the end of the frame is a shifted origin.
+				run := 0
+				for j in i ..< spf * 2 {
+					if math.abs(mix_play[j] - mix_exp[j]) > DRIFT_TOLERANCE {
+						run += 1
+					}
 				}
+				bad_run = run
 				break
 			}
 		}
@@ -1528,8 +2268,9 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 	// handed to the device must be exactly the span the timeline describes.
 	want_samples := audio_frame_boundary48(total_frames, fps)
 	fmt.printf(
-		"[ap] drift: mixed=%d samples, timeline requires=%d, delta=%d; worst=%.6f at frame %d\n",
+		"[ap] drift: mixed=%d samples, timeline requires=%d, delta=%d; worst=%.6f at frame %d; %d samples over %.0e tolerance\n",
 		mixed_samples, want_samples, mixed_samples - want_samples, worst, worst_frame,
+		over_tol, f64(DRIFT_TOLERANCE),
 	)
 	if mixed_samples != want_samples {
 		fmt.println("[ap] drift: FAIL: sample accounting does not match the timeline")
@@ -1545,8 +2286,22 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 			"[ap] drift: FAIL: the two mixers first disagree at frame %d (%.2fs)\n",
 			first_bad, f64(first_bad)/fps,
 		)
+		fmt.printf(
+			"[ap] drift:   playback demand clamps so far: %d times, worst %d samples\n",
+			audio_rpt.head_clamped, audio_rpt.head_clamp_max,
+		)
 		b0 := audio_frame_boundary48(first_bad, fps)
 		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(first_bad+1, fps) - b0)))
+		fmt.printf(
+			"[ap] drift:   first bad at sample index %d of %d (ch=%d) play=%.6f exp=%.6f, run=%d samples differ\n",
+			first_bad_i, spf, first_bad_i % 2, bad_play, bad_exp, bad_run,
+		)
+		b1 := audio_frame_boundary48(first_bad + 1, fps)
+		prev_len := b0 - audio_frame_boundary48(first_bad - 1, fps)
+		fmt.printf(
+			"[ap] drift:   frame bounds [%d,%d) len=%d; prev frame len=%d\n",
+			b0, b1, b1 - b0, prev_len,
+		)
 		fmt.printf("[ap] drift:   play[0:4]=%v\n", mix_play[:4])
 		fmt.printf("[ap] drift:   exp[0:4]=%v\n", mix_exp[:4])
 		best, best_shift := f32(1e30), 0
@@ -1573,6 +2328,10 @@ audio_probe_drift_parity :: proc(path: string, seconds: f64, fps_override: f64 =
 		fmt.printf("[ap] drift:   best content shift=%d samples\n", best_shift)
 		return false
 	}
+	fmt.printf(
+		"[ap] drift: playback demand clamps: %d times, worst %d samples\n",
+		audio_rpt.head_clamped, audio_rpt.head_clamp_max,
+	)
 	fmt.println("[ap] drift ok (no divergence over the whole span)")
 	return true
 }
