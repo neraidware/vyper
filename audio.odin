@@ -675,6 +675,7 @@ Play_Seg :: struct {
 	// per frame through audio_gain_linear, so automation animates live without
 	// the producer ever reading live timeline state.
 	gain: Audio_Gain_Snapshot,
+	pitch: Audio_Pitch_Snapshot,
 }
 
 // Play_Src is one source stream's 48 kHz stereo S16 decoder + content-relative
@@ -1029,6 +1030,83 @@ audio_gain_linear :: proc(g: ^Audio_Gain_Snapshot, rel: i32) -> f32 {
 	return kf_gain_linear(g.keys[:g.n], rel, g.db)
 }
 
+// Audio_Pitch_Snapshot is a clip's pitch, committed: a static semitone offset plus
+// its keyframe track.
+//
+// It is deliberately the SAME SHAPE as Audio_Gain_Snapshot, and for the same reason
+// the two mixers agree about gain: the producer never reads live clips, so a track
+// the producer does not know about is a track that silently does nothing. One shape,
+// one path, one snapshot -- so pitch cannot drift out of step with the property it is
+// modelled on.
+Audio_Pitch_Snapshot :: struct {
+	semitones: f32,
+	keys:      [GAIN_KF_MAX_KEYS]Keyframe,
+	n:         int,
+}
+
+// audio_pitch_snapshot_from_clip snapshots a clip's pitch track into the shared
+// shape. Mirrors audio_gain_snapshot_from_clip exactly, including returning the
+// track's REAL key count so the caller can log truncation.
+audio_pitch_snapshot_from_clip :: proc(clip: ^Clip) -> (p: Audio_Pitch_Snapshot, total: int) {
+	p.semitones = clip.pitch
+	p.n, total = kf_fill_snapshot(clip, "pitch", p.keys[:])
+	return
+}
+
+// audio_pitch_semitones evaluates a committed pitch snapshot at clip-relative frame
+// `rel`.
+//
+// The one place it deliberately DIFFERS from the gain path: gain converts dB to a
+// linear multiplier, because amplitude is a multiplier. Pitch is NOT a multiplier --
+// it is a frequency ratio -- so it is returned in SEMITONES and converted to a ratio
+// once, where the ratio is actually needed (the shifter's resample factor). Converting
+// here would bake a unit into the snapshot and make the key values unreadable, which
+// is the mistake the dB comment on kf_gain_linear warns about in the other direction.
+audio_pitch_semitones :: proc(p: ^Audio_Pitch_Snapshot, rel: i32) -> f32 {
+	if p.n == 0 {
+		return p.semitones
+	}
+	v, _ := kf_sample_keys(p.keys[:p.n], rel, p.semitones)
+	return v
+}
+
+// semitones_to_ratio converts a semitone offset to the frequency ratio a pitch shifter
+// needs: 2^(n/12). The exponent is divided by 12 because an octave is 12 semitones,
+// and the base is 2 because pitch is a ratio, not a multiplier -- so +12 is exactly
+// one octave up, not 12x.
+semitones_to_ratio :: proc(semitones: f32) -> f64 {
+	return math.pow(2.0, f64(semitones) / 12.0)
+}
+
+// CLIP_PITCH_MIN / CLIP_PITCH_MAX bound a clip's pitch offset.
+//
+// Asymmetric on purpose. Downward is limited because every semitone DOWN is more
+// octave division in the shifter's resampler, and the lower it goes the more content
+// has to be discarded to do it -- so the floor is where quality is still acceptable,
+// not a round number. Upward is far more generous because shifting up is nearly free:
+// it needs resampling, not division.
+//
+// These are ASSERTED at the point of use rather than clamped, for the same reason
+// clip_speed asserts: a clamp would silently play a pitch the user did not ask for.
+CLIP_PITCH_MIN :: -24.0
+CLIP_PITCH_MAX :: 12.0
+
+// clip_pitch_at_playhead is the pitch the inspector should DISPLAY for `clip`: the
+// keyed semitone value where its pitch track is active at the playhead, else the
+// static clip.pitch.
+//
+// It exists because the gain row was the one holdout and so disagreed with what
+// playback was doing -- the readout sampled the resting field while playback used the
+// keyed curve. Without the mirror, a pitch automation would look inert in the
+// inspector while audible, which is the same class of bug and would be found the same
+// expensive way.
+clip_pitch_at_playhead :: proc(clip: ^Clip) -> f32 {
+	f := playhead.frame
+	rel := i32(f - clip.timeline_start_frame)
+	p, _ := audio_pitch_snapshot_from_clip(clip)
+	return audio_pitch_semitones(&p, rel)
+}
+
 // AUDIO_GEOM_SLOTS is how many geometry slots exist. Three, not two, and the
 // reason is the READER'S HOLD TIME: the producer does not read the slab for a
 // moment, it reads it for a whole provision (every decoder reopened, tens of
@@ -1055,6 +1133,9 @@ Audio_Geom_Chip :: struct {
 	// producer never reads live clips, so a tempo the producer does not know about is
 	// a tempo it will play at 1.0 and report no error for.
 	speed:         f64,
+	// pitch is the clip's semitone offset, snapshotted for the same reason gain and
+	// speed are: the producer never reads live clips.
+	pitch:         Audio_Pitch_Snapshot,
 	gain:          Audio_Gain_Snapshot,
 	path_off:      int, // offset into Audio_Geom_Slot.paths
 	path_len:      int,
@@ -1095,6 +1176,10 @@ Audio_Geom :: struct {
 	overflow:   bool,
 	// kf_trunc_logged logs once when a gain keyframe track is capped.
 	kf_trunc_logged: bool,
+	// pitch_kf_trunc_logged is the same for pitch. Separate flag rather than a shared
+	// one, because sharing them would mean a long gain track silences the pitch
+	// warning forever -- the second cap would look already-reported.
+	pitch_kf_trunc_logged: bool,
 }
 audio_geom_state: Audio_Geom
 
@@ -1210,7 +1295,13 @@ audio_geometry_commit :: proc() {
 			// shared committed shape. kf_fill_snapshot renders the name; the
 			// geometry commit is UI-thread so reading the live clip is safe.
 			g, total := audio_gain_snapshot_from_clip(clip)
+			pitch_snap, pitch_total := audio_pitch_snapshot_from_clip(clip)
 			chip.gain = g
+			chip.pitch = pitch_snap
+			if pitch_total > GAIN_KF_MAX_KEYS && !audio_geom_state.pitch_kf_trunc_logged {
+				fmt.printf("[audio] pitch keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, pitch_total)
+				audio_geom_state.pitch_kf_trunc_logged = true
+			}
 			if g.n > 0 && total > GAIN_KF_MAX_KEYS && !audio_geom_state.kf_trunc_logged {
 				fmt.printf("[audio] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, g.n)
 				audio_geom_state.kf_trunc_logged = true
@@ -1415,6 +1506,7 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			start_s_rate = chip.source_rate,
 			len_a        = chip.source_len,
 			gain         = chip.gain,
+			pitch        = chip.pitch,
 		}
 		g.seg_count += 1
 	}

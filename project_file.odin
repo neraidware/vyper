@@ -91,7 +91,7 @@ Saved_Clip :: struct {
 	stream_index:         c.int,
 	gain:                 f32,
 	speed:                f64,
-	pitch:                f64,
+	pitch:                f32,
 	source_start_frame:   i64,
 	audio_src_rate:       f64,
 	source_length_frames: i64,

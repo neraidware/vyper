@@ -1584,6 +1584,7 @@ Render_Audio_Src :: struct {
 	// export cannot drift from playback (it previously applied no gain at all,
 	// so a rendered file ignored the slider and its automation entirely).
 	gain:                 Audio_Gain_Snapshot,
+	pitch:                Audio_Pitch_Snapshot,
 	dec:                  Audio_Clip_Decoder, // 48 kHz stereo S16
 	fifo:                 Audio_Ring, // converted stereo f32, content-relative
 	first48:              i64, // content 48 kHz frame of fifo's head
@@ -1911,6 +1912,7 @@ render_audio_src_from_chip :: proc(slot: ^Audio_Geom_Slot, chip: ^Audio_Geom_Chi
 		source_start_rate = chip.source_rate,
 		source_length_frames = chip.source_len,
 		gain = chip.gain,
+		pitch = chip.pitch,
 	}
 }
 

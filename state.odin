@@ -130,7 +130,16 @@ clip_speed :: proc(c: ^Clip) -> f64 {
 // no default to own -- but it is an accessor so the audio path has ONE place to read
 // pitch from, rather than a bare field read that a future pitch shifter would have to
 // be threaded through.
-clip_pitch :: proc(c: ^Clip) -> f64 {
+clip_pitch :: proc(c: ^Clip) -> f32 {
+	if c.pitch < CLIP_PITCH_MIN || c.pitch > CLIP_PITCH_MAX {
+		assert(
+			false,
+			fmt.tprintf(
+				"clip_pitch: %.2f semitones is outside [%f, %f]",
+				f64(c.pitch), CLIP_PITCH_MIN, CLIP_PITCH_MAX,
+			),
+		)
+	}
 	return c.pitch
 }
 
@@ -571,7 +580,7 @@ Clip :: struct {
 	// This is the one that is explicitly opt-in: nothing in the engine changes pitch
 	// on its own, which is the same rule as the clip-boundary ramp that was removed --
 	// the engine does not touch what you did not ask it to touch.
-	pitch:                f64,
+	pitch:                f32,
 	source_start_frame:   i64,
 	// audio_src_rate pins the rate an AUDIO clip's source_start_frame is
 	// counted against, so changing the project rate cannot silently re-point
