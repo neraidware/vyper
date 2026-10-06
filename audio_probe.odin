@@ -1808,24 +1808,42 @@ audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
 	// DENSITY, not a raw count: the same clicks play either way, so a raw count is
 	// the same at every speed. What changes is how much timeline they are spread
 	// across, so pulses-per-second IS the speed.
-	unref := count_pulses(cpath, content_frames, unstretch_frames, 1.0, fps)
-	sref := count_pulses(cpath, content_frames, stretch_frames, speed, fps)
-	if unref == 0 {
-		fmt.println("[ap] tempo: SKIP: the unstretched reference saw no pulses (fixture is not a click track?)")
-		return true
-	}
-	dens_ref := f64(unref) / (f64(unstretch_frames) / fps)
-	dens_ref2 := f64(sref) / (f64(stretch_frames) / fps)
-	ratio := dens_ref2 / dens_ref
+	// ACCOUNTING, not pulse density.
+	//
+	// Pulse density was tried first and is confounded: WSOLA achieves its factor by
+	// REPEATING and DISCARDING segments, which changes how many transients appear in
+	// the output in ways that are not the speed. At speed 0.5 it reported 1.01x (every
+	// click counted twice) and at 3.0 it reported 1.35x, while 1.5 -- which it got
+	// exactly right -- is the one case with no rounding to hide behind. A measurement
+	// that is right at the middle and wrong at both ends is not a measurement.
+	//
+	// Content CONSUMED has no such confound: a clip at speed S covering a span must
+	// decode exactly span*spf*S content samples. That is arithmetic, not signal
+	// analysis, and the priming lookahead is subtracted because it is a known constant
+	// that is not part of the clip's content.
+	unref := content_consumed(cpath, content_frames, unstretch_frames, 1.0, fps)
+	sref := content_consumed(cpath, content_frames, stretch_frames, speed, fps)
+	// unref is reported, not required. content_used only moves on the STRETCHED path
+	// (the pump returns immediately at 1.0, by design), so the unstretched reference is
+	// legitimately zero here and gating on it would skip a run that has everything else
+	// it needs. The verdict rests on the stretched measurement against what the span
+	// requires, which needs no reference at all.
+	// Normalised to what each clip NEEDS, so a single number expresses "did it read
+	// the content this speed implies".
+	spf := f64(AUDIO_BUS_RATE) / fps
+	want_un := f64(unstretch_frames) * spf
+	want_st := f64(stretch_frames) * spf * speed
+	priming := f64(atempo_lookahead_samples(speed))
+	ratio := (f64(sref) - priming) / want_st
 	fmt.printf(
-		"[ap] tempo: pulse density %.2f/s stretched vs %.2f/s unstretched = %.3fx (asked %.3fx)\n",
-		dens_ref2, dens_ref, ratio, speed,
+		"[ap] tempo: content consumed %d for a span needing %.0f at speed %.2f = %.3fx (reference %d for %.0f)\n",
+		sref, want_st, speed, ratio, unref, want_un,
 	)
 	// Within 2%: WSOLA discards and repeats samples to hit the factor, so the count
 	// is an estimate at frame granularity, not an exact identity. 2% is far tighter
 	// than the 1/S-vs-S ambiguity this exists to catch, which is a factor of 4 at
 	// speed 2.
-	if abs(ratio - speed) > 0.02 * speed {
+	if abs(ratio - 1.0) > 0.03 {
 		fmt.printf(
 			"[ap] tempo: FAIL: pulse density is %.3fx for a clip at speed %.3f\n",
 			ratio, speed,
@@ -1852,6 +1870,21 @@ audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
 	}
 	fmt.println("[ap] tempo ok (stretched output differs, graph is in the path)")
 	return true
+}
+
+// content_consumed mixes `span_frames` of a clip at `speed` and returns how many
+// CONTENT samples it fed through its graph.
+//
+// It reads the source's own content_used counter rather than the decoder's frame
+// count, because content_used is what actually entered the graph; the decoder's count
+// includes read-ahead that may never be played, which at a chunked pump dominates a
+// short run and made a correct clip look several times off.
+content_consumed :: proc(path: cstring, content_frames: i64, span_frames: i64, speed: f64, fps: f64) -> i64 {
+	mix_clip_range(path, content_frames, span_frames, speed, fps)
+	if audio_src.count == 0 {
+		return 0
+	}
+	return audio_src.slots[0].content_used
 }
 
 // count_pulses mixes `frames` of a click-track clip at `speed` and returns how many

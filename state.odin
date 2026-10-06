@@ -90,6 +90,34 @@ SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.001)
 TIMELINE_MAX_ZOOM :: f32(16)
 
+// clip_timeline_length is how many TIMELINE frames a clip occupies.
+//
+// It is source_length_frames divided by speed, and those are two different numbers
+// for a stretched clip -- which is the whole point of stretching. The same content,
+// played faster, is over sooner.
+//
+// This exists because `source_length_frames` was quietly doing DOUBLE DUTY as both
+// the content length and the timeline length. The comment on Play_Seg said so
+// outright: "len_a is both the timeline length and the source length (clips are not
+// time-stretched)". That was true when written and stopped being true the moment
+// clip speed did, and every span computation, coverage check and segment build
+// inherited the conflation. The observable symptom was a 2x clip occupying its full
+// unstretched timeline, playing at roughly 1x and then running out of content.
+//
+// One function, so there is one place that knows the difference. Anything asking "how
+// long is this clip ON THE TIMELINE" comes here; anything asking "how much SOURCE
+// does it read" asks for source_length_frames directly.
+//
+// Integer division floors, which is the right way round: a clip must not claim a
+// timeline frame its content does not reach.
+clip_timeline_length :: proc(clip: ^Clip) -> i64 {
+	speed := clip_speed(clip)
+	if speed <= 0 {
+		return clip.source_length_frames
+	}
+	return max(1, i64(f64(clip.source_length_frames) / speed))
+}
+
 // CLIP_SPEED_MIN / CLIP_SPEED_MAX bound a clip's tempo.
 //
 // The upper bound is not arbitrary: atempo is chained ATEMPO_MAX_STAGES deep and a
@@ -322,6 +350,26 @@ audio_source_start_sample :: proc(source_start_frame: i64, audio_src_rate: f64) 
 // truncating the sum once is what made the old form position-dependent.
 audio_content_sample :: proc(frames_into: i64, start_s: i64, start_s_rate: f64) -> Sample_Pos {
 	return timeline_frame_sample(frames_into) + audio_source_start_sample(start_s, start_s_rate)
+}
+
+// audio_content_sample_at_speed is the same mapping for a clip whose speed is not 1.0.
+//
+// A stretched clip advances through its CONTENT faster than it advances through the
+// TIMELINE: at speed S, timeline frame N holds content sample N*S. Without the factor
+// the mixer asks for content at 1x while the clip occupies 1/S of the timeline, so it
+// reads the wrong content and runs out early -- which is what the tempo gate was
+// reporting as "playing at roughly 1x".
+//
+// The multiply is exact in the bus-sample domain (Sample_Pos is an integer count), so
+// this introduces no rounding the rest of the position path does not already have.
+audio_content_sample_at_speed :: proc(
+	frames_into: i64, start_s: i64, start_s_rate: f64, speed: f64,
+) -> Sample_Pos {
+	base := timeline_frame_sample(frames_into)
+	if speed == 1.0 {
+		return base + audio_source_start_sample(start_s, start_s_rate)
+	}
+	return Sample_Pos(f64(base) * speed) + audio_source_start_sample(start_s, start_s_rate)
 }
 
 // frame_at_sample is timeline_frame_at_sample over an explicit rate, so the

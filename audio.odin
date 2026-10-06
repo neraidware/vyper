@@ -656,9 +656,15 @@ ring_destroy :: proc(r: ^Audio_Ring) {
 }
 
 // Play_Seg is one timeline segment of a source stream: where it sits on the
-// timeline (start_a/len_a) and where its content starts in the source
-// (start_s). len_a is both the timeline length and the source length (clips are
-// not time-stretched), so a segment's source range is [start_s, start_s+len_a).
+// timeline (start_a/len_a) and where its content starts in the source (start_s).
+//
+// len_a is the TIMELINE length, which is NOT the source length for a time-stretched
+// clip. The old comment here said "len_a is both the timeline length and the source
+// length (clips are not time-stretched)" -- true when written, false the moment clip
+// speed existed, and every span computation inherited it. So a segment's source range
+// is now [start_s, start_s + len_a*speed), where `speed` is the owning source's clip
+// tempo. At 1.0 that reduces to the old behaviour exactly, which is why nothing
+// regressed when this changed.
 Play_Seg :: struct {
 	start_a: i64, // timeline_start_frame
 	start_s: i64, // source_start_frame
@@ -667,7 +673,9 @@ Play_Seg :: struct {
 	// the contiguity checks that compare start_s across segments stay in one
 	// space.
 	start_s_rate: f64,
-	len_a:   i64, // source_length_frames
+	// len_a is the TIMELINE length in frames -- see the note above. Not the content
+	// length; those differ for a stretched clip.
+	len_a:   i64,
 	// gain is the segment's latched copy of the committed gain snapshot (static
 	// dB + keyed curve), taken once at provision from the geometry slab. Rides
 	// the per-segment snapshot (not per-source) because a split makes adjacent
@@ -1124,6 +1132,11 @@ Audio_Geom_Chip :: struct {
 	timeline_start: i64,
 	source_start:   i64,
 	source_len:     i64,
+	// timeline_len is source_len divided by speed -- how long the clip OCCUPIES.
+	// Carried separately because the two are different numbers for a stretched clip,
+	// and every span computation was previously reading source_len for both. See
+	// clip_timeline_length.
+	timeline_len:   i64,
 	// source_rate pins the rate source_start is counted against, carried with
 	// the clip so the producer converts it without reading live timeline state
 	// (see audio_source_start_sec).
@@ -1287,6 +1300,7 @@ audio_geometry_commit :: proc() {
 			chip.source_start = clip.source_start_frame
 			chip.source_rate = clip.audio_src_rate
 			chip.source_len = clip.source_length_frames
+			chip.timeline_len = clip_timeline_length(clip)
 			chip.stream_index = clip.stream_index
 			// clip_speed owns the 0-means-1.0 default, so a clip that never had its
 			// speed touched snapshots as 1.0 rather than 0.
@@ -1504,7 +1518,10 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			start_a      = chip.timeline_start,
 			start_s      = chip.source_start,
 			start_s_rate = chip.source_rate,
-			len_a        = chip.source_len,
+			// The TIMELINE length, not the content length. These were the same number
+			// before clips could be time-stretched, and treating them as interchangeable
+			// is what made a 2x clip play at 1x.
+			len_a        = chip.timeline_len,
 			gain         = chip.gain,
 			pitch        = chip.pitch,
 		}
@@ -2027,7 +2044,11 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		if seg == nil {
 			continue
 		}
-		demand48 := i64(audio_content_sample(frame - seg.start_a, seg.start_s, seg.start_s_rate))
+		// Content position, scaled by the clip's tempo. At 1.0 this is exactly the old
+		// call -- the helper short-circuits -- so the unstretched path is untouched.
+		demand48 := i64(
+			audio_content_sample_at_speed(frame - seg.start_a, seg.start_s, seg.start_s_rate, s.speed),
+		)
 		// The fifo sits somewhere other than where this frame needs samples.
 		// Both distances are re-anchored with a seek, because a decode only
 		// substitutes when it is cheaper:
@@ -2042,7 +2063,9 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		head_ahead := s.first48 - demand48 > i64(spf)
 		head_behind := demand48 - s.have48 > AUDIO_FORWARD_DECODE_MAX_48
 		if head_ahead || head_behind {
-			content_sec := audio_content_sec(frame - seg.start_a, seg.start_s, seg.start_s_rate, fps)
+			content_sec := f64(
+				audio_content_sample_at_speed(frame - seg.start_a, seg.start_s, seg.start_s_rate, s.speed),
+			) / f64(AUDIO_BUS_RATE)
 			if !audio_src_seek_anchor(s, content_sec) {
 				continue
 			}
