@@ -1983,6 +1983,114 @@ test_trim_respects_source_length :: proc() {
 	)
 }
 
+
+// test_head_trim_anchors_tail: every trim must move ONE edge and leave the other
+// where it was.
+//
+// Reported as "moving the left end, and instead of clipping the left end it is
+// clipping the total size" — the clip's RIGHT edge moving too, so the clip shrinks
+// from both sides at once. That is the signature of a tail that is not anchored, and
+// it is invisible in a length assertion alone: the length after a head drag should
+// equal (old length + how far the head moved), and a bug that also drags the tail
+// can produce the right length by moving both edges.
+//
+// So this asserts the EDGES, not the length, and it covers all four handles because
+// they share the failure mode.
+test_head_trim_anchors_tail :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset{id = 9501, kind = .Video, frame_count = 600, dur_us = 50000000, video_fps = 30.0},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 21, kind = .Video, asset_id = 9501, src_fps = 30.0,
+			timeline_start_frame = 300, source_length_frames = 120, source_start_frame = 60,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 60.0
+	c := &tl.clips[0]
+
+	// State is re-read immediately before every operation and never carried across
+	// one. Carrying a pre-operation head into a post-operation assertion is wrong in
+	// a way that reads like a real failure — this probe's first version compared
+	// `head0 + length` and so reported the tail jumping 420 -> 480 when the trim was
+	// exact and the tail never moved.
+	head := c.timeline_start_frame
+	tail := head + c.source_length_frames
+	ssrc := c.source_start_frame
+	resize_clip_left(tl, 0, head - 60)
+	tl_probe_check(
+		c.timeline_start_frame == head - 60,
+		"head left: head must land where asked — got %d, want %d",
+		c.timeline_start_frame, head - 60,
+	)
+	tl_probe_check(
+		c.timeline_start_frame + c.source_length_frames == tail,
+		"head left: the TAIL must not move — got %d, want %d",
+		c.timeline_start_frame + c.source_length_frames, tail,
+	)
+	tl_probe_check(
+		c.source_length_frames == (tail - head) + 60,
+		"head left: length must grow by the head's travel — got %d, want %d",
+		c.source_length_frames, (tail - head) + 60,
+	)
+	// 60 timeline frames at 30fps over a 60fps project is 30 source frames.
+	tl_probe_check(
+		c.source_start_frame == ssrc - 30,
+		"head left: the source offset must move by 30 — got %d, want %d",
+		c.source_start_frame, ssrc - 30,
+	)
+
+	// Head right: a trim, with the tail still the anchor.
+	head = c.timeline_start_frame
+	tail = head + c.source_length_frames
+	ssrc = c.source_start_frame
+	resize_clip_left(tl, 0, head + 40)
+	tl_probe_check(
+		c.timeline_start_frame + c.source_length_frames == tail,
+		"head right: the TAIL must not move — got %d, want %d",
+		c.timeline_start_frame + c.source_length_frames, tail,
+	)
+	tl_probe_check(
+		c.source_length_frames == tail - (head + 40),
+		"head right: length must shorten by exactly the travel — got %d, want %d",
+		c.source_length_frames, tail - (head + 40),
+	)
+	tl_probe_check(
+		c.source_start_frame == ssrc + 20,
+		"head right: the source offset must advance by 20 — got %d, want %d",
+		c.source_start_frame, ssrc + 20,
+	)
+
+	// Tail: the HEAD is the anchor here.
+	head = c.timeline_start_frame
+	tail = head + c.source_length_frames
+	ssrc = c.source_start_frame
+	resize_clip_right(tl, 0, tail + 90)
+	tl_probe_check(
+		c.timeline_start_frame == head,
+		"tail: the HEAD must not move — got %d, want %d",
+		c.timeline_start_frame, head,
+	)
+	tl_probe_check(
+		c.timeline_start_frame + c.source_length_frames == tail + 90,
+		"tail: the tail must land where asked — got %d, want %d",
+		c.timeline_start_frame + c.source_length_frames, tail + 90,
+	)
+	tl_probe_check(
+		c.source_start_frame == ssrc,
+		"tail: the source offset must not move — got %d, want %d",
+		c.source_start_frame, ssrc,
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow()
@@ -1993,6 +2101,9 @@ timeline_probe_run :: proc(_: string) {
 	tl_scene()
 	test_fps_reflow_keyframes()
 	fmt.println("[tl-probe] fps-reflow-keyframes ok")
+	tl_scene()
+	test_head_trim_anchors_tail()
+	fmt.println("[tl-probe] head-trim-anchors-tail ok")
 	tl_scene()
 	test_trim_respects_source_length()
 	fmt.println("[tl-probe] trim-source-length ok")
