@@ -7403,3 +7403,101 @@ reasons having nothing to do with tempo. All three failed while the engine was r
   memcmp — the runtime's noise, not this program's. It needs the `vyper-valgrind`
   binary; the default one dies on an AVX-512 instruction in `math_big` startup, which
   the gate already treats as a vacuous pass.
+
+## Active 41 — The undo probe was red, and the gate over it had never measured it
+
+**Status: fixed 2026-10-06.** `VYPER_UNDO_PROBE` failed with **6 failures** while
+`undo_valgrind` reported PASS. Both halves were true at once, and that is the finding.
+
+### Active 41, first defect — the probe never moved a key, and every later assertion passed anyway
+
+All 6 failures were in the multi-key-move block, and all of them were about keyframes:
+
+    FAIL: moving four keys is ONE undo node
+    FAIL: every key slid by the same delta, each clamped into its own clip
+    FAIL: the slid key re-landed on the vacated frame WITH ITS OWN VALUE
+    FAIL: and the key it displaced moved on carrying its own value
+    FAIL: the same delta over a wider selection DOES commit
+    FAIL: the clamped key held its frame, the other slid, and the unselected key it
+          landed on was absorbed
+
+Instrumented, the commit never ran at all:
+
+    DIAG after 4-key move: undo_count=0 snaps=4 engaged=false delta=3
+    DIAG   snap 0: start=10 final=10   (and likewise for all four)
+
+`commit_keyframe_drag` returns immediately when `kf_move.engaged` is false, and the only
+thing that sets it is `update_keyframe_drag`, once the cursor passes
+`KF_DRAG_THRESHOLD_PX` from the press. The probe set `kf_move.delta` and called the commit
+directly, so it exercised nothing.
+
+**The part worth keeping is what the other assertions did next.** "A move preserves the
+key's interpolation", "every lane comes back sorted", "undo restores all four frames" —
+all PASSED. Not because the engine was right, but because the keys had never moved and
+those statements were trivially true of the fixture. Three of the six failures were real
+findings about a code path that had not run; the three silent passes were the engine
+looking healthy for the wrong reason. That is the exact shape of the Active 37 probes,
+and the fifth time it has happened in this repo.
+
+**Fix is to the PROBE.** `kf_probe_commit_move(delta)` sets the latch and commits, with
+the reason written down. The engine's commit path was correct throughout: the two-phase
+delete-then-set re-land, the per-key easing re-stamp, the selection rebuild, and the
+single undo node all pass once the gesture actually reaches them.
+
+**The gap this exposes and does NOT close.** No probe drives the actual keyframe DRAG —
+press, threshold, move, release, undo. `keyframe_probe` covers the keyframe STORE
+(insert/replace/sample/trim/clone) and `ui_probe` does not touch `kf_move` at all. So the
+press/drag half, including the frame mapping inside `update_keyframe_drag`, has **no
+coverage whatsoever** — and that is where the "moving four keys" class of bug lives.
+Named rather than papered over.
+
+### Active 41, second defect — undo_valgrind's success marker was an informational line
+
+    valgrind_assert "$log" undo-valgrind '\[undo-probe\] ok:'
+
+`undo_probe_run` prints, early, before any assertion runs:
+
+    [undo-probe] ok: count=7 current=5 max_depth=5
+
+That is a STACK DEPTH report — "count" is the number of undo nodes, "current" the cursor,
+"max_depth" the tree depth. It is printed by the first block of checks and reads exactly
+like a success line. So a run with six failures still satisfied the marker, and the gate
+passed over a red probe. The gate was not measuring the probe at all.
+
+Two fixes, and the second is the one that generalises:
+
+- The probe now prints a **terminal** `[undo-probe] PASS`, distinct from the early
+  `ok: count=...`, and the marker points at that.
+- `valgrind_assert` itself now **rejects any log containing `] FAIL:` or `N
+  failure(s)`**, whatever the marker says. A probe that reported failures and still
+  matched its success marker has told us the marker is wrong, not that the run was
+  clean. Every probe in this tree writes failures in that form, so this makes a success
+  marker mean something for all of them, not just this one.
+
+Confirmed the guard bites: with a `[undo-probe] FAIL: injected` line added and the PASS
+line still present, `undo_valgrind` exits 1 and names the line. (`geom_key_valgrind`,
+`parity_valgrind`, `dnd_valgrind`, `render_valgrind`, `undo_valgrind` all still pass with
+the stricter helper.)
+
+### Active 41, third defect — audio_clip_tempo_alignment_valgrind is red for a third reason
+
+    [ap] clip-edit-alignment: FAIL: speed edit did not rebuild source (sought=0, speed=2.000)
+
+**Pre-existing** — identical with `audio.odin` at HEAD, so not from the tempo/grouping
+work. The probe's own target already caught it as a vacuous pass (its marker never
+appeared), which is the non-vacuity check doing its job.
+
+So this probe's failure has now moved three times and each time had a different cause:
+first the wrong fixture (a pure sine has no transient to measure a content origin from),
+then a stale assertion, and now `sought=0` — the reconcile is not re-seeking a source
+whose clip speed changed. That last one is a REAL engine question and is not yet
+diagnosed. It is the next thing to look at.
+
+### Note on process
+
+Recovering this required `git checkout` over four conflicted files. The cause was mine:
+`git stash push -- <path>` stashes the WHOLE working tree in this git version, so a
+later `git stash pop` fought a commit made in between and left `UU` markers in
+`interaction.odin`, `main.odin`, `state.odin` and `timeline.odin`. All committed work was
+intact at HEAD and verified afterwards; the two genuinely uncommitted files were copied
+out first. Path-limited stash is not a safe way to A/B a single file here.

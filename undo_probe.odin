@@ -130,6 +130,11 @@ undo_probe_run :: proc() {
 		fmt.printf("[undo-probe] %d failure(s)\n", fail)
 		os.exit(1)
 	}
+	// A TERMINAL success line, distinct from the informational "ok: count=..." the
+	// stack-depth check prints early. The gate matched that early line, so a run with
+	// six failures still satisfied the marker and undo_valgrind reported a PASS over
+	// a red probe -- the gate was not measuring the probe at all.
+	fmt.println("[undo-probe] PASS")
 	os.exit(0)
 }
 
@@ -340,6 +345,31 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	// as a bug in the block under test rather than as a dirty fixture. The one
 	// exception is the interp block, which round-trips through undo_undo on
 	// purpose: that IS what it is testing.
+// kf_probe_commit_move arms the drag latch and commits a keyframe move of `delta`.
+//
+// The latch is the whole point of this helper. `commit_keyframe_drag` returns
+// immediately when `kf_move.engaged` is false, and the only thing that sets it is
+// `update_keyframe_drag`, once the cursor passes KF_DRAG_THRESHOLD_PX from the press.
+// A probe that sets `kf_move.delta` and calls the commit directly therefore does
+// NOTHING -- and reports six failures that all read like engine bugs.
+//
+// Measured before this helper existed: undo_count()=0, all four snaps start==final,
+// engaged=false. Every assertion after it then passed VACUOUSLY, because the keys had
+// never moved and "undo restores all four frames" was trivially true of the fixture.
+// A probe that passes for the wrong reason is the failure mode this repo has hit four
+// times, and it is worth stating that the fix here is to the PROBE, not the engine.
+//
+// The gap it exposes is real, though, and is not closed by this helper: NO probe
+// drives the actual keyframe drag -- press, threshold, move, release, undo. This
+// helper covers the COMMIT (the two-phase delete-then-set re-land, the easing
+// re-stamp, the selection rebuild, the single undo node); the press/drag half,
+// including the frame mapping in `update_keyframe_drag`, has no coverage at all.
+kf_probe_commit_move :: proc(delta: i32) {
+	kf_move.delta = delta
+	kf_move.engaged = true
+	commit_keyframe_drag()
+}
+
 	base_fixture :: proc() {
 		cl := &timeline.tracks[0].clips[0]
 		cl.timeline_start_frame = 10
@@ -465,8 +495,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	base_fixture()
 	clip0 = &timeline.tracks[0].clips[0]
 	kf_select_all(all4[:])
-	kf_move.delta = 3
-	commit_keyframe_drag()
+	kf_probe_commit_move(3)
 	rcheck(undo_count() == 1, "moving four keys is ONE undo node", fail)
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
@@ -513,8 +542,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	base_fixture()
 	clip0 = &timeline.tracks[0].clips[0]
 	kf_select_all(pair[:])
-	kf_move.delta = 10
-	commit_keyframe_drag()
+	kf_probe_commit_move(10)
 	clip0 = &timeline.tracks[0].clips[0]
 	// The unselected key at 50 is untouched, so the lane is [20, 30, 50].
 	rcheck(
@@ -548,8 +576,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	kf_select(0, 0, 0, 2)
 	undo_begin()
 	kf_capture_sel(&kf_move.snaps)
-	kf_move.delta = 10
-	commit_keyframe_drag()
+	kf_probe_commit_move(10)
 	rcheck(undo_count() == 0, "a drag whose every key clamps back commits no undo node", fail)
 	clip0 = &timeline.tracks[0].clips[0]
 	rcheck(
@@ -560,8 +587,7 @@ undo_probe_restore_checks :: proc(fail: ^int) {
 	kf_snaps_drop(&kf_move.snaps)
 	wide_clamp := [2]Kf_Ref{{0, 0, 0, 0}, {0, 0, 0, 2}}
 	kf_select_all(wide_clamp[:])
-	kf_move.delta = 10
-	commit_keyframe_drag()
+	kf_probe_commit_move(10)
 	rcheck(undo_count() == 1, "the same delta over a wider selection DOES commit", fail)
 	clip0 = &timeline.tracks[0].clips[0]
 	// The clamped key held 50; the sliding key went 10 -> 20, where an UNSELECTED

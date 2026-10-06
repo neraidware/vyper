@@ -567,7 +567,7 @@ target_undo_valgrind() {
 		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
 	local rc=$?
 	echo "undo-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
-	valgrind_assert "$log" undo-valgrind '\[undo-probe\] ok:'
+	valgrind_assert "$log" undo-valgrind '\[undo-probe\] PASS'
 }
 
 # The live-preview handoff check (render_live_probe.odin). The composed-frame
@@ -834,6 +834,17 @@ valgrind_assert() {
 	if grep -q "Unrecognised instruction" "$log"; then
 		echo "$label: memcheck died on an instruction VEX cannot decode -- vacuous pass" >&2
 		grep -A4 "Unrecognised instruction" "$log" | head -12 >&2
+		failed=1
+	fi
+	# A probe that reported FAILURES and still satisfies its success marker has told
+	# us the marker is wrong, not that the run was clean. undo_valgrind did exactly
+	# that for as long as the probe was red: the marker was the early informational
+	# "[undo-probe] ok: count=...", which is printed before any assertion runs. Every
+	# probe in this tree writes failures as "FAIL:" or "N failure(s)", so this is the
+	# one check that makes a success marker mean something.
+	if grep -qE '\] FAIL:|failure\(s\)' "$log"; then
+		echo "$label: the probe reported failures but the success marker was present -- marker is wrong or vacuous" >&2
+		grep -E '\] FAIL:|failure\(s\)' "$log" | head -10 >&2
 		failed=1
 	fi
 	if ! grep -q "definitely lost: 0 bytes in 0 blocks" "$log"; then
