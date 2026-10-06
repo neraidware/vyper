@@ -1579,6 +1579,37 @@ is_srt_pick :: proc(path: cstring) -> bool {
 	return true
 }
 
+// prefer_native_wayland pins SDL to the Wayland backend when this session IS
+// Wayland. Called before sdl.Init, because the driver is chosen there.
+//
+// Why: SDL ships two Wayland bootstraps. The "preferred" one refuses to be used
+// unless the compositor implements wp_fifo_v1, and when it refuses, SDL falls
+// back to XWayland -- its own log line reads "falling back to XWayland for GPU
+// performance reasons". That is a frame-pacing trade, and it is silently the
+// wrong trade for an editor: an XWayland client is not a Wayland surface, so the
+// compositor does not hand it desktop drags. On niri (no wp_fifo_v1) every OS
+// file drag was therefore refused before SDL generated a single event, so the
+// drop feature was dead on that machine with nothing failing anywhere.
+//
+// The cost of pinning is that a session which claims Wayland but cannot reach a
+// compositor no longer falls back to X11, so SDL_Init fails outright. That is
+// the right way round: XWayland is not a working fallback for a Wayland session,
+// it is a slower one that silently drops a shipped feature.
+prefer_native_wayland :: proc() {
+	when ODIN_OS != .Linux {
+		return
+	}
+	// An explicit choice already wins. SDL's own advice for this case is to set
+	// SDL_VIDEO_DRIVER, so overriding it would leave no way to ask for X11.
+	if pinned := sdl.GetHint("SDL_VIDEO_DRIVER"); pinned != nil && len(pinned) > 0 {
+		return
+	}
+	if _, present := os.lookup_env("WAYLAND_DISPLAY", context.temp_allocator); !present {
+		return
+	}
+	sdl.SetHint("SDL_VIDEO_DRIVER", "wayland")
+}
+
 // pointer_over_context_menu reports whether the cursor is inside the context
 // menu popup proper or its "Add >" submenu (both are part of the same transient
 // UI). It tests the last frame's element GEOMETRY directly (not clay's
@@ -2116,6 +2147,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		subtitle_render_probe_run(string(probe_out))
 		return
 	}
+	prefer_native_wayland()
 	if !sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO) {
 		fmt.println("SDL initialization failed")
 		return

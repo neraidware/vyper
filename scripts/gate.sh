@@ -657,11 +657,12 @@ target_dnd_probe() {
 }
 
 # The memory gate for dnd_probe: the drop path takes an SDL-owned C string for
-# each dropped file and hands it to the bin, which clones what it keeps. The
-# clone is the whole reason sdl.free on the event buffer is safe, and this is
-# the only gate that exercises that handoff (import_path_to_bin's refusal branch
-# plus the refusal of a path SDL would have delivered). Same four invariants as
-# target_valgrind.
+# each dropped file and hands it to the bin, which clones what it keeps. So the
+# app owns nothing here -- SDL's SDL_FreeTemporaryMemory list owns the event
+# buffer and frees it at the next pump -- and the probe covers the handoff from
+# both ends: the commit it makes and the clone it makes (import_path_to_bin's
+# refusal branch plus the refusal of a path SDL would have delivered). Same four
+# invariants as target_valgrind.
 target_dnd_valgrind() {
 	require_fresh_valgrind_binary dnd-valgrind || return 1
 	mkdir -p target/valgrind
