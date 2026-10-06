@@ -243,6 +243,28 @@ proxy_bg_verify_complete :: proc(path: cstring, frame_count: i64, keep_cache: bo
 		}
 		decoder_set_preview(&px, pick, pick_base)
 		if !decode_clip_frame_sync(&px, path, f, pxs[i][:]) {
+			// A proxy is allowed to be SHORT, and this one is: the source has 90 frames
+			// and the segment carries 88. That is exactly PROXY_FRAME_TOLERANCE, the
+			// engine's own named allowance for an encoder that does not emit its last
+			// reorder-buffer frames, and the editor copes by falling back to the source
+			// for an under-built edge segment (proxy.odin: the unbuilt tail falls back to
+			// source).
+			//
+			// The probe was asking for frame_count-1 -- the source's LAST frame -- through
+			// the proxy, with no tolerance, while the source path just above it HAS one
+			// for exactly this case. So the probe demanded of the proxy something the
+			// engine never asks of it, and reported FAIL on correct behaviour.
+			//
+			// Bounded by the tolerance and by proximity to the end, and NOT silent: a skip
+			// inside the allowance is normal, a skip outside it is still a failure, and a
+			// frame in the middle of the timeline is still checked against the source.
+			if f >= frame_count - PROXY_FRAME_TOLERANCE {
+				fmt.printf(
+					"[proxy-bg-test] note: proxy does not carry frame %d (source has %d, within PROXY_FRAME_TOLERANCE=%d); the editor falls back to the source here\n",
+					f, frame_count, PROXY_FRAME_TOLERANCE,
+				)
+				continue
+			}
 			fmt.printf("[proxy-bg-test] FAIL: segment decode frame %d via %q\n", f, string(pick))
 			os.exit(1)
 		}

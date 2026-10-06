@@ -1168,6 +1168,34 @@ target_audio_group_isolation() {
 	echo "audio-group-isolation: ok (each clip is mixed by a graph built for its own speed)"
 }
 
+# proxy_bg: the BACKGROUND segmented proxy builder, end to end -- enqueue, build the
+# segments, serve a frame out of one, compare it against the same frame decoded from the
+# source, then re-import and require the complete proxy to be recognised as a cache hit
+# without enqueuing a rebuild.
+#
+# It had no gate target, which is why it was red for as long as it was. The failure was
+# the probe's own: it asked the proxy for the source's LAST frame through a segment that
+# carries PROXY_FRAME_TOLERANCE fewer frames, with no tolerance, while the source path
+# immediately above it HAS one for exactly that case. Measured on a 90-frame 1080p source:
+# the segment holds 88, and the editor copes by falling back to the source for an
+# under-built edge segment.
+target_proxy_bg() {
+	require_fresh_binary proxy-bg || return 1
+	local src=target/keyed_export/src.mp4
+	if [ ! -s "$src" ]; then
+		echo "proxy-bg: missing fixture $src" >&2
+		return 1
+	fi
+	local out
+	if ! out=$(VYPER_PROXY_BG_TEST="$PWD/$src" timeout 1800 ./vyper 2>&1); then
+		echo "$out" | grep -E '^\[proxy-bg-test\]' >&2
+		echo "proxy-bg: FAILED -- see the [proxy-bg-test] lines above" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[proxy-bg-test\]'
+	echo "proxy-bg: ok (segments build, serve, match the source, and re-import as a cache hit)"
+}
+
 target_image_decode_probe() {
 	require_fresh_binary image-decode-probe || return 1
 	mkdir -p "$PROXY_DIR"
@@ -2079,6 +2107,7 @@ main() {
 	proxy_probe) target_proxy_probe ;;
 	image_probe) target_image_probe ;;
 	image_decode_probe) target_image_decode_probe ;;
+	proxy_bg) target_proxy_bg ;;
 	audio_group_isolation) target_audio_group_isolation ;;
 	fuzz) shift; target_fuzz "$@" ;;
 	silent_playback) target_silent_playback ;;
@@ -2088,7 +2117,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

@@ -7546,3 +7546,45 @@ graph_changed re-seek path, and a `sought=0` there is a real bug.
 been red for three different causes in a row — the wrong fixture, a stale assertion, and
 this — which is what "no gate target" costs: nothing told anyone which one they were
 looking at.
+
+### Active 41, fifth defect — the proxy-bg probe demanded of the proxy what the engine never asks
+
+    [proxy-bg-test] FAIL: segment decode frame 89 via ".../src-cdd29dac.vyperproxy.seg0000.mp4"
+
+The last red probe, and the same shape as the fourth: the probe was stricter than the
+engine, about something the engine has a named tolerance for.
+
+The probe builds a set of check frames from the SOURCE's frame count and decodes each one
+twice: once from the source as ground truth, once through the proxy segment. On a 90-frame
+1080p source the set is `{0, 87, 89}` — and the segment carries **88** frames. So frame 89,
+the source's last, does not exist in the proxy, and the segment decode correctly fails.
+
+`PROXY_FRAME_TOLERANCE :: 2` is the engine's own named allowance for a proxy that does not
+carry its final frames, and the editor copes: an under-built edge segment falls back to
+the source (proxy.odin, "the unbuilt tail falls back to source"). The shortfall is exactly
+2 — precisely the allowance.
+
+**The probe had a tolerance for the source path and none for the proxy path.** Ten lines
+above the failure it handles `!gt_ok && f == frame_count - 1` by noting and skipping,
+which is the same situation on the other decoder. So it demanded of the proxy something
+the engine never asks of it, and reported FAIL on correct behaviour.
+
+Fixed with the tolerance **bounded and not silent**: a skip is only allowed within
+`PROXY_FRAME_TOLERANCE` of the end, it prints a note saying the editor falls back to the
+source there, and a frame anywhere else in the timeline is still compared against the
+source exactly as before.
+
+**Verified on a fresh encode, not a cached one.** The first green run said "proxy already
+complete (no rebuild)", which proved nothing about the encoder. With the cached segment
+deleted the probe reported `progress=34%/78% phase=Building` — it really encoded — and the
+note still appeared, so the 2-frame shortfall is consistent rather than a stale artifact.
+
+**Named and NOT diagnosed:** a freshly encoded segment carries 2 fewer frames than its
+source, within tolerance, on every run. The likely mechanism is the encoder's reorder
+buffer tail (h264 with B-frame delay holds its last frames until the drain), but this was
+not traced and is not claimed. It is tolerated, visible at segment edges as the editor
+showing source frames for the last two, and worth a look on its own — it is not a symptom
+of anything reported here.
+
+`target_proxy_bg` added. The probe also has no gate target of its own until now, which is
+the second time "no gate target" has cost a diagnosis.
