@@ -542,7 +542,7 @@ atempo_prime :: proc(g: ^Atempo_Graph) {
 	// what made this worse rather than better: the table cannot be trusted (see
 	// below), so a table-sized prime sometimes primed too little and sometimes
 	// discarded real content.
-	in_frames := ATEMPO_LOOKAHEAD_MAX_SAMPLES * 2
+	in_frames := ATEMPO_LOOKAHEAD_MAX_SAMPLES * 4
 	// Bounded chunk so a large lookahead does not want a large stack buffer.
 	CHUNK :: 2048
 	silence: [CHUNK * 2]f32

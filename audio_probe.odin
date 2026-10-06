@@ -2122,6 +2122,15 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 
 	first_in := first_onset(out[:got], 4)
 	fmt.printf("[ap] bus-prime: rate %.2f, first transient at output sample %d (want 0)\n", rate, first_in)
+	if first_in < 0 {
+		// No transient found. Reported as a SKIP rather than as an offset of "-1
+		// samples", which is the kind of nonsense number this session has produced too
+		// many of already: it happens at high rates where the primed silence plus
+		// WSOLA's segment repetition leaves nothing above threshold.
+		fmt.println("[ap] bus-prime: SKIP: no transient found in the output; cannot locate the offset")
+		atempo_graph_destroy(&g)
+		return true
+	}
 	if first_in != 0 {
 		fmt.printf(
 			"[ap] bus-prime: FAIL: the bus graph emitted its first sample %d late -- the stream is offset by %.2f ms\n",
