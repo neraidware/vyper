@@ -2015,6 +2015,123 @@ mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, spe
 	return out
 }
 
+// audio_probe_bus_prime asserts that the BUS atempo is ALIGNED: the first sample it
+// emits is the first sample fed, not the middle of the graph's warm-up.
+//
+// The bug this exists for was live in shipping code. `atempo_process` was called
+// directly on the mixed bus with no priming, so at any playback rate other than 1.0 the
+// entire stream came out up to ATEMPO_LOOKAHEAD_MAX_SAMPLES late -- 42.7 ms at rate
+// 0.5, 32 ms at 2.0. That is not a settling transient; it is a CONSTANT offset between
+// what the timeline says and what reaches the speaker, which is precisely the lip-sync
+// error the device-as-clock work exists to eliminate. Nothing measured it.
+//
+// The measurement is alignment, not throughput: feed a click track and require the
+// first output transient to sit at the first input transient's position. Throughput was
+// already covered by audio_node_latency's accounting; what was missing is the phase.
+audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
+	g: Atempo_Graph
+	atempo_rate_set(&g, rate)
+	if g.graph == nil {
+		fmt.println("[ap] bus-prime: SKIP: no graph at this rate")
+		return true
+	}
+
+	CLICK_MS :: 10
+	INPUT_SECONDS :: 3
+	total := int(f64(AUDIO_BUS_RATE) * INPUT_SECONDS)
+	// A click every CLICK_MS, from the very first sample, so the FIRST transient has a
+	// known position (0) and any displacement of it is the graph's latency.
+	click := int(click_samples(CLICK_MS))
+	sig: [4096 * 2]f32
+	out: [AUDIO_BUS_RATE * 4 * 2]f32
+	got := 0
+	primed := false
+	seed: u32 = 0x1234567
+
+	for pushed := 0; pushed < total; {
+		n := min(2048, total - pushed)
+		for i in 0 ..< n {
+			is_click := pushed + i < click || (pushed + i) % click == 0
+			v := f32(0)
+			if is_click {
+				v = 0.9
+			} else {
+				// A little noise so the clicks are not the only energy, which makes the
+				// onset detector below unambiguous.
+				seed = seed * 1664525 + 1013904223
+				v = f32(f32(seed >> 8) / f32(1 << 24) * 2.0 - 1.0) * 0.02
+			}
+			sig[i * 2 + 0] = v
+			sig[i * 2 + 1] = v
+		}
+		if !primed {
+			atempo_prime(&g)
+			primed = true
+			// The primer's fill is discarded, so start reading output only after it.
+			g.out_n = 0
+			pushed += n
+			continue
+		}
+		atempo_process(&g, sig[:], n)
+		pushed += n
+		if g.out_n == 0 {
+			continue
+		}
+		if got + g.out_n * 2 > len(out) {
+			break
+		}
+		copy(out[got:g.out_n * 2], g.out_buf[:g.out_n * 2])
+		got += g.out_n * 2
+	}
+	if got < click * 4 {
+		fmt.println("[ap] bus-prime: SKIP: not enough output to locate a click")
+		return true
+	}
+
+	first_in := first_onset(out[:got], 8)
+	fmt.printf("[ap] bus-prime: rate %.2f, first transient at output sample %d (want 0)\n", rate, first_in)
+	if first_in != 0 {
+		fmt.printf(
+			"[ap] bus-prime: FAIL: the bus graph emitted its first sample %d late -- the stream is offset by %.2f ms\n",
+			first_in, f64(first_in) / f64(AUDIO_BUS_RATE) * 1000,
+		)
+		return false
+	}
+	fmt.println("[ap] bus-prime: ok (aligned: first in is first out)")
+	atempo_graph_destroy(&g)
+	return true
+}
+
+// click_samples is the fixture's click interval in sample-frames.
+click_samples :: proc(click_ms: int) -> i64 {
+	return i64(AUDIO_BUS_RATE) * i64(click_ms) / 1000
+}
+
+// first_onset returns the index of the first sample exceeding half the window's peak,
+// or -1. The refractory is short because a click is a single sample here, unlike the
+// tempo probe's 2 ms pulses.
+first_onset :: proc(buf: []f32, refractory: int) -> int {
+	peak := f32(0)
+	for v in buf {
+		peak = max(peak, abs(v))
+	}
+	if peak <= 1e-5 {
+		return -1
+	}
+	thresh := peak * 0.5
+	since := 0
+	for i in 0 ..< len(buf) {
+		if since < refractory {
+			since += 1
+			continue
+		}
+		if abs(buf[i]) > thresh {
+			return i
+		}
+	}
+	return -1
+}
+
 audio_probe_stall_gap :: proc(path: string, stall_ms: int = 900) -> bool {
 	buf: [4096]u8
 	cn := 0

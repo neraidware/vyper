@@ -1534,6 +1534,42 @@ target_audio_clip_tempo() {
 	echo "audio-clip-tempo: ran (speeds 0.25 .. 4.0). NOT gating: its direction check is unsound -- see scripts/gate.sh"
 }
 
+# audio_bus_prime asserts the bus atempo is ALIGNED: the first sample it emits is the
+# first sample fed.
+#
+# This offset was live in shipping code and measured by nothing. `atempo_process` was
+# called straight on the mixed bus, so at any playback rate other than 1.0 the whole
+# stream came out up to ATEMPO_LOLOOKAHEAD_MAX_SAMPLES late -- a CONSTANT offset
+# between what the timeline says and what reaches the speaker, which is exactly the
+# lip-sync error the device-as-clock work exists to eliminate. It was neither a settling
+# transient nor something that averaged out.
+#
+# Priming brought it from 134/29/33/33 ms down to 3.7/10.3/1.3/12 ms across
+# rates 0.5/1.5/2.0/3.0, but it is NOT exact: the discard is sized from
+# atempo_lookahead_samples, which INTERPOLATES between four measured points, so
+# intermediate rates are approximate. This target is therefore a measurement, not a
+# pass/fail gate on alignment, and it exists to keep the number visible and to stop it
+# growing -- which is how the original 33 ms hid for so long.
+target_audio_bus_prime() {
+	require_fresh_binary audio-bus-prime || return 1
+	local worst=0
+	for r in 0.5 1.5 2.0 3.0; do
+		local line
+		line=$(VYPER_AUDIO_BUS_PRIME=$r timeout 300 ./vyper 2>&1 | grep -oE "first transient at output sample [0-9]+" | head -1)
+		echo "  rate $r: $line"
+		local n
+		n=$(echo "$line" | grep -oE "[0-9]+$" || echo 0)
+		[ "${n:-0}" -gt "$worst" ] && worst=$n
+	done
+	# 1536 samples is the largest measured lookahead; beyond that the priming is not
+	# working at all rather than being approximate.
+	if [ "$worst" -gt 1536 ]; then
+		echo "audio-bus-prime: FAILED -- worst offset $worst samples exceeds the graph's own lookahead" >&2
+		return 1
+	fi
+	echo "audio-bus-prime: worst offset $worst samples ($(awk "BEGIN{printf \"%.2f\", $worst/48.0}") ms) -- priming is approximate, not exact"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1547,7 +1583,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1584,6 +1620,7 @@ main() {
 	audio_stall_gap) target_audio_stall_gap ;;
 	audio_node_latency) target_audio_node_latency ;;
 	audio_clip_tempo) target_audio_clip_tempo ;;
+	audio_bus_prime) target_audio_bus_prime ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
@@ -1603,7 +1640,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_bus_prime|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

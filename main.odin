@@ -1977,6 +1977,17 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
+	// VYPER_AUDIO_BUS_PRIME=<rate> -- asserts the bus atempo is ALIGNED, i.e. that the
+	// first sample it emits is the first sample fed. The offset this catches was live
+	// in shipping code at any rate other than 1.0.
+	if bp, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_PRIME", context.temp_allocator); bp != "" {
+		rate := 2.0
+		if v, ok := strconv.parse_f64(strings.trim_space(bp)); ok {
+			rate = v
+		}
+		ok: bool = audio_probe_bus_prime("", rate)
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_CLIP_TEMPO=<path>|<speed> -- proves a STRETCHED clip through the real
 	// playback mixer: that it produces output for the span, and that the graph is
 	// genuinely in the path (a stretch that rendered identically would mean tempo is

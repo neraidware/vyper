@@ -1791,6 +1791,10 @@ audio_src_pump_tempo :: proc(s: ^Play_Src, want_out: i64) {
 			return
 		}
 		s.content_used = 0
+		// The graph was just built, so its lookahead has not been filled yet. The pump
+		// primes on its next pass via content_used == 0; clearing it here is what makes
+		// that true after a rate change on an existing source.
+		s.tempo.primed = false
 	}
 
 	// Chunk staging: bounded, so a long fill does not need a large stack buffer.
@@ -2471,6 +2475,10 @@ audio_producer_feed :: proc() {
 		push_frames := cur_spf
 		src := mix[:]
 		if audio_atempo.graph != nil {
+			// Prime past the graph's lookahead on the first block after a build, so
+			// content 0 comes out as content 0 rather than 32 ms late. A one-time cost
+			// per rate change; after it the graph tracks content exactly.
+			atempo_prime(&audio_atempo)
 			atempo_process(&audio_atempo, mix[:], cur_spf)
 			push_frames = audio_atempo.out_n
 			src = audio_atempo.out_buf[:]

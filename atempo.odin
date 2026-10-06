@@ -77,6 +77,25 @@ Atempo_Graph :: struct {
 	// contiguous view, not one buffer ref per atempo output frame.
 	out_buf: [ATEMPO_OUT_CAP]f32,
 	out_n:   int, // stereo frames currently in out_buf
+	// primed is false until the graph has been filled past its lookahead. WSOLA cannot
+	// emit anything until it has that much context, so a freshly built graph's first
+	// outputs are the graph FILLING rather than the content that was fed -- which puts
+	// the whole stream late by up to ATEMPO_LOOKAHEAD_MAX_SAMPLES (42.7 ms at 48 kHz).
+	//
+	// Cleared by every build, so a rate change re-primes: the new chain has a different
+	// window, and skipping that is how a rate change used to shift content mid-playback.
+	// The per-clip tempo pump has its own priming because it runs continuously; this
+	// one is a single pass after each build.
+	primed: bool,
+	// discard_next is how many output samples the NEXT real push must throw away.
+	//
+	// Priming with silence is not by itself enough. After L samples of silence the
+	// graph's window is full, so its next outputs correspond to input at L -- meaning
+	// the first REAL sample would still arrive L/rate late. Priming has to be followed
+	// by discarding the output that corresponds to the priming region, and doing that
+	// inside atempo_process is what makes it impossible for a caller to forget: the
+	// graph owns its own alignment rather than relying on every call site to know.
+	discard_next: int,
 }
 
 // atempo_new_frame allocates one refcounted stereo FLT frame with an
@@ -158,6 +177,8 @@ atempo_link_stage :: proc(
 atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64) {
 	atempo_graph_destroy(g)
 	g.rate = rate
+	g.primed = false
+	g.discard_next = 0
 	if rate <= 0.0 || rate == 1.0 {
 		return // identity: skip the whole graph
 	}
@@ -374,6 +395,15 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 		mem.copy(&g.out_buf[out_n * 2], src_ptr, count * 2 * size_of(f32))
 		out_n += count
 	}
+	if g.discard_next > 0 && out_n > 0 {
+		skip := min(g.discard_next, out_n)
+		keep := out_n - skip
+		if keep > 0 {
+			copy(g.out_buf[:keep * 2], g.out_buf[skip * 2:out_n * 2])
+		}
+		g.discard_next -= skip
+		out_n = keep
+	}
 	g.out_n = out_n
 }
 
@@ -438,6 +468,42 @@ atempo_lookahead_samples :: proc(tempo: f64) -> int {
 		}
 	}
 	return vals[len(vals) - 1]
+}
+
+// atempo_prime fills a freshly built graph past its lookahead and throws that fill
+// away, so the first REAL sample it emits is content 0 rather than the middle of the
+// graph's warm-up.
+//
+// Without this the bus atempo delays everything behind it by its own lookahead: at
+// rate 2.0 that is 1536 input samples, 32 ms, and it is not a settling transient that
+// goes away -- it is a constant offset between what the timeline says and what comes
+// out, which is exactly the lip-sync error the device-as-clock work was built to
+// eliminate. It was live in shipping code and unmeasured by any gate.
+//
+// Silence is the correct thing to prime with: there is no content yet, and feeding it
+// real audio would put the wrong samples in the graph's history window.
+atempo_prime :: proc(g: ^Atempo_Graph) {
+	if g.graph == nil || g.primed {
+		return
+	}
+	g.primed = true
+	in_frames := atempo_lookahead_samples(g.rate)
+	discard := int(f64(in_frames) / g.rate)
+	if in_frames <= 0 {
+		return
+	}
+	// Bounded chunk so a large lookahead does not want a large stack buffer.
+	CHUNK :: 2048
+	silence: [CHUNK * 2]f32
+	done := 0
+	for done < in_frames {
+		n := min(CHUNK, in_frames - done)
+		atempo_process(g, silence[:], n)
+		done += n
+	}
+	// Now throw away the output that corresponds to the priming region, so the first
+	// REAL sample emitted is content 0. atempo_process does this itself.
+	g.discard_next = discard
 }
 
 // atempo_reset clears the graph's internal window so stale buffered samples
