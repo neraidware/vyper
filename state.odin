@@ -930,6 +930,36 @@ Clip_Resize_State :: struct {
 }
 clip_resize: Clip_Resize_State = {edge = .None, roll_track = -1}
 
+// Clip_Stretch_State is the audio-clip STRETCH gesture: shift-dragging an edge changes
+// the clip's SPEED while its timeline duration stays exactly where it was.
+//
+// The distinction from a trim is the whole point of the gesture. A trim changes how much
+// of the clip exists; a stretch changes how fast the same amount plays, so the clip's
+// slot on the timeline does not move and nothing downstream of it shifts. Dragging the
+// RIGHT edge left therefore does NOT shorten the clip -- it slows it down, and the
+// content that used to be at the end is now at the end, played slower.
+//
+// Keeping the duration fixed is arithmetic, not a fudge: the clip occupies
+// source_length_frames / speed frames, so holding that product constant while speed
+// changes means source_length_frames = timeline_len * speed. Without that the edge drag
+// would stretch AND resize, which is how the same gesture ends up meaning two things.
+Clip_Stretch_State :: struct {
+	clip:          ^Clip,
+	edge:          Clip_Resize_Edge,
+	start_x:       f32,
+	start_speed:   f64,
+	// timeline_len is captured at press and NEVER recomputed during the drag. Reading
+	// it live would compound: each frame would re-derive the duration from the speed the
+	// previous frame just set, and the clip would drift.
+	timeline_len:  i64,
+	moved:         bool,
+}
+// Stretch is coarse: 1% of speed per 4 px of horizontal travel. Fine enough to reach
+// 0.25x and 4.0x without a modifier, coarse enough that a stray click does not
+// retime a clip by 3%.
+CLIP_STRETCH_PCT_PER_PX :: 0.25
+clip_stretch: Clip_Stretch_State
+
 // Clip_Move_State is the whole clip-drag gesture (moving a timeline clip along
 // its track or onto another, plus linked-group drags): the clip being dragged,
 // the (track, index) it was grabbed from and the track its ghost currently
@@ -1494,6 +1524,7 @@ Interaction :: enum {
 	Panel_Resize,  // dragging the divider to resize the upper/lower areas
 	Playhead_Scrub,
 	Clip_Resize,   // dragging a clip's duration edge
+	Clip_Stretch,  // shift-dragging an AUDIO clip's edge: changes SPEED, not length
 	Clip_Move,     // dragging a clip along/onto tracks
 	Preview_Move,  // dragging a clip's transform in the preview
 	Media_Bin_Drag,

@@ -641,6 +641,23 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				if edge := timeline_resize_edge_at(track_idx, index, inp.x, inp.y); edge != .None {
 					selection.track = track_idx
 					selection.index = index
+					// SHIFT on an audio edge means STRETCH, not trim. Checked before the
+					// resize arm because both gestures start from the same edge hit and
+					// they must never both claim it.
+					if inp.shift && track.clips[index].kind == .Audio {
+						c := &track.clips[index]
+						clip_stretch.clip = c
+						clip_stretch.edge = edge
+						clip_stretch.start_x = inp.x
+						clip_stretch.start_speed = clip_speed(c)
+						// Captured ONCE. See Clip_Stretch_State: recomputing this during
+						// the drag compounds and the clip walks across the timeline.
+						clip_stretch.timeline_len = clip_timeline_length(c)
+						clip_stretch.moved = false
+						undo_begin()
+						active_interaction = .Clip_Stretch
+						return true
+					}
 					undo_begin()
 					active_interaction = .Clip_Resize
 					clip_resize.edge = edge
@@ -1292,6 +1309,16 @@ interaction_release :: proc(inp: Mouse_Input) {
 				audio_note_edit()
 			}
 		}
+	case .Clip_Stretch:
+		// The speed was applied live on every move; this is the single commit, and
+		// only if it actually moved. audio_note_edit (not a bare seek) because the
+		// clip's LENGTH and every source's speed snapshot changed, which the seek
+		// path does not rebuild.
+		if clip_stretch.clip != nil && clip_stretch.moved {
+			undo_push(.Transform, "Stretch clip")
+			audio_note_edit()
+		}
+		clip_stretch.clip = nil
 	case .Clip_Resize:
 		// Resize is applied live during the drag; capture the gesture as one
 		// undo node on release.
@@ -1459,6 +1486,30 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 				clip_geom_drag(sel, .Trans_Y, handle_drag.start_ty)
 			}
 		}
+	case .Clip_Stretch:
+		if clip_stretch.clip != nil {
+			c := clip_stretch.clip
+			dx := inp.x - clip_stretch.start_x
+			// Dragging an edge INWARD slows the clip and OUTWARD speeds it up, for
+			// both edges. Direction comes from the edge so the gesture matches the
+			// trim it replaces: dragging the right edge left means "show me less
+			// time", which for a stretch means "play it slower".
+			dir := f64(1.0)
+			if clip_stretch.edge == .Right {
+				dir = -1.0
+			}
+			want := clip_stretch.start_speed * (1.0 - dir * f64(dx) * CLIP_STRETCH_PCT_PER_PX / 100.0)
+			want = clamp(want, CLIP_SPEED_MIN, CLIP_SPEED_MAX)
+			if want != clip_speed(c) {
+				c.speed = want
+				// Hold the timeline span fixed, which is what makes this a stretch.
+				c.source_length_frames = max(1, i64(f64(clip_stretch.timeline_len) * want))
+				clip_stretch.moved = true
+			}
+			// No audio_note_edit() here, same reason as the resize gesture: it is a
+			// full re-provision per frame. The release commits once.
+		}
+		clip_stretch.moved = false
 	case .Clip_Resize:
 		if selection.track >= 0 &&
 		   selection.index >= 0 &&

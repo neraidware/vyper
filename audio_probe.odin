@@ -1715,6 +1715,80 @@ measure_atempo_delay :: proc(rate: f64, push_frames: int = 192000) -> (in_frames
 }
 
 
+// audio_probe_clip_stretch proves the STRETCH gesture's core invariant: changing a
+// clip's speed must NOT move the clip on the timeline.
+//
+// A clip occupies source_length_frames / speed frames. The gesture holds the numerator
+// product constant -- timeline_len = source_length_frames / speed -- so
+// source_length_frames = timeline_len * speed. If that arithmetic is wrong the clip
+// slides across the timeline as it is stretched, which is exactly what a trim does and
+// exactly what a stretch must not.
+//
+// This is the property the gesture cannot be checked for by eye, because the clip looks
+// like it stays put while dragging and only drifts after release. So it is arithmetic on
+// a Clip, checked against the same accessor the renderer reads.
+audio_probe_clip_stretch :: proc() -> bool {
+	fails := 0
+	TIMELINE_LEN :: i64(480)
+	fmt.printf("[ap] stretch: timeline span must stay %d frames at every speed\n", TIMELINE_LEN)
+	for speed in ([]f64{0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0}) {
+		c := Clip {source_length_frames = TIMELINE_LEN, speed = 1.0}
+		start := clip_timeline_length(&c)
+		// Exactly what the gesture does on every move.
+		c.speed = speed
+		c.source_length_frames = max(1, i64(f64(TIMELINE_LEN) * speed))
+		got := clip_timeline_length(&c)
+		ok := start == got && got == TIMELINE_LEN
+		fmt.printf(
+			"[ap] stretch: speed %.3f -> %d content frames, timeline %d frames (want %d) %s\n",
+			speed, c.source_length_frames, got, TIMELINE_LEN, verdict(ok),
+		)
+		if !ok {
+			fails += 1
+		}
+	}
+	// And the converse, because a stretch that changed nothing would also pass the
+	// check above: the CONTENT must actually change, or the clip is not retimed.
+	c := Clip {source_length_frames = 480, speed = 1.0}
+	c.speed = 2.0
+	c.source_length_frames = max(1, i64(f64(480) * 2.0))
+	if c.source_length_frames == 480 {
+		fmt.println("[ap] stretch: FAIL: doubling the speed did not change the content read")
+		fails += 1
+	}
+	// The RANGE BOUNDS themselves, at the ends the gesture clamps to.
+	//
+	// Deliberately NOT testing that clip_speed clamps an out-of-range speed: it ASSERTS,
+	// and that is the correct design. A clamp there would silently play a speed the user
+	// never asked for, which is the same value/content disagreement the rest of this work
+	// has been removing. Clamping belongs at the EDGE of the system -- the typed edit
+	// clamps before it gets here, and the gesture clamps before it writes the field --
+	// so what the accessor owes the user is a loud failure, not a quiet correction.
+	for speed in ([]f64{CLIP_SPEED_MIN, CLIP_SPEED_MAX}) {
+		c := Clip{source_length_frames = 480, speed = speed}
+		if clip_speed(&c) != speed {
+			fmt.printf("[ap] stretch: FAIL: clip_speed rejected its own bound %.3f\n", speed)
+			fails += 1
+		}
+	}
+	// The gesture's own clamp is what protects the field: a drag that runs off the end of
+	// the range must land on the bound, not past it.
+	drag := f64(1.0)
+	for _ in 0 ..< 2000 {
+		drag = clamp(drag * 1.01, CLIP_SPEED_MIN, CLIP_SPEED_MAX)
+	}
+	if drag != CLIP_SPEED_MAX {
+		fmt.printf("[ap] stretch: FAIL: a runaway drag reached %.3f, past the bound %.3f\n", drag, CLIP_SPEED_MAX)
+		fails += 1
+	}
+	if fails > 0 {
+		fmt.printf("[ap] stretch: FAIL (%d)\n", fails)
+		return false
+	}
+	fmt.println("[ap] stretch ok (span fixed, content length follows speed)")
+	return true
+}
+
 // verdict renders a pass/fail word for the probe's single output line. A named helper
 // rather than an inline ternary so every assertion in the probe reads the same way.
 verdict :: proc(ok: bool) -> string {

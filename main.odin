@@ -1995,6 +1995,12 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		ok: bool = audio_probe_clip_tempo()
 		os.exit(ok ? 0 : 1)
 	}
+	// VYPER_AUDIO_CLIP_STRETCH -- proves the stretch gesture's invariant: changing speed
+	// must not move the clip on the timeline.
+	if st, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_STRETCH", context.temp_allocator); st != "" {
+		ok: bool = audio_probe_clip_stretch()
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_CLIP_PITCH=<path>|<semitones> -- proves the pitch property SHIFTS
 	// frequency without changing duration, which is what separates it from tempo.
 	if cp, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_PITCH", context.temp_allocator); cp != "" {
