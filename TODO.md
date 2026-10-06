@@ -6239,6 +6239,61 @@ separated from Active 32's: the X11 path demonstrably delivers `DROP_BEGIN` +
 `DROP_POSITION` from a hand-built XDND gesture, and never got a `DROP_FILE`
 through — because xwayland-satellite drops the synthetic `SelectionNotify` that
 carries the path. The two failures looked identical from the outside.
+
+## Active 33 — Snapping the playhead to a clip's end showed the next clip's first frame
+
+**Status: fixed 2026-10-06.** Branch `fix/playhead-snap-end` (base `a269a5a`).
+
+**The symptom.** With playhead→clip snapping on, scrubbing near a clip's end edge
+parked the playhead one frame past the clip, and the preview showed whatever came
+next — with contiguous clips, the next clip's frame 0. A gap after the clip made it
+look correct, which is what kept this from reading as an obvious off-by-one.
+
+**The defect.** `snap_playhead_to_clip_edge` targeted the end BOUNDARY
+(`start + length`) rather than a frame the clip owns. A clip spans
+`[start, start+length)` — `clip_visible_at` is half-open and says so — so the
+exclusive end is a frame this clip does not have. timeline.odin:224 already
+explained exactly that, then fixed only the case where it was visible (the final
+clip, via the `timeline_duration() - 1` clamp) and explicitly waved the interior
+case through, because `dur` is the LAST clip's end. Correct about the void, blind
+to the neighbour.
+
+So the resolver emitted a coordinate in the half-open convention's gap, and
+`clip_visible_at` — correct and consistently half-open in all eleven call sites —
+then resolved that frame against whatever clip did own it.
+
+**The fix.** Snap the end to `end - 1`, the last content frame, and leave the start
+edge alone. `end - 1` is right for interior and final edges alike, so the final
+clip needs no special case: its last content frame IS the timeline's last content
+frame. The duration clamp stays as the same backstop the scrub path has
+(interaction.odin:1628) rather than as the thing making the final clip behave. A
+zero-length clip owns no end frame, so `max(length - 1, 0)` folds its end onto its
+start instead of pointing one frame *before* the clip.
+
+**Probe.** `snap_playhead_to_clip_edge` had **no probe coverage at all** — `rg`
+found zero references in any `*_probe.odin`, and `timeline_probe` covers
+drag/drop/resize/ripple throughout. Two tests now: the end snap must land on a
+frame `clip_visible_at` accepts, and the clip→playhead margin must stay exactly
+`SNAP_PIXELS` wide at any zoom (the old `max(..,1)` floor let it balloon to
+hundreds of frames zoomed out).
+
+Mutation-checked: restoring `end := start + c.source_length_frames` fails 4
+assertions.
+
+**The probe was wrong twice before the resolver was, and both corrections are in
+the comment.** Worth recording, because the shape recurs:
+
+- I first tested CONTIGUOUS clips and asserted 99. It returned 100, and it was
+  right to: at a seam the next clip's start is also a candidate, and nearest-edge
+  legitimately prefers it. The gap case isolates the end edge with nothing else in
+  range. A probe asserting 99 at a seam would have been pinning the wrong rule —
+  and would have failed on correct code, which is a probe that trains you to
+  distrust it.
+- The zero-length fold I put at the duration boundary, where `clip_timeline_end ==
+  duration` and the clamp answers before the fold is even reached. Placed
+  mid-timeline instead, so the thing under test is the thing being tested.
+
+## Active 34 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
 The replacement case was itself wrong on arrival — it nested a second
 `geom_key_fixture()` inside the direction case, and the fixture calls
 `free_timeline`, so the second call freed the clips array the first case's `cl`
@@ -6376,7 +6431,8 @@ whole zoom/pan record with it. Restored from `c03c1d1`. The code was never at ri
 — only the record of it — but a stale editor buffer overwriting a merged file is
 silent, and nothing in the gate set reads TODO.md.
 
-## Active 33 — A clip plays at its own rate; the project rate is a timebase, not a speed
+
+## Active 35 — A clip plays at its own rate; the project rate is a timebase, not a speed
 
 **Why:** changing the project frame rate changed the playback speed of every clip
 in the project. The mapping from timeline frame to source frame was

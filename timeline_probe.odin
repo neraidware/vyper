@@ -304,6 +304,113 @@ test_clip_visible_half_open :: proc() {
 	)
 }
 
+// The playhead→clip snap must land on a frame the clip OWNS. A clip spans
+// [start, start+length) (clip_visible_at is half-open), so the end boundary is
+// one frame PAST the last content frame. The old snap targeted that boundary,
+// which showed the NEXT clip's first frame whenever clips were contiguous and
+// merely looked fine when a gap followed.
+//
+// The case that isolates it is a clip with a GAP after it: only its own end edge
+// is in range, so whatever comes back is unambiguously that edge. Contiguous
+// clips are deliberately NOT the primary case — at a seam the next clip's start is
+// also a candidate and nearest-edge legitimately prefers it. That is the rule
+// working, not the bug, and a probe asserting 99 there asserts the wrong thing
+// (it did, until the resolver was run against it).
+test_snap_playhead_end_lands_inside_the_clip :: proc() {
+	timeline.tracks = make([dynamic]Track, 0, 1, context.temp_allocator)
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	// [0,100), a gap, then [200,300). Near frame 101 only clip 0's END edge is in
+	// range; clip 1's start (200) is far outside the margin.
+	append(&timeline.tracks[0].clips, mk_tl_clip(9101, 0, 0, 100, 0, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(9102, 0, 0, 100, 200, .Video))
+	timeline_view.zoom = 1
+	timeline_view.start = 0
+
+	got := snap_playhead_to_clip_edge(101)
+	tl_probe_check(got == 99, "snapping near a lone clip's end must land on 99 (its last frame), got %d", got)
+	tl_probe_check(
+		clip_visible_at(got, 0, 100),
+		"the snapped frame %d must be a frame the clip owns",
+		got,
+	)
+	// The reported symptom in one line: never the frame past the end.
+	tl_probe_check(got != 100, "the snap must not land on the exclusive end (100)")
+
+	// From inside the clip, near its end: still its last frame, never past it.
+	got_in := snap_playhead_to_clip_edge(97)
+	tl_probe_check(got_in == 99, "snapping from inside near the end must land on 99, got %d", got_in)
+
+	// A start edge is untouched: frame 200 is clip 1's start and snaps to itself.
+	tl_probe_check(
+		snap_playhead_to_clip_edge(200) == 200,
+		"a start edge must still snap to itself, got %d",
+		snap_playhead_to_clip_edge(200),
+	)
+
+	// The final clip's end must not park the playhead in the sheet-empty slot
+	// past all content: duration is 300, so 299 is the last real frame.
+	got3 := snap_playhead_to_clip_edge(299)
+	tl_probe_check(got3 == 299, "snapping the final clip's end must land on 299, got %d", got3)
+	tl_probe_check(
+		got3 <= timeline_duration() - 1,
+		"the snap must stay inside the timeline (%d > %d)",
+		got3,
+		timeline_duration() - 1,
+	)
+
+	// Beyond the margin the frame comes back untouched: this is a latch, not a
+	// magnet.
+	tl_probe_check(
+		snap_playhead_to_clip_edge(50) == 50,
+		"a frame far from every edge must not move",
+	)
+	tl_probe_check(
+		snap_playhead_to_clip_edge(150) == 150,
+		"a frame in the gap between clips must not move",
+	)
+
+	// A zero-length clip owns no end frame, so its end folds onto its start rather
+	// than pointing one frame BEFORE it. Placed mid-timeline so the duration clamp
+	// cannot be what answers: a zero-length clip AT the duration boundary makes
+	// clip_timeline_end == duration, and the clamp then masks the fold entirely.
+	append(&timeline.tracks[0].clips, mk_tl_clip(9103, 0, 0, 0, 150, .Video))
+	got_zero := snap_playhead_to_clip_edge(150)
+	tl_probe_check(
+		got_zero == 150,
+		"a zero-length clip's end must fold onto its start, got %d",
+		got_zero,
+	)
+	tl_probe_check(
+		got_zero >= timeline.tracks[0].clips[2].timeline_start_frame,
+		"the fold must never point before the clip's own start (%d)",
+		got_zero,
+	)
+}
+
+// The clip→playhead direction is the other half of the toggle pair and shares
+// nothing with the resolver above, so it is pinned here too: a clip drag must
+// latch onto the playhead, and the margin must be exactly SNAP_PIXELS wide at
+// any zoom (the old max(..,1) floor let it balloon when zoomed out).
+test_snap_to_playhead_margin_scales_with_zoom :: proc() {
+	tl_scene()
+	playhead.frame = 100
+	timeline_view.zoom = 1
+	timeline_view.start = 0
+	// SNAP_PIXELS = 8 at zoom 1 -> within 8 frames latches, 9 does not.
+	tl_probe_check(snap_to_playhead(108) == 100, "8 frames from the playhead must latch")
+	tl_probe_check(snap_to_playhead(109) == 109, "9 frames away is outside the margin and must not latch")
+	// The margin is in pixels, so zooming out keeps the same on-screen band.
+	timeline_view.zoom = 0.01
+	tl_probe_check(
+		snap_to_playhead(900) == 100,
+		"the snap band stays 8px wide at zoom 0.01",
+	)
+	tl_probe_check(
+		snap_to_playhead(901) == 901,
+		"just past the band at zoom 0.01 must not latch",
+	)
+}
+
 mk_tl_clip :: proc(cid, link: u64, start, slen, tstart: i64, kind: Media_Kind) -> Clip {
 	return Clip {
 		clip_id = cid,
@@ -2193,6 +2300,13 @@ timeline_probe_run :: proc(_: string) {
 	fmt.println("[tl-probe] resize ok")
 	test_adjacent_seam_roll()
 	fmt.println("[tl-probe] adjacent seam roll ok")
+
+	test_snap_playhead_end_lands_inside_the_clip()
+	fmt.println("[tl-probe] playhead-snap-end ok")
+	tl_scene()
+	test_snap_to_playhead_margin_scales_with_zoom()
+	fmt.println("[tl-probe] clip-snap-margin ok")
+	tl_scene()
 
 	test_still_resize_free()
 	fmt.println("[tl-probe] still-resize ok")
