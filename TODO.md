@@ -7588,3 +7588,48 @@ of anything reported here.
 
 `target_proxy_bg` added. The probe also has no gate target of its own until now, which is
 the second time "no gate target" has cost a diagnosis.
+
+### Active 41, sixth defect — NOT a defect: the S6b/S6c checklist is true, and I flagged it twice
+
+Recorded because it was raised twice in conversation as "a false completion in the
+tracker" and both times it was wrong, so the next person should not spend the afternoon
+on it again.
+
+The S6b/S6c items read:
+
+    - [x] S6b. 29.97 MEASURED and bit-identical over 600 s.
+    - [x] S6c. Drift beyond 30 s MEASURED: exact sample accounting at 600 s across
+          60 / 30 / 30000-over-1001, and the two sinks bit-identical at all three.
+
+The evidence that made this look false was `913e5d2`, on the now-merged
+`feat/audio-drift` branch: "At 30000/1001 they still diverge, from frame 2, worst 0.194
+by frame 4739 ... a mixer-origin divergence, not drift." `git cherry` reports that commit
+as NOT in `main` by patch-id, which reads as "the fix is missing".
+
+It is not missing. The chain is:
+
+- `a4364ee` fixed the drift probe's block placement (it handed `render_mix_block` the whole
+  frame buffer, so each 512-sample block overwrote the previous from offset 0 -- the
+  convincing "they differ by a factor of six THROUGHOUT the timeline").
+- `82bb4ad` found the rest: the probe was setting `playback.magic_fps`, which by its own
+  contract must not change what a frame index MEANS. Content positions come from
+  `project_fps`; `timeline_fps` honours `magic_fps` and drives the bus. So the probe made
+  playback DEMAND content at the project rate and MIX it at the playback rate, and
+  `demand48 = max(demand48, s.first48)` absorbed the difference -- 1786 clamps, worst
+  29.5 seconds off-position -- while the probe reported success. Every 29.97 and 30
+  result it produced was a report on that mistake, not on NTSC.
+
+Re-measured on `main` today, over the full 600 s the item claims:
+
+    [ap] drift: mixed=28799971, timeline requires=28799971, delta=0;
+                worst=0.000000 at frame -1; 0 samples over 1e-03 tolerance
+    [ap] drift: playback demand clamps: 0 times, worst 0 samples
+
+And separately at 25 fps (a rate the item does not mention, and the one in the user's
+JPEG log): `delta=0, worst=0.000000, 0 clamps`. Also clean: 30, 60.
+
+So the checklist is accurate, `audio_drift_parity` is in `all` and gating it, and the
+mixer-origin finding has no home in the tracker **because it was resolved, not lost**.
+The lesson worth keeping is about the method rather than the item: `git cherry` compares
+patch-ids, and a fix that landed through a squash or a merge with different context reads
+as absent. The check that settled it was running the measurement the item claims.
