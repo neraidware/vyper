@@ -939,13 +939,6 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	if lo > hi {
 		lo = hi
 	}
-	if vyper_trace {
-		fmt.printf(
-			"[trim] LEFT  id=%d kind=%v start=%d..%d len=%d ssrc=%d src_fps=%.4f audio_src_rate=%.4f rate=%.4f | ask=%d lo=%d hi=%d\n",
-			c.clip_id, c.kind, start, end, c.source_length_frames, c.source_start_frame,
-			c.src_fps, c.audio_src_rate, clip_frame_space_rate(c), new_head, lo, hi,
-		)
-	}
 	head := clamp(new_head, lo, hi)
 	// The head moved by a TIMELINE distance; source_start_frame counts SOURCE
 	// frames. Converting is what keeps the clamp above and this adjustment in
@@ -956,12 +949,6 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	}
 	c.timeline_start_frame = head
 	c.source_length_frames = end - head
-	if vyper_trace {
-		fmt.printf(
-			"[trim] LEFT  -> head=%d len=%d tail=%d ssrc=%d\n",
-			head, c.source_length_frames, head + c.source_length_frames, c.source_start_frame,
-		)
-	}
 	return c.source_length_frames
 }
 
