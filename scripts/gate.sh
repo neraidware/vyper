@@ -1542,7 +1542,7 @@ target_audio_clip_tempo() {
 target_audio_bus_prime() {
 	require_fresh_binary audio-bus-prime || return 1
 	local worst=0
-	for r in 0.5 1.5 2.0 3.0; do
+	for r in 0.25 0.5 0.75 1.5 2.0 3.0 4.0; do
 		local line
 		line=$(VYPER_AUDIO_BUS_PRIME=$r timeout 300 ./vyper 2>&1 | grep -oE "first transient at output sample [0-9]+" | head -1)
 		echo "  rate $r: $line"
@@ -1559,16 +1559,28 @@ target_audio_bus_prime() {
 	echo "audio-bus-prime: worst offset $worst frames ($(awk "BEGIN{printf \"%.2f\", $worst/48.0}") ms)"
 	# NOT a member of `all`, and deliberately so.
 	#
-	# The offsets are now small -- 56 / 37 / 168 / 130 / 160 frames at rates 0.5 / 0.75 /
-	# 1.25 / 1.5 / 2.0, against 134 / 29 / 33 / 33 ms before priming existed -- but they
-	# are not zero, and two rates are not measurable at all: at 3.0 the primed silence
-	# plus WSOLA's segment repetition leaves nothing above the onset threshold, and at
-	# 0.25 the graph REFUSES TO BUILD ("link atempo: Invalid argument").
+	# The offsets are small -- 56 / 130 / 160 / 84 frames at rates 0.5 / 1.5 / 2.0 / 3.0,
+	# against 134 / 29 / 33 / 33 ms before priming existed -- but they are not zero.
+	#
+	# Two earlier blockers are GONE, and the reasons are recorded because both were real
+	# bugs rather than probe artefacts:
+	#  - rate 3.0 could not be LOCATED: the primed silence plus WSOLA's segment repetition
+	#    left nothing above the onset threshold. One atempo stage instead of a chain fixed
+	#    it (the chain's extra latency buried the transient); it now measures 84 frames.
+	#  - rate 0.25 REFUSED TO BUILD. tempo 0.25 is below atempo's per-stage minimum of
+	#    0.5, so it legitimately needs the chain; the chain was simply not reached before.
+	#
+	# A deeper prime makes it WORSE, which is the interesting part: 4x gives 56/130/160/84
+	# and 8x gives 472/452/384/82. The self-calibration measures the graph's output during
+	# priming and discards exactly that, so the residual is WSOLA's internal history still
+	# settling after the measured window -- more priming feeds more settling, it does not
+	# cancel it. Getting to zero needs alignment measured against the output waveform
+	# after the graph has stabilised, not against the prime.
 	#
 	# The failure threshold stays where it is. Loosening it until the target passes is
 	# how the clip-tempo gate came to pass a broken feature earlier in this work, and a
 	# red gate is the honest state: it is named, runnable, and reports the numbers.
-	echo "audio-bus-prime: NOT gating. Offsets are small but non-zero, rate 0.25 will not build, and rate 3.0 cannot be located. See scripts/gate.sh."
+	echo "audio-bus-prime: NOT gating. Every rate builds and every rate measures now; offsets run 37-300 frames (0.8-6.25 ms) but are not zero. See scripts/gate.sh."
 }
 
 # audio_clip_pitch proves the pitch property SHIFTS frequency WITHOUT changing
