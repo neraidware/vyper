@@ -1005,6 +1005,77 @@ target_export_bench() {
 # because they exercise different letterboxing (243x432 centred in 768x432 vs
 # 768x432 filling it) and a portrait-only fixture would pass a fit-rect bug that
 # a landscape one exposes.
+# silent_playback proves a project with NO AUDIO PLAYBACK AT ALL still plays.
+#
+# Forward playback is device-master: the playhead is a readout of the sound device's
+# consumed position. That needs something consuming the stream. With no audio clip
+# covering the playhead there is nothing, and the chain has no clock anywhere in it:
+# audio_producer_feed breaks out of its fill loop on the first uncovered frame, so
+# next_frame never advances, so dev_frame -- published from next_frame, never from a
+# timer -- never advances, and the playhead sits on its starting frame for the whole
+# run. A STALL, not a freeze-with-sound: `playing` stays true and the frame never moves.
+#
+# Measured before the fix (VYPER_AUTOPLAY on a video with no audio track), identical
+# at HEAD, so not a regression from the scrub work:
+#
+#	[ui]  ph=0 dev=0 ... current=true playing=true -> ph=0
+#
+# for every tick of the run.
+#
+# This also covers the wall-clock path's OTHER user: BACKWARD playback has always
+# needed the wall clock for the same reason (audio is muted going backward). That code
+# was inline in playback_update and is now the shared playback_wall_clock_advance, so a
+# copy of the accumulator, the catch-up counter, the boundary stop and the boost reset
+# exists once and both callers get it.
+#
+# The fixture is a real video with NO audio track -- the whole point is that
+# audio_streams == 0, and a fixture that quietly had an audio lane would test nothing.
+target_silent_playback() {
+	require_fresh_binary silent-playback || return 1
+	mkdir -p "$PROXY_DIR"
+	local src="$PROXY_DIR/silent.mp4"
+	if [ ! -s "$src" ]; then
+		dev ffmpeg -y -f lavfi -i "testsrc2=size=640x360:rate=30:duration=3" \
+			-c:v libx264 -pix_fmt yuv420p -an "$src" >/dev/null 2>&1 || {
+			echo "silent-playback: could not synthesize the silent fixture" >&2
+			return 1
+		}
+	fi
+	# Asserted on the fixture, not assumed: -an is what makes this the test it is.
+	if ffprobe -v error -show_entries stream=codec_type -of csv=p=0 "$src" 2>/dev/null \
+		| grep -q audio
+	then
+		echo "silent-playback: fixture has an audio track, so it would test nothing" >&2
+		return 1
+	fi
+	# Exit status is deliberately ignored. The bug's most obvious symptom is that the
+	# run NEVER ENDS -- a pinned playhead cannot reach the end of the clip, so it
+	# cannot auto-stop, so the process is still going when the timeout takes it and
+	# reports 124. Gating on the status would catch the stall for the wrong reason
+	# ("the run errored") and would also fail this target on any unrelated crash.
+	# The playhead's furthest reach is the assertion.
+	local out
+	out=$(VYPER_AUTOPLAY="$PWD/$src" VYPER_PLAY_TRACE=1 timeout 120 ./vyper 2>&1 || true)
+	# The furthest frame the playhead reached. Zero is the bug: before the fix it
+	# never left its starting frame.
+	local max_ph
+	max_ph=$(echo "$out" | sed -n 's/^\[ui\]  ph=\([0-9-]*\) .*/\1/p' \
+		| sort -n | tail -1)
+	if [ -z "$max_ph" ]; then
+		echo "silent-playback: no playhead trace lines -- the probe never ran" >&2
+		return 1
+	fi
+	echo "silent-playback: playhead reached frame ${max_ph} with no audio track"
+	# Reported either way, because "the run never finished" is independent evidence of
+	# the same stall: a playhead that advances reaches the clip end and auto-stops.
+	if [ "$max_ph" -le 0 ]; then
+		echo "$out" | grep -E '^\[ui\]  ph=' | tail -5 >&2
+		echo "silent-playback: FAILED -- the playhead never advanced (the no-audio stall)" >&2
+		return 1
+	fi
+	echo "silent-playback: ok (no audio track still plays, on the wall clock)"
+}
+
 target_image_decode_probe() {
 	require_fresh_binary image-decode-probe || return 1
 	mkdir -p "$PROXY_DIR"
@@ -1855,7 +1926,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate image_probe image_decode_probe audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate image_probe image_decode_probe silent_playback audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1916,13 +1987,14 @@ main() {
 	proxy_probe) target_proxy_probe ;;
 	image_probe) target_image_probe ;;
 	image_decode_probe) target_image_decode_probe ;;
+	silent_playback) target_silent_playback ;;
 	smoke) target_smoke ;;
 	footprint) target_footprint "${2:-20}" ;;
 	valgrind) target_valgrind ;;
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|silent_playback|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

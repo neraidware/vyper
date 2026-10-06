@@ -7052,6 +7052,13 @@ in `main.odin`.
 **Status: fixed 2026-10-06.** Reported by the user as three symptoms: a `.jpg` "showed
 up as an audio clip", "doesn't render at all", and "literally stall reproduction".
 
+**The user's correction, which moved the stall.** They first attributed the stall to the
+image; on checking, the stall is nothing to do with images at all -- **it is what a
+project with no audio does**, and it had nothing to do with this import. It is written up
+as its own defect below because it is a different bug in a different subsystem. What
+remains genuinely image-specific here is the decode failure (which does make a still
+render nothing) and the encoder segfault.
+
 **The classification was never wrong.** The probe proves a synthesized JPEG imports as
 `kind=Video is_image=true` and places as a `kind=Video is_still=true` clip. The
 "audio clip" report is therefore either a file that is not a plain `.jpg` (an extension
@@ -7073,11 +7080,12 @@ Measured on a 1080x1920 jpg: `decode_clip_frame_sync` returned **false for sourc
 0**. Not a scaling problem, not a proxy problem, not an aspect problem — the decode
 never produced a frame.
 
-The stall is the consequence, and it is why this looked like a hang rather than a blank
-screen. In `preview_state` the per-frame decode is gated on `slot.has_frame`, and a
-failed decode never sets it. So the slot re-posts a decode on **every frame, forever**,
-for a clip whose 60 timeline frames all map to source frame 0. Measured shape of the
-retry: bounded by nothing, scaling with clip length.
+A failed decode does leave `slot.has_frame` false, so `preview_state` re-posts a decode
+on every frame rather than settling -- but **that is a retry storm, not the stall the
+user reported**, and it is not what was fixed here. See Active 38, third defect: the
+stall is the no-audio transport, it predates this work, and it has nothing to do with
+images. Recorded because the first version of this section credited the decode failure
+with it, which was wrong.
 
 Fix: a cold decoder asking for frame 0 must not seek (`cold_at_origin` in
 `decode_source_frame`). This is not an image special case — **any source whose first
@@ -7154,3 +7162,65 @@ checked the whole buffer and would have failed every correctly-letterboxed portr
   video fails at `segment decode frame 89` — identical at HEAD, so not from this work.
   **That path has no gate target**, which is why a real proxy bug has been sitting there
   unnoticed.
+
+### Active 38, third defect — a project with no audio could not play at all
+
+Found because the user corrected the stall's attribution: "It stalls when there's no
+audio. I was wrong." Nothing to do with the image.
+
+**Forward playback is device-master, and a clock needs something to consume it.** The
+playhead is a pure readout of `playback.dev_frame`, the sound device's consumed
+position -- that is the cannot-drift property, and it is correct. But with no audio clip
+covering the playhead there is no such stream, and the chain has no clock anywhere in
+it:
+
+    audio_producer_feed's fill loop breaks on the first uncovered frame
+      (audio_src_covers_frame is false with zero sources)
+      -> next_frame never advances
+      -> dev_frame, published FROM next_frame and never from a timer, never advances
+      -> the playhead sits on its starting frame for the whole run
+
+`dev_frame` is derived, never timed. There is no fallback anywhere, and the existing
+self-heal in `audio_update` covers the *opposite* fault (the timeline expects audio and
+the producer has no sources).
+
+Measured, `VYPER_AUTOPLAY` on a video with no audio track, **identical at HEAD** -- so
+not a regression from the scrub work:
+
+    [ui]  ph=0 dev=0 dev_resync=3 resync=3 current=true playing=true -> ph=0
+
+for every tick. A STALL rather than a freeze-with-sound: `playing` stays true, the frame
+never moves, and the run never reaches the clip end so it never auto-stops.
+
+**Fix.** The wall clock, for the same reason backward playback has always used it:
+there is no device consumption, and therefore no clock to be had -- and because there is
+no audible stream either, nothing here can drift against anything. The check is **per
+playhead position**, not per project: a timeline with audio in some ranges keeps the
+device clock inside them and only the silent stretches fall back, which is where they
+must. `timeline_has_audio_at` is the existing fact for exactly this question and is
+reused rather than a second predicate written.
+
+The backward branch's inline accumulator, catch-up counter, boundary stop and boost
+reset were extracted into `playback_wall_clock_advance`, because that is now two callers
+and a second copy of that behaviour is how forward and backward playback drift apart in
+a way nothing measures. Backward playback is unchanged by the extraction -- only its
+call site moved.
+
+Verified both directions, because the risk of this fix is a project WITH audio silently
+losing its device clock:
+
+    no audio track    ph=0 .. 89   (nb_frames 90, played through and auto-stopped)
+    with audio track  ph=179 dev=179, ph=180 dev=180   (dev tracks ph exactly)
+
+**`target_silent_playback`, in `all`.** `VYPER_AUTOPLAY` had NO gate target at all, which
+is why this survived; the target now owns it. Two details in it worth recording:
+
+- It asserts the FIXTURE has no audio track (`ffprobe ... | grep -q audio` must not
+  match). A silent-playback test whose fixture quietly grew an audio lane would test
+  nothing, and the `-an` flag is the only thing making it the test it is.
+- It deliberately IGNORES the exit status. The bug's most obvious symptom is that the run
+  never ends -- a pinned playhead cannot reach the clip end, cannot auto-stop, so the
+  process is still alive at the timeout and reports 124. Gating on status would catch the
+  stall for the wrong reason and would also fail on any unrelated crash. The furthest
+  frame the playhead reached is the assertion, and it is zero exactly when the bug is
+  present (verified by reverting the fix).

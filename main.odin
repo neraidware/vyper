@@ -1729,6 +1729,74 @@ playback_read_snapshot :: proc() -> (frame: i64, ns: i64) {
 // calls this mid-tick, including across a UI stall, so the playhead it targets
 // is where playback really is rather than where the UI last managed to render.
 // Only forward extrapolation is meaningful -- audio is forward-only.
+// playback_wall_clock_advance advances the playhead on the WALL CLOCK, for the two
+// cases where there is no device consumption to be a clock.
+//
+// It is one proc because both cases are the same argument, and the argument is the
+// reason the device-as-clock design cannot simply be unconditional: a clock needs
+// something consuming it. BACKWARD playback has no such thing because audio is
+// muted going backward. A TIMELINE WITH NO AUDIO HERE has none either, and that
+// case was unhandled -- see the call sites.
+//
+// Reusing this rather than duplicating the accumulator is not cosmetic. The
+// accumulator, the catch-up counter, the boundary stop and the boost reset are one
+// behaviour; a second copy of them is how forward and backward playback drift apart
+// in a way nothing measures.
+playback_wall_clock_advance :: proc(now_ns: sdl.Uint64) {
+	// DIAG (temporary): playback.magic_ms replaces the measured wall delta so the
+	// cadence is perfectly jitter-free (or any fixed rate).
+	dt_s :=
+		playback.magic_ms > 0 ? playback.magic_ms / 1000.0 : f64(now_ns - playback.last_tick_ns) / 1_000_000_000
+	playback.accumulator += dt_s * max(0.0, effective_playback_rate())
+	playback_fps := timeline_fps()
+	catchup := i64(0)
+	for playback.accumulator >= 1.0 / playback_fps {
+		playhead.frame += i64(playback.dir)
+		catchup += 1
+		playback.accumulator -= 1.0 / playback_fps
+	}
+	if catchup > 0 {
+		sync.atomic_store(&audio_rpt.ph_src, 2)
+		sync.atomic_store(&audio_rpt.ph_catch, catchup)
+		if catchup > 1 && vyper_trace {
+			fmt.printf(
+				"[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n",
+				i64(playback.dir) * catchup,
+				playhead.frame,
+				f64(now_ns - playback.last_tick_ns) / 1e6,
+				playback.accumulator,
+			)
+		}
+	}
+	// Directional boundary: stop at the run end going forward, at frame 0 going
+	// backward. Resetting the boost on auto-stop so a later play starts from the
+	// selected rate.
+	stop_frame := playback.stop_frame
+	if stop_frame < 0 {
+		stop_frame = timeline_duration()
+	}
+	at_end :=
+		(playback.dir == 1 && playhead.frame >= stop_frame) ||
+		(playback.dir == -1 && playhead.frame <= 0)
+	if at_end {
+		playback.stop_frame = -1
+		playback.boost = 0
+		playhead.frame = clamp(playhead.frame, 0, max(0, stop_frame - 1))
+		playhead.playing = false
+		preview.playing = false
+		if vyper_trace {
+			fmt.printf(
+				"[pb] auto-stop dir=%d ph=%d stop=%d\n",
+				playback.dir,
+				playhead.frame,
+				stop_frame,
+			)
+		}
+	}
+}
+
+// playback_update is the UI thread's per-tick transport update: it decides where
+// the playhead is, and it runs BEFORE audio_update in the frame loop.
 playback_update :: proc(now_ns: sdl.Uint64) {
 	if playback.last_tick_ns == 0 {
 		playback.last_tick_ns = now_ns
@@ -1792,65 +1860,46 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 				playhead.frame,
 			)
 		}
-		playback.accumulator = 0
-	} else if playhead.playing {
-		// BACKWARD PLAYBACK has to keep the wall clock, and that is a real asymmetry
-		// rather than an oversight: audio is MUTED going backward, so there is no
-		// device consumption to be a clock. Nothing can drift against a stream that
-		// does not exist, so a wall clock here cannot desync anything audible.
+		// NO AUDIO AT THE PLAYHEAD: THERE IS NO CLOCK.
 		//
-		// DIAG (temporary): playback.magic_ms replaces the measured wall delta so the
-		// cadence is perfectly jitter-free (or any fixed rate).
-		dt_s :=
-			playback.magic_ms > 0 ? playback.magic_ms / 1000.0 : f64(now_ns - playback.last_tick_ns) / 1_000_000_000
-		playback.accumulator += dt_s * max(0.0, effective_playback_rate())
-		playback_fps := timeline_fps()
-		catchup := i64(0)
-		for playback.accumulator >= 1.0 / playback_fps {
-			playhead.frame += i64(playback.dir)
-			catchup += 1
-			playback.accumulator -= 1.0 / playback_fps
+		// The device-as-clock design needs something consuming the stream. With no
+		// audio clip covering the playhead there is none: audio_producer_feed breaks
+		// out of its fill loop on the first uncovered frame, so next_frame never
+		// advances, so dev_frame -- published from next_frame, never from a timer --
+		// never advances, and the playhead sits at the frame it started on for the
+		// whole run. Measured, and it is a STALL rather than a freeze-with-sound:
+		// VYPER_AUTOPLAY on a video with no audio track printed
+		//
+		//	[ui]  ph=0 dev=0 ... current=true playing=true -> ph=0
+		//
+		// for every tick, `playing` true and the playhead pinned. Present at HEAD, so
+		// it is not a regression from the scrub work.
+		//
+		// This is the same asymmetry as backward playback, and the same answer: no
+		// device consumption means no clock to be had, and -- because there is no
+		// audible stream either -- nothing here can drift against anything. So the
+		// playhead runs on the wall clock, which is what playback_wall_clock_advance
+		// is for. The check is per playhead position, not per project: a timeline with
+		// audio in some ranges still gets the device clock inside them, and only the
+		// silent stretches fall back, which is where they must.
+		//
+		// The consequence to keep in mind: crossing INTO audio adopts dev_frame, and
+		// dev_frame is behind by however long the silent run was, so adoption would
+		// jump the playhead forward. The device clock is only allowed to move the
+		// playhead FORWARD and only when current, so the jump is bounded by what the
+		// producer has actually caught up to rather than being unbounded -- but the
+		// right fix for the discontinuity is for the producer to re-anchor at the
+		// playhead on entering audio, which is audio_update's existing
+		// timeline_has_audio_at self-heal. Named here rather than silently relied on.
+		if !timeline_has_audio_at(playhead.frame) {
+			playback_wall_clock_advance(now_ns)
+		} else {
+			playback.accumulator = 0
 		}
-		if catchup > 0 {
-			sync.atomic_store(&audio_rpt.ph_src, 2)
-			sync.atomic_store(&audio_rpt.ph_catch, catchup)
-			if catchup > 1 {
-				if vyper_trace {
-					fmt.printf(
-						"[pb] burst %+d ph=%d dt=%.1fms acc=%.3fs\n",
-						i64(playback.dir) * catchup,
-						playhead.frame,
-						f64(now_ns - playback.last_tick_ns) / 1e6,
-						playback.accumulator,
-					)
-				}
-			}
-		}
-		// Directional boundary: stop at the run end going forward, at frame 0
-		// going backward. Resetting the boost on auto-stop so a later play
-		// starts from the selected rate.
-		stop_frame := playback.stop_frame
-		if stop_frame < 0 {
-			stop_frame = timeline_duration()
-		}
-		at_end :=
-			(playback.dir == 1 && playhead.frame >= stop_frame) ||
-			(playback.dir == -1 && playhead.frame <= 0)
-		if at_end {
-			playback.stop_frame = -1
-			playback.boost = 0
-			playhead.frame = clamp(playhead.frame, 0, max(0, stop_frame - 1))
-			playhead.playing = false
-			preview.playing = false
-			if vyper_trace {
-				fmt.printf(
-					"[pb] auto-stop dir=%d ph=%d stop=%d\n",
-					playback.dir,
-					playhead.frame,
-					stop_frame,
-				)
-			}
-		}
+	} else if playhead.playing {
+		// Either BACKWARD playback, or FORWARD with no audio to be a clock for --
+		// playback_wall_clock_advance covers both, and its comment is the argument.
+		playback_wall_clock_advance(now_ns)
 		// Playback is real-time: the playhead (and with it the audio) runs on
 		// the wall clock. Video decode is best-effort on top of that clock.
 	}
