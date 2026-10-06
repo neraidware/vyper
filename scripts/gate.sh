@@ -1475,6 +1475,13 @@ target_audio_clip_tempo() {
 		echo "audio-clip-tempo: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
 		return 1
 	fi
+	# NOT a member of `all`, deliberately. The speed-direction check inside this probe
+	# is currently unsound -- it reports ~1.0x at every speed, so it is not measuring
+	# what it claims -- and a gate that fails for the wrong reason gets disabled, while
+	# a gate that passes for the wrong reason is worse than no gate at all.
+	#
+	# What does verify the direction today is audio_node_latency: 192000 frames through
+	# tempo 2.0 yield 95232 output frames, so out/in = 1/tempo and tempo = speed.
 	local rc=0
 	for sp in 1.0 0.25 0.5 1.5 2.0 3.0 4.0; do
 		VYPER_AUDIO_CLIP_TEMPO="$PWD/$src|$sp" timeout 600 ./vyper >/dev/null 2>&1
@@ -1483,7 +1490,7 @@ target_audio_clip_tempo() {
 	if [ $rc -ne 0 ]; then
 		return 1
 	fi
-	echo "audio-clip-tempo: ok (speeds 0.25 .. 4.0, with 1.0 as the inertness control)"
+	echo "audio-clip-tempo: ran (speeds 0.25 .. 4.0). NOT gating: its direction check is unsound -- see scripts/gate.sh"
 }
 
 target_all() {
@@ -1499,7 +1506,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_clip_tempo atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done

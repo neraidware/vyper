@@ -412,23 +412,28 @@ atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
 // pushed/rate - produced -- needs no waveform at all.
 ATEMPO_LOOKAHEAD_MAX_SAMPLES :: 2048
 
-// atempo_lookahead_samples is the measured lookahead for a given transport rate, by
-// interpolation on the measured points. EXACT at the measured rates and linear
+// atempo_lookahead_samples is the measured lookahead for a given TEMPO, by
+// interpolation on the measured points.
+//
+// Keyed on TEMPO, which is what atempo_rate_set takes -- NOT on a transport rate.
+// The two are the same number for the global bus (where the transport rate IS the
+// tempo) and DIFFERENT for a per-clip graph, and conflating them is how the previous
+// commit ended up passing 1.0/speed where it should have passed speed. EXACT at the measured rates and linear
 // between them, because the underlying window scales with the tempo factor rather
 // than jumping.
 //
 // Sampled from measurement rather than modelled, and that is the point: a model would
 // be one more thing that can be wrong silently, and this number decides where content
 // lands after a seek.
-atempo_lookahead_samples :: proc(rate: f64) -> int {
+atempo_lookahead_samples :: proc(tempo: f64) -> int {
 	pts := []f64{0.5, 0.75, 1.25, 2.0}
 	vals := []int{2048, 1722, 1350, 1536}
-	if rate <= pts[0] {
+	if tempo <= pts[0] {
 		return vals[0]
 	}
 	for i in 0 ..< len(pts) - 1 {
-		if rate <= pts[i + 1] {
-			t := (rate - pts[i]) / (pts[i + 1] - pts[i])
+		if tempo <= pts[i + 1] {
+			t := (tempo - pts[i]) / (pts[i + 1] - pts[i])
 			return int(f64(vals[i]) + (f64(vals[i + 1]) - f64(vals[i])) * t + 0.5)
 		}
 	}

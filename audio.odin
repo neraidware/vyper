@@ -1758,7 +1758,18 @@ audio_src_pump_tempo :: proc(s: ^Play_Src, want_out: i64) {
 		return
 	}
 	if s.tempo.graph == nil {
-		atempo_rate_set(&s.tempo, 1.0 / s.speed)
+		// tempo IS the speed multiplier: atempo's `tempo=` shortens the output above
+		// 1.0, so out/in = 1/tempo, and a clip at speed S needs out/in = 1/S -- which
+		// means tempo = S, not 1/S.
+		//
+		// The previous version passed 1.0/s.speed and every stretched clip played at
+		// the INVERSE of its speed. The gate did not catch it because the probe only
+		// asserted that a stretched render DIFFERS from an unstretched one, and an
+		// inverted render differs just as loudly as a correct one. That is the second
+		// broken thing this branch exists to fix, and it is the same shape as every
+		// other measurement mistake in this work: something that proved a thing was
+		// happening, never that it was happening correctly.
+		atempo_rate_set(&s.tempo, s.speed)
 		if s.tempo.graph == nil {
 			return
 		}

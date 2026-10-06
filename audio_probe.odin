@@ -1759,6 +1759,62 @@ audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
 		return true
 	}
 
+	// !! THIS CHECK IS NOT YET TRUSTWORTHY. It reports ~1.0x at every speed, which
+	// means it is not measuring what it claims -- most likely the pulse counting, or
+	// the click fixture's density not surviving the mix. It is kept here because the
+	// DIRECTION it needs to verify is real and the previous gate could not see it at
+	// all, but audio_clip_tempo does NOT pass on the strength of it, and neither does
+	// anything else.
+	//
+	// What DOES verify the direction, today, is audio_node_latency's accounting:
+	// pushing 192000 frames through tempo 2.0 yields 95232 output frames -- halved --
+	// and tempo is atempo's speed multiplier. So out/in = 1/tempo, a clip at speed S
+	// needs out/in = 1/S, and therefore tempo = S.
+	//
+	// DIRECTION, which is the check that matters and the one that was missing.
+	//
+	// "Output differs" proves the graph is in the path. It does NOT prove the clip
+	// plays at the speed the user asked for: an INVERTED render differs just as
+	// loudly as a correct one, and a previous version of this probe shipped a clip
+	// playing at the inverse of its speed for exactly that reason.
+	//
+	// So: measure how much CONTENT a stretched clip consumes for the same span, and
+	// require it to be S times the unstretched amount. That distinguishes speed S from
+	// speed 1/S, which "differs" cannot.
+	// PULSE DENSITY, not a content count.
+	//
+	// Counting decoded content does not work: the pump reads in chunks, so its
+	// read-ahead overshoot dominates a short run and made a correct clip look 2x off.
+	// And no waveform-based comparison can tell speed S from 1/S -- a clip at either
+	// produces the same audio, just traversed differently.
+	//
+	// A click track settles it. The fixture is impulses at a fixed CONTENT spacing, so
+	// in the OUTPUT they appear S times closer together for a clip at speed S. Pulse
+	// density therefore IS the speed, and the 1/S case lands on 1/S instead -- which
+	// at speed 2 is a factor of 4 apart, unmissable.
+	unref := count_pulses(cpath, run_frames, 1.0, fps)
+	sref := count_pulses(cpath, run_frames, speed, fps)
+	if unref == 0 {
+		fmt.println("[ap] tempo: SKIP: the unstretched reference saw no pulses (fixture is not a click track?)")
+		return true
+	}
+	ratio := f64(sref) / f64(unref)
+	fmt.printf(
+		"[ap] tempo: content consumed for the same span: %.0f stretched vs %d unstretched = %.3fx (asked %.3fx)\n",
+		f64(sref), unref, ratio, speed,
+	)
+	// Within 2%: WSOLA discards and repeats samples to hit the factor, so the count
+	// is an estimate at frame granularity, not an exact identity. 2% is far tighter
+	// than the 1/S-vs-S ambiguity this exists to catch, which is a factor of 4 at
+	// speed 2.
+	if abs(ratio - speed) > 0.02 * speed {
+		fmt.printf(
+			"[ap] tempo: FAIL: consumed %.3fx the content for a clip at speed %.3f -- the graph is in the path but running at the WRONG SPEED\n",
+			ratio, speed,
+		)
+		return false
+	}
+
 	// Not identical: a tempo change that produced bit-identical output would mean the
 	// graph is not in the path and pitch is NOT being corrected.
 	identical := len(stretched) == len(unstretched)
@@ -1777,6 +1833,77 @@ audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
 	}
 	fmt.println("[ap] tempo ok (stretched output differs, graph is in the path)")
 	return true
+}
+
+// count_pulses mixes `frames` of a click-track clip at `speed` and returns how many
+// pulses the OUTPUT contains.
+//
+// Counted on the mixed output's envelope, one count per rising crossing above half
+// the window's peak, so it does not care about pulse SHAPE -- which matters because
+// atempo is WSOLA and resynthesises the waveform rather than passing it through. What
+// survives time-stretching is the RATE at which transients arrive, which is exactly
+// the quantity being measured.
+count_pulses :: proc(path: cstring, frames: i64, speed: f64, fps: f64) -> int {
+	out := mix_clip_range(path, frames, speed, fps)
+	if len(out) == 0 {
+		return 0
+	}
+	mono := len(out) / 2
+	// Peak of the interior, so a silent lead-in cannot set the threshold to noise.
+	peak := f32(0)
+	for k in 0 ..< mono {
+		peak = max(peak, abs(out[k * 2]))
+	}
+	if peak <= 1e-5 {
+		return 0
+	}
+	thresh := peak * 0.5
+	// A refractory period stops one pulse being counted as several by WSOLA's
+	// overlapping segments. Half the fixture's click interval is ample.
+	gap := 64
+	pulses := 0
+	since := gap
+	for i in 0 ..< mono {
+		if since < gap {
+			since += 1
+			continue
+		}
+		if out[i * 2] > thresh {
+			pulses += 1
+			since = 0
+		}
+	}
+	return pulses
+}
+
+// mix_clip_range_setup builds the single-clip timeline at `speed` and provisions it.
+mix_clip_range_setup :: proc(path: cstring, frames: i64, speed: f64) {
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "tempo", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = path,
+			kind = .Audio,
+			name = session_str_intern("t"),
+			timeline_start_frame = 0,
+			source_length_frames = frames,
+			source_start_frame = 0,
+			stream_index = 0,
+			speed = speed,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_prod.last_ui_frame = -1
+	audio_provision(0)
 }
 
 // mix_clip_range mixes `frames` of a single clip at `speed` through the real playback
