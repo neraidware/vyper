@@ -10,6 +10,7 @@ import "core:strconv"
 import "core:strings"
 import "core:sync"
 import "core:thread"
+import sdl "vendor:sdl3"
 
 // Headless reproducibility probe for the "after many splits audio drops to a
 // blip" bug: VYPER_AUDIO_PROBE="<file>|<splits>|<audio_tracks>". Runs without an
@@ -601,6 +602,7 @@ audio_probe_gain_check :: proc() -> bool {
 // regression shows how bad it got rather than just that it happened.
 audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 	fmt.println("[ap] --- edit-burst provisioning ---")
+	audio_probe_timeline_reset()
 	buf: [4096]u8
 	cn := 0
 	for cn < len(path) && cn < len(buf) - 1 {
@@ -630,6 +632,7 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 	append(&timeline.tracks, atrack)
 	sync_track_order()
 	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
 
 	// The real engine: device, bridge ring and the producer thread, because the
 	// cost being measured happens on the producer and nowhere else.
@@ -650,15 +653,292 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 	thread.start(audio_prod.thread)
 	defer audio_shutdown()
 
-	// Playing, so the producer is live and mixing.
-	playhead.playing = true
+	// Import/edit publishes geometry while stopped. The worker must warm decoders
+	// behind the closed device gate so the Play press does not synchronously wait for
+	// several source opens.
 	playback.dir = 1
 	playhead.frame = 0
 	audio_prod.last_ui_frame = 0
-	sync.atomic_store(&audio_prod.run, true)
 	audio_seek(0)
+	STARTUP_TIMEOUT_MS :: 500
+	deadline := monotonic_ns() + u64(STARTUP_TIMEOUT_MS) * 1_000_000
+	for (sync.atomic_load(&audio_prod.src_count_ui) == 0 || sync.atomic_load(&audio_prod.provisioning)) &&
+	    monotonic_ns() < deadline {
+		sleep_ms(1)
+	}
+	if sync.atomic_load(&audio_prod.src_count_ui) == 0 || sync.atomic_load(&audio_prod.provisioning) {
+		fmt.println("[ap] startup: FAIL: stopped producer did not warm source before Play press")
+		return false
+	}
+	if audio_device_queued() != 0 {
+		fmt.printf("[ap] startup: FAIL: stopped warmup queued %d audible frames\n", audio_device_queued())
+		return false
+	}
+	warm_provisions := audio_rpt.provisions
+	playhead.playing = true
+	preview.playing = true
+	sync.atomic_store(&playback.dev_frame, playhead.frame)
+	start_feed_frames := audio_rpt.total_fed_frames
+	start_ns := monotonic_ns()
+	// Match main's order: the device-clock read occurs before audio_update handles
+	// the run edge. Seeding dev_frame above prevents stale stop position winning.
+	playback_update(sdl.Uint64(start_ns))
+	audio_update()
+	for audio_rpt.total_fed_frames == start_feed_frames &&
+	    monotonic_ns()-start_ns < u64(STARTUP_TIMEOUT_MS)*1_000_000 {
+		sleep_ms(1)
+	}
+	start_ms := f64(monotonic_ns()-start_ns) / 1e6
+	if audio_rpt.total_fed_frames == start_feed_frames {
+		fmt.printf("[ap] startup: FAIL: first PCM took %.1f ms after Play press\n", start_ms)
+		return false
+	}
+	if audio_rpt.provisions != warm_provisions {
+		fmt.printf("[ap] startup: FAIL: Play press re-provisioned warm sources (%d -> %d)\n", warm_provisions, audio_rpt.provisions)
+		return false
+	}
+	fmt.printf("[ap] startup: warm provision before Play; first PCM %.1f ms after press\n", start_ms)
+	// Run normal UI clock/feed updates briefly so the producer builds an audible
+	// queue and the playhead advances from zero before exercising stop/restart.
+	for _ in 0 ..< 80 {
+		sleep_ms(5)
+		now := monotonic_ns()
+		playback_update(sdl.Uint64(now))
+		playback_publish(playhead.frame, sdl.Uint64(now))
+		audio_update()
+	}
+	// Dragging the playhead BACKWARD while playing forward. The device clock is a
+	// forward-only readout, so it is always ahead of a backward drag -- if the
+	// readout outranks the pointer, the playhead cannot be moved back at all
+	// during playback, which is what the user reported.
+	live_frame := playhead.frame
+	drag_to := live_frame / 2
+	sync.atomic_store(&audio_rpt.ph_src, 1)
+	playhead.frame = drag_to
+	active_interaction = .Playhead_Scrub
+	playhead_scrub.moved = true
+	playback_update(sdl.Uint64(monotonic_ns()))
+	if playhead.frame != drag_to {
+		fmt.printf(
+			"[ap] backward scrub: FAIL: playhead jumped %d -> %d (the device clock outranked the pointer at %d)\n",
+			drag_to, playhead.frame, live_frame,
+		)
+		return false
+	}
+	// Release commits the one position the drag landed on, and that position
+	// becomes the device clock's new baseline: the old forward position must not
+	// be adopted on the next tick and undo the drag a second time.
+	audio_seek(playhead.frame)
+	playback_update(sdl.Uint64(monotonic_ns()))
+	if playhead.frame != drag_to {
+		fmt.printf(
+			"[ap] backward scrub: FAIL: release re-adopted the stale clock %d -> %d\n",
+			drag_to, playhead.frame,
+		)
+		return false
+	}
+	fmt.printf("[ap] backward scrub: playhead held at %d while playing forward from %d\n", drag_to, live_frame)
+	active_interaction = .None
+	playhead_scrub.moved = false
+	// CONTENT, not state. Every assertion in this probe family so far checked
+	// state (next_frame rewound, queue dropped, decoder re-anchored) or timing
+	// (first PCM within N ms), and all of them passed while the engine was feeding
+	// the PRE-SCRUB position: the forward-hop guard read the stale dev_frame and
+	// jumped the producer straight back. State was correct and the sound was wrong,
+	// and no state assertion can tell the difference.
+	//
+	// The producer's own position is the content oracle here. The fixture is a
+	// steady 440 Hz tone with no transients, which is exactly why this has to be
+	// arithmetic on positions: every onset check would read the same at frame 14
+	// and frame 31. The feed trace under VYPER_PLAY_TRACE=1 prints the content
+	// sample range per block, which is how the defect was found; this pins the
+	// outcome so it cannot come back.
+	//
+	// The check has to happen on the FIRST feed pass after the seek, not later. A
+	// wrong producer position is not static: the forward-hop guard jumps it BACK to
+	// the pre-scrub frame and then it keeps advancing forward from there, so any
+	// later sample is indistinguishable from correct behaviour by position alone.
+	// Sampling after a few ticks reads "37, advancing forward" in both the broken
+	// and the fixed build -- which is how this probe passed against a broken engine
+	// the first time it was written.
+	//
+	// What is unambiguous is the producer's position at the earliest observable
+	// moment: it must be at the scrub target, because the feed target is derived
+	// from next_frame and the queue was just dropped.
+	content_ticks :: 40
+	// Zero the marker, then run the loop. The producer publishes the content sample
+	// of every block it feeds, so after one tick this holds the content the DEVICE
+	// was actually handed for the seek above -- the one number that distinguishes
+	// "played the scrubbed position" from "kept playing the old one", and which
+	// end-state inspection cannot reach because both end up advancing forward.
+	sync.atomic_store(&audio_rpt.last_fed_content, -1)
+	sync.atomic_store(&audio_rpt.last_fed_content_armed, true)
+	for _ in 0 ..< content_ticks {
+		sleep_ms(1)
+		now := monotonic_ns()
+		playback_update(sdl.Uint64(now))
+		playback_publish(playhead.frame, sdl.Uint64(now))
+		audio_update()
+	}
+	probe_fps := timeline_fps()
+	want_content := audio_frame_boundary48(drag_to, probe_fps)
+	live_content := audio_frame_boundary48(live_frame, probe_fps)
+	got_content := sync.atomic_load(&audio_rpt.last_fed_content)
+	fmt.printf(
+		"[ap] content: scrub to frame %d (content sample %d); producer last fed content sample %d; pre-scrub frame %d was content %d\n",
+		drag_to, want_content, got_content, live_frame, live_content,
+	)
+	// The fed content must be the scrubbed position, not the one it came from. A
+	// tolerance of a few ms covers the decoder's seek preroll, which deliberately
+	// lands EARLY; what must never happen is landing at the pre-scrub content,
+	// which is hundreds of frames away.
+	tolerance := i64(0.1 * f64(AUDIO_BUS_RATE))
+	if abs(got_content - want_content) > tolerance {
+		fmt.printf(
+			"[ap] content: FAIL: after scrubbing back to frame %d the engine fed content sample %d, which is the PRE-SCRUB position (frame %d, content %d). Audio plays from where it was dragged FROM.\n",
+			drag_to, got_content, live_frame, live_content,
+		)
+		return false
+	}
+	// SUSTAINED. Every assertion above is about the FIRST tick after the seek, and
+	// that is exactly the window where the engine looks correct: the producer
+	// re-anchors within a few ms of the resync. The symptom that survives all of
+	// them is playback that starts at the requested position and then slides back
+	// to where it was -- the stale clock winning a frame later, once the seek's
+	// protection has expired. So run the real loop for long enough to span several
+	// cushion refills and require the playhead to advance from the scrub TARGET the
+	// whole time, never resuming from the pre-scrub position.
+	settle_ticks :: 240 // ~1.2 s at 5 ms, several cushion refills
+	saw_max := drag_to
+	for t in 0 ..< settle_ticks {
+		sleep_ms(5)
+		now := monotonic_ns()
+		playback_update(sdl.Uint64(now))
+		playback_publish(playhead.frame, sdl.Uint64(now))
+		audio_update()
+		if playhead.frame < drag_to {
+			fmt.printf(
+				"[ap] sustained: FAIL: tick %d, playhead went BACKWARD below the scrub target: %d < %d\n",
+				t, playhead.frame, drag_to,
+			)
+			return false
+		}
+		saw_max = max(saw_max, playhead.frame)
+	}
+	// It must have actually MOVED ON from the target. A playhead frozen at the
+	// scrub position passes every "did not jump back" check above while being just
+	// as wrong -- the engine stalled instead of playing from it.
+	if saw_max <= drag_to {
+		fmt.printf(
+			"[ap] sustained: FAIL: playhead never advanced past the scrub target %d over %d ticks (stalled, not playing from it)\n",
+			drag_to, settle_ticks,
+		)
+		return false
+	}
+	// And it must be tracking the DEVICE, not drifting somewhere of its own. The
+	// earlier version of this assertion recomputed the expected frame from the wall
+	// clock and a nominal frame rate, which is the wrong oracle twice over: the
+	// loop's own per-tick cost makes the elapsed time not tick_count * 5ms, and the
+	// device is still holding pre-scrub audio for the first cushion after the seek.
+	// The device clock is the engine's own answer to "where is the sound", so the
+	// invariant is that the playhead FOLLOWS it, and that it only ever moves
+	// forward from the scrub target.
+	//
+	// What this cannot hide: if the producer had resumed from the pre-scrub
+	// position, dev_frame would report that position, the playhead would follow it
+	// faithfully, and this check would pass. The producer's own position is
+	// asserted separately by audio_backward_scrub.
+	dev_final := sync.atomic_load(&playback.dev_frame)
+	skew := playhead.frame - dev_final
+	fmt.printf(
+		"[ap] sustained: %d ticks after scrub to %d -> playhead %d, device %d, skew %+d (pre-scrub was %d)\n",
+		settle_ticks, drag_to, playhead.frame, dev_final, skew, live_frame,
+	)
+	// The playhead is derived from the device position, so the two may differ by
+	// one publish at most. Anything more means the playhead is running on its own
+	// clock, which is the architecture this replaced.
+	if abs(skew) > 2 {
+		fmt.printf(
+			"[ap] sustained: FAIL: playhead %d and device %d differ by %+d frames after a scrub to %d. The playhead is not following the audio.\n",
+			playhead.frame, dev_final, skew, drag_to,
+		)
+		return false
+	}
+	// And the whole point: playback continued FORWARD from the scrub target, so
+	// the position after 1.2 s must be beyond it and must NOT be back up at the
+	// pre-scrub position it was dragged away from.
+	if playhead.frame <= drag_to {
+		fmt.printf(
+			"[ap] sustained: FAIL: playhead %d after a scrub to %d did not advance\n",
+			playhead.frame, drag_to,
+		)
+		return false
+	}
+	if playhead.frame < live_frame - 2 {
+		fmt.printf(
+			"[ap] sustained: FAIL: playhead %d is back at/below the pre-scrub position %d; it resumed from where it was dragged FROM\n",
+			playhead.frame, live_frame,
+		)
+		return false
+	}
+	// Let the re-anchored producer refill and the clock catch up before the
+	// stop/restart case below, which needs a playhead that has really advanced.
+	for _ in 0 ..< 80 {
+		sleep_ms(5)
+		now := monotonic_ns()
+		playback_update(sdl.Uint64(now))
+		playback_publish(playhead.frame, sdl.Uint64(now))
+		audio_update()
+	}
+	stopped_frame := playhead.frame
+	if stopped_frame <= 0 {
+		fmt.println("[ap] restart: FAIL: playhead did not advance before stop")
+		return false
+	}
+	playhead.playing = false
+	preview.playing = false
+	audio_update()
+	sleep_ms(20)
+	// Move playhead backward while stopped, as in the user's repro. PlayPause's
+	// immediate device-clock read must not replace this selected frame with the
+	// previous run's stale dev_frame.
+	playhead.frame = 0
+	audio_seek(playhead.frame)
+	warm_provisions = audio_rpt.provisions
+	playhead.playing = true
+	preview.playing = true
+	// NO dev_frame seed here. toggle_playback seeds it in the app, but a probe that
+	// seeds the value under test is testing the seed, not the path: playback_update
+	// runs BEFORE audio_update on this tick, so with a stale dev_frame still ahead the
+	// playhead must survive that read on its own. Seeding it away made this assertion
+	// pass for the wrong reason -- the same mistake 5670ba9's probe made.
+	start_feed_frames = audio_rpt.total_fed_frames
+	start_ns = monotonic_ns()
+	playback_update(sdl.Uint64(start_ns))
+	if playhead.frame != 0 {
+		fmt.printf("[ap] restart: FAIL: playback clock rewound selected frame 0 to %d\n", playhead.frame)
+		return false
+	}
+	audio_update()
+	for audio_rpt.total_fed_frames == start_feed_frames &&
+	    monotonic_ns()-start_ns < u64(STARTUP_TIMEOUT_MS)*1_000_000 {
+		sleep_ms(1)
+	}
+	restart_ms := f64(monotonic_ns()-start_ns) / 1e6
+	if audio_rpt.total_fed_frames == start_feed_frames || audio_rpt.provisions != warm_provisions {
+		fmt.printf("[ap] restart: FAIL: PCM=%t provisions=%d->%d after %.1f ms\n", audio_rpt.total_fed_frames > start_feed_frames, warm_provisions, audio_rpt.provisions, restart_ms)
+		return false
+	}
+	fmt.printf("[ap] restart: resumed from selected frame 0 in %.1f ms without reopening sources\n", restart_ms)
+	// Continue settled forward playback for the existing edit-burst test.
+	for _ in 0 ..< 80 {
+		sleep_ms(5)
+		now := monotonic_ns()
+		playback_update(sdl.Uint64(now))
+		playback_publish(playhead.frame, sdl.Uint64(now))
+		audio_update()
+	}
 	// Let it settle into steady playback before the burst.
-	sleep_ms(700)
 	base := audio_rpt.provisions
 	fmt.printf("[ap] steady state: %d provisions\n", base)
 
@@ -834,23 +1114,54 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 		return false
 	}
 
-	// The queue-clear half of a resync cannot be asserted here: whether the queue
-	// holds anything is decided by the audio DEVICE, and this probe runs without
-	// one, so the producer never fills and next_frame never leaves 0. Asserting a
-	// counter that cannot move would be a test that passes for the wrong reason.
-	// The predicate that decides it is pure, so pin that directly -- and note it
-	// is half of a resync, the half a user actually hears.
-	probe_window_src.seg[0] = Play_Seg{start_a = 200, len_a = 240}
+	// The queue-clear half of a resync cannot be asserted through the live counter
+	// alone: whether the queue holds anything is decided by the audio DEVICE, so on
+	// a machine without one next_frame never leaves 0 and the counter cannot move.
+	// The predicate behind it is pure, so pin that directly -- and it is half of a
+	// resync, the half a user actually hears.
+	//
+	// The cases that matter are pairs: what the queued frames play BEFORE an edit
+	// against what they play AFTER. Identical mapping must NOT touch the window,
+	// because that is what makes an edit nobody can hear free -- trimming the far
+	// end of the clip the playhead is inside leaves everything under the queue
+	// exactly where it was. Anything that changes the content under those frames,
+	// or takes them away, must.
+	probe_window_src.seg[0] = Play_Seg {
+		start_a = 200, len_a = 240, start_s = 0, start_s_rate = 1.0, speed = 1.0,
+	}
 	probe_window_src.seg_count = 1
-	window_ok := !play_src_touches_window(&probe_window_src, 0, 8) &&
-		play_src_touches_window(&probe_window_src, 200, 208) &&
-		!play_src_touches_window(&probe_window_src, 440, 500) &&
-		play_src_touches_window(&probe_window_src, 430, 500)
+	// The window is the shape the producer actually runs in: it starts at the
+	// playhead and reaches past the end of the content, because the producer feeds
+	// ahead of what the device has played.
+	WINDOW_LO :: 0
+	WINDOW_HI :: 500
+	old_maps: [MAX_WINDOW_MAPS]Window_Map
+	old_n, old_ok := play_src_window_maps(&probe_window_src, WINDOW_LO, WINDOW_HI, old_maps[:])
+	// Every "after the edit" side below is the same clip as the old one, with only
+	// the field under test moved: how far it reaches into the window, where its
+	// content starts, how fast it plays.
+	same := [1]Window_Map{probe_window_map(200, 440, 0, 1.0)}
+	none := [1]Window_Map{}
+	moved := [1]Window_Map{probe_window_map(200, 440, 30, 1.0)}
+	faster := [1]Window_Map{probe_window_map(200, 440, 0, 2.0)}
+	shorter := [1]Window_Map{probe_window_map(200, 300, 0, 1.0)}
+	window_ok := old_n == 1 &&
+		old_ok &&
+		// unchanged, in a window that reaches past the clip: the queued audio is
+		// still right, so the queue must stay
+		!play_src_window_maps_differ(old_maps[:], old_n, same[:], 1, WINDOW_LO, WINDOW_HI) &&
+		// clip gone from the timeline, or newly covering the window
+		play_src_window_maps_differ(old_maps[:], old_n, none[:], 0, WINDOW_LO, WINDOW_HI) &&
+		play_src_window_maps_differ(none[:], 0, same[:], 1, WINDOW_LO, WINDOW_HI) &&
+		// content moved, sped up, or the clip's tail pulled back inside the window
+		play_src_window_maps_differ(old_maps[:], old_n, moved[:], 1, WINDOW_LO, WINDOW_HI) &&
+		play_src_window_maps_differ(old_maps[:], old_n, faster[:], 1, WINDOW_LO, WINDOW_HI) &&
+		play_src_window_maps_differ(old_maps[:], old_n, shorter[:], 1, WINDOW_LO, WINDOW_HI)
 	if !window_ok {
-		fmt.println("[ap] FAIL: the queued-window predicate disagrees about a segment spanning [200,440)")
+		fmt.println("[ap] FAIL: the queued-window predicate misreads an unchanged mapping, or misses one that changed")
 		return false
 	}
-	fmt.println("[ap] queued-window predicate ok (ahead / covering / behind / abutting)")
+	fmt.println("[ap] queued-window predicate ok (unchanged / removed / added / moved / sped / shortened)")
 
 	fmt.printf("[ap] reconcile: kept/decisions verified on the live producer\n")
 	return true
@@ -863,6 +1174,15 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 // third of a megabyte on the stack, and the zero value is already a correct
 // "one segment, no decoder" source.
 probe_window_src: Play_Src
+
+// probe_window_map builds the "after the edit" side of a queued-window comparison:
+// the same clip as probe_window_src, with only the window range it covers, where
+// its content starts, and how fast it plays moved.
+probe_window_map :: proc(lo, hi: i64, start_s: i64, speed: f64) -> Window_Map {
+	return Window_Map {
+		lo = lo, hi = hi, start_a = 200, start_s = start_s, start_s_rate = 1.0, speed = speed,
+	}
+}
 
 // audio_probe_geom_slab_handoff pins the producer/UI handoff on the geometry
 // slab. The producer does not read the slab for a moment -- it reads it for a
@@ -1475,10 +1795,9 @@ DRIFT_TOLERANCE :: f32(1e-3)
 // the one in the signal path. The decoder's own swr is 48k -> 48k and is a no-op, so
 // measuring that would report a comfortable zero and prove nothing.
 //
-// atempo: no API reports its lookahead, so an impulse is pushed through the real
-// graph and located by cross-correlation against the input. Broadband input, so the
-// correlation has ONE peak -- a pure tone would have a peak every period and locate
-// nothing, which is the mistake the drift fixture already made once.
+// atempo: no API reports its internal holdback, so deterministic sample accounting
+// compares pushed input with emitted output. Waveform cross-correlation is not a
+// measure here: WSOLA reassembles overlapping segments rather than delaying a copy.
 audio_probe_node_latency :: proc() -> bool {
 	fails := 0
 
@@ -1515,23 +1834,14 @@ audio_probe_node_latency :: proc() -> bool {
 	//    reciprocal of the one requested. A number that is earlier than causality
 	//    allows is a detector artefact, not a latency.
 	//
-	// So it is reported as unmeasured instead of published. The value is a
-	// prerequisite for scrubbing and clip stretching, both of which are seeks; a
-	// plausible wrong number here is worse than an absent one, because it would be
-	// compensated for and the compensation would be silently wrong.
+	// Neither metric is used as a compensation constant. The bus computes outstanding
+	// input dynamically from its cumulative counters, and the per-clip path starts with
+	// real content and tests sample zero directly; reporting an untrusted scalar as a
+	// correction would reintroduce the exact offset this gate removed.
 	//
-	// What it needs: a finer onset detector (window well under 128), a graph FLUSH so
-	// the tail is not mistaken for latency, and the reciprocal-rate relationship
-	// between atempo_rate_set's argument and the filter's actual factor pinned first
-	// -- because that relationship is itself load-bearing for the transport.
-	// A DENSE sweep, because atempo_lookahead_samples must be EXACT at every tempo the
-	// transport can ask for -- it sizes the priming discard, and an approximate discard
-	// is exactly the 12 ms residual this measurement was built to remove.
-	//
-	// The probe already learned this the hard way: four points with interpolation
-	// between them left intermediate rates off by up to 12 ms, because WSOLA's window
-	// does not vary linearly with tempo. Sweeping finely and carrying the measured
-	// table replaces a model with data.
+	// The sweep still pins throughput and repeatable holdback across all supported
+	// rates. No interpolated latency table survives: it was the source of the per-clip
+	// discard and was not converged between its four sample points.
 	SWEEP :: []f64{
 		0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5, 1.625,
 		1.75, 1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0,
@@ -1548,16 +1858,15 @@ audio_probe_node_latency :: proc() -> bool {
 		// 0.5 / 0.75 / 1.25 / 2.0 -- that is 1/rate to within a percent, which is
 		// exactly what the design intends.
 		delay_in := int((f64(in_frames)/rate - f64(out_frames)) * rate + 0.5)
-		// CONVERGENCE. Doubling the input must not change the answer. If it does, the
-		// graph has not drained and the number is really the push size, so it is
-		// reported as unconverged rather than entered in the table.
+		// Repeatability. Doubling input should settle to the same held-output estimate;
+		// if it does not, report both samples rather than treating either as a constant.
 		_, _, delay_long := measure_atempo_delay(rate, 384000)
 		converged := abs(delay_long - delay_in) <= 8
 		if converged {
-			fmt.printf("[ap] latency: TABLE %.6f, %d,\n", rate, delay_in)
+			fmt.printf("[ap] latency: stable %.6f, %d input samples held\n", rate, delay_in)
 		} else {
 			fmt.printf(
-				"[ap] latency: UNCONVERGED at %.2f -- %d then %d as input doubles; not entered in the table\n",
+				"[ap] latency: rate %.2f varies with push length -- %d then %d; no fixed compensation used\n",
 				rate, delay_in, delay_long,
 			)
 		}
@@ -1937,11 +2246,10 @@ audio_probe_clip_tempo :: proc() -> bool {
 	// PART 1: the isolated graph.
 	SPEEDS :: []f64{0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0}
 	//
-	// MEASURED BY DIFFERENCE, not by ratio. A single run's out/in is biased low by a
-	// FIXED number of output samples -- the priming discard, which exists precisely so
-	// the graph's lookahead does not offset the audio. Reading it as a ratio made every
-	// speed look 1-2% slow and would have sent me hunting for a tempo bug that is not
-	// there:
+	// MEASURED BY DIFFERENCE, not by ratio. A single run's out/in is biased low by the
+	// output samples still held inside WSOLA -- the graph's real lookahead, not a priming
+	// discard. Reading it as a ratio made every speed look 1-2% slow and would have sent
+	// me hunting for a tempo bug that is not there:
 	//
 	//     speed 1.0 -> 0.49600 instead of 0.50000   (2.5% low at 4.0, 1.1% at 0.5)
 	//
@@ -1950,7 +2258,7 @@ audio_probe_clip_tempo :: proc() -> bool {
 	//
 	//     factor = (out(N2) - out(N1)) / (N2 - N1)
 	//
-	// No model of the priming is needed, and nothing about WSOLA has to be assumed.
+	// No model of graph holdback is needed, and nothing about WSOLA has to be assumed.
 	fmt.println("[ap] tempo: isolated graph, (out(N2)-out(N1))/(N2-N1) must equal 1/speed")
 	N1, N2 := 192000, 576000
 	for speed in SPEEDS {
@@ -2020,76 +2328,30 @@ audio_probe_clip_tempo :: proc() -> bool {
 	return true
 }
 
-// content_consumed mixes `span_frames` of a clip at `speed` and returns how many
-// CONTENT samples it fed through its graph.
-//
-// It reads the source's own content_used counter rather than the decoder's frame
-// count, because content_used is what actually entered the graph; the decoder's count
-// includes read-ahead that may never be played, which at a chunked pump dominates a
-// short run and made a correct clip look several times off.
-content_consumed :: proc(path: cstring, content_frames: i64, span_frames: i64, speed: f64, fps: f64) -> i64 {
-	mix_clip_range(path, content_frames, span_frames, speed, fps)
-	if audio_src.count == 0 {
-		return 0
-	}
-	return audio_src.slots[0].content_used
-}
-
-// count_pulses mixes `frames` of a click-track clip at `speed` and returns how many
-// pulses the OUTPUT contains.
-//
-// Counted on the mixed output's envelope, one count per rising crossing above half
-// the window's peak, so it does not care about pulse SHAPE -- which matters because
-// atempo is WSOLA and resynthesises the waveform rather than passing it through. What
-// survives time-stretching is the RATE at which transients arrive, which is exactly
-// the quantity being measured.
-count_pulses :: proc(path: cstring, content_frames: i64, span_frames: i64, speed: f64, fps: f64) -> int {
-	out := mix_clip_range(path, content_frames, span_frames, speed, fps)
-	if len(out) == 0 {
-		return 0
-	}
-	mono := len(out) / 2
-	// Peak of the interior, so a silent lead-in cannot set the threshold to noise.
-	peak := f32(0)
-	for k in 0 ..< mono {
-		peak = max(peak, abs(out[k * 2]))
-	}
-	if peak <= 1e-5 {
-		return 0
-	}
-	thresh := peak * 0.5
-	// A refractory period stops one pulse being counted as several. It must exceed
-	// the PULSE WIDTH, not the interval between pulses: the fixture's clicks are 2 ms
-	// (96 samples) wide at 48 kHz, so a 64-sample refractory landed back inside the
-	// same pulse and counted every click TWICE -- which is why the unstretched
-	// reference read 80 instead of 40, and why the ratio came out 1.0 at every speed
-	// and looked like "the graph is not stretching" rather than "the counter is
-	// broken".
-	//
-	// 256 samples is comfortably above the 96-sample width and far below the fixture's
-	// 4800-sample interval, so it cannot merge two real clicks.
-	gap := 256
-	pulses := 0
-	since := gap
-	for i in 0 ..< mono {
-		if since < gap {
-			since += 1
-			continue
-		}
-		if out[i * 2] > thresh {
-			pulses += 1
-			since = 0
-		}
-	}
-	return pulses
-}
-
 // mix_clip_range_setup builds the single-clip timeline at `speed` and provisions it.
-mix_clip_range_setup :: proc(path: cstring, frames: i64, speed: f64) {
+audio_probe_timeline_reset :: proc() {
 	audio_reset_for_load()
 	audio_reset_play()
+	// These headless probes own their synthetic timeline. Replacing a populated
+	// dynamic array with make() leaked its backing storage (and every Track.clips
+	// allocation) on each speed/seek case.
+	for i in 0 ..< len(timeline.tracks) {
+		if timeline.tracks[i].clips != nil {
+			delete(timeline.tracks[i].clips)
+		}
+	}
+	if timeline.tracks != nil {
+		delete(timeline.tracks)
+	}
+	if timeline.track_order != nil {
+		delete(timeline.track_order)
+	}
 	timeline.tracks = make([dynamic]Track, 0, 1)
 	timeline.track_order = make([dynamic]int, 0, 1)
+}
+
+mix_clip_range_setup :: proc(path: cstring, frames: i64, speed: f64) {
+	audio_probe_timeline_reset()
 	track := Track {name = "tempo", clips = make([dynamic]Clip, 0, 1)}
 	append(
 		&track.clips,
@@ -2116,11 +2378,14 @@ mix_clip_range_setup :: proc(path: cstring, frames: i64, speed: f64) {
 
 // mix_clip_range mixes `frames` of a single clip at `speed` through the real playback
 // mixer and returns the interleaved output.
-mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, speed: f64, fps: f64, semitones: f32 = 0) -> [dynamic]f32 {
-	audio_reset_for_load()
-	audio_reset_play()
-	timeline.tracks = make([dynamic]Track, 0, 1)
-	timeline.track_order = make([dynamic]int, 0, 1)
+mix_clip_range :: proc(
+	path: cstring,
+	content_frames, span_frames: i64,
+	speed, fps: f64,
+	semitones: f32 = 0,
+	timeline_start: i64 = 0,
+) -> [dynamic]f32 {
+	audio_probe_timeline_reset()
 	track := Track {name = "tempo", clips = make([dynamic]Clip, 0, 1)}
 	append(
 		&track.clips,
@@ -2147,18 +2412,20 @@ mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, spe
 	audio_geometry_commit()
 	audio_reset_play()
 	audio_prod.last_ui_frame = -1
-	audio_provision(0)
+	audio_provision(timeline_start)
 	if audio_src.count == 0 {
 		return {}
 	}
 	out: [dynamic]f32
 	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
-	for f in 0 ..< span_frames {
+	for f in timeline_start ..< timeline_start + span_frames {
 		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(f+1, fps) - audio_frame_boundary48(f, fps))))
-		if audio_mix_frame(mix[:], f, spf) {
-			for i in 0 ..< spf * 2 {
-				append(&out, mix[i])
-			}
+		// Keep timeline duration even when a mixer frame has a decode hole. The mixer
+		// zeros its destination before attempting delivery; omitting false frames here
+		// compresses time and can move a later transient to output sample zero.
+		audio_mix_frame(mix[:], f, spf)
+		for i in 0 ..< spf * 2 {
+			append(&out, mix[i])
 		}
 	}
 	return out
@@ -2167,16 +2434,15 @@ mix_clip_range :: proc(path: cstring, content_frames: i64, span_frames: i64, spe
 // audio_probe_bus_prime asserts that the BUS atempo is ALIGNED: the first sample it
 // emits is the first sample fed, not the middle of the graph's warm-up.
 //
-// The bug this exists for was live in shipping code. `atempo_process` was called
-// directly on the mixed bus with no priming, so at any playback rate other than 1.0 the
-// entire stream came out up to ATEMPO_LOOKAHEAD_MAX_SAMPLES late -- 42.7 ms at rate
-// 0.5, 32 ms at 2.0. That is not a settling transient; it is a CONSTANT offset between
-// what the timeline says and what reaches the speaker, which is precisely the lip-sync
-// error the device-as-clock work exists to eliminate. Nothing measured it.
+// A failed attempt to "fix" that offset introduced it: synthetic silence was pushed
+// through a fresh atempo graph and output from the first real input was discarded.
+// FFmpeg already zero-pads its first WSOLA half-window and begins overlap-add at sample
+// zero. The producer must feed REAL input immediately and let the filter buffer until
+// it can emit that origin-aligned output.
 //
-// The measurement is alignment, not throughput: feed a click track and require the
-// first output transient to sit at the first input transient's position. Throughput was
-// already covered by audio_node_latency's accounting; what was missing is the phase.
+// The measurement is both origin alignment and clock conservation: feed a click track
+// and require its first output transient at sample 0, then account for graph-held input
+// as well as queued output when deriving the device's audible content position.
 audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 	g: Atempo_Graph
 	atempo_rate_set(&g, rate)
@@ -2184,6 +2450,7 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 		fmt.println("[ap] bus-prime: SKIP: no graph at this rate")
 		return true
 	}
+	defer atempo_graph_destroy(&g)
 
 	CLICK_MS :: 10
 	INPUT_SECONDS :: 3
@@ -2194,9 +2461,14 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 	sig: [4096 * 2]f32
 	// Heap: 1.5 MB on the stack is the same overflow risk as the one above.
 	out: []f32 = make([]f32, AUDIO_BUS_RATE * 8 * 2)
+	defer delete(out)
 	got := 0
-	primed := false
 	seed: u32 = 0x1234567
+	// Do not manually prefill the graph. FFmpeg's atempo initializes the leading
+	// half-window with zeros and labels its first overlap-add output at sample 0;
+	// the graph buffers enough REAL input before emitting it. A silence prefill
+	// advances the graph's input/output positions and the subsequent discard loses
+	// genuine opening audio. Test the graph's natural origin-preserving path.
 
 	for pushed := 0; pushed < total; {
 		n := min(2048, total - pushed)
@@ -2214,14 +2486,6 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 			sig[i * 2 + 0] = v
 			sig[i * 2 + 1] = v
 		}
-		if !primed {
-			atempo_prime(&g)
-			primed = true
-			// The primer's fill is discarded, so start reading output only after it.
-			g.out_n = 0
-			pushed += n
-			continue
-		}
 		atempo_process(&g, sig[:], n)
 		pushed += n
 		if g.out_n == 0 {
@@ -2230,7 +2494,7 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 		if got + g.out_n * 2 > len(out) {
 			break
 		}
-		copy(out[got:g.out_n * 2], g.out_buf[:g.out_n * 2])
+		copy(out[got:got+g.out_n*2], g.out_buf[:g.out_n*2])
 		got += g.out_n * 2
 	}
 	if got < click * 4 {
@@ -2238,15 +2502,12 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 		return true
 	}
 
-	first_in := first_onset(out[:got], 4)
+	first_in := first_onset(out[:got], 0)
 	fmt.printf("[ap] bus-prime: rate %.2f, first transient at output sample %d (want 0)\n", rate, first_in)
 	if first_in < 0 {
-		// No transient found. Reported as a SKIP rather than as an offset of "-1
-		// samples", which is the kind of nonsense number this session has produced too
-		// many of already: it happens at high rates where the primed silence plus
-		// WSOLA's segment repetition leaves nothing above threshold.
+		// No transient found. Report a SKIP rather than an offset of "-1 samples";
+		// an absent measurement is not evidence of alignment.
 		fmt.println("[ap] bus-prime: SKIP: no transient found in the output; cannot locate the offset")
-		atempo_graph_destroy(&g)
 		return true
 	}
 	if first_in != 0 {
@@ -2256,8 +2517,125 @@ audio_probe_bus_prime :: proc(path: string, rate: f64 = 2.0) -> bool {
 		)
 		return false
 	}
-	fmt.println("[ap] bus-prime: ok (aligned: first in is first out)")
-	atempo_graph_destroy(&g)
+	// The device clock must account for samples held INSIDE atempo, not only samples
+	// already queued with the device. Simulate half the graph output consumed: the
+	// audible content sample must be that consumed output count, mapped back through
+	// the graph rate. Without the pending-input term the playhead reports graph lookahead
+	// as already audible even though the device has not received it.
+	consumed_out := g.output_total / 2
+	queued_out := g.output_total - consumed_out
+	pending_in := atempo_pending_input_samples(&g)
+	audible := audio_device_audible_sample(
+		Sample_Pos(g.input_total), queued_out, rate, &g, pending_in,
+	)
+	want_audible := i64(f64(consumed_out) * rate + 0.5)
+	if abs(i64(audible)-want_audible) > 1 {
+		fmt.printf(
+			"[ap] bus-prime: FAIL: device clock %d samples, expected %d after consuming half of output at %.2fx\n",
+			audible, want_audible, rate,
+		)
+		return false
+	}
+	fmt.println("[ap] bus-prime: ok (sample origin aligned; queued + WSOLA-held time maps to device consumption)")
+	return true
+}
+
+// audio_probe_bus_rate_transition exercises the production rate-change path with a
+// simulated device. It changes 1x -> 2x -> 3x -> 1x while audio is queued and proves
+// each rebuild anchors at the current audible sample, clears old-rate PCM, and never
+// moves the published device playhead backwards.
+audio_probe_bus_rate_transition :: proc(path: string) -> bool {
+	path_buf: [4096]u8
+	path_n := min(len(path), len(path_buf) - 1)
+	for i in 0 ..< path_n {
+		path_buf[i] = u8(path[i])
+	}
+	path_buf[path_n] = 0
+
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] rate-transition: no fps")
+		return false
+	}
+	old_rate := playback.rate
+	defer playback.rate = old_rate
+
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	run_frames := i64(fps * 12.0)
+	track := Track{name = "rate-transition", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip{
+			clip_id = new_clip_id(),
+			path = cstring(&path_buf[0]),
+			kind = .Audio,
+			name = session_str_intern("rt"),
+			timeline_start_frame = 0,
+			source_length_frames = run_frames,
+			source_start_frame = 0,
+			stream_index = 0,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+
+	SIM_CAP :: i64(AUDIO_BUS_RATE * 4)
+	audio_device_sim_enable(SIM_CAP)
+	defer audio_device_sim_disable()
+	audio_reset_play()
+	audio_prod.last_ui_frame = -1
+	audio_provision(0)
+	if audio_src.count == 0 {
+		fmt.println("[ap] rate-transition: SKIP: no source provisioned")
+		return true
+	}
+	playback.rate = 1.0
+	playhead.frame = 0
+	playhead.playing = true
+	preview.playing = true
+
+	TICK_MS :: 5
+	TICKS :: 240
+	RATE_2X_TICK :: 60
+	RATE_3X_TICK :: 140
+	TICK_SAMPLES :: i64(AUDIO_BUS_RATE * TICK_MS / 1000)
+	prior_dev := sync.atomic_load(&playback.dev_frame)
+	rebuild_start := audio_rpt.rate_rebuilt
+	for t in 0 ..< TICKS {
+		if t == RATE_2X_TICK {
+			playback.rate = 2.0
+		} else if t == RATE_3X_TICK {
+			playback.rate = 3.0
+		}
+		if t == TICKS - 1 {
+			playback.rate = 1.0
+		}
+		audio_producer_feed()
+		audio_device_sim_consume(TICK_SAMPLES)
+		dev := sync.atomic_load(&playback.dev_frame)
+		if dev < prior_dev {
+			fmt.printf("[ap] rate-transition: FAIL: device frame moved backwards %d -> %d at tick %d\\n", prior_dev, dev, t)
+			return false
+		}
+		prior_dev = dev
+		// The signal is only asserted after each requested transition has had one
+		// producer pass; rate_rebuilt is the effect the clock must remain aligned to.
+		if (t == RATE_2X_TICK || t == RATE_3X_TICK || t == TICKS - 1) &&
+		   audio_rpt.rate_rebuilt < rebuild_start + u64(t == RATE_2X_TICK ? 1 : t == RATE_3X_TICK ? 2 : 3) {
+			fmt.printf("[ap] rate-transition: FAIL: rate rebuild missing at tick %d\\n", t)
+			return false
+		}
+	}
+	if audio_device_queued() <= 0 {
+		fmt.println("[ap] rate-transition: FAIL: no audio queued after final 1x rebuild")
+		return false
+	}
+	fmt.println("[ap] rate-transition: ok (1x -> 2x -> 3x -> 1x; audible frame monotonic)")
 	return true
 }
 
@@ -2297,6 +2675,443 @@ first_onset :: proc(buf: []f32, refractory_frames: int) -> int {
 	return -1
 }
 
+// audio_probe_clip_tempo_alignment proves per-clip output ring begins at the timeline
+// sample mapped from content zero. The fixture starts with a pulse at source sample 0;
+// any interpolated lookahead discard or a pump that bypasses the provisioned fifo moves
+// or deletes that pulse.
+audio_probe_clip_tempo_alignment :: proc(path: string, speed: f64) -> bool {
+	defer audio_probe_timeline_reset()
+	fps := timeline_fps()
+	if fps <= 0 || speed <= 0 {
+		fmt.println("[ap] clip-alignment: invalid fps or speed")
+		return false
+	}
+	content_frames := i64(fps * 4.0)
+	clip := Clip{source_length_frames = content_frames, speed = speed}
+	span_frames := clip_timeline_length(&clip)
+	path_buf: [4096]u8
+	assert(len(path) < len(path_buf), "audio_probe_clip_tempo_alignment: path buffer overflow")
+	path_n := len(path)
+	for i in 0 ..< path_n {
+		path_buf[i] = u8(path[i])
+	}
+	path_buf[path_n] = 0
+	// Check both clip opening and an interior seek. The pulse interval is 125 ms, and
+	// the interior seek is at 0.5 s; for every tested speed, the sought content time is
+	// an exact multiple of the pulse interval. Thus the expected transient is output 0
+	// at both origins, without relying on a fuzzy waveform correlation.
+	for timeline_start in ([]i64{0, i64(fps * 0.5)}) {
+		out := mix_clip_range(
+			cstring(&path_buf[0]), content_frames, span_frames, speed, fps, 0, timeline_start,
+		)
+		if len(out) == 0 {
+			delete(out)
+			fmt.printf("[ap] clip-alignment: FAIL: speed %.3f at frame %d produced no output\n", speed, timeline_start)
+			return false
+		}
+		first := first_onset(out[:], 0)
+		delete(out)
+		fmt.printf(
+			"[ap] clip-alignment: speed %.3f seek frame %d first content transient at output sample %d (want 0)\n",
+			speed, timeline_start, first,
+		)
+		if first != 0 {
+			fmt.printf("[ap] clip-alignment: FAIL: speed %.3f seek frame %d moved opening content by %d output samples\n", speed, timeline_start, first)
+			return false
+		}
+	}
+	fmt.println("[ap] clip-alignment ok (opening and seek output zero map to requested content)")
+	return true
+}
+
+// audio_probe_backward_scrub_seeks proves that a playhead move actually MOVES THE
+// AUDIO, which is a different question from whether the playhead line moves.
+//
+// The reported symptom is "I can move the playhead, but playback isn't set to it":
+// the on-screen playhead follows the pointer while the sound keeps coming from
+// where the producer last fed. Those are two different pieces of state --
+// playhead.frame, and audio_src.next_frame / the decoder anchors -- and a probe
+// that only reads the first cannot see the second fail.
+//
+// A backward scrub is the case that separates them. Forward playback keeps
+// playhead.frame and next_frame moving together for free, because the device
+// clock pulls the playhead along behind the producer. Only a move AGAINST the
+// producer's direction needs an explicit rewind, and only a backward move can
+// land somewhere the producer has already fed past.
+audio_probe_backward_scrub_seeks :: proc(path: string) -> bool {
+	defer audio_probe_timeline_reset()
+	fmt.println("[ap] --- backward scrub moves the audio ---")
+	audio_reset_play()
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+	// One long clip, so "the playhead is at frame N" and "the audio under frame
+	// N" are the same statement for every N in range -- a multi-clip fixture
+	// would let a Keep decision be correct for the wrong reason.
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "t", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = cpath,
+			kind = .Audio,
+			name = session_str_intern("scrub"),
+			timeline_start_frame = 0,
+			source_length_frames = 900,
+			source_start_frame = 0,
+			stream_index = 0,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+	audio_prod.last_ui_frame = -1
+
+	// audio_init reads VYPER_AUDIO_TRACE, but every VYPER_AUDIO_* probe is
+	// dispatched BEFORE audio_init runs, so the flag is never set here and the
+	// [tr feed] lines -- which print devpos, target, queue depth and push size,
+	// i.e. every number this probe is reasoning about -- are off. Read the same
+	// env var the init path does rather than duplicating the flag's meaning.
+	saved_trace := audio_rpt.trace
+	audio_rpt.trace = os.get_env_alloc("VYPER_AUDIO_TRACE", context.temp_allocator) == "1"
+	defer audio_rpt.trace = saved_trace
+	// Simulated device: the assertion is about where the producer is AIMED, and
+	// a real device's consumption would make the target move under the test.
+	SIM_CAP :: i64(AUDIO_BUS_RATE * 8)
+	audio_device_sim_enable(SIM_CAP)
+	defer audio_device_sim_disable()
+	playback.rate = 1.0
+	playback.dir = 1
+	playhead.frame = 0
+	playhead.playing = true
+	preview.playing = true
+
+	// Drive the producer FAR ahead of the playhead: the state playback actually
+	// reaches, and the one a scrub has to undo. Simply filling and stopping parks
+	// the producer one cushion ahead, which is NOT far enough to tell the
+	// steady-state cushion from a playhead that moved elsewhere -- at 60 fps the
+	// cushion is 16 frames, so a producer at 15 makes every scrub read as steady
+	// state and the probe passes having tested nothing. That is exactly how this
+	// probe passed against the broken engine.
+	fps_fwd := timeline_fps()
+	// Each pass consumes exactly one timeline frame's worth of samples, so the
+	// audible position advances in step with real playback and the producer is free
+	// to follow it. The playhead is then left BEHIND the audible position by the
+	// scrub distance, which is the whole condition under test: the playhead says
+	// frame N while the sources are at N + distance, which is precisely what a
+	// backward scrub leaves behind and what the predicate has to notice.
+	// Consume BEFORE feeding. dev_pos -- the fill target -- is derived from what the
+	// device has already heard, so consuming first is what moves the target; feeding
+	// first fills to the old target and the ring overflows, because the producer
+	// throttles to a cushion that is only reached once the device drains. One frame
+	// per pass is exactly real time, so the audible position advances in step and
+	// the sources follow it forward.
+	frame_samples := i64(f64(AUDIO_BUS_RATE) / f64(fps_fwd))
+	PLAY_AHEAD_FRAMES :: 400
+	for _ in 0 ..< PLAY_AHEAD_FRAMES {
+		audio_device_sim_consume(frame_samples)
+		audio_producer_feed()
+	}
+	prod_before := audio_src.next_frame
+	queued_before := audio_device_queued()
+	// first48 is the content sample at the decoder fifo's head, i.e. where the
+	// sound is currently coming FROM. Recorded before the seek so assertion (3)
+	// can compare against what it was, not just against a computed target: the
+	// seek deliberately lands early (AUDIO_SEEK_PREROLL_SEC) because a demuxer
+	// can land late, so an exact match is the wrong expectation and "did it move
+	// back roughly as far as the playhead" is the real one.
+	anchor_before := audio_src.slots[0].first48
+	fmt.printf(
+		"[ap] scrub fixture: producer fed to %d, device holds %d queued frames, playhead 0\n",
+		prod_before,
+		queued_before,
+	)
+	if prod_before <= 0 || queued_before <= 0 {
+		fmt.println("[ap] scrub: SKIP: nothing fed; the fixture did not establish a real queue")
+		return true
+	}
+
+	// The scrub, BACKWARD: release behind everything the producer fed. The target
+	// is derived from where the fixture actually got rather than hardcoded,
+	// because "behind" is the entire premise -- a hardcoded frame is a forward
+	// seek whenever the fixture under-fills, and a forward seek passes with the
+	// rewind removed. The premise is asserted rather than hoped for.
+	// Steady state first: the producer deliberately runs AUDIO_CUSHION_SEC ahead of
+	// the audible position, so a healthy playhead and producer differ by exactly
+	// that and that difference must NOT read as a playhead move. Getting this wrong
+	// in the other direction re-anchors on every edit.
+	probe_fps := timeline_fps()
+	cushion := i64(AUDIO_CUSHION_SEC * f64(probe_fps) * audio_rate_scale() + 1)
+	steady := prod_before - cushion
+	if steady < 1 {
+		fmt.printf("[ap] stale anchor: SKIP: producer only reached %d, no room for a cushion\n", prod_before)
+		return true
+	}
+	playhead.frame = steady
+	if audio_reconcile_is_seeked(steady, probe_fps, audio_rate_scale()) {
+		fmt.printf(
+			"[ap] stale anchor: FAIL: a playhead %d with the producer %d ahead -- the steady-state cushion -- read as a playhead move. Every edit would re-anchor.\n",
+			steady, prod_before,
+		)
+		return false
+	}
+	fmt.printf(
+		"[ap] stale anchor: steady state playhead %d, producer %d (cushion %d) reads as NOT a seek\n",
+		steady, prod_before, cushion,
+	)
+	// THE STALE ANCHOR: the case the user's trace showed, and the one a
+	// request-versus-request comparison cannot see. Nothing seeks during ordinary
+	// forward playback, so audio_prod.anchor_frame sits at wherever the last seek
+	// left it while the sources play forward hundreds of frames past it. Point the
+	// anchor at the frame we are about to scrub back to, so the move cannot be
+	// detected by noticing that the requested frame changed.
+	//
+	// Measured on the user's run: anchor 57, playhead 198 -> 203, producer 218, then
+	// a scrub back to 57. The old predicate compared the new request against the
+	// remembered one, saw 57 == 57, and kept all 25 sources with 161 frames of
+	// pre-scrub audio queued. Every earlier version of this probe scrubbed to a
+	// frame the anchor did not already hold, so the fixture was arranged to make
+	// the bug invisible.
+	seek_to := max(1, steady / 3)
+	sync.atomic_store(&audio_prod.anchor_frame, seek_to)
+	if !audio_reconcile_is_seeked(seek_to, probe_fps, audio_rate_scale()) {
+		fmt.printf(
+			"[ap] stale anchor: FAIL: playhead %d with the producer %d frames ahead read as stationary, because the requested anchor already held %d\n",
+			seek_to, prod_before, seek_to,
+		)
+		return false
+	}
+	fmt.printf(
+		"[ap] stale anchor: anchor already reads %d, producer at %d, playhead moved to %d -- read as a seek\n",
+		seek_to, prod_before, seek_to,
+	)
+	if seek_to >= prod_before {
+		fmt.printf(
+			"[ap] scrub: SKIP: producer only reached %d, cannot scrub back from it to %d\n",
+			prod_before,
+			seek_to,
+		)
+		return true
+	}
+	playhead.frame = seek_to
+	audio_seek(seek_to)
+	// The seek decision comes from audio_reconcile_is_seeked, the same function the
+	// producer thread calls, so the probe cannot pass by handing the reconcile a
+	// flag the engine would never compute for itself.
+	rep := audio_reconcile(seek_to, audio_reconcile_is_seeked(seek_to, timeline_fps(), audio_rate_scale()))
+
+	prod_after := audio_src.next_frame
+	// (1) The producer must be rewound to the playhead. Carrying on from
+	// next_frame would skip exactly the range the user scrubbed back over, and
+	// the audio would resume mid-clip with no indication why.
+	if audio_src.next_frame != seek_to {
+		fmt.printf(
+			"[ap] scrub: FAIL: producer still at %d after seeking back to %d (touched_window=%v kept it there)\n",
+			audio_src.next_frame,
+			seek_to,
+			rep.touched_window,
+		)
+		return false
+	}
+	// (2) The queue must be dropped. It holds audio for frames 0..N and the
+	// playhead is now at 30; keeping it plays the old position out loud for the
+	// length of the cushion, which is the audible half of "playback isn't set to
+	// the playhead".
+	//
+	// The reconcile REPORTS that decision and the producer thread CARRIES it out,
+	// so the probe asserts the report and then performs the same clear. Asserting
+	// only one of the two would test half the chain: a reconcile that reported
+	// touched and a producer that ignored it both look like "nothing happened"
+	// here.
+	if !rep.touched_window {
+		fmt.printf(
+			"[ap] scrub: FAIL: reconcile did not report the queued window touched on a playhead move (kept +%d sought +%d)\n",
+			rep.kept,
+			rep.sought,
+		)
+		return false
+	}
+	audio_device_clear()
+	if audio_device_queued() != 0 {
+		fmt.printf(
+			"[ap] scrub: FAIL: clearing the reported-stale queue left %d frames behind\n",
+			audio_device_queued(),
+		)
+		return false
+	}
+	// (3) The decoder must sit at the content for the new playhead, not merely
+	// survive. A source kept at its old content plays the right TIMING with the
+	// wrong SOUND, which is worse than an obvious failure.
+	seg := play_src_first_seg_at(&audio_src.slots[0], seek_to)
+	if seg == nil {
+		fmt.println("[ap] scrub: FAIL: no segment covers the seek target after reconcile")
+		return false
+	}
+	want_content := i64(
+		audio_content_sample_at_speed(
+			max(seek_to, seg.start_a) - seg.start_a,
+			seg.start_s,
+			seg.start_s_rate,
+			seg.speed,
+		),
+	)
+	anchor_after := audio_src.slots[0].first48
+	// The preroll window is what a correct seek is allowed to overshoot by; past
+	// it the decoder is demonstrably not at the requested content.
+	preroll_48 := i64(AUDIO_SEEK_PREROLL_SEC * f64(AUDIO_BUS_RATE))
+	if abs(anchor_after - want_content) > preroll_48 {
+		fmt.printf(
+			"[ap] scrub: FAIL: decoder head at content %d, want %d (preroll %d) for playhead %d; it was at %d and did not move\n",
+			anchor_after,
+			want_content,
+			preroll_48,
+			seek_to,
+			anchor_before,
+		)
+		return false
+	}
+	if anchor_after >= anchor_before {
+		fmt.printf(
+			"[ap] scrub: FAIL: decoder head did not move back (%d -> %d) seeking from playhead 0 to %d\n",
+			anchor_before,
+			anchor_after,
+			seek_to,
+		)
+		return false
+	}
+	// (4) And the next feed must actually produce the new position's audio,	// rather than only the state being correct. The state assertions above can
+	// all pass while the mixer reads a stale ring.
+	after_probe_frames := audio_src.next_frame
+	audio_producer_feed()
+	if audio_src.next_frame <= after_probe_frames {
+		fmt.printf(
+			"[ap] scrub: FAIL: producer made no progress from the seek target (%d)\n",
+			audio_src.next_frame,
+		)
+		return false
+	}
+	// prod_after is the post-RECONCILE position, captured before assertion (4)
+	// feeds from it -- printing audio_src.next_frame here would report the
+	// position the feed reached, which is a different number and reads as if the
+	// rewind overshot.
+	fmt.printf(
+		"[ap] scrub: playhead -> %d rewound producer %d -> %d, dropped %d queued frames, re-anchored decoder to content %d\n",
+		seek_to,
+		prod_before,
+		prod_after,
+		queued_before,
+		anchor_after,
+	)
+	fmt.println("[ap] scrub ok (playhead move reaches the producer, the queue, and the decoder)")
+	return true
+}
+
+// audio_probe_clip_tempo_edit_alignment changes an ALREADY-PROVISIONED source from
+// 1x to 2x at a nonzero playhead. This exercises geometry publication, source
+// reconciliation, graph rebuild, decoder seek, and output-ring origin together --
+// the inspector's real speed-edit path, not just a fresh clip provisioned at 2x.
+audio_probe_clip_tempo_edit_alignment :: proc(path: string) -> bool {
+	defer audio_probe_timeline_reset()
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] clip-edit-alignment: no fps")
+		return false
+	}
+	content_frames := i64(fps * 4.0)
+	start_frame := i64(fps * 0.5)
+	// Frames the device queue is pretended to hold ahead of the playhead, so the
+	// queued-window half of the edit has a window to decide about.
+	QUEUED_PROBE_FRAMES :: 8
+	path_buf: [4096]u8
+	assert(len(path) < len(path_buf), "audio_probe_clip_tempo_edit_alignment: path buffer overflow")
+	path_n := len(path)
+	for i in 0 ..< path_n {
+		path_buf[i] = u8(path[i])
+	}
+	path_buf[path_n] = 0
+	mix_clip_range_setup(cstring(&path_buf[0]), content_frames, 1.0)
+	if audio_src.count != 1 || len(timeline.tracks) == 0 || len(timeline.tracks[0].clips) == 0 {
+		fmt.println("[ap] clip-edit-alignment: FAIL: source did not provision at 1x")
+		return false
+	}
+	// Both reconciles below are EDITS at a fixed playhead, which is what an
+	// inspector speed/pitch change is. audio_reconcile_is_seeked decides that from
+	// the engine's own state rather than the probe asserting it. The queued position
+	// is placed a cushion ahead of the playhead first, which is the steady state --
+	// an edit made with the producer parked hundreds of frames away is not an edit,
+	// it is an unfollowed playhead move, and the predicate is right to say so.
+	audio_src.next_frame = start_frame + QUEUED_PROBE_FRAMES
+	timeline.tracks[0].clips[0].speed = 2.0
+	audio_geometry_commit()
+	rep := audio_reconcile(
+		start_frame,
+		audio_reconcile_is_seeked(start_frame, fps, audio_rate_scale()),
+	)
+	if rep.sought == 0 || audio_src.slots[0].speed != 2.0 {
+		fmt.printf(
+			"[ap] clip-edit-alignment: FAIL: speed edit did not rebuild source (sought=%d, speed=%.3f)\n",
+			rep.sought, audio_src.slots[0].speed,
+		)
+		return false
+	}
+	// Pin the queue half of a rate edit too, with a real queue: pitch moves every
+	// output sample without moving any content, so the mapping under the queued
+	// frames is identical before and after and only the graph change marks the
+	// queue stale. Miss that and a pitch edit leaves up to a cushion of audio
+	// playing at the old pitch.
+	audio_src.next_frame = start_frame + QUEUED_PROBE_FRAMES
+	timeline.tracks[0].clips[0].pitch = 5.0
+	audio_geometry_commit()
+	pitch_rep := audio_reconcile(
+		start_frame,
+		audio_reconcile_is_seeked(start_frame, fps, audio_rate_scale()),
+	)
+	want_pitch_ratio := semitones_to_ratio(5.0)
+	if pitch_rep.sought == 0 || abs(f64(audio_src.slots[0].pitch_ratio-want_pitch_ratio)) > 1e-6 {
+		fmt.printf("[ap] clip-edit-alignment: FAIL: pitch edit did not rebuild graph (sought=%d, ratio=%.6f want %.6f)\n", pitch_rep.sought, audio_src.slots[0].pitch_ratio, want_pitch_ratio)
+		return false
+	}
+	if !pitch_rep.touched_window {
+		fmt.println("[ap] clip-edit-alignment: FAIL: pitch edit left the queued frames marked current -- they were mixed by the old graph")
+		return false
+	}
+	spf := int(audio_frame_boundary48(start_frame+1, fps) - audio_frame_boundary48(start_frame, fps))
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	if !audio_mix_frame(mix[:], start_frame, spf) {
+		fmt.println("[ap] clip-edit-alignment: FAIL: edited source delivered no frame")
+		return false
+	}
+	first := first_onset(mix[:spf*2], 0)
+	fmt.printf("[ap] clip-edit-alignment: 1x -> 2x at frame %d, first pulse at output sample %d (want 0)\n", start_frame, first)
+	if first != 0 {
+		fmt.println("[ap] clip-edit-alignment: FAIL: speed edit moved the interior seek's content origin")
+		return false
+	}
+	// Pitch is the other graph property edited from the inspector. It does not change
+	// content position or timeline length, but it still must rebuild the per-source
+	// graph at the current playhead rather than leaving the old pitch ratio live --
+	// and the pitched output must still start on the content sample it was seeked to.
+	if !audio_mix_frame(mix[:], start_frame, spf) {
+		fmt.println("[ap] clip-edit-alignment: FAIL: pitched source delivered no frame")
+		return false
+	}
+	first = first_onset(mix[:spf*2], 0)
+	if first != 0 {
+		fmt.printf("[ap] clip-edit-alignment: FAIL: pitch edit moved content origin to sample %d\n", first)
+		return false
+	}
+	fmt.println("[ap] clip-edit-alignment ok (speed and pitch edits rebuild at audible playhead)")
+	return true
+}
+
 // audio_probe_clip_pitch proves the pitch property SHIFTS, and that it does so the way
 // the model promises: frequency moves, duration does not.
 //
@@ -2322,11 +3137,13 @@ audio_probe_clip_pitch :: proc(path: string, semitones: f32 = 12.0) -> bool {
 	span := frames
 
 	base := render_pitch_span(cpath_ref(path), frames, span, 0.0)
+	defer delete(base)
 	if len(base) == 0 {
 		fmt.println("[ap] pitch: SKIP: reference produced nothing (fixture should be a tone)")
 		return true
 	}
 	shifted := render_pitch_span(cpath_ref(path), frames, span, semitones)
+	defer delete(shifted)
 	if len(shifted) == 0 {
 		fmt.println("[ap] pitch: FAIL: the pitched render produced nothing at all")
 		return false

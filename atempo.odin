@@ -35,6 +35,10 @@ import avutil "vendor/ffmpeg/avutil"
 // ATEMPO_MAX_STAGES caps the chained atempo filters. Selected rates are <= 4.0
 // (two stages), but the cap is generous for future rates.
 ATEMPO_MAX_STAGES :: 8
+// FFmpeg n9.0.2 permits atempo tempo [0.5, 100]. Single-stage execution is
+// preferred for WSOLA accuracy; these bounds are only the decomposition fallback.
+ATEMPO_CHAIN_MIN_TEMPO :: 0.5
+ATEMPO_CHAIN_MAX_TEMPO :: 2.0
 
 // ATEMPO_IN_POOL is the number of refcounted staging frames for input. We
 // round-robin them so we never clobber a frame the graph still holds; atempo
@@ -84,25 +88,12 @@ Atempo_Graph :: struct {
 	// contiguous view, not one buffer ref per atempo output frame.
 	out_buf: [ATEMPO_OUT_CAP]f32,
 	out_n:   int, // stereo frames currently in out_buf
-	// primed is false until the graph has been filled past its lookahead. WSOLA cannot
-	// emit anything until it has that much context, so a freshly built graph's first
-	// outputs are the graph FILLING rather than the content that was fed -- which puts
-	// the whole stream late by up to ATEMPO_LOOKAHEAD_MAX_SAMPLES (42.7 ms at 48 kHz).
-	//
-	// Cleared by every build, so a rate change re-primes: the new chain has a different
-	// window, and skipping that is how a rate change used to shift content mid-playback.
-	// The per-clip tempo pump has its own priming because it runs continuously; this
-	// one is a single pass after each build.
-	primed: bool,
-	// discard_next is how many output samples the NEXT real push must throw away.
-	//
-	// Priming with silence is not by itself enough. After L samples of silence the
-	// graph's window is full, so its next outputs correspond to input at L -- meaning
-	// the first REAL sample would still arrive L/rate late. Priming has to be followed
-	// by discarding the output that corresponds to the priming region, and doing that
-	// inside atempo_process is what makes it impossible for a caller to forget: the
-	// graph owns its own alignment rather than relying on every call site to know.
-	discard_next: int,
+	// Cumulative graph-domain sample frames since build. For the live transport,
+	// input_total - output_total*rate is content still held inside WSOLA. The device
+	// clock subtracts that holdback as well as output still queued at the device, so
+	// dev_frame follows audible content rather than input already accepted by graph.
+	input_total:  i64,
+	output_total: i64,
 }
 
 // atempo_new_frame allocates one refcounted stereo FLT frame with an
@@ -153,6 +144,8 @@ atempo_graph_destroy :: proc(g: ^Atempo_Graph) {
 	}
 	g.n_stages = 0
 	g.out_n = 0
+	g.input_total = 0
+	g.output_total = 0
 	g.in_pool_i = 0
 	g.rate = 1.0
 }
@@ -185,8 +178,6 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 	atempo_graph_destroy(g)
 	g.rate = rate
 	g.pitch_ratio = pitch_ratio
-	g.primed = false
-	g.discard_next = 0
 	if (rate <= 0.0 || rate == 1.0) && pitch_ratio == 1.0 {
 		return // identity: skip the whole graph
 	}
@@ -246,32 +237,25 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 		prev_pitch = res_ctx
 	}
 
-	// atempo stages. Each instance time-stretches by a multiplicative factor in
-	// [0.5, 2.0]. Rate > 2.0 chains ceil over full 2.0 stages and one remainder
-	// stage for the leftover fraction: 2.5x = 2.0 x 1.25, never 2.0 + 0.5
-	// (adding would cancel to 1.0x). Selected rates are <= 4.0 -> at most two
-	// stages.
+	// Fallback decomposition into per-stage factors. Multiply stages, never add:
+	// 2.5x = 2.0 x 1.25, not 2.0 + 0.5 (which cancels to 1.0x).
 	n_full := 0
 	rem := rate
-	for rem > 2.0 {
+	for rem > ATEMPO_CHAIN_MAX_TEMPO {
 		n_full += 1
-		rem /= 2.0
+		rem /= ATEMPO_CHAIN_MAX_TEMPO
 	}
-	// The same problem in the other direction, which is what a FAST clip asks for.
-	// `rate` here is atempo's TEMPO, and atempo's tempo IS the speed multiplier: a clip
-	// at speed S passes tempo=S, not 1/S. S = 4 gives tempo 4.0, outside atempo's
-	// per-stage [0.5, 2.0]. The graph would
-	// create the stage, libavfilter would refuse the option ("Numerical result out
-	// of range"), and the clip would produce NO SAMPLES AT ALL.
+	// The same decomposition in the other direction. `rate` is atempo's TEMPO and
+	// atempo's tempo IS the speed multiplier: a clip at speed S passes tempo=S, not 1/S.
 	//
-	// So chain full 0.5 stages upward, exactly mirroring the 2.0 case:
+	// For a tempo below the minimum, chain full 0.5 stages upward:
 	// 4.0 = 0.5 x 0.5 x 2.0 x 2.0. Multiplying is the only composition that works -- adding
 	// would cancel toward 1.0 and silently play the wrong speed, which is the whole
 	// failure mode this guards against.
 	n_slow := 0
-	for rem < 0.5 {
+	for rem < ATEMPO_CHAIN_MIN_TEMPO {
 		n_slow += 1
-		rem /= 0.5
+		rem /= ATEMPO_CHAIN_MIN_TEMPO
 	}
 	if n_slow > 0 && g.n_stages+n_slow+n_full >= ATEMPO_MAX_STAGES {
 		fmt.printf("[atempo] too many stages for rate %.3f\n", rate)
@@ -287,10 +271,10 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 	//
 	// TRY ONE STAGE FIRST, before any chaining.
 	//
-	// atempo's accepted tempo range is a property of the FFmpeg BUILD, not a constant.
-	// The vendored 9.0.2 accepts a single stage at tempo 4.0; the [0.5, 2.0] rule the
-	// chaining below implements is the old cap, carried here as an assumption. So ask
-	// for one stage at the requested tempo and chain only if the build refuses it.
+	// The vendored 9.0.2 accepts a single stage up to tempo 100. For rates at/above
+	// the documented minimum, try one stage and chain only if this build refuses it.
+	// Below the minimum, decompose directly rather than asking libavfilter for a known
+	// invalid tempo and printing an error on every graph rebuild.
 	//
 	// This is an ACCURACY fix, not just a compatibility one. Chaining compounds WSOLA's
 	// per-stage segment rounding, and audio_probe_clip_tempo measures the damage:
@@ -302,14 +286,16 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 	// 0.8% is 4.8 s of drift across a 10-minute clip, which is audible and unacceptable
 	// in an editor. One stage at 4.0 measures exact, so the chaining path survives only
 	// as the fallback for a build that cannot take a single stage.
-	rate_buf: [32]u8
-	fmt.bprintf(rate_buf[:], "tempo=%f", rate)
-	single := atempo_link_stage(graph, prev_pitch, "atempo", cstring("atempo0"), cstring(raw_data(rate_buf[:])))
-	if single != nil {
-		g.stages[g.n_stages] = single
-		g.n_stages += 1
-		atempo_finish(graph, g, single)
-		return
+	if rate >= ATEMPO_CHAIN_MIN_TEMPO {
+		rate_buf: [32]u8
+		fmt.bprintf(rate_buf[:], "tempo=%f", rate)
+		single := atempo_link_stage(graph, prev_pitch, "atempo", cstring("atempo0"), cstring(raw_data(rate_buf[:])))
+		if single != nil {
+			g.stages[g.n_stages] = single
+			g.n_stages += 1
+			atempo_finish(graph, g, single)
+			return
+		}
 	}
 
 	prev_slow := prev_pitch
@@ -452,6 +438,7 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 		g.out_n = 0
 		return
 	}
+	g.input_total += i64(n)
 
 	// Drain every output frame the graph produced from this push.
 	out_n := 0
@@ -480,16 +467,23 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 		mem.copy(&g.out_buf[out_n * 2], src_ptr, count * 2 * size_of(f32))
 		out_n += count
 	}
-	if g.discard_next > 0 && out_n > 0 {
-		skip := min(g.discard_next, out_n)
-		keep := out_n - skip
-		if keep > 0 {
-			copy(g.out_buf[:keep * 2], g.out_buf[skip * 2:out_n * 2])
-		}
-		g.discard_next -= skip
-		out_n = keep
-	}
 	g.out_n = out_n
+	g.output_total += i64(out_n)
+}
+
+// atempo_pending_input_samples returns content accepted by the graph but not yet
+// represented in output. The device clock subtracts this algorithmic holdback along
+// with output samples that the device has not consumed yet.
+//
+// atempo tempo `r` emits out/in = 1/r, therefore output_total*r input samples are
+// represented. Their difference from input_total is the graph's current holdback,
+// measured from actual cumulative counts rather than a rate lookup table.
+atempo_pending_input_samples :: proc(g: ^Atempo_Graph) -> i64 {
+	if g.graph == nil || g.rate <= 0 {
+		return 0
+	}
+	pending := f64(g.input_total) - f64(g.output_total) * g.rate
+	return max(0, i64(pending + 0.5))
 }
 
 // atempo_rate_set ensures the graph matches `rate` (rebuilt when it changes).
@@ -523,112 +517,11 @@ atempo_rate_set :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) -> 
 	return false
 }
 
-// ATEMPO_LOOKAHEAD_MAX_SAMPLES is the largest lookahead the graph holds back,
-// measured by audio_probe_node_latency at rate 0.5 (the slowest rate, and so the
-// deepest window): 2048 input samples, 42.7 ms at 48 kHz.
-//
-// It is RATE-DEPENDENT, measured 2048 / 1722 / 1350 / 1536 input samples at rates
-// 0.5 / 0.75 / 1.25 / 2.0, because WSOLA's window scales with the tempo factor. So
-// this is a BOUND, not a constant to subtract, and compensation must use the
-// per-rate value. The maximum is what a caller needs in order to size a priming
-// buffer without asking.
-//
-// Measured rather than derived, and reproducible: the probe remeasures and compares.
-// The two methods that did NOT work are recorded in the probe, because they are the
-// obvious ones: impulse correlation cannot locate anything in WSOLA output (which is
-// reassembled, not shifted), and energy onset quantises to its analysis window and
-// reported an onset earlier than causality allows. Accounting --
-// pushed/rate - produced -- needs no waveform at all.
-ATEMPO_LOOKAHEAD_MAX_SAMPLES :: 2048
-
-// atempo_lookahead_samples is the measured lookahead for a given TEMPO, by
-// interpolation on the measured points.
-//
-// Keyed on TEMPO, which is what atempo_rate_set takes -- NOT on a transport rate.
-// The two are the same number for the global bus (where the transport rate IS the
-// tempo) and DIFFERENT for a per-clip graph, and conflating them is how the previous
-// commit ended up passing 1.0/speed where it should have passed speed. EXACT at the measured rates and linear
-// between them, because the underlying window scales with the tempo factor rather
-// than jumping.
-//
-// Sampled from measurement rather than modelled, and that is the point: a model would
-// be one more thing that can be wrong silently, and this number decides where content
-// lands after a seek.
-atempo_lookahead_samples :: proc(tempo: f64) -> int {
-	pts := []f64{0.5, 0.75, 1.25, 2.0}
-	vals := []int{2048, 1722, 1350, 1536}
-	if tempo <= pts[0] {
-		return vals[0]
-	}
-	for i in 0 ..< len(pts) - 1 {
-		if tempo <= pts[i + 1] {
-			t := (tempo - pts[i]) / (pts[i + 1] - pts[i])
-			return int(f64(vals[i]) + (f64(vals[i + 1]) - f64(vals[i])) * t + 0.5)
-		}
-	}
-	return vals[len(vals) - 1]
-}
-
-// atempo_prime fills a freshly built graph past its lookahead and throws that fill
-// away, so the first REAL sample it emits is content 0 rather than the middle of the
-// graph's warm-up.
-//
-// Without this the bus atempo delays everything behind it by its own lookahead: at
-// rate 2.0 that is 1536 input samples, 32 ms, and it is not a settling transient that
-// goes away -- it is a constant offset between what the timeline says and what comes
-// out, which is exactly the lip-sync error the device-as-clock work was built to
-// eliminate. It was live in shipping code and unmeasured by any gate.
-//
-// Silence is the correct thing to prime with: there is no content yet, and feeding it
-// real audio would put the wrong samples in the graph's history window.
-atempo_prime :: proc(g: ^Atempo_Graph) {
-	if g.graph == nil || g.primed {
-		return
-	}
-	g.primed = true
-	// A FIXED, generous prime rather than a computed one. It has to exceed any
-	// plausible lookahead, and ATEMPO_LOOKAHEAD_MAX_SAMPLES is the bound on that, so
-	// 2x the bound with room to spare. Sizing it from the measured table instead is
-	// what made this worse rather than better: the table cannot be trusted (see
-	// below), so a table-sized prime sometimes primed too little and sometimes
-	// discarded real content.
-	in_frames := ATEMPO_LOOKAHEAD_MAX_SAMPLES * 4
-	// Bounded chunk so a large lookahead does not want a large stack buffer.
-	CHUNK :: 2048
-	silence: [CHUNK * 2]f32
-	done := 0
-	// Measure the graph's ACTUAL latency rather than predicting it: however many
-	// output samples come out during the priming pass ARE the samples that belong to
-	// the warm-up, so that count is the discard.
-	//
-	// This replaces a LOOKUP TABLE, and the table is gone because it could not be
-	// trusted. atempo_lookahead_samples interpolated between four measured points and
-	// left intermediate rates off by up to 12 ms; when the measurement was made to
-	// prove convergence -- double the input and require the same answer -- almost every
-	// rate came back UNCONVERGED, swinging by hundreds of samples. So the accounting
-	// that produced the table was never authoritative, and this session's claim that it
-	// was was wrong.
-	//
-	// Self-calibration needs no model, no table and no assumption about how WSOLA's
-	// window scales with tempo. It is also correct by construction for any chain of
-	// any length, because it measures this graph rather than a model of it.
-	emitted := 0
-	for done < in_frames {
-		n := min(CHUNK, in_frames - done)
-		atempo_process(g, silence[:], n)
-		emitted += g.out_n
-		done += n
-	}
-	// Throw away the output that corresponds to the priming region, so the first REAL
-	// sample emitted is content 0. atempo_process applies it.
-	g.discard_next = emitted
-}
-
 // atempo_reset clears the graph's internal window so stale buffered samples
 // from a previous timeline position never leak into the new mix. Used on
 // re-provision and forward jumps, which also ClearAudioStream the device.
 atempo_reset :: proc(g: ^Atempo_Graph) {
 	if g.graph != nil {
-		atempo_graph_build(g, g.rate)
+		atempo_graph_build(g, g.rate, g.pitch_ratio)
 	}
 }

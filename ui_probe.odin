@@ -24,6 +24,7 @@ import "core:c"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:unicode/utf8"
 
 ui_probe_tracks :: 6
@@ -223,6 +224,11 @@ for j := 0; j < len(raw); {
 	// Track rows: buttons moved to the dedicated menu, and the timeline fits
 	// TRACKS_FIT_TARGET rows on import/load.
 	if !ui_probe_track_menu_asserts() {
+		os.exit(1)
+	}
+	// The playhead must be draggable, through the real press/drag/release chain.
+	// Runs after the track-menu case because that one reseeds the timeline.
+	if !ui_probe_playhead_scrub_asserts() {
 		os.exit(1)
 	}
 	// Composite order: track order for ordinary clips, subtitles pinned on top.
@@ -808,6 +814,240 @@ ui_probe_key_routing_asserts :: proc() -> bool {
 // Hold-to-jog is the one input behaviour whose evidence so far was structural
 // ("the router puts the field first") rather than observed. Drive the keys
 // through the real router and read the state jog_playback actually sets.
+// ui_probe_playhead_scrub_asserts drives the ruler scrub through the REAL chain:
+// a clay pointer state, interaction_click_dispatch to arm, interaction_move to
+// drag, playback_update to run the same tick the frame loop runs it. Every
+// earlier probe of the playhead set playhead.frame directly or faked
+// active_interaction, which bypasses the press that arms the gesture AND the
+// ordering that made the playhead un-draggable -- the two things that actually
+// broke, and neither of which a direct write can see.
+ui_probe_playhead_scrub_asserts :: proc() -> bool {
+	ok := true
+	saved_playing := playhead.playing
+	saved_frame := playhead.frame
+	saved_dir := playback.dir
+	saved_preview := preview.playing
+	saved_accum := playback.accumulator
+	saved_last_tick := playback.last_tick_ns
+	saved_dev := sync.atomic_load(&playback.dev_frame)
+	saved_dev_resync := sync.atomic_load(&playback.dev_resync)
+	saved_resync := sync.atomic_load(&audio_prod.resync)
+	saved_snap := editor_flags.snap_playhead_to_clips
+	// Snap OFF unless the case is about snapping: at low zoom the margin is
+	// SNAP_PIXELS/zoom frames wide, so leaving it on makes "drag to frame X"
+	// land somewhere else and every assertion below a snap assertion instead.
+	editor_flags.snap_playhead_to_clips = false
+	playhead.playing = false
+	playback.dir = 1
+	preview.playing = false
+	playback.last_tick_ns = 0
+	defer {
+		playhead.playing = saved_playing
+		playhead.frame = saved_frame
+		playback.dir = saved_dir
+		preview.playing = saved_preview
+		playback.accumulator = saved_accum
+		playback.last_tick_ns = saved_last_tick
+		sync.atomic_store(&playback.dev_frame, saved_dev)
+		sync.atomic_store(&playback.dev_resync, saved_dev_resync)
+		sync.atomic_store(&audio_prod.resync, saved_resync)
+		editor_flags.snap_playhead_to_clips = saved_snap
+		active_interaction = .None
+		playhead_scrub.moved = false
+		build_page(1920, 1600)
+	}
+	build_page(1920, 1600)
+	ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+	if ruler.width <= 0 || ruler.height <= 0 {
+		fmt.eprintf("[ui-probe] ruler has no box (%vx%v); the scrub cannot be armed\n", ruler.width, ruler.height)
+		return false
+	}
+	// Pointer x for a timeline frame, inside the ruler. y is the middle of the
+	// strip: the box is 30px tall and a press near either edge is a different
+	// gesture's business.
+	ry := ruler.y + ruler.height * 0.5
+	// Odin closures capture nothing, so the view transform is passed explicitly.
+	// Read from timeline_view at call time, not captured: case (4) changes the
+	// zoom to reach the minimum, and a captured value would silently test the
+	// previous zoom instead -- the case would pass for the wrong reason.
+	px_for_frame :: proc(ruler: clay.BoundingBox, frame: i64) -> f32 {
+		return ruler.x + (f32(frame) - timeline_view.start) * timeline_view.zoom
+	}
+	press_at :: proc(x, y: f32) {
+		clay.SetPointerState({x, y}, true)
+		interaction_click_dispatch(Mouse_Input{x, y, true, false, false, false, false, false}, false)
+	}
+	drag_to :: proc(x, y: f32) {
+		clay.SetPointerState({x, y}, true)
+		interaction_move(Mouse_Input{x, y, true, false, false, false, false, false}, true, 1600)
+	}
+	release_at :: proc(x, y: f32) {
+		clay.SetPointerState({x, y}, false)
+		interaction_release(Mouse_Input{x, y, false, false, false, false, false, false})
+	}
+	// One FULL frame-loop tick of a held drag, in the frame loop's order:
+	// interaction (which writes playhead.frame) and THEN playback_update (which
+	// reads the device clock). Every assertion below goes through this rather
+	// than through interaction_move alone, because the ordering is the defect:
+	// a drag that is correct on its own and then overwritten in the same tick by
+	// playback_update looks perfect in a probe that stops after the drag.
+	drag_tick :: proc(x, y: f32) {
+		drag_to(x, y)
+		playback_update(sdl.Uint64(monotonic_ns()))
+	}
+
+	// (1) ARMING. A press on the ruler must claim the gesture. Asserted through
+	// the press handler rather than assumed, because "the ruler is dead" and
+	// "the ruler armed the wrong gesture" look identical from outside and only
+	// one of them is a scrub bug.
+	playhead.frame = 400
+	press_at(px_for_frame(ruler, 400), ry)
+	if active_interaction != .Playhead_Scrub {
+		fmt.eprintf(
+			"[ui-probe] ruler press armed %v, want Playhead_Scrub (a press on the ruler that moves nothing)\n",
+			active_interaction,
+		)
+		ok = false
+		active_interaction = .None
+		return ok
+	}
+
+	// (2) DRAG FORWARD while STOPPED: the pointer moves the playhead.
+	drag_tick(px_for_frame(ruler, 260), ry)
+	if playhead.frame != 260 {
+		fmt.eprintf("[ui-probe] stopped drag to frame 260 left the playhead at %d\n", playhead.frame)
+		ok = false
+	}
+	release_at(px_for_frame(ruler, 260), ry)
+
+	// (3) DRAG BACKWARD while PLAYING FORWARD, with the device clock ahead. This
+	// is the reported defect and it needs the clock set up by hand: no producer
+	// runs in the probe, so dev_frame would otherwise sit at whatever the last
+	// case left. Both halves matter -- mid-drag (the pointer owns the playhead)
+	// and the tick after release (a stale reading must not outrank the seek).
+	playhead.playing = true
+	preview.playing = true
+	playback.dir = 1
+	playhead.frame = 400
+	sync.atomic_store(&audio_prod.resync, saved_resync)
+	sync.atomic_store(&playback.dev_resync, saved_resync)
+	sync.atomic_store(&playback.dev_frame, 400)
+	press_at(px_for_frame(ruler, 400), ry)
+	drag_tick(px_for_frame(ruler, 120), ry)
+	if playhead.frame != 120 {
+		fmt.eprintf(
+			"[ui-probe] backward drag during playback: playhead %d, want 120 (device clock outranked the pointer)\n",
+			playhead.frame,
+		)
+		ok = false
+	}
+	// Release commits the seek, which bumps resync. The clock still reads 400 --
+	// larger than 120 -- until a producer adopts the new generation, so the next
+	// playback_update must ignore it.
+	release_at(px_for_frame(ruler, 120), ry)
+	playback_update(sdl.Uint64(monotonic_ns()))
+	if playhead.frame != 120 {
+		fmt.eprintf(
+			"[ui-probe] after release: playhead %d, want 120 (a stale device reading outranked the committed seek)\n",
+			playhead.frame,
+		)
+		ok = false
+	}
+	// Once the producer catches up, the clock owns the playhead again: this is
+	// the cannot-drift property, and the fix must not have broken it to buy the
+	// drag.
+	sync.atomic_store(&playback.dev_resync, sync.atomic_load(&audio_prod.resync))
+	sync.atomic_store(&playback.dev_frame, 200)
+	playback_update(sdl.Uint64(monotonic_ns()))
+	if playhead.frame != 200 {
+		fmt.eprintf(
+			"[ui-probe] current device reading was not adopted: playhead %d, want 200 (the drag fix cost the audio clock its authority)\n",
+			playhead.frame,
+		)
+		ok = false
+	}
+
+	// (4) BACKWARD TRANSPORT. After a backward jog, playback.dir == -1, and
+	// playback_update takes the OTHER branch: a wall-clock accumulator that adds
+	// dir every tick, written AFTER the drag. That path has no device clock to
+	// consult, so the scrub guard added for forward playback does not apply and
+	// the two fight by a frame per tick -- the playhead drifts off the pointer
+	// while the button is held. Same gesture, third arm of the same switch.
+	playback.dir = -1
+	playhead.playing = true
+	playhead.frame = 400
+	sync.atomic_store(&playback.dev_frame, 400)
+	sync.atomic_store(&playback.dev_resync, sync.atomic_load(&audio_prod.resync))
+	press_at(px_for_frame(ruler, 400), ry)
+	drag_tick(px_for_frame(ruler, 300), ry)
+	if playhead.frame != 300 {
+		fmt.eprintf(
+			"[ui-probe] drag during backward transport: playhead %d, want 300 (the wall-clock branch moved it under the pointer)\n",
+			playhead.frame,
+		)
+		ok = false
+	}
+	release_at(px_for_frame(ruler, 300), ry)
+	playback_update(sdl.Uint64(monotonic_ns()))
+	if playhead.frame != 300 {
+		fmt.eprintf(
+			"[ui-probe] after release during backward transport: playhead %d, want 300\n",
+			playhead.frame,
+		)
+		ok = false
+	}
+	playback.dir = 1
+
+	// (4) SNAP, ON, at the DEFAULT zoom -- the state the app actually ships in.
+	// This is the difference between "the playhead moves" and "the playhead moves
+	// freely". The margin is a fixed number of SCREEN pixels (SNAP_PIXELS), so at
+	// a typical zoom it is a wide band of FRAMES: the scrub latches onto a clip
+	// edge and stops responding well outside the 8px the user can see, which
+	// reads as a playhead that will not move. Measured, not assumed, and the
+	// measured margin is printed either way.
+	saved_zoom := timeline_view.zoom
+	editor_flags.snap_playhead_to_clips = true
+	margin := snap_margin_frames()
+	// A frame far enough from any clip edge to be free, and confirm the pointer
+	// can actually be placed there (a frame outside the visible ruler would test
+	// nothing).
+	free_frame := i64(400)
+	for ci in 0 ..< len(timeline.tracks[0].clips) {
+		start := timeline.tracks[0].clips[ci].timeline_start_frame
+		if abs(f64(free_frame - start)) < f64(margin) {
+			free_frame = start + i64(margin) + 30
+		}
+	}
+	timeline_view.zoom = 1.0
+	build_page(1920, 1600)
+	press_at(px_for_frame(ruler, free_frame), ry)
+	drag_to(px_for_frame(ruler, free_frame), ry)
+	snapped_to := playhead.frame
+	release_at(px_for_frame(ruler, free_frame), ry)
+	fmt.printf(
+		"[ui-probe] snap margin at zoom 1.0: %.1f frames; drag to %d landed on %d\n",
+		f64(margin),
+		free_frame,
+		snapped_to,
+	)
+	if snapped_to != free_frame {
+		fmt.eprintf(
+			"[ui-probe] snap margin is %.1f frames at zoom 1.0: a drag to the free frame %d landed on %d, %d frames away. An 8px magnet that spans %d frames is not an 8px magnet.\n",
+			f64(margin),
+			free_frame,
+			snapped_to,
+			abs(f64(snapped_to - free_frame)),
+			int(margin),
+		)
+		ok = false
+	}
+	editor_flags.snap_playhead_to_clips = false
+	timeline_view.zoom = saved_zoom
+
+	fmt.printf("[ui-probe] playhead scrub: arm/drag-back/release/clock-authority/snap-at-min-zoom asserted\n")
+	return ok
+}
+
 ui_probe_jog_asserts :: proc() -> bool {
 	ok := true
 

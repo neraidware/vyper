@@ -37,6 +37,13 @@ toggle_playback :: proc() {
 	playback.accumulator = 0
 	playback.last_tick_ns = monotonic_ns()
 	audio_prod.was_playing = false
+	if play_trace {
+		fmt.printf("[ui]  Play press at ph=%d dir=%d dev=%d\n", playhead.frame, playback.dir, sync.atomic_load(&playback.dev_frame))
+	}
+	// playback_update runs later in this same UI tick and reads the device clock.
+	// Before the producer has handled the new seek that clock still describes the
+	// previous run; seed it at requested origin so it cannot overwrite playhead.
+	sync.atomic_store(&playback.dev_frame, playhead.frame)
 	playhead.playing = true
 	preview.playing = true
 	if vyper_trace {
@@ -67,6 +74,7 @@ jog_playback :: proc(dir: int) {
 		playback.accumulator = 0
 		playback.last_tick_ns = monotonic_ns()
 		audio_prod.was_playing = false
+		sync.atomic_store(&playback.dev_frame, playhead.frame)
 		playhead.playing = true
 		preview.playing = true
 		if vyper_trace {
@@ -1681,6 +1689,7 @@ play_project_area :: proc() {
 	playback.accumulator = 0
 	playback.last_tick_ns = monotonic_ns()
 	audio_prod.was_playing = false
+	sync.atomic_store(&playback.dev_frame, playhead.frame)
 	playhead.playing = true
 	preview.playing = true
 	if vyper_trace {
@@ -1736,13 +1745,45 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// second clock to disagree, and video, which reads playhead.frame, is a pure
 		// function of where the sound actually is.
 		//
-		// Never adopted backwards: between a seek and the producer's next publish,
-		// dev_frame is stale and usually smaller, and taking it would visibly jump
-		// the playhead backwards. A seek sets the frame directly, so the stale window
-		// costs nothing.
+		// Adopted forward-only, and only while the reading is CURRENT. Two guards,
+		// and the second is the one that makes a backward scrub possible at all:
+		//
+		//  - forward-only, because dev_frame is a consumption counter. Between a
+		//    seek and the producer's next publish it names the old position, and
+		//    taking a smaller one would visibly jump the playhead backwards.
+		//  - only when `dev_resync` matches the generation the UI has already
+		//    requested. A scrub release bumps `resync`, and until the producer
+		//    adopts it dev_frame is the PREVIOUS run's position -- which for a
+		//    backward scrub is LARGER than where the user just put the playhead.
+		//    Forward-only adoption therefore does not filter it: the clock wins,
+		//    and the playhead snaps forward to where it was before the drag. The
+		//    generation is the only thing that distinguishes "the device is
+		//    ahead of the playhead" from "the device has not caught up with my
+		//    seek yet", and only the first may move the playhead.
+		//
+		// And a scrub in progress is the pointer talking, not the device. The
+		// gesture owns the playhead until it is released -- that is what "drag the
+		// playhead" means -- so the clock does not get a vote mid-drag. The device
+		// is still playing the old position, and the release seek is where that
+		// disagreement is supposed to surface.
 		dev := sync.atomic_load(&playback.dev_frame)
-		if dev > playhead.frame {
+		dev_resync := sync.atomic_load(&playback.dev_resync)
+		resync_now := sync.atomic_load(&audio_prod.resync)
+		clock_current := dev_resync == resync_now
+		if clock_current && dev > playhead.frame && active_interaction != .Playhead_Scrub {
 			playhead.frame = dev
+		}
+		if play_trace {
+			fmt.printf(
+				"[ui]  ph=%d dev=%d dev_resync=%d resync=%d current=%t scrub=%t -> ph=%d\n",
+				playhead.frame,
+				dev,
+				dev_resync,
+				resync_now,
+				clock_current,
+				active_interaction == .Playhead_Scrub,
+				playhead.frame,
+			)
 		}
 		playback.accumulator = 0
 	} else if playhead.playing {
@@ -1817,6 +1858,7 @@ main :: proc() {
 		win_ffmpeg_versions_diag()
 	}
 	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
+	play_trace = os.get_env_alloc("VYPER_PLAY_TRACE", context.temp_allocator) == "1"
 	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
 	// the audio producer reads playback.rate for its atempo graph and cushion.
@@ -1977,9 +2019,8 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
-	// VYPER_AUDIO_BUS_PRIME=<rate> -- asserts the bus atempo is ALIGNED, i.e. that the
-	// first sample it emits is the first sample fed. The offset this catches was live
-	// in shipping code at any rate other than 1.0.
+	// VYPER_AUDIO_BUS_PRIME=<rate> -- asserts sample-origin alignment and device-clock
+	// accounting for bus atempo.
 	if bp, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_PRIME", context.temp_allocator); bp != "" {
 		rate := 2.0
 		if v, ok := strconv.parse_f64(strings.trim_space(bp)); ok {
@@ -1995,6 +2036,36 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		ok: bool = audio_probe_clip_tempo()
 		os.exit(ok ? 0 : 1)
 	}
+	// VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT=<path>|<speed> proves clip-level output
+	// sample zero maps to content zero through decoder FIFO, atempo, and output ring.
+	if ca, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT", context.temp_allocator); ca != "" {
+		parts := strings.split(ca, "|")
+		if len(parts) < 2 {
+			fmt.println("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT requires <path>|<speed>")
+			os.exit(1)
+		}
+		speed, ok := strconv.parse_f64(strings.trim_space(parts[1]))
+		if !ok {
+			fmt.println("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT speed is invalid")
+			os.exit(1)
+		}
+		ok = audio_probe_clip_tempo_alignment(strings.trim_space(parts[0]), speed)
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_CLIP_TEMPO_EDIT=<path> edits an already-provisioned clip from
+	// 1x to 2x at the playhead and verifies reconcile rebuilds its output origin.
+	if ce, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO_EDIT", context.temp_allocator); ce != "" {
+		ok: bool = audio_probe_clip_tempo_edit_alignment(ce)
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_BACKWARD_SCRUB=<path> -- proves a playhead move reaches the AUDIO:
+	// the producer is rewound, the device queue dropped, and the decoder re-anchored
+	// at the new playhead's content. Separate from the playhead's own position,
+	// because "the line moved but the sound did not" is a distinct failure.
+	if bs, _ := os.lookup_env_alloc("VYPER_AUDIO_BACKWARD_SCRUB", context.temp_allocator); bs != "" {
+		ok: bool = audio_probe_backward_scrub_seeks(bs)
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_SCRUB_EXACT -- proves a seek lands on the content sample the timeline
 	// says belongs there, unstretched and stretched.
 	if se, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_EXACT", context.temp_allocator); se != "" {
@@ -2005,6 +2076,12 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// must not move the clip on the timeline.
 	if st, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_STRETCH", context.temp_allocator); st != "" {
 		ok: bool = audio_probe_clip_stretch()
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_BUS_RATE_TRANSITION=<path> -- changes transport rate while a simulated
+	// device is consuming, proving rebuilds preserve audible position.
+	if rt, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_RATE_TRANSITION", context.temp_allocator); rt != "" {
+		ok: bool = audio_probe_bus_rate_transition(rt)
 		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_CLIP_PITCH=<path>|<semitones> -- proves the pitch property SHIFTS
@@ -2018,17 +2095,6 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			}
 		}
 		ok: bool = audio_probe_clip_pitch(strings.trim_space(parts[0]), semi)
-		os.exit(ok ? 0 : 1)
-	}
-	// VYPER_AUDIO_BUS_PRIME=<rate> -- asserts the bus atempo is ALIGNED, i.e. that the
-	// first sample it emits is the first sample fed. The offset this catches was live
-	// in shipping code at any rate other than 1.0.
-	if bp, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_PRIME", context.temp_allocator); bp != "" {
-		rate := 2.0
-		if v, ok := strconv.parse_f64(strings.trim_space(bp)); ok {
-			rate = v
-		}
-		ok: bool = audio_probe_bus_prime("", rate)
 		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_NODE_LATENCY measures the two graph delays (swr device conversion,
@@ -2358,6 +2424,7 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
 		}
 		playhead.playing = true
+		sync.atomic_store(&playback.dev_frame, playhead.frame)
 		preview.playing = true
 		playback.accumulator = 0
 		playback.last_tick_ns = monotonic_ns()

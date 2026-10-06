@@ -338,9 +338,12 @@ edit_commit :: proc() {
 		kf_auto_key(cl, name, val)
 	}
 	undo_push(kind, label)
-	if audio_changed || speed_field != nil || pitch_field != nil {
-		// Speed and pitch change the clip's LENGTH or its graph, so the allocation
-		// and every source's speed/pitch snapshot are stale. Same commit gain uses.
+	if speed_field != nil || pitch_field != nil {
+		// These discrete graph changes must reconcile the provisioned source at the
+		// playhead; publishing only a new slab leaves the existing Play_Src speed,
+		// output ring and WSOLA state alive at their old values.
+		audio_note_edit()
+	} else if audio_changed {
 		audio_geometry_commit()
 	}
 }

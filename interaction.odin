@@ -1385,6 +1385,9 @@ interaction_release :: proc(inp: Mouse_Input) {
 		// common "click the ruler to set the position" case) moves nothing
 		// and so re-provisions nothing.
 		if playhead_scrub.moved {
+			if play_trace {
+				fmt.printf("[ui]  scrub RELEASE at ph=%d\n", playhead.frame)
+			}
 			audio_seek(playhead.frame)
 		}
 	}
@@ -1716,7 +1719,18 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		if playhead.frame != frame {
 			playhead_scrub.moved = true
 		}
+		was := playhead.frame
 		playhead.frame = frame
+		if play_trace {
+			fmt.printf(
+				"[ui]  pointer scrub -> ph=%d (was %d) x=%.1f dev=%d resync=%d\n",
+				frame,
+				was,
+				inp.x,
+				sync.atomic_load(&playback.dev_frame),
+				sync.atomic_load(&audio_prod.resync),
+			)
+		}
 		// No audio_seek here. A seek is not a playhead write, it is a full
 		// re-provision: the producer clears the device and reopens every
 		// decoder (tens to hundreds of ms). Asking for one on every frame of

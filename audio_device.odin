@@ -516,10 +516,16 @@ audio_device_available :: proc() -> i64 {
 // which is invisible next to a seek and far cheaper than the race would be.
 audio_device_clear :: proc() {
 	if audio_dev.sim.on {
-		// A clear drops the QUEUED audio, so the simulated device's read cursor
-		// catches up to what has been written -- the queue becomes empty
-		// immediately, which is what the real path promises too.
-		audio_dev.sim.read = audio_dev.sim.written
+		// Both cursors, not just the read one. `written` is a monotonic counter,
+		// so moving `read` up to it empties the queue and leaves the ring
+		// permanently full -- the next push trips the overflow assert, and a sim
+		// device that cannot survive a clear cannot model a seek, which is the
+		// one thing every backward-scrub test has to do. Nothing else reads these
+		// cursors concurrently: `sim_consume` runs on the probe's own thread, so
+		// resetting both is the honest model of "the queue is dropped and the room
+		// comes back".
+		audio_dev.sim.written = 0
+		audio_dev.sim.read = 0
 		return
 	}
 	sync.atomic_store(&audio_dev.clear_req, true)

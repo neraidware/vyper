@@ -6726,18 +6726,214 @@ re-derived from the asset. That is the next thing to decide.
   walks across the timeline, invisibly while dragging.
 - One atempo stage instead of a chain. The vendored 9.0.2 takes tempo 4.0 directly;
   the chain survives only as the fallback for a build that refuses.
-- Gates measure where they are not confounded: the tempo factor on an ISOLATED graph
-  by DIFFERENCE (a single run's out/in is biased low by the fixed priming discard, which
-  made every speed look 1-2% slow), the geometry as arithmetic on a Clip.
+- Gates measure where they are not confounded: tempo factor on an ISOLATED graph by
+  DIFFERENCE (a single run's out/in is biased low by output still held inside WSOLA,
+  which made every speed look 1-2% slow), and clip geometry as arithmetic on a Clip.
 
-**Still open.** The bus atempo residual is 0.8-6.25 ms, not zero. A DEEPER prime makes
-it worse (4x → 56/130/160/84, 8x → 472/452/384/82), because the self-calibration
-measures the graph's output during priming and WSOLA's history keeps settling after that
-window. Reaching zero means aligning against the output waveform once the graph has
-stabilised, not against the prime. `audio_bus_prime` is out of `all` for exactly that
-one reason.
+**Bus alignment fixed.** The residuals above came from the manual prime itself. It fed
+synthetic silence into `atempo`, advancing the filter's input/output positions, then
+discarded output from the first real push. Two probe defects hid that cause: priming in
+the loop skipped the first real input block while advancing the input count, and its
+onset detector ignored the first four frames.
+
+FFmpeg 9.0.2 `af_atempo.c` initializes its first WSOLA fragment at `-window/2`,
+zero-pads the leading half-window, and starts overlap-add at output sample 0. Let it
+buffer REAL input until that first output is ready. The transport bus no longer primes
+or discards samples. The device clock now subtracts both queued output (converted back
+to content time) and `input_total - output_total * rate`, the content still held inside
+WSOLA. Without the latter, feeding enough input to fill the graph's window advances the
+playhead before the device has heard any of it. `audio_bus_prime` asserts the first
+transient at output sample 0 AND simulates device consumption to prove queued output plus
+WSOLA-held input maps back to exactly the consumed content sample at rates 0.25, 0.5, 0.75,
+1.5, 2.0, 3.0 and 4.0. `audio_bus_rate_transition` also drives the real producer against
+a simulated device through 1x → 2x → 3x → 1x, requiring monotonic audible position while
+each rate change captures the old audible frame, clears old-rate PCM, and reconciles
+sources there. Both are in `all`.
+
+The per-clip path now feeds the decoder's already-trimmed content FIFO into WSOLA, so
+it cannot skip the provisioned opening chunk. It discards no guessed lookahead, and
+seeks reset the derived output ring at the requested clip-relative timeline sample.
+Speed/pitch edits publish through `audio_note_edit`, update source snapshots during
+reconcile, and re-anchor the graph even when source sample at playhead is unchanged.
+`audio_clip_tempo_alignment` asserts content sample zero at clip opening and at an
+interior seek across 0.25x..4x, then changes an already provisioned clip 1x→2x at an
+interior playhead and edits pitch on the live source, verifying reconcile rebuilds its
+output ring/filter at that content origin. The removed four-point lookahead table is no
+longer used or kept as an authority. `audio_clip_tempo_alignment_valgrind` runs both
+opening/seek and active-edit probes with zero definitely/indirectly lost bytes and no
+invalid access.
 
 **No automatic audio effects.** The earlier plan in this file for automatic declick on
 every clip edge is DEAD and stays dead: cuts are hard and transparent, fades and gain
 are authored. `audio_probe_transparent_cuts` asserts a cut is not a fade (boundary
 0.08080 against an interior peak of 0.12563). Do not reintroduce it.
+
+## Active 37 — Play took half a second to make a sound, and stopped-then-moved playback started where it left off
+
+**Status: fixed 2026-10-06.** Found by the user on the merged Active 36 work, as two
+symptoms that looked unrelated and were not.
+
+**Why 1 — the first Play press paid for every decoder open.** `audio_update`'s stop
+edge called `audio_reset_play`, which closed every source, and the producer's `!run`
+branch did the same on each stop. So every Play press re-provisioned from zero, and
+`audio_provision` prices that at 18.8 ms for two sources, hundreds of milliseconds
+with several streams open — all of it between the keypress and the first sample.
+
+Stopping now releases the DEVICE and the queue, and nothing else. The producer keeps
+the decoders and their FIFOs and reconciles geometry while the device gate is closed,
+so an import or a scrub made while stopped has already done its work by the time Play
+is pressed. The graph the transport bus holds is reset (it is a position, not a
+resource), the sources are not.
+
+**Why 2 — a stale `dev_frame` outran the seek.** `playback_update` runs before
+`audio_update`, reads the device clock and moves the playhead forward only. On the run
+after a stop, that clock still held the frame the playhead had reached when it stopped,
+so moving the playhead back and pressing Play wrote the OLD frame straight back before
+anything acted on the new one. Every start path — PlayPause, jog, project load,
+autoplay — now seeds `playback.dev_frame` at the selected frame first.
+
+**Probe.** `audio_probe_edit_burst_provisions` opens with the user's sequence rather
+than a synthetic one: warm geometry while stopped, assert no PCM is queued, press Play,
+require the first PCM inside 500 ms with no re-provision, play forward, stop, move the
+playhead back to zero, restart, and require both that the frame stays zero and that the
+first PCM arrives inside 500 ms without reopening a source. Measured 4.2 ms and 1.1 ms.
+
+**The queue-clear predicate was the third defect, found by that probe.** Trimming the
+far end of a clip the playhead is inside cleared the device queue, because the decision
+was "does a segment overlap the queued frames" and that clip does — before and after.
+The queued audio was still correct; a user who cannot hear the edit got a gap anyway.
+The predicate is now what the queue is made of: the content MAPPING under the queued
+frames, compared old against new (`play_src_window_maps_differ`). A rate edit still
+marks the window touched on its own — pitch moves every output sample without moving
+any content, so its mapping is identical by construction.
+
+The first cut of that predicate reported every edit as touching, and the probe caught it:
+the producer feeds ahead of the content, so the window routinely reaches past the end of
+every clip, and silence on both sides of the edit is not a change. `probe_window_map`
+pins the pairs directly — unchanged, removed, added, moved, sped, shortened, and the
+past-the-end window — and the live counter pins it against a running device.
+`audio_probe_clip_tempo_edit_alignment` additionally requires a pitch edit to mark the
+window touched, with a queue it positions itself.
+
+### Active 37, second defect — the playhead could not be dragged backward at all
+
+The user reported this after the first fix: "I still can't move the playhead back."
+The first fix addressed the STOP→move→Play sequence. This is the live drag, and it
+never worked, in either direction of the gesture's lifetime.
+
+**Why — the device clock outranked the pointer.** `playback_update` runs after
+`interaction_post_build` in the same UI tick (main.odin:2443 vs 2435), so a scrub's
+`playhead.frame = frame` was immediately overwritten by the forward-only adoption at
+main.odin:1750. While playing forward, `dev_frame` is always AHEAD of a backward drag,
+so every tick of the drag restored the old position. The playhead could not be moved
+back during playback, at all.
+
+The forward-only guard was there for a real reason and stays: `dev_frame` is a
+consumption counter, and between a seek and the producer's next publish it names the
+OLD position, which for a FORWARD seek is smaller and would yank the playhead back.
+Forward-only filters that case. It does not filter a BACKWARD seek, where the stale
+value is LARGER — so the clock won, and the playhead snapped forward to where it had
+been. **Forward-only adoption cannot distinguish "the device is ahead of the playhead"
+from "the device has not caught up with my seek yet," and only the first may move the
+playhead.**
+
+**Fix — the reading carries the generation it was computed under.** `dev_frame` alone
+is just an i64 and carries no way to tell those two cases apart. `playback.dev_resync`
+now publishes the `resync` generation the position was computed under, and adoption
+requires it to equal the generation the UI has already requested. A seek bumps
+`resync`; until the producer adopts it, `dev_frame` is stale by construction and the
+playhead ignores it. Once current, forward-only adoption resumes and the cannot-drift
+property is unchanged.
+
+Mid-drag, the pointer owns the playhead: `active_interaction == .Playhead_Scrub`
+suppresses adoption entirely. That is not a workaround for the generation guard — it
+is the other half of the same statement. The gesture is a live edit of the playhead,
+and the device is by definition still playing the old position until the release seek;
+letting the clock vote during the drag is what made the drag impossible.
+
+**Probe.** `audio_probe_edit_burst_provisions` now holds the playhead at half its
+frame mid-drag while playing forward, then releases and requires it to STAY there on
+the following tick — the second assertion is the stale-clock re-adoption, which is a
+distinct failure from the mid-drag one and would have passed a fix that only handled
+the drag. Fails without both guards (`playhead jumped 15 -> 31`); passes with them.
+
+### Active 37, third defect — the playhead moved, and playback was not set to it
+
+The user's correction, after two wrong fixes: "I can move the playhead. The playback
+just doesn't get set to the playhead." Both earlier fixes were about the playhead LINE.
+The line was never the broken part. Playback is a different piece of state — the
+producer's position, the device queue, and the decoder anchors — and all three stayed
+where they were.
+
+**Why.** `audio_seek` and a geometry edit share ONE counter, `audio_prod.resync`. Before
+`5670ba9` the producer handled it by re-provisioning, which always cleared the queue and
+always anchored at the playhead, so a backward scrub was correct — slow, but correct.
+`5670ba9` ("audio: reconcile an edit into the live decoders instead of re-provisioning")
+replaced that handler with `audio_reconcile`, and the reconcile decides by comparing the
+geometry BEFORE and AFTER. A playhead move changes neither geometry. `old_content` and
+`new_content` are both evaluated at the same `play_frame`, so on a pure seek they are
+equal by construction, every source is `Keep`ed, and `touched_window` is false.
+
+Measured: producer at 15, playhead scrubbed back to 7, `touched_window=false`, producer
+still at 15, 12000 frames of pre-seek audio still queued. The playhead line moves; the
+sound does not. Comparing two geometries can only ever detect a geometry change, so the
+playhead move has to be STATED, not inferred.
+
+`13a8ec3` (this branch) did not introduce it and did make it quieter: the old overlap
+predicate happened to return true for a scrub, since a clip covers the window, so the
+queue was dropped and `next_frame` rewound — accidentally covering the seek. The mapping
+diff honestly reports "the geometry did not change" → false, and the accidental cover is
+gone. Same bug, less noise over it.
+
+Worth recording: `5670ba9`'s own commit message saw this and named it wrong — *"an
+earlier version of that probe DID assert it live and failed — not because the engine was
+wrong, but because moving the playhead without audio_seek leaves the reconcile anchoring
+at a stale anchor_frame."* That was this bug, explained away as a probe artifact.
+
+**Fix, and the wrong first version of it.** The first attempt compared the requested anchor
+against the anchor the producer had last been *asked for*, remembered across resyncs
+(`Audio_Served_Anchor` + `anchor_moved`). That is the wrong comparison, and the user's own
+trace proved it:
+
+```
+[ui]  audio_update ph=198 ... anchor=57          <- anchor already reads 57
+[ui]  pointer scrub -> ph=57 (was 203)          <- scrubbed TO 57
+[ui]  audio_seek to=57  (resync 33->34)
+[prod] resync evt=34 anchor=57 seeked=false     <- "the playhead did not move"
+[prod] reconcile done kept=25 sought=0 dropped=0 touched=false next_frame=218 queued=11520
+```
+
+The anchor is a REQUEST, not a position. Nothing seeks during ordinary forward playback, so
+the requested anchor sits still while the sources play forward hundreds of frames past it
+-- 57 while the producer was at 218. Comparing request-against-request found 57 == 57 and
+reported no move, so all 25 sources were kept, the queue was not dropped, `next_frame` was
+not rewound, and 161 frames of pre-scrub audio played on.
+
+`audio_reconcile_is_seeked` compares the request against where the sources ACTUALLY are:
+`abs(play_frame - audio_src.next_frame) > cushion`. That is a fact about the engine's own
+state, it cannot be fooled by a repeated or stale request, and it is the same quantity the
+reconcile has to move. The cushion is the tolerance because that is the normal steady-state
+gap: the producer deliberately runs `AUDIO_CUSHION_SEC` ahead of the audible position so a
+hiccup cannot starve the device, so a healthy playhead and producer differ by exactly that.
+`audio_rate_scale` is the named helper for the other half of that arithmetic, because a
+second copy of it in the feed loop is how the two drift apart.
+
+Every version of this probe scrubbed to a frame the anchor did not already hold, which is
+how the broken predicate passed: the fixture was arranged to make the bug invisible. It now
+drives the producer 414 frames ahead, confirms the steady-state cushion does NOT read as a
+seek, then PRE-SETS the anchor to the frame it scrubs back to -- the user's exact shape --
+and requires the move to be detected and the producer rewound.
+it is genuinely ahead of the playhead, derives the seek target from where the fixture
+actually got (a hardcoded frame is a FORWARD seek whenever the fixture under-fills, and a
+forward seek passes with the rewind removed), then asserts four separate things: the
+producer is rewound, the reconcile REPORTS the window stale and the clear the producer
+performs empties it, the decoder head re-anchored within the preroll window and moved
+back, and the next feed makes progress. Fails without the fix, on the rewind.
+
+**Also fixed by tracing it.** `audio_device_clear` on the simulated device moved only
+the read cursor up to `written`, leaving the ring permanently full — the next push tripped
+the overflow assert, so the sim device could not survive a seek at all, which is the one
+thing every backward-scrub test must do. Both cursors reset now. Found by running the
+probe with `VYPER_AUDIO_TRACE=1`, which every `VYPER_AUDIO_*` probe previously could not
+do: they are all dispatched before `audio_init`, so `audio_rpt.trace` was never set and
+the `[tr feed]` lines were off. The probe now reads the same env var.

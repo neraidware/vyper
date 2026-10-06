@@ -1530,6 +1530,32 @@ target_audio_clip_stretch() {
 	echo "audio-clip-stretch: ok (timeline span fixed at every speed)"
 }
 
+# audio_backward_scrub proves a PLAYHEAD MOVE reaches the AUDIO, which is a different
+# question from whether the playhead line moves. The user-facing report was "I can move
+# the playhead, playback just isn't set to it" -- two pieces of state (playhead.frame,
+# and the producer's position plus its decoder anchors) that can disagree.
+#
+# A MEMBER OF `all`. It pins the regression this replaces: audio_seek and a geometry edit
+# share one resync counter, so routing seeks through the reconcile silently redefined
+# them, and a seek is invisible to a comparison of the geometry before and after because
+# a seek changes neither.
+target_audio_backward_scrub() {
+	require_fresh_binary audio-backward-scrub || return 1
+	local src=target/mixparity/tempo_clicks_125ms.wav
+	mkdir -p target/mixparity
+	if [ ! -s "$src" ]; then
+		target_audio_clip_tempo_alignment || return 1
+	fi
+	local out
+	if ! out=$(VYPER_AUDIO_BACKWARD_SCRUB="$PWD/$src" timeout 300 ./vyper 2>&1); then
+		echo "$out" >&2
+		echo "audio-backward-scrub: FAILED -- see the [ap] scrub lines above" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[ap\] scrub'
+	echo "audio-backward-scrub: ok (playhead move rewinds the producer, drops the queue, re-anchors the decoder)"
+}
+
 # audio_clip_tempo proves the clip TEMPO property changes DURATION and leaves pitch
 # alone, across the whole buildable speed range 0.25x .. 4.0x.
 #
@@ -1554,10 +1580,10 @@ target_audio_clip_stretch() {
 #        factor = (out(N2) - out(N1)) / (N2 - N1)   ==   1/speed
 #
 #    The DIFFERENCE is what makes it exact. A single run's out/in is biased low by a
-#    fixed number of output samples -- the priming discard, which exists so the graph's
-#    lookahead does not offset the audio -- and reading it as a ratio made every speed
-#    look 1-2% slow. That bias is the same constant at every speed, so differencing
-#    divides it out with no model of the priming required.
+#    fixed number of output samples still held inside WSOLA -- the graph's actual
+#    lookahead -- and reading it as a ratio made every speed look 1-2% slow. That
+#    bias is the same constant at every speed, so differencing divides it out without
+#    needing a model of graph holdback.
 #
 #  - THE GEOMETRY, as arithmetic on a Clip: timeline span == content / speed.
 target_audio_clip_tempo() {
@@ -1571,64 +1597,109 @@ target_audio_clip_tempo() {
 	echo "audio-clip-tempo: ok (isolated factor exact, clip geometry exact)"
 }
 
-# audio_bus_prime asserts the bus atempo is ALIGNED: the first sample it emits is the
-# first sample fed.
-#
-# This offset was live in shipping code and measured by nothing. `atempo_process` was
-# called straight on the mixed bus, so at any playback rate other than 1.0 the whole
-# stream came out up to ATEMPO_LOLOOKAHEAD_MAX_SAMPLES late -- a CONSTANT offset
-# between what the timeline says and what reaches the speaker, which is exactly the
-# lip-sync error the device-as-clock work exists to eliminate. It was neither a settling
-# transient nor something that averaged out.
-#
-# Priming brought it from 134/29/33/33 ms down to 3.7/10.3/1.3/12 ms across
-# rates 0.5/1.5/2.0/3.0, but it is NOT exact: the discard is sized from
-# atempo_lookahead_samples, which INTERPOLATES between four measured points, so
-# intermediate rates are approximate. This target is therefore a measurement, not a
-# pass/fail gate on alignment, and it exists to keep the number visible and to stop it
-# growing -- which is how the original 33 ms hid for so long.
-target_audio_bus_prime() {
-	require_fresh_binary audio-bus-prime || return 1
-	local worst=0
-	for r in 0.25 0.5 0.75 1.5 2.0 3.0 4.0; do
-		local line
-		line=$(VYPER_AUDIO_BUS_PRIME=$r timeout 300 ./vyper 2>&1 | grep -oE "first transient at output sample [0-9]+" | head -1)
-		echo "  rate $r: $line"
-		local n
-		n=$(echo "$line" | grep -oE "[0-9]+$" || echo 0)
-		[ "${n:-0}" -gt "$worst" ] && worst=$n
+# audio_clip_tempo_alignment proves the ACTUAL clip pump preserves content zero through
+# decoder FIFO -> atempo -> output ring, both at clip start and after an interior seek.
+# The synthetic PCM fixture has 10 ms pulses every 125 ms, including source sample zero;
+# the 0.5 s timeline seek maps to a pulse boundary at every tested speed. This catches
+# skipped FIFO heads, stale output rings, and any tempo lookahead discard independently
+# of the isolated graph-factor test.
+target_audio_clip_tempo_alignment() {
+	require_fresh_binary audio-clip-tempo-alignment || return 1
+	local src=target/mixparity/tempo_clicks_125ms.wav
+	mkdir -p target/mixparity
+	if [ ! -s "$src" ]; then
+		ffmpeg -v error -f lavfi \
+			-i "aevalsrc='cos(2*PI*440*t)*lt(mod(t\\,0.125)\\,0.01)':s=48000:d=12" \
+			-ac 2 -c:a pcm_s16le "$src" -y || return 1
+	fi
+	for speed in 0.25 0.5 0.75 1.5 2.0 3.0 4.0; do
+		local out
+		if ! out=$(VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT="$PWD/$src|$speed" timeout 600 ./vyper 2>&1); then
+			echo "$out" >&2
+			echo "audio-clip-tempo-alignment: FAILED at speed $speed" >&2
+			return 1
+		fi
+		echo "$out" | grep -E '^\[ap\] clip-alignment'
 	done
-	# 1536 samples is the largest measured lookahead; beyond that the priming is not
-	# working at all rather than being approximate.
-	if [ "$worst" -gt 1536 ]; then
-		echo "audio-bus-prime: FAILED -- worst offset $worst samples exceeds the graph's own lookahead" >&2
+	local out
+	if ! out=$(VYPER_AUDIO_CLIP_TEMPO_EDIT="$PWD/$src" timeout 600 ./vyper 2>&1); then
+		echo "$out" >&2
+		echo "audio-clip-tempo-alignment: FAILED on active 1x -> 2x edit" >&2
 		return 1
 	fi
-	echo "audio-bus-prime: worst offset $worst frames ($(awk "BEGIN{printf \"%.2f\", $worst/48.0}") ms)"
-	# NOT a member of `all`, and deliberately so.
-	#
-	# The offsets are small -- 56 / 130 / 160 / 84 frames at rates 0.5 / 1.5 / 2.0 / 3.0,
-	# against 134 / 29 / 33 / 33 ms before priming existed -- but they are not zero.
-	#
-	# Two earlier blockers are GONE, and the reasons are recorded because both were real
-	# bugs rather than probe artefacts:
-	#  - rate 3.0 could not be LOCATED: the primed silence plus WSOLA's segment repetition
-	#    left nothing above the onset threshold. One atempo stage instead of a chain fixed
-	#    it (the chain's extra latency buried the transient); it now measures 84 frames.
-	#  - rate 0.25 REFUSED TO BUILD. tempo 0.25 is below atempo's per-stage minimum of
-	#    0.5, so it legitimately needs the chain; the chain was simply not reached before.
-	#
-	# A deeper prime makes it WORSE, which is the interesting part: 4x gives 56/130/160/84
-	# and 8x gives 472/452/384/82. The self-calibration measures the graph's output during
-	# priming and discards exactly that, so the residual is WSOLA's internal history still
-	# settling after the measured window -- more priming feeds more settling, it does not
-	# cancel it. Getting to zero needs alignment measured against the output waveform
-	# after the graph has stabilised, not against the prime.
-	#
-	# The failure threshold stays where it is. Loosening it until the target passes is
-	# how the clip-tempo gate came to pass a broken feature earlier in this work, and a
-	# red gate is the honest state: it is named, runnable, and reports the numbers.
-	echo "audio-bus-prime: NOT gating. Every rate builds and every rate measures now; offsets run 37-300 frames (0.8-6.25 ms) but are not zero. See scripts/gate.sh."
+	echo "$out" | grep -E '^\[ap\] clip-edit-alignment'
+	echo "audio-clip-tempo-alignment: ok (opening, interior seek, and active speed/pitch edits preserve content origin)"
+}
+
+# Valgrind the actual per-clip tempo pump, including its content FIFO, filter graph,
+# output ring, reset path and probe buffers. This is the allocation/release gate for the
+# newly exercised seek path; parity_valgrind is a separate export target.
+target_audio_clip_tempo_alignment_valgrind() {
+	require_fresh_valgrind_binary audio-clip-tempo-alignment-valgrind || return 1
+	local src=target/mixparity/tempo_clicks_125ms.wav
+	if [ ! -s "$src" ]; then
+		target_audio_clip_tempo_alignment || return 1
+	fi
+	mkdir -p target/valgrind
+	local log=target/valgrind/audio_clip_tempo_alignment.log
+	env VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT="$PWD/$src|2.0" timeout 1200 valgrind \
+		--leak-check=full --error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	valgrind_assert "$log" audio-clip-tempo-alignment-valgrind '\[ap\] clip-alignment ok'
+	local edit_log=target/valgrind/audio_clip_tempo_edit_alignment.log
+	env VYPER_AUDIO_CLIP_TEMPO_EDIT="$PWD/$src" timeout 1200 valgrind \
+		--leak-check=full --error-exitcode=99 "$VALGRIND_BIN" >"$edit_log" 2>&1
+	valgrind_assert "$edit_log" audio-clip-tempo-edit-alignment-valgrind '\[ap\] clip-edit-alignment ok'
+}
+
+# Bus atempo must preserve input sample zero. FFmpeg pads its initial WSOLA
+# half-window internally; synthetic-silence priming advances that timeline and
+# discards genuine opening audio. The probe feeds real input immediately and
+# verifies the first transient at each supported transport rate.
+target_audio_bus_prime() {
+	require_fresh_binary audio-bus-prime || return 1
+	local failed=0
+	for r in 0.25 0.5 0.75 1.5 2.0 3.0 4.0; do
+		local out line
+		if ! out=$(VYPER_AUDIO_BUS_PRIME=$r timeout 300 ./vyper 2>&1); then
+			echo "audio-bus-prime: FAILED to run at rate $r" >&2
+			echo "$out" | tail -8 >&2
+			failed=1
+			continue
+		fi
+		line=$(printf '%s\n' "$out" | grep -F "first transient at output sample" | head -1 || true)
+		if [[ "$line" != *"sample 0 (want 0)"* ]]; then
+			echo "audio-bus-prime: FAILED at rate $r: ${line:-no alignment result}" >&2
+			echo "$out" | tail -8 >&2
+			failed=1
+		else
+			echo "  rate $r: origin aligned; device clock accounts for WSOLA holdback"
+		fi
+	done
+	if [ "$failed" -ne 0 ]; then
+		return 1
+	fi
+	echo "audio-bus-prime: ok (sample origin and device clock conserved at all tested rates)"
+}
+
+# audio_bus_rate_transition changes transport speed while the simulated hardware device
+# drains real producer output. Rebuilding atempo changes its queue's time scale, so the
+# producer must capture audible position BEFORE destroying the old graph, clear old-rate
+# PCM, reconcile sources there, then continue with the new graph. A stale-queue
+# reinterpretation would jump the playhead or schedule mixed-rate audio.
+target_audio_bus_rate_transition() {
+	require_fresh_binary audio-bus-rate-transition || return 1
+	local src=target/mixparity/long.m4a
+	if [ ! -s "$src" ]; then
+		echo "audio-bus-rate-transition: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
+		return 1
+	fi
+	VYPER_AUDIO_BUS_RATE_TRANSITION="$PWD/$src" timeout 600 ./vyper
+	local rc=$?
+	if [ $rc -ne 0 ]; then
+		echo "audio-bus-rate-transition: FAILED -- see the [ap] rate-transition lines above" >&2
+		return 1
+	fi
+	echo "audio-bus-rate-transition: ok (audible frame monotonic through rate changes)"
 }
 
 # audio_clip_pitch proves the pitch property SHIFTS frequency WITHOUT changing
@@ -1680,7 +1751,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_scrub_exact audio_clip_stretch audio_clip_tempo audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1717,9 +1788,13 @@ main() {
 	audio_stall_gap) target_audio_stall_gap ;;
 	audio_node_latency) target_audio_node_latency ;;
 	audio_clip_tempo) target_audio_clip_tempo ;;
+	audio_clip_tempo_alignment) target_audio_clip_tempo_alignment ;;
+	audio_clip_tempo_alignment_valgrind) target_audio_clip_tempo_alignment_valgrind ;;
 	audio_clip_stretch) target_audio_clip_stretch ;;
 	audio_scrub_exact) target_audio_scrub_exact ;;
+	audio_backward_scrub) target_audio_backward_scrub ;;
 	audio_bus_prime) target_audio_bus_prime ;;
+	audio_bus_rate_transition) target_audio_bus_rate_transition ;;
 	audio_clip_pitch) target_audio_clip_pitch ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
@@ -1740,7 +1815,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_bus_prime|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

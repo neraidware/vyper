@@ -17,6 +17,11 @@ import sdl "vendor:sdl3"
 // Off by default; set VYPER_TRACE=1 to turn on.
 vyper_trace: bool = false
 
+// play_trace: TEMPORARY diagnostic. Prints the playback and audio-engine update
+// loops every frame so a position bug can be read off the timeline instead of
+// inferred from end-state assertions. Enabled with VYPER_PLAY_TRACE=1.
+play_trace := false
+
 WINDOW_WIDTH :: 1280
 WINDOW_HEIGHT :: 720
 
@@ -820,6 +825,13 @@ Playback :: struct {
 	// (dev != playhead.frame).
 	dev_frame:     i64,
 	dev_at_ns:     i64,
+	// dev_resync is the resync generation dev_frame was computed under. A seek
+	// bumps the generation, and until the producer has HANDLED that seek its
+	// published frame still describes the position before it -- so a reader
+	// cannot tell a stale clock from a current one by looking at dev_frame
+	// alone, because both are just an i64. Publishing the generation alongside is
+	// what lets the playhead tell the difference; see playback_update.
+	dev_resync:    i64,
 }
 
 playback: Playback = {
