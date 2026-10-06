@@ -1459,6 +1459,33 @@ target_audio_node_latency() {
 	echo "audio-node-latency: ok"
 }
 
+# audio_clip_tempo drives a STRETCHED clip through the real playback mixer, across
+# the whole buildable speed range.
+#
+# It checks the two things that make per-clip tempo more than a field that compiles:
+# that a stretched clip produces output for its span, and that the graph is genuinely
+# in the path -- a stretch that rendered bit-identically would mean tempo is not being
+# applied and, therefore, that pitch is not being corrected. Speed 1.0 is the
+# CONTROL and must be bit-identical, because that is what proves the feature is inert
+# until a clip is actually stretched.
+target_audio_clip_tempo() {
+	require_fresh_binary audio-clip-tempo || return 1
+	local src=target/mixparity/long.m4a
+	if [ ! -s "$src" ]; then
+		echo "audio-clip-tempo: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
+		return 1
+	fi
+	local rc=0
+	for sp in 1.0 0.25 0.5 1.5 2.0 3.0 4.0; do
+		VYPER_AUDIO_CLIP_TEMPO="$PWD/$src|$sp" timeout 600 ./vyper >/dev/null 2>&1
+		[ $? -ne 0 ] && { echo "audio-clip-tempo: FAILED at speed $sp" >&2; rc=1; }
+	done
+	if [ $rc -ne 0 ]; then
+		return 1
+	fi
+	echo "audio-clip-tempo: ok (speeds 0.25 .. 4.0, with 1.0 as the inertness control)"
+}
+
 target_all() {
 	local t
 	# render_valgrind was deliberately excluded here while it failed on two
@@ -1472,7 +1499,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_clip_tempo atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1507,6 +1534,7 @@ main() {
 	audio_drift_parity) target_audio_drift_parity ;;
 	audio_stall_gap) target_audio_stall_gap ;;
 	audio_node_latency) target_audio_node_latency ;;
+	audio_clip_tempo) target_audio_clip_tempo ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
@@ -1526,7 +1554,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

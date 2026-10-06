@@ -195,7 +195,40 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64) {
 		n_full += 1
 		rem /= 2.0
 	}
-	prev := g.src
+	// The same problem in the other direction, which is what a FAST clip asks for.
+	// `rate` here is atempo's tempo, so a clip at speed S passes 1/S -- and S = 3
+	// gives tempo 0.333, outside atempo's per-stage [0.5, 2.0]. The graph would
+	// create the stage, libavfilter would refuse the option ("Numerical result out
+	// of range"), and the clip would produce NO SAMPLES AT ALL.
+	//
+	// So chain full 0.5 stages upward, exactly mirroring the 2.0 case:
+	// 0.333 = 0.5 x 0.667. Multiplying is the only composition that works -- adding
+	// would cancel toward 1.0 and silently play the wrong speed, which is the whole
+	// failure mode this guards against.
+	n_slow := 0
+	for rem < 0.5 {
+		n_slow += 1
+		rem /= 0.5
+	}
+	if n_slow > 0 && g.n_stages+n_slow+n_full >= ATEMPO_MAX_STAGES {
+		fmt.printf("[atempo] too many stages for rate %.3f\n", rate)
+		atempo_graph_destroy(g)
+		return
+	}
+	prev_slow := g.src
+	for s in 0 ..< n_slow {
+		name_buf: [32]u8
+		fmt.bprintf(name_buf[:], "atemslow%d", g.n_stages)
+		ctx := atempo_link_stage(graph, prev_slow, "atempo", cstring(raw_data(name_buf[:])), cstring("tempo=0.500000"))
+		if ctx == nil {
+			atempo_graph_destroy(g)
+			return
+		}
+		g.stages[g.n_stages] = ctx
+		g.n_stages += 1
+		prev_slow = ctx
+	}
+	prev := prev_slow
 	for s in 0 ..< n_full {
 		if g.n_stages >= ATEMPO_MAX_STAGES {
 			fmt.printf("[atempo] too many stages for rate %.2f\n", rate)
@@ -323,7 +356,16 @@ atempo_process :: proc(g: ^Atempo_Graph, mix: []f32, n: int) {
 			break
 		}
 		count := int(g.out_frame.nb_samples)
-		if out_n + count > ATEMPO_OUT_CAP {
+		// The bound is in FRAMES but out_buf is a flat float array holding
+		// count*2 floats per frame, so the capacity is ATEMPO_OUT_CAP/2 frames.
+		//
+		// Comparing frame counts against ATEMPO_OUT_CAP directly permitted TWICE the
+		// buffer. That is a real overflow, not a theoretical one -- it only triggers
+		// above 8192 output frames in a single drain, which is why nothing hit it until
+		// a clip was stretched past 2x and the graph produced that much at once. It
+		// wrote past the end of a struct field that now also exists once per audio
+		// source, so the blast radius grew with this change even though the bug did not.
+		if out_n + count > ATEMPO_OUT_CAP / 2 {
 			fmt.printf("[atempo] output overflow: %d + %d > %d (rate %.2f)\n", out_n, count, ATEMPO_OUT_CAP, g.rate)
 			break
 		}

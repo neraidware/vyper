@@ -1943,6 +1943,19 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		os.exit(0)
 	}
+	// VYPER_AUDIO_CLIP_TEMPO=<path>|<speed> -- proves a STRETCHED clip through the real
+	// playback mixer: that it produces output for the span, and that the graph is
+	// genuinely in the path (a stretch that rendered identically would mean tempo is
+	// not applied and pitch is not being corrected).
+	if ct, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO", context.temp_allocator); ct != "" {
+		parts := strings.split(ct, "|")
+		speed := 2.0
+		if len(parts) >= 2 {
+			speed, _ = strconv.parse_f64(strings.trim_space(parts[1]))
+		}
+		ok: bool = audio_probe_clip_tempo(strings.trim_space(parts[0]), speed)
+		os.exit(ok ? 0 : 1)
+	}
 	// VYPER_AUDIO_NODE_LATENCY measures the two graph delays (swr device conversion,
 	// atempo lookahead) that scrubbing and clip stretching both depend on.
 	// lookup_env_alloc, not os.getenv: getenv returns NIL when the variable is

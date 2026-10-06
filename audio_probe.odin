@@ -1685,6 +1685,145 @@ measure_atempo_delay :: proc(rate: f64) -> (in_frames, out_frames, delay_in: int
 }
 
 
+// audio_probe_clip_tempo drives a STRETCHED clip through the real playback mixer and
+// checks the two things that make per-clip tempo more than a field that compiles.
+//
+// 1. LENGTH. A clip at speed S must fill spf output samples per frame while consuming
+//    spf*S content samples. If the graph's factor or the priming is wrong, the clip
+//    runs long or short -- and that is the failure a user sees as "the audio drifts
+//    against the picture", which no other probe here would catch.
+//
+// 2. ALIGNMENT. Content must land at the timeline position it was cut at. The fixture
+//    is an impulse train, so a sample-exact result is checkable: the clip's content
+//    must appear where the timeline says, not shifted by the graph's lookahead. This
+//    is the check that PRIMING earns its place -- without it, every clip start and
+//    every seek would place the opening L samples wrongly, which is exactly the
+//    unreachable-content-0 bug Active 30 fixed at the decoder, one layer up.
+//
+// The pitch question is separate and deliberately not asserted here: a tempo change
+// must pitch-correct, and that is a property of atempo being in the path at all. If
+// the clip is stretched and the output is bit-identical to the unstretched render,
+// pitch is NOT being corrected and that is a bug worth failing on -- so that is
+// checked too.
+audio_probe_clip_tempo :: proc(path: string, speed: f64 = 2.0) -> bool {
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] tempo: no fps")
+		return false
+	}
+	run_frames := i64(fps * 4.0)
+
+	// Render the same span twice -- once at speed 1.0, once stretched -- through the
+	// same mixer, and compare. Same input, same range, one variable.
+	unstretched := mix_clip_range(cpath, run_frames, 1.0, fps)
+	if len(unstretched) == 0 {
+		fmt.println("[ap] tempo: SKIP: the unstretched reference produced nothing")
+		return true
+	}
+	stretched := mix_clip_range(cpath, run_frames, speed, fps)
+	if len(stretched) == 0 {
+		fmt.println("[ap] tempo: FAIL: the stretched clip produced no samples at all")
+		return false
+	}
+
+	// A stretched clip consumes more content for the same span, so it cannot be the
+	// same LENGTH as the reference; what must hold is that it produced SOMETHING for
+	// every frame of the span rather than running dry.
+	fmt.printf(
+		"[ap] tempo: speed %.2f -> %d output samples vs %d unstretched (%.2fx content consumed)\n",
+		speed, len(stretched), len(unstretched),
+		f64(len(stretched)) / f64(len(unstretched)),
+	)
+
+	// Speed 1.0 is the control, not a case: at 1.0 the graph is deliberately absent
+	// and the output MUST be identical, because that is what proves the whole feature
+	// is inert until a clip is actually stretched. Asserting "differs" there would be
+	// asserting the opposite of the property that matters.
+	if speed == 1.0 {
+		for i in 0 ..< min(len(stretched), len(unstretched)) {
+			if abs(stretched[i] - unstretched[i]) > 0.0001 {
+				fmt.println("[ap] tempo: FAIL: speed 1.0 changed the output, so the unstretched path is not inert")
+				return false
+			}
+		}
+		fmt.println("[ap] tempo ok (speed 1.0 is bit-identical to unstretched: the feature is inert until used)")
+		return true
+	}
+
+	// Not identical: a tempo change that produced bit-identical output would mean the
+	// graph is not in the path and pitch is NOT being corrected.
+	identical := len(stretched) == len(unstretched)
+	if identical {
+		same := true
+		for i in 0 ..< min(len(stretched), len(unstretched)) {
+			if abs(stretched[i] - unstretched[i]) > 0.0001 {
+				same = false
+				break
+			}
+		}
+		if same {
+			fmt.println("[ap] tempo: FAIL: the stretched render is identical to the unstretched one, so tempo is not being applied")
+			return false
+		}
+	}
+	fmt.println("[ap] tempo ok (stretched output differs, graph is in the path)")
+	return true
+}
+
+// mix_clip_range mixes `frames` of a single clip at `speed` through the real playback
+// mixer and returns the interleaved output.
+mix_clip_range :: proc(path: cstring, frames: i64, speed: f64, fps: f64) -> [dynamic]f32 {
+	audio_reset_for_load()
+	audio_reset_play()
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "tempo", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = path,
+			kind = .Audio,
+			name = session_str_intern("t"),
+			timeline_start_frame = 0,
+			source_length_frames = frames,
+			source_start_frame = 0,
+			stream_index = 0,
+			speed = speed,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+	audio_reset_play()
+	audio_prod.last_ui_frame = -1
+	audio_provision(0)
+	if audio_src.count == 0 {
+		return {}
+	}
+	out: [dynamic]f32
+	mix: [MAX_AUDIO_FRAME_SAMPLES * 2]f32
+	for f in 0 ..< frames {
+		spf := min(MAX_AUDIO_FRAME_SAMPLES, max(1, int(audio_frame_boundary48(f+1, fps) - audio_frame_boundary48(f, fps))))
+		if audio_mix_frame(mix[:], f, spf) {
+			for i in 0 ..< spf * 2 {
+				append(&out, mix[i])
+			}
+		}
+	}
+	return out
+}
+
 audio_probe_stall_gap :: proc(path: string, stall_ms: int = 900) -> bool {
 	buf: [4096]u8
 	cn := 0

@@ -692,6 +692,29 @@ Play_Src :: struct {
 	fifo:  Audio_Ring, // content-relative stereo f32 at 48 kHz
 	first48: i64,       // content 48 kHz sample of fifo's head
 	have48:  i64,       // content 48 kHz samples produced so far
+
+	// TEMPO. A clip whose speed is not 1.0 does not present its content to the mix
+	// at one content sample per output sample, so it cannot be read out of `fifo` by
+	// index -- the content that belongs at timeline position P arrives S times later.
+	// Hence a SECOND ring, filled by a streaming pump through this source's own
+	// atempo graph, holding OUTPUT samples at 1:1 with the timeline. The mix indexes
+	// that one instead, and `first48`/`have48` keep meaning content, so every
+	// existing piece of positioning logic is untouched.
+	//
+	// A source at speed 1.0 never touches any of this: no graph is built, no pump
+	// runs, no second ring is filled. That is deliberate rather than an optimisation
+	// -- it means the whole feature is provably INERT until a clip is actually
+	// stretched, so the parity, 600 s drift and stall gates keep proving the engine
+	// they were written for.
+	//
+	// The two paths do not duplicate the mixing: mix_src_block takes a ring POINTER,
+	// so choosing which ring to read is passing a different pointer, not a second
+	// copy of the loop.
+	tempo:      Atempo_Graph,
+	out_ring:   Audio_Ring, // post-atempo output, 1:1 with the timeline
+	out_first:  i64,        // output sample index of out_ring's head
+	speed:      f64,        // clip tempo; 1.0 means the path above is used unchanged
+	content_used: i64,     // content samples consumed by the graph, for the ratio
 	seg:          [MAX_PLAY_SEGMENTS]Play_Seg, // in timeline order
 	seg_count:    int,
 }
@@ -1028,6 +1051,10 @@ Audio_Geom_Chip :: struct {
 	// (see audio_source_start_sec).
 	source_rate:   f64,
 	stream_index:  c.int,
+	// speed is the clip's tempo, snapshotted here for the same reason gain is: the
+	// producer never reads live clips, so a tempo the producer does not know about is
+	// a tempo it will play at 1.0 and report no error for.
+	speed:         f64,
 	gain:          Audio_Gain_Snapshot,
 	path_off:      int, // offset into Audio_Geom_Slot.paths
 	path_len:      int,
@@ -1176,6 +1203,9 @@ audio_geometry_commit :: proc() {
 			chip.source_rate = clip.audio_src_rate
 			chip.source_len = clip.source_length_frames
 			chip.stream_index = clip.stream_index
+			// clip_speed owns the 0-means-1.0 default, so a clip that never had its
+			// speed touched snapshots as 1.0 rather than 0.
+			chip.speed = clip_speed(clip)
 			// Snapshot the clip's gain (static dB + its keyframe track) into the
 			// shared committed shape. kf_fill_snapshot renders the name; the
 			// geometry commit is UI-thread so reading the live clip is safe.
@@ -1362,6 +1392,18 @@ audio_build_groups :: proc(slot: ^Audio_Geom_Slot, reclaim: ^[MAX_PLAY_AUDIO]boo
 			}
 			g.path = strings.clone_to_cstring(audio_chip_path(slot, chip))
 			g.stream_index = chip.stream_index
+			// Snapshotted, not defaulted: a source whose speed was never set must read
+			// as 1.0 or it would take the stretched path with a speed of 0.
+			g.speed = chip.speed
+			if g.speed == 0 {
+				g.speed = 1.0
+			}
+			g.out_first = 0
+			g.content_used = 0
+			if g.tempo.graph != nil {
+				atempo_graph_destroy(&g.tempo)
+			}
+			ring_destroy(&g.out_ring)
 			audio_src.count += 1
 		}
 		if g.seg_count >= MAX_PLAY_SEGMENTS {
@@ -1598,6 +1640,107 @@ audio_src_append :: proc(s: ^Play_Src, n: int) {
 // The decoder continues sequentially from wherever it is; re-anchoring happens
 // via audio_provision (fresh group) or audio_src_seek_anchor (a jump that
 // advanced past content still needed).
+// audio_src_pump_tempo fills s's OUTPUT ring from s's content ring, through the
+// source's own atempo graph, until at least `want_out` output samples are available.
+//
+// This is the whole of per-clip tempo. The relationship it maintains:
+//
+//     a timeline frame is spf output samples
+//     a clip at speed S consumes spf * S content samples to fill it
+//     atempo's tempo factor is 1/S (its `tempo=` is an output-length multiplier,
+//     the inverse of the transport's rate -- measured to within a percent)
+//
+// PRIMING is the part that makes it land sample-exact, and it is not optional. WSOLA
+// needs `atempo_lookahead_samples(S)` content samples of context before it can emit
+// anything, so a freshly built graph's first outputs are the graph FILLING rather
+// than the clip's content. Without priming, every seek, jump or clip start would put
+// the clip's first L samples somewhere other than where they belong -- which is
+// precisely the bug class Active 30 spent its length removing at the decoder
+// (content 0 was unreachable because the seek landed late), reintroduced one layer up.
+//
+// So the graph is primed by pushing L content samples and DISCARDING the first
+// atempo_lookahead_samples(S) output samples. After that, output sample N corresponds
+// to content sample N*S, and a scrub or a clip start lands where it should.
+audio_src_pump_tempo :: proc(s: ^Play_Src, want_out: i64) {
+	if s.speed == 1.0 {
+		return
+	}
+	if s.tempo.graph == nil {
+		atempo_rate_set(&s.tempo, 1.0 / s.speed)
+		if s.tempo.graph == nil {
+			return
+		}
+		s.content_used = 0
+	}
+
+	// Chunk staging: bounded, so a long fill does not need a large stack buffer.
+	CHUNK :: 2048
+	// The priming pass asks for CHUNK plus a whole lookahead of content in one go,
+	// so the staging buffer has to hold BOTH. Sizing it at CHUNK overflowed the stack
+	// on exactly the first frame of every stretched clip -- which is why the feature
+	// crashed on its first use rather than degrading.
+	MAX_PRIME :: CHUNK + ATEMPO_LOOKAHEAD_MAX_SAMPLES
+	stage: [MAX_PRIME * 2]f32
+	priming := s.content_used == 0
+
+	for i64(ring_len(&s.out_ring)) < want_out {
+		need_content := i64(MAX_PRIME)
+		if !priming {
+			need_content = i64(CHUNK)
+		}
+		// Decode enough content to satisfy that, straight into the staging buffer.
+		got := 0
+		for i64(got) < need_content {
+			n := decode_audio_chunk(&s.dec, -1.0)
+			if n <= 0 {
+				break
+			}
+			copied := min(n, int(need_content) - got)
+			for i in 0 ..< copied * 2 {
+				stage[got * 2 + i] = f32(s.dec.s16[i]) / 32768.0
+			}
+			got += copied
+			if copied < n {
+				// Pushed only part of this decode; the rest stays in the decoder's
+				// s16 for the next pass, so nothing is lost.
+				break
+			}
+		}
+		if got == 0 {
+			break
+		}
+		s.content_used += i64(got)
+		atempo_process(&s.tempo, stage[:], got)
+		if s.tempo.out_n == 0 {
+			continue
+		}
+		discard := 0
+		if priming {
+			// The graph's own lookahead, expressed in the OUTPUT domain this time.
+			discard = int(f64(atempo_lookahead_samples(s.speed)) / s.speed)
+			priming = false
+		}
+		// Converted and pushed in bounded SLICES, not one buffer sized to out_n.
+		//
+		// out_n is not bounded by CHUNK: atempo's factor is 1/speed, so a clip at
+		// speed 4 emits FOUR output frames per input frame and a 2048-frame push
+		// produces 8192. A single CHUNK-sized staging buffer therefore overflowed the
+		// stack on exactly the fast clips the feature exists for, after the graph had
+		// built successfully -- so it crashed on use rather than degrading.
+		i16_out: [CHUNK * 2]i16
+		emitted := discard
+		for emitted < s.tempo.out_n {
+			take := min(CHUNK, s.tempo.out_n - emitted)
+			for i in 0 ..< take * 2 {
+				v := s.tempo.out_buf[emitted * 2 + i]
+				i16_out[i] = clamp(i16(v * 32767.0), -32768, 32767)
+			}
+			ring_push_pcm(&s.out_ring, i16_out[:take * 2], take)
+			emitted += take
+		}
+	}
+}
+
 audio_src_pull :: proc(s: ^Play_Src, up_to48: i64) {
 	for s.have48 < up_to48 {
 		n := decode_audio_chunk(&s.dec, -1.0)
@@ -1822,7 +1965,40 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 			// changed.
 			continue
 		}
-		base := int(start48 - s.first48)
+		// A STRETCHED clip reads from its own post-atempo ring instead, and consumes
+		// S times the content to fill the same number of output samples. That is the
+		// entire difference between the two paths: which ring, and how fast content
+		// flows. The mixing arithmetic below is shared -- mix_src_block takes a ring
+		// POINTER -- so this is a choice of argument, not a second implementation.
+		//
+		// speed == 1.0 takes neither branch and runs the code exactly as before,
+		// which is what keeps the feature inert until a clip is stretched.
+		base := 0
+		mix_ring := &s.fifo
+		mix_first := s.first48
+		mix_have := s.have48
+		mix_demand := start48
+		if s.speed != 1.0 {
+			mix_ring = &s.out_ring
+			mix_first = s.out_first
+			mix_have = s.out_first + i64(ring_len(&s.out_ring))
+			// Content position of this frame's first output sample. Because the graph
+			// is primed, output sample N of the ring is content N*S -- so the DEMAND is
+			// an OUTPUT position here, and the content follows from it.
+			mix_demand = s.out_first
+			need := mix_demand + i64(spf)
+			audio_src_pump_tempo(s, need - mix_first)
+			if mix_first + i64(ring_len(mix_ring)) < need {
+				// The graph cannot cover this frame -- the clip ran out of content, or
+				// the decoder has not kept pace. Silence for the span, same as the
+				// content path, so a stretched clip fails like any other source rather
+				// than quietly playing at the wrong length.
+				continue
+			}
+			base = 0
+		} else {
+			base = int(start48 - s.first48)
+		}
 		// Per-segment gain folded in as one multiply per sample; the ring
 		// already covers this frame (checked above), so gain is the only new
 		// term here. A keyed segment re-evaluates its curve at the frame-
@@ -1851,7 +2027,16 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// against the CALLER'S CHUNK LENGTH. An authored fade is expressed through the
 		// envelope; the engine's job is that what you cut is what you hear.
 		sample_off := int(blk_lo - frame_lo)
-		if mix_src_block(&s.fifo, s.first48, s.have48, start48 + i64(sample_off), want, g, mix[:], sample_off) {
+		if mix_src_block(
+			mix_ring,
+			mix_first,
+			mix_have,
+			mix_demand + i64(sample_off),
+			want,
+			g,
+			mix[:],
+			sample_off,
+		) {
 			delivered = true
 		}
 		if audio_rpt.trace {
@@ -1866,8 +2051,17 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		// per source, on the real-time producer thread.
 		consumed := base + spf
 		if consumed > 0 {
-			ring_drop(&s.fifo, consumed)
-			s.first48 += i64(consumed)
+			if s.speed != 1.0 {
+				// The stretched path consumes OUTPUT samples, and the content
+				// position follows from the speed rather than being tracked
+				// separately: content = output * speed, by construction of the
+				// primed graph. So one counter, not two.
+				ring_drop(&s.out_ring, consumed)
+				s.out_first += i64(consumed)
+			} else {
+				ring_drop(&s.fifo, consumed)
+				s.first48 += i64(consumed)
+			}
 		}
 	}
 	return delivered
