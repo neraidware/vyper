@@ -1986,6 +1986,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		proxy_bg_probe_run(xb)
 		return
 	}
+	if xi, _ := os.lookup_env_alloc("VYPER_IMAGE_PROBE", context.temp_allocator); xi != "" {
+		probe_image_run(xi)
+		return
+	}
+	if xd, _ := os.lookup_env_alloc("VYPER_IMAGE_DECODE_PROBE", context.temp_allocator); xd != "" {
+		probe_image_decode_run(xd)
+		return
+	}
 	if xs, _ := os.lookup_env_alloc("VYPER_PROXY_SCHED_TEST", context.temp_allocator); xs != "" {
 		proxy_sched_probe_run(xs)
 		return

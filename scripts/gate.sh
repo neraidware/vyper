@@ -978,6 +978,86 @@ target_export_bench() {
 	export_bench_run off_canvas    VYPER_TX="-3000,0,1.0" || return 1
 }
 
+# image_probe proves a STILL IMAGE is not treated as footage. It exists because
+# the user imported a .jpg and the app SEGFAULTED: a still probes as a one-frame
+# mjpeg video stream, so every "is this video?" test says yes and the on-demand
+# scheduler posted a background H.264 build for it. The encode loop then reached
+# its trailing drain having fed the encoder nothing, and h264_vaapi dereferenced
+# surface state that only exists after the first real frame -- SIGSEGV inside
+# libavcodec, on the import worker, with no gate target anywhere on that path.
+#
+# The fixture is synthesized, so it is the same file every run and costs nothing.
+# image_decode_probe proves a still image DECODES, and holds across its span.
+# Separate from image_probe because the two failures are different and the user
+# reported both: a .jpg that "renders nothing" is not a classification problem.
+# The clip classified correctly (kind=Video, is_still) and still showed nothing,
+# because the decode failed -- and a decode that always fails is ALSO the stall:
+# slot.has_frame never becomes true, so preview_state re-posts a decode on every
+# single frame, forever.
+#
+# The defect was a cold decoder SEEKING to frame 0. A fresh decoder is already
+# there, so the seek bought nothing -- and on a single-packet source it cost the
+# only packet: avformat_seek_frame to ts 0 with BACKWARD lands past it and the
+# read that follows returns EOF. JPEG's demuxer does this; PNG's does not, which
+# is why a .jpg failed and a .png did not.
+#
+# The fixture is synthesized. Both a PORTRAIT and a LANDSCAPE still are checked,
+# because they exercise different letterboxing (243x432 centred in 768x432 vs
+# 768x432 filling it) and a portrait-only fixture would pass a fit-rect bug that
+# a landscape one exposes.
+target_image_decode_probe() {
+	require_fresh_binary image-decode-probe || return 1
+	mkdir -p "$PROXY_DIR"
+	local rc=0
+	local spec
+	for spec in "still.jpg:1080x1920:-q:v 3" "wide.jpg:1920x1080:-q:v 3" "still.png:800x600:"; do
+		local name="${spec%%:*}"
+		local rest="${spec#*:}"
+		local size="${rest%%:*}"
+		local extra="${rest#*:}"
+		local src="$PROXY_DIR/$name"
+		if [ ! -s "$src" ]; then
+			# shellcheck disable=SC2086
+			dev ffmpeg -y -f lavfi -i "testsrc2=size=$size:rate=1" \
+				-frames:v 1 $extra "$src" >/dev/null 2>&1 || {
+				echo "image-decode-probe: could not synthesize $name" >&2
+				return 1
+			}
+		fi
+		local out
+		if ! out=$(VYPER_IMAGE_DECODE_PROBE="$PWD/$src" timeout 300 ./vyper 2>&1); then
+			echo "$out" | grep -E '^\[image-dec\]' >&2
+			echo "image-decode-probe: FAILED for $name" >&2
+			rc=1
+			continue
+		fi
+		echo "$out" | grep -E '^\[image-dec\] fit='
+	done
+	[ "$rc" -eq 0 ] || return 1
+	echo "image-decode-probe: ok (portrait/landscape stills decode to real pixels and hold)"
+}
+
+target_image_probe() {
+	require_fresh_binary image-probe || return 1
+	mkdir -p "$PROXY_DIR"
+	local src="$PROXY_DIR/still.jpg"
+	if [ ! -s "$src" ]; then
+		dev ffmpeg -y -f lavfi -i "testsrc2=size=1080x1920:rate=1" \
+			-frames:v 1 -q:v 3 "$src" >/dev/null 2>&1 || {
+			echo "image-probe: could not synthesize the still fixture" >&2
+			return 1
+		}
+	fi
+	local out
+	if ! out=$(VYPER_IMAGE_PROBE="$PWD/$src" timeout 300 ./vyper 2>&1); then
+		echo "$out" >&2
+		echo "image-probe: FAILED -- see the [image-probe] lines above" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[image-probe\]'
+	echo "image-probe: ok (a still image is Video+is_still and is never proxy-encoded)"
+}
+
 target_proxy_probe() {
 	require_fresh_binary proxy-probe || return 1
 	mkdir -p "$PROXY_DIR"
@@ -1775,7 +1855,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate image_probe image_decode_probe audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -1834,13 +1914,15 @@ main() {
 	render_valgrind) target_render_valgrind ;;
 	subtitle_probe) target_subtitle_probe ;;
 	proxy_probe) target_proxy_probe ;;
+	image_probe) target_image_probe ;;
+	image_decode_probe) target_image_decode_probe ;;
 	smoke) target_smoke ;;
 	footprint) target_footprint "${2:-20}" ;;
 	valgrind) target_valgrind ;;
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

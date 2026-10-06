@@ -560,6 +560,22 @@ mux_packet :: proc(
 // send (or a trailing send_frame(nil)) until EAGAIN/EOF, muxing each packet.
 // Returns the resulting running done count (packets flushed do not add to it
 // since the frames they carry were already counted when sent).
+//
+// NEVER DRAIN AN ENCODER THAT WAS NEVER FED, which is what `done == 0` means.
+//
+// send_frame(nil) is the drain signal, and for a hardware encoder it is not a
+// no-op on an encoder with no input history: h264_vaapi dereferences surface
+// and rate-control state that only exists after the first real frame, and the
+// process dies inside libavcodec with no way to catch it. Reproduced on a still
+// image, which probes as a one-frame mjpeg video stream, so every "is this
+// video?" test says yes and the scheduler posted a background H.264 build for
+// it: the encode loop never reached a send, then the EOF branch drained, and
+// h264_vaapi segfaulted.
+//
+// The image guard upstream (import_bg_request refuses a still) is the fix for
+// that path; this is the invariant that keeps the crash out of every OTHER way
+// of producing zero frames -- a truncated source, a segment whose frames were
+// all skipped, a source whose first decode step reports EOF.
 flush_encoded_packets :: proc(
 	enc: ^avcodec.CodecContext,
 	enc_pkt: ^avcodec.Packet,
@@ -568,6 +584,9 @@ flush_encoded_packets :: proc(
 	enc_tb: avutil.Rational,
 	done: i64,
 ) -> i64 {
+	if done == 0 {
+		return 0
+	}
 	_ = avcodec.send_frame(enc, nil)
 	for {
 		rc := avcodec.receive_packet(enc, enc_pkt)

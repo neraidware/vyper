@@ -638,3 +638,285 @@ buffer_mean :: proc(buf: []u8) -> f64 {
 	}
 	return sum / f64(len(buf))
 }
+
+// ---------------------------------------------------------------------------
+// VYPER_IMAGE_PROBE="<file>": a still image is NOT footage.
+//
+// The user reported that importing a .jpg put an AUDIO clip on the timeline, and
+// then the app SEGFAULTED in the proxy encoder. Both are measured here, on the
+// real import path, because both were invisible to every other probe: nothing
+// imported an image, and the crash was in a path with no gate target at all.
+//
+// The crash is the one that matters. A still probes as a one-frame mjpeg VIDEO
+// stream (verified with ffprobe: codec_type=video, codec_name=mjpeg,
+// r_frame_rate=25/1, nb_frames=N/A), so every "is this video?" test says yes and
+// the on-demand proxy scheduler posts a background H.264 build for it. The
+// encoder is then drained having been fed nothing, and h264_vaapi dereferences
+// state that only exists after the first frame. Reproduced exactly, same two log
+// lines and the same SIGSEGV, before any fix.
+//
+// Asserts, in order:
+//   1. the asset is classified Video and flagged is_image;
+//   2. placing it yields a Video clip that is flagged is_still;
+//   3. the background builder REFUSES an image rather than encoding one.
+// ---------------------------------------------------------------------------
+
+probe_image_path :: proc(v: string) -> cstring {
+	inp: [4096]u8
+	n := 0
+	for n < len(v) && n < len(inp) - 1 {
+		inp[n] = v[n]
+		n += 1
+	}
+	inp[n] = 0
+	return cstring(&inp[0])
+}
+
+probe_image_run :: proc(v: string) {
+	path := probe_image_path(v)
+	if !media_is_image(path) {
+		fmt.printf("[image-probe] FAIL: %q is not named like a still image\n", string(path))
+		os.exit(1)
+	}
+
+	// 1. Asset classification. A jpg is a one-frame video stream, so has_video is
+	// true and the kind is right -- but is_image is what every other decision
+	// keys off, and it is computed separately, so it is asserted separately.
+	asset_id := import_media_to_bin(path)
+	if asset_id == 0 {
+		fmt.println("[image-probe] FAIL: import_media_to_bin refused the image")
+		os.exit(1)
+	}
+	asset := find_asset(asset_id)
+	if asset == nil {
+		fmt.println("[image-probe] FAIL: imported asset not found")
+		os.exit(1)
+	}
+	fmt.printf(
+		"[image-probe] asset kind=%v is_image=%v frames=%d src=%dx%d dur=%dus\n",
+		asset.kind,
+		asset.is_image,
+		asset.frame_count,
+		asset.src_w,
+		asset.src_h,
+		asset.dur_us,
+	)
+	if asset.kind != .Video {
+		fmt.printf("[image-probe] FAIL: a still image probed as %v, want Video\n", asset.kind)
+		os.exit(1)
+	}
+	if !asset.is_image {
+		fmt.println("[image-probe] FAIL: is_image not set for a .jpg")
+		os.exit(1)
+	}
+	// A still has no real frame rate -- mjpeg defaults to 25/1 -- so the clip must
+	// not be pinned to it or a one-second image becomes 25 frames of footage.
+	if asset.video_fps != 0 {
+		fmt.printf(
+			"[image-probe] FAIL: still pinned to source fps %v; mjpeg's default rate is not the image's\n",
+			asset.video_fps,
+		)
+		os.exit(1)
+	}
+
+	// 2. Placement. add_asset_to_timeline picks the lane count from audio_streams
+	// and the kind, so this is where a misclassification becomes an audio clip.
+	playhead.frame = 0
+	placed := add_asset_to_timeline(asset_id, 0, 0)
+	_, clip, found := clip_at_frame(placed)
+	if !found || clip == nil {
+		fmt.printf("[image-probe] FAIL: no clip on the timeline at placed frame %d\n", placed)
+		os.exit(1)
+	}
+	fmt.printf("[image-probe] placed clip kind=%v is_still=%v at frame %d\n", clip.kind, clip.is_still, placed)
+	if clip.kind != .Video {
+		fmt.printf("[image-probe] FAIL: a still image placed as a %v clip\n", clip.kind)
+		os.exit(1)
+	}
+	if !clip.is_still {
+		fmt.println("[image-probe] FAIL: placed clip is not flagged is_still")
+		os.exit(1)
+	}
+
+	// 3. The builder refuses it. This is the crash: before the fix this posted a
+	// background H.264 build and the process died in h264_vaapi.
+	//
+	// The wait is the assertion. Reading `building` straight after the post is
+	// vacuous -- the worker has not woken yet, so it reads false whether or not a
+	// build was accepted, and the probe would pass against the crashing code. The
+	// window is generous because the point is that nothing EVER starts, so
+	// spinning the full budget is what makes a late start fail too.
+	import_bg_init()
+	editor_flags.preview_proxy_enabled = true
+	editor_flags.async_import_mode = true
+	import_bg_request(path, asset.frame_count, asset.dur_us, asset.src_w, asset.src_h, 0, 1)
+	settled := false
+	for _ in 0 ..< 200 {
+		_, _, _, has_request, _, _, _, building, _, _, _, _, _, _, _, _ := import_bg_window()
+		if building {
+			fmt.println("[image-probe] FAIL: the builder started an encode for a still image")
+			break
+		}
+		if !has_request {
+			// Refused outright: no request was ever recorded.
+			settled = true
+			break
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	import_bg_shutdown()
+	if !settled {
+		// Reaching here with no refusal and no build means the request sat in the
+		// queue for the whole window, which is not what "refuses a still" means.
+		fmt.println("[image-probe] FAIL: the builder neither refused nor finished the request")
+		os.exit(1)
+	}
+	fmt.println("[image-probe] ok (still image: Video kind, is_still, no proxy build)")
+	os.exit(0)
+}
+
+// ---------------------------------------------------------------------------
+// VYPER_IMAGE_DECODE_PROBE="<file>": a still image must DECODE, and every
+// timeline frame of it must show that one image.
+//
+// Separate from the classification probe because the two failures are different
+// and the user reported both: a .jpg that "doesn't render at all" is not a
+// classification problem. Classification is right (kind=Video, is_still) and the
+// clip still shows nothing, so the defect is in the decode/draw path and a probe
+// that stops at the asset cannot see it.
+//
+// The thing worth pinning is the HOLD. A still has one source frame, and
+// clip_source_frame maps every timeline frame of the clip to it -- so the decoder
+// is asked for frame 0 once per timeline frame, 60 times over a one-second clip.
+// That is the conform repeat path (decode_source_frame's `frame_idx ==
+// dec.last_frame` branch), and if it re-decodes instead of re-scaling it pays a
+// full seek plus decode per timeline frame, which is a stall proportional to the
+// clip's length.
+// ---------------------------------------------------------------------------
+
+image_buf: [PREVIEW_W * PREVIEW_H * 4]u8
+
+probe_image_decode_run :: proc(v: string) {
+	path := probe_image_path(v)
+	if !media_is_image(path) {
+		fmt.printf("[image-dec] FAIL: %q is not named like a still image\n", string(path))
+		os.exit(1)
+	}
+	asset_id := import_media_to_bin(path)
+	if asset_id == 0 {
+		fmt.println("[image-dec] FAIL: import_media_to_bin refused the image")
+		os.exit(1)
+	}
+	asset := find_asset(asset_id)
+	if asset == nil {
+		fmt.println("[image-dec] FAIL: imported asset not found")
+		os.exit(1)
+	}
+	playhead.frame = 0
+	placed := add_asset_to_timeline(asset_id, 0, 0)
+	_, clip, found := clip_at_frame(placed)
+	if !found || clip == nil {
+		fmt.println("[image-dec] FAIL: no clip placed")
+		os.exit(1)
+	}
+
+	// Every timeline frame of the clip must map to the SAME source frame. If this
+	// is wrong the hold cannot work no matter what the decoder does, so it is the
+	// first thing asserted.
+	mapped := clip_source_frame(
+		clip.source_start_frame,
+		clip.timeline_start_frame,
+		clip.timeline_start_frame,
+		clip.is_still,
+		clip.src_fps,
+	)
+	// The clip's REAL extent, not `placed - timeline_start_frame`: a still is
+	// placed at its own start frame, so that difference is 0 and the hold would
+	// go untested -- which is the whole point of this probe.
+	span := max(1, clip_timeline_length(clip) - 1)
+	late := clip_source_frame(
+		clip.source_start_frame,
+		clip.timeline_start_frame,
+		clip.timeline_start_frame + span,
+		clip.is_still,
+		clip.src_fps,
+	)
+	fmt.printf(
+		"[image-dec] span=%d source frames %d..%d -> %d..%d\n",
+		span,
+		clip.source_start_frame,
+		clip.source_start_frame + span,
+		mapped,
+		late,
+	)
+	if mapped != late {
+		fmt.println("[image-dec] FAIL: a still does not hold one source frame across its span")
+		os.exit(1)
+	}
+
+	// Decode the frame the preview would ask for, twice: the second call is the
+	// repeat every later timeline frame makes, and it is where a re-decode-per-
+	// timeline-frame stall would live.
+	dec: Clip_Decoder
+	for pass in 0 ..< 2 {
+		if !decode_clip_frame_sync(&dec, clip.path, mapped, image_buf[:]) {
+			fmt.printf("[image-dec] FAIL: pass %d could not decode source frame %d\n", pass, mapped)
+			os.exit(1)
+		}
+	}
+
+	clip_decoder_release_ffmpeg(&dec)
+	// Real pixels, not a decode that "succeeded" into nothing.
+	//
+	// The bound is the FIT RECT, not the whole buffer: decode_into_buffer places
+	// the aspect-preserved decode INSIDE the preview box, so a 1080x1920 portrait
+	// lands as 243x432 centred in 768x432 and covers ~32% of it by construction.
+	// Asserting the buffer is mostly written would fail every correctly
+	// letterboxed portrait. What must hold is that the fit rect carries image
+	// content with real dynamic range.
+	fit_w, fit_h := i64(dec.dst_w), i64(dec.dst_h)
+	ox, oy := i64(dec.fit_ox), i64(dec.fit_oy)
+	if fit_w <= 0 || fit_h <= 0 {
+		fmt.println("[image-dec] FAIL: decoder reported no fit rect")
+		os.exit(1)
+	}
+	buf_w := i64(PREVIEW_W)
+	nonzero, inside := 0, 0
+	min_v, max_v: u8 = 255, 0
+	for row in 0 ..< fit_h {
+		for col in 0 ..< fit_w {
+			i := (oy + row) * buf_w + (ox + col)
+			if i < 0 || i * 4 + 3 >= i64(len(image_buf)) {
+				continue
+			}
+			inside += 1
+			v := image_buf[i * 4]
+			if v != 0 {
+				nonzero += 1
+			}
+			min_v = min(min_v, v)
+			max_v = max(max_v, v)
+		}
+	}
+	frac := f64(nonzero) / f64(max(inside, 1))
+	fmt.printf(
+		"[image-dec] fit=%dx%d at (%d,%d) nonzero=%.3f min=%d max=%d (decoded twice, still holds)\n",
+		fit_w,
+		fit_h,
+		ox,
+		oy,
+		frac,
+		min_v,
+		max_v,
+	)
+	if frac < 0.5 {
+		fmt.println("[image-dec] FAIL: the fit rect is mostly empty (the image would not render)")
+		os.exit(1)
+	}
+	if max_v - min_v < 32 {
+		fmt.println("[image-dec] FAIL: the fit rect is flat (no image content)")
+		os.exit(1)
+	}
+	fmt.println("[image-dec] ok (still decodes to real pixels and holds across its span)")
+	os.exit(0)
+}

@@ -7046,3 +7046,111 @@ lines were off. The probe now reads the same env var.
 **Temporary.** The `[ui]` playhead/producer/feed trace lines and the `VYPER_PLAY_TRACE=1`
 switch are diagnostic scaffolding for this work and are still in the tree, commented as such
 in `main.odin`.
+
+## Active 38 — A JPEG imported, showed nothing, stalled the app, and segfaulted the encoder
+
+**Status: fixed 2026-10-06.** Reported by the user as three symptoms: a `.jpg` "showed
+up as an audio clip", "doesn't render at all", and "literally stall reproduction".
+
+**The classification was never wrong.** The probe proves a synthesized JPEG imports as
+`kind=Video is_image=true` and places as a `kind=Video is_still=true` clip. The
+"audio clip" report is therefore either a file that is not a plain `.jpg` (an extension
+`media_is_image` does not recognise, or a stream layout FFmpeg reports as audio) or a
+different entry path than import-then-place. **Not reproduced, and not fixed** — it
+needs the actual file. Everything below is measured.
+
+### Active 38, first defect — a cold decoder seeked to frame 0, and a still has one packet
+
+This is the "renders nothing" and the stall, and they are the same bug.
+
+`decode_source_frame`'s cold/backward branch called `seek_to_source_frame` before
+decoding. For frame 0 on a fresh decoder that seek is a no-op at best — the decoder is
+already at frame 0 — and on a **single-packet source it is destructive**.
+`avformat_seek_frame` to ts 0 with BACKWARD lands *past* the only packet, so the read
+that follows returns EOF, `decode_one_forward` fails, and the decode returns false.
+
+Measured on a 1080x1920 jpg: `decode_clip_frame_sync` returned **false for source frame
+0**. Not a scaling problem, not a proxy problem, not an aspect problem — the decode
+never produced a frame.
+
+The stall is the consequence, and it is why this looked like a hang rather than a blank
+screen. In `preview_state` the per-frame decode is gated on `slot.has_frame`, and a
+failed decode never sets it. So the slot re-posts a decode on **every frame, forever**,
+for a clip whose 60 timeline frames all map to source frame 0. Measured shape of the
+retry: bounded by nothing, scaling with clip length.
+
+Fix: a cold decoder asking for frame 0 must not seek (`cold_at_origin` in
+`decode_source_frame`). This is not an image special case — **any source whose first
+frame is asked for on a fresh decoder was being seeked to where it already was.**
+
+**A useful asymmetry, because it says what the bug was not.** Reverting only this fix:
+
+    still.jpg   (1080x1920)  FAIL: could not decode source frame 0
+    wide.jpg    (1920x1080)  FAIL: could not decode source frame 0
+    still.png   (800x600)    decoded fine
+
+PNG passed with the bug present. Both formats are one packet; their demuxers disagree
+about where a seek to ts 0 lands. So "images do not render" was JPEG-specific, and a
+probe built on a PNG would have passed against the broken code — which is the reason
+`target_image_decode_probe` checks a portrait AND a landscape still, and the fixture
+list includes the PNG as a control.
+
+### Active 38, second defect — the proxy builder encoded a still, and h264_vaapi segfaulted
+
+The import worker path had **no image handling at all** (no `media_is_image` anywhere in
+`import_bg.odin`), unlike `import_media_to_bin`, which correctly guards with
+`probe.has_video && !is_image`. A still probes as a one-frame mjpeg VIDEO stream
+(ffprobe: `codec_type=video, codec_name=mjpeg, r_frame_rate=25/1, nb_frames=N/A`), so
+every "is this video?" test says yes, the on-demand scheduler posted a background H.264
+build, and the encode loop reached its trailing drain **having fed the encoder nothing**.
+`h264_vaapi` dereferences surface and rate-control state that only exists after the first
+real frame: SIGSEGV inside libavcodec, on the worker thread, uncatchable.
+
+Reproduced exactly with no code change (`VYPER_PROXY_BG_TEST` on a jpg), same two log
+lines and the same signal:
+
+    decoded 1080x1920 (243x432) @ 25/1 fps
+    [enc] proxy encoder: h264_vaapi (hardware)
+    Segmentation fault (139)
+
+Two layers, deliberately:
+
+- `import_bg_may_encode` — the admission check and the single home for the fact. Both
+  `import_bg_request` and `import_bg_redefine` call it, before the mutex, so a refusal
+  costs nothing and no future caller can post a source the encoder will crash on. It
+  also refuses `frames <= 0`, which is the same crash for non-image reasons.
+- `flush_encoded_packets` returns early when `done == 0`. Draining an encoder that was
+  never fed is meaningless work, and this keeps the fault out of every other route to
+  zero frames — a truncated source, a segment whose frames were all skipped, a source
+  whose first decode step reports EOF. **Not independently proven** to be load-bearing:
+  with the admission check in place the image never reaches the encoder, so removing
+  this guard alone changed nothing observable. It is kept as the invariant, not as a
+  measured fix.
+
+### Probes, both in `all`
+
+`image_probe` (`VYPER_IMAGE_PROBE`) pins the classification and placement facts, and
+that the builder refuses a still. Its refusal assertion **waits** — reading `building`
+straight after the post is vacuous, because the worker has not woken yet, so it reads
+false whether or not a build was accepted and the probe would have passed against the
+crashing code.
+
+`image_decode_probe` (`VYPER_IMAGE_DECODE_PROBE`) pins the decode and the HOLD: all 60
+timeline frames of the clip must map to one source frame, and the decode must land real
+pixels in the fit rect. The bound is the **fit rect**, not the buffer — `decode_into_buffer`
+places the aspect-preserved decode inside the preview box, so a 1080x1920 portrait lands
+as 243x432 centred in 768x432 and covers ~32% of it by construction. My first assertion
+checked the whole buffer and would have failed every correctly-letterboxed portrait.
+
+### Known-open, not fixed
+
+- The "audio clip" half. Needs the user's actual file.
+- A still gets `frames=60 dur=40000us`, an implied **1500 fps**, because the asset's
+  duration is a placeholder. `proxy_maybe_post_build` computes `fps = frame_count*1e6/
+  dur_us` from it, so the window math runs on a nonsense rate for any still. Harmless
+  now that the builder refuses images, but the numbers are wrong and anything else that
+  reads them inherits it.
+- **Pre-existing, found while verifying:** `VYPER_PROXY_BG_TEST` on a real 1080p h264
+  video fails at `segment decode frame 89` — identical at HEAD, so not from this work.
+  **That path has no gate target**, which is why a real proxy bug has been sitting there
+  unnoticed.

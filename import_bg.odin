@@ -121,6 +121,49 @@ Import_UI_State :: struct {
 }
 import_ui: Import_UI_State
 
+// import_bg_may_encode is the builder's admission check, and the ONE place that
+// decides whether a source is worth an H.264 proxy at all.
+//
+// A STILL IMAGE IS NOT A SOURCE. It probes as a one-frame mjpeg video stream --
+// verified with ffprobe: codec_type=video, codec_name=mjpeg, r_frame_rate=25/1,
+// nb_frames=N/A -- so every "does this have video?" test upstream says yes and
+// hands us a .jpg to encode. A still needs no proxy: it is one frame, decoded
+// directly, and the proxy path would only ever make it worse.
+//
+// It was worse than wasteful. With no frame to send, the encode loop reached its
+// trailing drain having fed the encoder nothing, and h264_vaapi dereferenced
+// surface state that only exists after the first real frame: SIGSEGV inside
+// libavcodec, on the import worker. Reproduced exactly (same two log lines, same
+// signal) before this check existed.
+//
+// `frames <= 0` is refused for the same reason and is not image-specific: with no
+// frames there is nothing to encode, and the drain below would fault.
+//
+// The caller-facing side of the same fact is `clip.is_still`, which
+// import_media_to_bin already sets and proxy_maybe_post_build already has in
+// hand -- it is checked HERE rather than there so this stays the single admission
+// point, and no future caller can post a source the encoder will crash on.
+import_bg_may_encode :: proc(src: cstring, frames: i64, dur_us: i64) -> bool {
+	if media_is_image(src) {
+		if vyper_trace {
+			fmt.printf("[bg] refused a still image: %q needs no proxy\n", string(src))
+		}
+		return false
+	}
+	if frames <= 0 || dur_us <= 0 {
+		if vyper_trace {
+			fmt.printf(
+				"[bg] refused %q: frames=%d dur=%dus, nothing to encode\n",
+				string(src),
+				frames,
+				dur_us,
+			)
+		}
+		return false
+	}
+	return true
+}
+
 // import_bg_request enqueues a proxy build of the SEGMENT WINDOW
 // [seg_lo, seg_hi) of `src` (half-open; seg_lo..seg_hi-1). Safe to call with a
 // build already running (it becomes the next job). A request for a window that
@@ -136,6 +179,9 @@ import_bg_request :: proc(
 	seg_lo, seg_hi: int,
 ) {
 	ib := &import_ui.builder
+	if !import_bg_may_encode(src, frames, dur_us) {
+		return
+	}
 	if ib.worker.thread == nil {
 		return
 	}
@@ -169,6 +215,9 @@ import_bg_redefine :: proc(
 	seg_lo, seg_hi: int,
 ) {
 	ib := &import_ui.builder
+	if !import_bg_may_encode(src, frames, dur_us) {
+		return
+	}
 	if ib.worker.thread == nil {
 		return
 	}

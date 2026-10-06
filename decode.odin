@@ -947,7 +947,20 @@ decode_source_frame :: proc(dec: ^Clip_Decoder, frame_idx: i64) -> bool {
 	}
 	// Backward jump, cold decoder, or a forward jump beyond the streaming
 	// bound: seek to the keyframe before the target, then decode forward.
-	if !seek_to_source_frame(dec, frame_idx) {
+	//
+	// A COLD DECODER ASKING FOR FRAME 0 MUST NOT SEEK. It is already positioned
+	// there, so the seek buys nothing -- and on a single-packet source it costs
+	// the only packet. A still image is the case that proves it: one mjpeg frame,
+	// and avformat_seek_frame to ts 0 with BACKWARD lands past it, so the read
+	// that follows returns EOF and the decode fails outright. Measured on a
+	// 1080x1920 jpg: `decode_clip_frame_sync` returned false for source frame 0,
+	// which is why a still image imported and placed correctly and then rendered
+	// nothing at all.
+	//
+	// This is not an image special case. Any source whose first frame is asked for
+	// on a fresh decoder was being seeked to where it already was.
+	cold_at_origin := !dec.have_last && frame_idx <= 0
+	if !cold_at_origin && !seek_to_source_frame(dec, frame_idx) {
 		return false
 	}
 	return decode_forward_to_target(dec, frame_idx)
