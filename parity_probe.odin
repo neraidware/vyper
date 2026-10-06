@@ -1245,6 +1245,20 @@ parity_probe_env :: proc() {
 		// The clones are freed by this proc's normal return; the fixture body
 		// cannot hold them itself, because it ends in os.exit and the compiler is
 		// right to call that defer unreachable.
+		// VYPER_ENC, with the same spelling and the same default as
+		// render_test_run — two harnesses reaching the same switch by different
+		// routes is how they drift. It exists for the memory gate: this box has no
+		// hardware encoder, so every export walks h264_nvenc, h264_vaapi,
+		// h264_qsv and h264_amf before reaching libx264, and each failed open is a
+		// dlopen plus a device enumeration. Under memcheck that is minutes of
+		// work whose result is always "no device", paid once per run.
+		if oc, ok := os.lookup_env_alloc("VYPER_ENC", context.allocator); ok && oc != "" {
+			if oc == "GPU" {
+				render_encoder_ui.choice = .GPU
+			} else {
+				render_encoder_ui.choice = .CPU
+			}
+		}
 		still_c := strings.clone_to_cstring(parts[0])
 		clip_c := strings.clone_to_cstring(parts[1])
 		parity_probe_build_fixture(still_c, clip_c, parts[2])
