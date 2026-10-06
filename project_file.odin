@@ -53,6 +53,13 @@ Saved_Asset :: struct {
 	metadata:      string,
 	frame_count:   i64,
 	dur_us:        i64,
+	// video_fps persists the asset's probed source rate. Not optional bookkeeping:
+	// Clip.src_fps is pinned from it at load, so an asset arriving without one
+	// pins its clips to the PROJECT rate and they go back to playing at the
+	// project's speed — the exact defect conform removes. audio_rate is persisted
+	// for the same reason on the audio side; this field being absent while that
+	// one exists is what let a saved project load with every clip 5x too fast.
+	video_fps:     f64,
 	src_w:         c.int,
 	src_h:         c.int,
 	audio_streams: c.int,
@@ -94,6 +101,10 @@ Saved_Clip :: struct {
 	pitch:                f32,
 	source_start_frame:   i64,
 	audio_src_rate:       f64,
+	// src_fps persists the same pin for video. Saved unconditionally rather than
+	// behind a presence flag: an absent field decodes to 0, which already means
+	// "unpinned", so a flag would carry no information the value does not.
+	src_fps:              f64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
 	source_w:             c.int,
@@ -218,6 +229,7 @@ project_to_file :: proc() -> Project_File {
 			metadata      = a.metadata,
 			frame_count   = a.frame_count,
 			dur_us        = a.dur_us,
+			video_fps     = a.video_fps,
 			src_w         = a.src_w,
 			src_h         = a.src_h,
 			audio_streams = a.audio_streams,
@@ -255,6 +267,7 @@ project_to_file :: proc() -> Project_File {
 				pitch                = c.pitch,
 				source_start_frame   = c.source_start_frame,
 				audio_src_rate       = c.audio_src_rate,
+				src_fps              = c.src_fps,
 				source_length_frames = c.source_length_frames,
 				timeline_start_frame = c.timeline_start_frame,
 				source_w             = c.source_w,
@@ -391,6 +404,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				metadata      = strings.clone(sa.metadata),
 				frame_count   = sa.frame_count,
 				dur_us        = sa.dur_us,
+				video_fps     = sa.video_fps,
 				src_w         = sa.src_w,
 				src_h         = sa.src_h,
 				audio_streams = sa.audio_streams,
@@ -448,6 +462,7 @@ session_rebuild :: proc(pf: ^Project_File) {
 				pitch                = sc.pitch,
 				source_start_frame   = sc.source_start_frame,
 				audio_src_rate       = sc.audio_src_rate,
+				src_fps              = sc.src_fps,
 				source_length_frames = sc.source_length_frames,
 				timeline_start_frame = sc.timeline_start_frame,
 				source_w             = sc.source_w,
@@ -500,7 +515,13 @@ session_rebuild :: proc(pf: ^Project_File) {
 	copy(timeline.track_order[:], pf.track_order[:])
 	timeline.playhead_frame = pf.playhead_frame
 	timeline.frame_rate = pf.timeline_frame_rate
+	// Order matters. The rebase re-derives extents from durations measured at the
+	// AUTHORING rate, which needs nothing pinned; the pins then read assets, which
+	// is independent. But the rebase is what makes the extent<->duration invariant
+	// hold, and every later rate change depends on it.
+	pf_rebase_extents()
 	pf_pin_audio_src_rates()
+	pf_pin_src_fps()
 
 	// Post-load reset: a full session replace invalidates every decoder, the
 	// preview cache, and playback state. Mirrors the import post-edit block.
@@ -555,11 +576,72 @@ pf_pin_audio_src_rates :: proc() {
 			if c.kind != .Audio || c.audio_src_rate > 0 {
 				continue
 			}
-			pinned := rate
-			if as := find_asset(c.asset_id); as != nil && as.audio_rate > 0 {
-				pinned = as.audio_rate
+			// asset_authoring_rate covers all three rungs, including the one this
+			// never had: an asset from a project saved before Media_Asset
+			// .audio_rate existed has audio_rate=0, so this used to fall straight
+			// through to the PROJECT rate and read the clip's source_start_frame in
+			// the wrong timebase. ~/baby.vyproj's opus is that case — its counts were
+			// measured at 11.97fps and were being read at 60.
+			pinned, _ := asset_authoring_rate(c.asset_id)
+			if !(pinned > 0) {
+				pinned = rate
 			}
 			c.audio_src_rate = pinned
+		}
+	}
+}
+
+// pf_pin_src_fps pins the rate of every clip that has none — a project saved before
+// Clip.src_fps existed.
+//
+// The video half of pf_pin_audio_src_rates, and it has to run HERE, at load,
+// while the project's own rate is still the one the frame numbers were written
+// against. After that the rate is mutable and the authoring value is
+// unrecoverable, so a project that does not pin here is a project whose clips
+// silently change speed the first time the user touches the frame rate.
+//
+// Preference order, most to least trustworthy:
+//
+//  1. the asset's probed rate — exact, and what a project saved with the field
+//     carries;
+//  2. frame_count / dur_us — what a project saved BEFORE the field existed
+//     carries. The proxy scheduler already derives its rate this way for exactly
+//     this reason (proxy.odin). It is the difference between a project that
+//     conforms and one that does not: without this rung every project already on
+//     disk pins to the project rate and plays at the project's speed, which is
+//     the defect conform exists to remove;
+//  3. the project's effective rate — reproduces the pre-pin 1:1 exactly, for a
+//     source that cannot be characterised at all.
+pf_pin_src_fps :: proc() {
+	rate := project_fps()
+	for ti in 0 ..< len(timeline.tracks) {
+		for ci in 0 ..< len(timeline.tracks[ti].clips) {
+			c := &timeline.tracks[ti].clips[ci]
+			// NOT filtered on c.kind. See below: ~/baby.vyproj stores an AV1 webm
+			// as a .Audio clip over a .Video asset, and the kind filter this
+			// replaces skipped exactly the clip the user was looking at.
+			if c.src_fps > 0 || c.is_still {
+				continue
+			}
+			pinned := rate
+			// Keyed to the ASSET, not to c.kind. ~/baby.vyproj stores an AV1 webm
+			// as a .Audio clip over a .Video asset, so a kind filter here skipped
+			// exactly the clip the user was looking at: it kept src_fps=0, resolved
+			// to the project rate, and played a 12fps source at 60fps speed — the
+			// "5 times faster" report, still live after the conform fix because the
+			// pin never ran on it.
+			//
+			// src_fps is only ever read by the video frame mapping, so pinning a
+			// genuine audio clip's rate here is inert; not pinning a video-content
+			// clip is not.
+			if as := find_asset(c.asset_id); as != nil && as.kind == .Video {
+				if as.video_fps > 0 {
+					pinned = as.video_fps
+				} else if as.frame_count > 0 && as.dur_us > 0 {
+					pinned = f64(as.frame_count) * 1e6 / f64(as.dur_us)
+				}
+			}
+			c.src_fps = pinned
 		}
 	}
 }

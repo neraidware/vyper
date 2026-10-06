@@ -1,6 +1,7 @@
 package main
 
 import "core:fmt"
+import "core:math"
 import "core:os"
 import sdl "vendor:sdl3"
 import "core:strings"
@@ -300,6 +301,113 @@ test_clip_visible_half_open :: proc() {
 	tl_probe_check(
 		!clip_visible_at(start, start, 0),
 		"a zero-length clip must never be visible",
+	)
+}
+
+// The playhead→clip snap must land on a frame the clip OWNS. A clip spans
+// [start, start+length) (clip_visible_at is half-open), so the end boundary is
+// one frame PAST the last content frame. The old snap targeted that boundary,
+// which showed the NEXT clip's first frame whenever clips were contiguous and
+// merely looked fine when a gap followed.
+//
+// The case that isolates it is a clip with a GAP after it: only its own end edge
+// is in range, so whatever comes back is unambiguously that edge. Contiguous
+// clips are deliberately NOT the primary case — at a seam the next clip's start is
+// also a candidate and nearest-edge legitimately prefers it. That is the rule
+// working, not the bug, and a probe asserting 99 there asserts the wrong thing
+// (it did, until the resolver was run against it).
+test_snap_playhead_end_lands_inside_the_clip :: proc() {
+	timeline.tracks = make([dynamic]Track, 0, 1, context.temp_allocator)
+	append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+	// [0,100), a gap, then [200,300). Near frame 101 only clip 0's END edge is in
+	// range; clip 1's start (200) is far outside the margin.
+	append(&timeline.tracks[0].clips, mk_tl_clip(9101, 0, 0, 100, 0, .Video))
+	append(&timeline.tracks[0].clips, mk_tl_clip(9102, 0, 0, 100, 200, .Video))
+	timeline_view.zoom = 1
+	timeline_view.start = 0
+
+	got := snap_playhead_to_clip_edge(101)
+	tl_probe_check(got == 99, "snapping near a lone clip's end must land on 99 (its last frame), got %d", got)
+	tl_probe_check(
+		clip_visible_at(got, 0, 100),
+		"the snapped frame %d must be a frame the clip owns",
+		got,
+	)
+	// The reported symptom in one line: never the frame past the end.
+	tl_probe_check(got != 100, "the snap must not land on the exclusive end (100)")
+
+	// From inside the clip, near its end: still its last frame, never past it.
+	got_in := snap_playhead_to_clip_edge(97)
+	tl_probe_check(got_in == 99, "snapping from inside near the end must land on 99, got %d", got_in)
+
+	// A start edge is untouched: frame 200 is clip 1's start and snaps to itself.
+	tl_probe_check(
+		snap_playhead_to_clip_edge(200) == 200,
+		"a start edge must still snap to itself, got %d",
+		snap_playhead_to_clip_edge(200),
+	)
+
+	// The final clip's end must not park the playhead in the sheet-empty slot
+	// past all content: duration is 300, so 299 is the last real frame.
+	got3 := snap_playhead_to_clip_edge(299)
+	tl_probe_check(got3 == 299, "snapping the final clip's end must land on 299, got %d", got3)
+	tl_probe_check(
+		got3 <= timeline_duration() - 1,
+		"the snap must stay inside the timeline (%d > %d)",
+		got3,
+		timeline_duration() - 1,
+	)
+
+	// Beyond the margin the frame comes back untouched: this is a latch, not a
+	// magnet.
+	tl_probe_check(
+		snap_playhead_to_clip_edge(50) == 50,
+		"a frame far from every edge must not move",
+	)
+	tl_probe_check(
+		snap_playhead_to_clip_edge(150) == 150,
+		"a frame in the gap between clips must not move",
+	)
+
+	// A zero-length clip owns no end frame, so its end folds onto its start rather
+	// than pointing one frame BEFORE it. Placed mid-timeline so the duration clamp
+	// cannot be what answers: a zero-length clip AT the duration boundary makes
+	// clip_timeline_end == duration, and the clamp then masks the fold entirely.
+	append(&timeline.tracks[0].clips, mk_tl_clip(9103, 0, 0, 0, 150, .Video))
+	got_zero := snap_playhead_to_clip_edge(150)
+	tl_probe_check(
+		got_zero == 150,
+		"a zero-length clip's end must fold onto its start, got %d",
+		got_zero,
+	)
+	tl_probe_check(
+		got_zero >= timeline.tracks[0].clips[2].timeline_start_frame,
+		"the fold must never point before the clip's own start (%d)",
+		got_zero,
+	)
+}
+
+// The clip→playhead direction is the other half of the toggle pair and shares
+// nothing with the resolver above, so it is pinned here too: a clip drag must
+// latch onto the playhead, and the margin must be exactly SNAP_PIXELS wide at
+// any zoom (the old max(..,1) floor let it balloon when zoomed out).
+test_snap_to_playhead_margin_scales_with_zoom :: proc() {
+	tl_scene()
+	playhead.frame = 100
+	timeline_view.zoom = 1
+	timeline_view.start = 0
+	// SNAP_PIXELS = 8 at zoom 1 -> within 8 frames latches, 9 does not.
+	tl_probe_check(snap_to_playhead(108) == 100, "8 frames from the playhead must latch")
+	tl_probe_check(snap_to_playhead(109) == 109, "9 frames away is outside the margin and must not latch")
+	// The margin is in pixels, so zooming out keeps the same on-screen band.
+	timeline_view.zoom = 0.01
+	tl_probe_check(
+		snap_to_playhead(900) == 100,
+		"the snap band stays 8px wide at zoom 0.01",
+	)
+	tl_probe_check(
+		snap_to_playhead(901) == 901,
+		"just past the band at zoom 0.01 must not latch",
 	)
 }
 
@@ -1432,7 +1540,740 @@ test_ripple_ignores_a_straddler :: proc() {
 	tl_assert_no_new_overlap(before)
 }
 
+// tl_pin_scene builds a one-video-clip project whose asset carries a probed rate
+// and a frame count, so pf_pin_src_fps has something to choose between. A probed
+// rate of 0 is the OLD-project case: frame_count and dur_us present, no rate.
+tl_pin_scene :: proc(probed: f64, frames, dur_us: i64) {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id = 9001, kind = .Video, frame_count = frames, dur_us = dur_us, video_fps = probed,
+		},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(&tl.clips, Clip{kind = .Video, asset_id = 9001, source_length_frames = frames})
+}
+
+// test_pin_src_fps covers the pin that decides a clip's SPEED on load.
+//
+// It exists because a saved project loaded with every clip at the PROJECT's
+// speed — a 12fps source in a 60fps project played 5x too fast, which is the
+// defect conform removes, reproduced exactly. The cause was not the conform: it
+// was Media_Asset.video_fps never being persisted, so every asset arrived at
+// load with no rate and pf_pin_src_fps fell through to the project rate, which
+// is the 1:1 that conform is defined against. A pin that silently degrades to
+// the thing it exists to override is worse than no pin.
+//
+// So the three rungs are asserted separately, and the middle one is the one that
+// was missing: a project saved before the field existed carries frame_count and
+// dur_us but no rate, and must still pin to the source rather than the project.
+test_pin_src_fps :: proc() {
+	ok := true
+	fail_msg := ""
+
+	saved_rate := project.frame_rate
+	saved_tracks := timeline.tracks
+	saved_assets := media_bin.assets
+	saved_order := timeline.track_order
+	defer {
+		project.frame_rate = saved_rate
+		timeline.tracks = saved_tracks
+		media_bin.assets = saved_assets
+		timeline.track_order = saved_order
+	}
+
+	// Rung 1: the probed rate, when the project has one.
+	project.frame_rate = 60.0
+	tl_pin_scene(12.0, 219, 18261000)
+	pf_pin_src_fps()
+	got := timeline.tracks[0].clips[0].src_fps
+	if math.abs(got - 12.0) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("probed rate ignored: pinned %v, want 12", got)
+	}
+
+	// Rung 2: an OLD project — frame_count/dur_us, no probed rate. This is the
+	// regression: it used to fall through to the project rate (60), which is a
+	// ratio of 1 and replays the 12fps source at 5x speed.
+	tl_pin_scene(0.0, 219, 18261000)
+	pf_pin_src_fps()
+	got = timeline.tracks[0].clips[0].src_fps
+	derived := 219.0 * 1e6 / 18261000.0
+	if math.abs(got - derived) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("old project pinned %v (project rate would be 60, derived %v)", got, derived)
+	}
+	// And the thing the user actually saw. Asserted as BEHAVIOUR over one second
+	// of playback rather than as a pair of frame indices: one second at 60fps is
+	// 60 timeline frames, and one second of a 12fps source is 12 source frames, so
+	// the clip must advance 12. A derived rate is 11.9928 rather than 12 (it comes
+	// from frame_count/dur_us), which is 0.06% fast, so the tolerance is a
+	// fraction of a frame rather than zero — pinning an exact index pair here
+	// would be asserting the derived value, not the speed.
+	if math.abs(derived - 12.0) / 12.0 > 0.005 {
+		ok = false
+		fail_msg = fmt.tprintf("derived rate %v is not within 0.5%% of the source's 12", derived)
+	}
+	advanced := f64(clip_source_frame(0, 0, 60, false, got))
+	if math.abs(advanced - 12.0) > 0.2 {
+		ok = false
+		fail_msg = fmt.tprintf(
+			"one second at 60fps advanced %.3f source frames, want 12 — the 5x-too-fast defect",
+			advanced,
+		)
+	}
+
+	// Rung 3: nothing characterisable — the project rate, reproducing 1:1 so a
+	// project we cannot measure behaves as it did before.
+	tl_pin_scene(0.0, 0, 0)
+	pf_pin_src_fps()
+	got = timeline.tracks[0].clips[0].src_fps
+	if math.abs(got - 60.0) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("unmeasurable source pinned %v, want the project rate 60", got)
+	}
+
+	// An ALREADY-pinned clip is left alone: re-pinning must not move a clip whose
+	// rate the file recorded, or every reload would rewrite authored speeds.
+	tl_pin_scene(0.0, 219, 18261000)
+	timeline.tracks[0].clips[0].src_fps = 24.0
+	pf_pin_src_fps()
+	got = timeline.tracks[0].clips[0].src_fps
+	if math.abs(got - 24.0) > 0.001 {
+		ok = false
+		fail_msg = fmt.tprintf("re-pin overwrote an authored rate: %v, want 24", got)
+	}
+
+	tl_probe_check(ok, "src_fps pin: probed rate, old-project derive, unmeasurable fallback, no re-pin [%s]", fail_msg)
+}
+
+
+// tl_fps_scene builds two clips on one track with a real GAP between them, from a
+// 12fps source of 219 frames (18.25s of content) — the shape of ~/baby.vyproj, and
+// the case the user reported as "5 times faster" at 60fps.
+tl_fps_scene :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset{id = 9101, kind = .Video, frame_count = 219, dur_us = 18250000, video_fps = 12.0},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 1, kind = .Video, asset_id = 9101,
+			timeline_start_frame = 0, source_length_frames = 219, src_fps = 12.0,
+		},
+	)
+	// Second clip starts 2s (24 frames at 12fps) after the first ends, so a reflow
+	// that preserves the GAP is distinguishable from one that pins positions.
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 2, kind = .Video, asset_id = 9101,
+			timeline_start_frame = 243, source_length_frames = 219, src_fps = 12.0,
+		},
+	)
+}
+
+// test_fps_reflow covers the acceptance criterion directly: the same project must
+// show the same CONTENT at 12fps and at 60fps, at the same speed, differing only
+// in how finely it is sampled.
+//
+// It is stated on wall-clock CONTENT, not on frame counts, because frame counts
+// are exactly what legitimately differs and asserting them would pin the bug back
+// in: at 60fps the clip has five times the frames and must show five times fewer
+// new source frames each.
+test_fps_reflow :: proc() {
+	tl_fps_scene()
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+
+	// Baseline at the source's own rate: 219 frames, 18.25s.
+	project.frame_rate = 12.0
+	len12 := clip_timeline_len(&timeline.tracks[0].clips[0])
+	content12 := f64(clip_src_len_frames(&timeline.tracks[0].clips[0])) / 12.0
+	gap12 := f64(
+		timeline.tracks[0].clips[1].timeline_start_frame -
+		(timeline.tracks[0].clips[0].timeline_start_frame + len12),
+	) / 12.0
+
+	// Now the user's case: switch to 60 and reflow, as the preset button does.
+	set_project_fps(60)
+	c0 := &timeline.tracks[0].clips[0]
+	c1 := &timeline.tracks[0].clips[1]
+	len60 := clip_timeline_len(c0)
+	content60 := f64(clip_src_len_frames(c0)) / 12.0
+	gap60 := f64(c1.timeline_start_frame - (c0.timeline_start_frame + len60)) / 60.0
+
+	// Same CONTENT, to within the frame quantization it has to survive: a 12fps
+	// source can only be sampled at 12fps, so 60fps is inherently a coarser view of
+	// the same 18.25s. The tolerance is one source frame.
+	ok := math.abs(content60 - content12) <= 1.0 / 12.0 + 0.001
+	tl_probe_check(
+		ok,
+		"fps reflow: content must match across rates — %.4fs at 12fps vs %.4fs at 60fps (tolerance one source frame)",
+		content12, content60,
+	)
+
+	// Same WALL CLOCK, which is what "not slower nor faster" means.
+	ok = math.abs(f64(len60)/60.0 - f64(len12)/12.0) <= 1.0 / 60.0 + 0.001
+	tl_probe_check(
+		ok,
+		"fps reflow: wall clock must match — %.4fs at 12fps vs %.4fs at 60fps",
+		f64(len12)/12.0, f64(len60)/60.0,
+	)
+
+	// And the extent really did re-derive rather than staying pinned: five times
+	// the frames at five times the rate.
+	tl_probe_check(
+		len60 == 1095 && len12 == 219,
+		"fps reflow: extent must re-derive from source duration — 219 frames at 12fps, want 1095 at 60fps, got %d",
+		len60,
+	)
+
+	// The GAP keeps its real-world size. This is what distinguishes preserving gaps
+	// from pinning positions: the second clip moved from frame 243 to 1140, so a
+	// pin-everything implementation fails here while passing the content checks.
+	tl_probe_check(
+		math.abs(gap60 - gap12) <= 1.0 / 60.0 + 0.001 && math.abs(gap12 - 2.0) < 0.01,
+		"fps reflow: the gap must keep its real-world size — %.4fs, want ~2s",
+		gap60,
+	)
+	tl_probe_check(
+		c1.timeline_start_frame == 1095 + 120,
+		"fps reflow: the trailing clip must shift by the length delta — start %d, want 1215",
+		c1.timeline_start_frame,
+	)
+
+	// Round trip: back to 12 must restore the original layout exactly. A reflow
+	// that only ever grows is not a reflow.
+	set_project_fps(12)
+	tl_probe_check(
+		timeline.tracks[0].clips[0].source_length_frames == 219 &&
+		timeline.tracks[0].clips[1].timeline_start_frame == 243,
+		"fps reflow: 60 -> 12 must restore the layout — len %d, second start %d",
+		timeline.tracks[0].clips[0].source_length_frames,
+		timeline.tracks[0].clips[1].timeline_start_frame,
+	)
+}
+
+// test_fps_reflow_keyframes: keyframes are clip-relative in TIMELINE frames, so
+// an extent that grows fivefold slides every key to a fifth of its position unless
+// they are rescaled with it. The keys survive either way — nothing about a
+// misplaced key looks wrong, which is why this needs its own case.
+test_fps_reflow_keyframes :: proc() {
+	tl_fps_scene()
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 12.0
+
+	c := &timeline.tracks[0].clips[0]
+	kf_set_key(c, "transform.x", 109, 5.0)
+	kf_set_key(c, "transform.x", 218, 9.0)
+	tr := session_trk_view(c.keyframe_tracks, 0)
+	before := session_kf_at(tr.keys, 0).frame_off
+
+	set_project_fps(60)
+	tr = session_trk_view(c.keyframe_tracks, 0)
+	after := session_kf_at(tr.keys, 0).frame_off
+
+	// 109 of 219 is the clip's midpoint; it must still be the midpoint at 1095.
+	tl_probe_check(
+		before == 109 && after == 545,
+		"keyframes must stay on their content across a reflow — offset %d at 219 frames, want %d at 1095",
+		after, 545,
+	)
+	// Strictly ascending: a shrinking reflow folds keys together, and a duplicate
+	// offset breaks every interpolating sampler's sorted-ascending assumption.
+	set_project_fps(12)
+	set_project_fps(60)
+	set_project_fps(12)
+	tr = session_trk_view(c.keyframe_tracks, 0)
+	asc := true
+	prev := i32(-1)
+	for ki in 0 ..< tr.keys.n {
+		off := session_kf_at(tr.keys, ki).frame_off
+		if off <= prev {
+			asc = false
+			break
+		}
+		prev = off
+	}
+	tl_probe_check(asc, "keyframes must stay strictly ascending through repeated reflows")
+}
+
+
+// test_fps_reflow_assetless: a clip whose asset is gone (a still image, a text
+// generator, a deleted file) has no measured duration — its length comes from the
+// stored extent divided by the rate it was authored at.
+//
+// This is a trap rather than a detail. clip_duration_sec's fallback divides by a
+// rate it is GIVEN, and during a reflow the project rate has already moved to the
+// new one. Dividing a 12-frame one-second still by 60 instead of by 12 turns it
+// into 0.2s, so every asset-less clip on the project silently shrinks by the rate
+// ratio. Nothing about the result looks wrong — the clip still plays, just fast
+// and short.
+test_fps_reflow_assetless :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip{
+			clip_id = 3, kind = .Video, is_still = true, asset_id = 9999,
+			timeline_start_frame = 0, source_length_frames = 12, src_fps = 12.0,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+
+	project.frame_rate = 12.0
+	set_project_fps(60)
+	c := &timeline.tracks[0].clips[0]
+	tl_probe_check(
+		c.source_length_frames == 60,
+		"a one-second still must stay one second across a reflow — got %d frames at 60fps, want 60",
+		c.source_length_frames,
+	)
+	set_project_fps(12)
+	tl_probe_check(
+		timeline.tracks[0].clips[0].source_length_frames == 12,
+		"and return to 12 frames at 12fps — got %d",
+		timeline.tracks[0].clips[0].source_length_frames,
+	)
+}
+
+
+// test_pin_src_fps_kind_mismatch: the pin must key off the ASSET, not Clip.kind.
+//
+// ~/baby.vyproj stores an AV1 webm as a clip of kind .Audio over an asset of kind
+// .Video. Both pf_pin_src_fps and clip_duration_sec used to filter on the clip's
+// kind, so this clip matched no rung: it kept src_fps=0, resolved to the project
+// rate, and a 12fps source played at 60fps speed — the "5 times faster" report,
+// still live after the conform fix because the pin never ran on it.
+//
+// The fixture mirrors the real file: kind .Audio, asset kind .Video, no probed
+// rate, a frame count and a duration to derive from.
+test_pin_src_fps_kind_mismatch :: proc() {
+	tl_pin_scene(0.0, 219, 18250000)
+	// Overwrite the scene's clip and asset to the real shape.
+	timeline.tracks[0].clips[0].kind = .Audio
+	media_bin.assets[0].kind = .Video
+	media_bin.assets[0].video_fps = 0 // a project saved before the field existed
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 60.0
+
+	pf_pin_src_fps()
+	c := &timeline.tracks[0].clips[0]
+	tl_probe_check(
+		c.src_fps > 0 && math.abs(c.src_fps - 12.0) < 0.2,
+		"the pin must key off the asset's kind — a .Audio clip over a .Video asset pinned src_fps=%.4f, want ~12",
+		c.src_fps,
+	)
+	// And the observable consequence: one second of a 12fps source is 12 frames,
+	// not the 60 an unpinned clip would advance.
+	advanced := f64(clip_source_frame(0, 0, 60, false, c.src_fps))
+	tl_probe_check(
+		math.abs(advanced - 12.0) <= 0.2,
+		"a clip whose kind disagrees with its asset must still conform — one second advanced %.3f source frames, want 12",
+		advanced,
+	)
+	// The duration has to come from the same place, or the extent is derived from
+	// the wrong quantity and the clip is the wrong length.
+	sec := clip_duration_sec(c, 12.0)
+	tl_probe_check(
+		math.abs(sec - 18.25) < 0.1,
+		"duration must come from the asset too — got %.4fs, want ~18.25s",
+		sec,
+	)
+}
+
+
+// test_audio_head_trim is ~/baby.vyproj's "Sr Pelo" clip, which was 5x short at
+// every rate and stayed that way through four rounds of the fps work.
+//
+// Two independent defects, and the second is the one that kept it wrong:
+//
+//  1. Its asset has audio_rate=0 (a project saved before that field existed), so
+//     pf_pin_audio_src_rates fell through to the PROJECT rate — 60 — when the
+//     clip's counts were measured at 11.97 (79 audio frames over 6.6s). A 44-frame
+//     extent read at 60 is 0.733s; at 11.97 it is 3.676s. The audio pin had no
+//     derive rung at all, which is the same gap the video pin had.
+//  2. The clip starts at source frame 35, and the rebase skipped any clip whose
+//     source_start_frame != 0. That is true and irrelevant: the extent is a
+//     LENGTH, and where the clip starts in the source says nothing about how long
+//     it is. Skipping on it left the extent stranded in the authoring timebase.
+//
+// The fixture is the real file's numbers: an audio asset with audio_rate=0,
+// audio_frames=79, dur_us=6.6s, and a clip of 44 frames starting at source frame
+// 35 — a head trim, so not the whole asset, and the asset's 6.6s duration must NOT
+// be used for it.
+test_audio_head_trim :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id = 9201, kind = .Audio, frame_count = 1,
+			dur_us = 6600000, audio_rate = 0, audio_frames = 79,
+		},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 9, kind = .Audio, asset_id = 9201,
+			timeline_start_frame = 0, source_length_frames = 44, source_start_frame = 35,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 60.0
+
+	pf_rebase_extents()
+
+	c := &timeline.tracks[0].clips[0]
+	// The duration is 44 frames read at the rate its counts were measured at.
+	want := 44.0 / (79.0 * 1e6 / 6600000.0)
+	got := f64(c.source_length_frames) / project_fps()
+	tl_probe_check(
+		math.abs(got - want) < 0.02,
+		"a head-trimmed audio clip must keep its real duration — got %.4fs, want %.4fs",
+		got, want,
+	)
+	// NOT the asset's 6.6s: the head trim means this is a fragment, and using the
+	// asset's duration would stretch a 3.7s clip to 6.6s.
+	tl_probe_check(
+		got < 5.0,
+		"a trimmed audio clip must not take the asset's full duration — got %.4fs of 6.6s",
+		got,
+	)
+	// And the pin recovered the authoring rate, which is what makes the duration
+	// recoverable at all.
+	pf_pin_audio_src_rates()
+	rate := c.audio_src_rate
+	tl_probe_check(
+		math.abs(rate - 79.0 * 1e6 / 6600000.0) < 0.05,
+		"the audio pin must derive the authoring rate from the asset — got %.4f, want %.4f",
+		rate, 79.0 * 1e6 / 6600000.0,
+	)
+
+	// And it survives a rate change at both rates.
+	targets := ([]f64{12.0, 60.0})
+	for target in targets {
+		set_project_fps(target)
+		d := clip_duration_sec(c, project_fps())
+		tl_probe_check(
+			math.abs(d - want) < 0.05,
+			"the clip must keep %.4fs of audio at %gfps — got %.4fs",
+			want, target, d,
+		)
+	}
+}
+
+
+// test_trim_respects_source_length is the reported bug: dragging the siren head
+// clip's tail out to its source's full length capped at 219 frames.
+//
+// resize_clip_right capped the clip's TIMELINE length with the asset's SOURCE
+// frame count. That was correct only while the two rates matched; at 60fps a
+// 219-frame 12fps source occupies 1096 timeline frames, so the cap landed at a
+// fifth of the real length and the tail could not be dragged out at all.
+//
+// The cap is now converted through the clip's own conform, so the assertion is
+// that dragging to the very end yields the FULL source length in timeline frames —
+// and that stopping one frame short yields one frame less, so the cap is a real
+// bound rather than a wall.
+test_trim_respects_source_length :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset {
+			id = 9301, kind = .Video, frame_count = 219, dur_us = 18261000, video_fps = 12.0,
+		},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 11, kind = .Video, asset_id = 9301, src_fps = 12.0,
+			timeline_start_frame = 0, source_length_frames = 60,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+
+	// At 60fps the 219-frame source must be draggable out to 1095 timeline frames.
+	project.frame_rate = 60.0
+	want := clip_src_len_to_timeline_frames(&tl.clips[0], 219)
+	applied := resize_clip_right(tl, 0, i64(1) << 40) // absurd tail: must clamp to the source
+	tl_probe_check(
+		applied == want && want == 1095,
+		"the tail must drag out to the source's full length — applied %d frames, want %d (1095 at 60fps for a 219-frame 12fps source)",
+		applied, want,
+	)
+	// And the bound is real: one frame short of the end is one frame short.
+	applied = resize_clip_right(tl, 0, i64(want) - 1)
+	tl_probe_check(
+		applied == want - 1,
+		"one frame short of the source must give one frame less — applied %d, want %d",
+		applied, want - 1,
+	)
+	// Past the end is refused, not wrapped or extended.
+	applied = resize_clip_right(tl, 0, i64(want) + 500)
+	tl_probe_check(
+		applied == want,
+		"a tail past the source must clamp, not extend — applied %d, want %d",
+		applied, want,
+	)
+
+	// The head bound is converted too: a clip whose head sits 35 source frames in
+	// may extend left by 35 source frames, expressed in timeline frames.
+	free_timeline(&timeline)
+	append(&timeline.tracks, Track{})
+	tl = &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 12, kind = .Video, asset_id = 9301, src_fps = 12.0,
+			timeline_start_frame = 600, source_length_frames = 60, source_start_frame = 35,
+		},
+	)
+	head_frames := clip_src_len_to_timeline_frames(&tl.clips[0], 35)
+	got_len := resize_clip_left(tl, 0, 0) // drag the head as far left as it will go
+	c := &tl.clips[0]
+	// The head cannot pass the point where source_start_frame would go negative:
+	// 35 source frames back is 175 timeline frames at 60fps.
+	limit := 600 - head_frames
+	tl_probe_check(
+		c.timeline_start_frame == limit,
+		"the head must stop where the source runs out — landed at %d, want %d (600 - %d timeline frames for 35 source frames)",
+		c.timeline_start_frame, limit, head_frames,
+	)
+	// And the source offset it adjusted must not go NEGATIVE. Unconverted, the
+	// head moved 175 timeline frames and source_start_frame was decremented by
+	// all 175, landing at -140 — reading before the source's first frame while the
+	// clamp above said the head was still inside the media.
+	tl_probe_check(
+		c.source_start_frame == 0,
+		"dragging the head to the source's start must leave source_start_frame at 0 — got %d",
+		c.source_start_frame,
+	)
+	// A PARTIAL drag, because the clamp above hides the bug at the limit: dragged all
+	// the way left, the unconverted delta overshoots to a negative offset that
+	// max(0, ...) clamps straight back to 0, so the assertion above passes either
+	// way. Mid-drag there is nowhere to hide.
+	c.source_start_frame = 35
+	c.timeline_start_frame = 600
+	c.source_length_frames = 60
+	resize_clip_left(tl, 0, 500) // 100 timeline frames left
+	tl_probe_check(
+		c.source_start_frame == 15,
+		"a 100-timeline-frame head drag at 12fps over 60fps must move source_start_frame by 20 — got %d, want 15 (35 - 20)",
+		c.source_start_frame,
+	)
+	tl_probe_check(
+		got_len == 660 - limit,
+		"the applied length must match the new head — got %d, want %d",
+		got_len, 660 - limit,
+	)
+}
+
+
+// test_head_trim_anchors_tail: every trim must move ONE edge and leave the other
+// where it was.
+//
+// Reported as "moving the left end, and instead of clipping the left end it is
+// clipping the total size" — the clip's RIGHT edge moving too, so the clip shrinks
+// from both sides at once. That is the signature of a tail that is not anchored, and
+// it is invisible in a length assertion alone: the length after a head drag should
+// equal (old length + how far the head moved), and a bug that also drags the tail
+// can produce the right length by moving both edges.
+//
+// So this asserts the EDGES, not the length, and it covers all four handles because
+// they share the failure mode.
+test_head_trim_anchors_tail :: proc() {
+	free_timeline(&timeline)
+	clear(&media_bin.assets)
+	append(
+		&media_bin.assets,
+		Media_Asset{id = 9501, kind = .Video, frame_count = 600, dur_us = 50000000, video_fps = 30.0},
+	)
+	append(&timeline.tracks, Track{})
+	tl := &timeline.tracks[0]
+	append(
+		&tl.clips,
+		Clip {
+			clip_id = 21, kind = .Video, asset_id = 9501, src_fps = 30.0,
+			timeline_start_frame = 300, source_length_frames = 120, source_start_frame = 60,
+		},
+	)
+	saved_rate := project.frame_rate
+	defer project.frame_rate = saved_rate
+	project.frame_rate = 60.0
+	c := &tl.clips[0]
+
+	// State is re-read immediately before every operation and never carried across
+	// one. Carrying a pre-operation head into a post-operation assertion is wrong in
+	// a way that reads like a real failure — this probe's first version compared
+	// `head0 + length` and so reported the tail jumping 420 -> 480 when the trim was
+	// exact and the tail never moved.
+	head := c.timeline_start_frame
+	tail := head + c.source_length_frames
+	ssrc := c.source_start_frame
+	resize_clip_left(tl, 0, head - 60)
+	tl_probe_check(
+		c.timeline_start_frame == head - 60,
+		"head left: head must land where asked — got %d, want %d",
+		c.timeline_start_frame, head - 60,
+	)
+	tl_probe_check(
+		c.timeline_start_frame + c.source_length_frames == tail,
+		"head left: the TAIL must not move — got %d, want %d",
+		c.timeline_start_frame + c.source_length_frames, tail,
+	)
+	tl_probe_check(
+		c.source_length_frames == (tail - head) + 60,
+		"head left: length must grow by the head's travel — got %d, want %d",
+		c.source_length_frames, (tail - head) + 60,
+	)
+	// 60 timeline frames at 30fps over a 60fps project is 30 source frames.
+	tl_probe_check(
+		c.source_start_frame == ssrc - 30,
+		"head left: the source offset must move by 30 — got %d, want %d",
+		c.source_start_frame, ssrc - 30,
+	)
+
+	// Head right: a trim, with the tail still the anchor.
+	head = c.timeline_start_frame
+	tail = head + c.source_length_frames
+	ssrc = c.source_start_frame
+	resize_clip_left(tl, 0, head + 40)
+	tl_probe_check(
+		c.timeline_start_frame + c.source_length_frames == tail,
+		"head right: the TAIL must not move — got %d, want %d",
+		c.timeline_start_frame + c.source_length_frames, tail,
+	)
+	tl_probe_check(
+		c.source_length_frames == tail - (head + 40),
+		"head right: length must shorten by exactly the travel — got %d, want %d",
+		c.source_length_frames, tail - (head + 40),
+	)
+	tl_probe_check(
+		c.source_start_frame == ssrc + 20,
+		"head right: the source offset must advance by 20 — got %d, want %d",
+		c.source_start_frame, ssrc + 20,
+	)
+
+	// Tail: the HEAD is the anchor here.
+	head = c.timeline_start_frame
+	tail = head + c.source_length_frames
+	ssrc = c.source_start_frame
+	resize_clip_right(tl, 0, tail + 90)
+	tl_probe_check(
+		c.timeline_start_frame == head,
+		"tail: the HEAD must not move — got %d, want %d",
+		c.timeline_start_frame, head,
+	)
+	tl_probe_check(
+		c.timeline_start_frame + c.source_length_frames == tail + 90,
+		"tail: the tail must land where asked — got %d, want %d",
+		c.timeline_start_frame + c.source_length_frames, tail + 90,
+	)
+	tl_probe_check(
+		c.source_start_frame == ssrc,
+		"tail: the source offset must not move — got %d, want %d",
+		c.source_start_frame, ssrc,
+	)
+}
+
 timeline_probe_run :: proc(_: string) {
+	tl_scene()
+	test_fps_reflow()
+	fmt.println("[tl-probe] fps-reflow ok")
+	tl_scene()
+	test_fps_reflow_assetless()
+	fmt.println("[tl-probe] fps-reflow-assetless ok")
+	tl_scene()
+	test_fps_reflow_keyframes()
+	fmt.println("[tl-probe] fps-reflow-keyframes ok")
+	tl_scene()
+	test_head_trim_anchors_tail()
+	fmt.println("[tl-probe] head-trim-anchors-tail ok")
+	tl_scene()
+	test_trim_respects_source_length()
+	fmt.println("[tl-probe] trim-source-length ok")
+	tl_scene()
+	test_audio_head_trim()
+
+	// The TAIL cap on an audio clip, measured in the AUDIO clip's frame space.
+	// This is ~/baby.vyproj's opus after the tail cap was converted: the conversion
+	// used Clip.src_fps, the VIDEO rate, while the clip's frame numbers are counted
+	// against audio_src_rate. Those differ whenever a clip was imported at a
+	// different rate than the project — here 11.97 against 60 — so the cap ran 1:1
+	// where it had to run 5:1 and the tail clipped at 38 timeline frames instead of
+	// the 221 its 44 source frames occupy.
+	{
+		free_timeline(&timeline)
+		clear(&media_bin.assets)
+		append(
+			&media_bin.assets,
+			Media_Asset {
+				id = 9401, kind = .Audio, frame_count = 1, dur_us = 6600000,
+				audio_rate = 0, audio_frames = 79,
+			},
+		)
+		append(&timeline.tracks, Track{})
+		tl := &timeline.tracks[0]
+		append(
+			&tl.clips,
+			Clip {
+				clip_id = 13, kind = .Audio, asset_id = 9401,
+				timeline_start_frame = 0, source_length_frames = 44, source_start_frame = 35,
+			},
+		)
+		saved_rate := project.frame_rate
+		defer project.frame_rate = saved_rate
+		project.frame_rate = 60.0
+		pf_pin_audio_src_rates()
+		c := &tl.clips[0]
+		// 44 source frames remain after the head (79 - 35), at the audio rate.
+		want := clip_src_len_to_timeline_frames(c, 44)
+		applied := resize_clip_right(tl, 0, i64(1) << 40)
+		tl_probe_check(
+			applied == want && applied == 221,
+			"an audio clip's tail cap must convert in its OWN frame space — applied %d timeline frames, want %d (44 source frames at 11.97 over a 60fps project)",
+			applied, want,
+		)
+		// And it must exceed the source's frame count, which is the whole point: a
+		// 1:1 conversion would cap at 44 and quietly shorten the clip fivefold.
+		tl_probe_check(
+			applied > 44,
+			"the cap must not be the bare source frame count — got %d, which is the 1:1 conversion",
+			applied,
+		)
+		project.frame_rate = saved_rate
+	}
+	tl_scene()
+	test_pin_src_fps_kind_mismatch()
+	fmt.println("[tl-probe] audio-head-trim ok")
+	tl_scene()
+	test_pin_src_fps_kind_mismatch()
+	fmt.println("[tl-probe] pin-kind-mismatch ok")
+	tl_scene()
+	test_pin_src_fps()
+	fmt.println("[tl-probe] pin-src-fps ok")
 	tl_scene()
 	test_cut_resolves_playhead()
 	fmt.println("[tl-probe] cut-resolves ok")
@@ -1459,6 +2300,13 @@ timeline_probe_run :: proc(_: string) {
 	fmt.println("[tl-probe] resize ok")
 	test_adjacent_seam_roll()
 	fmt.println("[tl-probe] adjacent seam roll ok")
+
+	test_snap_playhead_end_lands_inside_the_clip()
+	fmt.println("[tl-probe] playhead-snap-end ok")
+	tl_scene()
+	test_snap_to_playhead_margin_scales_with_zoom()
+	fmt.println("[tl-probe] clip-snap-margin ok")
+	tl_scene()
 
 	test_still_resize_free()
 	fmt.println("[tl-probe] still-resize ok")

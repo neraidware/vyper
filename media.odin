@@ -33,8 +33,33 @@ set_project_resolution_auto :: proc() {
 // set_project_fps applies an explicit project frame rate (preset button). The
 // timeline grid, playhead cadence, and audio producer all remap to this rate;
 // later imports no longer override it.
+//
+// Changing the rate REFLOWS the timeline. A clip's length on the timeline is its
+// source duration quantized to the current rate (clip_timeline_len), so a 12fps
+// clip of 219 frames occupies 219 frames at 12fps and 1095 at 60fps. Without the
+// reflow the stored extents stay at the rate they were authored at, and every clip
+// covers less and less of its source as the rate goes up: the same project shows a
+// fifth of its content at 60fps, at the right speed but the wrong length. That was
+// the state after the conform fix on its own.
+//
+// Positions shift by each clip's length DELTA so the gaps between clips keep their
+// real-world size. Clips on different tracks are independent, so this is per track:
+// a track is a list of clips in order, and each clip's new start is the old start
+// plus the sum of the length deltas of everything before it.
+//
+// keyframe tracks are rescaled by the same ratio. A keyframe's offset is in
+// TIMELINE frames from its clip's start, so an extent that grows five times would
+// otherwise slide every key to a fifth of its original position in the clip — the
+// keys would survive and silently land on the wrong content, which is worse than
+// losing them.
 set_project_fps :: proc(fps: f64) {
+	old_rate := project_fps()
 	project.frame_rate = fps
+	new_rate := project_fps()
+	if !(old_rate > 0) || !(new_rate > 0) || old_rate == new_rate {
+		return
+	}
+	reflow_timeline_for_fps(old_rate, new_rate)
 }
 
 // set_project_orientation forces the given canvas orientation (landscape when
@@ -159,6 +184,11 @@ media_frame_count :: proc(metadata: string) -> i64 {
 		if strings.has_prefix(line, "avg_frame_rate=") {
 			rate := line[len("avg_frame_rate="):]
 			parts := strings.split(rate, "/")
+			// Same rule as `lines` above: an allocating split is caller-owned and
+			// `for` does not free it. The dnd probe's import is what reached this
+			// line -- every earlier import of a decodable file went through
+			// open_file_at, which valgrind does not run.
+			defer delete(parts)
 			if len(parts) == 2 {
 				numerator, nok := strconv.parse_f64(parts[0])
 				denominator, dok := strconv.parse_f64(parts[1])
@@ -394,6 +424,13 @@ import_media_to_bin :: proc(path: cstring) -> u64 {
 			// referenced by the bin.
 			path = strings.clone_to_cstring(string(path)),
 			kind = probe.has_video ? .Video : (probe.has_audio ? .Audio : .Other),
+			// The source's OWN rate, kept. See Media_Asset.video_fps: this is the
+			// value a clip pins so the project rate cannot retime it.
+			video_fps = (
+				!is_image && probe.has_video && probe.video_fps_num > 0
+					? f64(probe.video_fps_num) / f64(probe.video_fps_den)
+					: 0
+			),
 			metadata = project.info_text,
 			frame_count = frame_count,
 			dur_us = i64(probe.duration_sec * 1_000_000),
@@ -557,6 +594,10 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 			// measured against (audio_frames above), so a later project-rate
 			// change retimes the clip without moving where it reads in the file.
 			audio_src_rate        = is_audio ? asset.audio_rate : 0,
+			// Same idea for the video half: pin the clip to the source's rate, so
+			// the timeline consumes its frames at the clip's real speed instead of
+			// one timeline frame per source frame.
+			src_fps               = is_video ? asset.video_fps : 0,
 			source_length_frames = lane_len,
 			timeline_start_frame = placed,
 		}

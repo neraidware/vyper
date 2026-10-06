@@ -1171,6 +1171,9 @@ Render_Video_Src :: struct {
 	path:                 cstring, // owned copy, freed by the worker
 	stream_index:         c.int,
 	source_start_frame:   i64,
+	// src_fps travels with the offsets so the worker conforms the clip's speed
+	// without reading a live Clip; see clip_source_frame.
+	src_fps:              f64,
 	source_length_frames: i64,
 	// is_still marks a single-frame image source; every timeline frame maps to
 	// source_start_frame (see media_is_image / Clip.is_still).
@@ -1448,6 +1451,9 @@ Render_Sub_Src :: struct {
 	fps:                  f32, // project rate, cues resolve to frames at this
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
+	// src_fps travels with the offsets so the worker conforms the clip's speed
+	// without reading a live Clip; see clip_source_frame.
+	src_fps:              f64,
 	source_length_frames: i64,
 	// geom is the same shared carrier a video or text clip carries, so a keyed
 	// subtitle clip exports animated too. This struct previously copied the
@@ -3130,6 +3136,7 @@ slot_idx := int(frame_idx & 1)
 				v.timeline_start_frame,
 				timeline_frame,
 				v.is_still,
+				v.src_fps,
 			)
 			t_src := time.now()._nsec
 			if !decode_source_frame(&v.dec, src_frame) {
@@ -4836,6 +4843,7 @@ render_start :: proc() {
 						path = strings.clone_to_cstring(string(clip.path)),
 						stream_index = clip.stream_index,
 						source_start_frame = clip.source_start_frame,
+						src_fps = clip.src_fps,
 						source_length_frames = clip.source_length_frames,
 						is_still = clip.is_still,
 						timeline_start_frame = clip.timeline_start_frame,
@@ -5045,6 +5053,66 @@ render_test_env :: proc() -> (bool, [2]string) {
 // their own, so the one number that decided whether the audio rework was done
 // had no way to be re-measured. That is the same shape as the text-keyframe
 // bug: a defect real workloads hit that the suite structurally cannot see.
+project_export_fps_override: f64
+
+// project_export_dump_layout prints what the fps model resolved each clip to, so a
+// headless export says WHY it is the length it is. Without it a wrong extent is
+// only visible as an output duration, which cannot distinguish a clip that covers
+// the wrong amount of source from a clip that is simply the wrong length.
+project_export_dump_layout :: proc() {
+	fmt.println(
+		"project-export: layout rate",
+		project_fps(),
+		"tracks",
+		len(timeline.tracks),
+		"end",
+		project.end_frame,
+	)
+	if project_export_fps_override > 0 {
+		fmt.println(
+			"project-export: rate override",
+			project_export_fps_override,
+			"stored project.frame_rate",
+			project.frame_rate,
+			"timeline.frame_rate",
+			timeline.frame_rate,
+		)
+	}
+	for ti in 0 ..< len(timeline.tracks) {
+		for &clip in timeline.tracks[ti].clips {
+			extent := clip_timeline_len(&clip)
+			// Why the pin landed where it did. src_fps=0 here means the clip was
+			// never pinned, and the only way to tell "the pin skipped it" from "the
+			// pin ran and found nothing" is to print the kind it filters on and the
+			// asset it would have read.
+			as := find_asset(clip.asset_id)
+			fmt.printf(
+				"project-export:   t%d kind=%v start=%d extent=%d (%.3fs) src_fps=%.4f src_len=%d content=%.3fs src_start=%d\n",
+				ti,
+				clip.kind,
+				clip.timeline_start_frame,
+				extent,
+				f64(extent) / project_fps(),
+				clip.src_fps,
+				clip_src_len_frames(&clip),
+				clip_duration_sec(&clip, project_fps()),
+				clip.source_start_frame,
+			)
+			fmt.printf(
+				"project-export:       asset=%d found=%v kind=%v video_fps=%.4f frame_count=%d dur_us=%d audio_rate=%.4f audio_frames=%d\n",
+				clip.asset_id,
+				as != nil,
+				as != nil ? as.kind : Media_Kind.Empty,
+				as != nil ? as.video_fps : -1,
+				as != nil ? as.frame_count : -1,
+				as != nil ? as.dur_us : -1,
+				as != nil ? as.audio_rate : -1,
+				as != nil ? as.audio_frames : -1,
+			)
+		}
+	}
+}
+
 render_project_export_env :: proc() -> (bool, [2]string) {
 	v, _ := os.lookup_env_alloc("VYPER_PROJECT_EXPORT", context.allocator)
 	if v == "" {
@@ -5056,6 +5124,18 @@ render_project_export_env :: proc() -> (bool, [2]string) {
 	if len(parts) >= 2 {
 		res[0] = parts[0]
 		res[1] = parts[1]
+	}
+	// An optional third field overrides the project rate. This is the only way to
+	// ask "does this project look the same at 12fps and at 60fps" headlessly: a
+	// project file stores exactly one rate, so the comparison needs the rate to
+	// change between two opens.
+	if len(parts) >= 3 && parts[2] != "" {
+		fps, ok := strconv.parse_f64(parts[2])
+		if !ok || !(fps > 0) {
+			fmt.println("project-export: ignoring unparseable rate override", parts[2])
+		} else {
+			project_export_fps_override = fps
+		}
 	}
 	return true, res
 }
@@ -5078,6 +5158,12 @@ render_project_export :: proc(paths: [2]string) {
 		os.exit(3)
 	}
 	sync_track_order()
+	if project_export_fps_override > 0 {
+		// AFTER the open, so the reflow sees the loaded extents rather than
+		// running against an empty timeline, and BEFORE anything reads a length.
+		set_project_fps(project_export_fps_override)
+	}
+	project_export_dump_layout()
 	fmt.println("project-export: opened", paths[0])
 	// The grid rate, for the audit script. The project file saves frame_rate 0.0
 	// to mean "inherit", so it cannot be read back from the .vyproj, and
@@ -5582,7 +5668,13 @@ preview_probe_run :: proc(paths: [2]string) {
 				slot.asset_id,
 				slot.timeline_start_frame,
 				slot.source_start_frame,
-				slot.source_start_frame + i64(f) - slot.timeline_start_frame,
+				clip_source_frame(
+					slot.source_start_frame,
+					slot.timeline_start_frame,
+					i64(f),
+					false,
+					slot.src_fps,
+				),
 				slot.dec.last_frame,
 				slot.dec.have_last,
 			)
@@ -5602,7 +5694,9 @@ preview_probe_run :: proc(paths: [2]string) {
 				if !slot.in_use {
 					continue
 				}
-				expected := slot.source_start_frame + i64(f) - slot.timeline_start_frame
+				expected := clip_source_frame(
+					slot.source_start_frame, slot.timeline_start_frame, i64(f), false, slot.src_fps,
+				)
 				diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
 				fmt.printf(
 					"  [probe play f=%d] clip_frame=%d last=%d have_last=%v has_frame=%v gt_served=%v pixel_diff=%d max_delta=%d\n",
@@ -5719,7 +5813,9 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			expected := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
+			expected := clip_source_frame(
+				slot.source_start_frame, slot.timeline_start_frame, playhead.frame, false, slot.src_fps,
+			)
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
 			fmt.printf(
 				"[bprobe ph=%d] tl=%d src=%d cf=%d last=%d hv=%v hf=%v gt=%v diff=%d maxd=%d\n",
@@ -5756,7 +5852,9 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			shown := slot.source_start_frame + playhead.frame - slot.timeline_start_frame
+			shown := clip_source_frame(
+				slot.source_start_frame, slot.timeline_start_frame, playhead.frame, false, slot.src_fps,
+			)
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, shown, slot.buffer[:])
 			fmt.printf(
 				"[bprobe live ph=%d] shown_cf=%d tl=%d src=%d has_frame=%v last=%d | gt=%v diff=%d maxd=%d\n",
@@ -5816,7 +5914,9 @@ boundary_probe_run :: proc(v: string) {
 			if !slot.in_use {
 				continue
 			}
-			expected := slot.source_start_frame + ph - slot.timeline_start_frame
+			expected := clip_source_frame(
+				slot.source_start_frame, slot.timeline_start_frame, ph, false, slot.src_fps,
+			)
 			diffs, maxd, gt_ok := probe_ground_truth(slot.path, expected, slot.buffer[:])
 			fmt.printf(
 				"[bprobe replay ph=%d] cf=%d tl=%d src=%d last=%d hv=%v has_frame=%v | gt=%v diff=%d maxd=%d\n",

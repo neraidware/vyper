@@ -577,6 +577,28 @@ target_undo_valgrind() {
 # pins the frame actually handed over, the DROP overflow policy (an undrained
 # mailbox must not be overwritten), the usability gate, and the publish
 # interval.
+# The held-frame decode path (conform). A project faster than its source asks for
+# the same source frame repeatedly, and serving a repeat must not re-seek: a seek
+# flushes the decoder, which on AV1 destroys the reference frames the next unit
+# needs. Synthesized rather than reusing a checked-in clip so the walk is
+# deterministic; 30fps testsrc2 conformed into 60fps holds every frame twice, which
+# is exactly the shape that used to fail.
+target_decode_repeat() {
+	require_fresh_binary decode-repeat || return 1
+	local dir=target/decode_repeat
+	mkdir -p "$dir"
+	local src="$dir/src.mp4"
+	if [ ! -s "$src" ]; then
+		dev ffmpeg -y -f lavfi -i "testsrc2=size=640x360:rate=30:duration=3" \
+			-c:v libx264 -pix_fmt yuv420p -crf 18 "$src" >/dev/null 2>&1 || {
+			echo "decode-repeat: could not synthesize the source clip" >&2
+			return 1
+		}
+	fi
+	local proj=${1:-60} srcfps=${2:-30}
+	env $PROBE_ENV VYPER_DECODE_REPEAT_PROBE="$src|$proj|$srcfps" timeout 120 ./vyper
+}
+
 target_render_live_probe() {
 	require_fresh_binary render-live-probe || return 1
 	VYPER_RENDER_LIVE_PROBE=1 timeout 120 ./vyper
@@ -657,11 +679,12 @@ target_dnd_probe() {
 }
 
 # The memory gate for dnd_probe: the drop path takes an SDL-owned C string for
-# each dropped file and hands it to the bin, which clones what it keeps. The
-# clone is the whole reason sdl.free on the event buffer is safe, and this is
-# the only gate that exercises that handoff (import_path_to_bin's refusal branch
-# plus the refusal of a path SDL would have delivered). Same four invariants as
-# target_valgrind.
+# each dropped file and hands it to the bin, which clones what it keeps. So the
+# app owns nothing here -- SDL's SDL_FreeTemporaryMemory list owns the event
+# buffer and frees it at the next pump -- and the probe covers the handoff from
+# both ends: the commit it makes and the clone it makes (import_path_to_bin's
+# refusal branch plus the refusal of a path SDL would have delivered). Same four
+# invariants as target_valgrind.
 target_dnd_valgrind() {
 	require_fresh_valgrind_binary dnd-valgrind || return 1
 	mkdir -p target/valgrind
@@ -1544,6 +1567,7 @@ main() {
 	geom_key_probe) target_geom_key_probe ;;
 	geom_key_valgrind) target_geom_key_valgrind ;;
 	render_live_probe) target_render_live_probe ;;
+	decode_repeat) target_decode_repeat ;;
 	render_live_valgrind) target_render_live_valgrind ;;
 	undo_valgrind) target_undo_valgrind ;;
 	timeline_probe) target_timeline_probe ;;

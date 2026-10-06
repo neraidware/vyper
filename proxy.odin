@@ -645,6 +645,7 @@ proxy_build_schedule :: proc() {
 		clip.timeline_start_frame,
 		playhead.frame,
 		clip.is_still,
+		clip.src_fps,
 	)
 	if src_frame < 0 {
 		src_frame = 0

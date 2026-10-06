@@ -510,6 +510,19 @@ Media_Asset :: struct {
 	kind:            Media_Kind,
 	metadata:        string,
 	frame_count:     i64,
+	// video_fps is the SOURCE's own frame rate, probed at import. It is not the
+	// project rate and must never be treated as one: a clip placed from this
+	// asset pins Clip.src_fps to it so the project rate cannot retime the clip.
+	//
+	// Before this existed the source rate was read once and thrown away, used
+	// only to seed timeline.frame_rate on the first import -- which is why the
+	// speed looked right until the user touched the project rate, at which point
+	// the rate had nowhere left to live and every clip conformed to it implicitly.
+	//
+	// 0 for audio and for sources ffprobe reports no rate for (some images).
+	// frame_count / dur_us is a fallback for those, not a second opinion to
+	// prefer over the probed rate.
+	video_fps:      f64,
 	// dur_us is the source duration in microseconds, captured at import so the
 	// on-demand proxy scheduler can derive fps (frame_count / duration) without
 	// re-probing the file every time the playhead crosses a segment boundary.
@@ -637,6 +650,16 @@ Clip :: struct {
 	// the file, not a quantization against the timeline clock. 0 = unpinned,
 	// which falls back to the current rate (pre-pin projects).
 	audio_src_rate:        f64,
+	// src_fps pins a VIDEO clip's rate to the source's own, captured at import,
+	// so the project rate cannot silently retime it. It is the video half of
+	// audio_src_rate and obeys the same rule: 0 means unpinned (a project saved
+	// before the field existed), which resolves to the project rate and so
+	// reproduces the old 1:1 behaviour exactly.
+	//
+	// This is the only reason a clip's speed is independent of the project rate.
+	// Clip.source_length_frames counts SOURCE frames, and the timeline consumes
+	// them through clip_source_frame's conform, not one-for-one.
+	src_fps:              f64,
 	source_length_frames: i64,
 	timeline_start_frame: i64,
 	// Native source pixel size (0 = unknown). The clip image is drawn keeping
@@ -1230,6 +1253,10 @@ Preview_Slot :: struct {
 	path:                 cstring,
 	timeline_start_frame: i64,
 	source_start_frame:   i64,
+	// src_fps travels with the offsets so a previewed clip shows the frame it
+	// would export — the worker and the preview must not disagree about a
+	// conformed clip's speed.
+	src_fps:              f64,
 	// geom is the clip's geometry and opacity EVALUATED at this slot's
 	// displayed frame, latched here because the draw pass runs later than
 	// update_preview_slots and must not re-read the (by then mutated) live

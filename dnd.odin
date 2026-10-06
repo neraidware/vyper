@@ -176,10 +176,22 @@ handle_file_drop_event :: proc(event: sdl.Event) {
 	case .DROP_FILE:
 		mx, my := file_drag_point()
 		drop_file_at(event.drop.data, mx, my)
-		// SDL owns `data`: it is a buffer SDL allocated for this one event and
-		// the bin clones whatever it keeps, so releasing it here is the only
-		// owner that can -- skip it and every dropped file leaks.
-		sdl.free(rawptr(event.drop.data))
+		// `data` is SDL's, not ours, and this branch therefore owns nothing.
+		// SDL_SendDropFile builds it with SDL_CreateTemporaryString, which is
+		// SDL_FreeLater(SDL_strdup(...)): the buffer goes on SDL's own
+		// per-thread temporary-memory list, and SDL_PumpEvents runs
+		// SDL_FreeTemporaryMemory over that list at the top of the NEXT pump --
+		// once per frame, whether or not the app polled the event. Calling
+		// SDL_free on it here frees a block SDL still has a pointer to, so the
+		// very next frame frees it again: a double free, silent when the chunk
+		// has been handed back out in between and an abort when it has not.
+		// That is the whole reason a drop looked like it did nothing: the
+		// placement ran, then the heap came apart underneath it.
+		//
+		// SDL offers SDL_ClaimTemporaryMemory for an app that really wants the
+		// block, which is internal to SDL and not bound here; the bin clones
+		// every path it keeps (import_media_to_bin), so nothing here needs it to
+		// outlive the call, and the correct action is to leave it alone.
 	case .DROP_COMPLETE:
 		file_drag = {}
 	case .DROP_TEXT:

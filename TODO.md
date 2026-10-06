@@ -3365,9 +3365,11 @@ gesture). Mutation-checked: reverting the lane resolver to the panel box fails
 three, and removing the import gate fails two.
 
 **Memory.** Each dropped file hands an SDL-owned buffer to the bin, which clones
-what it keeps — so `sdl.free` on the event buffer is the only owner that can
-release it, and `dnd_valgrind` is the gate that measures that handoff (0
-definitely lost, 0 indirectly lost, no invalid free).
+what it keeps. The clone is what makes the *bin* safe to hand the path on and
+forget it — it is **not** what makes the *event buffer* ours to free. See Active
+31: this paragraph used to claim the opposite, and that claim was the bug.
+`dnd_valgrind` is the gate that measures the handoff (0 definitely lost, 0
+indirectly lost, no invalid free).
 
 ## Active 16 — Export frame rate came from the first video source, not the frame grid
 
@@ -6112,3 +6114,581 @@ and is then required to stop.
 The probe also refuses to pass by doing nothing: it requires the device to have run
 dry AND the queue to have ended back at the cushion.
 
+
+## Active 31 — A drop freed SDL's buffer, so the feature that worked read as broken
+
+**Status: fixed 2026-10-06.** Branch `fix/dnd-drop` (base `771044b`). `dnd_probe` +
+`dnd_valgrind` were already members of `all` and both cover this.
+
+**The symptom.** Dragging a file onto the media bin or the timeline did nothing.
+
+**The defect.** `handle_file_drop_event`'s `DROP_FILE` branch called
+`sdl.free(rawptr(event.drop.data))` on the comment's authority — *"SDL owns
+`data` ... releasing it here is the only owner that can"*. That is the wrong
+reading of "SDL owns", and it is wrong twice over. SDL does own the buffer, but
+not exclusively: `SDL_SendDropFile` builds it with `SDL_CreateTemporaryString`,
+which is `SDL_FreeLater(SDL_strdup(...))` — the block goes onto SDL's own
+per-thread temporary-memory list, and `SDL_PumpEventsInternal` runs
+`SDL_FreeTemporaryMemory` over that list at the top of the *next* pump. Once per
+frame, whether or not the app ever polled the event. So the branch freed a block
+SDL still held a pointer to, and the next frame freed it again.
+
+The consequence is why this read as "nothing happened" rather than as a crash: the
+placement runs *first* (import, then `add_asset_to_timeline`), so the clip lands,
+and only then does the heap come apart underneath it. A double free is silent
+when the chunk has been handed back out in between and an abort when it has not —
+so the same defect presents as a crash or as a quietly corrupted session
+depending on what the allocator did, which is also why it survived a probe suite.
+
+`SDL_ClaimTemporaryMemory` is the API for an app that genuinely wants the block;
+it is internal to SDL and not bound here, and nothing needs it — the bin clones
+every path it keeps (`import_media_to_bin`), so the correct action was to leave
+the pointer alone. The branch now owns nothing, and says why at the site.
+
+**Why it stayed invisible for three years.** Every existing `dnd_probe` check
+stops at the *decision*: which zone a point means, whether the bin will hold the
+file, whether the gesture state is clean. None of them hands a path across the
+event boundary, so none of them could see an ownership bug there — the probe
+passed with the double free in place, and `dnd_valgrind` reported 0 definitely
+lost, because the *probe* was never the owner SDL was double-freeing. A gate can
+only measure the boundary it actually crosses.
+
+**Probe.** The probe now drives the commit, not just the decision: a real
+`DROP_POSITION` + `DROP_FILE` pair pushed through SDL's own queue and drained by
+`handle_sdl_events` (the app's only poll site), over a WAV the probe writes
+itself, so the handoff is exercised by one owner exactly as SDL has it.
+- drop on the bin → the asset appears, and the timeline is untouched
+- bin item pressed → dragged → released over the timeline → clips appear and the
+  gesture disarms (the in-app half, checked against the same laid-out geometry so
+  the two paths that must agree are compared directly)
+- drop on the timeline → clips appear, on a timeline that already has lanes
+
+Mutation-checked: putting the `sdl.free` back kills the probe with
+`free(): invalid pointer` before any assertion is reached. That is the load-bearing
+result — it is the first thing in this suite that can see the defect at all.
+
+Each test re-lays out the page before asking where the timeline is. A drop
+resolves lanes out of the layout, so a test that placed clips earlier in the run
+would otherwise read `EmptyTimeline`'s box on a timeline that now has tracks —
+a zero box, and a red test that says nothing about the code.
+
+**Second defect, found by the first.** With the commit actually running,
+`dnd_valgrind` went red on something the probe had never reached:
+`media_frame_count` (`media.odin:161`) leaked the `[]string` from
+`strings.split(rate, "/")` on every import — the same bug its own
+`strings.split_lines(metadata)` two lines above had already been fixed for, with
+the rule written in a comment right there. Every *other* import path runs through
+`open_file_at`, which no valgrind target exercises; the dnd probe was the first
+gate to import a decodable file under memcheck. `defer delete(parts)`.
+
+`dnd_valgrind`: 0 definitely lost, 0 indirectly lost, no invalid access.
+
+## Active 32 — SDL moved the app onto XWayland, and niri does not bridge desktop drags
+
+**Status: fixed 2026-10-06.** Branch `fix/dnd-drop` (base `771044b`). Found while
+fixing Active 31, on the same machine, by the user still reporting "nothing
+happens" after the double free was gone.
+
+**The defect.** Dropping a file on the bin or the timeline produced no events at
+all — not even the zone highlight, which is drawn from `DROP_POSITION`. SDL's own
+trace showed the drag never reached the window: no `wl_data_device` offer, no
+`XdndEnter`, nothing.
+
+The reason is one line in SDL, found by reading `SDL_waylandvideo.c` rather than
+guessing:
+
+```
+This compositor lacks support for the fifo-v1 protocol; falling back to XWayland
+for GPU performance reasons (set SDL_VIDEO_DRIVER=wayland to override)
+```
+
+SDL ships two Wayland bootstraps. `Wayland_preferred_bootstrap` refuses unless the
+compositor implements `wp_fifo_v1`, and on refusal SDL picks X11 instead — a
+frame-pacing trade. It is the wrong trade for an editor, and silently so: an
+XWayland client is not a Wayland surface, so **the compositor does not hand it
+desktop drags**. A drag started in a native Wayland file manager has to be
+bridged into an X11 window by the compositor, and niri's XWayland server does not
+do that. So on niri the whole feature was dead before SDL generated a single
+event, and no amount of correctness in `dnd.odin` could have reached it.
+
+**The fix.** `prefer_native_wayland` (`main.odin`), called before `sdl.Init`
+because that is where the driver is chosen: when `WAYLAND_DISPLAY` is set and
+`SDL_VIDEO_DRIVER` is not already pinned, `sdl.SetHint("SDL_VIDEO_DRIVER",
+"wayland")`. The explicit-pinned check comes first so SDL's own documented advice
+(`SDL_VIDEO_DRIVER=wayland`) still works and nothing overrides a user's choice.
+
+**The cost, stated plainly.** A session that claims Wayland but cannot reach a
+compositor no longer falls back to X11 — `SDL_Init` fails outright. That is the
+right way round: XWayland is not a working fallback for a Wayland session, it is a
+slower one that silently drops a shipped feature. And the app now runs on a
+*different backend than it did before* for anyone on a compositor without
+`wp_fifo_v1` (niri). Compositors that have it — sway, wlroots, KDE 6, GNOME —
+were already on Wayland and see no change.
+
+**Not probeable, and how it was verified instead.** A headless run cannot conjure
+a compositor, so no gate covers the driver choice. It was verified on the real
+session against a real drag, which is what found it: with the trace on
+(`SDL_LOGGING="*=error,input=trace"`) a drag that does not work shows *no*
+`wl_data_device`/`XdndEnter` trace at all, versus a working one showing
+`data_device_handle_enter` → `data_device_handle_motion` → `data_device_handle_drop`
+→ `DROP_POSITION` → `DROP_FILE` → `DROP_COMPLETE`. That difference — an empty
+trace — is the only evidence a broken drag produces, which is why "it does
+nothing" took a backend trace to tell apart from "it crashes". Note this is also
+the same evidence the X11 path gives, which is how Active 31's real defect was
+separated from Active 32's: the X11 path demonstrably delivers `DROP_BEGIN` +
+`DROP_POSITION` from a hand-built XDND gesture, and never got a `DROP_FILE`
+through — because xwayland-satellite drops the synthetic `SelectionNotify` that
+carries the path. The two failures looked identical from the outside.
+
+## Active 33 — Snapping the playhead to a clip's end showed the next clip's first frame
+
+**Status: fixed 2026-10-06.** Branch `fix/playhead-snap-end` (base `a269a5a`).
+
+**The symptom.** With playhead→clip snapping on, scrubbing near a clip's end edge
+parked the playhead one frame past the clip, and the preview showed whatever came
+next — with contiguous clips, the next clip's frame 0. A gap after the clip made it
+look correct, which is what kept this from reading as an obvious off-by-one.
+
+**The defect.** `snap_playhead_to_clip_edge` targeted the end BOUNDARY
+(`start + length`) rather than a frame the clip owns. A clip spans
+`[start, start+length)` — `clip_visible_at` is half-open and says so — so the
+exclusive end is a frame this clip does not have. timeline.odin:224 already
+explained exactly that, then fixed only the case where it was visible (the final
+clip, via the `timeline_duration() - 1` clamp) and explicitly waved the interior
+case through, because `dur` is the LAST clip's end. Correct about the void, blind
+to the neighbour.
+
+So the resolver emitted a coordinate in the half-open convention's gap, and
+`clip_visible_at` — correct and consistently half-open in all eleven call sites —
+then resolved that frame against whatever clip did own it.
+
+**The fix.** Snap the end to `end - 1`, the last content frame, and leave the start
+edge alone. `end - 1` is right for interior and final edges alike, so the final
+clip needs no special case: its last content frame IS the timeline's last content
+frame. The duration clamp stays as the same backstop the scrub path has
+(interaction.odin:1628) rather than as the thing making the final clip behave. A
+zero-length clip owns no end frame, so `max(length - 1, 0)` folds its end onto its
+start instead of pointing one frame *before* the clip.
+
+**Probe.** `snap_playhead_to_clip_edge` had **no probe coverage at all** — `rg`
+found zero references in any `*_probe.odin`, and `timeline_probe` covers
+drag/drop/resize/ripple throughout. Two tests now: the end snap must land on a
+frame `clip_visible_at` accepts, and the clip→playhead margin must stay exactly
+`SNAP_PIXELS` wide at any zoom (the old `max(..,1)` floor let it balloon to
+hundreds of frames zoomed out).
+
+Mutation-checked: restoring `end := start + c.source_length_frames` fails 4
+assertions.
+
+**The probe was wrong twice before the resolver was, and both corrections are in
+the comment.** Worth recording, because the shape recurs:
+
+- I first tested CONTIGUOUS clips and asserted 99. It returned 100, and it was
+  right to: at a seam the next clip's start is also a candidate, and nearest-edge
+  legitimately prefers it. The gap case isolates the end edge with nothing else in
+  range. A probe asserting 99 at a seam would have been pinning the wrong rule —
+  and would have failed on correct code, which is a probe that trains you to
+  distrust it.
+- The zero-length fold I put at the duration boundary, where `clip_timeline_end ==
+  duration` and the clamp answers before the fold is even reached. Placed
+  mid-timeline instead, so the thing under test is the thing being tested.
+
+## Active 34 — Zoom and Pan are properties; Alt+wheel and Alt+drag stopped faking them
+The replacement case was itself wrong on arrival — it nested a second
+`geom_key_fixture()` inside the direction case, and the fixture calls
+`free_timeline`, so the second call freed the clips array the first case's `cl`
+pointed into. The y-axis check then read freed memory, which valgrind reported as
+76 invalid-read contexts inside `clip_pan_by`. The fixture now states its
+one-live-pointer contract at the definition; the zoom-invariance case is a
+sibling, not a nested block. Context count 76 -> 39, the remainder being Odin
+runtime internals with no frame in this change. Worth recording because a probe
+that cannot fail is worse than no probe: the tautology above and this crash both
+came from the same case, and the second would have shipped as "tested".
+
+That needed a second tolerance. `kf_approx` is a 1e-4 bar on source-fraction lane
+arithmetic; a source fraction scaled by a box width amplifies f32 rounding by
+~10^5, so 1e-4 px is below the noise floor (~1e-2 px) and rejected a case that
+was in fact exact — a check that read "got 120.00" and failed. Added
+`kf_approx_px` for the pixel-space bar rather than loosening the shared one.
+
+**The pan value could run away from the pan the clip showed.** The window clamp
+lived only in `geom_source_window`, so it bounded the CONTENT while the lane kept
+being incremented: dragging into an edge pinned the picture and moved the number
+forever. The inspector showed a pan that was not the pan on screen, and a key
+taken from it recorded a pan the clip would never display. Same class as the
+sign bug and the opposite failure: there the lane moved the wrong way, here it
+moved too far.
+
+**A window clamp is not a value bound.** They are different quantities, and
+bounding only the rendered one is what let the stored one drift — the writer has
+to be bounded, not just the reader of what the writer wrote. Fixed by
+`geom_pan_range`, which returns the pan values for which the window clamp is NOT
+binding, derived by inverting the window's own clamp against the same
+`source_window_parts` the window uses. `clip_pan_by` and the typed inspector both
+clamp through it, and the resolver keeps its clamp as the belt to that suspenders:
+a value can still arrive out of range from a hand-edited file, but nothing that
+writes a pan can produce one.
+
+`source_window_parts` was split out because the range needs the zoomed window's
+center and size, and re-deriving them from the insets would have been a second
+answer to "how far can this axis slide". `cl_geom_all` exists for the same reason
+at the clip boundary: `geom_pan_range` needs the crop and zoom lanes, so a caller
+holding a Clip cannot bound a pan against a partial sample — a range from the
+resting crop while the playhead sits on a keyed one would admit pans the window
+refuses.
+
+The probe drags a zoomed clip 12 steps past a border and asserts the lane stops at
+`x_hi`, that the stored value is one the window does not clamp (a lane parked on
+a clamped value would be the original bug, not a fix), and that panning back
+immediately moves the content again — a bound, not a dead end. Reverting to
+window-only clamping reproduces the report exactly:
+
+- `a drag into the border must stop the lane at the achievable limit (11.111111,
+  limit 1.7222222)`
+- `the stored pan must land inside the window's clamp (-2.1124997 of 0..0.775)`
+
+**The pan direction was inverted, and nothing caught it.** `clip_pan_by` negated the
+drag delta on the reasoning that "the gesture drags content the other way" —
+which is true of the WINDOW and not of the thing the user is dragging. So a
+rightward drag moved the CONTENT leftward. Two things had to be true to miss it:
+every existing case asserted only that pan CHANGED, never which way, and pan is
+defined as the window's offset, which is the opposite quantity to the one the
+user actually sees. `geom_source_window` and `Clip.pan_x` both stated the
+semantics backwards, so the wrong thing read as the documented thing.
+
+Fixed by inverting the delta. The semantics are now stated the same way in both
+places: **pan is the WINDOW's offset** (positive slides the sampled region toward
+the source's left/top), **so the content travels the other way**, which is what
+makes a rightward drag move the image rightward — the grab-the-content
+convention the gesture had before it had a property.
+
+The probe now pins the direction end to end, which is the part that was missing.
+It zooms in FIRST, because at zoom 1 the window fills the source and every pan
+clamps to a no-op, so a direction check there passes for the wrong reason. Then it
+drags right and asserts the sampled window moved toward the source's left. It
+also asserts the content tracks the CURSOR one-for-one — a 120px drag must move
+the content 120px — because moving the right way at a zoom-dependent speed is the
+same feel bug the win_w conversion exists to prevent.
+
+**Two more real bugs were found by the new cases rather than by inspection:**
+
+- **`clip_pan_by` wrote both pan lanes unconditionally**, so a horizontal drag
+  marked `pan.y` pending with its own value and "key all modified" would mint a
+  key for something the user never moved. Now per-axis, and only when that axis
+  moved — the same rule `clip_geom_drag` already followed for an untouched lane.
+- **The probe's own window math read `r - l` as a width.** `Source_Window`
+  carries INSETS, so the width is `1 - l - r`; the assertion passed for the
+  unzoomed case only because both insets are equal there.
+
+The old probe cases that PINNED the coupling (`n == 6`, and two packed section
+knots from one pan) were inverted rather than deleted, so the decoupling is now
+the thing under test.
+
+**Accept.** `check build probe keyframe_probe geom_key_probe render_kf_probe
+transform_probe timeline_probe opacity zorder render_live_probe subtitle_probe
+parity keyed_export` pass; `geom_key_valgrind render_valgrind parity_valgrind
+undo_valgrind` clean.
+
+**A segfault from an eight-entry name table behind an eleven-lane enum.**
+`geom_key_pending_labels` built the inspector's pending-lane summary from
+`short := []string{"X","Y","Scale","L","R","T","B","Opac"}` and indexed it by lane
+over `0 ..< int(Render_Geom_Prop._COUNT)`. Zoom/Pan_X/Pan_Y made that eleven, so
+lanes 8-10 read past the end of the literal. The garbage was a `string`, so
+`fmt.bprintf("%s", short[i])` dereferenced a garbage pointer and the process died.
+Reported as "segfault when zooming after a few crop and scale edits", which is
+exactly its shape: it needs nine or more lanes pending at once, so it needs
+several geometry edits plus a zoom, which is why no probe and no export reached it
+— only the interactive inspector, with a real project open.
+
+Two things had to be true to miss it. `geom_modified` had been widened to u16 by
+this same branch (the `Render_Geom_Prop` comment says so, right next to the enum),
+so the lane count had already moved once beneath a table still indexed by
+position. And nothing in the app compared the two numbers: the UI only ever needed
+the formatted list, so no code path could notice the table was short.
+
+Fixed by deriving the names from the enum instead of indexing a literal.
+`render_geom_short_name` is a `switch` on `Render_Geom_Prop`, which is
+compiler-checked for exhaustiveness, so the next lane added is a compile error
+rather than an out-of-bounds read at runtime. That is the structural fix; adding
+three strings to the literal would have left the next lane to do this again.
+
+The probe lights up ALL lanes (the only way to reach indices 8-10) and asserts the
+exact summary string, that every lane has a non-empty short name, and that the
+result fits `kf_pending_list`. **Against the original code it segfaults** — the
+probe reproduces the reported crash headlessly, which is the proof that it would
+have caught it.
+
+Two stale bounds sat next to it and are corrected. The `kf_pending_list` comment
+said "seven lanes" while the table had eight and the enum had eleven (eleven lanes
+is 28 bytes of names plus 20 of separators, so 47 — still inside the 64-byte
+buffer). And the truncation was silent: `fmt.bprintf` drops what does not fit, so a
+too-long lane would draw a plausible short list with nothing on screen to explain
+it. The write now asserts the fit.
+
+**NOTE: this section was lost once.** Audio commit `3a61921` committed a TODO.md
+whose buffer predated the merge that created Active 31, deleting 311 lines and the
+whole zoom/pan record with it. Restored from `c03c1d1`. The code was never at risk
+— only the record of it — but a stale editor buffer overwriting a merged file is
+silent, and nothing in the gate set reads TODO.md.
+
+
+## Active 35 — A clip plays at its own rate; the project rate is a timebase, not a speed
+
+**Why:** changing the project frame rate changed the playback speed of every clip
+in the project. The mapping from timeline frame to source frame was
+unconditionally 1:1 (`clip_source_frame` returned
+`source_start + timeline_frame - timeline_start`), so a clip's speed WAS the
+project rate by definition — there was no setting anywhere that said otherwise, and
+no way to express a clip that holds its own speed. A 30fps source on a 60fps
+timeline played at double speed.
+
+The source's own rate was probed at import and then thrown away: `media.odin` read
+`probe.video_fps_num/den` only to seed `timeline.frame_rate` on the first import.
+That is exactly why the bug looked absent — the project rate was set FROM the
+first clip, so until the user touched the rate, source rate and project rate were
+the same number by coincidence and 1:1 was accidentally correct.
+
+**Fix.** `Media_Asset.video_fps` keeps the probed source rate; `Clip.src_fps` pins
+it to the clip, the video half of the existing `audio_src_rate` pin.
+`clip_source_frame` now advances through the source at `src_fps / project_fps`, so
+the timeline consumes a clip's frames at the clip's real speed: a 60fps timeline
+holds each frame of a 30fps source twice, a 24fps timeline drops frames from a
+60fps source. Conform, not resample — the project rate only decides how finely the
+timeline samples it.
+
+`src_fps == 0` means unpinned, and resolves to the project rate, which reproduces
+the historical 1:1 exactly so a project saved before the field existed does not
+change speed on load. The rate-equal case returns through integer arithmetic and
+never touches a float: that is the overwhelmingly common path and it has to stay
+bit-exact.
+
+One choke point, so preview, export and the proxy picker cannot disagree — they
+already all routed through `clip_source_frame`, which is why this needed no
+per-site change beyond passing the pin.
+
+**Accept.** `check build probe transform_probe geom_key_probe render_kf_probe
+keyframe_probe timeline_probe opacity zorder subtitle_probe keyed_export parity
+render_live_probe` pass; `render_valgrind parity_valgrind` clean. The speed case
+walks a clip at 24/25/30/50/59.94/60/29.97 project fps and asserts the source
+advance rate is `src_fps/project_fps` at every one; restoring 1:1 fails it with
+`project 60.0000 fps, a 30fps clip 120 frames long advanced 120.00 source frames,
+want 60.00`. It also pins what was NOT obvious: a non-integer ratio must round
+rather than truncate (30/29.97 creeps early under truncation), and the mapping
+must never run backwards at any of 9×3 rate pairs, since a non-monotonic conform
+makes the decoder seek backwards every frame.
+
+**Still open — clip EXTENT, deliberately not done here.** This fixes SPEED only,
+and it leaves a second, separate coupling in place: a clip's length on the timeline
+is its SOURCE frame count (`Clip.source_length_frames` is `asset.frame_count`,
+used directly as the timeline extent), and an audio clip's is
+`duration_sec × import-time fps`. Both are therefore measured in whatever rate
+happened to be current when the clip was placed. Consequences after an fps change:
+
+- a 30fps clip of 300 frames occupies 300 timeline frames, so at 60fps it covers
+  5 seconds of its 10 seconds of content — conformed correctly, and truncated;
+- an audio clip's audible content no longer matches its lane, so it overruns or is
+  cut off at its end.
+
+Both are one decision with two possible answers and they are not equivalent, so it
+is not bundled into a speed fix:
+
+1. **Conform in place** — leave every clip's extent as authored and let the fps
+   change alter how much source each clip covers. Non-destructive: no position
+   moves, no keyframe is touched, and every clip keeps its real-world speed. The
+   visible artifact is that a clip can cover less (or more) of its source than it
+   did, which reads as truncation to the user.
+2. **Retime the timeline** — on an fps change, rescale every clip extent and
+   position (and every keyframe offset, and audio sample offsets) by
+   `new/old`, so durations and coverage are preserved exactly. Correct, but it
+   rewrites the project's frame numbers, and a keyframe track stored in timeline
+   frames has to be rescaled with it or keyframes land on the wrong content.
+
+**Decision: conform in place (1).** Retime is deferred to a manual, user-applied
+operation in a future update. Nothing in the conform is provisional: the speed work
+above is the same either way, because a retimed clip is still conformed at the
+same ratio — only the extent is in question, and conform-in-place means the
+extent is simply left as authored.
+
+**Conforming in place required finishing the job, and the interesting part was
+there.** "The clip's source range" was `[source_start, source_start+length)`
+everywhere, and that identity IS the 1:1 assumption. Conform makes it wrong, and
+wrong in both directions at once, both of them live:
+
+- **too permissive.** A 300-frame 30fps clip on a 60fps timeline displays source
+  frames 0-149, but the old window accepted 0-299 — so a stale async decode left
+  over from a previous clip on the same path, at frame 200, would be accepted as
+  this clip's and painted.
+- **too restrictive, and this one freezes the preview.** A 60fps source on a 30fps
+  timeline displays 0-599 from a 300-frame extent, so every frame past 300 was
+  rejected as "stale" and the clip stopped updating. 30fps projects with 60fps
+  footage are common, so this is the shape a user hits first.
+
+`clip_source_span` is the fix, derived through `clip_source_frame` so there is one
+conform policy rather than a second restatement of it, and used at all three
+sites: the async stale-result window (correctness), the adjacency test that lets
+two abutting clips donate a decoded frame across a cut (a decode per cut
+otherwise), and the forward cache buttress (which otherwise warms frames the clip
+never shows and misses ones it is about to).
+
+Its own first version had an off-by-one and the probe caught it: sampling
+`t0+length` reads one frame PAST the clip's last, so the identity case returned a
+301-frame window for a 300-frame clip — exactly wide enough to let a stale result
+at the boundary pass. Caught by asserting the identity case, which is the one that
+has to hold for every pre-conform project; `span: unpinned and rate-equal clips
+keep the identity window` fails on the revert.
+
+**The pin did not survive a save, so the fix did not work on any existing project.**
+Reported as `~/baby.vyproj` at auto vs 60fps being "completely different, 5 times
+faster". The source is a 12fps AV1 webm (ffprobe: `r_frame_rate=12/1`), so 60/12
+= 5 exactly — the conform was simply not applied, and the clip played at the
+project rate as before.
+
+The cause was not the conform. `Media_Asset.video_fps` was never added to the
+project file DTO, so every asset arrived at load with no rate, `pf_pin_src_fps`
+found nothing to pin from, and fell through to its last rung: the project rate.
+That is the 1:1 conform is defined against — so the pin silently degraded to
+precisely the thing it exists to override. `Media_Asset.audio_rate` IS persisted,
+for the same reason on the audio side; the new field was simply missing where its
+counterpart was not. A pin whose fallback is the defect is worse than no pin,
+because it looks like it is working.
+
+Two fixes:
+
+  - `video_fps` is persisted (DTO, save, load), so a project saved from now on
+    carries the exact probed rate.
+  - `pf_pin_src_fps` derives `frame_count / dur_us` as a middle rung, which is what
+    a project saved BEFORE the field exists carries — `frame_count` and `dur_us`
+    are both already in the file. The proxy scheduler derives its rate the same
+    way for exactly this reason. On `~/baby.vyproj` that yields 11.9928 against a
+    true 12: 0.06% fast, so a 219-frame clip drifts ~13ms over its whole length,
+    which is far below the frame quantization it has to survive anyway. Without
+    this rung every project already on disk keeps playing at the project rate.
+
+`timeline_probe` asserts the three rungs separately, because the middle one is
+the one that was missing and a test of the outer two passes while it is absent.
+The assertion is BEHAVIOURAL — one second of playback at 60fps must advance 12
+source frames — because a pin value can be correct while the mapping ignores it,
+and because the derived rate is not exactly 12, so pinning an index pair would be
+asserting the derived number instead of the speed. Reverting the middle rung
+fails with `one second at 60fps advanced 60.000 source frames, want 12`.
+
+**Also conformed: the probes that compute `expected` from the identity.** Five
+sites in `preview_probe_run` and `boundary_probe_run` derived the frame a slot
+"should" hold as `source_start + f - timeline_start`. They would have compared
+against a frame the app never displays — a test that passes by checking the wrong
+thing, which is how the stale-window bug would have survived a green run. They now
+route through `clip_source_frame` with the slot's pin.
+
+**Clip EXTENT is derived from source duration, and the timeline reflows on a rate
+change.** Reported after the conform fix as "baby still doesn't match between 60fps
+and 12fps — the content should be exactly the same, not slower nor faster, just
+with less frames".
+
+Conform alone did not deliver that, because it fixed SPEED and left LENGTH alone. A
+clip's extent on the timeline was its source frame count (`Clip.source_length_frames`
+= `asset.frame_count` used directly as the extent), which is correct only while the
+project rate equals the source rate. So a 219-frame 12fps clip occupied 219 frames at
+12fps and still 219 at 60fps — 18.25 seconds of content in 3.65 seconds of
+timeline, showing a fifth of the material at the right speed. The two previews
+cannot match, and no conform work changes that.
+
+This was mine to catch the first time. The user described clip duration; I mapped it
+onto a global-timeline decision, recorded it as settled, and shipped the half that
+fixes speed while visibly not delivering the stated outcome.
+
+The model now:
+
+- `clip_duration_sec` — a clip's wall-clock time, a property of its SOURCE,
+  measured from the asset (`frame_count / video_fps`), falling back to the stored
+  extent divided by the rate it was AUTHORED at.
+- `clip_timeline_len` — that duration quantized to the current rate: the extent
+  every reader should use.
+- `clip_src_len_frames` — the inverse through the conform, for the decoder and
+  proxy machinery that needs a source count.
+- `Clip.source_length_frames` KEEPS its meaning as the stored timeline extent, so
+  its ~117 existing readers are unchanged and correct. That was the load-bearing
+  decision: redefining the field as a source count would have put every one of
+  those readers in scope for no benefit, since the source count is *derivable* from
+  the extent.
+- `set_project_fps` reflows: new length from duration at the new rate, new start
+  from the previous clip's new end plus the old gap re-quantized, keyframe offsets
+  rescaled with the clip.
+
+**Two bugs the reflow probes caught, both of which pass every other check:**
+
+- **Gaps silently shrank.** The obvious implementation — shift each clip by the
+  previous clip's length delta — is wrong, because the gap was measured in frames
+  and only the clip grew. A 2s gap became 0.4s at 60fps. Every content, duration and
+  speed check still passed; only comparing two clips' relative timing catches it.
+- **Every asset-less clip silently shrank too.** `clip_duration_sec`'s fallback
+  divides the stored extent by a rate it is *given*, and during a reflow the project
+  rate has already moved. Dividing a 12-frame one-second still by 60 instead of 12
+  turns it into 0.2s — still images, text generators and clips whose file is gone
+  all quietly lose `rate_ratio` of their duration. Nothing about the result looks
+  wrong; the clip still plays, just short and fast.
+
+Both revert-to-fail:
+`the gap must keep its real-world size — 0.4000s, want ~2s`,
+`a one-second still must stay one second across a reflow — got 12 frames at 60fps,
+want 60`.
+
+The keyframe case is separate and worth its own: a keyframe's `frame_off` is
+clip-relative in TIMELINE frames, so an extent growing fivefold slides every key to
+a fifth of its position unless rescaled with it. The keys survive and land on the
+wrong content, which is worse than losing them because nothing about it looks wrong.
+Offsets are re-ascending-strict, since a shrinking reflow folds keys together and a
+duplicate offset breaks every interpolating sampler's sorted-ascending invariant.
+Reverting fails at `offset 109 at 219 frames, want 545 at 1095`.
+
+
+**Accept.** `check build probe transform_probe geom_key_probe render_kf_probe
+keyframe_probe timeline_probe opacity zorder subtitle_probe keyed_export parity
+render_live_probe decode_repeat` pass; `render_valgrind parity_valgrind
+undo_valgrind` clean. New span cases
+assert both directions separately, because a span test that only checks the
+permissive direction passes a helper that is off by one in the restrictive one.
+
+**`~/baby.vyproj` found four defects no fixture reached.** The project stores an AV1
+webm as a clip of kind `.Audio` over an asset of kind `.Video`. Both `pf_pin_src_fps`
+and `clip_duration_sec` filtered on `Clip.kind`, so that clip matched no rung at all:
+`src_fps` stayed 0, it resolved to the project rate, and a 12fps source played at
+60fps speed. The "5 times faster" report was STILL LIVE after the conform fix,
+because the pin never ran on that clip. Both now branch on the **asset's** kind,
+which comes from probing the file — the clip's kind is precisely the field an
+older-written or hand-edited project gets wrong. `timeline_probe` gained the
+kind-mismatch case; restoring the filter fails it at `one second advanced 60.000
+source frames, want 12`.
+
+Three more, all from running the real file:
+
+- **A rate returned where a duration was wanted.** The derive fallback computed
+  `frame_count/dur_us` = 11.99 for an 18.26s source, and 11.99 is a
+  plausible-looking duration — it reads as a slightly-short clip rather than as an
+  arithmetic slip. It returns `dur_us` directly now, which is already the duration.
+- **The asset's duration would have un-trimmed every trimmed clip.** A clip trimmed
+  to half a second snaps back to its source's full length on the next rate change,
+  and nothing about that looks wrong. The asset's duration is used only when the
+  clip verifiably IS the whole asset.
+- **The load-time rebase stretched the project's PNG to 20.17s.** A still has no
+  measurable duration, so the rebase divided its extent by `timeline.frame_rate`
+  (12) when it had in fact been authored at the project's 60. It now rebases only
+  clips with a measured duration and leaves the rest exactly as found. A single
+  global authoring rate cannot be right even in principle: in that one file the
+  webm's extent was authored at 12fps and the still's at 60.
+
+**A project now tests its own fps model.** `VYPER_PROJECT_EXPORT` takes an optional
+third field, the rate — the only way to ask "does this project look the same at 12
+and at 60" headlessly, since a project file stores exactly one rate. It applies
+through `set_project_fps`, so the export runs against a REFLOWED timeline rather
+than one whose extents were rewritten behind the model's back. A layout dump prints
+each clip's resolved extent, rate, source length and content, so a wrong extent is
+visible as a number rather than only as an output duration. Verified on
+`~/baby.vyproj`: the webm resolves to **18.261s of content at both rates**, extent
+219 frames at 12fps and 1096 at 60.
+
+**STILL OPEN, and it is not an fps problem.** That webm clip is of kind `.Audio`, so
+`render_clip_sink` returns `ok=false` and its AV1 video is **never decoded** — at any
+frame rate. Both exports of the file are essentially black. So the "completely
+different preview" was a still image and black rather than a retimed webm, and this
+project cannot demonstrate the fps fix visually until the classification is
+re-derived from the asset. That is the next thing to decide.

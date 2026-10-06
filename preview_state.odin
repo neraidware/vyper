@@ -171,7 +171,20 @@ prewarm_next_clip :: proc() {
 		return
 	}
 	for kf in i64(1) ..< 4 {
-		wf := best.source_start_frame + kf
+		// The frames this clip will really show next, which under conform are not
+		// the next few source frames: holding (project faster than source) repeats
+		// one, dropping (project slower) skips. Warming source_start+kf would
+		// decode frames the clip never displays and miss ones it is about to.
+		wf := clip_source_frame(
+			best.source_start_frame,
+			best.timeline_start_frame,
+			playhead.frame + kf,
+			false,
+			best.src_fps,
+		)
+		if wf <= best.source_start_frame + kf - 1 {
+			wf = best.source_start_frame + kf // never warm behind the current frame
+		}
 		warm_pick, warm_base = proxy_pick_for_frame(
 			best.path,
 			best.source_length_frames,
@@ -221,9 +234,16 @@ slot_claim_flush_peer :: proc(clip: ^Clip, claimed: [MAX_PREVIEW_SLOTS]bool) -> 
 			continue
 		}
 		peer_end := peer.timeline_start_frame + peer.source_length_frames
-		peer_src_end := peer.source_start_frame + peer.source_length_frames
 		clip_end := clip.timeline_start_frame + clip.source_length_frames
-		clip_src_end := clip.source_start_frame + clip.source_length_frames
+		// Source adjacency is a property of the source SPANS, which conform
+		// changes; the [start, start+len) identity made two abutting clips from one
+		// path look non-adjacent and cost a decode per cut.
+		_, peer_src_end := clip_source_span(
+			peer.source_start_frame, peer.timeline_start_frame, peer.source_length_frames, peer.src_fps,
+		)
+		_, clip_src_end := clip_source_span(
+			clip.source_start_frame, clip.timeline_start_frame, clip.source_length_frames, clip.src_fps,
+		)
 		forward :=
 			peer_end == clip.timeline_start_frame &&
 			peer_src_end == clip.source_start_frame
@@ -455,6 +475,7 @@ update_preview_slots :: proc() -> bool {
 			}
 			slot.timeline_start_frame = clip.timeline_start_frame
 			slot.source_start_frame = clip.source_start_frame
+			slot.src_fps = clip.src_fps
 			if anchor_shifted {
 				// A clip was moved (drag) or its source window changed. The
 				// slot's decoded buffer + texture still hold the OLD position's
@@ -659,6 +680,7 @@ slot.is_text = true
 				clip.timeline_start_frame,
 				req,
 				clip.is_still,
+				clip.src_fps,
 			)
 			// Resolve the preview target PER FRAME: a segmented proxy grows as
 			// the background builder lands more segments, so the frame the
@@ -793,9 +815,18 @@ slot.is_text = true
 						in_window := false
 						p_ok, p_frame, _ := async_peek_result(slot_idx, slot.path)
 						if p_ok {
-							in_window =
-								p_frame >= clip.source_start_frame &&
-								p_frame < clip.source_start_frame + clip.source_length_frames
+							// The clip's real source window, not
+							// [source_start, source_start+length): under conform those
+							// differ, and using the identity form rejects valid frames
+							// (a 60fps source on a 30fps timeline displays twice the
+							// source its extent implies) and accepts stale ones.
+							lo, hi := clip_source_span(
+								clip.source_start_frame,
+								clip.timeline_start_frame,
+								clip.source_length_frames,
+								clip.src_fps,
+							)
+							in_window = p_frame >= lo && p_frame < hi
 						}
 						if !in_window {
 							if vyper_trace {

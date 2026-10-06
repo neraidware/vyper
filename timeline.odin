@@ -45,14 +45,493 @@ clip_visible_at :: proc(frame, start, length: i64) -> bool {
 // export and the proxy picker each had their own copy of this arithmetic,
 // including the still case, and a divergence there is a clip that previews one
 // frame and exports another.
+//
+// src_fps is where the clip's SPEED is decided, and it is a parameter for the
+// same reason the offsets are: the worker must not read a live clip.
+//
+// A clip plays at its OWN rate. src_fps is the rate pinned to the clip at
+// import; project_fps() is the timebase the timeline happens to be quantized to.
+// Those are different things, and the mapping used to conflate them -- it was
+// unconditionally 1:1, so a clip's speed WAS the project rate by definition. A
+// 30fps source on a 60fps timeline therefore played at double speed, with no
+// setting anywhere that said so, and changing the project rate retimed every
+// clip in the project.
+//
+// The timeline frame now advances through the source at src_fps/project_fps: a
+// 60fps timeline showing a 30fps source holds each source frame for two
+// timeline frames, and a 24fps timeline showing a 60fps source drops frames.
+// Both are conform -- the clip keeps its real-world speed, the timebase only
+// decides how finely it is sampled.
+//
+// Two deliberate exactness choices:
+//
+//   - src_fps <= 0 means UNPINNED, a project saved before the field existed. It
+//     resolves to the project rate, reproducing the historical 1:1 exactly, so
+//     old projects keep the speed they had rather than changing on load.
+//   - The rates-equal case returns through integer arithmetic and never touches
+//     a float. That is the overwhelmingly common path (a clip imported at the
+//     project's own rate) and it has to stay bit-exact: rounding it would put a
+//     wobble into every frame of every clip to accommodate a case that does not
+//     apply.
 clip_source_frame :: proc(
 	source_start, timeline_start, timeline_frame: i64,
 	still: bool,
+	src_fps: f64,
 ) -> i64 {
 	if still {
 		return source_start
 	}
-	return source_start + timeline_frame - timeline_start
+	off := timeline_frame - timeline_start
+	rate := src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	proj := project_fps()
+	if !(rate > 0) || !(proj > 0) || rate == proj {
+		return source_start + off
+	}
+	// Round, not truncate: truncation biases every frame one late, which at a
+	// non-integer ratio reads as the clip starting a fraction of a frame in and
+	// never catching up.
+	return source_start + i64(math.round(f64(off) * (rate / proj)))
+}
+
+// clip_duration_sec is how much wall-clock time a clip occupies, which is a
+// property of its SOURCE and not of the timeline.
+//
+// It is the quantity that makes a project fps-independent. A clip's extent on the
+// timeline is this duration quantized to the current rate, so the same clip
+// occupies 219 frames at 12fps and 1095 at 60fps while showing the same 18.26
+// seconds of content at the same speed. Reading the extent instead — which is
+// what the code did, because the extent was set from the source frame count and
+// the two happened to be equal at import — pins a clip's length to the rate in
+// force when it was placed, so the same project shows less and less of every clip
+// as the rate goes up.
+//
+// Keyed to the ASSET, never to Clip.kind. That is not a style choice: ~/baby.vyproj
+// stores an AV1 webm as a clip of kind .Audio whose asset is of kind .Video, and
+// both this function and pf_pin_src_fps used to filter on the clip's kind. So the
+// webm matched no rung — no probed video rate (the asset predates the field), no
+// audio rate either — and fell through to the extent, which made a clip whose
+// asset says kind=Video resolve as if it had no media rate at all. The clip's kind
+// is the one field here that a hand-edited or older-written project gets wrong;
+// the asset's kind is measured from the file.
+// asset_content_duration_sec is an asset's own content length in seconds, and
+// whether that content is video.
+//
+// The single place that answers "what rate does this asset's media run at", read
+// by both clip_duration_sec and pf_pin_src_fps so the two cannot disagree about
+// it — they did, which is how a clip ended up with a duration from the video side
+// and a playback rate from neither.
+//
+// Branches on the ASSET's kind, not the clip's. The asset's kind comes from
+// probing the file, so it is the reliable one.
+// asset_authoring_rate is the rate an asset's frame counts were MEASURED against.
+//
+// It is the single recovery path for a project saved before the rate fields
+// existed, and it is the audio half of a bug that was already fixed on the video
+// side. `Media_Asset.audio_rate` and `.video_fps` are both 0 in such a project, so
+// both pins fell through to the PROJECT rate and read every clip's frame counts in
+// the wrong timebase.
+//
+// ~/baby.vyproj's "Sr Pelo" opus is the case: audio_rate=0, audio_frames=79,
+// dur_us=6.6s, so its counts were measured at 79/6.6 = 11.97fps. The clip's stored
+// extent of 44 frames is 3.676s of audio. Read at the project's 60fps it is
+// 0.733s — five times short, and the clip lands at the wrong point on the
+// timeline.
+//
+// Deriving it from the frame count and the duration is exact to the same
+// quantization the counts already carry, and the proxy scheduler derives its rate
+// this way for the same reason.
+asset_authoring_rate :: proc(asset_id: u64) -> (rate: f64, is_video: bool) {
+	as := find_asset(asset_id)
+	if as == nil || as.dur_us <= 0 {
+		return 0, false
+	}
+	switch as.kind {
+	case .Video:
+		if as.video_fps > 0 {
+			return as.video_fps, true
+		}
+		if as.frame_count > 0 {
+			return f64(as.frame_count) * 1e6 / f64(as.dur_us), true
+		}
+	case .Audio:
+		if as.audio_rate > 0 {
+			return as.audio_rate, false
+		}
+		if as.audio_frames > 0 {
+			return f64(as.audio_frames) * 1e6 / f64(as.dur_us), false
+		}
+	case .Image, .Text, .Subtitles, .Other, .Empty:
+		// A still has no rate; its length is authored, not measured.
+		return 0, false
+	}
+	return 0, false
+}
+
+asset_content_duration_sec :: proc(asset_id: u64) -> (sec: f64, is_video: bool) {
+	as := find_asset(asset_id)
+	if as == nil {
+		return 0, false
+	}
+	// dur_us IS the duration for both media kinds, so it is used directly rather
+	// than derived through a rate. The first version of the video rung returned
+	// frame_count/dur_us — a frame RATE — where the caller wanted seconds, which
+	// reported an 18.26s source as 11.99s: numerically the fps, which is plausible
+	// enough to look like a plausible duration.
+	//
+	// Gated on a positive rate so an asset with no usable counts cannot have its
+	// dur_us read as a duration.
+	rate, media_is_video := asset_authoring_rate(asset_id)
+	if rate > 0 && as != nil {
+		return f64(as.dur_us) / 1e6, media_is_video
+	}
+	return 0, false
+}
+
+clip_duration_sec :: proc(clip: ^Clip, rate: f64) -> f64 {
+	// The extent is in PROJECT frames, always. That invariant is established once,
+	// at load, by pf_rebase_extents — and it is the reason this proc is trivial.
+	//
+	// It was not trivial for three iterations, because the asset's duration was
+	// consulted here as well as in the rebase, and the two disagreed about which
+	// timebase the extent was in. The rebase converts; this read. With both asking
+	// the asset, a converted extent got read again at the asset's authoring rate
+	// and the webm came out at 91.5s instead of 18.26s — the same clip, wrong in a
+	// new direction each time.
+	//
+	// `rate` is the authoring rate during the load-time rebase (a legacy extent is
+	// still in the timebase it was written in) and the project rate everywhere else.
+	r := rate
+	if !(r > 0) {
+		r = project_fps()
+	}
+	if !(r > 0) {
+		return 0
+	}
+	return f64(clip.source_length_frames) / r
+}
+
+// clip_timeline_len is how many timeline FRAMES a clip occupies at the current
+// project rate: its source duration quantized to that rate.
+//
+// This is the extent every reader should use. `Clip.source_length_frames` is that
+// same number, but it is a stored value, so it is only as good as the reflow that
+// last ran — which is why it read as the source frame count and why every one of
+// its ~117 readers was correct only while the rate matched the source.
+clip_timeline_len :: proc(clip: ^Clip) -> i64 {
+	rate := project_fps()
+	sec := clip_duration_sec(clip, rate)
+	if !(rate > 0) || !(sec > 0) {
+		return clip.source_length_frames
+	}
+	// At least one frame: a source shorter than one timeline frame still has to
+	// occupy a frame, or it is invisible and unselectable.
+	return max(1, i64(math.round(sec * rate)))
+}
+
+// clip_src_len_frames is how many SOURCE frames a clip carries — the inverse of
+// the extent through the conform, and the number a decoder or proxy segment
+// needs. Distinct from the extent by exactly the conform ratio.
+clip_src_len_frames :: proc(clip: ^Clip) -> i64 {
+	rate := clip.src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	proj := project_fps()
+	extent := f64(clip_timeline_len(clip))
+	if !(rate > 0) || !(proj > 0) {
+		return clip.source_length_frames
+	}
+	return max(1, i64(math.round(extent * (rate / proj))))
+}
+
+// clip_source_span is the half-open range of SOURCE frames a clip can display
+// across its whole timeline extent, under conform.
+//
+// It exists because "the clip's source range" is no longer
+// [source_start, source_start+length): that identity assumed 1:1, and every
+// caller that bounds a source frame by a clip's extent was silently wrong the
+// moment conform landed. Two ways it went wrong, both live:
+//
+//   - too PERMISSIVE: a 300-frame 30fps clip on a 60fps timeline displays source
+//     frames 0-149, but the old window accepted 0-299 — so a stale async result
+//     left over from a previous clip on the same path, at frame 200, would be
+//     accepted as this clip's.
+//   - too RESTRICTIVE, and this one freezes the preview: a 60fps source on a 30fps
+//     timeline displays 0-599 from a 300-frame extent, so every frame past 300
+//     was rejected as stale and the clip stopped updating.
+//
+// Derived through clip_source_frame so there is one conform policy rather than a
+// second restatement of it here. The `+ 1` makes it half-open at the far end: the
+// last timeline frame displays source frame hi-1, not hi.
+// clip_src_len_to_timeline_frames converts a count of SOURCE frames into the
+// TIMELINE length that many source frames occupy for this clip — the inverse of
+// clip_src_len_frames.
+//
+// It has to be a conversion and not a constant ratio, because the factor is the
+// clip's own conform (src_fps over project_fps) and every caller is holding a
+// timeline length on the other side of the comparison.
+// clip_timeline_to_src_frames is the inverse: a distance in TIMELINE frames
+// expressed in SOURCE frames.
+//
+// Needed wherever a drag moves the head, because the distance the pointer travelled
+// is a timeline distance while the field being adjusted (Clip.source_start_frame)
+// counts source frames. Under conform those differ by exactly the clip's ratio, so
+// `source_start_frame += delta` walks the head off the front of the file: dragging
+// a 35-source-frame head left by its full 175 timeline frames decremented
+// source_start_frame by 175 and left it at -140, reading before the first frame.
+clip_timeline_to_src_frames :: proc(clip: ^Clip, timeline_frames: i64) -> i64 {
+	rate := clip_frame_space_rate(clip)
+	proj := project_fps()
+	if !(rate > 0) || !(proj > 0) {
+		return timeline_frames
+	}
+	return i64(math.round(f64(timeline_frames) * (rate / proj)))
+}
+
+// clip_frame_space_rate is the rate a clip's SOURCE frame numbers are counted in,
+// which is not the same field for every clip kind.
+//
+// Clip.src_fps is the VIDEO conform rate — how many source frames one timeline
+// frame shows, for a picture. An audio clip's frames are counted against
+// Clip.audio_src_rate instead, and for a clip imported at a different rate than
+// the project those two disagree.
+//
+// Getting this wrong is not subtle. ~/baby.vyproj's opus has audio_src_rate 11.97
+// and src_fps 60, so a conversion using src_fps ran 1:1 where it had to run 5:1,
+// and trimming the clip's tail capped it at 38 timeline frames instead of the 221
+// its 44 source frames actually occupy. The audio clip was being measured in the
+// video clip's timebase.
+clip_frame_space_rate :: proc(clip: ^Clip) -> f64 {
+	rate := clip.kind == .Audio ? clip.audio_src_rate : clip.src_fps
+	if !(rate > 0) {
+		rate = project_fps()
+	}
+	return rate
+}
+
+clip_src_len_to_timeline_frames :: proc(clip: ^Clip, src_frames: i64) -> i64 {
+	rate := clip_frame_space_rate(clip)
+	proj := project_fps()
+	if !(rate > 0) || !(proj > 0) {
+		return max(1, src_frames)
+	}
+	return max(1, i64(math.round(f64(src_frames) * (proj / rate))))
+
+}
+
+clip_source_span :: proc(
+	source_start, timeline_start, length: i64,
+	src_fps: f64,
+) -> (lo, hi: i64) {
+	if length <= 0 {
+		return source_start, source_start
+	}
+	// Sampled at the LAST frame the clip actually has, t0+length-1. Sampling
+	// t0+length reads one frame past the clip, which makes the identity case
+	// return a 301-frame window for a 300-frame clip -- one frame wider than the
+	// clip, and enough to let a stale async result at the boundary pass as this
+	// clip's. The probe's identity assertion is what caught it.
+	lo = clip_source_frame(source_start, timeline_start, timeline_start, false, src_fps)
+	hi = clip_source_frame(source_start, timeline_start, timeline_start + length - 1, false, src_fps) + 1
+	if hi <= lo {
+		hi = lo + 1
+	}
+	return lo, hi
+}
+
+// reflow_timeline_for_fps re-derives every clip's extent for a new project rate
+// and shifts positions so the gaps between clips keep their real-world size.
+//
+// Per track, because tracks are independent lanes: a clip's new length is its
+// source duration at the new rate, and a clip's new start is its old start plus
+// the length deltas of the clips before it on the SAME track. Clips on other
+// tracks do not move, which is what makes a multi-track sequence keep its
+// relationships: a clip starting 2s after another clip on a different lane stays
+// 2s after it, because both extents and both positions scale by the same ratio.
+//
+// The ratio is the RATE ratio, not each clip's own, and that is the point: the
+// whole timeline is being re-quantized to a new timebase, uniformly. A clip's
+// conform ratio (src_fps/project_fps) is a separate thing and is deliberately not
+// applied here — it governs which source frame each timeline frame shows, not how
+// long the clip is.
+//
+// Keyframes are rescaled by the same ratio, per clip, by that clip's extent delta.
+// A keyframe's frame_off is clip-relative in TIMELINE frames, so an extent that
+// grows fivefold slides every key to a fifth of its position in the clip. The keys
+// would survive and land on the wrong content, which is a worse failure than
+// losing them because nothing about it looks wrong.
+//
+// Returns the total length delta applied, for the probe.
+// pf_rebase_extents_for_authoring_rate re-derives every video clip's extent ONCE,
+// at load, using the rate the project was AUTHORED at.
+//
+// It exists because the extent<->duration invariant ("extent == duration x rate")
+// did not hold for projects written before this change: their extents are source
+// frame counts, correct only at the source's rate, and nothing records the rate
+// they were written at except timeline.frame_rate. ~/baby.vyproj is the case —
+// extents authored at 12, project.frame_rate already 60, so its clips read as
+// 3.65s of content instead of 18.26s.
+//
+// After this runs, the invariant holds and every later rate change can measure a
+// clip's duration from its own extent, which is what makes reflow preserve
+// TRIMMING. Without the rebase a trimmed clip's duration is unrecoverable: the
+// file stores the trimmed extent and the asset stores the full length, and nothing
+// says which is which.
+//
+// No-op when timeline.frame_rate does not disagree with the project rate, which is
+// the common case for a project already in the new model.
+pf_rebase_extents :: proc() {
+	for ti in 0 ..< len(timeline.tracks) {
+		for &clip in timeline.tracks[ti].clips {
+			// A clip's extent is only convertible if the asset says what rate its
+			// counts were measured at. Where it cannot, the stored extent is believed
+			// as-is and stays in project frames — which is what it already was.
+			//
+			// This is what bit ~/baby.vyproj's PNG: a still has no usable duration
+			// (its dur_us is not a duration), so there is nothing to convert from, and
+			// an earlier version guessed using timeline.frame_rate and stretched a
+			// 4-second still to 20.17s. It played fine and looked fine.
+			authoring, _ := asset_authoring_rate(clip.asset_id)
+			if !(authoring > 0) {
+				continue
+			}
+			// The legacy extent is in the AUTHORING timebase, so that is what reads
+			// the clip's duration out of it.
+			//
+			// Note this does NOT require an untrimmed head. ~/baby.vyproj's opus starts
+			// at source frame 35, and an earlier version skipped any clip that did,
+			// reasoning that a trimmed head means the extent is not the asset's — which
+			// is true and irrelevant. The extent is a LENGTH; where the clip starts in
+			// the source says nothing about how long it is. Skipping on it left that
+			// clip's extent stranded in the authoring timebase and it stayed 5x short
+			// forever. Only the whole-asset REFINEMENT below needs an untrimmed head.
+			dur := f64(clip.source_length_frames) / authoring
+			// When the clip is the whole asset, prefer the asset's own measured
+			// duration over the two-rounding reconstruction above.
+			//
+			// Compared with a TOLERANCE, not equality: the stored extent and the
+			// asset's duration come from different roundings and routinely differ by
+			// a frame. An exact-equality test read every untrimmed clip as trimmed
+			// and sent it down the fallback path — which restored the very bug the
+			// check was meant to catch.
+			if clip.source_start_frame == 0 {
+				if asset_dur, _ := asset_content_duration_sec(clip.asset_id); asset_dur > 0 {
+					if math.abs(dur - asset_dur) <= 1.0 / authoring {
+						dur = asset_dur
+					}
+				}
+			}
+			// Into the CURRENT timebase. One pass, here, is the only place an extent
+			// changes timebase; everything downstream can then assume project frames.
+			clip.source_length_frames = max(1, i64(math.round(dur * project_fps())))
+		}
+	}
+}
+
+reflow_timeline_for_fps :: proc(old_rate, new_rate: f64) -> i64 {
+	if !(old_rate > 0) || !(new_rate > 0) || old_rate == new_rate {
+		return 0
+	}
+	total_delta := i64(0)
+	rate_ratio := new_rate / old_rate
+	for &track in timeline.tracks {
+		// Each clip's new start is the previous clip's new end plus the OLD gap
+		// re-quantized to the new rate. Shifting by the length delta alone — the
+		// obvious implementation — silently shrinks every gap by the rate ratio,
+		// because the gap was measured in frames and only the clip grew. That
+		// passes any check on content and fails the moment two clips are compared.
+		prev_new_start := i64(0)
+		prev_new_len := i64(0)
+		prev_old_end := i64(0)
+		have_prev := false
+		for &clip in track.clips {
+			old_start := clip.timeline_start_frame
+			old_len := clip.source_length_frames
+			// Measured against the OLD rate: this is the clip's real duration, and
+			// the new length is that duration re-quantized. Deriving the length by
+			// scaling the old one would be wrong for a clip whose source rate
+			// differs from the project's, which is most of them.
+			sec := clip_duration_sec(&clip, old_rate)
+			new_len := old_len
+			if sec > 0 && new_rate > 0 {
+				new_len = max(1, i64(math.round(sec * new_rate)))
+			}
+			if have_prev {
+				gap_old := old_start - prev_old_end
+				clip.timeline_start_frame =
+					prev_new_start + prev_new_len + i64(math.round(f64(gap_old) * rate_ratio))
+			} else {
+				// A leading gap is real time too, so it is re-quantized as well.
+				clip.timeline_start_frame = i64(math.round(f64(old_start) * rate_ratio))
+			}
+			if new_len != old_len {
+				rescale_clip_keyframes(&clip, old_len, new_len)
+				total_delta += new_len - old_len
+			}
+			clip.source_length_frames = new_len
+			prev_new_start = clip.timeline_start_frame
+			prev_new_len = new_len
+			prev_old_end = old_start + old_len
+			have_prev = true
+		}
+	}
+	return total_delta
+}
+
+// rescale_clip_keyframes moves every key on a clip from the old extent's frame
+// space to the new one's, so each key stays on the same CONTENT.
+//
+// Offsets are rounded and then forced strictly ascending. Two keys can collide
+// when the clip SHRINKS (a 60fps clip's five-times-denser keys folded into a 12fps
+// extent), and a track's invariant is sorted-ascending offsets — equal offsets
+// would break every interpolating sampler's assumption about ordering. Colliding
+// keys keep the later one's value, which is the one the shrink moved onto the same
+// frame.
+rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
+	if old_len <= 0 || new_len <= 0 || old_len == new_len {
+		return
+	}
+	ratio := f64(new_len) / f64(old_len)
+	// Rebuilt rather than edited in place, the same shape kf_trim_head uses: the
+	// key store is a session window, so replacing the range wholesale is what keeps
+	// a shared range (two clips aliasing one set of keys) from having its offsets
+	// rewritten under the other clip.
+	out := Kf_Track_Range{}
+	for si in 0 ..< clip.keyframe_tracks.n {
+		st := session_trk_view(clip.keyframe_tracks, si)
+		r := Kf_Keys_Range{}
+		prev := i32(-1)
+		for ki in 0 ..< st.keys.n {
+			k := session_kf_at(st.keys, ki)
+			off := i32(math.round(f64(k.frame_off) * ratio))
+			off = clamp(off, 0, i32(new_len - 1))
+			// Enforce strict ascent. A shrinking clip folds keys together, and a
+			// duplicate offset breaks the sorted-ascending invariant every
+			// interpolating sampler depends on; equal offsets would make the
+			// interpolation between them a zero-length span.
+			if off <= prev {
+				off = prev + 1
+			}
+			if i64(off) >= new_len {
+				off = i32(new_len - 1)
+			}
+			prev = off
+			// mask, value and interp ride along untouched: a packed section key
+			// keeps its own curve and its lane mask through the rescale.
+			session_kf_push(&r, Keyframe{frame_off = off, mask = k.mask, value = k.value, interp = k.interp})
+		}
+		if r.n > 0 {
+			session_trk_push(&out, Kf_Track{name = st.name, keys = r})
+		} else {
+			session_kf_release(r)
+		}
+	}
+	old := clip.keyframe_tracks
+	clip.keyframe_tracks = out
+	kf_free_tracks(old)
 }
 
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
@@ -198,8 +677,20 @@ snap_to_playhead :: proc(frame: i64) -> i64 {
 }
 
 // snap_playhead_to_clip_edge latches a scrubbed playhead onto the nearest clip
-// start or end frame that falls within the snap margin. Used by the
-// playhead→clip toggle.
+// edge that falls within the snap margin. Used by the playhead→clip toggle.
+//
+// Both edges target a frame the clip OWNS, which for the end means the last
+// content frame (end-1) rather than the exclusive `end`. A clip spans
+// [start, start+length) -- clip_visible_at is half-open -- so the exclusive end
+// is a frame this clip does not have. Snapping there showed the NEXT clip's
+// first frame whenever clips were contiguous, which is the common case, and it
+// only looked right when a gap followed, because a gap put the playhead in empty
+// space where "wrong frame" and "no frame" look alike.
+//
+// `end-1` is right for interior and final edges alike, so the final clip needs no
+// special case: its last content frame IS the timeline's last content frame. The
+// duration clamp below stays as the same backstop the scrub path has, not as the
+// thing that makes the final clip behave.
 snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 	best := frame
 	best_dist := f32(0)
@@ -208,7 +699,11 @@ snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 		for index := 0; index < len(timeline.tracks[track_idx].clips); index += 1 {
 			c := &timeline.tracks[track_idx].clips[index]
 			start := c.timeline_start_frame
-			end := start + c.source_length_frames
+			// A zero-length clip owns no end frame; clamp it onto its start rather
+			// than letting end-1 point before the clip. Such a clip cannot be
+			// reached by a real import (every placer clamps length to >= 1), so this
+			// is arithmetic, not a guard for a case the app can reach.
+			end := start + max(c.source_length_frames - 1, 0)
 			dist := f32(abs(frame - start))
 			if dist <= m && (best == frame || dist < best_dist) {
 				best = start
@@ -221,12 +716,9 @@ snap_playhead_to_clip_edge :: proc(frame: i64) -> i64 {
 			}
 		}
 	}
-	// A clip end edge is exclusive -- one frame PAST its last content frame --
-	// so snapping onto the FINAL clip's end parks the playhead in the void
-	// (timeline_duration() is that same exclusive end; frame == dur has no
-	// frame to show, and scrubbing already refuses it). Interior end edges
-	// (a following clip's start) survive the clamp because dur is the LAST
-	// clip's end: only the final edge exceeds it.
+	// Same backstop the scrub path applies (interaction.odin): timeline_duration()
+	// is the exclusive content end, so frame == dur is a sheet-empty slot past
+	// every clip with no frame to show.
 	return clamp(best, 0, max(0, timeline_duration() - 1))
 }
 
@@ -403,7 +895,24 @@ resize_clip_right :: proc(track: ^Track, idx: int, new_tail: i64) -> i64 {
 	max_len := i64(1) << 50
 	if !c.is_still {
 		if src_total := asset_source_frames(c.asset_id, c.kind); src_total > 0 {
-			max_len = max(1, src_total - c.source_start_frame)
+			// SOURCE frames available after the head, converted to the TIMELINE
+			// length the caller is clamping.
+			//
+			// These were compared directly before conform, which was correct only
+			// while the two rates were equal. `new_tail - start` is a TIMELINE
+			// length, so capping it with a SOURCE frame count caps a 60fps clip at
+			// 219 frames — a fifth of the 1096 its source actually occupies — and
+			// the user cannot drag the tail out to the source's full length. That is
+			// exactly the report: "dragging the end of the siren head clip to its
+			// full length caps at 219 frames".
+			//
+			// The conversion goes through clip_src_len_frames, so the cap tracks the
+			// clip's own conform rather than restating the ratio here.
+			head_frames := src_total - c.source_start_frame
+			if head_frames < 1 {
+				head_frames = 1
+			}
+			max_len = clip_src_len_to_timeline_frames(c, head_frames)
 		}
 	}
 	next := clip_next_start(track, idx)
@@ -430,7 +939,10 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 	ssrc := c.source_start_frame
 	end := start + c.source_length_frames
 	// The head may extend left only as far as source frames precede the head.
-	min_start := start - ssrc
+	// Converted, because `start` is a TIMELINE frame and `ssrc` a SOURCE frame:
+	// subtracting them directly lets the head run `ssrc` frames too far left on any
+	// clip whose conform ratio is not 1.
+	min_start := start - clip_src_len_to_timeline_frames(c, ssrc)
 	if c.is_still {
 		min_start = 0
 	}
@@ -441,9 +953,12 @@ resize_clip_left :: proc(track: ^Track, idx: int, new_head: i64) -> i64 {
 		lo = hi
 	}
 	head := clamp(new_head, lo, hi)
-	delta := head - start
+	// The head moved by a TIMELINE distance; source_start_frame counts SOURCE
+	// frames. Converting is what keeps the clamp above and this adjustment in
+	// agreement — unconverted, the head lands exactly where the source runs out
+	// and source_start_frame is already far past it.
 	if !c.is_still {
-		c.source_start_frame += delta
+		c.source_start_frame = max(0, c.source_start_frame + clip_timeline_to_src_frames(c, head-start))
 	}
 	c.timeline_start_frame = head
 	c.source_length_frames = end - head
@@ -468,21 +983,26 @@ resize_clip_seam :: proc(track: ^Track, left_idx, right_idx: int, new_seam: i64)
 	if right.is_still {
 		lo = max(lo, 0)
 	} else {
-		lo = max(lo, old_seam-right.source_start_frame)
+		// TIMELINE minus SOURCE, so converted. Same reason as resize_clip_left's
+		// min_start, and wrong in the same direction.
+		lo = max(lo, old_seam-clip_src_len_to_timeline_frames(right, right.source_start_frame))
 	}
 	if !left.is_still {
 		if source_total := asset_source_frames(left.asset_id, left.kind); source_total > 0 {
-			max_left_len := max(1, source_total-left.source_start_frame)
+			max_left_len := clip_src_len_to_timeline_frames(left, max(1, source_total-left.source_start_frame))
 			hi = min(hi, left_start+max_left_len)
 		}
 	}
 	assert(lo <= hi, "resize_clip_seam: no valid frame boundary remains")
 	seam := clamp(new_seam, lo, hi)
-	delta := seam - old_seam
 	left.source_length_frames = seam - left_start
 	right.timeline_start_frame = seam
 	if !right.is_still {
-		right.source_start_frame += delta
+		// TIMELINE distance into a SOURCE count; see resize_clip_left.
+		right.source_start_frame = max(
+			0,
+			right.source_start_frame + clip_timeline_to_src_frames(right, seam-old_seam),
+		)
 	}
 	right.source_length_frames = right_end - seam
 	return seam
