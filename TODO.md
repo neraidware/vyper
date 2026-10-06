@@ -6937,3 +6937,45 @@ thing every backward-scrub test must do. Both cursors reset now. Found by runnin
 probe with `VYPER_AUDIO_TRACE=1`, which every `VYPER_AUDIO_*` probe previously could not
 do: they are all dispatched before `audio_init`, so `audio_rpt.trace` was never set and
 the `[tr feed]` lines were off. The probe now reads the same env var.
+
+
+### Active 37, fourth defect — the playhead could not be dragged while playing, because the sound was still coming from where it was
+
+**Fix: holding the playhead STOPS playback.** `playhead_scrub_arm` is the one place the
+ruler press claims the gesture, and it now pauses.
+
+The playhead is a forward-only transport position: the device has already consumed up to
+some frame, and that audio cannot be un-heard. So while the user drags, the sound is
+*necessarily* still coming from the old position. The engine's only honest choices were to
+play old audio under a moving playhead -- which is exactly what it did, and what the user
+reported -- or to stop. Stopping is what every NLE does, and it is the only one of the two
+where the picture and the sound describe the same instant.
+
+It is also why this is a STOP and not another guard on the adoption of the device clock.
+While playing, the producer keeps feeding from the old anchor and republishing that clock,
+so every frame of the drag was a frame where something with authority to move the playhead
+disagreed with the pointer. Four rounds of guards were spent on that disagreement. Suspending
+removes it instead of out-arguing it, and `playback_update`'s scrub guard is now redundant --
+`playhead.playing` is false for the whole drag, so that branch is never reached. It was
+deleted rather than left as dead weight.
+
+The scrub leaves playback paused. Resuming automatically would re-assert the position the user
+just navigated away from, and the release seek has already put the engine where they want to
+start from.
+
+**Both probes that were faking the gesture had to change,** which is the part worth recording.
+`audio_probe_edit_burst_provisions` and `ui_probe_playhead_scrub_asserts` each set
+`active_interaction = .Playhead_Scrub` by hand, bypassing the press that stops playback --
+so they were testing a state the app never enters, and both failed the moment the behaviour
+became real. They now call `playhead_scrub_arm()` (audio_probe) or the real press through
+clay (ui_probe) and assert that playback actually stopped, because a playhead that merely
+fails to move is indistinguishable from one that moves and is immediately overruled.
+
+**Still open: seek landing.** `audio_probe_seek_landing_offset` measures it and it fails:
+a seek to frame 56 lands +3200 samples (0.067 s) late on the playback producer path, and the
+mechanism is isolated -- `decode_from_content` seeks `AUDIO_SEEK_PREROLL_SEC` early on purpose
+and `audio_src_seek_anchor` labels the fifo at the decoder's LANDING point rather than the
+REQUESTED sample, so `start48 = max(demand48, first48)` in the mixer shifts playback late.
+Five candidate fixes were tried and reverted; the one-shot signed trim gets frame 56 to +720
+but leaves frame 112 at +3920, and none of them is verified. The probe is committed so the
+defect is measured rather than described, and it is not in `all`.

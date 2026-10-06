@@ -228,10 +228,40 @@ click_cases := []Click_Case{
 	// Clicking the timeline ruler starts a scrub (drag to seek).
 	{ hit = proc(inp: Mouse_Input) -> bool {
 		return len(timeline.tracks) > 0 && clay.PointerOver(clay.ID("Ruler"))
-	}, action = proc(_: Mouse_Input) {
-		active_interaction = .Playhead_Scrub
-		playhead_scrub.moved = false
-	} },
+	}, action = proc(_: Mouse_Input) { playhead_scrub_arm() } },
+}
+
+// playhead_scrub_arm begins a ruler scrub: claims the gesture, and STOPS
+// PLAYBACK.
+//
+// Holding the playhead stops the sound. The playhead is a forward-only transport
+// position -- the device has already consumed up to some frame, and that audio
+// cannot be un-heard -- so while the user drags, the sound is necessarily still
+// coming from the old position. The engine's only honest choices are to play the old
+// audio under a moving playhead, which is what it did, or to stop. Stopping is what
+// every NLE does, and it is the only one of the two where the picture and the sound
+// describe the same instant.
+//
+// It also makes the DRAG work, which is why this is a stop and not another guard on
+// the adoption of the device clock. While playing, the producer keeps feeding from
+// the old anchor and republishing that clock, so every frame of the drag was a frame
+// where something with authority to move the playhead disagreed with the pointer.
+// Suspending removes the disagreement instead of out-arguing it.
+//
+// The scrub leaves playback paused. Resuming automatically would re-assert the
+// position the user just navigated away from, and the release seek has already put
+// the engine where they want to start from.
+playhead_scrub_arm :: proc() {
+	active_interaction = .Playhead_Scrub
+	playhead_scrub.moved = false
+	if playhead.playing {
+		playhead.playing = false
+		preview.playing = false
+		// Cleared rather than left set, so audio_update takes its stop edge this tick
+		// instead of believing the producer is already running the position the user
+		// just left.
+		audio_prod.was_playing = false
+	}
 }
 
 // Apply a resolution preset without losing the current canvas orientation.

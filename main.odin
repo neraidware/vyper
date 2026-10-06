@@ -1761,27 +1761,26 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		//    ahead of the playhead" from "the device has not caught up with my
 		//    seek yet", and only the first may move the playhead.
 		//
-		// And a scrub in progress is the pointer talking, not the device. The
-		// gesture owns the playhead until it is released -- that is what "drag the
-		// playhead" means -- so the clock does not get a vote mid-drag. The device
-		// is still playing the old position, and the release seek is where that
-		// disagreement is supposed to surface.
+		// No scrub guard here, and none is needed: arming a scrub STOPS playback, so
+		// `playhead.playing` is false for the whole drag and this branch is never
+		// reached while the pointer owns the playhead. That is the point of stopping
+		// rather than out-arguing the clock -- the disagreement has nowhere to arise.
 		dev := sync.atomic_load(&playback.dev_frame)
 		dev_resync := sync.atomic_load(&playback.dev_resync)
 		resync_now := sync.atomic_load(&audio_prod.resync)
 		clock_current := dev_resync == resync_now
-		if clock_current && dev > playhead.frame && active_interaction != .Playhead_Scrub {
+		if clock_current && dev > playhead.frame {
 			playhead.frame = dev
 		}
 		if play_trace {
 			fmt.printf(
-				"[ui]  ph=%d dev=%d dev_resync=%d resync=%d current=%t scrub=%t -> ph=%d\n",
+				"[ui]  ph=%d dev=%d dev_resync=%d resync=%d current=%t playing=%t -> ph=%d\n",
 				playhead.frame,
 				dev,
 				dev_resync,
 				resync_now,
 				clock_current,
-				active_interaction == .Playhead_Scrub,
+				playhead.playing,
 				playhead.frame,
 			)
 		}
@@ -2050,6 +2049,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			os.exit(1)
 		}
 		ok = audio_probe_clip_tempo_alignment(strings.trim_space(parts[0]), speed)
+		os.exit(ok ? 0 : 1)
+	}
+	// VYPER_AUDIO_SEEK_LANDING=<path> -- measures WHERE a seek lands on the playback
+	// producer path, by content. Every other seek assertion reads state or renders
+	// through the export mixer, and both were satisfied while playback emitted the
+	// wrong samples.
+	if sl, _ := os.lookup_env_alloc("VYPER_AUDIO_SEEK_LANDING", context.temp_allocator); sl != "" {
+		ok: bool = audio_probe_seek_landing_offset(sl)
 		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_CLIP_TEMPO_EDIT=<path> edits an already-provisioned clip from

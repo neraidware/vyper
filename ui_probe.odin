@@ -920,11 +920,14 @@ ui_probe_playhead_scrub_asserts :: proc() -> bool {
 	}
 	release_at(px_for_frame(ruler, 260), ry)
 
-	// (3) DRAG BACKWARD while PLAYING FORWARD, with the device clock ahead. This
-	// is the reported defect and it needs the clock set up by hand: no producer
-	// runs in the probe, so dev_frame would otherwise sit at whatever the last
-	// case left. Both halves matter -- mid-drag (the pointer owns the playhead)
-	// and the tick after release (a stale reading must not outrank the seek).
+	// (3) DRAG BACKWARD WHILE PLAYING, with the device clock ahead. This is the
+	// reported defect. The clock is set up by hand because no producer runs in this
+	// probe, so dev_frame would otherwise hold whatever the last case left.
+	//
+	// The contract is now that ARMING STOPS PLAYBACK, so the drag happens paused and
+	// the clock is not consulted at all -- asserted rather than assumed, because a
+	// playhead that merely fails to move looks identical to one that moves and is
+	// immediately overruled.
 	playhead.playing = true
 	preview.playing = true
 	playback.dir = 1
@@ -933,35 +936,39 @@ ui_probe_playhead_scrub_asserts :: proc() -> bool {
 	sync.atomic_store(&playback.dev_resync, saved_resync)
 	sync.atomic_store(&playback.dev_frame, 400)
 	press_at(px_for_frame(ruler, 400), ry)
+	if playhead.playing {
+		fmt.eprintf("[ui-probe] holding the playhead did not stop playback\n")
+		ok = false
+	}
 	drag_tick(px_for_frame(ruler, 120), ry)
 	if playhead.frame != 120 {
 		fmt.eprintf(
-			"[ui-probe] backward drag during playback: playhead %d, want 120 (device clock outranked the pointer)\n",
+			"[ui-probe] backward drag: playhead %d, want 120 (something still owns the playhead while paused)\n",
 			playhead.frame,
 		)
 		ok = false
 	}
-	// Release commits the seek, which bumps resync. The clock still reads 400 --
-	// larger than 120 -- until a producer adopts the new generation, so the next
-	// playback_update must ignore it.
+	// Release commits the seek. Playback stays paused, and the clock -- still reading
+	// 400, larger than 120 -- must not drag the playhead forward on the next tick.
 	release_at(px_for_frame(ruler, 120), ry)
 	playback_update(sdl.Uint64(monotonic_ns()))
 	if playhead.frame != 120 {
 		fmt.eprintf(
-			"[ui-probe] after release: playhead %d, want 120 (a stale device reading outranked the committed seek)\n",
+			"[ui-probe] after release: playhead %d, want 120 (a device reading outranked the committed seek while paused)\n",
 			playhead.frame,
 		)
 		ok = false
 	}
-	// Once the producer catches up, the clock owns the playhead again: this is
-	// the cannot-drift property, and the fix must not have broken it to buy the
-	// drag.
+	// Once playback is resumed AND the reading is current, the clock owns the
+	// playhead again: the cannot-drift property, which the scrub fix must not have
+	// cost.
+	playhead.playing = true
 	sync.atomic_store(&playback.dev_resync, sync.atomic_load(&audio_prod.resync))
 	sync.atomic_store(&playback.dev_frame, 200)
 	playback_update(sdl.Uint64(monotonic_ns()))
 	if playhead.frame != 200 {
 		fmt.eprintf(
-			"[ui-probe] current device reading was not adopted: playhead %d, want 200 (the drag fix cost the audio clock its authority)\n",
+			"[ui-probe] current device reading was not adopted: playhead %d, want 200 (the scrub fix cost the audio clock its authority)\n",
 			playhead.frame,
 		)
 		ok = false

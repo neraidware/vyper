@@ -714,14 +714,46 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 	live_frame := playhead.frame
 	drag_to := live_frame / 2
 	sync.atomic_store(&audio_rpt.ph_src, 1)
+	// Arm through the REAL press handler, not by setting active_interaction. Arming
+	// now STOPS playback -- that is what makes the drag free -- and a probe that
+	// fakes the flag skips the stop, so the producer keeps feeding and republishing
+	// a device clock the pointer is in the middle of overruling. Every version of this
+	// probe that hand-set the flag was testing a state the app never enters.
+	playhead.playing = true
+	preview.playing = true
+	// Arm through the REAL press handler: build the layout, feed clay the pointer
+	// over the ruler, and run the actual click dispatch. That is the only way to
+	// reach the code that stops playback -- a probe that sets active_interaction
+	// itself bypasses the very thing under test.
+	// Run the arming through the same call the ruler press makes. Rebuilding the
+	// clay layout here is not an option -- this probe owns the device and the
+	// producer thread, and build_page under both segfaulted -- so the press HANDLER
+	// is called directly instead, which is the code that stops playback and is the
+	// thing under test. The hit test above it (PointerOver on the ruler) is covered
+	// by ui_probe, which drives the real press through the real layout.
+	playhead_scrub_arm()
+	if active_interaction != .Playhead_Scrub {
+		fmt.printf(
+			"[ap] backward scrub: FAIL: arming produced %v, want Playhead_Scrub\n",
+			active_interaction,
+		)
+		return false
+	}
+	playhead_scrub.moved = false
+	if playhead.playing {
+		fmt.println("[ap] backward scrub: FAIL: arming a scrub did not stop playback")
+		return false
+	}
+	// The stop takes effect on this tick's audio_update, so the producer is told
+	// before the drag starts writing.
+	audio_update()
 	playhead.frame = drag_to
-	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = true
 	playback_update(sdl.Uint64(monotonic_ns()))
 	if playhead.frame != drag_to {
 		fmt.printf(
-			"[ap] backward scrub: FAIL: playhead jumped %d -> %d (the device clock outranked the pointer at %d)\n",
-			drag_to, playhead.frame, live_frame,
+			"[ap] backward scrub: FAIL: playhead jumped %d -> %d while paused (something still owns the playhead)\n",
+			drag_to, playhead.frame,
 		)
 		return false
 	}
@@ -771,6 +803,13 @@ audio_probe_edit_burst_provisions :: proc(path: string) -> bool {
 	// was actually handed for the seek above -- the one number that distinguishes
 	// "played the scrubbed position" from "kept playing the old one", and which
 	// end-state inspection cannot reach because both end up advancing forward.
+	// Nothing is FED while the scrub holds playback paused -- that is the point of
+	// pausing -- so arm the latch only after playback is restarted, or it reads the
+	// "no block yet" sentinel and the probe would blame the engine for the pause.
+	playhead.playing = true
+	preview.playing = true
+	audio_prod.was_playing = false
+	audio_update()
 	sync.atomic_store(&audio_rpt.last_fed_content, -1)
 	sync.atomic_store(&audio_rpt.last_fed_content_armed, true)
 	for _ in 0 ..< content_ticks {
@@ -2673,6 +2712,137 @@ first_onset :: proc(buf: []f32, refractory_frames: int) -> int {
 		}
 	}
 	return -1
+}
+
+// audio_probe_seek_landing_offset measures WHERE a seek actually lands, on the
+// PLAYBACK PRODUCER path, by content rather than by state.
+//
+// Every existing seek assertion measures either state (next_frame rewound, queue
+// dropped) or the EXPORT mixer (mix_clip_range). Both were satisfied while playback
+// emitted the wrong samples: the user's own trace showed the same waveform playing 22
+// frames late after a backward scrub, a constant offset equal to
+// AUDIO_SEEK_PREROLL_SEC minus the demuxer's landing slack. State was correct and the
+// sound was at the wrong position.
+//
+// The fixture is the click track: a pulse every 125 ms starting at content sample 0.
+// After a seek to frame F the first transient must land at the timeline sample F maps
+// to. Anything else is an offset, and the offset is printed -- its SIZE is the
+// finding, not a pass/fail, because the size tells us which of the preroll, the
+// landing slack, or the labelling is wrong.
+audio_probe_seek_landing_offset :: proc(path: string) -> bool {
+	defer audio_probe_timeline_reset()
+	// play_trace is normally set in main(), which runs AFTER every VYPER_AUDIO_* probe
+	// is dispatched, so without this the per-frame decode trace is silently off here
+	// -- and that trace is the only way to see where a seek actually lands.
+	if os.get_env_alloc("VYPER_PLAY_TRACE", context.temp_allocator) == "1" {
+		play_trace = true
+		defer play_trace = false
+	}
+	fps := timeline_fps()
+	if fps <= 0 {
+		fmt.println("[ap] seek-landing: no fps")
+		return false
+	}
+	path_buf: [4096]u8
+	assert(len(path) < len(path_buf), "audio_probe_seek_landing_offset: path buffer overflow")
+	path_n := len(path)
+	for i in 0 ..< path_n {
+		path_buf[i] = u8(path[i])
+	}
+	path_buf[path_n] = 0
+
+	// fps is not a compile-time constant here, so these are plain values.
+	CLICK_FRAMES := i64(fps * 4.0)
+	// An exact multiple of the 125 ms click interval, so the expected transient
+	// lands on a sample boundary rather than near one.
+	CLICK_INTERVAL_FRAMES := i64(fps * 0.125)
+	for target in ([]i64{CLICK_INTERVAL_FRAMES * 8, CLICK_INTERVAL_FRAMES * 16, CLICK_INTERVAL_FRAMES * 24}) {
+		// Reference: the export mixer, which is the known-correct path, rendered from
+		// the same timeline. Same geometry, same clip, same content.
+		want := mix_clip_range(
+			cstring(&path_buf[0]),
+			CLICK_FRAMES,
+			target + CLICK_INTERVAL_FRAMES * 3,
+			1.0,
+			fps,
+			0,
+			0,
+		)
+		if len(want) == 0 {
+			delete(want)
+			fmt.printf("[ap] seek-landing: FAIL: reference render at frame %d produced nothing\n", target)
+			return false
+		}
+		// Playback: provision, then seek to the same target through the producer's own
+		// anchor path, then mix the frames that follow and find where the first pulse
+		// arrives.
+		mix_clip_range_setup(cstring(&path_buf[0]), CLICK_FRAMES, 1.0)
+		if audio_src.count != 1 {
+			delete(want)
+			fmt.println("[ap] seek-landing: FAIL: source did not provision")
+			return false
+		}
+		// Seek the way a backward scrub does: through audio_anchor_sources, which is
+		// what the reconcile calls.
+		// Seek the LIVE slot. Play_Src is ~1.4 MB (MAX_PLAY_SEGMENTS segments plus a
+		// decoder), so a local copy is both a stack overflow and a different source
+		// from the one the mixer will read.
+		content_sec := f64(audio_content_sample_at_speed(target, 0, 1.0, 1.0)) / f64(AUDIO_BUS_RATE)
+		ok := audio_src_seek_anchor(&audio_src.slots[0], content_sec, audio_frame_boundary48(target, fps))
+		if !ok {
+			delete(want)
+			fmt.printf("[ap] seek-landing: FAIL: seek to frame %d failed\n", target)
+			return false
+		}
+		// Mix forward from the target and find the first transient in the OUTPUT. The
+		// click pulse is 10 ms wide, so a landing one pulse late still has the next one
+		// inside the window -- which is the whole reason a click fixture measures an
+		// offset at all: a steady tone cannot, because every position looks the same.
+		frames_to_mix := int(CLICK_INTERVAL_FRAMES * 3)
+		spf := int(audio_frame_boundary48(target + 1, fps) - audio_frame_boundary48(target, fps))
+		got: [MAX_AUDIO_FRAME_SAMPLES * 16]f32
+		if spf * frames_to_mix * 2 > len(got) {
+			delete(want)
+			fmt.println("[ap] seek-landing: FAIL: scratch buffer too small for the span")
+			return false
+		}
+		for f in 0 ..< frames_to_mix {
+			fr := target + i64(f)
+			if !audio_mix_frame(got[f * spf * 2:], fr, spf) {
+				delete(want)
+				fmt.printf("[ap] seek-landing: FAIL: frame %d delivered no samples\n", fr)
+				return false
+			}
+		}
+		got_first := first_onset(got[:spf * frames_to_mix * 2], 0)
+		want_first := first_onset(want[:], 0)
+		delete(want)
+		// The reference's first pulse is at its sample 0; the playback path's should
+		// be too. A difference is the offset, in samples.
+		offset := got_first - want_first
+		fmt.printf(
+			"[ap] seek-landing: frame %d -> playback transient at %d, reference at %d, offset %+d samples (%+.3f s)\n",
+			target,
+			got_first,
+			want_first,
+			offset,
+			f64(offset) / f64(AUDIO_BUS_RATE),
+		)
+		// One frame of tolerance: the mixer's per-frame boundary is exact, so anything
+		// larger is a real offset and the probe should fail on it rather than print a
+		// number and move on. The value is printed above either way, because the SIZE
+		// is the finding.
+		tolerance := spf
+		if abs(offset) > tolerance {
+			fmt.printf(
+				"[ap] seek-landing: FAIL: seek to frame %d lands %+d samples off (tolerance %d = one frame)\n",
+				target, offset, tolerance,
+			)
+			return false
+		}
+	}
+	fmt.println("[ap] seek-landing: ok (every seek lands on the requested content sample)")
+	return true
 }
 
 // audio_probe_clip_tempo_alignment proves per-clip output ring begins at the timeline
