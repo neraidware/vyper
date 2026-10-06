@@ -408,7 +408,13 @@ render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179
 				width = f32(lane.clip_len) * timeline_view.zoom,
 				height = lane_box.height,
 			}
-			sdl.SetGPUScissor(pass, sdl.Rect{c.int(lane_box.x), c.int(lane_box.y), c.int(lane_box.width), c.int(lane_box.height)})
+			sdl.SetGPUScissor(
+			pass,
+			scissor_clamp(
+				renderer,
+				sdl.Rect{c.int(lane_box.x), c.int(lane_box.y), c.int(lane_box.width), c.int(lane_box.height)},
+			),
+		)
 			if lane.blocked {
 				// The lane can't host the aligned anchor frame, so the whole drop
 				// will be refused on release. Paint it red so the user never has to

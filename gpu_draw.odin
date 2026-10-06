@@ -250,7 +250,7 @@ render_clay :: proc(
 				depth += 1
 			}
 			if !suppressed {
-				cr := scissor_intersect(bounds, current)
+				cr := scissor_intersect(renderer, bounds, current)
 				if cr.w > 0 && cr.h > 0 {
 					current = cr
 					sdl.SetGPUScissor(pass, current)
@@ -456,6 +456,34 @@ marker_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
 	return box_intersect(span, tracks_scroll_box())
 }
 
+// scissor_clamp clips a scissor rect to the RENDER TARGET.
+//
+// SDL rejects a scissor whose x+w or y+h exceeds the target and logs an assertion
+// for it (SDL_SetGPUScissor_REAL, SDL_gpu.c:1984), and it is an assert, not a clamp:
+// the app keeps running and the rect is wrong, which is why this read as a stray
+// message rather than a visible bug.
+//
+// Layout boxes are not bounded by the window. A scrolled lane, a clip row wider than
+// the viewport, a box_union over a gap, a band starting near the bottom edge -- each
+// of those can name a rect that overshoots. The user hit this twice with a portrait
+// 1080x1920 clip on the timeline.
+//
+// This exists as ONE clamp rather than a check per call site because there are 23
+// SetGPUScissor calls in the draw code and every one of them is a place to forget.
+// The hazard already documented on scissor_to_bottom (a full-height band at a non-zero
+// y overshoots by exactly `top`) is the same missing clamp seen from one direction.
+scissor_clamp :: proc(renderer: ^GPU_Renderer, rect: sdl.Rect) -> sdl.Rect {
+	tw := i32(renderer.viewport.x)
+	th := i32(renderer.viewport.y)
+	// Truncation must not round a negative coordinate UP to zero, or a box that
+	// starts off-screen left would silently gain a pixel of clamped width.
+	x0 := clamp(rect.x, 0, tw)
+	y0 := clamp(rect.y, 0, th)
+	x1 := clamp(rect.x + rect.w, 0, tw)
+	y1 := clamp(rect.y + rect.h, 0, th)
+	return sdl.Rect{x0, y0, max(0, x1 - x0), max(0, y1 - y0)}
+}
+
 // scissor_to_bottom sets a scissor to the vertical band starting at `top` and
 // running to the window's bottom edge, `width` wide from `x`.
 //
@@ -467,6 +495,10 @@ marker_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
 // starts below the window's top edge -- the ruler's playhead column, the render
 // range, the marker tooltip -- goes through here rather than spelling the
 // subtraction out at each site.
+//
+// Still clamped on the way out, because `top - 8` (the playhead column starts just
+// above the ruler) can itself sit below the window's bottom edge in a short window,
+// which would make the leftover height NEGATIVE -- a size SDL also rejects.
 scissor_to_bottom :: proc(
 	renderer: ^GPU_Renderer,
 	pass: ^sdl.GPURenderPass,
@@ -474,21 +506,30 @@ scissor_to_bottom :: proc(
 ) {
 	sdl.SetGPUScissor(
 		pass,
-		sdl.Rect {
-			c.int(x),
-			c.int(top),
-			c.int(width),
-			c.int(renderer.viewport.y - top),
-		},
+		scissor_clamp(
+			renderer,
+			sdl.Rect {
+				c.int(x),
+				c.int(top),
+				c.int(width),
+				c.int(renderer.viewport.y - top),
+			},
+		),
 	)
 }
 
 // scissor_intersect clips a Clay command's bounds to the active scissor rect.
-scissor_intersect :: proc(bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect {
-	x := max(c.int(bounds.x), clip.x)
-	y := max(c.int(bounds.y), clip.y)
-	x2 := min(c.int(bounds.x + bounds.width), clip.x + clip.w)
-	y2 := min(c.int(bounds.y + bounds.height), clip.y + clip.h)
+//
+// The active rect is clamped to the render target on the way in. Intersecting with a
+// rect that already overshoots cannot produce a valid one -- it can only shrink the
+// visible area by however much the clip was wrong -- so without this the Clay scissor
+// stack could reintroduce exactly the out-of-bounds rect scissor_clamp exists to stop.
+scissor_intersect :: proc(renderer: ^GPU_Renderer, bounds: clay.BoundingBox, clip: sdl.Rect) -> sdl.Rect {
+	cl := scissor_clamp(renderer, clip)
+	x := max(c.int(bounds.x), cl.x)
+	y := max(c.int(bounds.y), cl.y)
+	x2 := min(c.int(bounds.x + bounds.width), cl.x + cl.w)
+	y2 := min(c.int(bounds.y + bounds.height), cl.y + cl.h)
 	return sdl.Rect{x, y, x2 - x, y2 - y}
 }
 
@@ -713,7 +754,10 @@ draw_clip_markers :: proc(
 			).boundingBox
 		sdl.SetGPUScissor(
 			pass,
-			sdl.Rect{c.int(span.x), c.int(span.y), c.int(span.width), c.int(span.height)},
+			scissor_clamp(
+				renderer,
+				sdl.Rect{c.int(span.x), c.int(span.y), c.int(span.width), c.int(span.height)},
+			),
 		)
 		restore_full = true
 		for clip, index in track.clips {
@@ -877,7 +921,10 @@ draw_keyframes :: proc(
 		}
 		sdl.SetGPUScissor(
 			pass,
-			sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+			scissor_clamp(
+				renderer,
+				sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+			),
 		)
 		for clip, index in track.clips {
 			rows := clip.keyframe_tracks.n
@@ -983,7 +1030,10 @@ draw_drag_ghost :: proc(
 			}
 			sdl.SetGPUScissor(
 				pass,
-				sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+				scissor_clamp(
+					renderer,
+					sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+				),
 			)
 			render_sdf_rect(renderer, command_buffer, pass, bounds, fill, 6, 0)
 			render_sdf_rect(renderer, command_buffer, pass, bounds, edge, 6, 2)
@@ -1025,7 +1075,10 @@ draw_drag_ghost :: proc(
 	// Keep the ghost inside the lane (semi-transparent fill + strong border).
 	sdl.SetGPUScissor(
 		pass,
-		sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+		scissor_clamp(
+			renderer,
+			sdl.Rect{c.int(lane.x), c.int(lane.y), c.int(lane.width), c.int(lane.height)},
+		),
 	)
 	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{127, 187, 179, 80}, 6, 0)
 	render_sdf_rect(renderer, command_buffer, pass, bounds, clay.Color{127, 187, 179, 220}, 6, 2)
@@ -1059,7 +1112,10 @@ draw_track_drag_ghost :: proc(
 	}
 	sdl.SetGPUScissor(
 		pass,
-		sdl.Rect{c.int(body.x), c.int(body.y), c.int(body.width), c.int(body.height)},
+		scissor_clamp(
+			renderer,
+			sdl.Rect{c.int(body.x), c.int(body.y), c.int(body.width), c.int(body.height)},
+		),
 	)
 	// Gray out the row being dragged so it reads as "lifted out of the stack".
 	render_sdf_rect(renderer, command_buffer, pass, row_box, clay.Color{16, 20, 23, 160}, 4, 0)
@@ -1363,7 +1419,10 @@ draw_kf_add_buttons :: proc(
 	ins := clay.GetElementData(clay.ID("Inspector")).boundingBox
 	sdl.SetGPUScissor(
 		pass,
-		sdl.Rect{c.int(ins.x), c.int(ins.y), c.int(ins.width), c.int(ins.height)},
+		scissor_clamp(
+			renderer,
+			sdl.Rect{c.int(ins.x), c.int(ins.y), c.int(ins.width), c.int(ins.height)},
+		),
 	)
 	for id in KF_ADD_BTN_IDS {
 		bb := clay.GetElementData(clay.ID(id)).boundingBox
@@ -2473,7 +2532,15 @@ draw_preview :: proc(
 	ix2 := min(view.x + view.width, bounds.x + bounds.width)
 	iy2 := min(view.y + view.height, bounds.y + bounds.height)
 	if ix2 > ix && iy2 > iy {
-		sdl.SetGPUScissor(pass, sdl.Rect{c.int(ix), c.int(iy), c.int(ix2 - ix), c.int(iy2 - iy)})
+		// Clamped like every other layout-derived rect: the intersection is
+		// non-empty, which is not the same as being inside the render target.
+		sdl.SetGPUScissor(
+			pass,
+			scissor_clamp(
+				renderer,
+				sdl.Rect{c.int(ix), c.int(iy), c.int(ix2 - ix), c.int(iy2 - iy)},
+			),
+		)
 	}
 
 	// The composed export frame fills the canvas rect exactly: it IS the
@@ -2573,7 +2640,10 @@ draw_preview :: proc(
 	// handles on an off-canvas box stay visible/grabbable.
 	sdl.SetGPUScissor(
 		pass,
-		sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)},
+		scissor_clamp(
+			renderer,
+			sdl.Rect{c.int(bounds.x), c.int(bounds.y), c.int(bounds.width), c.int(bounds.height)},
+		),
 	)
 	if selected_clip, ok := transformable_selected(); ok {
 		sb := clip_image_bounds(canvas, selected_clip)

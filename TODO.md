@@ -7224,3 +7224,70 @@ is why this survived; the target now owns it. Two details in it worth recording:
   stall for the wrong reason and would also fail on any unrelated crash. The furthest
   frame the playhead reached is the assertion, and it is zero exactly when the bug is
   present (verified by reverting the fix).
+
+## Active 39 — SDL asserted on an out-of-bounds scissor rect, twice, and kept running
+
+**Status: fixed 2026-10-06.** Reported by the user verbatim:
+
+    Assertion failure at SDL_SetGPUScissor_REAL (SDL_gpu.c:1984), triggered 2 times:
+      '!"Scissor rectangle size exceeds current render target dimensions"'
+
+**Why it survived review for so long, and why it is worse than a log line.** SDL
+*asserts* and then proceeds with the rect anyway. There is no visual symptom to notice
+and no crash — the app keeps drawing, just with a clip window that is not the one asked
+for. So the only evidence is the message, and the draw code had 23 `SetGPUScissor` call
+sites, every one of which is a place to get a rect wrong.
+
+**Root cause: layout boxes are not bounded by the window.** A Clay bounding box is
+whatever the layout computed. A lane scrolled off the left edge, a clip row wider than
+the viewport, a `box_union` over a gap — each names a rect that overshoots, and it was
+passed straight to SDL. The one site that *was* careful about this, `scissor_to_bottom`,
+documents the hazard for itself ("a full-height rect at a non-zero y overshoots by
+exactly `top`") and still had a second case: with `top` below the window's bottom edge
+the leftover height goes NEGATIVE, which SDL also rejects.
+
+The user's content is what makes it reachable — a portrait 1080x1920 clip is the widest
+thing that has been on this timeline, and a tall source is what pushes a lane box past
+the viewport's height.
+
+**Fix: one clamp, at one place.** `scissor_clamp` clips any rect to
+`renderer.viewport` (the render-target size) and is routed through from every site that
+builds a rect out of layout rather than naming the target exactly: clip markers
+(`box_union`), keyframes (lane), both drag ghosts (lane), the track-drag row, the
+media-bin drag ghost (lane_box), the keyframe-add buttons (Inspector box), the selected
+clip's border/handles, the preview's canvas-intersection, `scissor_to_bottom`, and
+`scissor_intersect`.
+
+Worth recording about getting that list: the first audit grepped only same-line
+arguments and reported 23 sites with four offenders, and the commit made on that basis
+was **wrong** — `mediabin.odin` was not actually edited (the replacement's indentation
+did not match, so the assert failed and the script exited without writing), and a later
+sweep for multi-line arguments found five more offenders it had missed entirely. The
+commit message claimed the media-bin site was clamped when it was not. Auditing "every
+call site" by grepping for one argument shape is not an audit; the check that actually
+settled it was re-grepping for `sdl.Rect` inside a few lines of each call and requiring
+that everything left over either names the viewport exactly or passes through the
+clamp. That is the version to reuse.
+
+Two details that are the actual content of the fix:
+
+- `scissor_intersect` clamps its incoming clip too. Intersecting a command with a rect
+  that already overshoots cannot produce a valid rect — it can only shrink the visible
+  area by however much the clip was wrong — so without this the Clay scissor stack could
+  reintroduce exactly the rect the clamp exists to stop.
+- Truncation must not round a NEGATIVE coordinate up to zero. A box starting off-screen
+  left would otherwise silently gain a pixel of clamped width, which is a quiet wrong
+  answer rather than a loud one.
+
+**Probe.** `ui_probe_scissor_clamp_asserts`, in `probe` and therefore in `all`. 4 viewport
+sizes x 11 rect shapes, including the negative-height case. `scissor_clamp` is pure, so
+the probe is exhaustive over the shapes rather than sampled from whatever layout the
+probe happens to build — which is the point, since the original defect only fired on a
+layout this probe never produced. It also asserts a rect already inside the target is
+NOT shrunk, because a clamp that inflates a band would silently widen every clip row.
+
+Confirmed the assertion bites: with `scissor_clamp` neutered to a passthrough it reports
+five failures on the first viewport alone, including the two shapes the real bug took —
+a full-height band at non-zero y, and a lane extending past the bottom edge.
+
+Gates: probe, gpu_composite, gpu_nv12 pass. -vet clean.

@@ -226,6 +226,11 @@ for j := 0; j < len(raw); {
 	if !ui_probe_track_menu_asserts() {
 		os.exit(1)
 	}
+	// The scissor invariant, before anything builds a layout: a rect exceeding the
+	// render target is the one draw defect SDL reports and does not stop for.
+	if !ui_probe_scissor_clamp_asserts() {
+		os.exit(1)
+	}
 	// The playhead must be draggable, through the real press/drag/release chain.
 	// Runs after the track-menu case because that one reseeds the timeline.
 	if !ui_probe_playhead_scrub_asserts() {
@@ -1055,6 +1060,79 @@ ui_probe_playhead_scrub_asserts :: proc() -> bool {
 	timeline_view.zoom = saved_zoom
 
 	fmt.printf("[ui-probe] playhead scrub: arm/drag-back/release/clock-authority/snap-at-min-zoom asserted\n")
+	return ok
+}
+
+// ui_probe_scissor_clamp_asserts pins the invariant SDL demands and does not enforce:
+// a scissor rect must lie inside the render target. SDL asserts
+// (SDL_SetGPUScissor_REAL, SDL_gpu.c:1984) and then proceeds anyway, so a violation
+// shows up as a stray log line rather than a visible fault -- which is exactly how the
+// user found it ("triggered 2 times"), twice, with a portrait 1080x1920 clip on the
+// timeline.
+//
+// The rects below are the shapes that actually occur: a lane scrolled off the left
+// edge, a clip row wider than the viewport, a box_union over a gap, and a band
+// starting below the window's bottom edge (whose leftover height goes NEGATIVE, the
+// case scissor_to_bottom's own comment warned about).
+//
+// scissor_clamp is pure, so this is exhaustive over the cases rather than sampled from
+// whatever layout the probe happens to build -- which is the point, since the original
+// defect only fired on a layout this probe never produced.
+ui_probe_scissor_clamp_asserts :: proc() -> bool {
+	ok := true
+	// Viewport sizes the draw code really uses: the probe builds pages at the first
+	// two, and a short window is what makes a band near the bottom overshoot.
+	sizes := [][2]f32{{1280, 720}, {1920, 1600}, {1920, 1080}, {640, 360}}
+	rects := [][4]i32{
+		{0, 0, 1280, 720},        // exactly the target
+		{0, 100, 1280, 720},      // full height at non-zero y: overshoots by 100
+		{-40, 0, 400, 720},       // starts off-screen left
+		{100, -30, 200, 100},     // starts above the top edge
+		{100, 700, 200, 400},     // extends far below a 720-tall target
+		{1200, 0, 800, 720},      // wider than the target
+		{-100, -100, 2000, 2000}, // larger than the target in every direction
+		{100, 900, 200, -300},    // NEGATIVE height: scissor_to_bottom's worst case
+		{100, 900, 200, 0},       // zero height
+		{-50, -50, 10, 10},       // entirely off-screen, negative origin
+		{1279, 719, 100, 100},    // one pixel past the bottom-right corner
+	}
+	for sz in sizes {
+		r: GPU_Renderer
+		r.viewport = sz
+		for rc in rects {
+			got := scissor_clamp(&r, sdl.Rect{rc.x, rc.y, rc.z, rc.w})
+			tw, th := i32(sz.x), i32(sz.y)
+			if got.x < 0 || got.y < 0 || got.w < 0 || got.h < 0 {
+				fmt.eprintf(
+					"[ui-probe] scissor clamp: %dx%d rect %v -> %v, negative origin or size\n",
+					tw, th, rc, got,
+				)
+				ok = false
+				continue
+			}
+			if got.x + got.w > tw || got.y + got.h > th {
+				fmt.eprintf(
+					"[ui-probe] scissor clamp: %dx%d rect %v -> %v, EXCEEDS the target (this is the SDL assert)\n",
+					tw, th, rc, got,
+				)
+				ok = false
+				continue
+			}
+			// A rect that does not reach the target must not be INFLATED to fill it:
+			// clamping that grows a band would silently widen every clip row.
+			if rc.x >= 0 && rc.y >= 0 && (rc.x + rc.z) <= tw && (rc.y + rc.w) <= th &&
+			   (got.w < rc.z || got.h < rc.w) {
+				fmt.eprintf(
+					"[ui-probe] scissor clamp: %dx%d rect %v -> %v shrank a rect already inside the target\n",
+					tw, th, rc, got,
+				)
+				ok = false
+			}
+		}
+	}
+	if ok {
+		fmt.println("[ui-probe] scissor clamp: every rect lands inside the target (4 viewports x 11 shapes)")
+	}
 	return ok
 }
 
