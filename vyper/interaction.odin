@@ -263,29 +263,6 @@ playhead_scrub_arm :: proc() {
 	// anything.
 	playhead_scrub.requested_resync = sync.atomic_load(&audio_prod.resync)
 
-	// TEMPORARILY DISABLED, 2026-10-06 -- re-enable when the seek-landing work is done.
-	//
-	// Holding the playhead stops the sound. The playhead is a forward-only transport
-	// position -- the device has already consumed up to some frame, and that audio cannot
-	// be un-heard -- so while the user drags, the sound is necessarily still coming from
-	// the old position. Stopping makes picture and sound describe the same instant,
-	// which is what every NLE does, and it makes the drag work at all: while playing,
-	// the producer keeps feeding from the old anchor and republishing the device clock,
-	// so every frame of the drag was a frame where something with authority to move the
-	// playhead disagreed with the pointer.
-	//
-	// Off while that is verified, because a stop makes the drag unobservable -- with
-	// playback suspended the playhead has nothing to fight, so the symptom disappears
-	// and any remaining fault in the live path goes unseen.
-	//
-	// if playhead.playing {
-	// 	playhead.playing = false
-	// 	preview.playing = false
-	// 	// Cleared rather than left set, so audio_update takes its stop edge this tick
-	// 	// instead of believing the producer is already running the position the user
-	// 	// just left.
-	// 	audio_prod.was_playing = false
-	// }
 }
 
 // Apply a resolution preset without losing the current canvas orientation.

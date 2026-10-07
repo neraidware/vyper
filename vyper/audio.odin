@@ -983,6 +983,16 @@ Audio_Producer :: struct {
 	// owns playhead position. Producer-side anomaly checks ignore that requested
 	// mismatch and resume checking when release commits the final seek.
 	scrub_active: bool,
+	// The release boundary, recorded so the trace can say what the listener
+	// already heard versus what the engine resumed at. Without this the only
+	// evidence is a clears COUNTER, which cannot distinguish "the queue was
+	// dropped before the device reached it" from "the device played it first".
+	// forced_frame/forced_evt are the target frame and generation of the last
+	// explicit seek; seen_dev is what the device had consumed when the producer
+	// took it (atomic).
+	forced_frame: i64,
+	forced_evt:   i64,
+	seen_dev:     i64,
 	// anchor_frame is the playhead frame the UI last seeded for a resync
 	// (atomic); anchor_now is monotonic_ns() when that frame was seeded.
 	anchor_frame: i64,
@@ -3302,6 +3312,31 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 								audio_src.next_frame,
 								audio_device_queued(),
 							)
+							if force_seek {
+								// The repeat verdict, in one line. `heard` is where the
+								// device had actually consumed when this landed; the engine
+								// resumes at `anchor`. Resuming below `heard` means the listener
+								// is about to be handed audio they just heard, which is the
+								// reported symptom -- and neither a clears counter nor a
+								// position anomaly can see it, because from the engine's side the
+								// position moved exactly where it was asked to.
+								heard := sync.atomic_load(&playback.dev_frame)
+								verdict := "forward"
+								if anchor < heard {
+									verdict = "REWIND: replays heard audio"
+								}
+								fmt.printf(
+									"[prod] release boundary gen=%d target=%d heard=%d resume=%d queued=%d clears=%d pending=%t -> %s\n",
+									evt,
+									anchor,
+									heard,
+									audio_src.next_frame,
+									audio_device_queued(),
+									audio_device_clears(),
+									audio_device_clear_pending(),
+									verdict,
+								)
+							}
 						}
 					}
 				} else {
@@ -3715,16 +3750,28 @@ audio_seek :: proc(frame: i64, force_reanchor: bool = true) {
 	}
 	when ODIN_DEBUG {
 		if play_trace {
+			// A forced seek is the moment a scrub release hands the playhead back to
+			// the device. The listener has already HEARD everything up to the device
+			// position below, so that number and the queued depth are what make a
+			// later repeat legible: resuming below the heard position is the repeat,
+			// and neither is knowable from a clears counter.
 			fmt.printf(
-				"[ui]  audio_seek to=%d force=%t (playhead=%d prod=%d resync %d->%d)\n",
+				"[ui]  audio_seek to=%d force=%t (playhead=%d prod=%d resync %d->%d; device already heard %d, %d frames queued, %d clears acked)\n",
 				frame,
 				force_reanchor,
 				playhead.frame,
 				sync.atomic_load(&audio_prod.prod_frame),
 				prev_evt,
 				evt,
+				sync.atomic_load(&playback.dev_frame),
+				audio_device_queued(),
+				audio_device_clears(),
 			)
 		}
+	}
+	if force_reanchor {
+		sync.atomic_store(&audio_prod.forced_frame, frame)
+		sync.atomic_store(&audio_prod.forced_evt, evt)
 	}
 	sync.atomic_store(&audio_prod.resync, evt)
 }
