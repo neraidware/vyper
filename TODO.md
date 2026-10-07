@@ -13,6 +13,18 @@
       (`VYPER_PROXY_PROBE`, decode + proxy) passes on Windows, so the common
       probe/thumbnail/proxy import path is healthy — the picker path is not
       exercised by CI.
+- [ ] **Windows CI was red from `660ef38` until the workflow was repaired** — that
+      commit moved `vendor/` to `vyper/vendor/` and rewrote `windows.yml` but left the
+      ffmpeg import-lib copy at `vendor\ffmpeg\<lib>\<lib>.lib`, so "Download ffmpeg"
+      died in ~30 s (`Could not find a part of the path ...\vendor\ffmpeg\avcodec\
+      avcodec.lib`). Two more breaks sat behind it: the smoke step set `NERED_FRAME_PROBE`
+      / `NERED_PROXY_PROBE` (renamed `VYPER_*`; the app reads no `NERED_*`), and those
+      probes are `when ODIN_DEBUG`, absent from the `release` build CI ships. Repaired:
+      path fixed, env names fixed, and a separate debug `vyper-probe.exe` is built for the
+      smoke step. **Caveat to keep:** the smoke step now exercises the shared ffmpeg DLL
+      set and decode path through the DEBUG build, not the shipped release exe. The Linux
+      equivalent of both probes was run locally and passes (`frame-probe checked=8
+      mismatches=0`, `proxy-probe OK`); the Windows run itself is unverified until a push.
 - [ ] **CI artifact upload vs quota** — Windows workflow `.github/workflows/
       windows.yml` upload step. The account artifact quota filled (3.18 GB /
       43 `nered-windows` artifacts, all <= 2026-09-11); cleared them via the

@@ -54,7 +54,7 @@ jobs:
       # that filled the artifact quota.
       # NOTE: vendor:ffmpeg declares its Windows import as a bare relative name
       # `foreign import "<lib>.lib"`, which Odin resolves *relative to the source
-      # file dir* (vendor/ffmpeg/<lib>/<lib>.lib), then passes as an absolute file
+      # file dir* (vyper/vendor/ffmpeg/<lib>/<lib>.lib), then passes as an absolute file
       # to link.exe so /LIBPATH does NOT apply. So we must drop each import lib in
       # the exact vendor slot Odin expects, in addition to deps\lib (for SDL3).
       - name: Download ffmpeg (prebuilt shared)
@@ -68,10 +68,10 @@ jobs:
           Copy-Item "$src\bin\*.dll" deps\ -Force
           Copy-Item "$src\bin\ffmpeg.exe" deps\ -Force
           Copy-Item "$src\bin\ffprobe.exe" deps\ -Force
-          # Drop import libs into vendor/ffmpeg/<lib>/<lib>.lib for the libs the
+          # Drop import libs into vyper/vendor/ffmpeg/<lib>/<lib>.lib for the libs the
           # app actually binds (relative foreign-import resolution).
           foreach ($l in @("avcodec","avfilter","avformat","avutil","swresample","swscale")) {
-            Copy-Item "deps\lib\$l.lib" "vendor\ffmpeg\$l\$l.lib" -Force
+            Copy-Item "deps\lib\$l.lib" "vyper\vendor\ffmpeg\$l\$l.lib" -Force
           }
 
       # build.odin drives cl and lib on Windows, so MSVC has to be on PATH
@@ -91,12 +91,26 @@ jobs:
           # Odin's vendored SDL3 / ffmpeg bindings reference the .lib import libs
           # by name. SDL3 is imported via `{ "SDL3.lib" }`, passed to link.exe as
           # a name and resolved via /LIBPATH -> deps\lib. ffmpeg import libs were
-          # dropped into vendor/ffmpeg/<lib>/ by the previous step, and
+          # dropped into vyper/vendor/ffmpeg/<lib>/ by the previous step, and
           # FFMPEG_LINK=system is what selects them.
           $env:VYPER_LINK_FLAGS = "/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
           $env:VYPER_OUT = "vyper.exe"
           ./build.odin release
           if ($LASTEXITCODE -ne 0) { throw "build.odin failed (exit $LASTEXITCODE)" }
+
+      # The probes (VYPER_FRAME_PROBE, VYPER_PROXY_PROBE) are debug-only: a release
+      # binary does not contain them, which is the point of the release build. So the
+      # smoke test below runs a separate debug build of the same source against the
+      # same ffmpeg DLLs the dist ships, and the dist's vyper.exe stays the release
+      # build. What the smoke test proves is the DLL set and the decode path, which the
+      # two builds share; it does not run the shipped exe.
+      - name: Build probe binary (debug)
+        shell: pwsh
+        run: |
+          $env:VYPER_LINK_FLAGS = "/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
+          $env:VYPER_OUT = "vyper-probe.exe"
+          ./build.odin debug
+          if ($LASTEXITCODE -ne 0) { throw "build.odin debug failed (exit $LASTEXITCODE)" }
 
       - name: Stage dist
         shell: pwsh
@@ -108,10 +122,11 @@ jobs:
           Get-ChildItem deps\*.dll | Copy-Item -Destination dist -Force
           Get-ChildItem dist | Select-Object Name,Length
 
-      # Smoke test the shipped dist headlessly: generate a sample, decode a
-      # frame range through the vendored ffmpeg DLLs (NERED_FRAME_PROBE), then
+      # Smoke test the shipped DLL set headlessly: generate a sample, decode a
+      # frame range through the vendored ffmpeg DLLs (VYPER_FRAME_PROBE), then
       # build a proxy with the bundled ffmpeg.exe and verify proxy/source
-      # parity (NERED_PROXY_PROBE). A dist whose DLL set or decode path is
+      # parity (VYPER_PROXY_PROBE), using the debug probe binary built above. A dist
+      # whose DLL set or decode path is
       # broken dies HERE with a non-zero exit -- and vyper_crash.log next to
       # the exe is captured into the log so the fault is diagnosable without
       # a Windows box. This is what would have caught "crashes as soon as I
@@ -119,33 +134,33 @@ jobs:
       - name: Smoke test (decode + proxy)
         shell: pwsh
         run: |
-          # vyper.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
+          # vyper-probe.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
           # redirected, so every run writes a log that we dump on failure/success.
           $env:PATH = "$PWD\dist;$env:PATH"
           & .\deps\ffmpeg.exe -y -loglevel error -f lavfi -i testsrc2=duration=8:size=320x180:rate=30 -frames:v 240 -pix_fmt yuv420p sample.mp4
           if ($LASTEXITCODE -ne 0) { throw "sample generation failed (exit $LASTEXITCODE)" }
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_frame.log
-          $env:NERED_FRAME_PROBE = "sample.mp4|0-239|30"
-          & .\dist\vyper.exe > .\smoke_frame.log 2>&1
+          $env:VYPER_FRAME_PROBE = "sample.mp4|0-239|30"
+          & .\vyper-probe.exe > .\smoke_frame.log 2>&1
           if ($LASTEXITCODE -ne 0) {
             Get-Content .\smoke_frame.log
-            if (Test-Path .\dist\vyper_crash.log) { Get-Content .\dist\vyper_crash.log }
+            if (Test-Path .\vyper_crash.log) { Get-Content .\vyper_crash.log }
             throw "frame-probe failed (exit $LASTEXITCODE)"
           }
-          Remove-Item Env:NERED_FRAME_PROBE
+          Remove-Item Env:VYPER_FRAME_PROBE
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_proxy.log
-          $env:NERED_PROXY_PROBE = "sample.mp4"
-          & .\dist\vyper.exe > .\smoke_proxy.log 2>&1
+          $env:VYPER_PROXY_PROBE = "sample.mp4"
+          & .\vyper-probe.exe > .\smoke_proxy.log 2>&1
           if ($LASTEXITCODE -ne 0) {
             Get-Content .\smoke_proxy.log
-            if (Test-Path .\dist\vyper_crash.log) { Get-Content .\dist\vyper_crash.log }
+            if (Test-Path .\vyper_crash.log) { Get-Content .\vyper_crash.log }
             throw "proxy-probe failed (exit $LASTEXITCODE)"
           }
 
-          if (Test-Path .\dist\vyper_crash.log) {
-            Get-Content .\dist\vyper_crash.log
+          if (Test-Path .\vyper_crash.log) {
+            Get-Content .\vyper_crash.log
             throw "vyper_crash.log present after smoke test"
           }
           Get-Content .\smoke_frame.log
