@@ -4,7 +4,9 @@ import "core:c"
 import "core:fmt"
 import "core:hash"
 import "core:mem"
+import "core:os"
 import "core:strings"
+import "core:time"
 
 // ---------------------------------------------------------------------------
 // Preview slot lifecycle: assigning a Preview_Slot to each video clip that
@@ -272,6 +274,119 @@ pick_hash_u32 :: proc(pick: cstring) -> u32 {
 		return 0
 	}
 	return hash.fnv32(transmute([]u8)string(pick))
+}
+
+// STILL_CACHE_SLOTS is how many distinct decoded stills are kept. A still is one
+// immutable frame, so the decoded preview buffer is the whole result of the decode; a
+// project that cycles a few images (the usual use of a short still) pays that decode
+// once instead of at every cut and every scrub position. More distinct stills than
+// this evict the least recently shown, so the cost degrades to the old behaviour
+// rather than failing.
+STILL_CACHE_SLOTS :: 8
+
+// Still_Cache_Entry is one decoded still. The key is everything that decides the
+// pixels: the file (path + modification time, so an image edited on disk mid-session
+// is decoded again rather than served stale), the proxy pick, and the source frame.
+// The zero value is an empty entry, so the cache needs no init.
+Still_Cache_Entry :: struct {
+	used:       bool,
+	path_hash:  u64,
+	mtime_ns:   i64,
+	pick:       u32,
+	frame:      i64,
+	last_touch: u64,
+	buffer:     [PREVIEW_W * PREVIEW_H * 4]u8,
+}
+
+// still_cache is session-lifetime fixed storage, single-writer: only
+// update_preview_slots (the UI thread) reads or writes it. still_cache_clock is the
+// recency stamp; it advances on every access, so eviction is true LRU rather than a
+// use count that only ever grows.
+still_cache: [STILL_CACHE_SLOTS]Still_Cache_Entry
+still_cache_clock: u64
+
+// still_cache_key resolves the identity of a still on disk. ok is false when the file
+// cannot be stat'ed, in which case the still is simply not cached: decoding it is
+// still correct, and caching something whose identity is unknown is not.
+still_cache_key :: proc(path: cstring) -> (path_hash: u64, mtime_ns: i64, ok: bool) {
+	if path == nil || len(path) == 0 {
+		return 0, 0, false
+	}
+	mtime, err := os.modification_time_by_path(string(path))
+	if err != nil {
+		return 0, 0, false
+	}
+	return hash.fnv64a(transmute([]u8)string(path)), time.to_unix_nanoseconds(mtime), true
+}
+
+still_cache_find :: proc(path_hash: u64, mtime_ns: i64, pick: u32, frame: i64) -> int {
+	for i in 0 ..< STILL_CACHE_SLOTS {
+		e := &still_cache[i]
+		if e.used &&
+		   e.path_hash == path_hash &&
+		   e.mtime_ns == mtime_ns &&
+		   e.pick == pick &&
+		   e.frame == frame {
+			return i
+		}
+	}
+	return -1
+}
+
+// still_cache_serve fills slot.buffer from the cache and reports whether it did. A
+// hit is a memcpy instead of a decode, and it is synchronous, so the still is on
+// screen the update it is claimed instead of after an async round trip.
+still_cache_serve :: proc(slot: ^Preview_Slot, pick: u32, frame: i64) -> bool {
+	path_hash, mtime_ns, ok := still_cache_key(slot.path)
+	if !ok {
+		return false
+	}
+	i := still_cache_find(path_hash, mtime_ns, pick, frame)
+	if i < 0 {
+		return false
+	}
+	still_cache_clock += 1
+	still_cache[i].last_touch = still_cache_clock
+	copy(slot.buffer[:], still_cache[i].buffer[:])
+	slot.displayed_frame = frame
+	slot.displayed_pick = pick
+	slot.has_frame = true
+	slot.tex_dirty = true
+	slot.still_cached = true
+	return true
+}
+
+// still_cache_store keeps a copy of a still the slot has just decoded. Called only for a
+// slot whose buffer really holds `frame` decoded through `pick` (displayed_frame and
+// displayed_pick say so), never for a stale or partial result.
+still_cache_store :: proc(slot: ^Preview_Slot, pick: u32, frame: i64) {
+	slot.still_cached = true
+	path_hash, mtime_ns, ok := still_cache_key(slot.path)
+	if !ok {
+		return
+	}
+	victim := still_cache_find(path_hash, mtime_ns, pick, frame)
+	if victim < 0 {
+		victim = 0
+		for i in 0 ..< STILL_CACHE_SLOTS {
+			if !still_cache[i].used {
+				victim = i
+				break
+			}
+			if still_cache[i].last_touch < still_cache[victim].last_touch {
+				victim = i
+			}
+		}
+	}
+	still_cache_clock += 1
+	e := &still_cache[victim]
+	e.used = true
+	e.path_hash = path_hash
+	e.mtime_ns = mtime_ns
+	e.pick = pick
+	e.frame = frame
+	e.last_touch = still_cache_clock
+	copy(e.buffer[:], slot.buffer[:])
 }
 
 // update_preview_slots walks every video clip covering the current playhead and
@@ -724,6 +839,16 @@ slot.is_text = true
 			// segments, so the SAME source frame may later resolve to a better
 			// file (source -> segment); that must re-decode even while parked.
 			pick_hash := pick_hash_u32(slot_pick)
+			if clip.is_still && !slot.still_cached {
+				if slot.has_frame {
+					if slot.displayed_frame == clip_frame && slot.displayed_pick == pick_hash {
+						still_cache_store(slot, pick_hash, clip_frame)
+					}
+				} else if still_cache_serve(slot, pick_hash, clip_frame) {
+					changed = true
+					continue
+				}
+			}
 			if slot.has_frame &&
 			   !slot.tex_dirty &&
 			   slot.displayed_frame == clip_frame &&

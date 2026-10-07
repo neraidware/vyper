@@ -1931,8 +1931,8 @@ target_still_switch() {
 		echo "still-switch: FAILED -- a still covered the playhead with no decoded frame (black frame)" >&2
 		return 1
 	fi
-	echo "$out" | grep -E '^\[still-switch\] (clip_len|ok)'
-	echo "still-switch: ok (every short still has a frame the moment it covers the playhead)"
+	echo "$out" | grep -E '^\[still-switch\] (clip_len|scrub steps|edited|eviction|ok)'
+	echo "still-switch: ok (every short still has a frame the moment it covers the playhead, played or scrubbed)"
 }
 
 # audio_decode_integrity proves the DECODER's output matches its labels: the resampler

@@ -8152,3 +8152,70 @@ log: the project as the snapshot, a space keypress, 480 frames) with
 - **A kind enum is not a type test.** Images carry `kind=.Video`; any `switch`
   on `Media_Kind` that has an `.Image` arm is dead for them. Test `is_image` first,
   and when adding a branch on `kind`, ask which assets can actually carry it.
+
+## Active 44 — Black frames while scrubbing fast through stills
+
+**Status: FIXED on the recorded session; user reports the flashing is gone.**
+Scrubbing parks the transport, so `prewarm_next_clip` never runs and every pointer
+position is a cold claim: the slot is zeroed and a JPEG decodes on an async worker,
+black until it lands. A project that cycles three images re-decoded the same three
+files on every one of 43 cuts and every scrub position.
+
+### Steps
+
+- [x] Decoded-still cache (`still_cache` in `preview_state.odin`): 8 fixed slots,
+  true LRU by a recency stamp, keyed on file path hash + modification time + proxy
+  pick + source frame. A cold still claim is served by a memcpy the update it is
+  claimed instead of an async decode. Session-lifetime BSS (about 10.6 MB), UI-thread
+  only, zero value valid. A file edited on disk changes its mtime and misses, so it
+  decodes again. More distinct stills than slots evict the least recently shown, so the
+  cost degrades to the old behaviour rather than failing.
+
+### Probe
+
+- [x] `still_switch` gate extended with a scrub scenario (400 random pointer jumps over
+  24 stills, transport parked, `.Playhead_Scrub`). A black frame only counts on an image
+  already shown once, since a first decode is unavoidable. Red before: 259 of 400 steps
+  black; green after: 0. It also hashes the pixels each time an image is shown and
+  requires them to equal the first time (0 wrong), proves an edited file misses the
+  cache, and proves eviction is LRU.
+- [x] Each new check was shown able to fail: mtime dropped from the key turns the edit
+  check red; a key blind to the image turns the pixel check red (2 wrong); removing the
+  recency touch turns the LRU check red.
+- [x] The user's recorded scrub (`~/` session, 2388 frames, 1815 with the pointer held,
+  window 951x1028) replayed on the same binary with and without the cache: black
+  rendered frames 625 of 2375 without, 11 with. All 11 are the first-ever show of one of
+  the three images; none is a revisit.
+
+### Accept
+
+- [x] `check`, `timeline_probe`, `still_switch`, `render_live_probe`, `zorder`, `opacity`,
+  `smoke`, `probe`, `footprint` pass; `valgrind`, `render_live_valgrind`, `undo_valgrind`
+  report 0 lost and no invalid access.
+- [ ] A second recorded scrub (window 1908x1028) could not be replayed here: the compositor
+  tiles the window to 951 wide and ignores the resize, and the replay refuses a window that
+  does not match the recording (correctly). Replay it in a window of that size to extend
+  the check.
+
+### Known, not fixed
+
+- **A still edited on disk mid-session is shown stale by the existing async worker.** The
+  worker keeps a one-slot decoded result per path (`res_valid`/`res_path`) with the
+  decoder held open, and nothing re-checks the file. Found because the probe's first
+  edit check went red with the new cache disabled, so it predates it. The cache itself
+  is correct (mtime in the key); the stale picture comes from the worker.
+- **The first show of each distinct still is still a cold decode** (the 11 black frames
+  above). Priming the cache for the timeline's stills at load, or on an idle worker,
+  would remove them; with more distinct stills than cache slots it would need a policy.
+
+### Rules from this workstream
+
+- **A cache needs three checks, not one: it hits, it is right, and it forgets.** Presence
+  (no black frame) is the easy half. Compare the pixels against the first decode, prove a
+  changed input misses, and prove eviction is the policy it claims, and make each fail on a
+  deliberate mutation before trusting it.
+- **When a new check fails, find out which layer it is blaming before changing code.** The
+  edit check failed with the cache on and with it off; assuming the cache was wrong would
+  have sent the fix to the wrong place. Re-run with the new piece disabled.
+- **`~/…/session.vya` is overwritten by every debug launch, including gate runs.** Copy a
+  recording to a named file before running anything else.

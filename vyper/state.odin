@@ -1446,6 +1446,10 @@ Preview_Slot :: struct {
 	// re-uploading (a ~4MB GPU transfer per slot) is pure waste.
 	displayed_frame:      i64,
 	displayed_pick:       u32,
+	// still_cached is set once this slot's still has been stored in, or served from,
+	// still_cache, so the per-frame path does not re-stat the file to ask again. It
+	// clears with the slot (slot^ = {} on every reassign).
+	still_cached:         bool,
 	// layer is the slot's position in this frame's cover-set walk (track order,
 	// 0 = topmost clip). Slots keep a stable index per clip identity; the
 	// composition order must come from layer, NOT the slot index, so draw_preview
