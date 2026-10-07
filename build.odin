@@ -387,14 +387,29 @@ file_has_gate :: proc(path: string) -> bool {
 	return strings.contains(string(data), "when ODIN_DEBUG {")
 }
 
+// shader_compiler is glslang's command line under whichever name this host has it.
+// Upstream renamed glslangValidator to glslang (same tool, same -V), and the 16.x
+// Windows release zip ships only the new name, so a host with a current glslang and
+// no compatibility link would otherwise be told it has no compiler. The old name wins
+// when both exist, so a host that has always built keeps building the same way.
+shader_compiler :: proc() -> string {
+	for name in ([]string{"glslangValidator", "glslang"}) {
+		if locate_tool(name) != "" {
+			return name
+		}
+	}
+	return ""
+}
+
 build_shaders :: proc() {
 	fmt.println("==> Compiling shaders")
 	// Required, not optional. A host without it used to fall back to the
 	// committed .spv, so whether the shaders were recompiled depended on the
 	// machine -- and a silently stale .spv is exactly the failure the shader
 	// list exists to catch.
-	if locate_tool("glslangValidator") == "" {
-		fmt.eprintln("error: glslangValidator not found; the shaders are compiled on every build.")
+	compiler := shader_compiler()
+	if compiler == "" {
+		fmt.eprintln("error: glslangValidator (or glslang) not found; the shaders are compiled on every build.")
 		os.exit(1)
 	}
 	// Every shader, every build. Skipping one whose .spv looked fresh made the
@@ -406,7 +421,7 @@ build_shaders :: proc() {
 	for name in SHADERS {
 		src := join_or_empty({dir, name})
 		spv := strings.concatenate({src, ".spv"}, context.temp_allocator)
-		run_or_die("glslangValidator", {"-V", src, "-o", spv}, "shaders")
+		run_or_die(compiler, {"-V", src, "-o", spv}, "shaders")
 	}
 }
 

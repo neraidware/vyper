@@ -12,6 +12,7 @@ permissions:
 env:
   ODIN_VERSION: dev-2026-09
   SDL3_VER: 3.4.14
+  GLSLANG_VER: 16.6.0
 
 jobs:
   build-windows:
@@ -73,6 +74,20 @@ jobs:
           foreach ($l in @("avcodec","avfilter","avformat","avutil","swresample","swscale")) {
             Copy-Item "deps\lib\$l.lib" "vyper\vendor\ffmpeg\$l\$l.lib" -Force
           }
+
+      # build.odin compiles every shader on every build and refuses to fall back to the
+      # committed .spv, so the runner needs glslang. The Windows release zip ships it as
+      # glslang.exe (upstream renamed glslangValidator; same tool, same -V), which
+      # build.odin's shader_compiler accepts. Pinned, like Odin and SDL3, so the shaders
+      # compile with the same tool on every run.
+      - name: Download glslang (shader compiler)
+        shell: pwsh
+        run: |
+          curl.exe -sL -o glslang.zip `
+            "https://github.com/KhronosGroup/glslang/releases/download/$env:GLSLANG_VER/glslang-$env:GLSLANG_VER-windows-x86_64-release.zip"
+          Expand-Archive -Path glslang.zip -DestinationPath deps\glslang
+          "$PWD\deps\glslang\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          & "$PWD\deps\glslang\bin\glslang.exe" --version
 
       # build.odin drives cl and lib on Windows, so MSVC has to be on PATH
       # before it runs.
