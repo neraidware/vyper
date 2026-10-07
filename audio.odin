@@ -1127,11 +1127,20 @@ Audio_Dump :: struct {
 }
 audio_dump: Audio_Dump
 
+// VYPER_DECDUMP is the one file diagnostic NOT defaulted on in a debug build,
+// and the reason is volume rather than taste. This dumps every SOURCE's decoded
+// PCM pre-mix, so it writes at (sources x 192 KB/s): a 25-track project fills
+// /tmp at ~4.8 MB/s, about 17 GB an hour. The mixed-output dump below is one
+// stream and is on by default. Set VYPER_DECDUMP=<path> when a decode bug needs
+// the per-source view and you have the disk for it.
 audio_dec_dump_open :: proc() {
-	if audio_dump.dec != nil || os.get_env_alloc("VYPER_DECDUMP", context.temp_allocator) == "" {
+	if audio_dump.dec != nil {
 		return
 	}
-	path := os.get_env_alloc("VYPER_DECDUMP", context.temp_allocator)
+	path, has := os.lookup_env_alloc("VYPER_DECDUMP", context.temp_allocator)
+	if !has || path == "" {
+		return
+	}
 	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
 	if err == nil {
 		audio_dump.dec = f
@@ -1139,11 +1148,17 @@ audio_dec_dump_open :: proc() {
 	}
 }
 
+// The mixed-output dump: ONE stream (48 kHz stereo s16 = 192 KB/s, ~690 MB an
+// hour), so it defaults on in a debug build and lands under the temp dir.
 audio_pcm_dump_open :: proc() {
-	if audio_dump.pcm != nil || os.get_env_alloc("VYPER_PCMDUMP", context.temp_allocator) == "" {
+	if audio_dump.pcm != nil {
 		return
 	}
-	path := os.get_env_alloc("VYPER_PCMDUMP", context.temp_allocator)
+	path_buf: [1024]u8
+	path := diag_path("VYPER_PCMDUMP", "mix.pcm", path_buf[:])
+	if path == "" {
+		return
+	}
 	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
 	if err == nil {
 		audio_dump.pcm = f
@@ -2558,14 +2573,12 @@ audio_init :: proc() -> bool {
 	// Read the log toggles BEFORE opening the device: the device announces its
 	// negotiated shape under trace, and the old order had that print fire before
 	// trace was ever set, so it had never printed once.
-	if interval := os.get_env_alloc("VYPER_AUDIO_LOG", context.temp_allocator); interval != "" {
-		v, ok := strconv.parse_i64(interval)
-		if ok && v >= 50 {
-			audio_rpt.log_ms = v
-		}
-	}
-	audio_rpt.log_full = os.get_env_alloc("VYPER_AUDIO_FULL", context.temp_allocator) == "1"
-	audio_rpt.trace = os.get_env_alloc("VYPER_AUDIO_TRACE", context.temp_allocator) == "1"
+	// The periodic audio log has a period rather than being a flag, so it takes a
+	// number; the default is 2s. Below 50ms it would print faster than a terminal
+	// shows, which is not more information, it is less.
+	audio_rpt.log_ms = i64(diag_interval("VYPER_AUDIO_LOG", 2000))
+	audio_rpt.log_full = diag_flag("VYPER_AUDIO_FULL")
+	audio_rpt.trace = diag_flag("VYPER_AUDIO_TRACE")
 	// The device, the bridge ring, and the resampler live in audio_device.odin
 	// behind a narrow interface; this only decides whether playback is possible at
 	// all. Failure is not fatal (the app runs silent), which is exactly what

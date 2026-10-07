@@ -850,6 +850,9 @@ action_log_capture_session :: proc() {
 // already loaded, is captured by action_log_capture_session after that block.
 // The recorder is closed by the frame loop's exit path, not here.
 action_log_startup :: proc(window: ^sdl.Window) {
+	// Fixed storage: diag_path returns a view into its buffer, and the recorder
+	// holds the path for the whole session.
+	record_buf: [1024]u8
 	if replay := os.get_env_alloc("VYPER_ACTION_REPLAY", context.temp_allocator); replay != "" {
 		// Borrowed, not owned: main created the window and outlives the loop.
 		action_play.win = window
@@ -858,7 +861,11 @@ action_log_startup :: proc(window: ^sdl.Window) {
 		}
 		return
 	}
-	if record := os.get_env_alloc("VYPER_ACTION_RECORD", context.temp_allocator); record != "" {
+	// Records to <temp>/vyper/session.vya in a debug build, so a debug session is
+	// replayable without being told where to put it. VYPER_ACTION_RECORD=<path>
+	// overrides; the record itself is opt-OUT via an explicit path being how you
+	// turn it on and VYPER_ACTION_RECORD=0 turning it off.
+	if record := diag_path("VYPER_ACTION_RECORD", "session.vya", record_buf[:]); record != "" {
 		action_rec_open(record)
 	}
 }

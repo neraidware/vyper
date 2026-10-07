@@ -84,7 +84,12 @@ dev() {
 }
 
 target_check() {
-	dev odin check . -strict-style -vet-using-param -vet-using-stmt
+	# -debug is load-bearing, not a preference. `odin check` does not compile a
+	# `when ODIN_DEBUG` branch unless -debug is passed, so without it this
+	# validates the RELEASE view and reports clean while the build we actually
+	# produce by default is unverified -- a deliberate error inside
+	# `when ODIN_DEBUG` type-checks fine here. Measured, not assumed.
+	dev odin check . -debug -strict-style -vet-using-param -vet-using-stmt
 }
 
 # Shader compilation is a build step, not a thing you remember to do by hand.

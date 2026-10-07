@@ -41,10 +41,15 @@ spall_state: Spall_State
 @(thread_local) spall_buffer_data: [spall.BUFFER_DEFAULT_SIZE]u8
 @(thread_local) spall_thread_active: bool
 
-// spall_prof_init opens the capture file when VYPER_SPALL is set and arms the
-// render thread's buffer. Returns true always (init is best-effort).
+// spall_prof_init opens the capture file and arms the render thread's buffer.
+// Returns true always (init is best-effort).
+//
+// The capture path defaults to <temp>/vyper/spall.json in a debug build, so
+// profiling is available without inventing a filename; VYPER_SPALL=<path> still
+// wins and VYPER_SPALL=0 turns it off. A release build has no spall code at all.
 spall_prof_init :: proc() -> bool {
-	path := os.get_env_alloc("VYPER_SPALL", context.temp_allocator)
+	path_buf: [1024]u8
+	path := diag_path("VYPER_SPALL", "spall.json", path_buf[:])
 	if path == "" {
 		spall_state.enabled = false
 		return true

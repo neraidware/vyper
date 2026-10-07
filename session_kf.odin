@@ -212,7 +212,12 @@ session_kf_free :: proc(off: int, slots: int) {
 		}
 	}
 	append(spans, Session_Kf_Free{})
-	mem.copy(&spans[idx + 1].off, &spans[idx].off, (len(spans) - idx - 1) * size_of(Session_Kf_Free))
+	// Shifting up is skipped when the new span landed at the end, which is the
+	// common case: taking &spans[idx+1] regardless forms an address one past the
+	// end of the slice, whatever the length argument says.
+	if idx + 1 < len(spans) {
+		mem.copy(&spans[idx + 1].off, &spans[idx].off, (len(spans) - idx - 1) * size_of(Session_Kf_Free))
+	}
 	spans[idx] = Session_Kf_Free{off = off, cap = slots}
 	// Coalesce forward, then backward. Order matters: merging forward first can
 	// create a new adjacency with the backward neighbour.
@@ -273,12 +278,21 @@ session_kf_grow :: proc(off: int, slots: int, need: int) -> (int, int) {
 // safe here. A caller that needs to hold keys across an edit must copy them out
 // (that is what the snapshot seam already does). Do not add a proc that returns
 // this view to be held.
-session_kf_view :: proc(r: Kf_Keys_Range) -> []Keyframe {
+// session_kf_window validates `r` and returns its first `n` entries. The one
+// place a range is turned into a slice, because a mutator that re-slices
+// `session_kf_keys` inline skips the check -- and the bounds check that
+// `session_kf_erase`'s inline slice skipped is how an out-of-range window
+// reached mem.copy instead of the assert naming it.
+session_kf_window :: proc(r: Kf_Keys_Range, n: int) -> []Keyframe {
 	assert(
-		r.n >= 0 && r.n <= r.slots && r.first + r.slots <= len(session_kf_keys),
-		"session_kf_view: range is out of bounds (stale handle after a reset?)",
+		n >= 0 && n <= r.slots && r.first + r.slots <= len(session_kf_keys),
+		"session range is out of bounds (stale handle after a reset?)",
 	)
-	return session_kf_keys[r.first : r.first + r.n]
+	return session_kf_keys[r.first : r.first + n]
+}
+
+session_kf_view :: proc(r: Kf_Keys_Range) -> []Keyframe {
+	return session_kf_window(r, r.n)
 }
 
 // session_kf_keys_mut is session_kf_view for a range the caller owns
@@ -362,7 +376,7 @@ session_kf_clone :: proc(r: Kf_Keys_Range) -> Kf_Keys_Range {
 session_kf_push :: proc(r: ^Kf_Keys_Range, k: Keyframe) {
 	assert(!r.shared, "session_kf_push: range is shared; make it unique first")
 	session_kf_reserve(r, r.n + 1)
-	session_kf_keys[r.first + r.n] = k
+	session_kf_window(r^, r.n + 1)[r.n] = k
 	r.n += 1
 }
 
@@ -372,8 +386,15 @@ session_kf_push :: proc(r: ^Kf_Keys_Range, k: Keyframe) {
 session_kf_erase :: proc(r: ^Kf_Keys_Range, i: int) {
 	assert(!r.shared, "session_kf_erase: range is shared; make it unique first")
 	assert(i >= 0 && i < r.n, "session_kf_erase: index out of range")
-	keys := session_kf_keys[r.first : r.first + r.n]
-	mem.copy(&keys[i], &keys[i + 1], (r.n - i - 1) * size_of(Keyframe))
+	keys := session_kf_window(r^, r.n)
+	// Only when there is something to move. `&keys[i+1]` is evaluated whatever the
+	// length argument says, so erasing the LAST key formed a pointer one past the
+	// end of the slice and handed it to mem.copy with a length of 0. The bounds
+	// check rejected the index; -no-bounds-check made it a pointer nobody looked
+	// at.
+	if i + 1 < r.n {
+		mem.copy(&keys[i], &keys[i + 1], (r.n - i - 1) * size_of(Keyframe))
+	}
 	r.n -= 1
 }
 
@@ -383,7 +404,7 @@ session_kf_erase :: proc(r: ^Kf_Keys_Range, i: int) {
 session_kf_set :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
 	assert(!r.shared, "session_kf_set: range is shared; make it unique first")
 	assert(i >= 0 && i < r.n, "session_kf_set: index out of range")
-	session_kf_keys[r.first + i] = k
+	session_kf_window(r^, i + 1)[i] = k
 }
 
 // session_kf_at reads one key by index. Indexing the range through the store
@@ -412,8 +433,13 @@ session_kf_insert :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
 	assert(!r.shared, "session_kf_insert: range is shared; make it unique first")
 	assert(i >= 0 && i <= r.n, "session_kf_insert: insert position out of range")
 	session_kf_reserve(r, r.n + 1)
-	keys := session_kf_keys[r.first : r.first + r.n + 1]
-	mem.copy(&keys[i + 1], &keys[i], (r.n - i) * size_of(Keyframe))
+	// One past n: insert slides into the slot session_kf_reserve just made.
+	keys := session_kf_window(r^, r.n + 1)
+	// Same reason as session_kf_erase: appending at the end (i == r.n) has nothing
+	// to slide, and forming &keys[i+1] anyway is the out-of-bounds address.
+	if i < r.n {
+		mem.copy(&keys[i + 1], &keys[i], (r.n - i) * size_of(Keyframe))
+	}
 	keys[i] = k
 	r.n += 1
 }

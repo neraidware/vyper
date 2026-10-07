@@ -97,7 +97,7 @@ echo "==> Checking Odin"
 . scripts/toolchain.sh
 resolve_odin_root
 
-odin check . \
+odin check . -debug \
     -strict-style \
     -vet-using-param \
     -vet-using-stmt

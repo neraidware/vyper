@@ -1950,14 +1950,20 @@ main :: proc() {
 		crash_handler_install()
 		win_ffmpeg_versions_diag()
 	}
-	vyper_trace = os.get_env_alloc("VYPER_TRACE", context.temp_allocator) == "1"
-	play_trace = os.get_env_alloc("VYPER_PLAY_TRACE", context.temp_allocator) == "1"
-	// VYPER_REPRO_TRACE=1 turns on the audio reproduction engine's own trace, which
-	// prints one line per producer feed pass and an explicit ANOMALY line for each
-	// REPEAT / JUMP / DESYNC. It is separate from play_trace because it runs on the
-	// PRODUCER thread and answers a different question: not "what did each loop do"
-	// but "was any of it wrong".
-	repro_trace = os.get_env_alloc("VYPER_REPRO_TRACE", context.temp_allocator) == "1"
+	// The three continuous traces. All three are ON by default in a debug build
+	// and absent from a release one (see diag_flag): a trace you have to
+	// remember to switch on is off exactly when the bug needs it.
+	//   VYPER_TRACE       every subsystem's own trace, the interactive one
+	//   VYPER_PLAY_TRACE  scrub/play commits and seek landings
+	//   VYPER_REPRO_TRACE the audio reproduction engine: one line per producer
+	//     feed pass and an explicit ANOMALY line per REPEAT / JUMP / DESYNC.
+	//     Separate from play_trace because it runs on the PRODUCER thread and
+	//     answers a different question: not "what did each loop do" but "was any
+	//     of it wrong".
+	vyper_trace = diag_flag("VYPER_TRACE")
+	play_trace = diag_flag("VYPER_PLAY_TRACE")
+	repro_trace = diag_flag("VYPER_REPRO_TRACE")
+	diag_report_temp()
 	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
 	// the audio producer reads playback.rate for its atempo graph and cushion.

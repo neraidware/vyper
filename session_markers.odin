@@ -66,7 +66,14 @@ session_marker_free :: proc(off, slots: int) {
 		}
 	}
 	append(spans, Session_Marker_Free{})
-	mem.copy(&spans[idx+1], &spans[idx], (len(spans)-idx-1)*size_of(Session_Marker_Free))
+	// Shifting up is skipped when the new span landed at the end, which is the
+	// common case: taking &spans[idx+1] regardless forms an address one past the
+	// end of the slice, whatever the length argument says. Same fix as the copy in
+	// session_kf.odin -- these four pools grew as copies of each other, so the bug
+	// came in four.
+	if idx+1 < len(spans) {
+		mem.copy(&spans[idx+1], &spans[idx], (len(spans)-idx-1)*size_of(Session_Marker_Free))
+	}
 	spans[idx] = Session_Marker_Free{off=off, slots=slots}
 	if idx+1 < len(spans) && spans[idx].off+spans[idx].slots == spans[idx+1].off {
 		spans[idx].slots += spans[idx+1].slots

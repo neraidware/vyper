@@ -7742,3 +7742,47 @@ as absent. The check that settled it was running the measurement the item claims
   downgrade the memory gate to one that reads nothing. Still clean: 0 definitely
   lost, 0 indirectly lost.
 - Windows CI is unaffected — it invokes `odin build` directly and never set `-o:`.
+
+## Implemented — diagnostics on by default in debug, out of release entirely (2026-10-06)
+
+- `diag.odin`: `diag_flag` (a diagnostic is ON in a debug build, OFF in a
+  release one), `diag_path` (records default to `<temp>/vyper/<name>`), and
+  `diag_interval`. Setting the variable still wins and setting it to `0` turns
+  it off, so a default-on diagnostic is still silenceable:
+  `VYPER_TRACE=0 ./vyper`. A debug run is now instrumented without anyone having
+  to remember a flag or invent a path.
+- Wired: `VYPER_TRACE`, `VYPER_PLAY_TRACE`, `VYPER_REPRO_TRACE`,
+  `VYPER_AUDIO_TRACE`, `VYPER_AUDIO_LOG`, `VYPER_AUDIO_FULL`, `VYPER_FRAME_TIME`,
+  `VYPER_SPALL`, `VYPER_FLASH_REC`/`VYPER_FLASH_LOG`, `VYPER_PCMDUMP`,
+  `VYPER_ACTION_RECORD`. `VYPER_FLASH_REC`'s path was a hardcoded
+  `/tmp/vyper_flash_rec.log`; it now goes through the same temp convention.
+  `VYPER_FRAME_TIME` used to be "any value enables", so `=0` enabled it — now
+  `=0` disables, matching every other flag.
+- `VYPER_DECDUMP` is the one file diagnostic deliberately NOT defaulted on: it
+  dumps every SOURCE's decoded PCM pre-mix, so it writes at
+  (sources × 192 KB/s) — a 25-track project fills /tmp at ~4.8 MB/s, about
+  17 GB an hour. The mixed-output dump is one stream (~690 MB an hour) and is on.
+- `check` now passes `-debug`, in both `scripts/gate.sh` and `build.sh`. This was
+  load-bearing and was wrong before: `odin check` does not compile a
+  `when ODIN_DEBUG` branch without `-debug`, so the gate was validating the
+  RELEASE view and reporting clean while the build produced by default was
+  unverified. Measured with a deliberate undeclared name inside the branch.
+- Turning bounds checking on found FIVE out-of-bounds writes, all one idiom:
+  `mem.copy(&a[i + 1], &a[i], (n - i - 1) * size_of(T))` evaluates `&a[i + 1]`
+  before the length argument, so the last-element case builds a pointer one past
+  the end of the slice and hands it to `mem.copy` with a length of 0. It is not a
+  no-op: the address is out of bounds whatever the length says.
+  - `session_kf.odin` erase (erasing the LAST key) and insert (appending).
+  - the free-list coalescing in `session_kf.odin`, `session_markers.odin` and
+    `session_tracks.odin` — three copies of one function, so the bug came in
+    three. The four session pools are still copy-pasted; that duplication is what
+    let one bug land four times, and it is worth collapsing.
+  - Separately, the `session_kf` MUTATORS (`push`/`erase`/`set`/`insert`)
+    re-sliced `session_kf_keys` inline, skipping the range validation every
+    reader goes through. There is now one `session_kf_window`, which asserts and
+    slices, and all five procs use it.
+- Gates green after the fixes: check, probe, dnd_probe, action_log, timeline,
+  transform, session str/kf/trk/marker, audio_probe, audio_clip_tempo,
+  audio_scrub_exact, audio_seek_landing, parity, image_probe, opacity,
+  audio_group_isolation. Valgrind clean (0 definitely lost, 0 indirectly lost) on
+  undo, dnd and action-log.

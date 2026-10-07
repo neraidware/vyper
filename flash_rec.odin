@@ -31,13 +31,18 @@ Flash_Rec :: struct {
 flash_rec: Flash_Rec
 
 flash_rec_init :: proc() {
-	if v, _ := os.lookup_env_alloc("VYPER_FLASH_REC", context.temp_allocator); v == "" {
+	if !diag_flag("VYPER_FLASH_REC") {
 		return
 	}
 	flash_rec.enabled = true
-	path := "/tmp/vyper_flash_rec.log"
-	if override, _ := os.lookup_env_alloc("VYPER_FLASH_LOG", context.temp_allocator); override != "" {
-		path = override
+	// Was a hardcoded /tmp/vyper_flash_rec.log, which is neither the temp
+	// convention the rest of the diagnostics use nor portable. VYPER_FLASH_LOG
+	// still overrides it.
+	path_buf: [1024]u8
+	path := diag_path("VYPER_FLASH_LOG", "flash-rec.log", path_buf[:])
+	if path == "" {
+		flash_rec.enabled = false
+		return
 	}
 	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
 	if err == nil {

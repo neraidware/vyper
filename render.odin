@@ -3322,7 +3322,7 @@ render_worker_run :: proc() {
 	// percentages are now a per-thread CPU split (they sum to combined work,
 	// not wall time); the ratio is the signal. Declared in scope before the
 	// defer so the report can read them on any exit path.
-	split_timing := os.get_env_alloc("VYPER_FRAME_TIME", context.temp_allocator) != ""
+	split_timing := diag_flag("VYPER_FRAME_TIME")
 	render_split_timing = split_timing
 	render_probe_rect = split_timing
 	audio_ns, composite_ns, loop_start := i64(0), i64(0), i64(0)
