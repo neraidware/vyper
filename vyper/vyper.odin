@@ -2313,6 +2313,14 @@ main :: proc() {
 			os.exit(ok ? 0 : 1)
 		}
 	}
+	// VYPER_AUDIO_DECODE_INTEGRITY=<path> -- proves the decoder's output matches its labels
+	// and that a seek leaves nothing of the audio decoded before it.
+	when ODIN_DEBUG {
+		if di, _ := os.lookup_env_alloc("VYPER_AUDIO_DECODE_INTEGRITY", context.temp_allocator); di != "" {
+			ok: bool = audio_probe_decode_integrity(di)
+			os.exit(ok ? 0 : 1)
+		}
+	}
 	// VYPER_AUDIO_SCRUB_EXACT -- proves a seek lands on the content sample the timeline
 	// says belongs there, unstretched and stretched.
 	when ODIN_DEBUG {

@@ -1908,6 +1908,36 @@ target_audio_backward_scrub() {
 	echo "audio-backward-scrub: ok (playhead move rewinds the producer, drops the queue, re-anchors the decoder)"
 }
 
+# audio_decode_integrity proves the DECODER's output matches its labels: the resampler
+# retains no input, and a seek leaves no trace of the audio decoded before it. The
+# fixture is FLAC because its 4608-sample blocks are larger than the decoder's old
+# 4096-sample buffer, which is the shape that lagged every chunk behind its label on a
+# real recording while the AAC and WAV fixtures (smaller frames) never saw it. The chirp
+# does not repeat, so a replayed sample cannot coincide with the right one.
+target_audio_decode_integrity() {
+	require_fresh_binary audio-decode-integrity || return 1
+	mkdir -p target/mixparity
+	# 44.1 kHz as well as 48: it is resampled, so it carries inherent filter delay and
+	# filter history, which is what a seek must also discard.
+	local rate
+	for rate in 48000 44100; do
+		local src=target/mixparity/chirp_flac_blocks_$rate.flac
+		if [ ! -s "$src" ]; then
+			ffmpeg -v error -f lavfi \
+				-i "aevalsrc='0.5*sin(2*PI*(200+150*t)*t)':s=$rate:d=12" \
+				-ac 2 -c:a flac -frame_size 4608 "$src" -y || return 1
+		fi
+		local out
+		if ! out=$(VYPER_AUDIO_DECODE_INTEGRITY="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
+			echo "$out" | grep -E '^\[ap\] decode-integrity' >&2
+			echo "audio-decode-integrity: FAILED at $rate Hz -- see the [ap] decode-integrity lines above" >&2
+			return 1
+		fi
+		echo "$out" | grep -E '^\[ap\] decode-integrity'
+	done
+	echo "audio-decode-integrity: ok (resampler backlog never grows; a seek leaves no trace of earlier audio)"
+}
+
 # audio_seek_landing proves WHERE a seek lands, by content, on the playback producer
 # path. Every other seek check reads state (next_frame rewound, queue dropped,
 # decoder re-anchored) or renders through the export mixer, and all of them passed
@@ -2127,7 +2157,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_decode_integrity audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -2170,6 +2200,7 @@ main() {
 	audio_clip_stretch) target_audio_clip_stretch ;;
 	audio_scrub_exact) target_audio_scrub_exact ;;
 	audio_backward_scrub) target_audio_backward_scrub ;;
+	audio_decode_integrity) target_audio_decode_integrity ;;
 	audio_seek_landing) target_audio_seek_landing ;;
 	audio_bus_prime) target_audio_bus_prime ;;
 	audio_bus_rate_transition) target_audio_bus_rate_transition ;;
@@ -2200,7 +2231,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

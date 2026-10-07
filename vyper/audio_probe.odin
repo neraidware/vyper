@@ -4351,4 +4351,118 @@ when ODIN_DEBUG {
 		return true
 	}
 
+	// audio_probe_decode_integrity proves decode_audio_chunk hands over the audio the
+	// file holds at the position it labels, whatever came before.
+	//
+	// Two properties, both measured on the decoder itself rather than inferred from a
+	// position counter, because every counter in the engine is derived from the label:
+	//
+	//   - the resampler's backlog never grows. swres_convert buffers whatever the room
+	//     cannot hold, silently; a source whose decoder frames exceeded the output
+	//     buffer (FLAC's 4608-sample blocks against the old 4096) then lagged its own
+	//     labels by a growing margin. A rate-converting source has an inherent filter
+	//     delay, so the check is that the delay after the last chunk is no larger than
+	//     after the first, which holds for both it and a 48 kHz source (delay 0).
+	//   - a seek forgets everything decoded before it. The same position decoded
+	//     fresh and decoded after a detour elsewhere must be byte-identical; a
+	//     resampler that kept pre-seek input replays it after the seek.
+	//
+	// `path` should be a stereo file with non-repeating content and decoder frames
+	// larger than 4096 samples; the gate builds FLAC chirps at 48 kHz and 44.1 kHz.
+	audio_probe_decode_integrity :: proc(path: string) -> bool {
+		cpath := strings.clone_to_cstring(path, context.temp_allocator)
+		DECODE_CHUNKS :: 6
+		FRESH_ASK :: i64(96000)
+		DETOUR_ASK :: i64(480000)
+
+		Run :: struct {
+			start:       i64,
+			samples:     [dynamic]i16,
+			first_delay: i64,
+			last_delay:  i64,
+			ok:          bool,
+		}
+		run_at :: proc(dec: ^Audio_Clip_Decoder, ask: i64, run: ^Run) {
+			clear(&run.samples)
+			n := decode_from_content(dec, ask)
+			if n <= 0 {
+				return
+			}
+			run.start = i64(decoder_pts_sample(dec.first_ts, dec.stream.time_base))
+			for chunk in 0 ..< DECODE_CHUNKS {
+				if chunk > 0 {
+					n = decode_audio_chunk(dec, -1.0)
+					if n <= 0 {
+						return
+					}
+				}
+				append(&run.samples, ..dec.s16[:n * int(dec.out_channels)])
+				run.last_delay = i64(swres.get_delay(dec.swr_ctx, i64(dec.out_rate)))
+				if chunk == 0 {
+					run.first_delay = run.last_delay
+				}
+			}
+			run.ok = true
+		}
+
+		fresh, detour := Run{}, Run{}
+		defer delete(fresh.samples)
+		defer delete(detour.samples)
+
+		a: Audio_Clip_Decoder
+		if !open_audio_decoder_resampled(&a, cpath, 0, 48000, 2) {
+			fmt.println("[ap] decode-integrity: could not open", path)
+			return false
+		}
+		defer audio_decoder_reset(&a)
+		run_at(&a, FRESH_ASK, &fresh)
+
+		b: Audio_Clip_Decoder
+		if !open_audio_decoder_resampled(&b, cpath, 0, 48000, 2) {
+			return false
+		}
+		defer audio_decoder_reset(&b)
+		scratch := Run{}
+		defer delete(scratch.samples)
+		run_at(&b, DETOUR_ASK, &scratch)
+		run_at(&b, FRESH_ASK, &detour)
+
+		if !fresh.ok || !detour.ok || !scratch.ok {
+			fmt.println("[ap] decode-integrity: FAIL decode ran dry")
+			return false
+		}
+		peak := i16(0)
+		for v in fresh.samples {
+			peak = max(peak, abs(v))
+		}
+		if peak < 1000 {
+			fmt.println("[ap] decode-integrity: FAIL fixture is silent; the comparison would prove nothing")
+			return false
+		}
+		fmt.printf(
+			"[ap] decode-integrity: in=%dHz ask=%d start fresh=%d detour=%d samples=%d peak=%d swr_delay first=%d last=%d\n",
+			int(a.input_rate), int(FRESH_ASK), int(fresh.start), int(detour.start), len(fresh.samples), int(peak),
+			int(fresh.first_delay), int(fresh.last_delay),
+		)
+		for r in ([]Run{fresh, detour, scratch}) {
+			if r.last_delay > r.first_delay {
+				fmt.println("[ap] decode-integrity: FAIL resampler backlog grew; its output lags the labels")
+				return false
+			}
+		}
+		if fresh.start != detour.start || len(fresh.samples) != len(detour.samples) {
+			fmt.println("[ap] decode-integrity: FAIL a seek after a detour landed or sized differently from a fresh seek")
+			return false
+		}
+		for i in 0 ..< len(fresh.samples) {
+			if fresh.samples[i] != detour.samples[i] {
+				fmt.printf("[ap] decode-integrity: FAIL sample %d differs after a seek: fresh=%d detour=%d (pre-seek audio resurfaced)\n",
+					i, int(fresh.samples[i]), int(detour.samples[i]))
+				return false
+			}
+		}
+		fmt.println("[ap] decode-integrity ok (resampler holds nothing, and a seek leaves no trace of what came before)")
+		return true
+	}
+
 }

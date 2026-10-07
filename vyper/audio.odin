@@ -14,7 +14,10 @@ import avfmt "vendor/ffmpeg/avformat"
 import avutil "vendor/ffmpeg/avutil"
 import swres "vendor/ffmpeg/swresample"
 
-// AUDIO_CHUNK is the number of output sample-frames decoded in one step.
+// AUDIO_CHUNK is the number of output sample-frames decoded in one step: the point at
+// which decode_audio_chunk stops STARTING new decoder frames. It is not a size limit.
+// A frame that begins under it is converted whole, so a chunk can exceed it by up to
+// one frame (FLAC blocks are 4608 samples).
 AUDIO_CHUNK :: 4096
 // AUDIO_MAX_CH yields a generous fixed scratch buffer for interleaved S16.
 AUDIO_MAX_CH :: 8
@@ -277,9 +280,37 @@ seek_audio :: proc(dec: ^Audio_Clip_Decoder, seconds: f64) -> bool {
 		return false
 	}
 	avcodec.flush_buffers(dec.dec_ctx)
+	// The resampler buffers input it had no room to convert (and, when resampling,
+	// its filter history). flush_buffers resets only the codec, so without this the
+	// samples decoded BEFORE the seek come out of swr after it, labelled with the
+	// seek's position: the audio the listener just heard, played again at the new
+	// point. close+init discards all of it and keeps the configured options.
+	swres.close(dec.swr_ctx)
+	if ret := swres.init(dec.swr_ctx); ret < 0 {
+		fmt.println("swr_init after seek:", ff_err_str(ret))
+		return false
+	}
 	dec.have_last = false
 	dec.have_cursor = false
 	return true
+}
+
+// audio_decoder_reserve makes dec.s16 hold at least `need` more sample-frames after
+// the first `produced`, and returns the room available from there. Grow-only: the
+// buffer reaches the largest frame the stream carries and then never reallocates,
+// so steady-state decoding allocates nothing. `need` is swres_get_out_samples, an
+// upper bound that includes input the resampler is already holding.
+audio_decoder_reserve :: proc(dec: ^Audio_Clip_Decoder, produced, need: int) -> int {
+	assert(need >= 0, "audio_decoder_reserve: swr_get_out_samples failed on a configured context")
+	ch := int(dec.out_channels)
+	want := (produced + need) * ch
+	if want > len(dec.s16) {
+		grown := make([]i16, want)
+		copy(grown, dec.s16[:produced * ch])
+		delete(dec.s16)
+		dec.s16 = grown
+	}
+	return len(dec.s16) / ch - produced
 }
 
 // decode_audio_chunk decodes up to AUDIO_CHUNK output sample-frames. A
@@ -330,8 +361,7 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 	}
 
 	out_planes: [1][^]u8
-	out_count := c.int(AUDIO_CHUNK)
-	produced := 0
+		produced := 0
 	for produced < int(AUDIO_CHUNK) {
 		ret := avfmt.read_frame(dec.fmt_ctx, dec.pkt)
 		if ret < 0 {
@@ -358,10 +388,20 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 			for i in 0..<8 {
 				in_planes[i] = dec.frame.data[i]
 			}
+			// The output buffer is sized to the frame, not the frame to the buffer.
+			// swres_convert converts only what the room holds and keeps the rest as
+			// internal delay, with no error: with a 4096-sample buffer, FLAC's
+			// 4608-sample blocks converted 4096 on every call and the delay grew
+			// 512, 1024, ... 4096 without ever draining. Each chunk then lagged its own
+			// position label by a widening margin, so the fifo held audio from an
+			// earlier position than it was labelled with -- which no position counter
+			// can see, because each is derived from the label. A resampled source hit
+			// the same thing whenever its last frame straddled the buffer end.
+			room := audio_decoder_reserve(dec, produced, int(swres.get_out_samples(dec.swr_ctx, dec.frame.nb_samples)))
 			out_planes[0] = ([^]u8)(raw_data(dec.s16))[produced * int(dec.out_channels) * size_of(i16):]
 			n := swres.convert(
 				dec.swr_ctx,
-				&out_planes[0], out_count - c.int(produced),
+				&out_planes[0], c.int(room),
 				&in_planes[0], dec.frame.nb_samples,
 			)
 			frame_ts_at_decode := dec.frame.best_effort_timestamp
@@ -983,16 +1023,6 @@ Audio_Producer :: struct {
 	// owns playhead position. Producer-side anomaly checks ignore that requested
 	// mismatch and resume checking when release commits the final seek.
 	scrub_active: bool,
-	// The release boundary, recorded so the trace can say what the listener
-	// already heard versus what the engine resumed at. Without this the only
-	// evidence is a clears COUNTER, which cannot distinguish "the queue was
-	// dropped before the device reached it" from "the device played it first".
-	// forced_frame/forced_evt are the target frame and generation of the last
-	// explicit seek; seen_dev is what the device had consumed when the producer
-	// took it (atomic).
-	forced_frame: i64,
-	forced_evt:   i64,
-	seen_dev:     i64,
 	// anchor_frame is the playhead frame the UI last seeded for a resync
 	// (atomic); anchor_now is monotonic_ns() when that frame was seeded.
 	anchor_frame: i64,
@@ -3312,31 +3342,6 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 								audio_src.next_frame,
 								audio_device_queued(),
 							)
-							if force_seek {
-								// The repeat verdict, in one line. `heard` is where the
-								// device had actually consumed when this landed; the engine
-								// resumes at `anchor`. Resuming below `heard` means the listener
-								// is about to be handed audio they just heard, which is the
-								// reported symptom -- and neither a clears counter nor a
-								// position anomaly can see it, because from the engine's side the
-								// position moved exactly where it was asked to.
-								heard := sync.atomic_load(&playback.dev_frame)
-								verdict := "forward"
-								if anchor < heard {
-									verdict = "REWIND: replays heard audio"
-								}
-								fmt.printf(
-									"[prod] release boundary gen=%d target=%d heard=%d resume=%d queued=%d clears=%d pending=%t -> %s\n",
-									evt,
-									anchor,
-									heard,
-									audio_src.next_frame,
-									audio_device_queued(),
-									audio_device_clears(),
-									audio_device_clear_pending(),
-									verdict,
-								)
-							}
 						}
 					}
 				} else {
@@ -3768,10 +3773,6 @@ audio_seek :: proc(frame: i64, force_reanchor: bool = true) {
 				audio_device_clears(),
 			)
 		}
-	}
-	if force_reanchor {
-		sync.atomic_store(&audio_prod.forced_frame, frame)
-		sync.atomic_store(&audio_prod.forced_evt, evt)
 	}
 	sync.atomic_store(&audio_prod.resync, evt)
 }

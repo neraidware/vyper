@@ -7981,8 +7981,37 @@ Investigation uses the captured 2111-frame `/tmp/vyper/session.vya` replay.
 - [x] Replayed same action log twice. Both runs: 4/4 releases forced, 25/25
   sources sought, queued window touched/cleared, producer `next_frame` exactly
   at release target. Repeat/desync counters stayed clear after scrub arm.
-- [ ] User confirms the audible repeat/desync is gone. Last report says it still
-  reproduces, so the fix below is necessary but not yet sufficient.
+- [~] User reports the audible repeat is gone after the decoder fix below; case
+  stays open until further scrubbing in the editor confirms it.
+- [x] Root cause of the remaining defect: the decoder, not the transport. The
+  user's recording carries FLAC audio in 4608-sample blocks; `decode_audio_chunk`
+  converted into a 4096-sample buffer, so `swres_convert` accepted part of each
+  frame and silently retained the rest as internal delay (measured `conv=4096` of
+  `nb_in=4608` on all 5840 calls, delay walking 512..4096). Every chunk then
+  lagged its own content label by a growing margin, so the fifo held audio from an
+  earlier position than it was labelled with. No position counter can see this,
+  because each is derived from the label. The AAC/WAV fixtures decode in smaller
+  frames, so no gate exercised it.
+- [x] `decode_audio_chunk` now sizes its output buffer to the frame: grow-only
+  `audio_decoder_reserve` takes `swr_get_out_samples` before each convert, so the
+  resampler can never retain input for lack of room and there is no frame-size
+  limit to trip over (FLAC allows blocks to 65535). A resampled source hit the
+  same retention whenever a frame straddled the old buffer end. `seek_audio` also
+  `swr_close`/`swr_init`s the resampler: `flush_buffers` reset only the codec, so
+  input and filter history from before a seek surfaced after it. The export
+  decodes through the same function and gets both fixes.
+- [x] New gate `audio_decode_integrity` (FLAC chirp, 4608-sample blocks, at 48 kHz
+  and 44.1 kHz): the resampler backlog must not grow across chunks, and a seek
+  after a detour must be byte-identical to a fresh seek. Red on the original
+  decoder (48 kHz: delay 512 -> 3072); red with only the seek reset removed
+  (44.1 kHz: mismatch after the detour); green with both.
+- [x] Removed the `REWIND: replays heard audio` release-boundary verdict and its
+  `forced_frame`/`forced_evt`/`seen_dev` fields: a legitimate backward seek also
+  prints it, so it never identified a defect.
+- [x] Retracted earlier claims: the "frames 29..40 byte-identical push" was digital
+  silence (my zero-hash check assumed 4 bytes per sample, the hash stepped 3), and
+  the device-clock `DEVICE-REPEAT` count came from subtracting the cushion twice
+  in the diagnostic. Neither was an engine fault; that scaffolding was removed.
 - [x] Per-source diagnostics now include speed, pitch, WSOLA presence, output
   ring length, and output origin; same replay confirmed WSOLA is not involved
   here (`speed=1`, `pitch=1`, `wsola=false`).
@@ -7991,6 +8020,11 @@ Investigation uses the captured 2111-frame `/tmp/vyper/session.vya` replay.
 
 - [x] `scripts/gate.sh check`, `audio_probe`, and `audio_backward_scrub` pass.
 - [x] Same captured replay passes twice with the four release assertions above.
-- [ ] Audible playback passes scrub-release reproduction in the editor.
+- [x] `audio_decode_integrity`, `audio_mix_parity`, `audio_drift_parity`,
+  `audio_scrub_exact`, `audio_seek_landing`, `audio_clip_*`, `audio_stall_gap`
+  pass; replay of `/tmp/vyper/session.vya` reports 0 ANOMALY lines; `valgrind`
+  0 definitely/indirectly lost.
+- [ ] Audible playback passes scrub-release reproduction in the editor (user
+  reports improved; awaiting full confirmation).
 - [x] `scripts/gate.sh action_log` passes; `valgrind` reports 0 definitely/indirectly
   lost and no invalid access (65 existing FFmpeg/Odin error contexts).
