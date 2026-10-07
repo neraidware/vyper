@@ -105,10 +105,6 @@ kf_track_name :: proc(t: ^Kf_Track) -> string {
 	return session_str_view(t.name)
 }
 
-kf_track_set_name :: proc(t: ^Kf_Track, s: string) {
-	t.name = session_str_intern(s)
-}
-
 // ---------------------------------------------------------------------------
 // Packed keys: a track whose keys carry a [KF_PACK_MAX]f32 payload instead of
 // a scalar, with a mask saying which lanes each knot keys. A consumer groups

@@ -1745,26 +1745,6 @@ find_clip_by_id :: proc(id: u64) -> (^Track, ^Clip, bool) {
 	return nil, nil, false
 }
 
-timeline_frame_at :: proc(frame: i64) -> Timeline_Frame {
-	for track_idx := 0; track_idx < len(timeline.tracks); track_idx += 1 {
-		candidate_track := &timeline.tracks[track_idx]
-		for i := 0; i < len(candidate_track.clips); i += 1 {
-			candidate := &candidate_track.clips[i]
-			if candidate.kind != .Video {
-				continue
-			}
-			if clip_visible_at(frame, candidate.timeline_start_frame, candidate.source_length_frames) {
-				return {
-					active_clip = candidate,
-					clip_frame = candidate.source_start_frame +
-					frame -
-					candidate.timeline_start_frame,
-				}
-			}
-		}
-	}
-	return {}
-}
 
 // move_clip_to_track moves the clip at (src_track, src_index) onto dst_track at
 // `start`, removing it from the source track. The placement is clamped so the

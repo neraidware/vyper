@@ -2588,8 +2588,13 @@ audio_init :: proc() -> bool {
 	// The periodic audio log has a period rather than being a flag, so it takes a
 	// number; the default is 2s. Below 50ms it would print faster than a terminal
 	// shows, which is not more information, it is less.
-	audio_rpt.log_ms = i64(diag_interval("VYPER_AUDIO_LOG", 2000))
-	audio_rpt.log_full = diag_flag("VYPER_AUDIO_FULL")
+	// The periodic audio log has a period rather than being a flag, so it takes a
+	// number; the default is 2s. Below 50ms it would print faster than a terminal
+	// shows, which is not more information, it is less.
+	when ODIN_DEBUG {
+		audio_rpt.log_ms = i64(diag_interval("VYPER_AUDIO_LOG", 2000))
+		audio_rpt.log_full = diag_flag("VYPER_AUDIO_FULL")
+	}
 	when ODIN_DEBUG {
 		audio_rpt.trace = diag_flag("VYPER_AUDIO_TRACE")
 	}

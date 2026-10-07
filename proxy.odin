@@ -121,8 +121,14 @@ proxy_hw_bitrate :: proc(out_w, out_h: c.int, fps: f64) -> i64 {
 // on a machine that HAS a working hardware encoder — otherwise the fallback
 // only ever runs where there is no choice to make.
 proxy_encoder_use_hw :: proc() -> bool {
-	override := os.get_env_alloc("VYPER_PROXY_ENCODER", context.temp_allocator)
-	return proxy_encoder_choice == .GPU && override != "cpu"
+	// No override means "use whatever proxy_encoder_choice says", which is the
+	// shipped behavior; only the CPU-forcing override is debug-only.
+	when ODIN_DEBUG {
+		if override := os.get_env_alloc("VYPER_PROXY_ENCODER", context.temp_allocator); override == "cpu" {
+			return false
+		}
+	}
+	return proxy_encoder_choice == .GPU
 }
 
 proxy_encoder: Proxy_Encoder = {

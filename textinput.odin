@@ -11,10 +11,7 @@ import sdl "vendor:sdl3"
 // cursor movement, selection, select-all, and system-clipboard copy/cut/paste.
 // ---------------------------------------------------------------------------
 
-// field buffer views
-text_input_bytes :: proc() -> []u8 {
-	return ti.buf[:]
-}
+// field buffer view
 text_input_string :: proc() -> string {
 	return string(ti.buf[:])
 }

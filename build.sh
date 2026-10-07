@@ -15,10 +15,42 @@ cd "$ROOT"
 # -debug, and prints a garbage pointer value under -debug -no-bounds-check. A
 # debug build that cannot catch the defect is the exact silent-wrong this file
 # exists to prevent, so the flag is simply not here.
+# A release build must not acquire a probe. This used to be enforced by copying
+# the tree to target/release-src without *_probe.odin and building there, and
+# that was two bugs waiting: `cp -a . target/release-src` recurses into target/
+# (which is inside `.`), and its errors were sent to /dev/null, so a partial copy
+# silently produced a release build from a source set missing whichever files the
+# copy happened to drop -- render.odin once, which took `Render_Geom_Prop` with
+# it and failed with three unrelated errors.
+#
+# The staging is also redundant now: every probe file is `when ODIN_DEBUG`-gated,
+# so a release build does not contain one regardless of what the source set is.
+# What the staging bought was the guarantee that adding an ungated probe would be
+# caught, so that guarantee is kept -- as a check, which cannot half-copy
+# anything.
+assert_probes_gated() {
+	local ungated=0 f
+	for f in *_probe.odin; do
+		[ -e "$f" ] || continue
+		if ! grep -q '^when ODIN_DEBUG {' "$f"; then
+			echo "error: $f has no file-scope 'when ODIN_DEBUG {' -- it would" >&2
+			echo "       be part of a release build. Gate it or rename it." >&2
+			ungated=$((ungated + 1))
+		fi
+	done
+	if [ "$ungated" -ne 0 ]; then
+		echo "error: $ungated probe file(s) are not gated out of release" >&2
+		exit 1
+	fi
+}
+
 MODE="${1:-debug}"
 case "$MODE" in
 debug) OPT=(-debug) ;;
-release) OPT=(-o:aggressive) ;;
+release)
+	OPT=(-o:aggressive)
+	assert_probes_gated
+	;;
 *)
 	echo "error: unknown build mode '$MODE' (expected: debug | release)" >&2
 	exit 1

@@ -26,7 +26,6 @@ import stb "vendor:stb/truetype"
 // main thread only touch render_progress, through atomic handoff — no mutex.
 // ---------------------------------------------------------------------------
 
-RENDER_FPS :: 60
 RENDER_AUDIO_RATE :: 48000
 // MAX_AUDIO_FRAME_SAMPLES caps the per-canvas-frame audio mix at the lowest
 // practical timeline rate (12 fps -> 4000 samples), leaving headroom for
@@ -2381,7 +2380,11 @@ enc_hw_upload_open :: proc(
 // path is byte-different by design (different chroma subsample), so it is
 // off by default.
 enc_convert_finish :: proc(e: ^Render_Enc, width, height: c.int) -> bool {
-	e.use_fast_yuv = os.get_env_alloc("VYPER_YUV", context.temp_allocator) == "1"
+	// Default off, so gating the read changes nothing a shipped build could do.
+	e.use_fast_yuv = false
+	when ODIN_DEBUG {
+		e.use_fast_yuv = os.get_env_alloc("VYPER_YUV", context.temp_allocator) == "1"
+	}
 	e.sws_rgb_yuv = sws.getContext(
 		width,
 		height,
@@ -3324,7 +3327,10 @@ render_worker_run :: proc() {
 	// percentages are now a per-thread CPU split (they sum to combined work,
 	// not wall time); the ratio is the signal. Declared in scope before the
 	// defer so the report can read them on any exit path.
-	split_timing := diag_flag("VYPER_FRAME_TIME")
+	split_timing := false
+	when ODIN_DEBUG {
+		split_timing = diag_flag("VYPER_FRAME_TIME")
+	}
 	render_split_timing = split_timing
 	render_probe_rect = split_timing
 	audio_ns, composite_ns, loop_start := i64(0), i64(0), i64(0)
@@ -4777,15 +4783,22 @@ render_start :: proc() {
 	// the kernel looks like a measurement instead of a misparse. Only an
 	// explicit 0 pins the kernel; anything else, including 1, leaves the GPU
 	// on, so the knob cannot be set backwards.
-	gpu_setting, gpu_found := os.lookup_env_alloc("VYPER_KEYED_GPU", context.temp_allocator)
-	keyed_gpu_enabled = !(gpu_found && gpu_setting == "0")
-	if !keyed_gpu_enabled {
-		fmt.println("render: VYPER_KEYED_GPU=0 -- pinned to the CPU resample kernel")
-	}
-	nv12_setting, nv12_found := os.lookup_env_alloc("VYPER_GPU_NV12", context.temp_allocator)
-	gpu_nv12_enabled = !(nv12_found && nv12_setting == "0")
-	if !gpu_nv12_enabled {
-		fmt.println("render: VYPER_GPU_NV12=0 -- pinned to encoder-side swscale")
+	// Both default ON, and the env var can only pin them off, so a release build
+	// gets exactly what an unconfigured build gets: only the ability to fall back
+	// to the CPU kernel goes away with the read.
+	keyed_gpu_enabled = true
+	gpu_nv12_enabled = true
+	when ODIN_DEBUG {
+		gpu_setting, gpu_found := os.lookup_env_alloc("VYPER_KEYED_GPU", context.temp_allocator)
+		keyed_gpu_enabled = !(gpu_found && gpu_setting == "0")
+		if !keyed_gpu_enabled {
+			fmt.println("render: VYPER_KEYED_GPU=0 -- pinned to the CPU resample kernel")
+		}
+		nv12_setting, nv12_found := os.lookup_env_alloc("VYPER_GPU_NV12", context.temp_allocator)
+		gpu_nv12_enabled = !(nv12_found && nv12_setting == "0")
+		if !gpu_nv12_enabled {
+			fmt.println("render: VYPER_GPU_NV12=0 -- pinned to encoder-side swscale")
+		}
 	}
 
 	// Render range.

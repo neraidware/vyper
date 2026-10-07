@@ -1994,9 +1994,9 @@ main :: proc() {
 	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
 	// the audio producer reads playback.rate for its atempo graph and cushion.
-	if v := os.get_env_alloc("VYPER_RATE", context.temp_allocator); v != "" {
-		playback.rate, _ = strconv.parse_f64(v)
-		when ODIN_DEBUG {
+	when ODIN_DEBUG {
+		if v := os.get_env_alloc("VYPER_RATE", context.temp_allocator); v != "" {
+			playback.rate, _ = strconv.parse_f64(v)
 			if vyper_trace {
 				fmt.printf("[main] VYPER_RATE -> playback.rate=%.2f\n", playback.rate)
 			}
@@ -2006,8 +2006,10 @@ main :: proc() {
 	// lines) used to go to a silenced ffmpeg subprocess (-loglevel error); it
 	// is in-process now, so quiet the library globally to match.
 	avutil.log_set_level(.Error)
-	if os.get_env_alloc("VYPER_HW_ENABLE", context.temp_allocator) == "1" {
-		hw_decode_enabled = true
+	when ODIN_DEBUG {
+		if os.get_env_alloc("VYPER_HW_ENABLE", context.temp_allocator) == "1" {
+			hw_decode_enabled = true
+		}
 	}
 	// Probes below drive real edit paths (split, delete, duplicate, track
 	// reorder) that record undo history, so the history must exist before any

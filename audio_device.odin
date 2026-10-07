@@ -114,12 +114,6 @@ Audio_Device :: struct {
 }
 audio_dev: Audio_Device
 
-// audio_bridge_frames_to_bytes converts bus frames to bytes. Only needed for the
-// preallocation assert below; the queue accounting is done in frames, not bytes.
-audio_bridge_bytes :: proc(frames: int) -> int {
-	return frames * AUDIO_BUS_FRAME_BYTES
-}
-
 // audio_device_data is miniaudio's data callback, on its own real-time thread.
 //
 // Real-time rules observed here, deliberately and not incidentally: no

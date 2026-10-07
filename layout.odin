@@ -125,7 +125,6 @@ TIMELINE_BAR_H :: f32(36)  // Timeline bottom bar height (snap toggles, zoom).
 INSPECTOR_MIN_W :: 296     // Right inspector column width bounds.
 INSPECTOR_MAX_W :: 356
 FIELD_H :: f32(30)         // Inline property field (X/Y/Scale/crop) height.
-LABEL_W :: f32(58)         // Text label width inside a property field.
 
 // Media bin grid (file-manager style thumbnail cells).
 MEDIA_CELL_W :: f32(120)  // Base cell width; columns derive from the bin width.

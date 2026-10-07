@@ -1777,41 +1777,47 @@ draw_preview_hud :: proc(
 	// (the negation was missing), which is true for essentially all playback and
 	// dumped the line every second during a perfectly healthy mix -- burying the
 	// one case it exists to report.
-	if dev - ph < -i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
-		rsync := sync.atomic_load(&audio_prod.resync)
-		prod := sync.atomic_load(&audio_prod.prod_frame)
-		holes := sync.atomic_load(&audio_rpt.silence_holes)
-		anchor := sync.atomic_load(&audio_prod.anchor_frame)
-		// dev_at is sampled after now, so a producer publish landing between the
-		// two reads makes it the NEWER stamp; saturate rather than underflow the
-		// unsigned delta into a nonsense age.
-		age_s := f64(-1.0)
-		if dev_at > 0 {
-			age_s = u64(dev_at) > now ? 0.0 : f64(now-u64(dev_at))/1e9
+	// The desync alarm. Rate-limited rather than flag-gated, which is exactly the
+	// shape a trace-flag sweep cannot see: it prints on a CONDITION, not behind a
+	// flag. Gated for the same reason as the traces -- it is a stdout diagnostic,
+	// and a shipped GUI has no console to print it to.
+	when ODIN_DEBUG {
+		if dev - ph < -i64(AUDIO_DESYNC_ALERT_SEC * fps) && now - audio_skew_diag.tick >= u64(1_000_000_000) {
+			rsync := sync.atomic_load(&audio_prod.resync)
+			prod := sync.atomic_load(&audio_prod.prod_frame)
+			holes := sync.atomic_load(&audio_rpt.silence_holes)
+			anchor := sync.atomic_load(&audio_prod.anchor_frame)
+			// dev_at is sampled after now, so a producer publish landing between the
+			// two reads makes it the NEWER stamp; saturate rather than underflow the
+			// unsigned delta into a nonsense age.
+			age_s := f64(-1.0)
+			if dev_at > 0 {
+				age_s = u64(dev_at) > now ? 0.0 : f64(now-u64(dev_at))/1e9
+			}
+			fmt.printf(
+				"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d age=%.1fs holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
+				f64(dev-ph)/fps,
+				f64(prod)/fps,
+				f64(prod-dev)/fps,
+				f64(anchor)/fps,
+				rsync, rsync-audio_skew_diag.prev_rsync,
+				sync.atomic_load(&audio_prod.provisioning) ? 1 : 0,
+				age_s,
+				holes, holes-audio_skew_diag.prev_holes,
+				audio_rpt.skip_nocov, audio_rpt.skip_nocov-audio_skew_diag.prev_ncov,
+				audio_rpt.skip_full, audio_rpt.skip_full-audio_skew_diag.prev_full,
+				audio_rpt.starve_ticks, audio_rpt.starve_ticks-audio_skew_diag.prev_wedge,
+				audio_rpt.rate_rebuilt, audio_rpt.rate_rebuilt-audio_skew_diag.prev_rebuilt,
+				playback.rate, playback.boost,
+			)
+			audio_skew_diag.tick = now
+			audio_skew_diag.prev_rsync = rsync
+			audio_skew_diag.prev_holes = holes
+			audio_skew_diag.prev_ncov = audio_rpt.skip_nocov
+			audio_skew_diag.prev_full = audio_rpt.skip_full
+			audio_skew_diag.prev_wedge = audio_rpt.starve_ticks
+			audio_skew_diag.prev_rebuilt = audio_rpt.rate_rebuilt
 		}
-		fmt.printf(
-			"[skew] d=%+.2fs prod=%+.2fs q=%+.2fs an=%+.2fs rsync=%d(+%d) prov=%d age=%.1fs holes=%d(+%d) ncov=%d(+%d) full=%d(+%d) wedge=%d(+%d) rebuilt=%d(+%d) rate=%.2f boost=%d\n",
-			f64(dev-ph)/fps,
-			f64(prod)/fps,
-			f64(prod-dev)/fps,
-			f64(anchor)/fps,
-			rsync, rsync-audio_skew_diag.prev_rsync,
-			sync.atomic_load(&audio_prod.provisioning) ? 1 : 0,
-			age_s,
-			holes, holes-audio_skew_diag.prev_holes,
-			audio_rpt.skip_nocov, audio_rpt.skip_nocov-audio_skew_diag.prev_ncov,
-			audio_rpt.skip_full, audio_rpt.skip_full-audio_skew_diag.prev_full,
-			audio_rpt.starve_ticks, audio_rpt.starve_ticks-audio_skew_diag.prev_wedge,
-			audio_rpt.rate_rebuilt, audio_rpt.rate_rebuilt-audio_skew_diag.prev_rebuilt,
-			playback.rate, playback.boost,
-		)
-		audio_skew_diag.tick = now
-		audio_skew_diag.prev_rsync = rsync
-		audio_skew_diag.prev_holes = holes
-		audio_skew_diag.prev_ncov = audio_rpt.skip_nocov
-		audio_skew_diag.prev_full = audio_rpt.skip_full
-		audio_skew_diag.prev_wedge = audio_rpt.starve_ticks
-		audio_skew_diag.prev_rebuilt = audio_rpt.rate_rebuilt
 	}
 	fs: u16 = FONT_SMALL
 	text_w := f32(len(label)) * f32(fs) * 0.6

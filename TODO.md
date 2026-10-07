@@ -7827,11 +7827,37 @@ as absent. The check that settled it was running the measurement the item claims
   whether a print survived. 615 sampled messages, 7 survived, all of them error
   paths (`graph_alloc failed`, `avformat_new_stream failed`, `project load
   failed:`) that should stay.
-- Release now contains NO diagnostic output at all: a release run of
-  sallyface.vyproj prints zero bracketed tags and writes nothing under
-  `/tmp/vyper`. Six env names remain, deliberately: `VYPER_HW_ENABLE`,
-  `VYPER_KEYED_GPU`, `VYPER_YUV`, `VYPER_GPU_NV12`, `VYPER_PROXY_ENCODER` and
-  `VYPER_RATE` select a backend, not a diagnostic.
+- The last six env knobs are gated too, so a release binary contains NO env var
+  name at all: `VYPER_HW_ENABLE`, `VYPER_KEYED_GPU`, `VYPER_YUV`,
+  `VYPER_GPU_NV12`, `VYPER_PROXY_ENCODER`, `VYPER_RATE`, plus
+  `VYPER_AUDIO_FULL`, `VYPER_AUDIO_LOG` and `VYPER_FRAME_TIME` which had been
+  missed because they feed `diag_flag`/`diag_interval` rather than a bare
+  `get_env_alloc`. Each keeps its default in release, so no shipped behavior
+  changes: `VYPER_KEYED_GPU` and `VYPER_GPU_NV12` default ON (the var could only
+  pin them off), the rest default off.
+- Two more that no flag sweep could see, because they print on a CONDITION
+  rather than behind a flag: the `[skew]` audio-desync alarm in gpu_draw.odin
+  (rate-limited to once a second, so it has no trace flag to key on) and an
+  unconditional one-shot `[md]` geometry dump. A release run of sallyface.vyproj
+  now prints ZERO bracketed tags and writes nothing under `/tmp/vyper`.
+- Release staging REMOVED. `build.sh release` used to copy the tree to
+  `target/release-src` without `*_probe.odin` and build there; `cp -a .
+  target/release-src` recurses into `target/` (which is inside `.`) and its
+  errors went to `/dev/null`, so a partial copy silently produced a release build
+  from a source set missing whichever files the copy dropped -- `render.odin`
+  once, which took `Render_Geom_Prop` with it and failed with three unrelated
+  errors. Both modes now build from `.`, and the guarantee the staging bought is
+  kept as a CHECK: release mode refuses to build if any `*_probe.odin` lacks a
+  file-scope `when ODIN_DEBUG`. A check cannot half-copy anything.
+- Dead code removed: procs `audio_bridge_bytes`, `kf_track_set_name`,
+  `text_input_bytes`, `timeline_frame_at`; constants `ICON_COUNT`,
+  `KF_DIAMOND_FILL_DISABLED`, `LABEL_W`, `RENDER_FPS` (superseded by
+  `project.frame_rate`). All verified unreferenced across the whole tree before
+  deletion.
+- Asserts stay in ALL builds, per AGENTS.md §6. 19 asserts sit inside
+  `when ODIN_DEBUG` blocks, and every one is inside a debug-only unit (11 in
+  probe files, 8 in the action log's gated recorder/player) where there is no
+  release counterpart to assert about. No app-code assert is gated.
 - `check` must keep `-debug` or this whole arrangement is unverifiable: without
   it `odin check` does not compile the `when ODIN_DEBUG` branch at all.
 - Gates green: check (debug and release), probe, dnd_probe, action_log,

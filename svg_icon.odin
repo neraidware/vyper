@@ -30,7 +30,6 @@ Icon_Id :: enum {
 	FinderFile,
 }
 
-ICON_COUNT :: 12
 ICON_RASTER :: 96 // rasterized texture size per icon (px).
 
 skip_back_svg := #load("icons/skip_back.svg")
