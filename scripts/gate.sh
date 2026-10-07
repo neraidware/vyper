@@ -188,10 +188,17 @@ require_fresh_binary() {
 # So the memory gate gets its own binary at the baseline x86-64 target, built
 # from the same flags via build.sh (AGENTS.md §10: flags live in the script).
 # Name the output as VYPER_OUT rather than hardcoding a second odin invocation.
+#
+# The mode is named explicitly rather than left to build.sh's default. Debug is
+# now that default, but this gate NEEDS frame pointers and symbols to unwind --
+# an optimized build omits frame pointers, so every allocation trace comes back
+# as "calloc <- runtime::heap_allocator_proc <- ??? <- ???", which names the
+# defect site no better than no trace at all. Naming it means a later flip of the
+# default cannot quietly downgrade the memory gate into one that reads nothing.
 VALGRIND_BIN=./vyper-valgrind
 
 build_valgrind_binary() {
-	VYPER_OUT=vyper-valgrind VYPER_MICROARCH= VYPER_DEBUG=1 ./build.sh
+	VYPER_OUT=vyper-valgrind VYPER_MICROARCH= ./build.sh debug
 }
 
 # Same freshness contract as require_fresh_binary, with one deliberate

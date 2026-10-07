@@ -7719,3 +7719,26 @@ as absent. The check that settled it was running the measurement the item claims
 - Still open: the actual audio repeat is not fixed. This makes it reproducible,
   which is the input the fix needs; the next step is recording the session that
   shows it and reading the producer trace from the replay.
+
+## Implemented — the default build is debug; `build.sh release` is the fast one (2026-10-06)
+
+- `./build.sh` now builds debug: unoptimized (`-debug` sets `-o:none`), with
+  frame pointers and symbols. `./build.sh release` builds `-o:aggressive`. An
+  unknown mode is rejected up front, before the shader and C steps, instead of
+  after them.
+- Why default to debug: it is the build a change should be measured against. It
+  keeps the bounds checks, so a bad index is a loud failure instead of a
+  plausible wrong number, and it keeps the frame pointers the memory gate needs to
+  unwind. An optimized default meant every gate ran without them.
+- `-no-bounds-check` is gone from both modes. It was there for the release build,
+  but passing it alongside `-debug` CANCELS the debug build's bounds checking —
+  checked, not assumed: an index of 9 into a `[4]int` reports "Index 9 is out of
+  range 0..<4" under `-debug`, and prints a garbage pointer value under
+  `-debug -no-bounds-check`. A debug build that cannot catch the defect is the
+  silent-wrong AGENTS.md is about, so the flag is simply not in the script.
+- The memory gate names its mode explicitly (`./build.sh debug` with
+  `VYPER_MICROARCH=`) instead of relying on the default plus `VYPER_DEBUG=1`.
+  Same binary today; the point is that a later flip of the default cannot quietly
+  downgrade the memory gate to one that reads nothing. Still clean: 0 definitely
+  lost, 0 indirectly lost.
+- Windows CI is unaffected — it invokes `odin build` directly and never set `-o:`.

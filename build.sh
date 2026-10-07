@@ -4,6 +4,28 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+# The build mode. Debug is the default because that is what a change should be
+# measured against: it is unoptimized, it has frame pointers and symbols, and it
+# keeps the bounds checks that turn a bad index into a loud failure instead of a
+# plausible wrong number. `./build.sh release` is the optimized build.
+#
+# There is deliberately no -no-bounds-check in either mode. Passing it alongside
+# -debug cancels the debug build's bounds checking -- verified here, not assumed:
+# an index of 9 into a [4]int reports "Index 9 is out of range 0..<4" under
+# -debug, and prints a garbage pointer value under -debug -no-bounds-check. A
+# debug build that cannot catch the defect is the exact silent-wrong this file
+# exists to prevent, so the flag is simply not here.
+MODE="${1:-debug}"
+case "$MODE" in
+debug) OPT=(-debug) ;;
+release) OPT=(-o:aggressive) ;;
+*)
+	echo "error: unknown build mode '$MODE' (expected: debug | release)" >&2
+	exit 1
+	;;
+esac
+echo "==> Mode: $MODE"
+
 echo "==> Compiling shaders"
 
 for shader in \
@@ -91,22 +113,14 @@ OUT="${VYPER_OUT:-vyper}"
 # __$startup_runtime, BEFORE main. Valgrind then reports "0 definitely lost"
 # for a process that allocated nothing, and the memory gate passes while
 # measuring nothing. Setting VYPER_MICROARCH= (empty) drops to the baseline
-# x86-64 target Valgrind does understand; -o:aggressive is not arch-specific
-# and stays.
+# x86-64 target Valgrind does understand. The memory gate builds the default
+# (debug) mode this way, which is what gives memcheck the frame pointers and
+# symbols to unwind: an optimized build omits frame pointers, so every
+# allocation trace comes back as "calloc <- runtime::heap_allocator_proc <- ???
+# <- ???", which names the defect site no better than no trace at all.
 MICROARCH=(-microarch:native)
 if [ "${VYPER_MICROARCH-native}" != "native" ]; then
 	MICROARCH=()
-fi
-
-# The release build omits frame pointers, so memcheck cannot unwind Odin frames:
-# every allocation trace came back as "calloc <- runtime::heap_allocator_proc
-# <- ??? <- ???", which names the defect site no better than no trace at all.
-# -debug supplies frame pointers and symbols, so a leak points at the proc that
-# allocated it. Set alongside VYPER_MICROARCH= by the memory gate; -debug and
-# -o:aggressive are mutually exclusive, so the optimization level follows.
-OPT=(-o:aggressive)
-if [ "${VYPER_DEBUG-0}" != "0" ]; then
-	OPT=(-debug)
 fi
 
 # mold cuts link time noticeably on this binary, but it is not installed on
@@ -134,7 +148,6 @@ odin build . \
     -out:"$OUT" \
     "${MICROARCH[@]}" \
     "${OPT[@]}" \
-    -no-bounds-check \
     -extra-linker-flags:"$MOLD_FLAG --sysroot=/ -lavcodec -lavformat -lavutil -lswresample -lswscale -lgio-2.0 -lglib-2.0"
 
 echo "==> Done: ./$OUT"
