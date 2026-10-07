@@ -7884,3 +7884,63 @@ as absent. The check that settled it was running the measurement the item claims
 - Consequence to decide: the debug build is now the default, so this gate fails
   by default until the decode path is fixed. Options are to fix the decode
   defect (correct), or to keep the image probe running against a release build.
+
+## Implemented — one build path, and the build variability removed with it (2026-10-06)
+
+Sources moved into the `vyper/` package (`vyper/vyper.odin` is `package vyper`'s
+`main`), `build.sh` is gone, and `build.odin` is the single build for the dev
+machine, the nix package, and Windows CI. `./build.odin [debug|release|install]`
+also replaced the `-file` incantation for install, via a `#!/usr/bin/env -S sh -c`
+shebang, so there is no second way to spell the same build.
+
+**Six sources of variability removed, each of which made one source tree produce
+more than one binary:**
+
+1. **`-microarch:native`** — codegen followed whatever CPU happened to build it,
+   so the binary was not portable, and under Valgrind it died with SIGILL in
+   `math_big::initialize_constants` before `main`, which made the memory gate
+   report "0 definitely lost" for a process that had allocated nothing. The knob
+   and the gate's `VYPER_MICROARCH=` workaround both went with it.
+2. **The linker was chosen silently** — the same code picked mold where it
+   existed and the compiler default elsewhere, and never said which. It now uses
+   mold wherever it is on PATH, prints `linker: <name>` on every build, and takes
+   `VYPER_LINKER` for the exceptions (nix pins gold there, because mold and lld
+   both fail to resolve Odin's absolute `-l:` namespecs inside the sandbox).
+   A missing mold still falls back, which costs link speed and nothing else.
+   `target_bench` keeps `-microarch:native`, the one place that flag survives:
+   a benchmark measuring anything but the code this machine will run is not
+   measuring what it claims.
+3. **Shaders compiled conditionally** — an existing `.spv` newer than its source
+   was reused, so whether the shaders were recompiled depended on what was
+   already in the tree, and the committed `.spv` was an input rather than a
+   cache. Every shader is compiled every build, and `glslangValidator` is now
+   required: it used to be silently skipped when absent, which is the one way the
+   stale-SPIR-V failure this step prevents could still happen.
+4. **C objects rebuilt conditionally** — same shape, same fix: both are compiled
+   every build. Verified idempotent (recompiling leaves the tree clean).
+5. **CI compiled with a different Odin than the dev machine** —
+   `.github/workflows/windows.yml` pinned `dev-2026-07a` while `.mise.toml`
+   tracked `dev-2026-09`. CI was validating a build two months behind the one the
+   gates run, which defeats the point of a build gate. Now `dev-2026-09`.
+6. **The nix and Windows build steps were hand-copied** — the shader lists had
+   already drifted (CI named two shaders that no longer exist and missed both
+   nv12 stages; both nix derivations missed nv12 too). Both now call `build.odin`
+   and hold only what the sandbox knows: the linker, and on Windows the MSVC
+   `/LIBPATH` for the import libraries CI stages.
+
+**Known floor, measured rather than assumed:** the binary is still not
+byte-reproducible. Three builds of an unchanged tree with identical flags produce
+three different binaries, differing from the first bytes of `.text` onward —
+a permutation of emitted code, not scattered values. Ruled out by experiment, not
+by inspection: not the build script (reproduces from a bare `odin build`), not
+shader or C recompilation (SPIR-V is identical and recompiling is idempotent),
+not ASLR (identical under `setarch -R`), not thread count (identical under
+`-thread-count:1`, and `taskset` does not serialize LLVM's threads anyway), and
+not microarch or the linker (both pinned above). So it is codegen order inside
+the compiler. Worth an upstream report against `dev-2026-09`; not worth
+chasing here, since it is a layout permutation that does not change what the
+program does, and the cross-machine divergence that did matter is fixed.
+
+Gates: `check`, `build`, `action_log`, `probe`, `smoke` and `valgrind` all pass
+(0 definitely lost, 0 indirectly lost, 65 error contexts of the usual
+FFmpeg/Odin noise).

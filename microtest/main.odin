@@ -1,6 +1,6 @@
 package main
 
-import clay "../vendor/clay-odin"
+import clay "../vyper/clay-odin"
 import "core:fmt"
 import "core:c"
 

@@ -28,7 +28,7 @@ PROJ=${1:?usage: scripts/audio-verify.sh <project.vyproj> [out.mp4]}
 OUT=${2:-/tmp/audio-verify-$$.mp4}
 [ -f "$PROJ" ] || { echo "no such project: $PROJ" >&2; exit 1; }
 
-BIN=./vyper
+BIN=./target/vyper
 [ -x "$BIN" ] || { echo "build first: scripts/gate.sh build" >&2; exit 1; }
 
 echo "==> exporting $PROJ"

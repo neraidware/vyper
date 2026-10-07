@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 env:
-  ODIN_VERSION: dev-2026-07a
+  ODIN_VERSION: dev-2026-09
   SDL3_VER: 3.4.14
 
 jobs:
@@ -21,6 +21,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Same compiler line as .mise.toml. This was dev-2026-07a while the dev
+      # machine tracked dev-2026-09, so CI was validating a build two months
+      # behind the one the gates actually run -- a compiler bump changes codegen,
+      # which is exactly what a build gate is supposed to catch.
       - name: Setup Odin
         uses: laytan/setup-odin@v2
         with:
@@ -70,53 +74,29 @@ jobs:
             Copy-Item "deps\lib\$l.lib" "vendor\ffmpeg\$l\$l.lib" -Force
           }
 
-      - name: Compile shaders (best-effort, .spv are committed)
-        shell: pwsh
-        run: |
-          # Shader .spv artifacts are already committed; recompile here when a
-          # glslangValidator is available (e.g. Vulkan SDK on the runner) so a
-          # shader change gets caught, but do not fail the build without it.
-          if (Get-Command glslangValidator -ErrorAction SilentlyContinue) {
-            foreach ($src in @("rounded_rect.vert","rounded_rect.frag","text.vert","text.frag","preview.frag")) {
-              glslangValidator -V "shaders\$src" -o "shaders\$src.spv"
-              if ($LASTEXITCODE -ne 0) { throw "glslang failed on $src" }
-            }
-          } else {
-            Write-Host "glslangValidator not found; using committed .spv files"
-          }
-
+      # build.odin drives cl and lib on Windows, so MSVC has to be on PATH
+      # before it runs.
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Compile nanosvg (SVG renderer)
-        shell: pwsh
-        run: |
-          # Instantiate the vendored parser+rasterizer. Mirrors the .o step in
-          # flake.nix; nerd receives it through foreign import (vendor/nanosvg).
-          cl /nologo /O2 /c vendor\nanosvg\nanosvg.c /Fovendor\nanosvg\nanosvg.obj
-
-      - name: Compile clay (UI layout library)
-        shell: pwsh
-        run: |
-          # Instantiate the vendored single-header clay into its link archive,
-          # the same slot the committed prebuilt used. Mirrors the flake.nix
-          # step so the shipped build always matches vendor/clay.h. The archive
-          # dir is NOT git-tracked (prebuilts were removed), so create it.
-          cl /nologo /O2 /c vendor\clay.c /Fovendor\clay.obj
-          New-Item -ItemType Directory -Force clay-odin\windows | Out-Null
-          lib /nologo /OUT:clay-odin\windows\clay.lib vendor\clay.obj
-
+      # The build is build.odin, the same program the dev machine and the nix
+      # package use. It picks cl/lib and the MSVC link line by itself; the only
+      # thing it cannot know is where CI staged the SDL3/ffmpeg import libs, so
+      # that path is handed over. Its shader list is also the real one: the list
+      # that used to live here had drifted and named two shaders that no longer
+      # exist while missing both nv12 stages.
       - name: Build vyper
         shell: pwsh
         run: |
           # Odin's vendored SDL3 / ffmpeg bindings reference the .lib import libs
-          # Run odin. SDL3 is imported via the `{ "SDL3.lib" }` form, which is passed to
-          # link.exe as a name and resolved via /LIBPATH -> deps\lib. ffmpeg import
-          # libs were dropped into vendor/ffmpeg/<lib>/ by the previous step.
-          odin build . -out:vyper.exe `
-            -define:FFMPEG_LINK=system `
-            -extra-linker-flags:"/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup" `
-            -show-timings
+          # by name. SDL3 is imported via `{ "SDL3.lib" }`, passed to link.exe as
+          # a name and resolved via /LIBPATH -> deps\lib. ffmpeg import libs were
+          # dropped into vendor/ffmpeg/<lib>/ by the previous step, and
+          # FFMPEG_LINK=system is what selects them.
+          $env:VYPER_LINK_FLAGS = "/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
+          $env:VYPER_OUT = "vyper.exe"
+          ./build.odin release
+          if ($LASTEXITCODE -ne 0) { throw "build.odin failed (exit $LASTEXITCODE)" }
 
       - name: Stage dist
         shell: pwsh

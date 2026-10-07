@@ -1,0 +1,474 @@
+package vyper
+
+import clay "clay-odin"
+import sdl "vendor:sdl3"
+
+// ---------------------------------------------------------------------------
+// SDL event handling: keyboard shortcuts, text input routing, and mouse-wheel
+// scroll zones. Runs every frame before the mouse-position handling; the raw
+// pointer state itself is read by interaction.odin's read_mouse_input.
+// ---------------------------------------------------------------------------
+
+// handle_sdl_events drains the SDL event queue: window close, keyboard (text
+// fields, then app shortcuts), text input, wheel scrolling per widget, and OS
+// file drops. Sets *running = false on a quit/close event. Nothing here depends
+// on the current mouse position.
+//
+// This is the app's ONLY SDL poll site, which is what makes kbd.drain a
+// meaningful scope: one call empties the queue, so anything that needs to know
+// whether two events arrived in the same burst of input compares drain ids.
+//
+// A replay takes the place of the poll, not of the dispatch: the recorded
+// events are fed through dispatch_sdl_event, the same proc the live loop calls,
+// so a replayed session runs the input code a user runs rather than a second
+// implementation of it.
+handle_sdl_events :: proc(running: ^bool) {
+	kbd_begin_drain()
+	event: sdl.Event
+	replayed := false
+	when ODIN_DEBUG {
+		// A replay replaces the poll, not the dispatch: its recorded events go
+		// through dispatch_sdl_event, the same proc the live loop calls.
+		replayed = action_replaying()
+		if replayed {
+			action_replay_frame(running)
+		}
+	}
+	if !replayed {
+		for sdl.PollEvent(&event) {
+			// Recorded before dispatch: dispatch can start a text field, and the
+			// opener keypress must still be in the log.
+			when ODIN_DEBUG {
+				action_record_event(&event)
+			}
+			dispatch_sdl_event(&event, running)
+		}
+	}
+	// Between drains, never inside one. SDL documents that activating an IME
+	// "can prevent some key press events from being passed through", so a field
+	// that opened during this drain gets its text input here — with the opening
+	// keypress already consumed, and with no text input on to echo it.
+	text_input_flush_pending()
+}
+
+// dispatch_sdl_event routes one event to its owner. Split out of the poll loop
+// so the action-log replay hands its recorded events to exactly this code.
+//
+// The event cases here and the ones action_record_event writes must stay in
+// step: an event acted on but not recorded is an action the log silently drops.
+dispatch_sdl_event :: proc(event: ^sdl.Event, running: ^bool) {
+	#partial switch event.type {
+	case .QUIT, .WINDOW_CLOSE_REQUESTED:
+		running^ = false
+	case .KEY_UP:
+		// The app had no key-up path at all, so "is this key down" was
+		// unanswerable and hold-to-repeat could not be told apart from a
+		// fresh press. Recorded here and consumed by nobody else: a key
+		// release has no meaning to the UI or to the fields.
+		kbd_note_key(event.key.key, false)
+	case .KEY_DOWN:
+		kbd_note_key(event.key.key, true)
+		route_key_down(event.key.key, event.key.mod, event.key.repeat)
+	case .TEXT_INPUT:
+		// No echo suppression, and none is needed: a field enables SDL text
+		// input BETWEEN drains, never while the keypress that opened it is
+		// being handled, so the opener cannot produce a text event for
+		// itself. See text_input_begin.
+		if ti.active {
+			text_input_insert(string(event.text.text))
+		} else if edit_state.field != .None {
+			for ch in string(event.text.text) {
+				// Only accept printable ASCII that makes sense in a number.
+				if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
+					edit_append(u8(ch))
+				}
+			}
+		}
+	case .MOUSE_WHEEL:
+		handle_mouse_wheel(event.wheel)
+	case .DROP_BEGIN, .DROP_POSITION, .DROP_FILE, .DROP_COMPLETE, .DROP_TEXT:
+		handle_file_drop_event(event^)
+	}
+}
+// ---------------------------------------------------------------------------
+// Key routing: one entry point, ordered owners, one place that says who gets
+// a key first.
+//
+// The order IS the policy, so it is written down once here instead of being
+// implied by the nesting depth of an if/else chain:
+//
+//	1. the text field (ti.active)
+//	2. the playhead/number field (edit_state.field)
+//	3. the app — global shortcuts and continuous controls
+//
+// Each owner returns whether it CLAIMED the key, and a claimed key stops
+// travelling. There is one path to the app layer, and a field is on it, so a
+// key that opens a field is decided exactly once. Nothing downstream needs to
+// undo it: the field's text input is enabled after the drain, not during the
+// keypress, so the opener never echoes into the field it opened.
+// ---------------------------------------------------------------------------
+
+route_key_down :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool {
+	if field_claims_key(key, mods) {
+		return true
+	}
+	if edit_field_claims_key(key) {
+		return true
+	}
+	return app_claims_key(key, mods, repeat)
+}
+
+// field_claims_key handles a key while a text field has focus.
+//
+// It claims EVERY key, not merely the ones it acts on. That is the
+// pre-existing behaviour and it is preserved deliberately: the old if/else had
+// no exit from this branch, so with the prompt open a shortcut key such as "u"
+// did nothing instead of falling through to toggle links. Letting unhandled
+// keys reach the app is arguably the better behaviour, but it is a behaviour
+// CHANGE, and this pass is a refactor — it is a one-line edit here once
+// someone decides they want it.
+field_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod) -> bool {
+	if !ti.active {
+		return false
+	}
+	// Modifiers come off the event, never sdl.GetModState(): the event
+	// snapshots what was held at key-down, the global state is sampled at
+	// handling time. They diverge whenever the main thread stalls long enough
+	// for events to queue and the user releases or changes a modifier before
+	// the queue drains.
+	shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
+	ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
+	// Cmdline match navigation: Tab/arrows move the highlighted row; handled
+	// here so the generic text field stays generic.
+	if ti.input_type == TI_CMDLINE {
+		switch key {
+		case sdl.K_TAB:
+			cmdline_match_navigate(shift ? -1 : 1)
+			return true
+		case sdl.K_UP:
+			cmdline_match_navigate(-1)
+			return true
+		case sdl.K_DOWN:
+			cmdline_match_navigate(1)
+			return true
+		}
+	}
+	// Finder navigation: Tab/Up/Down move the highlight, Enter descends into
+	// the selected directory or opens the selected file — Enter never commits
+	// the field (the finder stays open across a descend), so it is handled
+	// before the generic commit path. In Save mode the field is a name, so
+	// Enter saves that name; the row only picks "commit" over "descend". Esc
+	// still cancels through the text field.
+	if ti.input_type == TI_FINDER {
+		switch key {
+		case sdl.K_TAB:
+			finder_navigate(shift ? -1 : 1)
+			return true
+		case sdl.K_UP:
+			finder_navigate(-1)
+			return true
+		case sdl.K_DOWN:
+			finder_navigate(1)
+			return true
+		case sdl.K_RETURN, sdl.K_RETURN2:
+			finder_refresh()
+			finder_enter()
+			return true
+		}
+	}
+	r := text_input_handle_key(key, shift, ctrl)
+	if r == .Commit {
+		if ti.input_type == TI_PLAYHEAD {
+			apply_playhead_time()
+		} else if ti.input_type == TI_CMDLINE {
+			// Rewrites the buffer to `open <highlighted>` when a match row is
+			// selected, so the normal command path opens that file; otherwise
+			// leaves typed text alone.
+			cmdline_match_apply_selection()
+			apply_command()
+		} else {
+			apply_rename()
+		}
+	} else if r == .Cancel {
+		if ti.input_type == TI_FINDER {
+			// Esc dismissed the finder's filter field.
+			finder_close()
+		} else if ti.is_create {
+			// Aborted a clip-create dialog: drop the clip that was
+			// temporarily inserted so no nameless clip remains.
+			delete_selected_clip_raw()
+			ti.is_create = false
+		}
+	}
+	return true
+}
+
+// edit_field_claims_key handles the inline playhead/number field. Unlike the
+// text field it does NOT swallow the keyboard: it takes three keys and passes
+// the rest down to the app, so a shortcut still works while the playhead is
+// being typed into. That asymmetry is pre-existing and intentional — a number
+// field is a single digit you nudge, not a document you type into.
+//
+// It also claims ONLY while a field is actually open. Two of the three keys it
+// takes are bound globally too, so without this guard both died in here:
+// Backspace ran edit_backspace against a zero-length buffer, did nothing
+// visible, and returned true — the ripple delete never fired. Escape never
+// reached escape_dismiss, so no menu or dialog could be dismissed from the
+// keyboard. The old `case:` comment claimed the router checked first;
+// route_key_down checks the TEXT field (ti.active) and nothing else, because the
+// number field was never expected to be reachable while closed.
+edit_field_claims_key :: proc(key: sdl.Keycode) -> bool {
+	if edit_state.field == .None {
+		return false
+	}
+	switch key {
+	case sdl.K_BACKSPACE:
+		edit_backspace()
+	case sdl.K_RETURN, sdl.K_RETURN2:
+		edit_commit()
+	case sdl.K_ESCAPE:
+		edit_cancel()
+	case:
+		// A bare `case:` is Odin's default clause in a value switch. Reached
+		// when a field IS open and the key is not one of its three, so the
+		// fallback is live: it lets the key travel on to the app layer.
+		return false
+	}
+	return true
+}
+
+// app_claims_key is the last owner: global shortcuts plus the continuous
+// controls. Reached only when no field took the key.
+app_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool {
+	if key == sdl.K_ESCAPE && !repeat {
+		escape_dismiss()
+		return true
+	}
+	// Locked while an export runs (the same reason the mouse editing entry
+	// points are gated in interaction_post_build): the render is writing the
+	// snapshot it committed at render_start, so a playhead move or an edit now
+	// would change neither the file nor the preview. ESC above still dismisses,
+	// and the Cancel button is a live mouse target.
+	if render_is_busy() {
+		return true
+	}
+	claimed := false
+	// Continuous actions run on the initial press AND on auto-repeat, which is
+	// what makes shuttle work: a tap nudges one step, holding it keeps
+	// nudging. key_down_now covers both halves — key_press alone would move
+	// only on the tap, key_repeat alone only while held.
+	if key_down_now(sdl.K_H) {
+		jog_playback(-1)
+		claimed = true
+	}
+	if key_down_now(sdl.K_L) {
+		jog_playback(1)
+		claimed = true
+	}
+	// A bound action fires on the initial press only. Gating on the event's
+	// repeat flag rather than on key_press() keeps this identical to the
+	// pre-router code; the two agree for a real key press, and the event flag
+	// is what the old branch tested.
+	if repeat {
+		return claimed
+	}
+	act := action_for(key, mods)
+	if act == .None {
+		return claimed
+	}
+	dispatch_action(act)
+	return true
+}
+
+dispatch_action :: proc(act: Action) {
+	switch act {
+	case .Open_Command_Line:
+		// Opens empty, and needs no echo cleanup: the field's SDL text input is
+		// enabled after this drain (text_input_flush_pending), not during this
+		// keypress, so no text event is ever generated for the ":" itself.
+		text_input_begin("", TI_CMDLINE, 0)
+	case .Toggle_Help:
+		// Always-available shortcut reference.
+		editor_flags.help_open = !editor_flags.help_open
+	case .Undo:
+		undo_undo()
+	case .Redo:
+		undo_redo()
+	case .Toggle_Playback:
+		toggle_playback()
+	case .Play_Project_Area:
+		play_project_area()
+	case .Begin_Rename:
+		begin_clip_rename()
+	case .Split_At_Playhead:
+		split_clip_at_playhead()
+	case .Toggle_Links:
+		// Toggle link state across the selection: a lone clip unlinks its
+		// group; several Shift+clicked clips join into one link group (or all
+		// split apart when already linked).
+		toggle_links_for_selection()
+	case .Delete_At_Playhead:
+		if !delete_selected_keyframe() {
+			// Delete the selected clip's timeline area and close the gap
+			// (ripple). A linked clip rips the WHOLE group: every member's own
+			// span on its own track, so a ripple cut never leaves the partner
+			// clip behind (rippling only the selected member's region would
+			// strand the rest).
+			if tr, clip, ok := selected_clip(); ok {
+				if clip.link_id != 0 {
+					ripple_delete_linked_group(clip.link_id)
+				} else {
+					ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
+				}
+			}
+		}
+	case .Delete_Selection:
+		if !delete_selected_keyframe() {
+			// Delete the clip raw, nothing else.
+			delete_selected_clip_raw()
+		}
+	case .Key_All_Modified:
+		// Keys every geometry lane that was edited without a keyframe, as one
+		// undo node, grouped into packed sections wherever the section has not
+		// already been unwrapped into per-lane tracks. Guarded on
+		// clip_geom_can_key_all_modified: pending alone is not enough, the
+		// playhead has to be on the clip, since the keys are written there.
+		if sel, ok := transformable_selected(); ok && clip_geom_can_key_all_modified(sel) {
+			clip_geom_key_all_modified(sel)
+		}
+	case .Set_In_Point:
+		// Set the render-range start at the playhead; collapsing the range to
+		// a single frame clears it.
+		project.start_frame = playhead.frame
+		if project.end_frame == playhead.frame {
+			project.start_frame = -1
+			project.end_frame = -1
+		}
+	case .Set_Out_Point:
+		project.end_frame = playhead.frame
+		if project.start_frame == playhead.frame {
+			project.start_frame = -1
+			project.end_frame = -1
+		}
+	case .None:
+	}
+}
+
+
+// MOUSE_WHEEL routes by what is under the cursor: the file finder, the media
+// bin, the inspector stack, the track list, the timeline, the crop box, or the
+// preview camera. The target tests are mutually exclusive, so the first hit
+// returns and the rest fall away -- one wheel event steers exactly one view.
+// The `break`s here used to leave the switch; a return is the same exit.
+handle_mouse_wheel :: proc(wheel: sdl.MouseWheelEvent) {
+	// Wheel over the file finder moves its selection (like the cmdline
+	// match list): up = earlier rows, down = later.
+	fc := clay.GetElementData(clay.ID("FinderColumn")).boundingBox
+	if fc.width > 0 && wheel.mouse_x >= fc.x && wheel.mouse_x <= fc.x + fc.width &&
+		wheel.mouse_y >= fc.y && wheel.mouse_y <= fc.y + fc.height {
+		if wheel.y != 0 {
+			finder_navigate(-int(wheel.y))
+			return
+		}
+	}
+	// Scroll over the media bin scrolls its active view: the thumbnail
+	// grid in the Media Bin view, the undo tree in the Undo Tree view.
+	mb := clay.GetElementData(clay.ID("MediaBin")).boundingBox
+	if mb.width > 0 && wheel.mouse_x >= mb.x && wheel.mouse_x <= mb.x + mb.width &&
+		wheel.mouse_y >= mb.y && wheel.mouse_y <= mb.y + mb.height {
+		if wheel.y != 0 {
+			if panel_views.media_bin_view == .Undo {
+				undo_hist.view_scroll = clamp(
+					undo_hist.view_scroll - f32(wheel.y) * TIMELINE_SCROLL_STEP,
+					0,
+					undo_view_max_scroll(),
+				)
+			} else if len(media_bin.assets) > 0 {
+				panel_views.media_bin_scroll = clamp(panel_views.media_bin_scroll - f32(wheel.y) * MEDIA_BIN_SCROLL_STEP, 0, media_bin_max_scroll())
+			}
+			return
+		}
+	}
+	// Scroll over the inspector column scrolls its card stack when
+	// the cards outgrow the viewport.
+	ic := clay.GetElementData(clay.ID("InspectorColumn")).boundingBox
+	if ic.height > 0 && wheel.mouse_x >= ic.x && wheel.mouse_x <= ic.x + ic.width &&
+		wheel.mouse_y >= ic.y && wheel.mouse_y <= ic.y + ic.height {
+		if wheel.y != 0 {
+			scrollbars.inspector.offset = clamp(scrollbars.inspector.offset - f32(wheel.y) * TIMELINE_SCROLL_STEP, 0, inspector_max_scroll())
+			return
+		}
+	}
+	// Vertical wheel over the track LANES (and the scrollbar strip
+	// beside them) scrolls the track list, exactly like the media
+	// bin. The ruler strip above still zooms on wheel.
+	ta := clay.GetElementData(clay.ID("TrackArea")).boundingBox
+	if ta.height > 0 && wheel.mouse_x >= ta.x && wheel.mouse_x <= ta.x + ta.width &&
+		wheel.mouse_y >= ta.y && wheel.mouse_y <= ta.y + ta.height {
+		if wheel.y != 0 {
+			timeline_view.top = clamp(timeline_view.top - f32(wheel.y) * TIMELINE_SCROLL_STEP, 0, timeline_tracks_max_top())
+			return
+		}
+	}
+	// Scroll over the timeline zooms horizontally, anchored at the playhead.
+	tlb := clay.GetElementData(clay.ID("ClipTimeline")).boundingBox
+	if len(timeline.tracks) > 0 && wheel.mouse_x >= tlb.x && wheel.mouse_x <= tlb.x + tlb.width &&
+		wheel.mouse_y >= tlb.y && wheel.mouse_y <= tlb.y + tlb.height {
+		if wheel.y != 0 {
+			ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
+			anchor := f32(playhead.frame - i64(timeline_view.start)) * timeline_view.zoom
+			anchor_frame := timeline_view.start + anchor / timeline_view.zoom
+			new_zoom := clamp(timeline_view.zoom * (1 + 0.1 * wheel.y), TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+			if new_zoom != timeline_view.zoom {
+				timeline_view.start = anchor_frame - anchor / new_zoom
+				timeline_view.start = clamp(timeline_view.start, 0, f32(timeline_duration()))
+				timeline_view.zoom = new_zoom
+			}
+		}
+		return
+	}
+	// Alt+Scroll over the preview crop-zooms the selected clip: the clip's
+	// source window magnifies about the box center while the visible box
+	// stays put, committed as one "Zoom clip" undo node per wheel event.
+	pb := clay.GetElementData(clay.ID("Preview")).boundingBox
+	if wheel.mouse_x >= pb.x && wheel.mouse_x <= pb.x + pb.width &&
+		wheel.mouse_y >= pb.y && wheel.mouse_y <= pb.y + pb.height {
+		if wheel.y != 0 {
+			// The one deliberate exception to "modifiers off the
+			// event": SDL's MouseWheelEvent carries no `mod` field at
+			// all (see vendor:sdl3 KeyboardEvent, which has one, and
+			// MouseWheelEvent, which does not), so there is nothing to
+			// read but the live state. Do not "fix" this to match the
+			// key handlers — it is not the same situation.
+			mods := sdl.GetModState()
+			if sdl.KeymodFlag.LALT in mods || sdl.KeymodFlag.RALT in mods {
+				if sel, ok := transformable_selected(); ok && sel.kind != .Text {
+					factor := 1 + 0.1 * wheel.y
+					if clip_zoom_by(sel, factor, false) {
+						undo_begin()
+						clip_zoom_by(sel, factor, true)
+						undo_push(.Transform, "Zoom clip")
+					}
+					return
+				}
+			}
+			// Scroll over the preview zooms the camera, keeping the point under
+			// the cursor fixed.
+			canvas := preview_canvas(pb)
+			mx_c := wheel.mouse_x - (canvas.x + canvas.width / 2)
+			my_c := wheel.mouse_y - (canvas.y + canvas.height / 2)
+			old_zoom := preview_cam.zoom
+			new_zoom := clamp(old_zoom * (1 + 0.1 * wheel.y), PREVIEW_CAM_MIN_ZOOM, PREVIEW_CAM_MAX_ZOOM)
+			if new_zoom != old_zoom {
+				// Zooming steers the camera, so the fit toggle releases.
+				preview_cam.fit_to_window = false
+				// NOTE: cursor-anchored zoom -- the point under the cursor
+			// stays put, so pan (preview_cam.ox|oy) scales by the zoom
+			// ratio here and only gets clamped later at render time.
+			preview_cam.ox = mx_c - (mx_c - preview_cam.ox) * (new_zoom / old_zoom)
+				preview_cam.oy = my_c - (my_c - preview_cam.oy) * (new_zoom / old_zoom)
+				preview_cam.zoom = new_zoom
+			}
+		}
+	}
+}

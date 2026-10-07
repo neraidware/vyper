@@ -14,21 +14,27 @@ Download: https://github.com/neraidware/vyper/actions → latest successful `win
 
 | Dep | Source | Layout |
 |-----|--------|--------|
-| Odin `dev-2026-07a` | [laytan/setup-odin](https://github.com/laytan/setup-odin) or [releases](https://github.com/odin-lang/Odin/releases) | System-wide |
+| Odin `dev-2026-09` | [laytan/setup-odin](https://github.com/laytan/setup-odin) or [releases](https://github.com/odin-lang/Odin/releases) | System-wide |
 | SDL3 3.4.14 | `SDL3-devel-3.4.14-VC.zip` from [SDL3 releases](https://github.com/libsdl-org/SDL/releases) | `lib/x64/SDL3.lib` + `lib/x64/SDL3.dll` |
-| ffmpeg (shared, BtbN) | [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/latest) | `lib/*.lib` (import; copied into `vendor/ffmpeg/<lib>/`) + `bin/*.dll` (runtime, shipped). `ffmpeg.exe` used by CI for smoke sample gen only — not shipped |
+| ffmpeg (shared, BtbN) | [ffmpeg-master-latest-win64-gpl-shared.zip](https://github.com/BtbN/FFmpeg-Builds/releases/latest) | `lib/*.lib` (import; copied into `vyper/vendor/ffmpeg/<lib>/`) + `bin/*.dll` (runtime, shipped). `ffmpeg.exe` used by CI for smoke sample gen only — not shipped |
 
 ## Build command
 
+`build.odin` is the build on Windows too — it selects `cl`/`lib` and the MSVC
+link line itself, which is why this document no longer carries one:
+
 ```
-odin build . -out:vyper.exe -define:FFMPEG_LINK=system -extra-linker-flags:"/LIBPATH:C:\path\to\sdl3\lib\x64;C:\path\to\ffmpeg\lib"
+set VYPER_LINK_FLAGS=/LIBPATH:C:\path\to\sdl3\lib\x64;C:\path\to\ffmpeg\lib
+.\build.odin release
 ```
 
-### Critical: ffmpeg import libs must be in vendor/ffmpeg/\<lib\>/
+That is the same single command CI runs.
+
+### Critical: ffmpeg import libs must be in vyper/vendor/ffmpeg/\<lib\>/
 
 The vendored `vendor:ffmpeg` bindings declare Windows imports as bare relative
 names (`foreign import "avcodec.lib"`), which Odin resolves relative to the
-binding source file dir (`vendor/ffmpeg/<lib>/<lib>.lib`) and passes as an
+binding source file dir (`vyper/vendor/ffmpeg/<lib>/<lib>.lib`) and passes as an
 absolute file path to `link.exe`. **`/LIBPATH` does not apply** for these.
 
 The CI copies the BtbN import libs into the correct vendor slots before
@@ -125,7 +131,7 @@ drift from a code bug in the decode path.
   Windows this resolves to bare `<lib>.lib` by name (vendor-dir-relative), as
   opposed to the `static`/`shared` modes that point at `windows_x64/*.lib`.
 - `clay-odin` selects `windows/clay.lib` for `.Windows` (`clay-odin/clay.odin`).
-- The Odin release **must be `dev-2026-07a` or later** (dev-2026-04 is missing
+- The Odin release **must be `dev-2026-09`** (the pin in `.mise.toml` and CI) (dev-2026-04 is missing
   `sdl.Condition`/`sdl.CreateCondition` which `vdecode.odin` requires).
 
 ## Not working yet

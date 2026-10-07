@@ -8,9 +8,44 @@ set -uo pipefail
 # regardless of how it was called or what the cwd is.
 SELF=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")
 
-# Shared toolchain resolution, the same fragment build.sh sources. Sourced, not
-# executed, so it only defines resolve_odin_root.
-. "$(dirname -- "$SELF")/toolchain.sh"
+# The compiler needs ODIN_ROOT to find base/ and core/. A stale value in the
+# environment fails every invocation with "Invalid ODIN_ROOT, directory does not
+# exist" -- an error that names a missing directory and never mentions that the
+# value points at a compiler that has since been replaced. That is not
+# hypothetical: a version manager taking over from a hand-installed compiler
+# leaves the old path exported, so the tree behind it is simply gone.
+#
+# build.odin implements the same rule for itself; this is the copy gate.sh needs
+# for the targets that invoke the compiler directly (target_bench). It was its
+# own file until now, but one function with one caller is a file that only lies
+# about being shared infrastructure.
+resolve_odin_root() {
+	if [ -d "${ODIN_ROOT-}/base" ]; then
+		return 0
+	fi
+
+	local odin_bin candidate
+	odin_bin="$(command -v odin 2>/dev/null || true)"
+	if [ -z "$odin_bin" ]; then
+		echo "error: odin not found on PATH." >&2
+		echo "  mise install provisions it; see .mise.toml." >&2
+		return 1
+	fi
+
+	candidate="$(dirname "$odin_bin")"
+	while [ ! -d "$candidate/base" ] && [ "$candidate" != "/" ]; do
+		candidate="$(dirname "$candidate")"
+	done
+	if [ ! -d "$candidate/base" ]; then
+		echo "error: no Odin tree found -- looked for base/ at and above $odin_bin." >&2
+		echo "  That directory has base/core/next; a bare compiler is not an Odin tree." >&2
+		return 1
+	fi
+
+	echo "==> ODIN_ROOT '${ODIN_ROOT-}' is not an Odin tree; using $candidate" >&2
+	ODIN_ROOT="$candidate"
+	export ODIN_ROOT
+}
 
 # The probe entry point. Headless: simulates the frame loop and runs the
 # layout/geometry/ownership asserts, then exits.
@@ -77,19 +112,20 @@ dev() {
 		# ODIN_ROOT exported by a previous install otherwise fails every target
 		# with "Invalid ODIN_ROOT, directory does not exist" — an error that
 		# names a missing directory, not the compiler mismatch behind it. Same
-		# function build.sh uses, so the two cannot drift.
+		# rule build.odin implements, so the two cannot drift.
 		resolve_odin_root || return 1
 		"$@"
 	fi
 }
 
 target_check() {
-	# -debug is load-bearing, not a preference. `odin check` does not compile a
-	# `when ODIN_DEBUG` branch unless -debug is passed, so without it this
-	# validates the RELEASE view and reports clean while the build we actually
-	# produce by default is unverified -- a deliberate error inside
-	# `when ODIN_DEBUG` type-checks fine here. Measured, not assumed.
-	dev odin check . -debug -strict-style -vet-using-param -vet-using-stmt
+	# build.odin owns the flag set (`odin check vyper -debug -strict-style
+	# -vet-using-param -vet-using-stmt`). This used to spell that command out
+	# again, so the gate could validate one flag set while the build used another.
+	# -debug inside it is load-bearing, not a preference: `odin check` does not
+	# compile a `when ODIN_DEBUG` branch without it, so the RELEASE view would
+	# type-check clean while the default build went unverified.
+	dev ./build.odin check
 }
 
 # Shader compilation is a build step, not a thing you remember to do by hand.
@@ -113,18 +149,18 @@ target_shaders() {
 		# failure the comment above warns about. A new shader that is not listed
 		# here fails the build rather than being silently skipped.
 		set -- \
-			shaders/rounded_rect.vert \
-			shaders/rounded_rect.frag \
-			shaders/quad.vert \
-			shaders/text.frag \
-			shaders/blit_box.frag \
-			shaders/blit_lod.frag \
-			shaders/nv12_luma.frag \
-			shaders/nv12_chroma.frag
+			vyper/shaders/rounded_rect.vert \
+			vyper/shaders/rounded_rect.frag \
+			vyper/shaders/quad.vert \
+			vyper/shaders/text.frag \
+			vyper/shaders/blit_box.frag \
+			vyper/shaders/blit_lod.frag \
+			vyper/shaders/nv12_luma.frag \
+			vyper/shaders/nv12_chroma.frag
 		for src in "$@"; do
 			glslangValidator -V "$src" -o "$src.spv"
 		done
-		for src in shaders/*.vert shaders/*.frag; do
+		for src in vyper/shaders/*.vert vyper/shaders/*.frag; do
 			found=
 			for want in "$@"; do
 				if [ "$src" = "$want" ]; then
@@ -140,21 +176,21 @@ target_shaders() {
 	'
 }
 
-# The flags live in build.sh and ONLY in build.sh: the sysroot and the extra
+# The flags live in build.odin and ONLY in build.odin: the sysroot and the extra
 # -l list are what make the binary link against the SYSTEM ffmpeg/SDL3/glib
 # rather than a toolchain's own bundled sysroot. Re-declaring them here is
 # exactly the "type the flags by hand instead of fixing the script" failure
 # AGENTS.md §10 exists to prevent, and it fails at the LINK step, a long way
-# from the cause. build.sh also compiles the vendored C and the SPIR-V, so
+# from the cause. build.odin also compiles the vendored C and the SPIR-V, so
 # delegating is the one place that can be right.
 target_build() {
-	./build.sh
+	./build.odin
 }
 
-# Every target that runs ./vyper must call this first.
+# Every target that runs ./target/vyper must call this first.
 #
 # The stale-SPIR-V hazard above has a twin that is worse, because it is silent:
-# these targets do NOT build, they only check that ./vyper exists. Editing a
+# these targets do NOT build, they only check that ./target/vyper exists. Editing a
 # source and re-running one therefore measures the PREVIOUS binary and reports
 # it as the new one. That is not hypothetical either -- a probe failure here was
 # chased as a pre-existing regression and then as a clean pass, when both runs
@@ -165,50 +201,50 @@ target_build() {
 # the exact failure this file already exists to prevent.
 require_fresh_binary() {
 	local target_name=$1
-	if [ ! -x ./vyper ]; then
-		echo "$target_name: ./vyper missing -- run scripts/gate.sh build" >&2
+	if [ ! -x ./target/vyper ]; then
+		echo "$target_name: ./target/vyper missing -- run scripts/gate.sh build" >&2
 		return 1
 	fi
 	# -nt is "newer than": any source or SPIR-V newer than the binary means the
 	# binary cannot reflect the tree. Includes the SPVs because a .frag edit
 	# changes the binary only after target_shaders + a rebuild.
 	local stale
-	stale=$(find . -maxdepth 1 -name '*.odin' -newer ./vyper -print -quit)
+	stale=$(find vyper -maxdepth 1 -name '*.odin' -newer ./target/vyper -print -quit)
 	if [ -z "$stale" ]; then
-		stale=$(find shaders -name '*.spv' -newer ./vyper -print -quit)
+		stale=$(find vyper/shaders -name '*.spv' -newer ./target/vyper -print -quit)
 	fi
 	if [ -n "$stale" ]; then
-		echo "$target_name: ./vyper is older than $stale" >&2
+		echo "$target_name: ./target/vyper is older than $stale" >&2
 		echo "$target_name: this would measure the PREVIOUS binary -- run scripts/gate.sh build" >&2
 		return 1
 	fi
 }
 
-# The memory gate cannot run ./vyper. -microarch:native lets LLVM emit AVX-512,
+# The memory gate cannot run ./target/vyper. -microarch:native lets LLVM emit AVX-512,
 # which VEX cannot decode, so the binary dies with SIGILL in
 # math_big::initialize_constants during __$startup_runtime -- before main, having
 # allocated nothing. Memcheck then dutifully reports "definitely lost: 0 bytes in
 # 0 blocks" and the gate passes while measuring nothing.
 #
 # So the memory gate gets its own binary at the baseline x86-64 target, built
-# from the same flags via build.sh (AGENTS.md §10: flags live in the script).
+# from the same flags via build.odin (AGENTS.md §10: flags live in the script).
 # Name the output as VYPER_OUT rather than hardcoding a second odin invocation.
 #
-# The mode is named explicitly rather than left to build.sh's default. Debug is
+# Debug is build.odin's default, and the mode is left to it. Debug is
 # now that default, but this gate NEEDS frame pointers and symbols to unwind --
 # an optimized build omits frame pointers, so every allocation trace comes back
 # as "calloc <- runtime::heap_allocator_proc <- ??? <- ???", which names the
 # defect site no better than no trace at all. Naming it means a later flip of the
 # default cannot quietly downgrade the memory gate into one that reads nothing.
-VALGRIND_BIN=./vyper-valgrind
+VALGRIND_BIN=./target/vyper-valgrind
 
 build_valgrind_binary() {
-	VYPER_OUT=vyper-valgrind VYPER_MICROARCH= ./build.sh debug
+	VYPER_OUT=target/vyper-valgrind ./build.odin
 }
 
 # Same freshness contract as require_fresh_binary, with one deliberate
 # difference: this one BUILDS on demand. require_fresh_binary refuses, because an
-# automatic rebuild of ./vyper would hide "I meant to measure the previous
+# automatic rebuild of ./target/vyper would hide "I meant to measure the previous
 # build". Here the opposite is true -- the baseline binary has different flags,
 # so a missing or stale one is not a measurement anybody could have meant to
 # make, and failing would just mean the gate never runs again.
@@ -220,7 +256,7 @@ require_fresh_valgrind_binary() {
 		return 0
 	fi
 	local stale
-	stale=$(find . -maxdepth 1 -name '*.odin' -newer "$VALGRIND_BIN" -print -quit)
+	stale=$(find vyper -maxdepth 1 -name '*.odin' -newer "$VALGRIND_BIN" -print -quit)
 	if [ -z "$stale" ]; then
 		stale=$(find shaders -name '*.spv' -newer "$VALGRIND_BIN" -print -quit)
 	fi
@@ -238,6 +274,10 @@ target_bench() {
 	# through to executing the previous binary and reporting stale numbers as
 	# current — which is worse than no benchmark, because it looks like data.
 	if ! dev odin build swsbench -out:bin_swsbench \
+	# -microarch:native is the one flag the app build dropped and this
+	# keeps: a benchmark measuring anything but the code this machine will
+	# actually run is not measuring what it claims. The trade is that the
+	# numbers compare within a machine, not across machines.
 		-microarch:native -o:aggressive -no-bounds-check; then
 		echo "bench: build failed" >&2
 		return 1
@@ -253,7 +293,7 @@ target_bench() {
 # not an exact copy, or the numbers did not print at all).
 target_gpu_probe() {
 	require_fresh_binary gpu-probe || return 1
-	VYPER_GPU_PROBE=1 timeout 300 ./vyper
+	VYPER_GPU_PROBE=1 timeout 300 ./target/vyper
 }
 
 # A/B gate for the GPU keyed-resample seam in the real export pipeline.
@@ -309,7 +349,7 @@ keyed_export_run() {
 		VYPER_KEYED_SCALE="$scale" \
 		VYPER_FRAME_TIME=1 \
 		"$@" \
-		timeout 600 ./vyper >"$KEYED_DIR/$tag.log" 2>&1
+		timeout 600 ./target/vyper >"$KEYED_DIR/$tag.log" 2>&1
 }
 
 # Echoes the average PSNR in dB between two clips, or "inf" when identical.
@@ -346,7 +386,7 @@ zorder_run() {
 		VYPER_RENDER_TEST="$KEYED_SRC|$ZORDER_DIR/$arm.mp4" \
 		VYPER_FRAME_TIME=1 \
 		$zv \
-		timeout 600 ./vyper >"$ZORDER_DIR/$arm.log" 2>&1
+		timeout 600 ./target/vyper >"$ZORDER_DIR/$arm.log" 2>&1
 }
 
 target_zorder() {
@@ -467,7 +507,7 @@ target_keyed_ab() {
 
 target_probe() {
 	require_fresh_binary probe || return 1
-	env $PROBE_ENV timeout 120 ./vyper
+	env $PROBE_ENV timeout 120 ./target/vyper
 }
 
 # The keyframe store/evaluator regression check (keyframe_probe.odin). Like the
@@ -478,12 +518,12 @@ target_probe() {
 # 0/1 itself.
 target_keyframe_probe() {
 	require_fresh_binary keyframe-probe || return 1
-	VYPER_KEYFRAME_PROBE=1 timeout 120 ./vyper
+	VYPER_KEYFRAME_PROBE=1 timeout 120 ./target/vyper
 }
 
 target_render_kf_probe() {
 	require_fresh_binary render-kf-probe || return 1
-	VYPER_RENDER_KF_PROBE=1 timeout 120 ./vyper
+	VYPER_RENDER_KF_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The audio engine regression check (audio_probe.odin). It has no gate target
@@ -515,11 +555,11 @@ target_audio_probe() {
 			return 1
 		fi
 	fi
-	VYPER_AUDIO_PROBE="$src|4|2" timeout 600 ./vyper || return 1
+	VYPER_AUDIO_PROBE="$src|4|2" timeout 600 ./target/vyper || return 1
 	# The forward-jump death, in its own process: it needs a clean timeline, and
 	# it is the only check covering a jump larger than the forward-decode bound
 	# (the mixer must seek there, not decode the skipped audio through).
-	VYPER_AUDIO_JUMP_PROBE="$src" timeout 600 ./vyper
+	VYPER_AUDIO_JUMP_PROBE="$src" timeout 600 ./target/vyper
 }
 
 # The preview handle/snap geometry regression check (transform_probe.odin).
@@ -529,7 +569,7 @@ target_audio_probe() {
 # there would have been invisible. The probe exits 0/1 itself.
 target_transform_probe() {
 	require_fresh_binary transform-probe || return 1
-	VYPER_TRANSFORM_PROBE=1 timeout 120 ./vyper
+	VYPER_TRANSFORM_PROBE=1 timeout 120 ./target/vyper
 }
 
 # Gesture-routing check (geom_key_probe.odin): an Alt+wheel / Alt+drag edit on
@@ -542,7 +582,7 @@ target_transform_probe() {
 # where the result goes, which no other target exercised.
 target_geom_key_probe() {
 	require_fresh_binary geom-key-probe || return 1
-	VYPER_GEOM_KEY_PROBE=1 timeout 120 ./vyper
+	VYPER_GEOM_KEY_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The memory gate for geom_key_probe. The probe builds and tears down clip
@@ -608,12 +648,12 @@ target_decode_repeat() {
 		}
 	fi
 	local proj=${1:-60} srcfps=${2:-30}
-	env $PROBE_ENV VYPER_DECODE_REPEAT_PROBE="$src|$proj|$srcfps" timeout 120 ./vyper
+	env $PROBE_ENV VYPER_DECODE_REPEAT_PROBE="$src|$proj|$srcfps" timeout 120 ./target/vyper
 }
 
 target_render_live_probe() {
 	require_fresh_binary render-live-probe || return 1
-	VYPER_RENDER_LIVE_PROBE=1 timeout 120 ./vyper
+	VYPER_RENDER_LIVE_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The memory gate for render_live_probe. Same argument as geom_key_valgrind
@@ -639,7 +679,7 @@ target_render_live_valgrind() {
 # off-by-one had already shipped silently in main.odin. The probe exits 0/1.
 target_timeline_probe() {
 	require_fresh_binary timeline-probe || return 1
-	VYPER_TL_PROBE=1 timeout 120 ./vyper
+	VYPER_TL_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The session string pool check (session_str_probe.odin). Clip names and marker
@@ -650,7 +690,7 @@ target_timeline_probe() {
 # stability under growth, and reset. Exits 0/1.
 target_session_str_probe() {
 	require_fresh_binary session-str-probe || return 1
-	VYPER_SESSION_STR_PROBE=1 timeout 120 ./vyper
+	VYPER_SESSION_STR_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The session keyframe store check (session_kf_probe.odin). Clip keyframe keys
@@ -664,19 +704,19 @@ target_session_str_probe() {
 # out of bounds. Exits 0/1.
 target_session_kf_probe() {
 	require_fresh_binary session-kf-probe || return 1
-	VYPER_SESSION_KF_PROBE=1 timeout 120 ./vyper
+	VYPER_SESSION_KF_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The session track-row arena check (session_tracks_probe.odin). It pins bounded
 # reuse and both COW layers: track rows first, then their key ranges.
 target_session_trk_probe() {
 	require_fresh_binary session-trk-probe || return 1
-	VYPER_SESSION_TRK_PROBE=1 timeout 120 ./vyper
+	VYPER_SESSION_TRK_PROBE=1 timeout 120 ./target/vyper
 }
 
 target_session_marker_probe() {
 	require_fresh_binary session-marker-probe || return 1
-	VYPER_SESSION_MARKER_PROBE=1 timeout 120 ./vyper
+	VYPER_SESSION_MARKER_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The OS file-drag-and-drop probe (dnd_probe.odin). Dragging a file in from the
@@ -687,7 +727,7 @@ target_session_marker_probe() {
 # the gesture state -- rather than the delivery a headless run cannot perform.
 target_dnd_probe() {
 	require_fresh_binary dnd-probe || return 1
-	VYPER_DND_PROBE=1 timeout 120 ./vyper
+	VYPER_DND_PROBE=1 timeout 120 ./target/vyper
 }
 
 # The action log's gate. A byte check would pass for a record that survives the
@@ -697,7 +737,7 @@ target_dnd_probe() {
 target_action_log() {
 	require_fresh_binary action-log || return 1
 	mkdir -p target/action-log
-	VYPER_ACTION_LOG_PROBE=target/action-log/roundtrip.vya timeout 120 ./vyper
+	VYPER_ACTION_LOG_PROBE=target/action-log/roundtrip.vya timeout 120 ./target/vyper
 }
 
 # The memory gate for dnd_probe: the drop path takes an SDL-owned C string for
@@ -752,7 +792,7 @@ target_yuv_exact() {
 	require_fresh_binary yuv-exact || return 1
 	local n out
 	for n in 8 16 32 64 96 128 160 256; do
-		out=$(VYPER_YUV_EXACT_PROBE="verify:$n" timeout 300 ./vyper 2>&1) || {
+		out=$(VYPER_YUV_EXACT_PROBE="verify:$n" timeout 300 ./target/vyper 2>&1) || {
 			echo "yuv-exact: probe failed at $n" >&2
 			echo "$out" | tail -5 >&2
 			return 1
@@ -768,7 +808,7 @@ target_yuv_exact() {
 	# or vertical stage, not the full-frame path.
 	for n in 64; do
 		for mode in flat vgrad; do
-			out=$(VYPER_YUV_EXACT_PROBE="$mode:$n" timeout 300 ./vyper 2>&1) || {
+			out=$(VYPER_YUV_EXACT_PROBE="$mode:$n" timeout 300 ./target/vyper 2>&1) || {
 				echo "yuv-exact: $mode:$n probe failed" >&2
 				return 1
 			}
@@ -790,7 +830,7 @@ target_yuv_exact() {
 	target_gpu_nv12() {
 		require_fresh_binary gpu-nv12 || return 1
 		local out
-		out=$(VYPER_GPU_NV12_PROBE=1 timeout 300 ./vyper 2>&1)
+		out=$(VYPER_GPU_NV12_PROBE=1 timeout 300 ./target/vyper 2>&1)
 		local code=$?
 		if [ $code -ne 0 ]; then
 			echo "$out" | grep -v '^gpu-nv12: adapter' | tail -8 >&2
@@ -808,7 +848,7 @@ target_yuv_exact() {
 	target_gpu_composite() {
 		require_fresh_binary gpu-composite || return 1
 		local out
-		out=$(VYPER_GPU_COMPOSITE_PROBE=1 timeout 300 ./vyper 2>&1)
+		out=$(VYPER_GPU_COMPOSITE_PROBE=1 timeout 300 ./target/vyper 2>&1)
 		local code=$?
 		if [ $code -ne 0 ]; then
 			echo "$out" | grep -v '^gpu-composite: adapter' | tail -6 >&2
@@ -832,7 +872,7 @@ target_footprint() {
 target_opacity() {
 	require_fresh_binary opacity || return 1
 	local out
-	out=$(VYPER_RENDER_OPACITY_PROBE=1 timeout 300 ./vyper 2>&1)
+	out=$(VYPER_RENDER_OPACITY_PROBE=1 timeout 300 ./target/vyper 2>&1)
 	local code=$?
 	if [ $code -ne 0 ]; then
 		echo "$out" | tail -6 >&2
@@ -844,7 +884,7 @@ target_opacity() {
 # The app must still be running when the timeout kills it; 124 is the pass.
 target_smoke() {
 	require_fresh_binary smoke || return 1
-	timeout 4 ./vyper
+	timeout 4 ./target/vyper
 	local rc=$?
 	if [ $rc -ne 124 ]; then
 		echo "smoke: exited $rc, expected 124 (timeout kill of a healthy run)" >&2
@@ -939,7 +979,7 @@ target_subtitle_probe() {
 	# and needs a media file this target does not have. The sub probe is
 	# standalone and builds its own timeline.
 	env VYPER_SUB_RENDER_PROBE="$SUB_DIR/subs.mp4" \
-		timeout 600 ./vyper >"$SUB_DIR/subs.log" 2>&1
+		timeout 600 ./target/vyper >"$SUB_DIR/subs.log" 2>&1
 	local rc=$?
 	# Assert the probe REACHED its end, not just that the process exited 0.
 	# Without this the target is a false green: the binary can bail during
@@ -977,7 +1017,7 @@ export_bench_run() {
 		VYPER_RENDER_TEST="$KEYED_SRC|$out" \
 		VYPER_FRAME_TIME=1 \
 		"$@" \
-		timeout 900 ./vyper >"$log" 2>&1
+		timeout 900 ./target/vyper >"$log" 2>&1
 	local rc=$?
 	t1=$(date +%s%N)
 	if [ $rc -ne 0 ]; then
@@ -1107,7 +1147,7 @@ target_silent_playback() {
 	# ("the run errored") and would also fail this target on any unrelated crash.
 	# The playhead's furthest reach is the assertion.
 	local out
-	out=$(VYPER_AUTOPLAY="$PWD/$src" VYPER_PLAY_TRACE=1 timeout 120 ./vyper 2>&1 || true)
+	out=$(VYPER_AUTOPLAY="$PWD/$src" VYPER_PLAY_TRACE=1 timeout 120 ./target/vyper 2>&1 || true)
 	# The furthest frame the playhead reached. Zero is the bug: before the fix it
 	# never left its starting frame.
 	local max_ph
@@ -1176,7 +1216,7 @@ target_fuzz() {
 	local out="$log/fuzz-$seed.log"
 	# stderr is kept, because the failures SDL reports and does not stop for -- the
 	# out-of-bounds scissor, for one -- arrive there and nowhere else.
-	if ! VYPER_FUZZ="$proj|$iters|$seed" timeout 1800 ./vyper >"$out" 2>&1; then
+	if ! VYPER_FUZZ="$proj|$iters|$seed" timeout 1800 ./target/vyper >"$out" 2>&1; then
 		grep -E '^\[fuzz\]' "$out" >&2
 		echo "fuzz: FAILED on $proj (seed $seed) -- see $out" >&2
 		return 1
@@ -1200,7 +1240,7 @@ target_audio_group_isolation() {
 		target_audio_clip_tempo_alignment || return 1
 	fi
 	local out
-	if ! out=$(VYPER_AUDIO_GROUP_ISOLATION="$PWD/$src" timeout 300 ./vyper 2>&1); then
+	if ! out=$(VYPER_AUDIO_GROUP_ISOLATION="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
 		echo "$out" | grep -E '^\[ap\] group-isolation' >&2
 		echo "audio-group-isolation: FAILED -- see the [ap] group-isolation lines above" >&2
 		return 1
@@ -1228,7 +1268,7 @@ target_proxy_bg() {
 		return 1
 	fi
 	local out
-	if ! out=$(VYPER_PROXY_BG_TEST="$PWD/$src" timeout 1800 ./vyper 2>&1); then
+	if ! out=$(VYPER_PROXY_BG_TEST="$PWD/$src" timeout 1800 ./target/vyper 2>&1); then
 		echo "$out" | grep -E '^\[proxy-bg-test\]' >&2
 		echo "proxy-bg: FAILED -- see the [proxy-bg-test] lines above" >&2
 		return 1
@@ -1257,7 +1297,7 @@ target_image_decode_probe() {
 			}
 		fi
 		local out
-		if ! out=$(VYPER_IMAGE_DECODE_PROBE="$PWD/$src" timeout 300 ./vyper 2>&1); then
+		if ! out=$(VYPER_IMAGE_DECODE_PROBE="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
 			echo "$out" | grep -E '^\[image-dec\]' >&2
 			echo "image-decode-probe: FAILED for $name" >&2
 			rc=1
@@ -1281,7 +1321,7 @@ target_image_probe() {
 		}
 	fi
 	local out
-	if ! out=$(VYPER_IMAGE_PROBE="$PWD/$src" timeout 300 ./vyper 2>&1); then
+	if ! out=$(VYPER_IMAGE_PROBE="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
 		echo "$out" >&2
 		echo "image-probe: FAILED -- see the [image-probe] lines above" >&2
 		return 1
@@ -1311,7 +1351,7 @@ target_proxy_probe() {
 	# and needs a media file this target does not have. The proxy probe is
 	# standalone and supplies its own source.
 	env VYPER_PROXY_PROBE="$PROXY_SRC" \
-		timeout 900 ./vyper >"$PROXY_DIR/proxy.log" 2>&1
+		timeout 900 ./target/vyper >"$PROXY_DIR/proxy.log" 2>&1
 	local rc=$?
 	# Remove the artifact the probe built, on EVERY path. A failing probe exits
 	# through os.exit, which never reaches the probe's own cleanup, and a
@@ -1397,7 +1437,7 @@ target_parity() {
 
 	local log="$PARITY_DIR/parity.log"
 	VYPER_PARITY_FIXTURE="$PARITY_DIR/still.png|$PARITY_DIR/clip.webm|$PARITY_DIR/out.mp4" \
-		timeout 600 ./vyper >"$log" 2>&1
+		timeout 600 ./target/vyper >"$log" 2>&1
 	local rc=$?
 	grep -E '^\[parity-probe\]' "$log" || true
 	if [ $rc -ne 0 ]; then
@@ -1435,7 +1475,7 @@ target_audio_rate() {
 	local wav="$AUDIO_RATE_DIR/fixture.wav"
 	local out="$AUDIO_RATE_DIR/out.mp4"
 	local log="$AUDIO_RATE_DIR/audio_rate.log"
-	VYPER_AUDIO_RATE_FIXTURE="$wav|$out" timeout 600 ./vyper >"$log" 2>&1
+	VYPER_AUDIO_RATE_FIXTURE="$wav|$out" timeout 600 ./target/vyper >"$log" 2>&1
 	local rc=$?
 	grep -E '^\[ar-probe\]' "$log" || true
 	if [ $rc -ne 0 ]; then
@@ -1613,7 +1653,7 @@ target_audio_export_audit() {
 	fi
 	local dir="$AUDIT_DIR"
 	mkdir -p "$dir"
-	env VYPER_PROJECT_EXPORT="$proj|$dir/out.mp4" timeout 900 ./vyper >"$dir/export.log" 2>&1
+	env VYPER_PROJECT_EXPORT="$proj|$dir/out.mp4" timeout 900 ./target/vyper >"$dir/export.log" 2>&1
 	if ! grep -q "project-export status: Render complete" "$dir/export.log"; then
 		echo "audio-audit: export did not complete -- see $dir/export.log" >&2
 		tail -5 "$dir/export.log" >&2
@@ -1637,7 +1677,7 @@ target_audio_export_audit() {
 # but a few seconds of CPU.
 target_atempo_probe() {
 	require_fresh_binary atempo-probe || return 1
-	VYPER_ATEMPO_PROBE=ALL timeout 600 ./vyper 2>&1 | tail -1
+	VYPER_ATEMPO_PROBE=ALL timeout 600 ./target/vyper 2>&1 | tail -1
 }
 
 # audio_mix_parity drives the playback mixer and the export mixer over the same
@@ -1668,11 +1708,11 @@ target_audio_mix_parity() {
 		return 1
 	fi
 	# The green half: identical arithmetic, no codec delay in the way.
-	VYPER_AUDIO_MIX_PARITY="$PWD/$wav" timeout 600 ./vyper 2>&1 | tail -2
+	VYPER_AUDIO_MIX_PARITY="$PWD/$wav" timeout 600 ./target/vyper 2>&1 | tail -2
 	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
 	# The red half: the encoder-delay case. Reported, not swallowed, and not
 	# allowed to hide the green half's verdict by running second.
-	VYPER_AUDIO_MIX_PARITY="$PWD/$aac" timeout 600 ./vyper 2>&1 | tail -2
+	VYPER_AUDIO_MIX_PARITY="$PWD/$aac" timeout 600 ./target/vyper 2>&1 | tail -2
 	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
 	if [ $rc -ne 0 ]; then
 		echo "audio-mix-parity: FAILED (known; TODO.md Active 30 S4)" >&2
@@ -1726,7 +1766,7 @@ target_audio_drift_parity() {
 	# possible error rather than a phase wobble that partly cancels.
 	for spec in "600|60" "600|29.97" "600|30"; do
 		printf '[gate] drift %ss at %s fps\n' "${spec%%|*}" "${spec##*|}"
-		VYPER_AUDIO_DRIFT_PARITY="$PWD/$src|${spec%%|*}|${spec##*|}" timeout 1800 ./vyper 2>&1 | tail -2
+		VYPER_AUDIO_DRIFT_PARITY="$PWD/$src|${spec%%|*}|${spec##*|}" timeout 1800 ./target/vyper 2>&1 | tail -2
 		[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
 	done
 	if [ $rc -ne 0 ]; then
@@ -1760,7 +1800,7 @@ target_audio_stall_gap() {
 		echo "audio-stall-gap: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
 		return 1
 	fi
-	VYPER_AUDIO_STALL_GAP="$PWD/$src|900" timeout 300 ./vyper 2>&1 | tail -2
+	VYPER_AUDIO_STALL_GAP="$PWD/$src|900" timeout 300 ./target/vyper 2>&1 | tail -2
 	local rc=${PIPESTATUS[0]}
 	if [ $rc -ne 0 ]; then
 		echo "audio-stall-gap: FAILED -- a stall did not produce a clean gap" >&2
@@ -1785,7 +1825,7 @@ target_audio_stall_gap() {
 # its own analysis window. Both produced confident numbers that meant nothing.
 target_audio_node_latency() {
 	require_fresh_binary audio-node-latency || return 1
-	VYPER_AUDIO_NODE_LATENCY=1 timeout 900 ./vyper 2>&1 | tail -6
+	VYPER_AUDIO_NODE_LATENCY=1 timeout 900 ./target/vyper 2>&1 | tail -6
 	local rc=${PIPESTATUS[0]}
 	if [ $rc -ne 0 ]; then
 		echo "audio-node-latency: FAILED" >&2
@@ -1811,7 +1851,7 @@ target_audio_node_latency() {
 #   - the ROUND TRIP, which needs the speed AND the source offset divided back out.
 target_audio_scrub_exact() {
 	require_fresh_binary audio-scrub-exact || return 1
-	VYPER_AUDIO_SCRUB_EXACT=1 timeout 600 ./vyper
+	VYPER_AUDIO_SCRUB_EXACT=1 timeout 600 ./target/vyper
 	local rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "audio-scrub-exact: FAILED -- see the [ap] scrub lines above" >&2
@@ -1833,7 +1873,7 @@ target_audio_scrub_exact() {
 # follows the speed, and that an out-of-range speed clamps rather than asserts.
 target_audio_clip_stretch() {
 	require_fresh_binary audio-clip-stretch || return 1
-	VYPER_AUDIO_CLIP_STRETCH=1 timeout 300 ./vyper
+	VYPER_AUDIO_CLIP_STRETCH=1 timeout 300 ./target/vyper
 	local rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "audio-clip-stretch: FAILED -- see the [ap] stretch lines above" >&2
@@ -1859,7 +1899,7 @@ target_audio_backward_scrub() {
 		target_audio_clip_tempo_alignment || return 1
 	fi
 	local out
-	if ! out=$(VYPER_AUDIO_BACKWARD_SCRUB="$PWD/$src" timeout 300 ./vyper 2>&1); then
+	if ! out=$(VYPER_AUDIO_BACKWARD_SCRUB="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
 		echo "$out" >&2
 		echo "audio-backward-scrub: FAILED -- see the [ap] scrub lines above" >&2
 		return 1
@@ -1883,7 +1923,7 @@ target_audio_seek_landing() {
 		target_audio_clip_tempo_alignment || return 1
 	fi
 	local out
-	if ! out=$(VYPER_AUDIO_SEEK_LANDING="$PWD/$src" timeout 300 ./vyper 2>&1); then
+	if ! out=$(VYPER_AUDIO_SEEK_LANDING="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
 		echo "$out" >&2
 		echo "audio-seek-landing: FAILED -- see the [ap] seek-landing lines above" >&2
 		return 1
@@ -1924,7 +1964,7 @@ target_audio_seek_landing() {
 #  - THE GEOMETRY, as arithmetic on a Clip: timeline span == content / speed.
 target_audio_clip_tempo() {
 	require_fresh_binary audio-clip-tempo || return 1
-	VYPER_AUDIO_CLIP_TEMPO=1 timeout 1800 ./vyper
+	VYPER_AUDIO_CLIP_TEMPO=1 timeout 1800 ./target/vyper
 	local rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "audio-clip-tempo: FAILED -- see the [ap] tempo lines above" >&2
@@ -1950,7 +1990,7 @@ target_audio_clip_tempo_alignment() {
 	fi
 	for speed in 0.25 0.5 0.75 1.5 2.0 3.0 4.0; do
 		local out
-		if ! out=$(VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT="$PWD/$src|$speed" timeout 600 ./vyper 2>&1); then
+		if ! out=$(VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT="$PWD/$src|$speed" timeout 600 ./target/vyper 2>&1); then
 			echo "$out" >&2
 			echo "audio-clip-tempo-alignment: FAILED at speed $speed" >&2
 			return 1
@@ -1958,7 +1998,7 @@ target_audio_clip_tempo_alignment() {
 		echo "$out" | grep -E '^\[ap\] clip-alignment'
 	done
 	local out
-	if ! out=$(VYPER_AUDIO_CLIP_TEMPO_EDIT="$PWD/$src" timeout 600 ./vyper 2>&1); then
+	if ! out=$(VYPER_AUDIO_CLIP_TEMPO_EDIT="$PWD/$src" timeout 600 ./target/vyper 2>&1); then
 		echo "$out" >&2
 		echo "audio-clip-tempo-alignment: FAILED on active 1x -> 2x edit" >&2
 		return 1
@@ -1996,7 +2036,7 @@ target_audio_bus_prime() {
 	local failed=0
 	for r in 0.25 0.5 0.75 1.5 2.0 3.0 4.0; do
 		local out line
-		if ! out=$(VYPER_AUDIO_BUS_PRIME=$r timeout 300 ./vyper 2>&1); then
+		if ! out=$(VYPER_AUDIO_BUS_PRIME=$r timeout 300 ./target/vyper 2>&1); then
 			echo "audio-bus-prime: FAILED to run at rate $r" >&2
 			echo "$out" | tail -8 >&2
 			failed=1
@@ -2029,7 +2069,7 @@ target_audio_bus_rate_transition() {
 		echo "audio-bus-rate-transition: no fixture at $src -- run scripts/gate.sh audio_drift_parity first" >&2
 		return 1
 	fi
-	VYPER_AUDIO_BUS_RATE_TRANSITION="$PWD/$src" timeout 600 ./vyper
+	VYPER_AUDIO_BUS_RATE_TRANSITION="$PWD/$src" timeout 600 ./target/vyper
 	local rc=$?
 	if [ $rc -ne 0 ]; then
 		echo "audio-bus-rate-transition: FAILED -- see the [ap] rate-transition lines above" >&2
@@ -2065,7 +2105,7 @@ target_audio_clip_pitch() {
 	fi
 	local rc=0
 	for semi in 12 -12 7 -5; do
-		VYPER_AUDIO_CLIP_PITCH="$PWD/$src|$semi" timeout 300 ./vyper >/dev/null 2>&1
+		VYPER_AUDIO_CLIP_PITCH="$PWD/$src|$semi" timeout 300 ./target/vyper >/dev/null 2>&1
 		[ $? -ne 0 ] && { echo "audio-clip-pitch: FAILED at $semi semitones" >&2; rc=1; }
 	done
 	if [ $rc -ne 0 ]; then

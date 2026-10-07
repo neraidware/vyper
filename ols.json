@@ -1,6 +1,6 @@
 {
   "collections": [
-    { "name": ".", "path": "." }
+    { "name": "vyper", "path": "vyper" }
   ],
   "checker_args": ["-vet-using-param", "-vet-using-stmt"],
   "flag_values": {

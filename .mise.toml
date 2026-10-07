@@ -2,14 +2,16 @@
 # own; the rest comes from the system package manager. The split is not
 # arbitrary — see the clang note, it was measured rather than assumed.
 #
-#     mise install && ./build.sh
+#     mise install && ./build.odin
 #
 # On Arch the system half is:
 #
 #     sudo pacman -S glslang valgrind ffmpeg sdl3 glib2
 #
-# WHY the system half stays on the system: mise has no backend for glslang
-# (glslangValidator compiles shaders/*.vert|frag to .spv on every build) or for
+# WHY the system half stays on the system: mise has no backend for glslang, which
+# is now REQUIRED rather than optional — glslangValidator compiles
+# shaders/*.vert|frag on every build, and skipping it would make the output depend
+# on what was already in the tree. mise also has no backend for
 # valgrind (scripts/gate.sh valgrind, the memory gate AGENTS.md 9b requires), so
 # there is nothing to pin. ffmpeg (libavcodec/libavformat/libavutil/libavfilter/
 # libswresample/libswscale), sdl3, and glib2 (libgio-2.0, libglib-2.0) are
@@ -37,15 +39,18 @@ odin = "dev-2026-09"
 # substitute gcc at the link step.
 #
 # mise builds this from conda-forge, which wraps it in a bundled sysroot that
-# knows nothing about this host's shared libraries. build.sh passes --sysroot=/
+# knows nothing about this host's shared libraries. build.odin passes --sysroot=/
 # to the link so it resolves the system ffmpeg/SDL3/glib; see the comment on
 # that flag for what happens without it. That is the whole reason the pin is
 # usable — the toolchain is only half the build, and the other half is the
 # libraries it has to be pointed at.
 clang = "21.1.8"
 
-# mold only shortens link time on a binary this size. build.sh detects it and
-# falls back to the default linker when absent, so unlike clang this one is
-# genuinely optional — but pinned anyway so every host gets the fast path
-# instead of one machine being mysteriously slower.
+# mold links the binary, so it is provisioned rather than hoped for, and pinned
+# like clang: a build that links several times slower on whichever machine happens
+# to lack it is a difference you would otherwise spend an afternoon explaining.
+# build.odin uses it wherever it is on PATH and falls back to the compiler default
+# when it is not, so a host without mise still builds. The nix package does not
+# take part in that — it pins gold via VYPER_LINKER, because mold and lld both
+# fail to resolve Odin's absolute -l: namespecs inside the sandbox.
 mold = "2.42.1"

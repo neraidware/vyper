@@ -28,45 +28,20 @@
           nativeBuildInputs = [ pkgs.odin pkgs.glslang pkgs.makeWrapper pkgs.llvmPackages.clang ];
           buildInputs = [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.ffmpeg pkgs.vulkan-loader pkgs.glib ];
           buildPhase = ''
-            # Odin links its static vendor archives (clay-odin, vendored
-            # stb/truetype) as -l:/abs/path GNU "namespec" arguments. The mold
-            # manpage documents plain `-l libname` only -- it has no reference
-            # to the GNU -l:filename namespec extension, and no default search
-            # paths ("Unlike the GNU linkers, mold does not have default search
-            # paths"). In practice mold/lld both fail to resolve odin's absolute
-            # -l: namespecs inside the nix sandbox ("library not found: :/...").
-            # gold (GNU binutils) resolves them, so the packaged build uses gold.
-            # The dev shell keeps mold for everyday local builds.
-            glslangValidator -V shaders/rounded_rect.vert -o shaders/rounded_rect.vert.spv
-            glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
-            glslangValidator -V shaders/quad.vert -o shaders/quad.vert.spv
-            glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
-            # The resample stages, shared by the export compositor, the preview
-            # pipeline and the probe. box.frag is the real resample; lod.frag is a
-            # diagnostic that hardcodes LOD 3. Plain Vulkan 1.0 on purpose: they
-            # used to be built --target-env vulkan1.1, which only raises the SPIR-V
-            # version word, and preview binding this shader would then need 1.1.
-            glslangValidator -V shaders/blit_box.frag -o shaders/blit_box.frag.spv
-            glslangValidator -V shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
-            clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
-            mkdir -p clay-odin/linux
-            clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
-            ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
-            odin check . -strict-style -vet-using-param -vet-using-stmt
-            odin build . -out:vyper \
-              -microarch:native -o:aggressive -no-bounds-check \
-              -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
+            # build.odin owns the steps; this only pins what the nix sandbox
+            # needs differently. mold and lld both fail to resolve Odin's
+            # absolute -l: namespecs inside the sandbox ("library not found:
+            # :/..."); gold does, so the packaged build pins gold. The dev shell
+            # keeps mold for everyday local builds.
+            VYPER_LINKER=gold ./build.odin release
           '';
-          # The binary is linked against SDL3/SDL3_ttf/vulkan-loader + the
-          # ffmpeg libs and shells out to ffmpeg for proxy transcode, so it
-          # can't be run from a bare result/ dir. Keep the real binary under
-          # libexec, wrap it with the needed runtime lib path + ffmpeg on
-          # PATH, and expose the wrapper as bin/vyper. The .desktop entry and
-          # icon ship in share/ so environment.systemPackages (or home-manager)
-          # pick them up for the app menu.
           installPhase = ''
-            mkdir -p $out/bin $out/libexec/vyper
-            cp vyper $out/libexec/vyper/vyper
+            # build.odin does the FHS copy; nix adds the runtime wrapper, which
+            # is the one thing it knows and build.odin cannot: the binary links
+            # SDL3/vulkan/glib and shells out to ffmpeg, so it cannot run from a
+            # bare result/ dir.
+            mkdir -p $out/libexec/vyper
+            cp target/vyper $out/libexec/vyper/vyper
             wrapProgram $out/libexec/vyper/vyper \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader pkgs.glib pkgs.ffmpeg ]}" \
               --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
@@ -87,45 +62,20 @@
           nativeBuildInputs = [ pkgs.odin pkgs.glslang pkgs.makeWrapper pkgs.llvmPackages.clang ];
           buildInputs = [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.ffmpeg pkgs.vulkan-loader pkgs.glib ];
           buildPhase = ''
-            # Odin links its static vendor archives (clay-odin, vendored
-            # stb/truetype) as -l:/abs/path GNU "namespec" arguments. The mold
-            # manpage documents plain `-l libname` only -- it has no reference
-            # to the GNU -l:filename namespec extension, and no default search
-            # paths ("Unlike the GNU linkers, mold does not have default search
-            # paths"). In practice mold/lld both fail to resolve odin's absolute
-            # -l: namespecs inside the nix sandbox ("library not found: :/...").
-            # gold (GNU binutils) resolves them, so the packaged build uses gold.
-            # The dev shell keeps mold for everyday local builds.
-            glslangValidator -V shaders/rounded_rect.vert -o shaders/rounded_rect.vert.spv
-            glslangValidator -V shaders/rounded_rect.frag -o shaders/rounded_rect.frag.spv
-            glslangValidator -V shaders/quad.vert -o shaders/quad.vert.spv
-            glslangValidator -V shaders/text.frag -o shaders/text.frag.spv
-            # The resample stages, shared by the export compositor, the preview
-            # pipeline and the probe. box.frag is the real resample; lod.frag is a
-            # diagnostic that hardcodes LOD 3. Plain Vulkan 1.0 on purpose: they
-            # used to be built --target-env vulkan1.1, which only raises the SPIR-V
-            # version word, and preview binding this shader would then need 1.1.
-            glslangValidator -V shaders/blit_box.frag -o shaders/blit_box.frag.spv
-            glslangValidator -V shaders/blit_lod.frag -o shaders/blit_lod.frag.spv
-            clang -c -O2 -o vendor/nanosvg/nanosvg.o vendor/nanosvg/nanosvg.c
-            mkdir -p clay-odin/linux
-            clang -c -O2 -o clay-odin/linux/clay.o vendor/clay.c
-            ar rcs clay-odin/linux/clay.a clay-odin/linux/clay.o
-            odin build . -out:vyper \
-              -debug \
-              -vet-style -vet-semicolon \
-              -extra-linker-flags:"-fuse-ld=gold -lgio-2.0 -lglib-2.0"
+            # build.odin owns the steps; this only pins what the nix sandbox
+            # needs differently. mold and lld both fail to resolve Odin's
+            # absolute -l: namespecs inside the sandbox ("library not found:
+            # :/..."); gold does, so the packaged build pins gold. The dev shell
+            # keeps mold for everyday local builds.
+            VYPER_LINKER=gold ./build.odin
           '';
-          # The binary is linked against SDL3/SDL3_ttf/vulkan-loader + the
-          # ffmpeg libs and shells out to ffmpeg for proxy transcode, so it
-          # can't be run from a bare result/ dir. Keep the real binary under
-          # libexec, wrap it with the needed runtime lib path + ffmpeg on
-          # PATH, and expose the wrapper as bin/vyper. The .desktop entry and
-          # icon ship in share/ so environment.systemPackages (or home-manager)
-          # pick them up for the app menu.
           installPhase = ''
-            mkdir -p $out/bin $out/libexec/vyper
-            cp vyper $out/libexec/vyper/vyper
+            # build.odin does the FHS copy; nix adds the runtime wrapper, which
+            # is the one thing it knows and build.odin cannot: the binary links
+            # SDL3/vulkan/glib and shells out to ffmpeg, so it cannot run from a
+            # bare result/ dir.
+            mkdir -p $out/libexec/vyper
+            cp target/vyper $out/libexec/vyper/vyper
             wrapProgram $out/libexec/vyper/vyper \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader pkgs.glib pkgs.ffmpeg ]}" \
               --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
