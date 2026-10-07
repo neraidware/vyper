@@ -95,7 +95,10 @@ jobs:
           # FFMPEG_LINK=system is what selects them.
           $env:VYPER_LINK_FLAGS = "/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
           $env:VYPER_OUT = "vyper.exe"
-          ./build.odin release
+          # `odin run`, not ./build.odin: the shebang is a sh feature, and PowerShell on
+          # Windows does not execute the file at all (no process, so $LASTEXITCODE stays
+          # empty). build.odin's header documents this as the portable form.
+          odin run build.odin -file -- release
           if ($LASTEXITCODE -ne 0) { throw "build.odin failed (exit $LASTEXITCODE)" }
 
       # The probes (VYPER_FRAME_PROBE, VYPER_PROXY_PROBE) are debug-only: a release
@@ -109,7 +112,7 @@ jobs:
         run: |
           $env:VYPER_LINK_FLAGS = "/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
           $env:VYPER_OUT = "vyper-probe.exe"
-          ./build.odin debug
+          odin run build.odin -file -- debug
           if ($LASTEXITCODE -ne 0) { throw "build.odin debug failed (exit $LASTEXITCODE)" }
 
       - name: Stage dist
