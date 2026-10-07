@@ -975,6 +975,14 @@ Audio_Producer :: struct {
 	done:     bool, // producer exited (atomic)
 	run:      bool, // false pauses the device and frees sources (atomic)
 	resync:   i64, // bump forces clear + re-provision at the anchor (atomic)
+	// force_seek_resync tags explicit playhead navigation. Its generation is
+	// consumed with resync so a seek inside the normal producer cushion still
+	// re-anchors sources and clears already-queued audio (atomic).
+	force_seek_resync: i64,
+	// scrub_active marks the interval where the UI pointer, not device clock,
+	// owns playhead position. Producer-side anomaly checks ignore that requested
+	// mismatch and resume checking when release commits the final seek.
+	scrub_active: bool,
 	// anchor_frame is the playhead frame the UI last seeded for a resync
 	// (atomic); anchor_now is monotonic_ns() when that frame was seeded.
 	anchor_frame: i64,
@@ -1566,7 +1574,7 @@ audio_note_edit :: proc() {
 	if !audio_device_ready() {
 		return
 	}
-	audio_seek(playhead.frame)
+	audio_seek(playhead.frame, false)
 }
 
 // play_src_seg_at returns the segment of s covering timeline frame f, or nil.
@@ -1924,8 +1932,18 @@ audio_rate_scale :: proc() -> f64 {
 // producer deliberately sits AUDIO_CUSHION_SEC ahead of the audible position so a
 // hiccup cannot starve the device, so "where the playhead is" and "where the
 // producer is" differ by exactly that much while everything is healthy. A playhead
-// move puts them further apart than the cushion can explain.
-audio_reconcile_is_seeked :: proc(play_frame: i64, fps: f64, rate_sc: f64) -> bool {
+// move puts them further apart than the cushion can explain. Explicit navigation
+// bypasses this inference: a deliberate scrub release inside the cushion is still a
+// seek, and its old queued audio is precisely what must not survive the release.
+audio_reconcile_is_seeked :: proc(
+	play_frame: i64,
+	fps: f64,
+	rate_sc: f64,
+	force_seek: bool = false,
+) -> bool {
+	if force_seek {
+		return true
+	}
 	if audio_src.count == 0 {
 		// Nothing to move. The first provision of a run lands wherever it is asked
 		// to, and there is no decoder to have drifted.
@@ -2612,6 +2630,8 @@ audio_init :: proc() -> bool {
 	sync.atomic_store(&audio_prod.done, false)
 	sync.atomic_store(&audio_prod.run, false)
 	sync.atomic_store(&audio_prod.resync, 0)
+	sync.atomic_store(&audio_prod.force_seek_resync, 0)
+	sync.atomic_store(&audio_prod.scrub_active, false)
 	audio_prod.thread = thread.create(audio_producer_proc)
 	if audio_prod.thread == nil {
 		fmt.println("could not start audio producer thread")
@@ -2682,6 +2702,8 @@ timeline_has_audio_at :: proc(f: i64) -> bool {
 // says whether there IS one. Package scope because a diagnostic that had to thread its
 // state through audio_producer_feed's signature would not have been written.
 repro_last_prod:  i64 = 0
+repro_last_ph:    i64 = 0
+repro_last_resync: i64 = 0
 repro_have_prod: bool = false
 repro_repeats:   i64 = 0
 repro_jumps:     i64 = 0
@@ -2715,6 +2737,7 @@ repro_report :: proc(fps: f64, dev_pos: i64) {
 	queued := audio_device_queued()
 	sources := audio_src.count
 	playing := sync.atomic_load(&audio_prod.run)
+	scrubbing := sync.atomic_load(&audio_prod.scrub_active)
 
 	if !repro_have_prod {
 		// First pass: establish the baseline and say so. Without this the very first
@@ -2722,38 +2745,68 @@ repro_report :: proc(fps: f64, dev_pos: i64) {
 		// diagnostic talks you into a bug that is not there.
 		repro_have_prod = true
 		repro_last_prod = prod
+		repro_last_ph = playhead.frame
+		repro_last_resync = resync
 		fmt.printf(
-			"[repro] BASELINE next=%d published_prod=%d dev=%d resync=%d sources=%d queued=%d running=%t (anomaly counting starts now)\n",
-			prod, sync.atomic_load(&audio_prod.prod_frame), dev, resync, sources, queued, playing,
+			"[repro] BASELINE next=%d ph=%d published_prod=%d dev=%d resync=%d sources=%d queued=%d running=%t (anomaly counting starts now)\n",
+			prod, playhead.frame, sync.atomic_load(&audio_prod.prod_frame), dev, resync, sources, queued, playing,
 		)
 		return
 	}
 	delta := prod - repro_last_prod
 	repro_last_prod = prod
+	ph_delta := playhead.frame - repro_last_ph
+	repro_last_ph = playhead.frame
+	resync_delta := resync - repro_last_resync
+	repro_last_resync = resync
 
 	fmt.printf(
-		"[repro] next=%d (d%+d) published_prod=%d dev=%d dev_resync=%d resync=%d srcs=%d q=%d fed=%d run=%t ph=%d\n",
-		prod, delta, sync.atomic_load(&audio_prod.prod_frame), dev, dev_resync, resync,
-		sources, queued, audio_rpt.total_fed_frames, playing, playhead.frame,
+		"[repro] next=%d (d%+d) ph=%d (d%+d) published_prod=%d dev=%d dev_resync=%d resync=%d (r%+d) srcs=%d q=%d fed=%d run=%t scrub=%t\n",
+		prod, delta, playhead.frame, ph_delta,
+		sync.atomic_load(&audio_prod.prod_frame), dev, dev_resync, resync,
+		resync_delta,
+		sources, queued, audio_rpt.total_fed_frames, playing, scrubbing,
 	)
 
-	// REPEAT: the producer's content position went BACKWARDS while running forward.
-	// This is the mechanical definition of audio repeating -- content already played
-	// is being fed again -- and no other fault in the engine produces it. A single
-	// backwards tick is worth reporting even if it is small, because a rewind of one
-	// frame is audible as a stutter and a rewind of a cushion is a loop.
-	if playing && delta < 0 {
+	// REPEAT: the producer fed content that was already played. That is only a FAULT
+	// when the playhead did not ask for it.
+	//
+	// This used to be `delta < 0`, which is wrong in the one case that matters most:
+	// a backward scrub moves the playhead back and the producer is supposed to follow
+	// it back, so every backward scrub in a run reported itself as a repeat. Measured
+	// on the replay of a 56-seek session: 5 REPEAT lines, every one of them a seek the
+	// user had just made -- including a "164 frame" one that replayed the content the
+	// scrub had just asked to go back to. A detector that fires on correct behaviour
+	// cannot be used to find the fault it was written for, and this is why the
+	// reported bug survived it.
+	//
+	// So the comparison is against the playhead's OWN move. prod_back is how far the
+	// producer rewound, ph_back how far the playhead did; the producer repeating is
+	// the difference, which is positive when it gave back more than was requested --
+	// and also positive when the playhead went forward and the producer went back at
+	// all, which is the unambiguous case.
+	//
+	// The producer runs AUDIO_CUSHION_SEC AHEAD of the audible playhead by design (see
+	// REPRO_DESYNC_FRAMES), so when a seek rewinds BOTH, the producer rewinds cushion-
+	// further than the playhead does. That excess is the cushion, not a fault, so the
+	// test subtracts it rather than treating any excess as one. What is left is content
+	// re-fed that nothing asked for. A new resync generation is also an explicit request
+	// to reconcile (including geometry edits), so its producer rewind is never a repeat.
+	cushion_frames := i64(AUDIO_CUSHION_SEC * f64(fps) + 1)
+	unasked := -delta - (-ph_delta) - cushion_frames
+	if playing && !scrubbing && resync_delta == 0 && delta < -REPRO_REPEAT_SLACK_FRAMES &&
+	   unasked > REPRO_REPEAT_SLACK_FRAMES {
 		repro_repeats += 1
 		fmt.printf(
-			"[repro] ANOMALY REPEAT #%d: producer went BACKWARDS %d -> %d (%d frames, %.3f s) while running forward\n",
-			repro_repeats, prod - delta, prod, -delta, f64(-delta) / max(f64(fps), 1),
+			"[repro] ANOMALY REPEAT #%d: producer %d -> %d (%d frames back) while playhead moved %+d; %d frames re-fed beyond the %d frame cushion\n",
+			repro_repeats, prod - delta, prod, -delta, ph_delta, unasked, cushion_frames,
 		)
 	}
 	// JUMP: a large advance with no user action behind it. Read against the
 	// [repro] CAUSE line the forward-skip branch prints when IT is the cause; if no
 	// CAUSE line precedes the jump, the advance came from the fill loop and the next
 	// thing to ask is why the queue emptied.
-	if playing && delta >= REPRO_JUMP_FRAMES {
+	if playing && !scrubbing && resync_delta == 0 && delta >= REPRO_JUMP_FRAMES {
 		repro_jumps += 1
 		fmt.printf(
 			"[repro] ANOMALY JUMP #%d: producer advanced %d -> %d (+%d frames, %.2f s) in one pass\n",
@@ -2764,7 +2817,7 @@ repro_report :: proc(fps: f64, dev_pos: i64) {
 	// reading is CURRENT (dev_resync == resync), because a stale dev_frame is a known
 	// and intended state for a few ms after every seek -- reporting that as desync
 	// would bury the real thing in noise.
-	if playing && dev_resync == resync {
+	if playing && !scrubbing && dev_resync == resync {
 		if gap := playhead.frame - dev; gap > REPRO_DESYNC_FRAMES || -gap > REPRO_DESYNC_FRAMES {
 			repro_desyncs += 1
 			fmt.printf(
@@ -2785,6 +2838,8 @@ repro_summary :: proc() {
 	)
 	repro_repeats, repro_jumps, repro_desyncs = 0, 0, 0
 	repro_have_prod = false
+	repro_last_ph = 0
+	repro_last_resync = 0
 }
 
 // audio_producer_feed mixes whole timeline frames up to a target derived from
@@ -3201,10 +3256,17 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 		if sync.atomic_load(&audio_prod.run) {
 			evt := sync.atomic_load(&audio_prod.resync)
 			if evt != last_evt || !had_evt {
+				force_evt := sync.atomic_load(&audio_prod.force_seek_resync)
+				force_seek := force_evt > last_evt && force_evt <= evt
 				last_evt = evt
 				open_start := monotonic_ns()
 				anchor := sync.atomic_load(&audio_prod.anchor_frame)
-				seeked := audio_reconcile_is_seeked(anchor, timeline_fps(), audio_rate_scale())
+				seeked := audio_reconcile_is_seeked(
+					anchor,
+					timeline_fps(),
+					audio_rate_scale(),
+					force_seek,
+				)
 				if had_evt {
 					// An EDIT or a SEEK: reconcile, so every decoder whose content
 					// position did not move keeps running. This is the path that
@@ -3255,9 +3317,10 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 				when ODIN_DEBUG {
 					if play_trace {
 				fmt.printf(
-					"[prod] resync evt=%d anchor=%d seeked=%t run=true  next_frame=%d dev=%d\n",
+					"[prod] resync evt=%d anchor=%d forced=%t seeked=%t run=true  next_frame=%d dev=%d\n",
 					evt,
 					anchor,
+					force_seek,
 					seeked,
 					audio_src.next_frame,
 					sync.atomic_load(&playback.dev_frame),
@@ -3388,11 +3451,14 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 								at = i64(audio_content_sec(audio_src.next_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
 								in_fifo = at >= s.first48 && at < s.have48
 							}
-							fmt.printf("[src %d] %s segs=%d dec=%t in=%dHz/%dch out=%dHz/%dch first48=%d have48=%d fifo=%dfr decoded=%dfr/%dch mix_at=%d(into %t) cov=%t\n",
+							fmt.printf("[src %d] %s segs=%d dec=%t in=%dHz/%dch out=%dHz/%dch first48=%d have48=%d fifo=%dfr out_ring=%dfr out_first=%d decoded=%dfr/%dch speed=%.3f pitch=%.3f wsola=%t mix_at=%d(into %t) cov=%t\n",
 								k, s.path, s.seg_count, s.dec.opened,
 								s.dec.input_rate, s.dec.input_channels, s.dec.out_rate, s.dec.out_channels,
 								s.first48, s.have48, ring_len(&s.fifo),
+								ring_len(&s.out_ring), s.out_first,
 								s.dec.decoded_frames, s.dec.decoded_chunks,
+								s.speed, s.pitch_ratio,
+								s.tempo.graph != nil,
 								at, in_fifo, covered)
 						}
 					}
@@ -3428,9 +3494,16 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 			// starts from current geometry instead of waiting for all decoders on press.
 			evt := sync.atomic_load(&audio_prod.resync)
 			if evt != last_evt {
+				force_evt := sync.atomic_load(&audio_prod.force_seek_resync)
+				force_seek := force_evt > last_evt && force_evt <= evt
 				last_evt = evt
 				anchor := sync.atomic_load(&audio_prod.anchor_frame)
-				seeked := audio_reconcile_is_seeked(anchor, timeline_fps(), audio_rate_scale())
+				seeked := audio_reconcile_is_seeked(
+					anchor,
+					timeline_fps(),
+					audio_rate_scale(),
+					force_seek,
+				)
 				if had_evt {
 					rep := audio_reconcile(anchor, seeked)
 					audio_rpt.reconciles += 1
@@ -3445,7 +3518,8 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					when ODIN_DEBUG {
 						if play_trace {
 							fmt.printf(
-								"[prod] reconcile(stopped) kept=%d sought=%d opened=%d dropped=%d touched=%t next_frame=%d\n",
+								"[prod] reconcile(stopped) forced=%t kept=%d sought=%d opened=%d dropped=%d touched=%t next_frame=%d\n",
+								force_seek,
 								rep.kept,
 								rep.sought,
 								rep.opened,
@@ -3621,27 +3695,36 @@ audio_update :: proc() {
 	}
 }
 
-// audio_seek re-anchors the producer at the given frame and requests a clear +
-// re-provision. UI thread only.
-audio_seek :: proc(frame: i64) {
+// audio_seek requests a new producer anchor. Explicit playhead navigation forces
+// decoder re-anchoring by default, even inside the normal cushion; geometry-only
+// reconciliation and in-drag scrub samples pass false. UI thread only.
+audio_seek :: proc(frame: i64, force_reanchor: bool = true) {
+	// resync has one writer (the UI thread). Publish anchor and intent before the
+	// generation so producer cannot observe request without its reason.
+	prev_evt := sync.atomic_load(&audio_prod.resync)
+	evt := prev_evt + 1
+	sync.atomic_store(&audio_prod.anchor_frame, frame)
+	sync.atomic_store(&audio_prod.anchor_now, i64(monotonic_ns()))
+	if force_reanchor {
+		sync.atomic_store(&audio_prod.force_seek_resync, evt)
+	}
 	when ODIN_DEBUG {
 		if audio_rpt.trace {
-			fmt.printf("[tr seek] to=%d\n", frame)
+			fmt.printf("[tr seek] to=%d force=%t\n", frame, force_reanchor)
 		}
 	}
 	when ODIN_DEBUG {
 		if play_trace {
 			fmt.printf(
-				"[ui]  audio_seek to=%d  (playhead=%d prod=%d resync %d->%d)\n",
+				"[ui]  audio_seek to=%d force=%t (playhead=%d prod=%d resync %d->%d)\n",
 				frame,
+				force_reanchor,
 				playhead.frame,
 				sync.atomic_load(&audio_prod.prod_frame),
-				sync.atomic_load(&audio_prod.resync),
-				sync.atomic_load(&audio_prod.resync) + 1,
+				prev_evt,
+				evt,
 			)
 		}
 	}
-	sync.atomic_store(&audio_prod.anchor_frame, frame)
-	sync.atomic_store(&audio_prod.anchor_now, i64(monotonic_ns()))
-	sync.atomic_add(&audio_prod.resync, 1)
+	sync.atomic_store(&audio_prod.resync, evt)
 }

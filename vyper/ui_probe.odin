@@ -842,6 +842,8 @@ when ODIN_DEBUG {
 		saved_dev := sync.atomic_load(&playback.dev_frame)
 		saved_dev_resync := sync.atomic_load(&playback.dev_resync)
 		saved_resync := sync.atomic_load(&audio_prod.resync)
+		saved_force_seek_resync := sync.atomic_load(&audio_prod.force_seek_resync)
+		saved_scrub_active := sync.atomic_load(&audio_prod.scrub_active)
 		saved_snap := editor_flags.snap_playhead_to_clips
 		// Snap OFF unless the case is about snapping: at low zoom the margin is
 		// SNAP_PIXELS/zoom frames wide, so leaving it on makes "drag to frame X"
@@ -861,6 +863,8 @@ when ODIN_DEBUG {
 			sync.atomic_store(&playback.dev_frame, saved_dev)
 			sync.atomic_store(&playback.dev_resync, saved_dev_resync)
 			sync.atomic_store(&audio_prod.resync, saved_resync)
+			sync.atomic_store(&audio_prod.force_seek_resync, saved_force_seek_resync)
+			sync.atomic_store(&audio_prod.scrub_active, saved_scrub_active)
 			editor_flags.snap_playhead_to_clips = saved_snap
 			active_interaction = .None
 			playhead_scrub.moved = false

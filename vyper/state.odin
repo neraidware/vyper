@@ -54,6 +54,14 @@ REPRO_JUMP_FRAMES :: 90
 // second at 60 fps, which is well past anything the cushion explains.
 REPRO_DESYNC_FRAMES :: 30
 
+// REPRO_REPEAT_SLACK_FRAMES is how far the producer may rewind past a backward playhead
+// before it counts as feeding already-played content. The producer is a separate thread
+// from the playhead and one pass can straddle a seek, so the two legitimately disagree
+// by a frame or two; without a slack the repeat test flickers on ordinary scrubs, which
+// is the failure that made this detector useless. Two frames is enough to absorb that
+// and far below the rewind a listener would hear as a repeat.
+REPRO_REPEAT_SLACK_FRAMES :: 2
+
 WINDOW_WIDTH :: 1280
 WINDOW_HEIGHT :: 720
 

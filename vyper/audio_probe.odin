@@ -650,6 +650,7 @@ when ODIN_DEBUG {
 		sync.atomic_store(&audio_prod.done, false)
 		sync.atomic_store(&audio_prod.run, false)
 		sync.atomic_store(&audio_prod.resync, 0)
+		sync.atomic_store(&audio_prod.force_seek_resync, 0)
 		audio_prod.thread = thread.create(audio_producer_proc)
 		if audio_prod.thread == nil {
 			fmt.println("[ap] SKIP: could not start the producer thread")
@@ -3079,6 +3080,25 @@ when ODIN_DEBUG {
 		fmt.printf(
 			"[ap] stale anchor: steady state playhead %d, producer %d (cushion %d) reads as NOT a seek\n",
 			steady, prod_before, cushion,
+		)
+		inside_cushion := steady + 1
+		if audio_reconcile_is_seeked(inside_cushion, probe_fps, audio_rate_scale()) {
+			fmt.printf(
+				"[ap] scrub release: FAIL: nearby playhead frame %d should be within the %d-frame cushion\n",
+				inside_cushion, cushion,
+			)
+			return false
+		}
+		if !audio_reconcile_is_seeked(inside_cushion, probe_fps, audio_rate_scale(), true) {
+			fmt.printf(
+				"[ap] scrub release: FAIL: explicit nearby seek to %d was suppressed by the cushion\n",
+				inside_cushion,
+			)
+			return false
+		}
+		fmt.printf(
+			"[ap] scrub release: explicit frame %d overrides the %d-frame cushion\n",
+			inside_cushion, cushion,
 		)
 		// THE STALE ANCHOR: the case the user's trace showed, and the one a
 		// request-versus-request comparison cannot see. Nothing seeks during ordinary

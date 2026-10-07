@@ -243,6 +243,7 @@ click_cases := []Click_Case{
 playhead_scrub_arm :: proc() {
 	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = false
+	sync.atomic_store(&audio_prod.scrub_active, true)
 	when ODIN_DEBUG {
 		if play_trace {
 			// Arming is where the playhead stops being a readout and becomes the pointer's,
@@ -1465,6 +1466,7 @@ interaction_release :: proc(inp: Mouse_Input) {
 			}
 			audio_seek(playhead.frame)
 		}
+		sync.atomic_store(&audio_prod.scrub_active, false)
 	}
 	active_interaction = .None
 	playhead_scrub.moved = false
@@ -1848,7 +1850,7 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		// my last request", which bounds it to exactly one outstanding seek and lets
 		// the drag keep making progress.
 		if frame != was && sync.atomic_load(&audio_prod.resync) == playhead_scrub.requested_resync {
-			audio_seek(frame)
+			audio_seek(frame, false)
 			playhead_scrub.requested_resync = sync.atomic_load(&audio_prod.resync)
 		}
 		sync.atomic_store(&audio_rpt.ph_src, 1)

@@ -7944,3 +7944,53 @@ program does, and the cross-machine divergence that did matter is fixed.
 Gates: `check`, `build`, `action_log`, `probe`, `smoke` and `valgrind` all pass
 (0 definitely lost, 0 indirectly lost, 65 error contexts of the usual
 FFmpeg/Odin noise).
+
+## Active 42 — Scrub release reused queued audio inside the producer cushion
+
+**Status: OPEN.** The explicit release re-anchor is verified in logs, but the
+user reports that the audible repeat/desync still occurs. Do not close this
+workstream from counters alone; the reported sound is the acceptance condition.
+Investigation uses the captured 2111-frame `/tmp/vyper/session.vya` replay.
+
+### Steps
+
+- [x] Trace each scrub release through UI request, producer reconciliation, and
+  device-queue invalidation using `VYPER_PLAY_TRACE`, `VYPER_AUDIO_TRACE`, and
+  `VYPER_REPRO_TRACE` on the same action log.
+- [x] Separate explicit playhead seeks from geometry-only reconciliation and
+  coalesced in-drag scrub requests.
+- [x] Repair repeat detection to compare producer rewind with the playhead's own
+  movement, subtracting the normal producer cushion. The old `delta < 0` test
+  reported all five backward scrubs in the baseline replay as audio repeats.
+  Explicit resyncs and the active pointer-owned scrub are requested movement, not
+  anomalies; the detector now excludes them rather than crying wolf during a drag.
+
+### Probe
+
+- [x] Before fix, release at frame 204 produced `resync evt=19 anchor=204
+  seeked=false`; reconcile kept all 25 sources, sought 0, touched no queued
+  window, and left producer at frame 200. The request fell inside the cushion,
+  so the engine treated a user seek as stationary geometry and left audio from
+  before the release queued.
+- [x] Explicit playhead navigation now tags its resync generation. Producer
+  consumes that intent even if later requests coalesce over it. `audio_seek`
+  forces re-anchor by default; geometry edits and intermediate scrub samples
+  explicitly retain reconcile-only behavior.
+- [x] `audio_backward_scrub` asserts that a target inside the cushion is ignored
+  as ordinary steady-state drift but accepted as an explicit seek.
+- [x] Replayed same action log twice. Both runs: 4/4 releases forced, 25/25
+  sources sought, queued window touched/cleared, producer `next_frame` exactly
+  at release target. Repeat/desync counters stayed clear after scrub arm.
+- [ ] User confirms the audible repeat/desync is gone. Last report says it still
+  reproduces, so the fix below is necessary but not yet sufficient.
+- [x] Per-source diagnostics now include speed, pitch, WSOLA presence, output
+  ring length, and output origin; same replay confirmed WSOLA is not involved
+  here (`speed=1`, `pitch=1`, `wsola=false`).
+
+### Accept
+
+- [x] `scripts/gate.sh check`, `audio_probe`, and `audio_backward_scrub` pass.
+- [x] Same captured replay passes twice with the four release assertions above.
+- [ ] Audible playback passes scrub-release reproduction in the editor.
+- [x] `scripts/gate.sh action_log` passes; `valgrind` reports 0 definitely/indirectly
+  lost and no invalid access (65 existing FFmpeg/Odin error contexts).
