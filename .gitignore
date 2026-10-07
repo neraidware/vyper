@@ -22,7 +22,7 @@
 
 # Compile-time outputs (nanosvg C TU), produced by flake.nix / CI / local build
 /vyper/vendor/nanosvg/*.o
-/vyper/vyper/vendor/nanosvg/*.obj
+/vyper/vendor/nanosvg/*.obj
 
 # Clay C TU + linked archive, produced by flake.nix / CI / local build from
 # the vendored single-header vendor/clay.h (never ship prebuilt clay binaries)
