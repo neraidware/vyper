@@ -2215,6 +2215,17 @@ main :: proc() {
 			return
 		}
 	}
+	// VYPER_STILL_SWITCH_PROBE="<img>|<img>[|...]" -- plays across back-to-back short
+	// stills and requires a decoded frame the moment each one covers the playhead.
+	when ODIN_DEBUG {
+		if sp, _ := os.lookup_env_alloc("VYPER_STILL_SWITCH_PROBE", context.temp_allocator); sp != "" {
+			async_live_mode = false
+			async_dec_init()
+			defer async_dec_shutdown()
+			still_switch_probe_run(sp)
+			return
+		}
+	}
 	// Characterisation only: opens a file and reports where the decoder lands
 	// after a seek, which is how Active 30 S4's "why" got answered (the muxer
 	// writes AAC's encoder delay as pts=-1024 + skip_samples=1024 on packet 0,

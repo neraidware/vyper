@@ -1908,6 +1908,33 @@ target_audio_backward_scrub() {
 	echo "audio-backward-scrub: ok (playhead move rewinds the producer, drops the queue, re-anchors the decoder)"
 }
 
+# still_switch proves a run of back-to-back SHORT stills never shows a black frame:
+# every clip must already have a decoded frame the moment it covers the playhead, at
+# one, two and three frames per clip. The three images are distinct JPEGs at 1080x1920
+# because that is the shape of the project that exposed it (~/spooky.vyproj: 1 and 3
+# frame stills cycling three screenshots); a still too small to cost a decode would
+# pass trivially.
+target_still_switch() {
+	require_fresh_binary still-switch || return 1
+	local dir=target/stills
+	mkdir -p "$dir"
+	local i
+	for i in 1 2 3; do
+		if [ ! -s "$dir/still_$i.jpg" ]; then
+			ffmpeg -v error -f lavfi -i "mandelbrot=s=1080x1920:start_scale=$((i*2))" \
+				-frames:v 1 -q:v 2 "$dir/still_$i.jpg" -y || return 1
+		fi
+	done
+	local out
+	if ! out=$(VYPER_STILL_SWITCH_PROBE="$PWD/$dir/still_1.jpg|$PWD/$dir/still_2.jpg|$PWD/$dir/still_3.jpg" timeout 300 ./target/vyper 2>&1); then
+		echo "$out" | grep -E '^\[still-switch\]' >&2
+		echo "still-switch: FAILED -- a still covered the playhead with no decoded frame (black frame)" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[still-switch\] (clip_len|ok)'
+	echo "still-switch: ok (every short still has a frame the moment it covers the playhead)"
+}
+
 # audio_decode_integrity proves the DECODER's output matches its labels: the resampler
 # retains no input, and a seek leaves no trace of the audio decoded before it. The
 # fixture is FLAC because its 4608-sample blocks are larger than the decoder's old
@@ -2157,7 +2184,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_decode_integrity audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_decode_integrity still_switch audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -2200,6 +2227,7 @@ main() {
 	audio_clip_stretch) target_audio_clip_stretch ;;
 	audio_scrub_exact) target_audio_scrub_exact ;;
 	audio_backward_scrub) target_audio_backward_scrub ;;
+	still_switch) target_still_switch ;;
 	audio_decode_integrity) target_audio_decode_integrity ;;
 	audio_seek_landing) target_audio_seek_landing ;;
 	audio_bus_prime) target_audio_bus_prime ;;
@@ -2231,7 +2259,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

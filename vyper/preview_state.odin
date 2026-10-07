@@ -295,9 +295,6 @@ update_preview_slots :: proc() -> bool {
 	if active_interaction == .Playhead_Scrub {
 		playback.scrub_tick += 1
 	}
-	// Warm the upcoming clip's decoder before the playhead crosses the
-	// boundary, so the transition hands over a warm decoder (no cut stall).
-	prewarm_next_clip()
 	sync_track_order()
 	for w := 0; w < len(timeline.track_order); w += 1 {
 		ti := timeline.track_order[w]
@@ -926,6 +923,18 @@ slot.is_text = true
 			slot^ = {}
 		}
 	}
+	// Warm the clip that follows, so the next boundary hands over a warm decoder (no
+	// cut stall). This runs AFTER the claim walk, never before it, and the order is
+	// load-bearing. Prewarm targets the earliest-starting clip after the one covering
+	// the playhead; run first, then on the frame the playhead ENTERS clip N it sees N
+	// as active, targets N+1, and resets the decoder warmed for N one step before N
+	// claims it. Every claim then misses (warm_hit=false) and decodes cold, which for
+	// a clip short enough that N+1 starts inside WARM_LOOKAHEAD is every clip: a black
+	// frame at each cut. Longer clips escaped only because N+1 was out of lookahead,
+	// prewarm found no target and returned without touching the decoder. Here the claim
+	// has already taken warm for N (warm.valid is false), so the retarget to N+1 costs
+	// nothing it was holding.
+	prewarm_next_clip()
 	return changed
 }
 

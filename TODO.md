@@ -8084,3 +8084,71 @@ is a specific way the investigation went wrong or the engine hid the fault.
 - **Do not panic on sizes the media chose.** Frame and block sizes come from the
   file (FLAC allows blocks up to 65535). Size buffers to the input and assert only
   invariants of our own code.
+
+## Active 43 — Black flashing between short stills (~/spooky.vyproj)
+
+**Status: FIXED, awaiting the user's eyes.** `~/spooky.vyproj` is 21 three-frame
+stills then 22 one-frame stills, cycling three 1080x1920 JPEGs. Two independent
+defects were found by replaying it headlessly (a synthesised `VYPER_ACTION_REPLAY`
+log: the project as the snapshot, a space keypress, 480 frames) with
+`VYPER_FLASH_REC=1`.
+
+### Steps
+
+- [x] Reproduce with the real project in the real frame loop, not a description of
+  it. `[flash-rec]` showed a covering still with `hf=false` (no decoded frame) at its
+  first render; `VYPER_TRACE` `[vf] assign` showed `warm_hit=false` on every claim
+  (1 of 37 hit).
+- [x] **Defect 1 — load collapsed every still to one frame.** An image imports as
+  `kind=.Video` with `is_image` set, so `asset_authoring_rate`'s `.Image` rung ("a
+  still has no rate") was never reached. The `.Video` rung derived a rate from the
+  still's `frame_count` (one timeline-second, 25) over its `dur_us` (one frame,
+  40 ms): 625 fps. `pf_rebase_extents` then converted each 3-frame extent as
+  3/625 s at 25 fps, rounded to 0, clamped to 1. A default one-second still (25
+  frames) loaded as 1. `asset_authoring_rate` now returns no rate for `is_image`
+  first.
+- [x] **Defect 2 — every claim was a cold decode.** `prewarm_next_clip` ran at the
+  top of `update_preview_slots`, before the claim walk. On the frame the playhead
+  entered clip N it saw N as active, targeted N+1, and reset the decoder warmed for N
+  one step before N claimed it. It only bites when N+1 starts inside `WARM_LOOKAHEAD`
+  (a clip shorter than the lookahead); longer clips found no target and left the
+  decoder alone, which is why it showed up as "switching really short clips
+  quickly". Prewarm now runs after the claim walk, so the claim has consumed warm
+  for N before it retargets to N+1.
+
+### Probe
+
+- [x] `test_still_extent_survives_load` (timeline_probe, the real asset's numbers):
+  red on the old code (`3 -> 1`, `625.0 fps`), green with the fix.
+- [x] New gate `still_switch` (`still_switch_probe.odin`): lays 24 back-to-back
+  1080x1920 JPEG stills at 1, 2 and 3 frames each, plays forward, and counts frames
+  where the covering clip has no decoded frame the moment `update_preview_slots`
+  returns. Red before the fix (22 / 44 / 66 black frames), 0 / 0 / 0 after.
+- [x] The real project replayed again: warm hits 1 -> 35 of 37 claims; black
+  rendered frames 39 -> 2 of 165. The 2 left are the playback-start cold claim
+  and a startup hitch that jumped the playhead past the warm target; neither is a
+  cut-to-cut handover.
+
+### Accept
+
+- [x] `check`, `timeline_probe`, `still_switch`, `render_live_probe`, `zorder`,
+  `opacity`, `smoke`, `probe` pass; the split-boundary `VYPER_FLASH_PROBE` reports
+  0 drops; `valgrind`, `render_live_valgrind`, `undo_valgrind` report 0 lost and
+  no invalid access.
+- [ ] User confirms the flashing is gone in the editor on `~/spooky.vyproj`.
+
+### Rules from this workstream
+
+- **A per-frame stage that retargets shared state runs after the stage that
+  consumes it.** A cache or handoff slot written for "the next thing" is read by
+  "this thing" one step later; if the writer runs first it overwrites exactly what
+  the reader is about to take. Order the pipeline reader-first, and pin it with a
+  probe that makes the handoff the only thing under test.
+- **Load is a place data changes, so replay the real file before blaming playback.**
+  The first replay showed 1-frame stills with gaps because load had already
+  rewritten the lengths; the flicker I was about to chase was partly authored by
+  the loader. Compare what the file says to what the timeline holds before reading
+  any render log.
+- **A kind enum is not a type test.** Images carry `kind=.Video`; any `switch`
+  on `Media_Kind` that has an `.Image` arm is dead for them. Test `is_image` first,
+  and when adding a branch on `kind`, ask which assets can actually carry it.
