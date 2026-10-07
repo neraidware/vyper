@@ -8028,3 +8028,47 @@ Investigation uses the captured 2111-frame `/tmp/vyper/session.vya` replay.
   reports improved; awaiting full confirmation).
 - [x] `scripts/gate.sh action_log` passes; `valgrind` reports 0 definitely/indirectly
   lost and no invalid access (65 existing FFmpeg/Odin error contexts).
+
+### Standing rules from this workstream — so we do not re-learn them
+
+The audible repeat took far longer to find than it should have. Every item below
+is a specific way the investigation went wrong or the engine hid the fault.
+
+- **Position is not content.** `next_frame`, `first48`, `dev_frame`, and the
+  `content=[a,b)` log are all derived from a label. A fifo filled with the wrong
+  audio reports a flawless position, so "every clock is clean" proves nothing about
+  what is played. A content fault needs a probe that compares BYTES: the same
+  position decoded fresh versus after a detour, or in chunks versus whole
+  (`audio_decode_integrity` is the pattern). Never close an audio defect from
+  counters; the listener's ear is the acceptance condition.
+- **Gate fixtures must have the shape of the user's real media, not tidy media.**
+  The bug lived in FLAC's 4608-sample blocks, larger than the decoder's 4096
+  buffer; every AAC/WAV fixture decoded in smaller frames and never saw it. Before
+  calling an audio path covered, `ffprobe` the user's actual file (codec, frame
+  size, sample rate, channels) and ask which fixture exercises that shape. Include
+  a frame larger than any internal buffer and a non-48 kHz (resampled) source.
+- **`swres_convert` fails silently.** If the output room is smaller than the
+  frame's output it converts what fits and keeps the rest as delay, with no error.
+  Size the output from `swr_get_out_samples` per frame, never from a fixed cap, and
+  treat a backlog that grows (`swr_get_delay`) as the signature.
+- **`flush_buffers` resets only the codec.** On every seek, every stateful stage
+  behind the codec must reset too: resampler (`swr_close`/`swr_init`), tempo graph,
+  fifo, and the position label. Adding a stage means adding its reset to the seek
+  path in the same change.
+- **Prove a detector before believing it.** Three false findings here: a clock
+  that assumed in-order content (circular), a "repeat" that was silence (my
+  all-zero check assumed 4 bytes per sample while the hash stepped 3), and a
+  cushion subtracted twice (a constant 16-frame offset). Run every new detector on
+  a known-positive and a known-negative first. A count in the thousands is a
+  detector bug until shown otherwise, and equal hashes of silence are expected.
+- **Logs state facts, not verdicts.** The `REWIND: replays heard audio` line fired
+  on every legitimate backward seek and read as a diagnosis; it was shipped, then
+  became the thing the next investigation anchored on. Log the values; let a probe
+  decide.
+- **A fix for a silent defect ships with a gate that is red on the old code.**
+  Verify both directions (old code fails, new code passes) and, when a fix has two
+  parts, that each part is red on its own (the 48 kHz case caught the retention, the
+  44.1 kHz case caught the missing seek reset).
+- **Do not panic on sizes the media chose.** Frame and block sizes come from the
+  file (FLAC allows blocks up to 65535). Size buffers to the input and assert only
+  invariants of our own code.
