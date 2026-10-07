@@ -1980,9 +1980,14 @@ main :: proc() {
 	//     Separate from play_trace because it runs on the PRODUCER thread and
 	//     answers a different question: not "what did each loop do" but "was any
 	//     of it wrong".
-	vyper_trace = diag_flag("VYPER_TRACE")
-	play_trace = diag_flag("VYPER_PLAY_TRACE")
-	repro_trace = diag_flag("VYPER_REPRO_TRACE")
+	// Gated, not just defaulted: a release binary should not even contain the
+	// env var names. The globals stay (state.odin declares them) and stay false,
+	// which is what every ungated reader sees.
+	when ODIN_DEBUG {
+		vyper_trace = diag_flag("VYPER_TRACE")
+		play_trace = diag_flag("VYPER_PLAY_TRACE")
+		repro_trace = diag_flag("VYPER_REPRO_TRACE")
+	}
 	when ODIN_DEBUG {
 		diag_report_temp()
 	}
@@ -2654,12 +2659,17 @@ main :: proc() {
 	)
 	clay.SetMeasureTextFunction(measure_text, nil)
 
-	// DIAG (temporary): magic playhead-clock knobs.
-	if v := os.get_env_alloc("VYPER_PLAYBACK_MAGIC_MS", context.temp_allocator); v != "" {
-		playback.magic_ms, _ = strconv.parse_f64(v)
-	}
-	if v := os.get_env_alloc("VYPER_PLAYBACK_FPS", context.temp_allocator); v != "" {
-		playback.magic_fps, _ = strconv.parse_f64(v)
+	// DIAG (temporary): magic playhead-clock knobs. They REPLACE the measured wall
+	// delta, so they change playback timing rather than observe it -- debug-only,
+	// and gated for the same reason as the recorder: a release binary does not
+	// carry them. state.odin reads the fields, which stay at zero.
+	when ODIN_DEBUG {
+		if v := os.get_env_alloc("VYPER_PLAYBACK_MAGIC_MS", context.temp_allocator); v != "" {
+			playback.magic_ms, _ = strconv.parse_f64(v)
+		}
+		if v := os.get_env_alloc("VYPER_PLAYBACK_FPS", context.temp_allocator); v != "" {
+			playback.magic_fps, _ = strconv.parse_f64(v)
+		}
 	}
 	if playback.magic_ms > 0 || playback.magic_fps > 0 {
 		when ODIN_DEBUG {
@@ -2789,7 +2799,9 @@ main :: proc() {
 		clear_expired_ui_notice()
 		width, height: c.int
 		sdl.GetWindowSize(window, &width, &height)
-		action_log_window(width, height)
+		when ODIN_DEBUG {
+			action_log_window(width, height)
+		}
 		handle_sdl_events(&running)
 		// A close/quit event sets running=false inside the event poll above. If
 		// we fall through into the render+present, the blocking GPU swapchain
@@ -2803,8 +2815,13 @@ main :: proc() {
 		// A replay's pointer comes from the log; the live one from SDL. One
 		// place decides which, and everything downstream sees the same
 		// Mouse_Input either way.
-		inp := action_replaying() ? action_replay_mouse_input() : read_mouse_input()
-		action_record_mouse(inp)
+		inp := read_mouse_input()
+		when ODIN_DEBUG {
+			if action_replaying() {
+				inp = action_replay_mouse_input()
+			}
+			action_record_mouse(inp)
+		}
 		// After the mouse read, so a backend that never sends DROP_POSITION
 		// resolves the highlighted zone from the live pointer.
 		refresh_file_drag()
@@ -2855,7 +2872,9 @@ main :: proc() {
 		// record for a frame that failed to present, and the log would read as
 		// truncated rather than as a slow frame.
 		render_ui_frame(device, window, &renderer, commands, width, height, &ui_dec_us)
-		action_record_frame_end(monotonic_ns() - frame_start_ns)
+		when ODIN_DEBUG {
+			action_record_frame_end(monotonic_ns() - frame_start_ns)
+		}
 		frame_start_ns = monotonic_ns()
 	}
 	// The log's buffer is the player's for the whole session and outlives every

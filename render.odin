@@ -1551,18 +1551,20 @@ rasterize_subtitle_cue :: proc(j: ^Render_Sub_Cue, text: string, scale: f32) {
 		font_px,
 		context.allocator,
 	)
-	if vyper_trace || os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
-		fmt.printf(
-			"[sub-raster] len=%d scale=%.1f bw=%d bh=%d ink=%d,%d,%d,%d\n",
-			len(text),
-			scale,
-			bw,
-			bh,
-			ox,
-			oy,
-			ow,
-			oh,
-		)
+	when ODIN_DEBUG {
+		if vyper_trace || os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
+			fmt.printf(
+				"[sub-raster] len=%d scale=%.1f bw=%d bh=%d ink=%d,%d,%d,%d\n",
+				len(text),
+				scale,
+				bw,
+				bh,
+				ox,
+				oy,
+				ow,
+				oh,
+			)
+		}
 	}
 	if ow <= 0 || oh <= 0 {
 		delete(buf)
@@ -4009,27 +4011,29 @@ render_worker_run :: proc() {
 			// on both sides.
 			w, h := text_box_dims(s.source_w, s.source_h, scale, f32(render_job.width))
 			bottom := anchor_y + h / 2
-			if vyper_trace ||
-			   os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
-				fmt.printf(
-					"[sub-blit] cue=%d ox=%d oy=%d ow=%d oh=%d bw=%d bh=%d w=%.0f h=%.0f x0=%.0f y0=%.0f anchor=(%.0f,%.0f) src=%dx%d\n",
-					ci,
-					jc.ox,
-					jc.oy,
-					jc.ow,
-					jc.oh,
-					jc.bw,
-					jc.bh,
-					w,
-					h,
-					anchor_x - w / 2,
-					bottom - h,
-					anchor_x,
-					anchor_y,
-					s.source_w,
-					s.source_h,
-					scale,
-				)
+			when ODIN_DEBUG {
+				if vyper_trace ||
+				   os.get_env_alloc("VYPER_SUB_RENDER_TRACE", context.temp_allocator) != "" {
+					fmt.printf(
+						"[sub-blit] cue=%d ox=%d oy=%d ow=%d oh=%d bw=%d bh=%d w=%.0f h=%.0f x0=%.0f y0=%.0f anchor=(%.0f,%.0f) src=%dx%d\n",
+						ci,
+						jc.ox,
+						jc.oy,
+						jc.ow,
+						jc.oh,
+						jc.bw,
+						jc.bh,
+						w,
+						h,
+						anchor_x - w / 2,
+						bottom - h,
+						anchor_x,
+						anchor_y,
+						s.source_w,
+						s.source_h,
+						scale,
+					)
+				}
 			}
 			render_text_blit(
 				eslot.canvas,

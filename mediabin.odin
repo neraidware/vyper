@@ -397,10 +397,24 @@ render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179
 				render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179, 255}, 0, 2)
 				}
 			}
-			if media_drag.trace_once {
-				rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
-				fmt.printf("[md] lane=%d created=%v gx=%.1f rg=%v row=%v lane_box=%v\n", lane.track_idx, lane.created, gx, rg, row, lane_box)
-				media_drag.trace_once = false
+			when ODIN_DEBUG {
+				// A one-shot geometry dump for the ghost-tile drag. Unconditional
+				// in the sense that it is not behind a trace flag, which is why it
+				// survived the sweep: a debug print is debug behavior whatever
+				// gates it.
+				if media_drag.trace_once {
+					rg := clay.GetElementData(clay.ID("RulerGutter")).boundingBox
+					fmt.printf(
+						"[md] lane=%d created=%v gx=%.1f rg=%v row=%v lane_box=%v\n",
+						lane.track_idx,
+						lane.created,
+						gx,
+						rg,
+						row,
+						lane_box,
+					)
+					media_drag.trace_once = false
+				}
 			}
 			b := clay.BoundingBox{
 				x = lane_box.x + (f32(lane.placed) - timeline_view.start) * timeline_view.zoom,

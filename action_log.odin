@@ -135,6 +135,13 @@ cursor_bytes :: proc (c: ^Action_Cursor, p: []u8) {
 	c.n += len(p)
 }
 
+// The recorder, the reader and the player are ONE debug-only unit: recording
+// and replaying a session is a debugging instrument, so a release binary
+// carries none of it. Only the writer was gated at first, which left the player
+// -- and VYPER_ACTION_REPLAY -- in a release binary that could still replay a
+// session log.
+when ODIN_DEBUG {
+
 // Action_Rd is the read-side mirror: every read reports whether it had the
 // bytes, because a truncated log is a corrupt input to this build, not an
 // invariant of the program.
@@ -382,10 +389,6 @@ action_record_frame_end :: proc(dt_ns: u64) {
 	rec.frames += 1
 }
 
-// Debug-only. The whole recorder is a debugging instrument: it exists so a
-// session can be replayed, and a release binary does not carry it.
-when ODIN_DEBUG {
-
 action_rec_open :: proc(path: string) {
 	f, err := os.open(path, {.Write, .Create, .Trunc})
 	if err != nil {
@@ -453,8 +456,6 @@ action_rec_close :: proc() {
 	fmt.printf("[action-log] recorded %d frames -> %s\n", frames, name)
 	delete(rec.name)
 	rec.name = ""
-}
-
 }
 
 // ---------------------------------------------------------------------------
@@ -835,6 +836,8 @@ action_replay_frame :: proc(running: ^bool) {
 	}
 }
 
+}
+
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
@@ -858,22 +861,20 @@ action_log_capture_session :: proc() {
 // already loaded, is captured by action_log_capture_session after that block.
 // The recorder is closed by the frame loop's exit path, not here.
 action_log_startup :: proc(window: ^sdl.Window) {
-	// Fixed storage: diag_path returns a view into its buffer, and the recorder
-	// holds the path for the whole session.
-	record_buf: [1024]u8
-	if replay := os.get_env_alloc("VYPER_ACTION_REPLAY", context.temp_allocator); replay != "" {
-		// Borrowed, not owned: main created the window and outlives the loop.
-		action_play.win = window
-		if !action_play_open(replay) {
-			os.exit(1)
-		}
-		return
-	}
-	// Records to <temp>/vyper/session.vya in a debug build, so a debug session is
-	// replayable without being told where to put it. VYPER_ACTION_RECORD=<path>
-	// overrides; the record itself is opt-OUT via an explicit path being how you
-	// turn it on and VYPER_ACTION_RECORD=0 turning it off.
 	when ODIN_DEBUG {
+		// Fixed storage: diag_path returns a view into its buffer, and the
+		// recorder holds the path for the whole session.
+		record_buf: [1024]u8
+		if replay := os.get_env_alloc("VYPER_ACTION_REPLAY", context.temp_allocator); replay != "" {
+			// Borrowed, not owned: main created the window and outlives the loop.
+			action_play.win = window
+			if !action_play_open(replay) {
+				os.exit(1)
+			}
+			return
+		}
+		// Records to <temp>/vyper/session.vya in a debug build, so a debug
+		// session is replayable without being told where to put it.
 		if record := diag_path("VYPER_ACTION_RECORD", "session.vya", record_buf[:]); record != "" {
 			action_rec_open(record)
 		}

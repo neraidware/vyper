@@ -2590,7 +2590,9 @@ audio_init :: proc() -> bool {
 	// shows, which is not more information, it is less.
 	audio_rpt.log_ms = i64(diag_interval("VYPER_AUDIO_LOG", 2000))
 	audio_rpt.log_full = diag_flag("VYPER_AUDIO_FULL")
-	audio_rpt.trace = diag_flag("VYPER_AUDIO_TRACE")
+	when ODIN_DEBUG {
+		audio_rpt.trace = diag_flag("VYPER_AUDIO_TRACE")
+	}
 	// The device, the bridge ring, and the resampler live in audio_device.odin
 	// behind a narrow interface; this only decides whether playback is possible at
 	// all. Failure is not fatal (the app runs silent), which is exactly what

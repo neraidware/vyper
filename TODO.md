@@ -7807,6 +7807,31 @@ as absent. The check that settled it was running the measurement the item claims
   warning). Both now live in `render_gpu.odin`; each probe loads its own copy.
   Gating those files without moving them would have shipped a release binary
   that cannot create its NV12 pipeline.
+- The action-log PLAYER (`action_play_open`, `action_replay_frame`,
+  `action_replay_mouse_input`, `VYPER_ACTION_REPLAY`) was still compiled into
+  release after the first pass: the recorder had been gated and the reader and
+  player had not, so a release binary could still replay a session log. The
+  recorder, the reader and the player are now one gated unit, with `when` at the
+  four call sites (`main.odin` x3, `event.odin` x1) rather than a
+  `action_replaying()` stub that returns false.
+- Three more that the flag-name sweep could not see, because they OR an env read
+  into a trace condition or are not behind a flag at all:
+  `VYPER_SUB_RENDER_TRACE` (`vyper_trace || get_env_alloc(...)` in two places in
+  render.odin), `VYPER_PLAYBACK_MAGIC_MS` / `VYPER_PLAYBACK_FPS` (these REPLACE
+  the measured wall delta, so they change playback rather than observe it), and
+  an unconditional one-shot `[md]` geometry dump in mediabin.odin that no flag
+  gated at all.
+- Audit method, so the next sweep can be a command rather than an eyeball: env
+  var NAMES are string literals, so `strings ./vyper | grep -qx VYPER_X` says
+  whether a read survived, and a sampled grep of `[tag] message` literals says
+  whether a print survived. 615 sampled messages, 7 survived, all of them error
+  paths (`graph_alloc failed`, `avformat_new_stream failed`, `project load
+  failed:`) that should stay.
+- Release now contains NO diagnostic output at all: a release run of
+  sallyface.vyproj prints zero bracketed tags and writes nothing under
+  `/tmp/vyper`. Six env names remain, deliberately: `VYPER_HW_ENABLE`,
+  `VYPER_KEYED_GPU`, `VYPER_YUV`, `VYPER_GPU_NV12`, `VYPER_PROXY_ENCODER` and
+  `VYPER_RATE` select a backend, not a diagnostic.
 - `check` must keep `-debug` or this whole arrangement is unverifiable: without
   it `odin check` does not compile the `when ODIN_DEBUG` branch at all.
 - Gates green: check (debug and release), probe, dnd_probe, action_log,

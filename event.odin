@@ -24,14 +24,23 @@ import sdl "vendor:sdl3"
 // implementation of it.
 handle_sdl_events :: proc(running: ^bool) {
 	kbd_begin_drain()
-	if action_replaying() {
-		action_replay_frame(running)
-	} else {
-		event: sdl.Event
+	event: sdl.Event
+	replayed := false
+	when ODIN_DEBUG {
+		// A replay replaces the poll, not the dispatch: its recorded events go
+		// through dispatch_sdl_event, the same proc the live loop calls.
+		replayed = action_replaying()
+		if replayed {
+			action_replay_frame(running)
+		}
+	}
+	if !replayed {
 		for sdl.PollEvent(&event) {
 			// Recorded before dispatch: dispatch can start a text field, and the
 			// opener keypress must still be in the log.
-			action_record_event(&event)
+			when ODIN_DEBUG {
+				action_record_event(&event)
+			}
 			dispatch_sdl_event(&event, running)
 		}
 	}
