@@ -30,6 +30,23 @@ import "core:time"
 import sdl "vendor:sdl3"
 import yuvconv "vendor/yuv"
 
+
+// The NV12 shaders, embedded at compile time. These were declared in
+// gpu_nv12_probe.odin, which was the only reason the probe file could not be
+// gated: render_gpu.odin builds the app's own luma/chroma pipelines from them, so
+// they are app assets that happened to live next to the probe that also used them.
+// The probe now loads its own copies (nv12_probe_*).
+nv12_luma_fragment_spirv := #load("shaders/nv12_luma.frag.spv")
+nv12_chroma_fragment_spirv := #load("shaders/nv12_chroma.frag.spv")
+
+// A driver's BACKEND name cannot identify a software rasterizer here: llvmpipe
+// reports backend "vulkan", the same string a real RADV/Intel/NVIDIA adapter
+// reports. Matching the device NAME is the only reliable signal, so the list lives
+// at file scope rather than being rebuilt on every setup. It was declared in
+// gpu_resample_probe.odin for the same reason as the shaders above.
+SOFTWARE_RASTERIZER_NAMES :: [5]string{"llvmpipe", "lavapipe", "softpipe", "swiftshader", "warp"}
+
+
 // The SPV blobs are #load-ed once in gpu_renderer.odin next to the other
 // stages; sharing them keeps one copy in the binary and one place that can go
 // stale. quad_vertex_spirv and blit_box_fragment_spirv are the SAME pair the
@@ -397,8 +414,10 @@ gpu_resample_into :: proc(
 		return false
 	}
 	upload_done := time.now()._nsec
-	if render_split_timing {
-		render_pipe.res_upload_ns += upload_done - t_stage
+	when ODIN_DEBUG {
+		if render_split_timing {
+			render_pipe.res_upload_ns += upload_done - t_stage
+		}
 	}
 	if !gpu_resample_dst(g, rw, rh) {
 		return false
@@ -477,13 +496,15 @@ gpu_resample_into :: proc(
 		return false
 	}
 	download_done := time.now()._nsec
-	if render_split_timing {
-		// Submit + wait + the map: everything after the copy pass is
-		// recorded, so the readback cost is not understated by putting
-		// the map outside.
-		render_pipe.res_gpu_ns += download_done - upload_done
-		render_pipe.res_submit_ns += submitted - pass_done
-		render_pipe.res_wait_ns += download_done - submitted
+	when ODIN_DEBUG {
+		if render_split_timing {
+			// Submit + wait + the map: everything after the copy pass is
+			// recorded, so the readback cost is not understated by putting
+			// the map outside.
+			render_pipe.res_gpu_ns += download_done - upload_done
+			render_pipe.res_submit_ns += submitted - pass_done
+			render_pipe.res_wait_ns += download_done - submitted
+		}
 	}
 	back := sdl.MapGPUTransferBuffer(g.device, g.down, true)
 	if back == nil {
@@ -491,8 +512,10 @@ gpu_resample_into :: proc(
 	}
 	copy(dst[:bytes], ([^]u8)(back)[:bytes])
 	sdl.UnmapGPUTransferBuffer(g.device, g.down)
-	if render_split_timing {
-		render_pipe.res_download_ns += time.now()._nsec - download_done
+	when ODIN_DEBUG {
+		if render_split_timing {
+			render_pipe.res_download_ns += time.now()._nsec - download_done
+		}
 	}
 	return true
 }

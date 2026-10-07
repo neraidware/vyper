@@ -3797,8 +3797,10 @@ render_worker_run :: proc() {
 				return
 			}
 		}
-		if split_timing {
-			loop_start = time.now()._nsec
+		when ODIN_DEBUG {
+			if split_timing {
+				loop_start = time.now()._nsec
+			}
 		}
 		slot_idx := int(frame_idx & 1)
 		eslot := &render_pipe.enc_slots[frame_idx & (RENDER_ENC_SLOTS - 1)]
@@ -4047,10 +4049,12 @@ render_worker_run :: proc() {
 				sg[int(Render_Geom_Prop.Opacity)],
 			)
 		}
-		if split_timing {
-			now := time.now()._nsec
-			composite_ns += now - loop_start
-			loop_start = now
+		when ODIN_DEBUG {
+			if split_timing {
+				now := time.now()._nsec
+				composite_ns += now - loop_start
+				loop_start = now
+			}
 		}
 
 		eslot.spf = 0
@@ -4079,8 +4083,10 @@ render_worker_run :: proc() {
 				render_pipe.audio_holes += 1
 			}
 		}
-		if split_timing {
-			audio_ns += time.now()._nsec - loop_start
+		when ODIN_DEBUG {
+			if split_timing {
+				audio_ns += time.now()._nsec - loop_start
+			}
 		}
 
 		// Offer the finished frame to the live preview sink. After the
@@ -4265,9 +4271,11 @@ render_eval_keyed_geom :: proc(
 	// takes its rgba_copy_rows branch for dst == src, so this drops a
 	// resample, not a resample plus a conversion.
 	if int(rw) == int(srcw) && int(rh) == int(srch) {
-		if render_split_timing {
-			render_pipe.cp1_ns += 0
-			render_pipe.cp1_n += 1
+		when ODIN_DEBUG {
+			if render_split_timing {
+				render_pipe.cp1_ns += 0
+				render_pipe.cp1_n += 1
+			}
 		}
 		render_keyed_frames += 1
 		render_blit_region(
@@ -4309,21 +4317,23 @@ render_eval_keyed_geom :: proc(
 					int(rw), int(rh),
 					raw_data(v.kres_scratch), len(v.kres_scratch),
 				)
-				if render_split_timing {
-					// The whole round trip: stage upload, resample, and the
-					// download that lands back in kres_scratch. If the
-					// download is not the cost, compositing straight to a
-					// GPU canvas is not the fix.
-					el := time.now()._nsec - t_res
-					render_pipe.comp_resample_ns += el
-					// Same per-geometry split as the CPU side, so the two are
-					// compared frame class to frame class rather than pooled.
-					if int(rw) == int(srcw) && int(rh) == int(srch) {
-						render_pipe.gpu1_ns += el
-						render_pipe.gpu1_n += 1
-					} else {
-						render_pipe.gpud_ns += el
-						render_pipe.gpud_n += 1
+				when ODIN_DEBUG {
+					if render_split_timing {
+						// The whole round trip: stage upload, resample, and the
+						// download that lands back in kres_scratch. If the
+						// download is not the cost, compositing straight to a
+						// GPU canvas is not the fix.
+						el := time.now()._nsec - t_res
+						render_pipe.comp_resample_ns += el
+						// Same per-geometry split as the CPU side, so the two are
+						// compared frame class to frame class rather than pooled.
+						if int(rw) == int(srcw) && int(rh) == int(srch) {
+							render_pipe.gpu1_ns += el
+							render_pipe.gpu1_n += 1
+						} else {
+							render_pipe.gpud_ns += el
+							render_pipe.gpud_n += 1
+						}
 					}
 				}
 				if gpu_ok {
@@ -4338,30 +4348,32 @@ render_eval_keyed_geom :: proc(
 				render_keyed_fallbacks += 1
 			}
 		}
-		if render_split_timing {
-			// Track the range, not just the first frame: if the crop moves or
-			// shrinks on later frames then the per-frame average below is not
-			// comparable to a probe case that resamples a whole stage.
-			area := int(srcw) * int(srch)
-			if render_pipe.rect_n == 0 {
-				render_pipe.rect_min_area, render_pipe.rect_max_area = area, area
+		when ODIN_DEBUG {
+			if render_split_timing {
+				// Track the range, not just the first frame: if the crop moves or
+				// shrinks on later frames then the per-frame average below is not
+				// comparable to a probe case that resamples a whole stage.
+				area := int(srcw) * int(srch)
+				if render_pipe.rect_n == 0 {
+					render_pipe.rect_min_area, render_pipe.rect_max_area = area, area
+				}
+				render_pipe.rect_n += 1
+				render_pipe.rect_min_area = min(render_pipe.rect_min_area, area)
+				render_pipe.rect_max_area = max(render_pipe.rect_max_area, area)
+				render_pipe.rect_w_min = min(render_pipe.rect_w_min, int(srcw))
+				render_pipe.rect_w_max = max(render_pipe.rect_w_max, int(srcw))
+				// The OUTPUT rect is the half that decides which branch
+				// rgba_resample takes: 1:1 is a memcpy, anything smaller is the
+				// box average. Reporting only the crop hid that difference.
+				if render_pipe.rect_n == 1 {
+					render_pipe.out_min_w, render_pipe.out_max_w = int(rw), int(rw)
+					render_pipe.out_min_h, render_pipe.out_max_h = int(rh), int(rh)
+				}
+				render_pipe.out_min_w = min(render_pipe.out_min_w, int(rw))
+				render_pipe.out_max_w = max(render_pipe.out_max_w, int(rw))
+				render_pipe.out_min_h = min(render_pipe.out_min_h, int(rh))
+				render_pipe.out_max_h = max(render_pipe.out_max_h, int(rh))
 			}
-			render_pipe.rect_n += 1
-			render_pipe.rect_min_area = min(render_pipe.rect_min_area, area)
-			render_pipe.rect_max_area = max(render_pipe.rect_max_area, area)
-			render_pipe.rect_w_min = min(render_pipe.rect_w_min, int(srcw))
-			render_pipe.rect_w_max = max(render_pipe.rect_w_max, int(srcw))
-			// The OUTPUT rect is the half that decides which branch
-			// rgba_resample takes: 1:1 is a memcpy, anything smaller is the
-			// box average. Reporting only the crop hid that difference.
-			if render_pipe.rect_n == 1 {
-				render_pipe.out_min_w, render_pipe.out_max_w = int(rw), int(rw)
-				render_pipe.out_min_h, render_pipe.out_max_h = int(rh), int(rh)
-			}
-			render_pipe.out_min_w = min(render_pipe.out_min_w, int(rw))
-			render_pipe.out_max_w = max(render_pipe.out_max_w, int(rw))
-			render_pipe.out_min_h = min(render_pipe.out_min_h, int(rh))
-			render_pipe.out_max_h = max(render_pipe.out_max_h, int(rh))
 		}
 		if render_split_timing && render_probe_rect {
 			// The probe resamples the FULL stage, the exporter resamples the
@@ -4384,6 +4396,26 @@ render_eval_keyed_geom :: proc(
 			raw_data(v.kres_scratch), int(rw) * 4,
 			int(rw), int(rh),
 		) {
+			when ODIN_DEBUG {
+				if render_split_timing {
+					el := time.now()._nsec - t_cpu
+					render_pipe.cpu_resample_ns += el
+					render_pipe.cpu_resample_n += 1
+					if one_to_one {
+						render_pipe.cp1_ns += el
+						render_pipe.cp1_n += 1
+					} else if downscaling {
+						render_pipe.cpd_ns += el
+						render_pipe.cpd_n += 1
+					} else {
+						render_pipe.cpu_ns += el
+						render_pipe.cpu_n += 1
+					}
+				}
+			}
+			return true
+		}
+		when ODIN_DEBUG {
 			if render_split_timing {
 				el := time.now()._nsec - t_cpu
 				render_pipe.cpu_resample_ns += el
@@ -4398,22 +4430,6 @@ render_eval_keyed_geom :: proc(
 					render_pipe.cpu_ns += el
 					render_pipe.cpu_n += 1
 				}
-			}
-			return true
-		}
-		if render_split_timing {
-			el := time.now()._nsec - t_cpu
-			render_pipe.cpu_resample_ns += el
-			render_pipe.cpu_resample_n += 1
-			if one_to_one {
-				render_pipe.cp1_ns += el
-				render_pipe.cp1_n += 1
-			} else if downscaling {
-				render_pipe.cpd_ns += el
-				render_pipe.cpd_n += 1
-			} else {
-				render_pipe.cpu_ns += el
-				render_pipe.cpu_n += 1
 			}
 		}
 		render_keyed_frames += 1

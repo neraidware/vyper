@@ -382,6 +382,10 @@ action_record_frame_end :: proc(dt_ns: u64) {
 	rec.frames += 1
 }
 
+// Debug-only. The whole recorder is a debugging instrument: it exists so a
+// session can be replayed, and a release binary does not carry it.
+when ODIN_DEBUG {
+
 action_rec_open :: proc(path: string) {
 	f, err := os.open(path, {.Write, .Create, .Trunc})
 	if err != nil {
@@ -449,6 +453,8 @@ action_rec_close :: proc() {
 	fmt.printf("[action-log] recorded %d frames -> %s\n", frames, name)
 	delete(rec.name)
 	rec.name = ""
+}
+
 }
 
 // ---------------------------------------------------------------------------
@@ -837,10 +843,12 @@ action_replay_frame :: proc(running: ^bool) {
 // session is loaded, so the record is the session the recording starts from and
 // not an empty one. A no-op in replay, and a no-op when recording is off.
 action_log_capture_session :: proc() {
-	if action_rec.f == nil || action_rec.broken {
-		return
+	when ODIN_DEBUG {
+		if action_rec.f == nil || action_rec.broken {
+			return
+		}
+		action_rec_snapshot()
 	}
-	action_rec_snapshot()
 }
 
 // action_log_startup resolves the two env vars. Recording opens the file;
@@ -865,7 +873,9 @@ action_log_startup :: proc(window: ^sdl.Window) {
 	// replayable without being told where to put it. VYPER_ACTION_RECORD=<path>
 	// overrides; the record itself is opt-OUT via an explicit path being how you
 	// turn it on and VYPER_ACTION_RECORD=0 turning it off.
-	if record := diag_path("VYPER_ACTION_RECORD", "session.vya", record_buf[:]); record != "" {
-		action_rec_open(record)
+	when ODIN_DEBUG {
+		if record := diag_path("VYPER_ACTION_RECORD", "session.vya", record_buf[:]); record != "" {
+			action_rec_open(record)
+		}
 	}
 }

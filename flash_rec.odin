@@ -31,24 +31,28 @@ Flash_Rec :: struct {
 flash_rec: Flash_Rec
 
 flash_rec_init :: proc() {
-	if !diag_flag("VYPER_FLASH_REC") {
-		return
-	}
-	flash_rec.enabled = true
-	// Was a hardcoded /tmp/vyper_flash_rec.log, which is neither the temp
-	// convention the rest of the diagnostics use nor portable. VYPER_FLASH_LOG
-	// still overrides it.
-	path_buf: [1024]u8
-	path := diag_path("VYPER_FLASH_LOG", "flash-rec.log", path_buf[:])
-	if path == "" {
-		flash_rec.enabled = false
-		return
-	}
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
-	if err == nil {
-		flash_rec.file = f
-	}
-	fmt.printf("[flash-rec] ENABLED, logging to %s (file_ok=%v)\n", path, flash_rec.file != nil)
+// Debug-only: the flash recorder exists to explain a decode miss, and a release
+// binary does not carry it.
+when ODIN_DEBUG {
+		if !diag_flag("VYPER_FLASH_REC") {
+			return
+		}
+		flash_rec.enabled = true
+		// Was a hardcoded /tmp/vyper_flash_rec.log, which is neither the temp
+		// convention the rest of the diagnostics use nor portable. VYPER_FLASH_LOG
+		// still overrides it.
+		path_buf: [1024]u8
+		path := diag_path("VYPER_FLASH_LOG", "flash-rec.log", path_buf[:])
+		if path == "" {
+			flash_rec.enabled = false
+			return
+		}
+		f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
+		if err == nil {
+			flash_rec.file = f
+		}
+		fmt.printf("[flash-rec] ENABLED, logging to %s (file_ok=%v)\n", path, flash_rec.file != nil)
+}
 }
 
 flash_rec_emit :: proc(line: string) {

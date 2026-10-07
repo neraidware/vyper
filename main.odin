@@ -25,8 +25,10 @@ toggle_playback :: proc() {
 		// A pause drops the jog speed boost so the next play uses the selected
 		// rate again.
 		playback.boost = 0
-		if vyper_trace {
-			fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[pb] toggle playing=%v ph=%d\n", playhead.playing, playhead.frame)
+			}
 		}
 		return
 	}
@@ -37,8 +39,10 @@ toggle_playback :: proc() {
 	playback.accumulator = 0
 	playback.last_tick_ns = monotonic_ns()
 	audio_prod.was_playing = false
-	if play_trace {
-		fmt.printf("[ui]  Play press at ph=%d dir=%d dev=%d\n", playhead.frame, playback.dir, sync.atomic_load(&playback.dev_frame))
+	when ODIN_DEBUG {
+		if play_trace {
+			fmt.printf("[ui]  Play press at ph=%d dir=%d dev=%d\n", playhead.frame, playback.dir, sync.atomic_load(&playback.dev_frame))
+		}
 	}
 	// playback_update runs later in this same UI tick and reads the device clock.
 	// Before the producer has handled the new seek that clock still describes the
@@ -46,13 +50,15 @@ toggle_playback :: proc() {
 	sync.atomic_store(&playback.dev_frame, playhead.frame)
 	playhead.playing = true
 	preview.playing = true
-	if vyper_trace {
-		fmt.printf(
-			"[pb] toggle playing=%v ph=%d dir=%d\n",
-			playhead.playing,
-			playhead.frame,
-			playback.dir,
-		)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf(
+				"[pb] toggle playing=%v ph=%d dir=%d\n",
+				playhead.playing,
+				playhead.frame,
+				playback.dir,
+			)
+		}
 	}
 }
 
@@ -77,27 +83,33 @@ jog_playback :: proc(dir: int) {
 		sync.atomic_store(&playback.dev_frame, playhead.frame)
 		playhead.playing = true
 		preview.playing = true
-		if vyper_trace {
-			fmt.printf("[pb] jog start dir=%d ph=%d\n", dir, playhead.frame)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[pb] jog start dir=%d ph=%d\n", dir, playhead.frame)
+			}
 		}
 		return
 	}
 	// Already playing.
 	if playback.dir == dir {
 		playback.boost += 1
-		if vyper_trace {
-			fmt.printf(
-				"[pb] jog boost dir=%d boost=%d eff=%.2fx\n",
-				dir,
-				playback.boost,
-				effective_playback_rate(),
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[pb] jog boost dir=%d boost=%d eff=%.2fx\n",
+					dir,
+					playback.boost,
+					effective_playback_rate(),
+				)
+			}
 		}
 	} else {
 		playback.dir = dir
 		playback.boost = 0
-		if vyper_trace {
-			fmt.printf("[pb] jog flip dir=%d ph=%d\n", dir, playhead.frame)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[pb] jog flip dir=%d ph=%d\n", dir, playhead.frame)
+			}
 		}
 	}
 }
@@ -1692,8 +1704,10 @@ play_project_area :: proc() {
 	sync.atomic_store(&playback.dev_frame, playhead.frame)
 	playhead.playing = true
 	preview.playing = true
-	if vyper_trace {
-		fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback.stop_frame)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[pb] area ph=%d stop=%d\n", playhead.frame, playback.stop_frame)
+		}
 	}
 }
 
@@ -1784,13 +1798,15 @@ playback_wall_clock_advance :: proc(now_ns: sdl.Uint64) {
 		playhead.frame = clamp(playhead.frame, 0, max(0, stop_frame - 1))
 		playhead.playing = false
 		preview.playing = false
-		if vyper_trace {
-			fmt.printf(
-				"[pb] auto-stop dir=%d ph=%d stop=%d\n",
-				playback.dir,
-				playhead.frame,
-				stop_frame,
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[pb] auto-stop dir=%d ph=%d stop=%d\n",
+					playback.dir,
+					playhead.frame,
+					stop_frame,
+				)
+			}
 		}
 	}
 }
@@ -1857,45 +1873,49 @@ playback_update :: proc(now_ns: sdl.Uint64) {
 		// Logged under play_trace rather than a flag of its own so one switch turns on
 		// the whole story -- pointer writes, adoption decisions, producer positions --
 		// in one interleaved stream, which is the only way to read an ordering.
-		if play_trace {
-			decision := "held"
-			reason := "dev<=playhead"
-			switch {
-			case active_interaction == .Playhead_Scrub:
-				reason = "SCRUB owns the playhead"
-			case !clock_current:
-				reason = "device reading is STALE"
-			case dev <= playhead.frame:
-				reason = "device is behind the playhead"
-			case:
-				decision = "ADOPTED"
-				reason = "device is ahead and current"
+		when ODIN_DEBUG {
+			if play_trace {
+				decision := "held"
+				reason := "dev<=playhead"
+				switch {
+				case active_interaction == .Playhead_Scrub:
+					reason = "SCRUB owns the playhead"
+				case !clock_current:
+					reason = "device reading is STALE"
+				case dev <= playhead.frame:
+					reason = "device is behind the playhead"
+				case:
+					decision = "ADOPTED"
+					reason = "device is ahead and current"
+				}
+				fmt.printf(
+					"[ui]  clock ph=%d dev=%d -> %s (%s; scrub=%v resync=%d dev_resync=%d)\n",
+					playhead.frame,
+					dev,
+					decision,
+					reason,
+					active_interaction == .Playhead_Scrub,
+					resync_now,
+					dev_resync,
+				)
 			}
-			fmt.printf(
-				"[ui]  clock ph=%d dev=%d -> %s (%s; scrub=%v resync=%d dev_resync=%d)\n",
-				playhead.frame,
-				dev,
-				decision,
-				reason,
-				active_interaction == .Playhead_Scrub,
-				resync_now,
-				dev_resync,
-			)
 		}
 		if clock_current && dev > playhead.frame && active_interaction != .Playhead_Scrub {
 			playhead.frame = dev
 		}
-		if play_trace {
-			fmt.printf(
-				"[ui]  ph=%d dev=%d dev_resync=%d resync=%d current=%t playing=%t -> ph=%d\n",
-				playhead.frame,
-				dev,
-				dev_resync,
-				resync_now,
-				clock_current,
-				playhead.playing,
-				playhead.frame,
-			)
+		when ODIN_DEBUG {
+			if play_trace {
+				fmt.printf(
+					"[ui]  ph=%d dev=%d dev_resync=%d resync=%d current=%t playing=%t -> ph=%d\n",
+					playhead.frame,
+					dev,
+					dev_resync,
+					resync_now,
+					clock_current,
+					playhead.playing,
+					playhead.frame,
+				)
+			}
 		}
 		// NO AUDIO AT THE PLAYHEAD: THERE IS NO CLOCK.
 		//
@@ -1963,14 +1983,18 @@ main :: proc() {
 	vyper_trace = diag_flag("VYPER_TRACE")
 	play_trace = diag_flag("VYPER_PLAY_TRACE")
 	repro_trace = diag_flag("VYPER_REPRO_TRACE")
-	diag_report_temp()
+	when ODIN_DEBUG {
+		diag_report_temp()
+	}
 	flash_rec_init()
 	// DIAG: headless playback-rate override (the GUI dropdown is mouse-only);
 	// the audio producer reads playback.rate for its atempo graph and cushion.
 	if v := os.get_env_alloc("VYPER_RATE", context.temp_allocator); v != "" {
 		playback.rate, _ = strconv.parse_f64(v)
-		if vyper_trace {
-			fmt.printf("[main] VYPER_RATE -> playback.rate=%.2f\n", playback.rate)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[main] VYPER_RATE -> playback.rate=%.2f\n", playback.rate)
+			}
 		}
 	}
 	// libav's INFO chatter (libx264 "using cpu capabilities", decoder open
@@ -1984,353 +2008,461 @@ main :: proc() {
 	// reorder) that record undo history, so the history must exist before any
 	// probe runs. The normal path re-inits at startup; probes return first.
 	undo_init()
-	if test_path_ok, test_paths := render_test_env(); test_path_ok {
-		render_test_run(test_paths)
-		return
+	when ODIN_DEBUG {
+		if test_path_ok, test_paths := render_test_env(); test_path_ok {
+			render_test_run(test_paths)
+			return
+		}
+		if pe_ok, pe_paths := render_project_export_env(); pe_ok {
+			render_project_export(pe_paths)
+			return
+		}
 	}
-	if pe_ok, pe_paths := render_project_export_env(); pe_ok {
-		render_project_export(pe_paths)
-		return
+	when ODIN_DEBUG {
+		parity_probe_env()
 	}
-	parity_probe_env()
-	if hw_probe, _ := os.lookup_env_alloc("VYPER_HW_PROBE", context.temp_allocator); hw_probe != "" {
-		preview_hw_probe_run(hw_probe)
-		return
+	when ODIN_DEBUG {
+		if hw_probe, _ := os.lookup_env_alloc("VYPER_HW_PROBE", context.temp_allocator); hw_probe != "" {
+			preview_hw_probe_run(hw_probe)
+			return
+		}
 	}
-	if ep, _ := os.lookup_env_alloc("VYPER_ENC_PROBE", context.temp_allocator); ep != "" {
-		os.exit(enc_probe_run(ep))
+	when ODIN_DEBUG {
+		if ep, _ := os.lookup_env_alloc("VYPER_ENC_PROBE", context.temp_allocator); ep != "" {
+			os.exit(enc_probe_run(ep))
+		}
 	}
-	if rp, _ := os.lookup_env_alloc("VYPER_RATE_PROBE", context.temp_allocator); rp != "" {
-		preview_rate_probe_run(rp)
-		return
+	when ODIN_DEBUG {
+		if rp, _ := os.lookup_env_alloc("VYPER_RATE_PROBE", context.temp_allocator); rp != "" {
+			preview_rate_probe_run(rp)
+			return
+		}
 	}
-	if fp, _ := os.lookup_env_alloc("VYPER_FRAME_PROBE", context.temp_allocator); fp != "" {
-		preview_framecheck_run(fp)
-		return
+	when ODIN_DEBUG {
+		if fp, _ := os.lookup_env_alloc("VYPER_FRAME_PROBE", context.temp_allocator); fp != "" {
+			preview_framecheck_run(fp)
+			return
+		}
 	}
-	if probe_path_ok, probe_paths := preview_probe_env(); probe_path_ok {
-		// These probes step the playhead through update_preview_slots, which
-		// routes every slot through its own async worker. Start it in probe
-		// mode (deterministic: every step waits for each slot's decode) and
-		// tear it down before asserting.
-		async_live_mode = false
-		async_dec_init()
-		defer async_dec_shutdown()
-		preview_probe_run(probe_paths)
-		return
+	when ODIN_DEBUG {
+		if probe_path_ok, probe_paths := preview_probe_env(); probe_path_ok {
+			// These probes step the playhead through update_preview_slots, which
+			// routes every slot through its own async worker. Start it in probe
+			// mode (deterministic: every step waits for each slot's decode) and
+			// tear it down before asserting.
+			async_live_mode = false
+			async_dec_init()
+			defer async_dec_shutdown()
+			preview_probe_run(probe_paths)
+			return
+		}
 	}
-if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); psp != "" {
-		async_live_mode = false
-		async_dec_init()
-		defer async_dec_shutdown()
-		proxy_step_probe_run(psp)
-		return
+	when ODIN_DEBUG {
+		if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); psp != "" {
+			async_live_mode = false
+			async_dec_init()
+			defer async_dec_shutdown()
+			proxy_step_probe_run(psp)
+			return
+		}
 	}
-	if bp, _ := os.lookup_env_alloc("VYPER_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
-		async_live_mode = false
-		async_dec_init()
-		defer async_dec_shutdown()
-		boundary_probe_run(bp)
-		return
+	when ODIN_DEBUG {
+		if bp, _ := os.lookup_env_alloc("VYPER_BOUNDARY_PROBE", context.temp_allocator); bp != "" {
+			async_live_mode = false
+			async_dec_init()
+			defer async_dec_shutdown()
+			boundary_probe_run(bp)
+			return
+		}
 	}
-	if dr, _ := os.lookup_env_alloc("VYPER_DECODE_REPEAT_PROBE", context.temp_allocator); dr != "" {
-		decode_repeat_probe_run(dr)
+	when ODIN_DEBUG {
+		if dr, _ := os.lookup_env_alloc("VYPER_DECODE_REPEAT_PROBE", context.temp_allocator); dr != "" {
+			decode_repeat_probe_run(dr)
+		}
 	}
-	if cp, _ := os.lookup_env_alloc("VYPER_CACHE_PROBE", context.temp_allocator); cp != "" {
-		cache_probe_run(cp)
-		return
+	when ODIN_DEBUG {
+		if cp, _ := os.lookup_env_alloc("VYPER_CACHE_PROBE", context.temp_allocator); cp != "" {
+			cache_probe_run(cp)
+			return
+		}
 	}
-	if tp, _ := os.lookup_env_alloc("VYPER_TRANSFORM_PROBE", context.temp_allocator); tp != "" {
-		transform_probe_run(tp)
-		return
+	when ODIN_DEBUG {
+		if tp, _ := os.lookup_env_alloc("VYPER_TRANSFORM_PROBE", context.temp_allocator); tp != "" {
+			transform_probe_run(tp)
+			return
+		}
 	}
-	if tlp, _ := os.lookup_env_alloc("VYPER_TL_PROBE", context.temp_allocator); tlp != "" {
-		timeline_probe_run(tlp)
-		return
+	when ODIN_DEBUG {
+		if tlp, _ := os.lookup_env_alloc("VYPER_TL_PROBE", context.temp_allocator); tlp != "" {
+			timeline_probe_run(tlp)
+			return
+		}
 	}
-	if ssp, _ := os.lookup_env_alloc("VYPER_SESSION_STR_PROBE", context.temp_allocator); ssp != "" {
-		session_str_probe_run()
-		return
+	when ODIN_DEBUG {
+		if ssp, _ := os.lookup_env_alloc("VYPER_SESSION_STR_PROBE", context.temp_allocator); ssp != "" {
+			session_str_probe_run()
+			return
+		}
 	}
-	if skp, _ := os.lookup_env_alloc("VYPER_SESSION_KF_PROBE", context.temp_allocator); skp != "" {
-		session_kf_probe_run()
-		return
+	when ODIN_DEBUG {
+		if skp, _ := os.lookup_env_alloc("VYPER_SESSION_KF_PROBE", context.temp_allocator); skp != "" {
+			session_kf_probe_run()
+			return
+		}
 	}
-	if stp, _ := os.lookup_env_alloc("VYPER_SESSION_TRK_PROBE", context.temp_allocator); stp != "" {
-		session_trk_probe_run()
-		return
+	when ODIN_DEBUG {
+		if stp, _ := os.lookup_env_alloc("VYPER_SESSION_TRK_PROBE", context.temp_allocator); stp != "" {
+			session_trk_probe_run()
+			return
+		}
 	}
-	if smp, _ := os.lookup_env_alloc("VYPER_SESSION_MARKER_PROBE", context.temp_allocator); smp != "" {
-		session_marker_probe_run()
-		return
+	when ODIN_DEBUG {
+		if smp, _ := os.lookup_env_alloc("VYPER_SESSION_MARKER_PROBE", context.temp_allocator); smp != "" {
+			session_marker_probe_run()
+			return
+		}
 	}
-	if drp, _ := os.lookup_env_alloc("VYPER_DRAG_PROBE", context.temp_allocator); drp != "" {
-		drag_probe_run(drp)
-		return
+	when ODIN_DEBUG {
+		if drp, _ := os.lookup_env_alloc("VYPER_DRAG_PROBE", context.temp_allocator); drp != "" {
+			drag_probe_run(drp)
+			return
+		}
 	}
 	// Headless OS file drag-and-drop probe: the zone routing, the "decodable
 	// or readable" import gate, and the BEGIN/POSITION/COMPLETE gesture state.
 	// Nothing caught the missing feature for years because ignoring all five
 	// SDL drop events is not a crash; this is the check that it stays wired.
-	if _, ok := os.lookup_env_alloc("VYPER_DND_PROBE", context.temp_allocator); ok {
-		dnd_probe_run()
-		return
+	when ODIN_DEBUG {
+		if _, ok := os.lookup_env_alloc("VYPER_DND_PROBE", context.temp_allocator); ok {
+			dnd_probe_run()
+			return
+		}
 	}
 	// Headless action-log roundtrip: records a scripted session, replays the
 	// file it wrote, and compares the app state across the two. A byte-level
 	// check cannot catch a record that survives the file but not the replay.
-	if alp, _ := os.lookup_env_alloc("VYPER_ACTION_LOG_PROBE", context.temp_allocator); alp != "" {
-		os.exit(action_log_probe_run())
+	when ODIN_DEBUG {
+		if alp, _ := os.lookup_env_alloc("VYPER_ACTION_LOG_PROBE", context.temp_allocator); alp != "" {
+			os.exit(action_log_probe_run())
+		}
 	}
-	if xp, _ := os.lookup_env_alloc("VYPER_PROXY_PROBE", context.temp_allocator); xp != "" {
-		proxy_probe_run(xp)
-		return
+	when ODIN_DEBUG {
+		if xp, _ := os.lookup_env_alloc("VYPER_PROXY_PROBE", context.temp_allocator); xp != "" {
+			proxy_probe_run(xp)
+			return
+		}
 	}
-if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); xb != "" {
-		proxy_bg_probe_run(xb)
-		return
+	when ODIN_DEBUG {
+		if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); xb != "" {
+			proxy_bg_probe_run(xb)
+			return
+		}
 	}
 	// VYPER_FUZZ="<project.vyproj>|<iters>|<seed>" -- randomised actions over a REAL
 	// project, through the same entry points the frame loop uses. See fuzz_probe.odin.
-	if fz, _ := os.lookup_env_alloc("VYPER_FUZZ", context.temp_allocator); fz != "" {
-		fuzz_probe_run(fz)
-		return
+	when ODIN_DEBUG {
+		if fz, _ := os.lookup_env_alloc("VYPER_FUZZ", context.temp_allocator); fz != "" {
+			fuzz_probe_run(fz)
+			return
+		}
 	}
-	if xi, _ := os.lookup_env_alloc("VYPER_IMAGE_PROBE", context.temp_allocator); xi != "" {
-		probe_image_run(xi)
-		return
+	when ODIN_DEBUG {
+		if xi, _ := os.lookup_env_alloc("VYPER_IMAGE_PROBE", context.temp_allocator); xi != "" {
+			probe_image_run(xi)
+			return
+		}
 	}
-	if xd, _ := os.lookup_env_alloc("VYPER_IMAGE_DECODE_PROBE", context.temp_allocator); xd != "" {
-		probe_image_decode_run(xd)
-		return
+	when ODIN_DEBUG {
+		if xd, _ := os.lookup_env_alloc("VYPER_IMAGE_DECODE_PROBE", context.temp_allocator); xd != "" {
+			probe_image_decode_run(xd)
+			return
+		}
 	}
-	if xs, _ := os.lookup_env_alloc("VYPER_PROXY_SCHED_TEST", context.temp_allocator); xs != "" {
-		proxy_sched_probe_run(xs)
-		return
+	when ODIN_DEBUG {
+		if xs, _ := os.lookup_env_alloc("VYPER_PROXY_SCHED_TEST", context.temp_allocator); xs != "" {
+			proxy_sched_probe_run(xs)
+			return
+		}
 	}
-	if ps, _ := os.lookup_env_alloc("VYPER_PROXY_PICK_SCAN", context.temp_allocator); ps != "" {
-		proxy_pick_scan_run(ps)
-		return
+	when ODIN_DEBUG {
+		if ps, _ := os.lookup_env_alloc("VYPER_PROXY_PICK_SCAN", context.temp_allocator); ps != "" {
+			proxy_pick_scan_run(ps)
+			return
+		}
 	}
-	if dp, _ := os.lookup_env_alloc("VYPER_DUP_PROBE", context.temp_allocator); dp != "" {
-		async_live_mode = false
-		async_dec_init()
-		defer async_dec_shutdown()
-		duplicate_probe_run(dp)
-		return
+	when ODIN_DEBUG {
+		if dp, _ := os.lookup_env_alloc("VYPER_DUP_PROBE", context.temp_allocator); dp != "" {
+			async_live_mode = false
+			async_dec_init()
+			defer async_dec_shutdown()
+			duplicate_probe_run(dp)
+			return
+		}
 	}
-	if fp, _ := os.lookup_env_alloc("VYPER_FLASH_PROBE", context.temp_allocator); fp != "" {
-		async_live_mode = false
-		async_dec_init()
-		defer async_dec_shutdown()
-		flash_probe_run(fp)
-		return
+	when ODIN_DEBUG {
+		if fp, _ := os.lookup_env_alloc("VYPER_FLASH_PROBE", context.temp_allocator); fp != "" {
+			async_live_mode = false
+			async_dec_init()
+			defer async_dec_shutdown()
+			flash_probe_run(fp)
+			return
+		}
 	}
 	// Characterisation only: opens a file and reports where the decoder lands
 	// after a seek, which is how Active 30 S4's "why" got answered (the muxer
 	// writes AAC's encoder delay as pts=-1024 + skip_samples=1024 on packet 0,
 	// and the decoder's landing point after seeking to 0 decides whether content
 	// 0 is reachable at all).
-	if pt, _ := os.lookup_env_alloc("VYPER_AUDIO_PRIMING_TRACE", context.temp_allocator); pt != "" {
-		ok: bool = audio_probe_priming_trace(pt)
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if pt, _ := os.lookup_env_alloc("VYPER_AUDIO_PRIMING_TRACE", context.temp_allocator); pt != "" {
+			ok: bool = audio_probe_priming_trace(pt)
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_MIX_PARITY=<path> -- playback vs export over a short span.
-	if mp, _ := os.lookup_env_alloc("VYPER_AUDIO_MIX_PARITY", context.temp_allocator); mp != "" {
-		parts := strings.split(mp, "|")
-		ok: bool = audio_probe_mix_parity(strings.trim_space(parts[0]))
-		if !ok {
-			os.exit(1)
+	when ODIN_DEBUG {
+		if mp, _ := os.lookup_env_alloc("VYPER_AUDIO_MIX_PARITY", context.temp_allocator); mp != "" {
+			parts := strings.split(mp, "|")
+			ok: bool = audio_probe_mix_parity(strings.trim_space(parts[0]))
+			if !ok {
+				os.exit(1)
+			}
+			os.exit(0)
 		}
-		os.exit(0)
 	}
 	// VYPER_AUDIO_BUS_PRIME=<rate> -- asserts sample-origin alignment and device-clock
 	// accounting for bus atempo.
-	if bp, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_PRIME", context.temp_allocator); bp != "" {
-		rate := 2.0
-		if v, ok := strconv.parse_f64(strings.trim_space(bp)); ok {
-			rate = v
+	when ODIN_DEBUG {
+		if bp, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_PRIME", context.temp_allocator); bp != "" {
+			rate := 2.0
+			if v, ok := strconv.parse_f64(strings.trim_space(bp)); ok {
+				rate = v
+			}
+			ok: bool = audio_probe_bus_prime("", rate)
+			os.exit(ok ? 0 : 1)
 		}
-		ok: bool = audio_probe_bus_prime("", rate)
-		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_CLIP_TEMPO -- proves the clip TEMPO property changes duration and leaves
 	// pitch alone. Measured on an isolated graph plus the clip geometry, never through
 	// the playback mixer, whose ring prefetch makes sample counts meaningless.
-	if ct, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO", context.temp_allocator); ct != "" {
-		ok: bool = audio_probe_clip_tempo()
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if ct, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO", context.temp_allocator); ct != "" {
+			ok: bool = audio_probe_clip_tempo()
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT=<path>|<speed> proves clip-level output
 	// sample zero maps to content zero through decoder FIFO, atempo, and output ring.
-	if ca, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT", context.temp_allocator); ca != "" {
-		parts := strings.split(ca, "|")
-		if len(parts) < 2 {
-			fmt.println("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT requires <path>|<speed>")
-			os.exit(1)
+	when ODIN_DEBUG {
+		if ca, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT", context.temp_allocator); ca != "" {
+			parts := strings.split(ca, "|")
+			if len(parts) < 2 {
+				fmt.println("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT requires <path>|<speed>")
+				os.exit(1)
+			}
+			speed, ok := strconv.parse_f64(strings.trim_space(parts[1]))
+			if !ok {
+				fmt.println("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT speed is invalid")
+				os.exit(1)
+			}
+			ok = audio_probe_clip_tempo_alignment(strings.trim_space(parts[0]), speed)
+			os.exit(ok ? 0 : 1)
 		}
-		speed, ok := strconv.parse_f64(strings.trim_space(parts[1]))
-		if !ok {
-			fmt.println("VYPER_AUDIO_CLIP_TEMPO_ALIGNMENT speed is invalid")
-			os.exit(1)
-		}
-		ok = audio_probe_clip_tempo_alignment(strings.trim_space(parts[0]), speed)
-		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_SEEK_LANDING=<path> -- measures WHERE a seek lands on the playback
 	// producer path, by content. Every other seek assertion reads state or renders
 	// through the export mixer, and both were satisfied while playback emitted the
 	// wrong samples.
-	if sl, _ := os.lookup_env_alloc("VYPER_AUDIO_SEEK_LANDING", context.temp_allocator); sl != "" {
-		ok: bool = audio_probe_seek_landing_offset(sl)
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if sl, _ := os.lookup_env_alloc("VYPER_AUDIO_SEEK_LANDING", context.temp_allocator); sl != "" {
+			ok: bool = audio_probe_seek_landing_offset(sl)
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_GROUP_ISOLATION=<path> -- adjacent same-file clips at different
 	// clip speeds must each be mixed by a graph built for their own speed. The
 	// regression test for the grouping bug the fuzz harness found.
-	if gi, _ := os.lookup_env_alloc("VYPER_AUDIO_GROUP_ISOLATION", context.temp_allocator); gi != "" {
-		ok: bool = audio_probe_group_tempo_isolation(gi)
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if gi, _ := os.lookup_env_alloc("VYPER_AUDIO_GROUP_ISOLATION", context.temp_allocator); gi != "" {
+			ok: bool = audio_probe_group_tempo_isolation(gi)
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_CLIP_TEMPO_EDIT=<path> edits an already-provisioned clip from
 	// 1x to 2x at the playhead and verifies reconcile rebuilds its output origin.
-	if ce, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO_EDIT", context.temp_allocator); ce != "" {
-		ok: bool = audio_probe_clip_tempo_edit_alignment(ce)
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if ce, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_TEMPO_EDIT", context.temp_allocator); ce != "" {
+			ok: bool = audio_probe_clip_tempo_edit_alignment(ce)
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_BACKWARD_SCRUB=<path> -- proves a playhead move reaches the AUDIO:
 	// the producer is rewound, the device queue dropped, and the decoder re-anchored
 	// at the new playhead's content. Separate from the playhead's own position,
 	// because "the line moved but the sound did not" is a distinct failure.
-	if bs, _ := os.lookup_env_alloc("VYPER_AUDIO_BACKWARD_SCRUB", context.temp_allocator); bs != "" {
-		ok: bool = audio_probe_backward_scrub_seeks(bs)
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if bs, _ := os.lookup_env_alloc("VYPER_AUDIO_BACKWARD_SCRUB", context.temp_allocator); bs != "" {
+			ok: bool = audio_probe_backward_scrub_seeks(bs)
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_SCRUB_EXACT -- proves a seek lands on the content sample the timeline
 	// says belongs there, unstretched and stretched.
-	if se, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_EXACT", context.temp_allocator); se != "" {
-		ok: bool = audio_probe_scrub_exact()
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if se, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_EXACT", context.temp_allocator); se != "" {
+			ok: bool = audio_probe_scrub_exact()
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_CLIP_STRETCH -- proves the stretch gesture's invariant: changing speed
 	// must not move the clip on the timeline.
-	if st, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_STRETCH", context.temp_allocator); st != "" {
-		ok: bool = audio_probe_clip_stretch()
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if st, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_STRETCH", context.temp_allocator); st != "" {
+			ok: bool = audio_probe_clip_stretch()
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_BUS_RATE_TRANSITION=<path> -- changes transport rate while a simulated
 	// device is consuming, proving rebuilds preserve audible position.
-	if rt, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_RATE_TRANSITION", context.temp_allocator); rt != "" {
-		ok: bool = audio_probe_bus_rate_transition(rt)
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if rt, _ := os.lookup_env_alloc("VYPER_AUDIO_BUS_RATE_TRANSITION", context.temp_allocator); rt != "" {
+			ok: bool = audio_probe_bus_rate_transition(rt)
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_CLIP_PITCH=<path>|<semitones> -- proves the pitch property SHIFTS
 	// frequency without changing duration, which is what separates it from tempo.
-	if cp, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_PITCH", context.temp_allocator); cp != "" {
-		parts := strings.split(cp, "|")
-		semi := f32(12.0)
-		if len(parts) >= 2 {
-			if v, ok := strconv.parse_f32(strings.trim_space(parts[1])); ok {
-				semi = v
+	when ODIN_DEBUG {
+		if cp, _ := os.lookup_env_alloc("VYPER_AUDIO_CLIP_PITCH", context.temp_allocator); cp != "" {
+			parts := strings.split(cp, "|")
+			semi := f32(12.0)
+			if len(parts) >= 2 {
+				if v, ok := strconv.parse_f32(strings.trim_space(parts[1])); ok {
+					semi = v
+				}
 			}
+			ok: bool = audio_probe_clip_pitch(strings.trim_space(parts[0]), semi)
+			os.exit(ok ? 0 : 1)
 		}
-		ok: bool = audio_probe_clip_pitch(strings.trim_space(parts[0]), semi)
-		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_NODE_LATENCY measures the two graph delays (swr device conversion,
 	// atempo lookahead) that scrubbing and clip stretching both depend on.
 	// lookup_env_alloc, not os.getenv: getenv returns NIL when the variable is
 	// unset, and comparing nil against "" traps rather than answering the question.
-	if _, lz := os.lookup_env_alloc("VYPER_AUDIO_NODE_LATENCY", context.temp_allocator); lz {
-		ok: bool = audio_probe_node_latency()
-		os.exit(ok ? 0 : 1)
+	when ODIN_DEBUG {
+		if _, lz := os.lookup_env_alloc("VYPER_AUDIO_NODE_LATENCY", context.temp_allocator); lz {
+			ok: bool = audio_probe_node_latency()
+			os.exit(ok ? 0 : 1)
+		}
 	}
 	// VYPER_AUDIO_STALL_GAP=<path>|<stall_ms> -- drives the real producer against a
 	// simulated device and proves a stall costs a GAP and no subsequent offset.
-	if sg, _ := os.lookup_env_alloc("VYPER_AUDIO_STALL_GAP", context.temp_allocator); sg != "" {
-		parts := strings.split(sg, "|")
-		stall_ms := 900
-		if len(parts) >= 2 {
-			if v, ok := strconv.parse_i64(strings.trim_space(parts[1])); ok {
-				stall_ms = int(v)
+	when ODIN_DEBUG {
+		if sg, _ := os.lookup_env_alloc("VYPER_AUDIO_STALL_GAP", context.temp_allocator); sg != "" {
+			parts := strings.split(sg, "|")
+			stall_ms := 900
+			if len(parts) >= 2 {
+				if v, ok := strconv.parse_i64(strings.trim_space(parts[1])); ok {
+					stall_ms = int(v)
+				}
 			}
+			ok: bool = audio_probe_stall_gap(strings.trim_space(parts[0]), stall_ms)
+			os.exit(ok ? 0 : 1)
 		}
-		ok: bool = audio_probe_stall_gap(strings.trim_space(parts[0]), stall_ms)
-		os.exit(ok ? 0 : 1)
 	}
 	// VYPER_AUDIO_DRIFT_PARITY=<path>|<seconds>|<fps> -- the same comparison run
 	// continuously over a LONG span, which is the only way an ACCUMULATED position
 	// error becomes visible: locally correct, globally wrong. fps is optional and
 	// defaults to the project's, so the NTSC run passes 30000/1001.
-	if dp, _ := os.lookup_env_alloc("VYPER_AUDIO_DRIFT_PARITY", context.temp_allocator); dp != "" {
-		parts := strings.split(dp, "|")
-		secs := 60.0
-		fps_override := f64(0)
-		if len(parts) >= 2 {
-			secs, _ = strconv.parse_f64(strings.trim_space(parts[1]))
-		}
-		if len(parts) >= 3 {
-			fps_override, _ = strconv.parse_f64(strings.trim_space(parts[2]))
-		}
-		ok: bool = audio_probe_drift_parity(strings.trim_space(parts[0]), secs, fps_override)
-		if !ok {
-			os.exit(1)
-		}
-		os.exit(0)
-	}
-	if atp, _ := os.lookup_env_alloc("VYPER_ATEMPO_PROBE", context.temp_allocator); atp != "" {
-		atempo_probe_run(atp)
-		return
-	}
-	if ap, _ := os.lookup_env_alloc("VYPER_AUDIO_PROBE", context.temp_allocator); ap != "" {
-		os.exit(audio_probe_run(ap))
-	}
-	if jp, _ := os.lookup_env_alloc("VYPER_AUDIO_JUMP_PROBE", context.temp_allocator); jp != "" {
-		// The forward-jump death on its own: audio_probe_run's other checks are
-		// written against the synthetic two-lane fixture and a real recording
-		// (3 FLAC streams, 60 fps, 1.9 GB) trips the gain check before this one
-		// gets a chance to run.
-		jpath, jf := jp, i64(0)
-		if parts := strings.split(jp, "|"); len(parts) > 1 {
-			jpath = parts[0]
-			if v, ok := strconv.parse_int(parts[1]); ok {
-				jf = i64(v)
+	when ODIN_DEBUG {
+		if dp, _ := os.lookup_env_alloc("VYPER_AUDIO_DRIFT_PARITY", context.temp_allocator); dp != "" {
+			parts := strings.split(dp, "|")
+			secs := 60.0
+			fps_override := f64(0)
+			if len(parts) >= 2 {
+				secs, _ = strconv.parse_f64(strings.trim_space(parts[1]))
 			}
-		}
-		if audio_probe_forward_jump(jpath, jf) {
+			if len(parts) >= 3 {
+				fps_override, _ = strconv.parse_f64(strings.trim_space(parts[2]))
+			}
+			ok: bool = audio_probe_drift_parity(strings.trim_space(parts[0]), secs, fps_override)
+			if !ok {
+				os.exit(1)
+			}
 			os.exit(0)
 		}
-		os.exit(1)
 	}
-	if ar, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_PROBE", context.temp_allocator); ar != "" {
-		audio_rate_probe_run(ar)
+	when ODIN_DEBUG {
+		if atp, _ := os.lookup_env_alloc("VYPER_ATEMPO_PROBE", context.temp_allocator); atp != "" {
+			atempo_probe_run(atp)
+			return
+		}
 	}
-	if arf, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_FIXTURE", context.temp_allocator); arf != "" {
-		audio_rate_fixture_run(arf)
+	when ODIN_DEBUG {
+		if ap, _ := os.lookup_env_alloc("VYPER_AUDIO_PROBE", context.temp_allocator); ap != "" {
+			os.exit(audio_probe_run(ap))
+		}
+	}
+	when ODIN_DEBUG {
+		if jp, _ := os.lookup_env_alloc("VYPER_AUDIO_JUMP_PROBE", context.temp_allocator); jp != "" {
+			// The forward-jump death on its own: audio_probe_run's other checks are
+			// written against the synthetic two-lane fixture and a real recording
+			// (3 FLAC streams, 60 fps, 1.9 GB) trips the gain check before this one
+			// gets a chance to run.
+			jpath, jf := jp, i64(0)
+			if parts := strings.split(jp, "|"); len(parts) > 1 {
+				jpath = parts[0]
+				if v, ok := strconv.parse_int(parts[1]); ok {
+					jf = i64(v)
+				}
+			}
+			if audio_probe_forward_jump(jpath, jf) {
+				os.exit(0)
+			}
+			os.exit(1)
+		}
+	}
+	when ODIN_DEBUG {
+		if ar, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_PROBE", context.temp_allocator); ar != "" {
+			audio_rate_probe_run(ar)
+		}
+	}
+	when ODIN_DEBUG {
+		if arf, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_FIXTURE", context.temp_allocator); arf != "" {
+			audio_rate_fixture_run(arf)
+		}
 	}
 	// Headless undo-tree probe: validates the history tree and the viewer's row
 	// renderer without a display (needs no fonts / SDL).
-	if handle_undo_probe() {
-		return
+	when ODIN_DEBUG {
+		if handle_undo_probe() {
+			return
+		}
 	}
 	// Headless keyframe-store probe: the generic store's sorted insert,
 	// linear sample, split/trim remaps, and clone/free round-trip.
-	if kp, _ := os.lookup_env_alloc("VYPER_KEYFRAME_PROBE", context.temp_allocator); kp != "" {
-		os.exit(keyframe_probe_run())
+	when ODIN_DEBUG {
+		if kp, _ := os.lookup_env_alloc("VYPER_KEYFRAME_PROBE", context.temp_allocator); kp != "" {
+			os.exit(keyframe_probe_run())
+		}
 	}
-	if rkp, _ := os.lookup_env_alloc("VYPER_RENDER_KF_PROBE", context.temp_allocator); rkp != "" {
-		os.exit(render_kf_probe_run())
+	when ODIN_DEBUG {
+		if rkp, _ := os.lookup_env_alloc("VYPER_RENDER_KF_PROBE", context.temp_allocator); rkp != "" {
+			os.exit(render_kf_probe_run())
+		}
 	}
 	// Headless live-preview mailbox probe: the worker/UI handoff for the export's
 	// composed-frame sink (Active 11 S5). Returns out of main on success so the
 	// runtime's own teardown allocations are still freed when memcheck takes
 	// its census -- the session buffer this probe allocates is exactly the kind
 	// of claim the compiler cannot check.
-	if render_live_probe_env() {
-		if render_live_probe_run() != 0 {
-			os.exit(1)
+	when ODIN_DEBUG {
+		if render_live_probe_env() {
+			if render_live_probe_run() != 0 {
+				os.exit(1)
+			}
+			return
 		}
-		return
 	}
 	// Headless gesture-routing probe: an Alt+wheel / Alt+drag edit on a keyed
 	// clip must land where the clip is actually read.
@@ -2342,11 +2474,13 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// state the program never actually leaked. A failing probe still exits
 	// immediately: the non-zero code IS the gate's pass/fail signal, and its
 	// memory census is meaningless anyway.
-	if _, ok := os.lookup_env_alloc("VYPER_GEOM_KEY_PROBE", context.temp_allocator); ok {
-		if geom_key_probe_run() != 0 {
-			os.exit(1)
+	when ODIN_DEBUG {
+		if _, ok := os.lookup_env_alloc("VYPER_GEOM_KEY_PROBE", context.temp_allocator); ok {
+			if geom_key_probe_run() != 0 {
+				os.exit(1)
+			}
+			return
 		}
-		return
 	}
 	// Headless UI draw-call probe: runs build_page's clay layout for N frames
 	// on a synthetic session and tallies per-frame draw calls (per Rectangle/
@@ -2356,46 +2490,64 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// committed CPU kernel. This is the first gate of the GPU export path --
 	// if the device, the SPIR-V, or the readback does not work here, the export
 	// falls back to the CPU and there is nothing further to tune.
-	if g, _ := os.lookup_env_alloc("VYPER_GPU_PROBE", context.temp_allocator); g != "" {
-		os.exit(gpu_resample_probe_run())
+	when ODIN_DEBUG {
+		if g, _ := os.lookup_env_alloc("VYPER_GPU_PROBE", context.temp_allocator); g != "" {
+			os.exit(gpu_resample_probe_run())
+		}
 	}
-	if _, ok := os.lookup_env_alloc("VYPER_GPU_NV12_PROBE", context.temp_allocator); ok {
-		os.exit(gpu_nv12_probe_run())
+	when ODIN_DEBUG {
+		if _, ok := os.lookup_env_alloc("VYPER_GPU_NV12_PROBE", context.temp_allocator); ok {
+			os.exit(gpu_nv12_probe_run())
+		}
 	}
-	if _, ok := os.lookup_env_alloc("VYPER_GPU_COMPOSITE_PROBE", context.temp_allocator); ok {
-		os.exit(gpu_composite_probe_run())
+	when ODIN_DEBUG {
+		if _, ok := os.lookup_env_alloc("VYPER_GPU_COMPOSITE_PROBE", context.temp_allocator); ok {
+			os.exit(gpu_composite_probe_run())
+		}
 	}
-	if _, ok := os.lookup_env_alloc("VYPER_RENDER_OPACITY_PROBE", context.temp_allocator); ok {
-		os.exit(render_opacity_probe_run())
+	when ODIN_DEBUG {
+		if _, ok := os.lookup_env_alloc("VYPER_RENDER_OPACITY_PROBE", context.temp_allocator); ok {
+			os.exit(render_opacity_probe_run())
+		}
 	}
-	if _, ok := os.lookup_env_alloc("VYPER_YUV_EXACT_PROBE", context.temp_allocator); ok {
-		os.exit(yuv_exact_probe_run())
+	when ODIN_DEBUG {
+		if _, ok := os.lookup_env_alloc("VYPER_YUV_EXACT_PROBE", context.temp_allocator); ok {
+			os.exit(yuv_exact_probe_run())
+		}
 	}
-	if v, _ := os.lookup_env_alloc("VYPER_CLIPW_PROBE", context.temp_allocator); v != "" {
-		ui_probe_clip_widths(v)
-		return
+	when ODIN_DEBUG {
+		if v, _ := os.lookup_env_alloc("VYPER_CLIPW_PROBE", context.temp_allocator); v != "" {
+			ui_probe_clip_widths(v)
+			return
+		}
 	}
-	if v, _ := os.lookup_env_alloc("VYPER_UI_PROBE", context.temp_allocator); v != "" {
-		ui_draw_probe_run()
+	when ODIN_DEBUG {
+		if v, _ := os.lookup_env_alloc("VYPER_UI_PROBE", context.temp_allocator); v != "" {
+			ui_draw_probe_run()
+		}
 	}
 	spall_prof_init()
 	defer spall_prof_shutdown()
 	if !load_font_data() {
 		return
 	}
-	if fp, _ := os.lookup_env_alloc("VYPER_FONT_PROBE", context.temp_allocator); fp != "" {
-		font_probe_run()
+	when ODIN_DEBUG {
+		if fp, _ := os.lookup_env_alloc("VYPER_FONT_PROBE", context.temp_allocator); fp != "" {
+			font_probe_run()
+		}
 	}
-	if sub_render_probe, _ := os.lookup_env_alloc(
-		"VYPER_SUB_RENDER_PROBE",
-		context.temp_allocator,
-	); sub_render_probe != "" {
-		// The probe free-alls the temp arena per simulated frame, so the env
-		// string must not live on the temp arena (same rule as the autoplay
-		// path below). Clone it to a cstring the probe keeps for the session.
-		probe_out := strings.clone_to_cstring(sub_render_probe, context.allocator)
-		subtitle_render_probe_run(string(probe_out))
-		return
+	when ODIN_DEBUG {
+		if sub_render_probe, _ := os.lookup_env_alloc(
+			"VYPER_SUB_RENDER_PROBE",
+			context.temp_allocator,
+		); sub_render_probe != "" {
+			// The probe free-alls the temp arena per simulated frame, so the env
+			// string must not live on the temp arena (same rule as the autoplay
+			// path below). Clone it to a cstring the probe keeps for the session.
+			probe_out := strings.clone_to_cstring(sub_render_probe, context.allocator)
+			subtitle_render_probe_run(string(probe_out))
+			return
+		}
 	}
 	prefer_native_wayland()
 	if !sdl.Init(sdl.INIT_VIDEO | sdl.INIT_AUDIO) {
@@ -2510,12 +2662,14 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		playback.magic_fps, _ = strconv.parse_f64(v)
 	}
 	if playback.magic_ms > 0 || playback.magic_fps > 0 {
-		if vyper_trace {
-			fmt.printf(
-				"[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n",
-				playback.magic_ms,
-				playback.magic_fps,
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[pb] DIAG magic clock: magic_ms=%.3f fps_override=%.3f\n",
+					playback.magic_ms,
+					playback.magic_fps,
+				)
+			}
 		}
 	}
 
@@ -2526,8 +2680,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// clones it), so the argv bytes are safe to point at directly.
 	for arg_i := 1; arg_i < len(os.args); arg_i += 1 {
 		path := cstring(raw_data(os.args[arg_i]))
-		if vyper_trace {
-			fmt.printf("[args] open \"%s\"\n", os.args[arg_i])
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[args] open \"%s\"\n", os.args[arg_i])
+			}
 		}
 		open_file_at(path)
 	}
@@ -2542,56 +2698,68 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	// starts playback after a couple of seconds. Refuses silently-failed imports
 	// (bad path, unreadable file, probe failure) instead of opening an empty
 	// project that immediately auto-stops without ever playing anything.
-	if autoplay := os.get_env_alloc("VYPER_AUTOPLAY", context.temp_allocator);
-		autoplay != "" &&
-		!action_replaying() {
-		if vyper_trace {
-			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
-		}
-		// open_file_at, not import_media: it routes a .vyproj to the project loader
-		// first, and import_media probes the path as MEDIA -- which fails on CBOR and
-		// leaves the autoplay harness with an empty project and nothing to play. That
-		// made `VYPER_REPRO_TRACE=1 VYPER_AUTOPLAY=~/x.vyproj` produce no trace at all,
-		// which reads as "clean" rather than "never ran" -- the same trap the anomaly
-		// baseline exists to avoid.
-		//
-		// Only reads this cstring (the bin clones it into session heap), so the
-		// null-terminated scratch copy dies with the frame arena.
-		open_file_at(strings.clone_to_cstring(autoplay))
-		if vyper_trace {
-			fmt.printf(
-				"[autoplay] env=\"%s\" imported tracks=%d step=delay\n",
-				autoplay,
-				len(timeline.tracks),
-			)
-		}
-		if len(timeline.tracks) == 0 {
-			if vyper_trace {
-				fmt.printf(
-					"[autoplay] FATAL: VYPER_AUTOPLAY=\"%s\" imported nothing (no audio track)\n",
-					autoplay,
-				)
-			}
-			os.exit(1)
-		}
-		sleep_ms(2500)
-		if vyper_trace {
-			fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
-		}
-		playhead.playing = true
-		sync.atomic_store(&playback.dev_frame, playhead.frame)
-		preview.playing = true
-		playback.accumulator = 0
-		playback.last_tick_ns = monotonic_ns()
-		if sec := os.get_env_alloc("VYPER_PLAY_SEC", context.temp_allocator); sec != "" {
-			if v, okf := strconv.parse_f64(sec); okf && v > 0 {
-				playback.stop_frame = i64(v * timeline_fps())
+	when ODIN_DEBUG {
+		if autoplay := os.get_env_alloc("VYPER_AUTOPLAY", context.temp_allocator);
+			autoplay != "" &&
+			!action_replaying() {
+			when ODIN_DEBUG {
 				if vyper_trace {
-					fmt.printf("[autoplay] VYPER_PLAY_SEC=%.0f -> stop=%d\n", v, playback.stop_frame)
+					fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 				}
 			}
+			// open_file_at, not import_media: it routes a .vyproj to the project loader
+			// first, and import_media probes the path as MEDIA -- which fails on CBOR and
+			// leaves the autoplay harness with an empty project and nothing to play. That
+			// made `VYPER_REPRO_TRACE=1 VYPER_AUTOPLAY=~/x.vyproj` produce no trace at all,
+			// which reads as "clean" rather than "never ran" -- the same trap the anomaly
+			// baseline exists to avoid.
+			//
+			// Only reads this cstring (the bin clones it into session heap), so the
+			// null-terminated scratch copy dies with the frame arena.
+			open_file_at(strings.clone_to_cstring(autoplay))
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf(
+						"[autoplay] env=\"%s\" imported tracks=%d step=delay\n",
+						autoplay,
+						len(timeline.tracks),
+					)
+				}
+			}
+			if len(timeline.tracks) == 0 {
+				when ODIN_DEBUG {
+					if vyper_trace {
+						fmt.printf(
+							"[autoplay] FATAL: VYPER_AUTOPLAY=\"%s\" imported nothing (no audio track)\n",
+							autoplay,
+						)
+					}
+				}
+				os.exit(1)
+			}
+			sleep_ms(2500)
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf("[autoplay] env=\"%s\" step=play\n", autoplay)
+				}
+			}
+			playhead.playing = true
+			sync.atomic_store(&playback.dev_frame, playhead.frame)
+			preview.playing = true
+			playback.accumulator = 0
+			playback.last_tick_ns = monotonic_ns()
+			if sec := os.get_env_alloc("VYPER_PLAY_SEC", context.temp_allocator); sec != "" {
+				if v, okf := strconv.parse_f64(sec); okf && v > 0 {
+					playback.stop_frame = i64(v * timeline_fps())
+					when ODIN_DEBUG {
+						if vyper_trace {
+							fmt.printf("[autoplay] VYPER_PLAY_SEC=%.0f -> stop=%d\n", v, playback.stop_frame)
+						}
+					}
+				}
+			}
+			audio_note_edit()
 		}
-		audio_note_edit()
 	}
 	// The session is loaded by now, so the log can carry it. Recording it here
 	// rather than at startup is what keeps the snapshot the project the
@@ -2662,18 +2830,20 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		if ui_report_tick == 0 {
 			ui_report_tick = now_ns
 		} else if now_ns - ui_report_tick >= 2_000_000_000 {
-			if vyper_trace {
-				elapsed := f64(now_ns - ui_report_tick) / 1e9
-				fmt.printf(
-					"[ui] fps=%.1f dec_ms=%.1f playhead=%d acc=%.3fs src=%d catch=%d prod=%d\n",
-					f64(ui_frame_count) / elapsed,
-					f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
-					playhead.frame,
-					playback.accumulator,
-					sync.atomic_load(&audio_rpt.ph_src),
-					sync.atomic_load(&audio_rpt.ph_catch),
-					sync.atomic_load(&audio_prod.prod_frame),
-				)
+			when ODIN_DEBUG {
+				if vyper_trace {
+					elapsed := f64(now_ns - ui_report_tick) / 1e9
+					fmt.printf(
+						"[ui] fps=%.1f dec_ms=%.1f playhead=%d acc=%.3fs src=%d catch=%d prod=%d\n",
+						f64(ui_frame_count) / elapsed,
+						f64(ui_dec_us) / 1000.0 / f64(ui_frame_count),
+						playhead.frame,
+						playback.accumulator,
+						sync.atomic_load(&audio_rpt.ph_src),
+						sync.atomic_load(&audio_rpt.ph_catch),
+						sync.atomic_load(&audio_prod.prod_frame),
+					)
+				}
 			}
 			ui_report_tick = now_ns
 			ui_frame_count = 0
@@ -2690,6 +2860,8 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	}
 	// The log's buffer is the player's for the whole session and outlives every
 	// record that read from it.
-	action_rec_close()
-	action_play_free()
+	when ODIN_DEBUG {
+		action_rec_close()
+		action_play_free()
+	}
 }

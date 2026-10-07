@@ -1140,8 +1140,10 @@ split_clip_at_playhead :: proc() {
 		kf_free_tracks(source_tracks)
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
-	if vyper_trace {
-		fmt.printf("[tl] split group link=%d (%d clips) @ %d\n", link, len(targets), frame)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[tl] split group link=%d (%d clips) @ %d\n", link, len(targets), frame)
+		}
 	}
 	undo_push(.Split, "Split clip(s)")
 	audio_note_edit()
@@ -1171,8 +1173,10 @@ unlink_selected_clips :: proc() {
 	// Any group drag math captured earlier is now invalid: members are free.
 	clear(&clip_move.group_orig)
 	audio_note_edit()
-	if vyper_trace {
-		fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
+		}
 	}
 }
 
@@ -1237,8 +1241,10 @@ toggle_links_for_selection :: proc() {
 			return
 		}
 		audio_note_edit()
-		if vyper_trace {
-			fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[tl] unlinked %d clips (was link=%d)\n", count, link)
+			}
 		}
 		return
 	}
@@ -1256,8 +1262,10 @@ toggle_links_for_selection :: proc() {
 			c.link_id = 0
 		}
 		audio_note_edit()
-		if vyper_trace {
-			fmt.printf("[tl] unlinked %d selected clips\n", len(resolved))
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[tl] unlinked %d selected clips\n", len(resolved))
+			}
 		}
 		return
 	}
@@ -1266,8 +1274,10 @@ toggle_links_for_selection :: proc() {
 		c.link_id = new_link
 	}
 	audio_note_edit()
-	if vyper_trace {
-		fmt.printf("[tl] linked %d selected clips (link=%d)\n", len(resolved), new_link)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[tl] linked %d selected clips (link=%d)\n", len(resolved), new_link)
+		}
 	}
 }
 
@@ -1353,21 +1363,25 @@ delete_selected_clip_raw :: proc() {
 		removed := tt.clips[target.index]
 		ordered_remove(&tt.clips, target.index)
 		clip_ranges_release(&removed)
-		if vyper_trace {
-			fmt.printf(
-				"[tl] deleted clip raw src=%s start=%d len=%d\n",
-				removed.path,
-				removed.timeline_start_frame,
-				removed.source_length_frames,
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[tl] deleted clip raw src=%s start=%d len=%d\n",
+					removed.path,
+					removed.timeline_start_frame,
+					removed.source_length_frames,
+				)
+			}
 		}
 		removed_any = true
 	}
 	if !removed_any {
 		return
 	}
-	if vyper_trace {
-		fmt.printf("[tl] deleted clip group link=%d (%d clips)\n", link, len(targets))
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[tl] deleted clip group link=%d (%d clips)\n", link, len(targets))
+		}
 	}
 	selection.track = -1
 	selection.index = -1
@@ -1543,8 +1557,10 @@ ripple_delete_region :: proc(start, length: i64) {
 	clip_move.source_index = -1
 	clip_move.hover_track = -1
 	invalidate_preview_slots()
-	if vyper_trace {
-		fmt.printf("[tl] ripple delete region [%d, %d)\n", start, start + length)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[tl] ripple delete region [%d, %d)\n", start, start + length)
+		}
 	}
 	selection.track = -1
 	selection.index = -1
@@ -1624,8 +1640,10 @@ ripple_delete_linked_group :: proc(link: u64) {
 	clip_move.source_index = -1
 	clip_move.hover_track = -1
 	invalidate_preview_slots()
-	if vyper_trace {
-		fmt.printf("[tl] ripple delete linked group link=%d (%d members)\n", link, len(spans))
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[tl] ripple delete linked group link=%d (%d members)\n", link, len(spans))
+		}
 	}
 	selection.track = -1
 	selection.index = -1
@@ -1785,15 +1803,17 @@ move_clip_to_track :: proc(src_track, src_index: int, dst_track: int, start: i64
 			break
 		}
 	}
-	if vyper_trace {
-		fmt.printf(
-			"[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
-			clip.path,
-			clip.source_length_frames,
-			start,
-			dst_track,
-			placed,
-		)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf(
+				"[tl] moved clip src=%s len=%d start=%d -> track %d @ %d\n",
+				clip.path,
+				clip.source_length_frames,
+				start,
+				dst_track,
+				placed,
+			)
+		}
 	}
 	// Cross-track moves change which clip covers the playhead: re-derive the
 	// slots from the edited timeline instead of reusing the old covering state.

@@ -434,20 +434,22 @@ update_preview_slots :: proc() -> bool {
 				slot.asset_id = clip.asset_id
 				slot.path = clip.path
 				slot.tex_dirty = true
-				if vyper_trace {
-					fmt.printf(
-						"[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
-						slot_idx,
-						clip.asset_id,
-						clip.timeline_start_frame,
-						clip.source_start_frame,
-						clip.source_length_frames,
-						playhead.playing,
-						same_asset,
-						warm_hit,
-						clip.clip_id,
-						warm.clip_id,
-					)
+				when ODIN_DEBUG {
+					if vyper_trace {
+						fmt.printf(
+							"[vf] assign slot=%d asset=%d tl=%d src=%d len=%d playing=%v same_asset=%v warm_hit=%v clip_id=%d warm_id=%d\n",
+							slot_idx,
+							clip.asset_id,
+							clip.timeline_start_frame,
+							clip.source_start_frame,
+							clip.source_length_frames,
+							playhead.playing,
+							same_asset,
+							warm_hit,
+							clip.clip_id,
+							warm.clip_id,
+						)
+					}
 				}
 				mem.zero(raw_data(slot.buffer[:]), len(slot.buffer))
 				// The reassign zeroed the slot (slot^ = {}), wiping the layer the
@@ -829,15 +831,17 @@ slot.is_text = true
 							in_window = p_frame >= lo && p_frame < hi
 						}
 						if !in_window {
-							if vyper_trace {
-								fmt.printf(
-									"[vf] stale-peek=%d clip(src=%d+%d) slot=%d ph=%d\n",
-									p_frame,
-									clip.source_start_frame,
-									clip.source_length_frames,
-									slot_idx,
-									playhead.frame,
-								)
+							when ODIN_DEBUG {
+								if vyper_trace {
+									fmt.printf(
+										"[vf] stale-peek=%d clip(src=%d+%d) slot=%d ph=%d\n",
+										p_frame,
+										clip.source_start_frame,
+										clip.source_length_frames,
+										slot_idx,
+										playhead.frame,
+									)
+								}
 							}
 							continue
 						}
@@ -852,8 +856,17 @@ slot.is_text = true
 							slot.has_frame = true
 							slot.tex_dirty = true
 							changed = true
-						} else if vyper_trace {
-							fmt.printf("[vf] async miss slot=%d req=%d ph=%d\n", slot_idx, req, playhead.frame)
+						} else {
+							when ODIN_DEBUG {
+								if vyper_trace {
+									fmt.printf(
+										"[vf] async miss slot=%d req=%d ph=%d\n",
+										slot_idx,
+										req,
+										playhead.frame,
+									)
+								}
+							}
 						}
 					}
 				} else {
@@ -868,8 +881,17 @@ slot.is_text = true
 						slot.has_frame = true
 						slot.tex_dirty = true
 						changed = true
-					} else if vyper_trace {
-						fmt.printf("[vf] miss slot=%d req=%d ph=%d\n", slot_idx, req, playhead.frame)
+					} else {
+						when ODIN_DEBUG {
+							if vyper_trace {
+								fmt.printf(
+									"[vf] miss slot=%d req=%d ph=%d\n",
+									slot_idx,
+									req,
+									playhead.frame,
+								)
+							}
+						}
 					}
 				}
 			}

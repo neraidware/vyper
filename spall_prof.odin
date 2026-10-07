@@ -25,156 +25,174 @@ import "core:strings"
 import "core:sync"
 import "core:time"
 
-// Spall_State is the shared profiler state: whether profiling is enabled for
-// this run, the shared Context (file writer, read-only after init), and the
-// capture duration limit in ns (0 = unbounded). Read by instrumentation on the
-// hot path only via the stable enable flag (see the header note on the scoped
-// end hook re-checking the gate).
-Spall_State :: struct {
-	enabled:     bool,
-	ctx:         spall.Context,
-	deadline_ns: i64,
-}
-spall_state: Spall_State
-
-@(thread_local) spall_buffer: spall.Buffer
-@(thread_local) spall_buffer_data: [spall.BUFFER_DEFAULT_SIZE]u8
-@(thread_local) spall_thread_active: bool
-
-// spall_prof_init opens the capture file and arms the render thread's buffer.
-// Returns true always (init is best-effort).
-//
-// The capture path defaults to <temp>/vyper/spall.json in a debug build, so
-// profiling is available without inventing a filename; VYPER_SPALL=<path> still
-// wins and VYPER_SPALL=0 turns it off. A release build has no spall code at all.
-spall_prof_init :: proc() -> bool {
-	path_buf: [1024]u8
-	path := diag_path("VYPER_SPALL", "spall.json", path_buf[:])
-	if path == "" {
-		spall_state.enabled = false
-		return true
+when ODIN_DEBUG {
+	// Spall_State is the shared profiler state: whether profiling is enabled for
+	// this run, the shared Context (file writer, read-only after init), and the
+	// capture duration limit in ns (0 = unbounded). Read by instrumentation on the
+	// hot path only via the stable enable flag (see the header note on the scoped
+	// end hook re-checking the gate).
+	Spall_State :: struct {
+		enabled:     bool,
+		ctx:         spall.Context,
+		deadline_ns: i64,
 	}
-	// precise_time=false: timestamps come from CLOCK_MONOTONIC_RAW (ns), so the
-	// scale is exactly 1.0 ns/tick. No RDTSC calibration, no startup sleep, and
-	// timestamps are real wall-clock-ns comparable across threads.
-	ctx, ok := spall.context_create_with_scale(path, false, 1.0)
-	if !ok {
-		fmt.eprintf("[spall] could not open capture file %q\n", path)
-		spall_state.enabled = false
-		return true
-	}
-	spall_state.ctx = ctx
-	spall_state.enabled = true
-	spall_thread_init("render")
-	// Optional capture-duration limit (ms): lets a scripted run take a bounded
-	// trace and exit cleanly so the shutdown defers flush the buffers. The
-	// render loop calls spall_expired() each frame and breaks when reached.
-	if ms := os.get_env_alloc("VYPER_SPALL_MS", context.temp_allocator); ms != "" {
-		if v, ok := strconv.parse_i64(strings.trim_space(ms)); ok && v > 0 {
-			spall_state.deadline_ns = time.now()._nsec + v * 1_000_000
+	spall_state: Spall_State
+
+	@(thread_local) spall_buffer: spall.Buffer
+	@(thread_local) spall_buffer_data: [spall.BUFFER_DEFAULT_SIZE]u8
+	@(thread_local) spall_thread_active: bool
+
+	// spall_prof_init opens the capture file and arms the render thread's buffer.
+	// Returns true always (init is best-effort).
+	//
+	// The capture path defaults to <temp>/vyper/spall.json in a debug build, so
+	// profiling is available without inventing a filename; VYPER_SPALL=<path> still
+	// wins and VYPER_SPALL=0 turns it off. A release build has no spall code at all.
+	spall_prof_init :: proc() -> bool {
+		path_buf: [1024]u8
+		path := diag_path("VYPER_SPALL", "spall.json", path_buf[:])
+		if path == "" {
+			spall_state.enabled = false
+			return true
 		}
+		// precise_time=false: timestamps come from CLOCK_MONOTONIC_RAW (ns), so the
+		// scale is exactly 1.0 ns/tick. No RDTSC calibration, no startup sleep, and
+		// timestamps are real wall-clock-ns comparable across threads.
+		ctx, ok := spall.context_create_with_scale(path, false, 1.0)
+		if !ok {
+			fmt.eprintf("[spall] could not open capture file %q\n", path)
+			spall_state.enabled = false
+			return true
+		}
+		spall_state.ctx = ctx
+		spall_state.enabled = true
+		spall_thread_init("render")
+		// Optional capture-duration limit (ms): lets a scripted run take a bounded
+		// trace and exit cleanly so the shutdown defers flush the buffers. The
+		// render loop calls spall_expired() each frame and breaks when reached.
+		if ms := os.get_env_alloc("VYPER_SPALL_MS", context.temp_allocator); ms != "" {
+			if v, ok := strconv.parse_i64(strings.trim_space(ms)); ok && v > 0 {
+				spall_state.deadline_ns = time.now()._nsec + v * 1_000_000
+			}
+		}
+		return true
 	}
-	return true
-}
 
-// spall_expired reports whether the optional capture-duration limit was reached
-// (render loop breaks so startup defers flush the trace). Always false when no
-// limit was set or profiling is off.
-spall_expired :: proc() -> bool {
-	if !spall_state.enabled || spall_state.deadline_ns == 0 {
-		return false
+	// spall_expired reports whether the optional capture-duration limit was reached
+	// (render loop breaks so startup defers flush the trace). Always false when no
+	// limit was set or profiling is off.
+	spall_expired :: proc() -> bool {
+		if !spall_state.enabled || spall_state.deadline_ns == 0 {
+			return false
+		}
+		return time.now()._nsec >= spall_state.deadline_ns
 	}
-	return time.now()._nsec >= spall_state.deadline_ns
-}
 
-// spall_prof_shutdown flushes the render-thread buffer and closes the file.
-// Must run after every worker thread has called spall_thread_term (main already
-// defers the worker shutdowns above its own shutdown).
-spall_prof_shutdown :: proc() {
-	if !spall_state.enabled {
-		return
+	// spall_prof_shutdown flushes the render-thread buffer and closes the file.
+	// Must run after every worker thread has called spall_thread_term (main already
+	// defers the worker shutdowns above its own shutdown).
+	spall_prof_shutdown :: proc() {
+		if !spall_state.enabled {
+			return
+		}
+		spall_thread_term()
+		spall.context_destroy(&spall_state.ctx)
+		spall_state.enabled = false
 	}
-	spall_thread_term()
-	spall.context_destroy(&spall_state.ctx)
-	spall_state.enabled = false
-}
 
-// spall_thread_init arms the calling thread's buffer (worker threads must call
-// this at thread start; the render thread gets it from spall_prof_init).
-spall_thread_init :: proc(name: string) {
-	if !spall_state.enabled {
-		return
+	// spall_thread_init arms the calling thread's buffer (worker threads must call
+	// this at thread start; the render thread gets it from spall_prof_init).
+	spall_thread_init :: proc(name: string) {
+		if !spall_state.enabled {
+			return
+		}
+		buf, ok := spall.buffer_create(spall_buffer_data[:], u32(sync.current_thread_id()))
+		if !ok {
+			return
+		}
+		spall_buffer = buf
+		spall_thread_active = true
+		spall._buffer_name_thread(&spall_state.ctx, &spall_buffer, name)
 	}
-	buf, ok := spall.buffer_create(spall_buffer_data[:], u32(sync.current_thread_id()))
-	if !ok {
-		return
-	}
-	spall_buffer = buf
-	spall_thread_active = true
-	spall._buffer_name_thread(&spall_state.ctx, &spall_buffer, name)
-}
 
-// spall_thread_term flushes the calling thread's buffer (must run at thread
-// exit so no pending events are lost).
-spall_thread_term :: proc() {
-	if !spall_state.enabled || !spall_thread_active {
-		return
-	}
-	spall.buffer_destroy(&spall_state.ctx, &spall_buffer)
-	spall_thread_active = false
-}
-
-// spall_scope emits a Begin event and, at the end of the enclosing scope (any
-// exit path), the matching End. Never call this from a thread that did not
-// spall_thread_init first -- the inactive gate catches that.
-@(deferred_in = spall_scope_end)
-@(no_instrumentation)
-spall_scope :: proc(name: string) -> bool {
-	if !spall_state.enabled || !spall_thread_active {
-		return false
-	}
-	spall._buffer_begin(&spall_state.ctx, &spall_buffer, name)
-	return true
-}
-
-@(no_instrumentation)
-spall_scope_end :: proc(name: string) {
-	if !spall_state.enabled || !spall_thread_active {
-		return
-	}
-	spall._buffer_end(&spall_state.ctx, &spall_buffer)
-}
-
-// ---------------------------------------------------------------------------
-// Full-program instrumentation: every proc call emits a begin/end pair, giving
-// the whole call tree. NOTE: in this toolchain, merely DECLARING the
-// instrumentation_enter/exit hooks makes the compiler instrument the entire
-// program (no -instrument flag needed) -- which would cost the release build a
-// guard check on every proc call even with profiling off. So the hooks are
-// compiled out by default and only exist when explicitly requested:
-//
-//	odin build . -define:VYPER_INSTRUMENT=true -o:aggressive ...
-//	VYPER_SPALL=/tmp/x.spall ./vyper
-//
-// Expect a big trace (this toolchain: ~20 MB per second); keep VYPER_SPALL_MS
-// short. For hot-path work the manual spall_scope markers are enough.
-// ---------------------------------------------------------------------------
-when #config(VYPER_INSTRUMENT, false) {
-
-	@(instrumentation_enter)
-	profiler_enter :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {
+	// spall_thread_term flushes the calling thread's buffer (must run at thread
+	// exit so no pending events are lost).
+	spall_thread_term :: proc() {
 		if !spall_state.enabled || !spall_thread_active {
 			return
 		}
-		spall._buffer_begin(&spall_state.ctx, &spall_buffer, "", "", loc)
+		spall.buffer_destroy(&spall_state.ctx, &spall_buffer)
+		spall_thread_active = false
 	}
 
-	@(instrumentation_exit)
-	profiler_exit :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {
+	// spall_scope emits a Begin event and, at the end of the enclosing scope (any
+	// exit path), the matching End. Never call this from a thread that did not
+	// spall_thread_init first -- the inactive gate catches that.
+	@(deferred_in = spall_scope_end)
+	@(no_instrumentation)
+	spall_scope :: proc(name: string) -> bool {
+		if !spall_state.enabled || !spall_thread_active {
+			return false
+		}
+		spall._buffer_begin(&spall_state.ctx, &spall_buffer, name)
+		return true
+	}
+
+	@(no_instrumentation)
+	spall_scope_end :: proc(name: string) {
 		if !spall_state.enabled || !spall_thread_active {
 			return
 		}
 		spall._buffer_end(&spall_state.ctx, &spall_buffer)
 	}
 
+	// ---------------------------------------------------------------------------
+	// Full-program instrumentation: every proc call emits a begin/end pair, giving
+	// the whole call tree. NOTE: in this toolchain, merely DECLARING the
+	// instrumentation_enter/exit hooks makes the compiler instrument the entire
+	// program (no -instrument flag needed) -- which would cost the release build a
+	// guard check on every proc call even with profiling off. So the hooks are
+	// compiled out by default and only exist when explicitly requested:
+	//
+	//	odin build . -define:VYPER_INSTRUMENT=true -o:aggressive ...
+	//	VYPER_SPALL=/tmp/x.spall ./vyper
+	//
+	// Expect a big trace (this toolchain: ~20 MB per second); keep VYPER_SPALL_MS
+	// short. For hot-path work the manual spall_scope markers are enough.
+	// ---------------------------------------------------------------------------
+	when #config(VYPER_INSTRUMENT, false) {
+
+		@(instrumentation_enter)
+		profiler_enter :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {
+			if !spall_state.enabled || !spall_thread_active {
+				return
+			}
+			spall._buffer_begin(&spall_state.ctx, &spall_buffer, "", "", loc)
+		}
+
+		@(instrumentation_exit)
+		profiler_exit :: proc "contextless" (proc_address, call_site_return_address: rawptr, loc: runtime.Source_Code_Location) {
+			if !spall_state.enabled || !spall_thread_active {
+				return
+			}
+			spall._buffer_end(&spall_state.ctx, &spall_buffer)
+		}
+
+	}
+}
+
+when !ODIN_DEBUG {
+
+// Release stub. A release binary carries no profiler: the call sites stay (they
+// are instrumentation sprinkled through the app and are not worth
+// `#no_inline`-ing a mode switch at each), and these are the bodies they reach.
+// A no-op scope still returns false, which is what spall_scope's result means.
+spall_prof_init :: proc() -> bool { return false }
+spall_prof_shutdown :: proc() {}
+spall_thread_init :: proc(name: string) {}
+spall_thread_term :: proc() {}
+spall_expired :: proc() -> bool { return false }
+@(deferred_in = spall_scope_end)
+spall_scope :: proc(name: string) -> bool { return false }
+spall_scope_end :: proc(name: string) {}
 }

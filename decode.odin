@@ -311,8 +311,10 @@ clip_decoder_release_ffmpeg :: proc(dec: ^Clip_Decoder) {
 }
 
 clip_decoder_reset :: proc(dec: ^Clip_Decoder) {
-	if vyper_trace {
-		fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[dec] RESET cache_len=%d opened=%v\n", len(dec.cache), dec.opened)
+		}
 	}
 	clip_decoder_release_ffmpeg(dec)
 	frame_cache_clear(dec)
@@ -650,10 +652,12 @@ open_clip_decoder_ex :: proc(dec: ^Clip_Decoder, path: cstring, stream_index: c.
 		dec.dst_h = dec.crop_dst_h
 		dec.fit_ox = dec.crop_dst_x
 		dec.fit_oy = dec.crop_dst_y
-		if vyper_trace {
-			fmt.printf("[dec] crop-render src(%d,%d %dx%d) dst %dx%d @ (%d,%d)\n",
-				dec.crop_px_x, dec.crop_px_y, dec.crop_px_w, dec.crop_px_h,
-				dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[dec] crop-render src(%d,%d %dx%d) dst %dx%d @ (%d,%d)\n",
+					dec.crop_px_x, dec.crop_px_y, dec.crop_px_w, dec.crop_px_h,
+					dec.dst_w, dec.dst_h, dec.fit_ox, dec.fit_oy)
+			}
 		}
 	} else {
 		dec.dst_w = dst_w
@@ -992,9 +996,11 @@ scale_decoded_frame :: proc(dec: ^Clip_Decoder) -> bool {
 			dec.crop_dropped = true
 			dec.dst_w, dec.dst_h = dec.crop_full_w, dec.crop_full_h
 			dec.fit_ox, dec.fit_oy = 0, 0
-			if vyper_trace {
-				fmt.printf("[dec] crop dropped: %s not in x-crop table\n",
-					string(avutil.get_pix_fmt_name(avutil.PixelFormat(src.format))))
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf("[dec] crop dropped: %s not in x-crop table\n",
+						string(avutil.get_pix_fmt_name(avutil.PixelFormat(src.format))))
+				}
 			}
 		}
 	}

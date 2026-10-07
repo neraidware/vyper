@@ -347,16 +347,18 @@ audio_device_init :: proc() -> bool {
 	}
 	audio_dev.started = true
 	audio_dev.ready = true
-	if audio_rpt.trace {
-		fmt.printf(
-			"miniaudio device ready (%d Hz, %dch, %d-bit, period %d ms, resampling=%t, backend=%s)\n",
-			audio_dev.rate,
-			audio_dev.channels,
-			audio_device_bits(),
-			AUDIO_DEVICE_PERIOD_MS,
-			audio_dev.resampling,
-			ma.get_backend_name(audio_dev.device.pContext.backend),
-		)
+	when ODIN_DEBUG {
+		if audio_rpt.trace {
+			fmt.printf(
+				"miniaudio device ready (%d Hz, %dch, %d-bit, period %d ms, resampling=%t, backend=%s)\n",
+				audio_dev.rate,
+				audio_dev.channels,
+				audio_device_bits(),
+				AUDIO_DEVICE_PERIOD_MS,
+				audio_dev.resampling,
+				ma.get_backend_name(audio_dev.device.pContext.backend),
+			)
+		}
 	}
 	return true
 }

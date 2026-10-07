@@ -7786,3 +7786,50 @@ as absent. The check that settled it was running the measurement the item claims
   audio_scrub_exact, audio_seek_landing, parity, image_probe, opacity,
   audio_group_isolation. Valgrind clean (0 definitely lost, 0 indirectly lost) on
   undo, dnd and action-log.
+
+## Implemented — the debug behavior is gated out of release with `when` (2026-10-06)
+
+- 98 inline trace sites (`vyper_trace`, `play_trace`, `repro_trace`,
+  `audio_rpt.trace`, `audio_rpt.log_full`, `split_timing`,
+  `render_split_timing`) across 15 app files are now inside
+  `when ODIN_DEBUG { }`, as are the 34 `*_probe.odin` files and their 59 entry
+  points in `main.odin`. `spall_prof.odin` is gated whole, with a
+  `when !ODIN_DEBUG` stub block so the seven instrumentation call sites keep
+  compiling and reach a no-op.
+- Verified as real exclusion, not a runtime flag: `strings` finds zero
+  occurrences of `ANOMALY`, `ui-probe`, `dnd-probe`, `spall`,
+  `recording ->`, `pcm dump ->` in the release binary, and the release binary
+  RUNS (exit 0, writes no diagnostics). Release 2.7 MB vs debug 11 MB.
+- Two assets had to MOVE before their probe file could be gated, because they
+  were app code living in probe files: the NV12 luma/chroma SPIR-V (`#load`ed,
+  used by `render_gpu.odin` to build the app's own pipelines) and
+  `SOFTWARE_RASTERIZER_NAMES` (used by `render_gpu.odin`'s software-rasterizer
+  warning). Both now live in `render_gpu.odin`; each probe loads its own copy.
+  Gating those files without moving them would have shipped a release binary
+  that cannot create its NV12 pipeline.
+- `check` must keep `-debug` or this whole arrangement is unverifiable: without
+  it `odin check` does not compile the `when ODIN_DEBUG` branch at all.
+- Gates green: check (debug and release), probe, dnd_probe, action_log,
+  timeline_probe, transform_probe, session str/kf/trk/marker, audio_probe,
+  audio_clip_tempo, audio_scrub_exact, audio_seek_landing, parity, image_probe,
+  opacity, gpu_nv12, gpu_composite, gpu_probe, audio_group_isolation, zorder,
+  keyed_export, yuv_exact, atempo_probe, subtitle_probe, proxy_probe,
+  geom_key_probe, render_kf_probe, keyframe_probe, smoke, silent_playback,
+  audio_export_audit, audio_drift_parity, audio_bus_prime, and the valgrind
+  gates (0 definitely lost, 0 indirectly lost).
+
+## OPEN — still-image decode is wrong in an unoptimized build (2026-10-06)
+
+- `image_decode_probe` FAILS on this branch and passes on `main`. Bisected: it
+  is NOT the `when` gating. It appeared with the debug-default build change, and
+  turning every diagnostic off does not help, and so does putting
+  `-no-bounds-check` back on the debug build. It is `-o:none` itself: the
+  still-image path decodes source frame 0 to zero frames
+  (`[image-dec] could not decode source frame 0`) only when unoptimized.
+- That is the signature of undefined behaviour the optimizer was papering over
+  (an uninitialized read, a strict-aliasing assumption, or an overlapping
+  `mem.copy`), not of a bounds violation. NOT DIAGNOSED and NOT FIXED — it needs
+  a look at `decode_clip_frame_sync` for the image/still path.
+- Consequence to decide: the debug build is now the default, so this gate fails
+  by default until the decode path is fixed. Options are to fix the decode
+  defect (correct), or to keep the image probe running against a release build.

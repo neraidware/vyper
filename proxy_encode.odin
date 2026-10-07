@@ -103,8 +103,10 @@ proxy_encode_range :: proc(
 	in_fmt: ^avfmt.FormatContext
 	defer avfmt.close_input(&in_fmt)
 	if ret := avfmt.open_input(&in_fmt, src, nil, nil); ret < 0 {
-		if vyper_trace {
-			fmt.printf("[enc] avformat_open_input %q: %s\n", string(src), ff_err_str(ret))
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[enc] avformat_open_input %q: %s\n", string(src), ff_err_str(ret))
+			}
 		}
 		return .Fail, 0
 	}
@@ -159,10 +161,12 @@ proxy_encode_range :: proc(
 			hw_pix_fmt = cfg.pix_fmt
 			dec.hw_device_ctx = avutil.buffer_ref(hw_dev)
 			enc_sw_frame = avutil.frame_alloc()
-			if vyper_trace {
-				fmt.printf("[enc] hw-decode %s via %s\n",
-					string(avcodec.get_name(par.codec_id)),
-					string(avutil.hwdevice_get_type_name(cfg.device_type)))
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf("[enc] hw-decode %s via %s\n",
+						string(avcodec.get_name(par.codec_id)),
+						string(avutil.hwdevice_get_type_name(cfg.device_type)))
+				}
 			}
 			break
 		}

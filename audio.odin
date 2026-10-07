@@ -204,8 +204,10 @@ open_audio_decoder_resampled :: proc(dec: ^Audio_Clip_Decoder, path: cstring, st
 	// >8ch file decodes into a buffer sized for what swr writes.
 	dec.s16 = make([]i16, AUDIO_CHUNK * dec.out_channels)
 	dec.opened = true
-	if audio_rpt.trace {
-		fmt.printf("audio %dch @ %d Hz -> S16\n", dec.out_channels, dec.out_rate)
+	when ODIN_DEBUG {
+		if audio_rpt.trace {
+			fmt.printf("audio %dch @ %d Hz -> S16\n", dec.out_channels, dec.out_rate)
+		}
 	}
 	return true
 }
@@ -451,11 +453,13 @@ decode_audio_chunk :: proc(dec: ^Audio_Clip_Decoder, at_seconds: f64) -> int {
 		dec.decoded_frames += i64(produced)
 		dec.decoded_chunks += 1
 	}
-	if audio_rpt.trace {
-		fmt.printf(
-			"[tr dec] seq=%v asked=%.3fs produced=%d first_ts=%v last_ts=%v\n",
-			sequential, at_seconds, produced, dec.first_ts, dec.last_ts,
-		)
+	when ODIN_DEBUG {
+		if audio_rpt.trace {
+			fmt.printf(
+				"[tr dec] seq=%v asked=%.3fs produced=%d first_ts=%v last_ts=%v\n",
+				sequential, at_seconds, produced, dec.first_ts, dec.last_ts,
+			)
+		}
 	}
 	return produced
 }
@@ -1134,37 +1138,43 @@ audio_dump: Audio_Dump
 // stream and is on by default. Set VYPER_DECDUMP=<path> when a decode bug needs
 // the per-source view and you have the disk for it.
 audio_dec_dump_open :: proc() {
-	if audio_dump.dec != nil {
-		return
-	}
-	path, has := os.lookup_env_alloc("VYPER_DECDUMP", context.temp_allocator)
-	if !has || path == "" {
-		return
-	}
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
-	if err == nil {
-		audio_dump.dec = f
-		fmt.printf("[audio] dec dump -> %s\n", path)
-	}
+// Debug-only (see the volume note above): not in a release binary.
+when ODIN_DEBUG {
+		if audio_dump.dec != nil {
+			return
+		}
+		path, has := os.lookup_env_alloc("VYPER_DECDUMP", context.temp_allocator)
+		if !has || path == "" {
+			return
+		}
+		f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
+		if err == nil {
+			audio_dump.dec = f
+			fmt.printf("[audio] dec dump -> %s\n", path)
+		}
+}
 }
 
 // The mixed-output dump: ONE stream (48 kHz stereo s16 = 192 KB/s, ~690 MB an
 // hour), so it defaults on in a debug build and lands under the temp dir.
 audio_pcm_dump_open :: proc() {
-	if audio_dump.pcm != nil {
-		return
-	}
-	path_buf: [1024]u8
-	path := diag_path("VYPER_PCMDUMP", "mix.pcm", path_buf[:])
-	if path == "" {
-		return
-	}
-	f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
-	if err == nil {
-		audio_dump.pcm = f
-		audio_dump.pcm_path = path
-		fmt.printf("[audio] pcm dump -> %s\n", path)
-	}
+// Debug-only: the mixed-output dump is a debug tool, absent from a release binary.
+when ODIN_DEBUG {
+		if audio_dump.pcm != nil {
+			return
+		}
+		path_buf: [1024]u8
+		path := diag_path("VYPER_PCMDUMP", "mix.pcm", path_buf[:])
+		if path == "" {
+			return
+		}
+		f, err := os.open(path, {.Write, .Create, .Trunc}, os.Permissions_Read_Write_All)
+		if err == nil {
+			audio_dump.pcm = f
+			audio_dump.pcm_path = path
+			fmt.printf("[audio] pcm dump -> %s\n", path)
+		}
+}
 }
 // The producer never touches live timeline memory. The UI thread publishes the
 // audio clip geometry into a double-buffered slab (audio_geometry_commit on
@@ -2542,11 +2552,13 @@ audio_mix_frame :: proc(mix: []f32, frame: i64, spf: int) -> bool {
 		) {
 			delivered = true
 		}
-		if audio_rpt.trace {
-			fmt.printf(
-				"[tr mix] fr=%d k=%d seg0=%d start48=%d have48=%d fifo=%d del=%v\n",
-				frame, k, seg.start_a, start48, s.have48, ring_len(&s.fifo), delivered,
-			)
+		when ODIN_DEBUG {
+			if audio_rpt.trace {
+				fmt.printf(
+					"[tr mix] fr=%d k=%d seg0=%d start48=%d have48=%d fifo=%d del=%v\n",
+					frame, k, seg.start_a, start48, s.have48, ring_len(&s.fifo), delivered,
+				)
+			}
 		}
 		// Drop everything up to and including this frame from the fifo. O(1):
 		// see ring_drop -- this used to be a mem.copy shifting the remaining
@@ -2894,15 +2906,17 @@ audio_producer_feed :: proc() {
 				ring_drop(&s.fifo, drop)
 			}
 		}
-		if repro_trace {
-			// This is the ONLY place in the engine that advances next_frame without a
-			// decode, so it is the only candidate for an audible jump. Naming it here
-			// means a `[repro] ANOMALY JUMP` line further down can be read against the
-			// cause instead of leaving the two to be correlated by hand.
-			fmt.printf(
-				"[repro] CAUSE jump_frame %d -> %d (+%d) trimmed %d samples, cleared the queue\n",
-				audio_src.next_frame, jmp, jmp - audio_src.next_frame, delta48,
-			)
+		when ODIN_DEBUG {
+			if repro_trace {
+				// This is the ONLY place in the engine that advances next_frame without a
+				// decode, so it is the only candidate for an audible jump. Naming it here
+				// means a `[repro] ANOMALY JUMP` line further down can be read against the
+				// cause instead of leaving the two to be correlated by hand.
+				fmt.printf(
+					"[repro] CAUSE jump_frame %d -> %d (+%d) trimmed %d samples, cleared the queue\n",
+					audio_src.next_frame, jmp, jmp - audio_src.next_frame, delta48,
+				)
+			}
 		}
 		audio_src.next_frame = jmp
 		audio_device_clear()
@@ -2947,8 +2961,10 @@ audio_producer_feed :: proc() {
 	sync.atomic_store(&playback.dev_resync, sync.atomic_load(&audio_prod.resync))
 	// Anomaly report LAST, so it sees the positions this pass just published rather
 	// than the ones it was about to publish.
-	if repro_trace {
-		repro_report(fps, dev_pos)
+	when ODIN_DEBUG {
+		if repro_trace {
+			repro_report(fps, dev_pos)
+		}
 	}
 	// Fold live gain edits (knob drag) into provisioned segments before mixing.
 	// The epoch check is cheap; folding only runs when the UI published a gain
@@ -3109,44 +3125,48 @@ audio_producer_feed :: proc() {
 			}
 		}
 		audio_src.next_frame += 1
-		if audio_rpt.trace {
-			fmt.printf(
-				"[tr feed] fr=%d devpos=%d target=%d q=%db ph=%d prod=%d dev=%d mix=%.2fs\n",
-				audio_src.next_frame - 1, dev_pos, target, qnow, ph, audio_src.next_frame, playback.dev_frame, f64(monotonic_ns() - feed_t0) / 1e9,
-			)
+		when ODIN_DEBUG {
+			if audio_rpt.trace {
+				fmt.printf(
+					"[tr feed] fr=%d devpos=%d target=%d q=%db ph=%d prod=%d dev=%d mix=%.2fs\n",
+					audio_src.next_frame - 1, dev_pos, target, qnow, ph, audio_src.next_frame, playback.dev_frame, f64(monotonic_ns() - feed_t0) / 1e9,
+				)
+			}
 		}
 		if sync.atomic_load(&audio_rpt.last_fed_content_armed) {
 			sync.atomic_store(&audio_rpt.last_fed_content, content_start)
 			sync.atomic_store(&audio_rpt.last_fed_content_armed, false)
 		}
-		if play_trace {
-			// What the device was just handed, in the two numbers that decide
-			// whether it is the right sound: the CONTENT sample range this block
-			// came from, and its level. A playhead at 0 with the engine feeding
-			// content 500000 is the bug this line exists to make visible.
-			peak: i32 = 0
-			for s in pcm[:out_bytes / 2] {
-				v := i32(s)
-				if v < 0 {
-					v = -v
+		when ODIN_DEBUG {
+			if play_trace {
+				// What the device was just handed, in the two numbers that decide
+				// whether it is the right sound: the CONTENT sample range this block
+				// came from, and its level. A playhead at 0 with the engine feeding
+				// content 500000 is the bug this line exists to make visible.
+				peak: i32 = 0
+				for s in pcm[:out_bytes / 2] {
+					v := i32(s)
+					if v < 0 {
+						v = -v
+					}
+					if v > peak {
+						peak = v
+					}
 				}
-				if v > peak {
-					peak = v
-				}
+				fmt.printf(
+					"[prod] fed fr=%d content=[%d,%d) peak=%.3f q=%d devpos=%d target=%d prod=%d dev=%d ph=%d\n",
+					audio_src.next_frame - 1,
+					content_start,
+					content_start + i64(push_frames),
+					f64(peak) / 32768.0,
+					qnow,
+					dev_pos,
+					target,
+					audio_src.next_frame,
+					playback.dev_frame,
+					playhead.frame,
+				)
 			}
-			fmt.printf(
-				"[prod] fed fr=%d content=[%d,%d) peak=%.3f q=%d devpos=%d target=%d prod=%d dev=%d ph=%d\n",
-				audio_src.next_frame - 1,
-				content_start,
-				content_start + i64(push_frames),
-				f64(peak) / 32768.0,
-				qnow,
-				dev_pos,
-				target,
-				audio_src.next_frame,
-				playback.dev_frame,
-				playhead.frame,
-			)
 		}
 	}
 	sync.atomic_store(&audio_prod.prod_frame, audio_src.next_frame)
@@ -3163,8 +3183,10 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 	last_evt := i64(0)
 	had_evt := false
 	device_active := false
-	if audio_rpt.trace {
-		fmt.println("[audio] producer thread up")
+	when ODIN_DEBUG {
+		if audio_rpt.trace {
+			fmt.println("[audio] producer thread up")
+		}
 	}
 	audio_rpt.thread_start_ns = monotonic_ns()
 	last_report := u64(0)
@@ -3199,17 +3221,19 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 						audio_device_clear()
 						audio_rpt.queue_clears += 1
 					}
-					if play_trace {
-						fmt.printf(
-							"[prod] reconcile done kept=%d sought=%d opened=%d dropped=%d touched=%t next_frame=%d queued=%d\n",
-							rep.kept,
-							rep.sought,
-							rep.opened,
-							rep.dropped,
-							rep.touched_window,
-							audio_src.next_frame,
-							audio_device_queued(),
-						)
+					when ODIN_DEBUG {
+						if play_trace {
+							fmt.printf(
+								"[prod] reconcile done kept=%d sought=%d opened=%d dropped=%d touched=%t next_frame=%d queued=%d\n",
+								rep.kept,
+								rep.sought,
+								rep.opened,
+								rep.dropped,
+								rep.touched_window,
+								audio_src.next_frame,
+								audio_device_queued(),
+							)
+						}
 					}
 				} else {
 					// First event of the run: nothing exists to reconcile, so this
@@ -3221,16 +3245,18 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					audio_device_clear()
 					audio_provision(anchor)
 				}
-				if play_trace {
-			fmt.printf(
-				"[prod] resync evt=%d anchor=%d seeked=%t run=true  next_frame=%d dev=%d\n",
-				evt,
-				anchor,
-				seeked,
-				audio_src.next_frame,
-				sync.atomic_load(&playback.dev_frame),
-			)
-		}
+				when ODIN_DEBUG {
+					if play_trace {
+				fmt.printf(
+					"[prod] resync evt=%d anchor=%d seeked=%t run=true  next_frame=%d dev=%d\n",
+					evt,
+					anchor,
+					seeked,
+					audio_src.next_frame,
+					sync.atomic_load(&playback.dev_frame),
+				)
+			}
+				}
 				had_evt = true
 				audio_device_set_active(true)
 				device_active = true
@@ -3267,8 +3293,10 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 						sync.atomic_store(&audio_prod.jump_frame, hop)
 					}
 				}
-				if audio_rpt.trace {
-					fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", audio_src.count, sync.atomic_load(&audio_prod.anchor_frame), f64(monotonic_ns()-open_start)/1e6)
+				when ODIN_DEBUG {
+					if audio_rpt.trace {
+						fmt.printf("[audio] re-provisioned %d srcs at frame %d in %.1f ms\n", audio_src.count, sync.atomic_load(&audio_prod.anchor_frame), f64(monotonic_ns()-open_start)/1e6)
+					}
 				}
 			}
 			if !device_active {
@@ -3341,23 +3369,25 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 					audio_rpt.dec_drop,
 					audio_device_rate(), audio_device_channels(), audio_device_bits(),
 					audio_device_underruns(), audio_device_clears(), 0)
-				if audio_rpt.log_full {
-					for k in 0 ..< audio_src.count {
-						s := &audio_src.slots[k]
-						at := i64(-1)
-						covered := false
-						in_fifo := false
-						if seg := play_src_seg_at(s, audio_src.next_frame); seg != nil {
-							covered = true
-							at = i64(audio_content_sec(audio_src.next_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
-							in_fifo = at >= s.first48 && at < s.have48
+				when ODIN_DEBUG {
+					if audio_rpt.log_full {
+						for k in 0 ..< audio_src.count {
+							s := &audio_src.slots[k]
+							at := i64(-1)
+							covered := false
+							in_fifo := false
+							if seg := play_src_seg_at(s, audio_src.next_frame); seg != nil {
+								covered = true
+								at = i64(audio_content_sec(audio_src.next_frame - seg.start_a, seg.start_s, seg.start_s_rate, fps) * 48000.0)
+								in_fifo = at >= s.first48 && at < s.have48
+							}
+							fmt.printf("[src %d] %s segs=%d dec=%t in=%dHz/%dch out=%dHz/%dch first48=%d have48=%d fifo=%dfr decoded=%dfr/%dch mix_at=%d(into %t) cov=%t\n",
+								k, s.path, s.seg_count, s.dec.opened,
+								s.dec.input_rate, s.dec.input_channels, s.dec.out_rate, s.dec.out_channels,
+								s.first48, s.have48, ring_len(&s.fifo),
+								s.dec.decoded_frames, s.dec.decoded_chunks,
+								at, in_fifo, covered)
 						}
-						fmt.printf("[src %d] %s segs=%d dec=%t in=%dHz/%dch out=%dHz/%dch first48=%d have48=%d fifo=%dfr decoded=%dfr/%dch mix_at=%d(into %t) cov=%t\n",
-							k, s.path, s.seg_count, s.dec.opened,
-							s.dec.input_rate, s.dec.input_channels, s.dec.out_rate, s.dec.out_channels,
-							s.first48, s.have48, ring_len(&s.fifo),
-							s.dec.decoded_frames, s.dec.decoded_chunks,
-							at, in_fifo, covered)
 					}
 				}
 				audio_rpt.queue_established = false
@@ -3405,28 +3435,32 @@ audio_producer_proc :: proc(t: ^thread.Thread) {
 						audio_device_clear()
 						audio_rpt.queue_clears += 1
 					}
-					if play_trace {
-						fmt.printf(
-							"[prod] reconcile(stopped) kept=%d sought=%d opened=%d dropped=%d touched=%t next_frame=%d\n",
-							rep.kept,
-							rep.sought,
-							rep.opened,
-							rep.dropped,
-							rep.touched_window,
-							audio_src.next_frame,
-						)
+					when ODIN_DEBUG {
+						if play_trace {
+							fmt.printf(
+								"[prod] reconcile(stopped) kept=%d sought=%d opened=%d dropped=%d touched=%t next_frame=%d\n",
+								rep.kept,
+								rep.sought,
+								rep.opened,
+								rep.dropped,
+								rep.touched_window,
+								audio_src.next_frame,
+							)
+						}
 					}
 				} else {
 					audio_rpt.provisions += 1
 					audio_device_clear()
 					audio_provision(anchor)
-					if play_trace {
-						fmt.printf(
-							"[prod] provision at=%d srcs=%d next_frame=%d\n",
-							anchor,
-							audio_src.count,
-							audio_src.next_frame,
-						)
+					when ODIN_DEBUG {
+						if play_trace {
+							fmt.printf(
+								"[prod] provision at=%d srcs=%d next_frame=%d\n",
+								anchor,
+								audio_src.count,
+								audio_src.next_frame,
+							)
+						}
 					}
 				}
 				had_evt = true
@@ -3468,11 +3502,13 @@ audio_update :: proc() {
 	if !audio_prod.was_playing {
 		audio_prod.was_playing = true
 		sync.atomic_store(&audio_prod.run, true)
-		if play_trace {
-			fmt.printf(
-				"[ui]  run edge: starting producer at playhead=%d\n",
-				playhead.frame,
-			)
+		when ODIN_DEBUG {
+			if play_trace {
+				fmt.printf(
+					"[ui]  run edge: starting producer at playhead=%d\n",
+					playhead.frame,
+				)
+			}
 		}
 		audio_seek(playhead.frame)
 		audio_prod.last_ui_frame = playhead.frame
@@ -3480,22 +3516,26 @@ audio_update :: proc() {
 	}
 	fwd := playhead.frame - audio_prod.last_ui_frame
 	audio_prod.last_ui_frame = playhead.frame
-	if play_trace {
-		fmt.printf(
-			"[ui]  audio_update ph=%d fwd=%+d last=%d prod=%d anchor=%d run=%t\n",
-			playhead.frame,
-			fwd,
-			audio_prod.last_ui_frame,
-			sync.atomic_load(&audio_prod.prod_frame),
-			sync.atomic_load(&audio_prod.anchor_frame),
-			sync.atomic_load(&audio_prod.run),
-		)
+	when ODIN_DEBUG {
+		if play_trace {
+			fmt.printf(
+				"[ui]  audio_update ph=%d fwd=%+d last=%d prod=%d anchor=%d run=%t\n",
+				playhead.frame,
+				fwd,
+				audio_prod.last_ui_frame,
+				sync.atomic_load(&audio_prod.prod_frame),
+				sync.atomic_load(&audio_prod.anchor_frame),
+				sync.atomic_load(&audio_prod.run),
+			)
+		}
 	}
 	if fwd > 3 || fwd < -1 {
-		if audio_rpt.trace {
-			fmt.printf("[ph] t=%.2fs ph=%d fwd=%+d (last_ui=%d) -> jump/health check\n",
-				f64(monotonic_ns()-audio_rpt.thread_start_ns)/1e9,
-				playhead.frame, fwd, audio_prod.last_ui_frame)
+		when ODIN_DEBUG {
+			if audio_rpt.trace {
+				fmt.printf("[ph] t=%.2fs ph=%d fwd=%+d (last_ui=%d) -> jump/health check\n",
+					f64(monotonic_ns()-audio_rpt.thread_start_ns)/1e9,
+					playhead.frame, fwd, audio_prod.last_ui_frame)
+			}
 		}
 	}
 	// A resync clears the stream, reopens every decoder (~16 ms) and then must
@@ -3523,8 +3563,10 @@ audio_update :: proc() {
 	// (5 FLAC decoders, ~300 ms total). Only a COMPLETED provision with zero
 	// survivors is a genuinely dead engine.
 	if sync.atomic_load(&audio_prod.src_count_ui) == 0 && !sync.atomic_load(&audio_prod.provisioning) && timeline_has_audio_at(playhead.frame) {
-		if audio_rpt.trace {
-			fmt.printf("[ph] self-heal: playing but 0 audio sources at ph=%d -> re-seed\n", playhead.frame)
+		when ODIN_DEBUG {
+			if audio_rpt.trace {
+				fmt.printf("[ph] self-heal: playing but 0 audio sources at ph=%d -> re-seed\n", playhead.frame)
+			}
 		}
 		audio_seek(playhead.frame)
 		return
@@ -3543,10 +3585,12 @@ audio_update :: proc() {
 		src := sync.atomic_load(&audio_rpt.ph_src)
 		catch := sync.atomic_load(&audio_rpt.ph_catch)
 		src_name := src == 1 ? "mouse" : src == 2 ? "auto" : "?"
-		if audio_rpt.trace {
-			fmt.printf("[ph] t=%.2fs ph=%d prod=%d anchor=%d -> %s reseek (fwd=%+d, phsrc=%s catch=%d)\n",
-				f64(now-audio_rpt.thread_start_ns)/1e9,
-				playhead.frame, prod, sync.atomic_load(&audio_prod.anchor_frame), reason, fwd, src_name, catch)
+		when ODIN_DEBUG {
+			if audio_rpt.trace {
+				fmt.printf("[ph] t=%.2fs ph=%d prod=%d anchor=%d -> %s reseek (fwd=%+d, phsrc=%s catch=%d)\n",
+					f64(now-audio_rpt.thread_start_ns)/1e9,
+					playhead.frame, prod, sync.atomic_load(&audio_prod.anchor_frame), reason, fwd, src_name, catch)
+			}
 		}
 		audio_seek(playhead.frame)
 	// There is no forward-skip branch here any more, and its absence is the point of
@@ -3573,18 +3617,22 @@ audio_update :: proc() {
 // audio_seek re-anchors the producer at the given frame and requests a clear +
 // re-provision. UI thread only.
 audio_seek :: proc(frame: i64) {
-	if audio_rpt.trace {
-		fmt.printf("[tr seek] to=%d\n", frame)
+	when ODIN_DEBUG {
+		if audio_rpt.trace {
+			fmt.printf("[tr seek] to=%d\n", frame)
+		}
 	}
-	if play_trace {
-		fmt.printf(
-			"[ui]  audio_seek to=%d  (playhead=%d prod=%d resync %d->%d)\n",
-			frame,
-			playhead.frame,
-			sync.atomic_load(&audio_prod.prod_frame),
-			sync.atomic_load(&audio_prod.resync),
-			sync.atomic_load(&audio_prod.resync) + 1,
-		)
+	when ODIN_DEBUG {
+		if play_trace {
+			fmt.printf(
+				"[ui]  audio_seek to=%d  (playhead=%d prod=%d resync %d->%d)\n",
+				frame,
+				playhead.frame,
+				sync.atomic_load(&audio_prod.prod_frame),
+				sync.atomic_load(&audio_prod.resync),
+				sync.atomic_load(&audio_prod.resync) + 1,
+			)
+		}
 	}
 	sync.atomic_store(&audio_prod.anchor_frame, frame)
 	sync.atomic_store(&audio_prod.anchor_now, i64(monotonic_ns()))

@@ -145,19 +145,23 @@ import_ui: Import_UI_State
 // point, and no future caller can post a source the encoder will crash on.
 import_bg_may_encode :: proc(src: cstring, frames: i64, dur_us: i64) -> bool {
 	if media_is_image(src) {
-		if vyper_trace {
-			fmt.printf("[bg] refused a still image: %q needs no proxy\n", string(src))
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[bg] refused a still image: %q needs no proxy\n", string(src))
+			}
 		}
 		return false
 	}
 	if frames <= 0 || dur_us <= 0 {
-		if vyper_trace {
-			fmt.printf(
-				"[bg] refused %q: frames=%d dur=%dus, nothing to encode\n",
-				string(src),
-				frames,
-				dur_us,
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[bg] refused %q: frames=%d dur=%dus, nothing to encode\n",
+					string(src),
+					frames,
+					dur_us,
+				)
+			}
 		}
 		return false
 	}
@@ -514,8 +518,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 
 	seg_total := proxy_seg_count(frames)
 	if seg_total <= 0 {
-		if vyper_trace {
-			fmt.printf("[bg] bad segment plan for %q: frames=%d dur_us=%d\n", string(src), frames, dur_us)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[bg] bad segment plan for %q: frames=%d dur_us=%d\n", string(src), frames, dur_us)
+			}
 		}
 		import_bg_finish(ib, .Done_Fail)
 		return
@@ -529,8 +535,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 		hi = seg_total
 	}
 	if hi <= lo {
-		if vyper_trace {
-			fmt.printf("[bg] empty window [%d,%d) for %q\n", lo, hi, string(src))
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[bg] empty window [%d,%d) for %q\n", lo, hi, string(src))
+			}
 		}
 		import_bg_finish(ib, .Done_Fail)
 		return
@@ -587,8 +595,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			pending := ib.cancel_pending
 			sync.mutex_unlock(&ib.worker.mutex)
 			if pending {
-				if vyper_trace {
-					fmt.printf("[bg] cancel between segments; keeping %d completed frames\n", env.completed_frames)
+				when ODIN_DEBUG {
+					if vyper_trace {
+						fmt.printf("[bg] cancel between segments; keeping %d completed frames\n", env.completed_frames)
+					}
 				}
 				import_bg_finish(ib, .Done_Cancelled)
 				import_bg_clear_cancel(ib)
@@ -614,8 +624,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 				}
 				idx.segs[k] = have
 				env.completed_frames += have
-				if vyper_trace {
-					fmt.printf("[bg] segment %d/%d reused: %d frames\n", k + 1, seg_total, have)
+				when ODIN_DEBUG {
+					if vyper_trace {
+						fmt.printf("[bg] segment %d/%d reused: %d frames\n", k + 1, seg_total, have)
+					}
 				}
 				continue
 			}
@@ -645,8 +657,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			import_bg_clear_cancel(ib)
 			return
 		case .Fail:
-			if vyper_trace {
-				fmt.printf("[bg] segment %d encode failed for %q\n", k, string(src))
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf("[bg] segment %d encode failed for %q\n", k, string(src))
+				}
 			}
 			os.remove(string(seg))
 			import_bg_finish(ib, .Done_Fail)
@@ -665,8 +679,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			tol = PROXY_FRAME_TOLERANCE
 		}
 		if count < seg_want - tol {
-			if vyper_trace {
-				fmt.printf("[bg] segment %d short: wanted %d frames, got %d\n", k, seg_want, count)
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf("[bg] segment %d short: wanted %d frames, got %d\n", k, seg_want, count)
+				}
 			}
 			os.remove(string(seg))
 			import_bg_finish(ib, .Done_Fail)
@@ -687,8 +703,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 			import_bg_set_progress(ib, frac)
 			env.last_frac = frac
 		}
-		if vyper_trace {
-			fmt.printf("[bg] segment %d/%d done: %d frames -> %.1f%%\n", k + 1, seg_total, count, frac * 100)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[bg] segment %d/%d done: %d frames -> %.1f%%\n", k + 1, seg_total, count, frac * 100)
+			}
 		}
 	}
 
@@ -723,8 +741,10 @@ import_bg_build :: proc(ib: ^Proxy_Builder, src: cstring, frames: i64, dur_us: i
 	}
 	import_bg_finish(ib, phase)
 	import_bg_clear_cancel(ib)
-	if vyper_trace {
-		fmt.printf("[bg] proxy %s -> %v (window [%d,%d), %d frames)\n", string(src), phase, lo, hi, got)
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf("[bg] proxy %s -> %v (window [%d,%d), %d frames)\n", string(src), phase, lo, hi, got)
+		}
 	}
 	// Record the covered window so the scheduler can extend from this frontier
 	// without re-requesting what's on disk. Worker writes, render thread reads

@@ -1022,13 +1022,15 @@ proxy_pick_for_frame :: proc(
 			}
 			return nil, 0
 		}
-		if vyper_trace {
-			fmt.printf(
-				"[pick] seg index %d not covered: len=%d segs=%v\n",
-				k,
-				len(rc.idx.segs),
-				rc.idx.segs,
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[pick] seg index %d not covered: len=%d segs=%v\n",
+					k,
+					len(rc.idx.segs),
+					rc.idx.segs,
+				)
+			}
 		}
 		// Not covered yet: the on-disk index may have grown since we read it,
 		// so fall through and re-consult it when the needed segment might
@@ -1059,8 +1061,10 @@ proxy_pick_for_frame :: proc(
 				rc.idx = {}
 				rc.idx_valid = proxy_idx_load(src, &rc.idx)
 				rc.idx_mtime = info.modification_time
-				if vyper_trace {
-					fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
+				when ODIN_DEBUG {
+					if vyper_trace {
+						fmt.printf("[pick] reloaded idx valid=%v len=%d\n", rc.idx_valid, len(rc.idx.segs))
+					}
 				}
 				if rc.idx_valid && k < len(rc.idx.segs) && rc.idx.segs[k] > 0 {
 					seg, sok := proxy_segment_path_for(src, k, out_buf)

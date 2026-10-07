@@ -134,16 +134,18 @@ vdec_decode :: proc(ad: ^Async_Decoder, path: cstring, preview: cstring, frame_b
 		want = preview
 	}
 	if !ad.dec.opened || ad.dec_path != path || string(ad.dec.opened_path) != string(want) {
-		if vyper_trace {
-			fmt.printf(
-				"[vdec s=%d] REOPEN src_f=%d want=%q opened=%v opened_path=%q preview=%q\n",
-				ad.slot_idx,
-				frame_idx + frame_base,
-				string(want),
-				ad.dec.opened,
-				ad.dec.opened_path != nil ? string(ad.dec.opened_path) : "",
-				preview != nil ? string(preview) : "<nil>",
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[vdec s=%d] REOPEN src_f=%d want=%q opened=%v opened_path=%q preview=%q\n",
+					ad.slot_idx,
+					frame_idx + frame_base,
+					string(want),
+					ad.dec.opened,
+					ad.dec.opened_path != nil ? string(ad.dec.opened_path) : "",
+					preview != nil ? string(preview) : "<nil>",
+				)
+			}
 		}
 		decoder_set_preview(&ad.dec, preview, frame_base)
 		if !open_clip_decoder(&ad.dec, path) {

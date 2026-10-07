@@ -243,17 +243,19 @@ click_cases := []Click_Case{
 playhead_scrub_arm :: proc() {
 	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = false
-	if play_trace {
-		// Arming is where the playhead stops being a readout and becomes the pointer's,
-		// so it is the one moment to record what the clock said on the way in. Without
-		// it, a jump measured after the release has no "before" to be measured against.
-		fmt.printf(
-			"[ui]  scrub ARM at ph=%d (device reads %d, current=%t, playing=%t)\n",
-			playhead.frame,
-			sync.atomic_load(&playback.dev_frame),
-			sync.atomic_load(&playback.dev_resync) == sync.atomic_load(&audio_prod.resync),
-			playhead.playing,
-		)
+	when ODIN_DEBUG {
+		if play_trace {
+			// Arming is where the playhead stops being a readout and becomes the pointer's,
+			// so it is the one moment to record what the clock said on the way in. Without
+			// it, a jump measured after the release has no "before" to be measured against.
+			fmt.printf(
+				"[ui]  scrub ARM at ph=%d (device reads %d, current=%t, playing=%t)\n",
+				playhead.frame,
+				sync.atomic_load(&playback.dev_frame),
+				sync.atomic_load(&playback.dev_resync) == sync.atomic_load(&audio_prod.resync),
+				playhead.playing,
+			)
+		}
 	}
 	// Seeded with the CURRENT generation, not zero: a zero here would read as
 	// "a seek is outstanding" forever and the drag would never tell the producer
@@ -965,8 +967,10 @@ update_track_drag :: proc() {
 end_track_drag :: proc() {
 	if track_drag.idx >= 0 && track_drag.hover_row >= 0 {
 		move_track_to_row(track_drag.idx, track_drag.hover_row)
-		if vyper_trace {
-			fmt.printf("[tl] reordered track storage=%d to row=%d\n", track_drag.idx, track_drag.hover_row)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf("[tl] reordered track storage=%d to row=%d\n", track_drag.idx, track_drag.hover_row)
+			}
 		}
 	}
 	active_interaction = .None
@@ -991,13 +995,15 @@ drag_move_in_place :: proc(frame: f32) {
 		// the band every member can hold (see ripple_clamp_delta).
 		want := i64(max(frame, 0)) - clip_move.ripple_orig[0].start
 		clip_move.ripple_delta = ripple_clamp_delta(want)
-		if vyper_trace {
-			fmt.printf(
-				"[tl] drag ripple clips=%d delta=%d (want %d)\n",
-				len(clip_move.ripple_orig),
-				clip_move.ripple_delta,
-				want,
-			)
+		when ODIN_DEBUG {
+			if vyper_trace {
+				fmt.printf(
+					"[tl] drag ripple clips=%d delta=%d (want %d)\n",
+					len(clip_move.ripple_orig),
+					clip_move.ripple_delta,
+					want,
+				)
+			}
 		}
 		apply_ripple_drag(clip_move.ripple_delta)
 		return
@@ -1012,13 +1018,15 @@ drag_move_in_place :: proc(frame: f32) {
 		delta = group_clamp_delta(delta)
 		if group_delta_feasible(delta) {
 			if clip_move.clip.timeline_start_frame != clip_move.group_orig[0].start + delta {
-				if vyper_trace {
-					fmt.printf(
-						"[tl] drag group link=%d (%d clips) delta=%d\n",
-						clip_move.clip.link_id,
-						len(clip_move.group_orig),
-						delta,
-					)
+				when ODIN_DEBUG {
+					if vyper_trace {
+						fmt.printf(
+							"[tl] drag group link=%d (%d clips) delta=%d\n",
+							clip_move.clip.link_id,
+							len(clip_move.group_orig),
+							delta,
+						)
+					}
 				}
 				clip_move.clip.timeline_start_frame = clip_move.group_orig[0].start + delta
 			}
@@ -1035,14 +1043,16 @@ drag_move_in_place :: proc(frame: f32) {
 			clip_move.clip.timeline_start_frame,
 		)
 		if clip_move.clip.timeline_start_frame != new_start {
-			if vyper_trace {
-				fmt.printf(
-					"[tl] drag clip src=%s len=%d start=%d -> %d\n",
-					clip_move.clip.path,
-					clip_move.clip.source_length_frames,
-					clip_move.clip.timeline_start_frame,
-					new_start,
-				)
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf(
+						"[tl] drag clip src=%s len=%d start=%d -> %d\n",
+						clip_move.clip.path,
+						clip_move.clip.source_length_frames,
+						clip_move.clip.timeline_start_frame,
+						new_start,
+					)
+				}
 			}
 			clip_move.clip.timeline_start_frame = new_start
 		}
@@ -1436,20 +1446,22 @@ interaction_release :: proc(inp: Mouse_Input) {
 		// common "click the ruler to set the position" case) moves nothing
 		// and so re-provisions nothing.
 		if playhead_scrub.moved {
-			if play_trace {
-				// The committed position, the position the engine's clock still names,
-				// and the generation gap between them. The third is the one that matters:
-				// audio_seek bumps resync, so until the producer adopts it dev_frame is
-				// STALE by construction and describes where the sound was BEFORE the
-				// scrub. If the playhead jumps forward after this line, that gap is why,
-				// and it is visible here rather than inferred afterwards.
-				fmt.printf(
-					"[ui]  scrub RELEASE commit ph=%d (device still reads %d, %d generation behind)\n",
-					playhead.frame,
-					sync.atomic_load(&playback.dev_frame),
-					sync.atomic_load(&audio_prod.resync) -
-					sync.atomic_load(&playback.dev_resync),
-				)
+			when ODIN_DEBUG {
+				if play_trace {
+					// The committed position, the position the engine's clock still names,
+					// and the generation gap between them. The third is the one that matters:
+					// audio_seek bumps resync, so until the producer adopts it dev_frame is
+					// STALE by construction and describes where the sound was BEFORE the
+					// scrub. If the playhead jumps forward after this line, that gap is why,
+					// and it is visible here rather than inferred afterwards.
+					fmt.printf(
+						"[ui]  scrub RELEASE commit ph=%d (device still reads %d, %d generation behind)\n",
+						playhead.frame,
+						sync.atomic_load(&playback.dev_frame),
+						sync.atomic_load(&audio_prod.resync) -
+						sync.atomic_load(&playback.dev_resync),
+					)
+				}
 			}
 			audio_seek(playhead.frame)
 		}
@@ -1732,24 +1744,26 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 			// cursor's frame target advanced but the clip's start did not —
 			// the exact moment a drag would be "cut short", with the lane/
 			// pointer context that differs at that frame.
-			if vyper_trace {
-				tf := i64(max(frame, 0))
-				if tf != clip_move.trace_last_target &&
-				   clip_move.trace_last_start == clip_move.clip.timeline_start_frame {
-					fmt.printf(
-						"[drag] STALL target=%d (last=%d) clip=%d hover=%d src=%d y=%.0f x=%.0f snap=%v\n",
-						tf,
-						clip_move.trace_last_target,
-						clip_move.clip.timeline_start_frame,
-						hover,
-						clip_move.source_track,
-						inp.y,
-						inp.x,
-						editor_flags.snap_clips_to_playhead,
-					)
+			when ODIN_DEBUG {
+				if vyper_trace {
+					tf := i64(max(frame, 0))
+					if tf != clip_move.trace_last_target &&
+					   clip_move.trace_last_start == clip_move.clip.timeline_start_frame {
+						fmt.printf(
+							"[drag] STALL target=%d (last=%d) clip=%d hover=%d src=%d y=%.0f x=%.0f snap=%v\n",
+							tf,
+							clip_move.trace_last_target,
+							clip_move.clip.timeline_start_frame,
+							hover,
+							clip_move.source_track,
+							inp.y,
+							inp.x,
+							editor_flags.snap_clips_to_playhead,
+						)
+					}
+					clip_move.trace_last_target = tf
+					clip_move.trace_last_start = clip_move.clip.timeline_start_frame
 				}
-				clip_move.trace_last_target = tf
-				clip_move.trace_last_start = clip_move.clip.timeline_start_frame
 			}
 		}
 	case .Playhead_Scrub:
@@ -1770,13 +1784,15 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 			frame = snap_playhead_to_clip_edge(frame)
 		}
 		if playhead.frame != frame {
-			if vyper_trace {
-				fmt.printf(
-					"[pb] scrub ph=%d (was %d) playing=%v\n",
-					frame,
-					playhead.frame,
-					playhead.playing,
-				)
+			when ODIN_DEBUG {
+				if vyper_trace {
+					fmt.printf(
+						"[pb] scrub ph=%d (was %d) playing=%v\n",
+						frame,
+						playhead.frame,
+						playhead.playing,
+					)
+				}
 			}
 		}
 		if playhead.frame != frame {
@@ -1784,15 +1800,17 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		}
 		was := playhead.frame
 		playhead.frame = frame
-		if play_trace {
-			fmt.printf(
-				"[ui]  pointer scrub -> ph=%d (was %d) x=%.1f dev=%d resync=%d\n",
-				frame,
-				was,
-				inp.x,
-				sync.atomic_load(&playback.dev_frame),
-				sync.atomic_load(&audio_prod.resync),
-			)
+		when ODIN_DEBUG {
+			if play_trace {
+				fmt.printf(
+					"[ui]  pointer scrub -> ph=%d (was %d) x=%.1f dev=%d resync=%d\n",
+					frame,
+					was,
+					inp.x,
+					sync.atomic_load(&playback.dev_frame),
+					sync.atomic_load(&audio_prod.resync),
+				)
+			}
 		}
 		// SEEK DURING THE DRAG, coalesced to a minimum interval.
 		//
