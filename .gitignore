@@ -2,7 +2,6 @@
 /bin_swsbench
 
 # The binary build.sh used to leave in the root. build.odin writes target/;
-/# this is only here so an old one lying around is not committed.
 /build
 
 # Render / probe output artifacts
