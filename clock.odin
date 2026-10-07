@@ -51,3 +51,14 @@ monotonic_ms :: proc "contextless" () -> u64 {
 sleep_ms :: proc "contextless" (ms: int) {
 	time.sleep(time.Duration(ms) * time.Millisecond)
 }
+
+// sleep_ns is the sub-millisecond form, for pacing a replay to the frame
+// durations a recording measured. Frame periods are tens of milliseconds, so
+// rounding them to whole milliseconds would drift a minute-long session by
+// seconds.
+sleep_ns :: proc "contextless" (ns: u64) {
+	if ns == 0 {
+		return
+	}
+	time.sleep(time.Duration(ns))
+}

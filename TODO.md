@@ -7639,3 +7639,83 @@ mixer-origin finding has no home in the tracker **because it was resolved, not l
 The lesson worth keeping is about the method rather than the item: `git cherry` compares
 patch-ids, and a fix that landed through a squash or a merge with different context reads
 as absent. The check that settled it was running the measurement the item claims.
+
+## Implemented — action log: record a session's raw input, replay it exactly (2026-10-06)
+
+- Problem: the reported audio repeat could not be pinned down because the
+  sessions that show it were not repeatable by hand. Every hand-run trace was
+  either contaminated (the run also scrubbed) or silent, and the traces that
+  looked like anomalies turned out to be requested seeks: 7 scrub gestures, 112
+  pointer moves, 71 seeks in one GUI run, with the producer and playhead
+  `-134` to `+120` frames apart at the seeks. "Scrub a bit, then play" does not
+  reproduce the bug, because where the pointer sat between samples and how long
+  each frame took are part of what the audio producer sees. The diagnostic
+  answer was to record the input instead of describing it.
+- Model: `action_log.odin` writes raw INPUT, not resolved commands — the
+  per-frame pointer state plus the key/text/wheel/drop/quit events — and replays
+  them through the SAME dispatch. `handle_sdl_events` splits into the poll and
+  `dispatch_sdl_event`; recording happens at the poll, replay calls the dispatch.
+  A replayed session is therefore the input code a user runs, not a second
+  implementation of the UI. Two details make that true rather than nominal:
+  the pointer is a per-frame snapshot (drags are "button held plus a position";
+  there is no motion-event path), and `event.odin` had exactly one SDL poll site
+  to record at.
+- Format: versioned, little-endian, `VYPRACT` + version, then length-prefixed
+  records. `SNAPSHOT` first — the CBOR project at recording start, so a replay
+  restores the session instead of loading a project and does not depend on the
+  file on disk still being what it was. Per frame: `MOUSE` (x, y, six held-state
+  bits) and `FRAME_END` (whole-frame duration, index, window size). Events:
+  `KEY` (keycode, modifier bits, down/repeat), `TEXT`, `WHEEL`, `DROP`, `QUIT`.
+  The wheel record carries the pointer position it arrived at, because
+  `handle_mouse_wheel` picks its scroll zone from it. Events the app ignores
+  (motion, window, focus, device) are neither written nor counted: they are not
+  app behaviour, so dropping them changes nothing, and every type the dispatch
+  DOES act on has a kind.
+- Replay pacing: the deadline advances by the recorded frame duration and the
+  frame sleeps until it, so the producer sees the recorded wall-clock spacing. A
+  frame that overran leaves the deadline where it landed and the next frame
+  catches up, rather than the session drifting later by every overrun. The
+  recorded duration is the whole frame period measured from the loop top, not the
+  gap between two interior samples — an interior sample excludes the render and
+  present the recording spent there, and a replay paced that way runs fast.
+- Window size: the log carries it because the pointer coordinates in a log are
+  pixels in the recorded layout, and at another size every one addresses a
+  different widget. A launch's window size is NOT stable — the same binary
+  measured 671x716 and 951x1028 on different runs — so a replay that refused to
+  run at a different size would be refused most of the time. The first frame
+  resizes the window to the recorded size; every later frame asserts the size
+  still holds, which is where a resize DURING a recording surfaces.
+- Failure is loud, because a log that quietly drops an action is worse than no
+  log: bad magic, a version this build does not read, a missing snapshot, an
+  over-size file and a record kind off the end of the enum each say so and exit
+  non-zero; a truncated log stops the replay at the byte it ran out, rather than
+  running a session missing its tail; a mismatched window size asserts with both
+  numbers.
+- Probe: `action_log` is a roundtrip, not a byte check — a record that survives
+  the file but not the replay is the failure this format cannot have, and it
+  looks like "the repro didn't reproduce". It records a scripted session
+  (Ctrl+Space down/up, Shift+`;` to open the command line, typed `ab`, a
+  DROP_BEGIN/POSITION/COMPLETE gesture, a wheel, and a distinct pointer state
+  per frame), reopens the file, replays it, and compares cmdline content,
+  cmdline-open, key press/release edges, drop open/position and the pointer
+  bitfield frame by frame; then it cuts 6 bytes off the log and requires the
+  replay to refuse it.
+- Mutation: stopping the writer from emitting `TEXT` fails the probe
+  (`cmdline "", want "ab"`); zeroing the recorded modifier bits fails it too
+  (the Shift+`;` opener never opens the prompt, so the text never lands) — which
+  is the check that matters for `mods_have`, where a lost modifier reads as a
+  binding that silently never fires; skipping `DROP` fails the drop assertions.
+- `action_log_valgrind` is the memory gate: 0 definitely lost, 0 indirectly
+  lost, no invalid access. It found three real leaks in the probe's own pushed
+  SDL strings and env string, which is why the pushed strings are now returned
+  to the caller and freed once the dispatch that reads them is done.
+- Use: `VYPER_ACTION_RECORD=/tmp/s.vya ./vyper <project.vyproj>` records from
+  launch to quit (no toggle); `VYPER_ACTION_REPLAY=/tmp/s.vya ./vyper` replays
+  it, restoring the snapshot and skipping `VYPER_AUTOPLAY` (both replace the
+  session, and autoplay must not fight the log for it). Verified on
+  `~/sallyface.vyproj`: 598 frames recorded and replayed, 3.36 s of recorded
+  frames against 3.6 s of replay wall time including startup, 7 tracks
+  restored, zero repro anomalies.
+- Still open: the actual audio repeat is not fixed. This makes it reproducible,
+  which is the input the fix needs; the next step is recording the session that
+  shows it and reading the producer trace from the replay.

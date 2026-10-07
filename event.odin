@@ -17,41 +17,22 @@ import sdl "vendor:sdl3"
 // This is the app's ONLY SDL poll site, which is what makes kbd.drain a
 // meaningful scope: one call empties the queue, so anything that needs to know
 // whether two events arrived in the same burst of input compares drain ids.
+//
+// A replay takes the place of the poll, not of the dispatch: the recorded
+// events are fed through dispatch_sdl_event, the same proc the live loop calls,
+// so a replayed session runs the input code a user runs rather than a second
+// implementation of it.
 handle_sdl_events :: proc(running: ^bool) {
 	kbd_begin_drain()
-	event: sdl.Event
-	for sdl.PollEvent(&event) {
-		#partial switch event.type {
-		case .QUIT, .WINDOW_CLOSE_REQUESTED:
-			running^ = false
-		case .KEY_UP:
-			// The app had no key-up path at all, so "is this key down" was
-			// unanswerable and hold-to-repeat could not be told apart from a
-			// fresh press. Recorded here and consumed by nobody else: a key
-			// release has no meaning to the UI or to the fields.
-			kbd_note_key(event.key.key, false)
-		case .KEY_DOWN:
-			kbd_note_key(event.key.key, true)
-			route_key_down(event.key.key, event.key.mod, event.key.repeat)
-		case .TEXT_INPUT:
-			// No echo suppression, and none is needed: a field enables SDL text
-			// input BETWEEN drains, never while the keypress that opened it is
-			// being handled, so the opener cannot produce a text event for
-			// itself. See text_input_begin.
-			if ti.active {
-				text_input_insert(string(event.text.text))
-			} else if edit_state.field != .None {
-				for ch in string(event.text.text) {
-					// Only accept printable ASCII that makes sense in a number.
-					if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
-						edit_append(u8(ch))
-					}
-				}
-			}
-		case .MOUSE_WHEEL:
-			handle_mouse_wheel(event.wheel)
-		case .DROP_BEGIN, .DROP_POSITION, .DROP_FILE, .DROP_COMPLETE, .DROP_TEXT:
-			handle_file_drop_event(event)
+	if action_replaying() {
+		action_replay_frame(running)
+	} else {
+		event: sdl.Event
+		for sdl.PollEvent(&event) {
+			// Recorded before dispatch: dispatch can start a text field, and the
+			// opener keypress must still be in the log.
+			action_record_event(&event)
+			dispatch_sdl_event(&event, running)
 		}
 	}
 	// Between drains, never inside one. SDL documents that activating an IME
@@ -59,6 +40,46 @@ handle_sdl_events :: proc(running: ^bool) {
 	// that opened during this drain gets its text input here — with the opening
 	// keypress already consumed, and with no text input on to echo it.
 	text_input_flush_pending()
+}
+
+// dispatch_sdl_event routes one event to its owner. Split out of the poll loop
+// so the action-log replay hands its recorded events to exactly this code.
+//
+// The event cases here and the ones action_record_event writes must stay in
+// step: an event acted on but not recorded is an action the log silently drops.
+dispatch_sdl_event :: proc(event: ^sdl.Event, running: ^bool) {
+	#partial switch event.type {
+	case .QUIT, .WINDOW_CLOSE_REQUESTED:
+		running^ = false
+	case .KEY_UP:
+		// The app had no key-up path at all, so "is this key down" was
+		// unanswerable and hold-to-repeat could not be told apart from a
+		// fresh press. Recorded here and consumed by nobody else: a key
+		// release has no meaning to the UI or to the fields.
+		kbd_note_key(event.key.key, false)
+	case .KEY_DOWN:
+		kbd_note_key(event.key.key, true)
+		route_key_down(event.key.key, event.key.mod, event.key.repeat)
+	case .TEXT_INPUT:
+		// No echo suppression, and none is needed: a field enables SDL text
+		// input BETWEEN drains, never while the keypress that opened it is
+		// being handled, so the opener cannot produce a text event for
+		// itself. See text_input_begin.
+		if ti.active {
+			text_input_insert(string(event.text.text))
+		} else if edit_state.field != .None {
+			for ch in string(event.text.text) {
+				// Only accept printable ASCII that makes sense in a number.
+				if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
+					edit_append(u8(ch))
+				}
+			}
+		}
+	case .MOUSE_WHEEL:
+		handle_mouse_wheel(event.wheel)
+	case .DROP_BEGIN, .DROP_POSITION, .DROP_FILE, .DROP_COMPLETE, .DROP_TEXT:
+		handle_file_drop_event(event^)
+	}
 }
 // ---------------------------------------------------------------------------
 // Key routing: one entry point, ordered owners, one place that says who gets

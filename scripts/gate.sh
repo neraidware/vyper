@@ -678,6 +678,16 @@ target_dnd_probe() {
 	VYPER_DND_PROBE=1 timeout 120 ./vyper
 }
 
+# The action log's gate. A byte check would pass for a record that survives the
+# file but not the replay, so this is a roundtrip: the probe records a scripted
+# session, reopens the file it wrote, and compares the app state across the two
+# phases, then cuts 6 bytes off the log and requires the replay to refuse it.
+target_action_log() {
+	require_fresh_binary action-log || return 1
+	mkdir -p target/action-log
+	VYPER_ACTION_LOG_PROBE=target/action-log/roundtrip.vya timeout 120 ./vyper
+}
+
 # The memory gate for dnd_probe: the drop path takes an SDL-owned C string for
 # each dropped file and hands it to the bin, which clones what it keeps. So the
 # app owns nothing here -- SDL's SDL_FreeTemporaryMemory list owns the event
@@ -694,6 +704,25 @@ target_dnd_valgrind() {
 	local rc=$?
 	echo "dnd-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
 	valgrind_assert "$log" dnd-valgrind '\[dnd-probe\] all checks passed'
+}
+
+# The memory gate for the action log. It is the one feature that opens a file,
+# reads a whole log into memory, keeps it for the session, and hands buffers
+# across a boundary in both directions -- the CBOR snapshot goes out to the
+# writer, and the log's own bytes back into SDL's event structs. Those are
+# exactly the handoffs the four invariants exist for. The probe deliberately
+# leaks the pushed SDL strings (SDL_PushEvent copies the event but not the
+# string), so the gate is about the log's own ownership, which is what the two
+# records and the reader are.
+target_action_log_valgrind() {
+	require_fresh_valgrind_binary action-log-valgrind || return 1
+	mkdir -p target/valgrind
+	local log=target/valgrind/action-log.log
+	VYPER_ACTION_LOG_PROBE=target/valgrind/action-log-roundtrip.vya timeout 900 valgrind \
+		--leak-check=full --error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
+	local rc=$?
+	echo "action-log-valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"
+	valgrind_assert "$log" action-log-valgrind '\[action-log-probe\] ok'
 }
 
 # The byte-exact RGBA->NV12 ground truth (yuv_exact.odin) against swscale.
@@ -2046,7 +2075,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -2075,6 +2104,7 @@ main() {
 	session_trk_probe) target_session_trk_probe ;;
 	session_marker_probe) target_session_marker_probe ;;
 	dnd_probe) target_dnd_probe ;;
+	action_log) target_action_log ;;
 	parity) target_parity ;;
 	audio_rate) target_audio_rate ;;
 	audio_export_audit) target_audio_export_audit ;;
@@ -2094,6 +2124,7 @@ main() {
 	audio_clip_pitch) target_audio_clip_pitch ;;
 	atempo_probe) target_atempo_probe ;;
 	dnd_valgrind) target_dnd_valgrind ;;
+	action_log_valgrind) target_action_log_valgrind ;;
 	parity_valgrind) target_parity_valgrind ;;
 	yuv_exact) target_yuv_exact ;;
 	gpu_nv12) target_gpu_nv12 ;;
@@ -2117,7 +2148,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

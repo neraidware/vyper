@@ -2070,6 +2070,12 @@ if psp, _ := os.lookup_env_alloc("VYPER_PROXY_STEP", context.temp_allocator); ps
 		dnd_probe_run()
 		return
 	}
+	// Headless action-log roundtrip: records a scripted session, replays the
+	// file it wrote, and compares the app state across the two. A byte-level
+	// check cannot catch a record that survives the file but not the replay.
+	if alp, _ := os.lookup_env_alloc("VYPER_ACTION_LOG_PROBE", context.temp_allocator); alp != "" {
+		os.exit(action_log_probe_run())
+	}
 	if xp, _ := os.lookup_env_alloc("VYPER_PROXY_PROBE", context.temp_allocator); xp != "" {
 		proxy_probe_run(xp)
 		return
@@ -2520,11 +2526,19 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		open_file_at(path)
 	}
 
+	// A replay restores the session from the log's own snapshot, so it runs
+	// instead of loading a project: both replace the session, and letting
+	// autoplay open a project after the log restored one would hand the replay
+	// a session the recording never had.
+	action_log_startup(window)
+
 	// DIAG: env-var autoplay for headless-ish diagnostics — autoloads a file and
 	// starts playback after a couple of seconds. Refuses silently-failed imports
 	// (bad path, unreadable file, probe failure) instead of opening an empty
 	// project that immediately auto-stops without ever playing anything.
-	if autoplay := os.get_env_alloc("VYPER_AUTOPLAY", context.temp_allocator); autoplay != "" {
+	if autoplay := os.get_env_alloc("VYPER_AUTOPLAY", context.temp_allocator);
+		autoplay != "" &&
+		!action_replaying() {
 		if vyper_trace {
 			fmt.printf("[autoplay] env=\"%s\" step=import\n", autoplay)
 		}
@@ -2573,7 +2587,10 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 		}
 		audio_note_edit()
 	}
-
+	// The session is loaded by now, so the log can carry it. Recording it here
+	// rather than at startup is what keeps the snapshot the project the
+	// recording actually began with, including when autoplay imported it.
+	action_log_capture_session()
 
 	running := true
 	was_mouse_down := false
@@ -2581,6 +2598,11 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 	ui_report_tick := u64(0)
 	ui_frame_count := 0
 	ui_dec_us := i64(0)
+	// Frame START stamp, kept separate from the now_ns below (a mid-frame
+	// sample): the recorded frame duration has to cover the whole period,
+	// including the render and present the interior sample excludes, or a
+	// replay's pacing runs faster than the session it came from.
+	frame_start_ns := monotonic_ns()
 	for running {
 		spall_scope("render_frame")
 		// Frame-scoped scratch (timeline edit temporaries, decode error
@@ -2591,6 +2613,9 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			running = false
 		}
 		clear_expired_ui_notice()
+		width, height: c.int
+		sdl.GetWindowSize(window, &width, &height)
+		action_log_window(width, height)
 		handle_sdl_events(&running)
 		// A close/quit event sets running=false inside the event poll above. If
 		// we fall through into the render+present, the blocking GPU swapchain
@@ -2601,9 +2626,11 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			break
 		}
 
-		width, height: c.int
-		sdl.GetWindowSize(window, &width, &height)
-		inp := read_mouse_input()
+		// A replay's pointer comes from the log; the live one from SDL. One
+		// place decides which, and everything downstream sees the same
+		// Mouse_Input either way.
+		inp := action_replaying() ? action_replay_mouse_input() : read_mouse_input()
+		action_record_mouse(inp)
 		// After the mouse read, so a backend that never sends DROP_POSITION
 		// resolves the highlighted zone from the live pointer.
 		refresh_file_drag()
@@ -2646,8 +2673,17 @@ if xb, _ := os.lookup_env_alloc("VYPER_PROXY_BG_TEST", context.temp_allocator); 
 			ui_frame_count = 0
 			ui_dec_us = 0
 		}
-		if !render_ui_frame(device, window, &renderer, commands, width, height, &ui_dec_us) {
-			continue
-		}
+		// The frame-end record is unconditional and last in the body. It used to be
+		// `if !render_ui_frame(...) { continue }` with nothing after it, so the
+		// continue jumped nowhere: guarding the record with it would drop one
+		// record for a frame that failed to present, and the log would read as
+		// truncated rather than as a slow frame.
+		render_ui_frame(device, window, &renderer, commands, width, height, &ui_dec_us)
+		action_record_frame_end(monotonic_ns() - frame_start_ns)
+		frame_start_ns = monotonic_ns()
 	}
+	// The log's buffer is the player's for the whole session and outlives every
+	// record that read from it.
+	action_rec_close()
+	action_play_free()
 }
