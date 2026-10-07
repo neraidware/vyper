@@ -148,6 +148,15 @@ asset_authoring_rate :: proc(asset_id: u64) -> (rate: f64, is_video: bool) {
 	if as == nil || as.dur_us <= 0 {
 		return 0, false
 	}
+	// A still has no rate; its length is authored, not measured. This is tested on
+	// is_image rather than left to the `.Image` rung below because an image IMPORTS as
+	// kind=.Video (the probe sees a one-frame video stream), so that rung is never
+	// reached by one. The .Video rung then derived a rate from the still's frame_count
+	// (one timeline-second) over its dur_us (one frame): 625 fps at 25, and every
+	// still longer than a frame collapsed to one on load.
+	if as.is_image {
+		return 0, false
+	}
 	switch as.kind {
 	case .Video:
 		if as.video_fps > 0 {

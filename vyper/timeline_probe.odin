@@ -1986,6 +1986,63 @@ when ODIN_DEBUG {
 	}
 
 
+	// test_still_extent_survives_load is ~/spooky.vyproj: 21 three-frame stills and then
+	// 22 one-frame stills, which loaded as 43 one-frame stills with a two-frame gap
+	// between the first 21 -- black frames the author never put there.
+	//
+	// An image imports as kind=.Video (the probe sees a one-frame video stream) with
+	// is_image set, so asset_authoring_rate's `.Image` rung -- "a still has no rate" --
+	// was never reached. The .Video rung ran instead and derived a rate from the
+	// still's frame_count (one timeline-second, 25) over its dur_us (one frame, 40 ms):
+	// 625 fps. pf_rebase_extents then converted each 3-frame extent as 3/625 s at 25 fps
+	// = 0.12 frames, rounded to 0 and clamped to 1.
+	//
+	// The fixture is the real asset's numbers. A still's extent is authored, so load
+	// must leave it alone at every length, including the one-frame case that already
+	// survived by luck.
+	test_still_extent_survives_load :: proc() {
+		free_timeline(&timeline)
+		clear(&media_bin.assets)
+		append(
+			&media_bin.assets,
+			Media_Asset {
+				id = 9401, kind = .Video, is_image = true,
+				frame_count = 25, dur_us = 40000, video_fps = 0,
+			},
+		)
+		append(&timeline.tracks, Track{})
+		tl := &timeline.tracks[0]
+		lengths := []i64{3, 1, 7, 25}
+		start := i64(0)
+		for len_frames, i in lengths {
+			append(
+				&tl.clips,
+				Clip {
+					clip_id = u64(i + 1), kind = .Video, asset_id = 9401, is_still = true,
+					timeline_start_frame = start, source_length_frames = len_frames,
+				},
+			)
+			start += len_frames
+		}
+		saved_rate := project.frame_rate
+		defer project.frame_rate = saved_rate
+		project.frame_rate = 25.0
+
+		pf_rebase_extents()
+
+		for len_frames, i in lengths {
+			got := timeline.tracks[0].clips[i].source_length_frames
+			tl_probe_check(
+				got == len_frames,
+				"a still's authored extent must survive load -- clip %d was %d frames, loaded as %d",
+				i, len_frames, got,
+			)
+		}
+		rate, _ := asset_authoring_rate(9401)
+		tl_probe_check(rate == 0, "a still has no authoring rate -- derived %.1f fps", rate)
+	}
+
+
 	// test_trim_respects_source_length is the reported bug: dragging the siren head
 	// clip's tail out to its source's full length capped at 219 frames.
 	//
@@ -2221,6 +2278,7 @@ when ODIN_DEBUG {
 		fmt.println("[tl-probe] trim-source-length ok")
 		tl_scene()
 		test_audio_head_trim()
+		test_still_extent_survives_load()
 
 		// The TAIL cap on an audio clip, measured in the AUDIO clip's frame space.
 		// This is ~/baby.vyproj's opus after the tail cap was converted: the conversion
