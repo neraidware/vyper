@@ -532,7 +532,10 @@ obj_ext :: proc() -> string {
 object_for :: proc(src: string) -> string {
 	when ODIN_OS == .Windows {
 		if strings.has_suffix(src, "clay.c") {
-			return join_or_empty({PKG, "clay", ".", obj_ext()})
+			// Concatenated, not joined: filepath.join reads a "." element as a path
+			// SEGMENT and absorbs it, which yields `vyper/clay.obj` -- the very path
+			// this branch exists to avoid. The second CI failure caught that.
+			return strings.concatenate({PKG, "/clay.", obj_ext()}, context.temp_allocator)
 		}
 	}
 	return strings.concatenate({strings.trim_suffix(src, ".c"), ".", obj_ext()}, context.temp_allocator)
