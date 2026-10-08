@@ -8280,6 +8280,26 @@ deleted; redone here from the sampler's own contract.
   a starting value, not the value everywhere. Confirm this is the intent, or
   anchor the run-up at the edit frame instead.
 
+### Q toggles auto-keyframing
+
+- [x] `Toggle_Auto_Keyframe` bound to bare `Q` (`action.odin`), handler flips
+  `editor_flags.auto_keyframe` (`event.odin`) — the SAME flag and meaning as the
+  timeline's AutoKf button, so keyboard and pointer cannot drift.
+- [x] Why this is the toggle and not something else: with auto-key ON, editing a
+  property that already has keyframes writes a key at the playhead. That is what
+  makes a clip impossible to re-pose without touching its animation, because
+  there is then no way to move the base value. Turning it OFF sends the edit to
+  the resting field. `Q` sits next to the other timeline verbs (A keys everything
+  modified, S splits, U toggles links, I/O set points) and is unused.
+- [x] Modifier-insensitive, matching the bare rows: Shift+Q and Ctrl+Q toggle the
+  same flag. Pinned in `ui_probe` because the table is ordered most-specific-first
+  and a bare row silently loses to a row added later.
+- [x] One press, one flip: a key repeat does not toggle it back. Also pinned.
+- [x] Fires on the initial press only, and is not consumed while an export holds
+  the app locked (`app_claims_key` returns early for `render_is_busy`).
+- [ ] `ui_probe` has no `gate.sh` target, so these checks run only when the probe
+  is invoked directly. Worth a target if more bindings land.
+
 ### Rules from this workstream
 
 - **"Where does the resting value go?" is a question every sampler change has to

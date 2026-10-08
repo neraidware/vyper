@@ -676,6 +676,13 @@ when ODIN_DEBUG {
 			// would notice.
 			{ sdl.K_A, shift, .Key_All_Modified, "Shift+A keys the same set as bare A" },
 			{ sdl.K_A, ctrl, .Key_All_Modified, "Ctrl+A keys the same set as bare A" },
+			{ sdl.K_Q, {}, .Toggle_Auto_Keyframe, "Q toggles auto-keyframing" },
+			// Modifier-insensitive for the same reason as A: the extra modifiers a user
+			// already holds must not change what the key means, and the
+			// most-specific-first walk is where a bare row silently loses to a row
+			// added later.
+			{ sdl.K_Q, shift, .Toggle_Auto_Keyframe, "Shift+Q toggles the same flag" },
+			{ sdl.K_Q, ctrl, .Toggle_Auto_Keyframe, "Ctrl+Q toggles the same flag" },
 		}
 
 		for c in cases {
@@ -1164,6 +1171,35 @@ when ODIN_DEBUG {
 		preview.playing = false
 		ti.active = false
 		edit_state.field = .None
+
+		// Q is a one-shot toggle: it flips auto-keyframing, does not care about key
+		// repeat, and is not consumed while an export holds the app locked.
+		// The table rows above pin which key maps to the action; this pins that the
+		// action is wired to the flag at all, which a table-only test cannot see.
+		{
+			saved_auto := editor_flags.auto_keyframe
+			editor_flags.auto_keyframe = false
+			kbd_begin_drain()
+			kbd_note_key(sdl.K_Q, true)
+			if !app_claims_key(sdl.K_Q, {}, false) {
+				fmt.eprintf("[ui-probe] K_Q was not claimed\n")
+				ok = false
+			}
+			if !editor_flags.auto_keyframe {
+				fmt.eprintf("[ui-probe] K_Q did not turn auto-keyframe on\n")
+				ok = false
+			}
+			// A repeat must not toggle it back; one press, one flip.
+			kbd_begin_drain()
+			kbd_note_key(sdl.K_Q, true)
+			app_claims_key(sdl.K_Q, {}, true)
+			if !editor_flags.auto_keyframe {
+				fmt.eprintf("[ui-probe] a K_Q repeat toggled the flag again\n")
+				ok = false
+			}
+			kbd_note_key(sdl.K_Q, false)
+			editor_flags.auto_keyframe = saved_auto
+		}
 
 		// Initial press of K_H: claimed, and directed backwards.
 		kbd_begin_drain()

@@ -336,6 +336,12 @@ dispatch_action :: proc(act: Action) {
 		if sel, ok := transformable_selected(); ok && clip_geom_can_key_all_modified(sel) {
 			clip_geom_key_all_modified(sel)
 		}
+	case .Toggle_Auto_Keyframe:
+		// With auto-key off, an edit to an ALREADY-keyed property goes to the
+		// resting field instead of writing a key at the playhead, which is the only
+		// way to move a clip's base pose without disturbing its animation. Same flag
+		// and same meaning as the timeline's AutoKf button, so the two cannot drift.
+		editor_flags.auto_keyframe = !editor_flags.auto_keyframe
 	case .Set_In_Point:
 		// Set the render-range start at the playhead; collapsing the range to
 		// a single frame clears it.
