@@ -8412,6 +8412,19 @@ All three of these were live in the sense that something still called them.
   `zorder`, `keyed_export`, `gpu_probe`, `opacity`, `subtitle_probe` pass.
   `valgrind`, `undo_valgrind`, `render_live_valgrind`, `action_log_valgrind` report
   0 definitely/indirectly lost.
-- [ ] **`flake.nix` is unverified.** Nix is not installed here, so its two `cp` path
-  changes have never been run. A wrong path fails the sandbox build, not a local
+- [x] Windows CI green (run 37742276902) after three rounds of Windows-only fixes:
+  MSVC `lib` resolves archive objects relative to the ARCHIVE, so clay's object must
+  sit beside `clay-odin/windows/clay.lib` rather than beside its source (Linux `ar`
+  takes both paths as arguments and has no such rule, so only CI could find this);
+  `filepath.join` absorbs a "." element and emits the host separator, so the path is
+  concatenated with a literal backslash; and `lib` does not create its `/OUT:`
+  directory, which nothing did any more once the object moved.
+- [x] **The smoke test was a false pass.** `vyper-probe.exe` is
+  `/SUBSYSTEM:WINDOWS`, so a binary with no probe compiled in exits 0 and prints
+  nothing — indistinguishable from a pass, and it had been green without decoding a
+  frame. It now requires the probe's own result line (`[frame-probe] checked=`,
+  `[proxy-probe] OK`) and fails when it is absent. Measured locally: the debug build
+  emits both lines, and a release build emits neither and would now fail.
+- [ ] **`flake.nix` is still unverified.** Nix is not installed here, so its two `cp`
+  path changes have never been run. A wrong path fails the sandbox build, not a local
   one. Run `nix build` before trusting this.
