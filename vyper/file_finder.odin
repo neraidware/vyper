@@ -367,11 +367,11 @@ finder_commit :: proc(entry: Finder_Entry) {
 		if project_path_is_project(entry.fullpath) {
 			// A project file picked in the finder loads like `:open` would —
 			// the finder is the bare :open's picker, so both paths must agree.
+			// Neither one toasts on success (the app bar already names the open
+			// project); a failed load still reports itself.
 			if err := project_file_open(entry.fullpath); len(err) > 0 {
 				defer delete(err)
 				show_ui_notice(err, 4000)
-			} else {
-				show_ui_noticef(3000, "Editing '%s'", project.name)
 			}
 			finder_close()
 			return

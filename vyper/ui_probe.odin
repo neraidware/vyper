@@ -1534,6 +1534,35 @@ when ODIN_DEBUG {
 			}
 		}
 
+		// A project load shows NO notice. The app bar already names the open
+		// project permanently, so a toast repeating it only covers the timeline the
+		// user opened the project to look at. Pinned for the finder path because the
+		// comment there claims `:open` and the finder agree -- a load toast put back
+		// in one of them would otherwise pass unnoticed.
+		{
+			// Whatever an earlier assertion raised must not leak into this one.
+			if len(ui_notice.text) > 0 {
+				delete(ui_notice.text)
+				ui_notice.text = ""
+			}
+			finder_open(.Open)
+			finder_commit(
+				Finder_Entry{
+					name     = "probe_saved" + PROJECT_FILE_EXTENSION,
+					fullpath = saved,
+					kind     = .File,
+				},
+			)
+			if len(ui_notice.text) > 0 {
+				fmt.eprintf(
+					"[ui-probe] a project load raised a notice %q; a successful load must stay silent\n",
+					string(ui_notice.text),
+				)
+				ok = false
+			}
+			finder_close()
+		}
+
 		// An explicit extension is the user's call and is left alone.
 		finder_open(.Save)
 		finder_descend(dir)

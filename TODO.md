@@ -8312,3 +8312,34 @@ deleted; redone here from the sampler's own contract.
 - **`zorder` and `subtitle_probe` need `keyed_export`'s fixture.** In a fresh
   worktree they fail with "render range is empty" / "No such file or directory",
   which reads like a code failure and is not one.
+
+## Active 46 — The "Editing '<project>'" popup on project load
+
+**Status: FIXED.** Loading a project toasted `Editing '<name>'` over the timeline.
+Removed from every successful project-load path.
+
+### Steps
+
+- [x] Three paths load a project, and all three now agree on silence:
+  - `apply_command` (`:open <path>`, `vyper <file>.vyproj` on argv) — `vyper.odin`.
+  - `finder_commit` (`:open` with no argument, the fuzzy finder) — `file_finder.odin`.
+    Its comment already claimed this path and `:open` "must agree", so dropping the
+    toast from one of them would have broken a stated invariant.
+  - `open_file_at` (the Open File button) — already silent on success.
+- [x] The app bar names the open project permanently (`ui.odin`, `project_label`), so
+  the toast was pure duplication covering the timeline the user opened it to look at.
+- [x] FAILED loads still report themselves. The error notice is information; only the
+  success confirmation was dropped.
+
+### Probe
+
+- [x] `ui_probe` drives `finder_commit` with a real project file and asserts no notice
+  is left. Validated by restoring the toast: the check reports
+  `a project load raised a notice "Editing 'Untitled Project'"`.
+
+### Note for whoever runs the probe next
+
+- [ ] The check sits in the finder section of `ui_probe`, which the probe reaches only
+  if every earlier section passed — it `os.exit(1)`s on the first failure. So a new
+  failure earlier in the probe makes this one silently vanish rather than fail, which
+  is how a first version of it passed against code that still toasted.
