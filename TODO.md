@@ -8343,3 +8343,75 @@ Removed from every successful project-load path.
   if every earlier section passed — it `os.exit(1)`s on the first failure. So a new
   failure earlier in the probe makes this one silently vanish rather than fail, which
   is how a first version of it passed against code that still toasted.
+
+## Active 47 — build.odin: three modes that built nothing, and a dead gate
+
+**Status: FIXED.** Found while giving each build mode its own output directory.
+All three of these were live in the sense that something still called them.
+
+### Steps
+
+- [x] **No `case "release"` in the mode switch.** `./build.odin release` fell through
+  the switch, printed `==> Done:` and exited 0 having compiled nothing. CI and
+  `flake.nix` both build `release`, so both were one green run away from shipping a
+  stale or absent binary.
+- [x] **`./build.odin` with no arguments errored.** The default mode resolved to
+  `build`, which `mode_flags` did not know, so `gate.sh build` and the nix debug
+  package both failed with "unknown build mode".
+- [x] **`install` installed a stale path.** It installed whatever `out` had been left
+  as rather than the binary that run produced. It now installs the release binary it
+  just built, and appends `.exe` only when `VYPER_OUT` has not already.
+- [x] Mode set closed to `check | debug | release | run | install`. There is no
+  separate `build` mode: it named the same build as `debug`, and two names for one
+  build is how a script ends up asking for a mode that does nothing. `install`
+  stays because it is the one thing the nix packages cannot do — they build in a
+  sandbox and copy into their own store.
+- [x] Per-mode output: `target/debug/vyper`, `target/release/vyper`, `VYPER_OUT`
+  overrides. `flake.nix` now copies from the mode directory it builds
+  (`target/release/vyper`, `target/debug/vyper`); `gate.sh build` passes
+  `VYPER_OUT=target/vyper` because 66 places in the script name that path.
+- [x] Simplified `main` into `check_mode` / `run_mode` / `build_mode` /
+  `install_mode` over one `odin_args` argv builder. Three near-copies of that
+  vector had already drifted apart.
+- [x] Two latent bugs found while simplifying: `mode_flags` asserted the probe gate
+  as a side effect of a lookup (now asserted in `build_mode`, keyed by mode name —
+  it compared flag *counts*, which asserts the wrong thing the moment two modes
+  share flags), and `build_c_deps` indexed a fixed `[2]string` of objects against a
+  `[?]string` of sources, so a third C file would compile and then index off the
+  end. Object paths are now derived from the source path.
+
+### Probe
+
+- [x] Both invocation forms, every mode: `./build.odin` and
+  `odin run build.odin -file --`. A removed or misspelled mode is rc=2 with the same
+  message from either.
+- [x] `install` verified with a temporary `INSTALL_PREFIX`: the three FHS entries
+  land, and `bin/vyper` is byte-identical to `target/release/vyper` from that run.
+- [x] Release really is release: 2.7 MB against debug's 11.4 MB, and 0 probe strings
+  against 11, so `assert_probes_gated` is doing real work.
+
+### Cleanups
+
+- [x] **`gate.sh bench` was dead.** It ran `odin build swsbench -out:bin_swsbench`,
+  and `swsbench/` was deleted in `91a4d54`. The target and its dispatch line are
+  gone.
+- [x] **`gpu_resample_probe`'s stated oracle no longer exists.** Its header justified
+  the CPU kernel as the reference by pointing at `swsbench`'s `kf_vs_swscale`, so
+  that deleting the package left the probe with no second opinion. The comment now
+  says the probe stands alone; `render.odin`'s matching reference is corrected.
+- [x] `.gitignore` rewritten: dropped `/bin_swsbench` (its target is gone),
+  `/build` and `/render.mp4` (nothing writes either — every `.mp4` a gate produces
+  goes under `target/<gate>/`), and `/out`. The C object rules follow the derived
+  paths, and `/vyper/clay.o` → `/vyper/vendor/clay.o` because that is where
+  `build.odin` now writes it.
+
+### Accept
+
+- [x] `check`, `build`, `smoke`, `probe`, `keyframe_probe`, `geom_key_probe`,
+  `timeline_probe`, `still_switch`, `audio_probe`, `audio_decode_integrity`,
+  `zorder`, `keyed_export`, `gpu_probe`, `opacity`, `subtitle_probe` pass.
+  `valgrind`, `undo_valgrind`, `render_live_valgrind`, `action_log_valgrind` report
+  0 definitely/indirectly lost.
+- [ ] **`flake.nix` is unverified.** Nix is not installed here, so its two `cp` path
+  changes have never been run. A wrong path fails the sandbox build, not a local
+  one. Run `nix build` before trusting this.
