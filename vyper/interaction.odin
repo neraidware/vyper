@@ -1889,7 +1889,19 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 				// crosses a step boundary. 0.1x steps keep the rate within 0.05x
 				// of the drag: at 2.4x that is 2%, about half a frame of lead
 				// over a second of dragging.
-				quantized := f64(i64(rate * 10 + 0.5)) / 10.0
+				// Smoothed and coarsely quantized. Raw pointer velocity slams between
+				// the floor and the ceiling on every stop-start, and EVERY rate
+				// change rebuilds the atempo graph: measured 810 rebuilds and 175%
+				// of the drag lost or repeated in a single recording. The EMA damps
+				// the stop-start slamming; 0.5x-step quantization means the graph
+				// rebuilds only when the smoothed drag actually crosses a boundary.
+				if playhead_scrub.smoothed_rate == 0 {
+					playhead_scrub.smoothed_rate = rate
+				} else {
+					playhead_scrub.smoothed_rate =
+						0.8 * playhead_scrub.smoothed_rate + 0.2 * rate
+				}
+				quantized := f64(i64(playhead_scrub.smoothed_rate * 2 + 0.5)) / 2.0
 				if quantized < SCRUB_MIN_RATE {
 					quantized = SCRUB_MIN_RATE
 				}

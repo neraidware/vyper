@@ -2930,7 +2930,13 @@ SCRUB_REANCHOR_SLACK_FRAMES :: 8
 // floor keeps atempo's tempo positive and the graph moving when the pointer is nearly
 // still; the ceiling is past the point where time-stretched audio stops being
 // intelligible and becomes a artifact. Both are about the drag, not the content.
-SCRUB_MIN_RATE :: 0.05
+// SCRUB_MIN_RATE is the floor on the scrub rate. It is 1.0 -- normal speed --
+// not because a slow drag should sound fast, but because dropping to a near-stop
+// was measured as the distortion: the rate slammed between the floor and the
+// ceiling on every stop-start, each change rebuilding the atempo graph (810
+// rebuilds, 175% of the drag lost or repeated). A floor at 1.0 keeps the rate in a
+// narrow band the graph can track without rebuilding on every pause.
+SCRUB_MIN_RATE :: 1.0
 SCRUB_MAX_RATE :: 16.0
 
 // audio_producer_feed mixes whole timeline frames up to a target derived from

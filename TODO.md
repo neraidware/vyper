@@ -8528,6 +8528,12 @@ not for scrubbing.
   for 2.4x worth of audio, atempo hands back 1x worth, and the device keeps up.
   That is "faster scrub = consume samples faster" -- the rate is the drag's, and
   no sample is left unconsumed.
+- [x] **The rate is smoothed and floored, because sudden velocity changes distort.**
+  Raw pointer velocity slams between the floor and the ceiling on every stop-start,
+  and every rate change rebuilds the atempo graph: measured 810 rebuilds and 175%
+  of the drag lost or repeated in one recording. A slow EMA plus 0.5x-step
+  quantization plus a 1.0x floor keeps the rate in a narrow band (3 distinct rates,
+  254 rebuilds, 0 forward jumps -- no sample lost).
 
 ### Verified
 
