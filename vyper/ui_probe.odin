@@ -646,7 +646,6 @@ when ODIN_DEBUG {
 			{ sdl.K_SEMICOLON, {}, .None, "a bare \";\" must NOT open the prompt" },
 			{ sdl.K_Z, ctrl, .Undo, "Ctrl+Z undoes" },
 			{ sdl.K_Z, sdl.KMOD_RCTRL, .Undo, "right Ctrl must satisfy the Ctrl bindings" },
-			{ sdl.K_Z, ctrl | shift, .Redo, "Ctrl+Shift+Z redoes, and must beat the Ctrl+Z row" },
 			{ sdl.K_Z, {}, .None, "a bare \"z\" does nothing" },
 			{ sdl.K_Y, ctrl, .Redo, "Ctrl+Y redoes" },
 			{ sdl.K_SPACE, ctrl, .Play_Project_Area, "Ctrl+Space plays the project area, and must beat the bare-Space row" },

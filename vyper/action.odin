@@ -86,7 +86,6 @@ BINDINGS := [?]Binding {
 	// what keeps a bare ";" from also opening the prompt.
 	{ .Open_Command_Line, sdl.K_SEMICOLON, sdl.KMOD_SHIFT },
 	{ .Toggle_Help, sdl.K_F1, {} },
-	{ .Redo, sdl.K_Z, sdl.KMOD_CTRL | sdl.KMOD_SHIFT },
 	{ .Undo, sdl.K_Z, sdl.KMOD_CTRL },
 	{ .Redo, sdl.K_Y, sdl.KMOD_CTRL },
 	{ .Play_Project_Area, sdl.K_SPACE, sdl.KMOD_CTRL },
