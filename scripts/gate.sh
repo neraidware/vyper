@@ -16,9 +16,9 @@ SELF=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_S
 # leaves the old path exported, so the tree behind it is simply gone.
 #
 # build.odin implements the same rule for itself; this is the copy gate.sh needs
-# for the targets that invoke the compiler directly (target_bench). It was its
-# own file until now, but one function with one caller is a file that only lies
-# about being shared infrastructure.
+# for the targets that invoke the compiler directly (``dev``, and the probes'
+# own builds). It was its own file until now, but one function with one caller is
+# a file that only lies about being shared infrastructure.
 resolve_odin_root() {
 	if [ -d "${ODIN_ROOT-}/base" ]; then
 		return 0
@@ -184,7 +184,10 @@ target_shaders() {
 # from the cause. build.odin also compiles the vendored C and the SPIR-V, so
 # delegating is the one place that can be right.
 target_build() {
-	./build.odin
+	# VYPER_OUT, because build.odin writes each mode to its own directory
+	# (target/debug, target/release) while every gate below runs ./target/vyper
+	# and checks ITS freshness against the sources.
+	VYPER_OUT=target/vyper ./build.odin
 }
 
 # Every target that runs ./target/vyper must call this first.
@@ -264,25 +267,6 @@ require_fresh_valgrind_binary() {
 		echo "$target_name: $VALGRIND_BIN is older than $stale -- rebuilding" >&2
 		build_valgrind_binary >/dev/null || return 1
 	fi
-}
-
-# swscale/resample microbenchmarks. Separate package (swsbench) so it can link
-# the vendored FFmpeg without dragging in the whole app; it exists to keep
-# claims about scaler cost measured rather than remembered.
-target_bench() {
-	# The script runs without `set -e`, so a failed build would otherwise fall
-	# through to executing the previous binary and reporting stale numbers as
-	# current — which is worse than no benchmark, because it looks like data.
-	if ! dev odin build swsbench -out:bin_swsbench \
-	# -microarch:native is the one flag the app build dropped and this
-	# keeps: a benchmark measuring anything but the code this machine will
-	# actually run is not measuring what it claims. The trade is that the
-	# numbers compare within a machine, not across machines.
-		-microarch:native -o:aggressive -no-bounds-check; then
-		echo "bench: build failed" >&2
-		return 1
-	fi
-	./bin_swsbench
 }
 
 # Headless GPU export probe. Separate from target_probe because it exits with
@@ -2195,7 +2179,6 @@ main() {
 	check) target_check ;;
 	shaders) target_shaders ;;
 	build) target_build ;;
-	bench) target_bench ;;
 	probe) target_probe ;;
 	transform_probe) target_transform_probe ;;
 	keyframe_probe) target_keyframe_probe ;;
@@ -2259,7 +2242,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|bench|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

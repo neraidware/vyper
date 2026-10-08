@@ -8,9 +8,26 @@ package main
 // argv[0] set to that binary's name, so this cannot find its own directory and
 // every path below (./vyper, ./packaging) is relative to where you invoked it.
 //
-//	./build.odin [check|debug|release|install]
-//	odin run build.odin -file [-- check|debug|release|install]
+//	./build.odin [check|debug|release|run|install]
+//	odin run build.odin -file -- [check|debug|release|run|install]
 //	VYPER_MODE=release ./build.odin
+//
+// Both invocation forms are supported and do the same thing: `./build.odin` is
+// the shebang above, and `odin run build.odin -file --` is what a platform
+// without it uses. PowerShell cannot execute an sh shebang at all -- no process
+// starts, so an exit code is never set -- which is why the Windows job uses the
+// second form and cannot use the first.
+//
+//	check    typecheck only; nothing is compiled, no build flags apply
+//	debug    a debug binary (the default)
+//	release  an optimised binary, with every probe proven gated out
+//	run      compile and run without writing a binary
+//	install  a release binary, plus the FHS copy into $INSTALL_PREFIX
+//
+// There is no separate "build" mode: it named the same thing as debug, and two
+// names for one build is how a script ends up asking for a mode that does
+// nothing. `install` stays because it is the one thing the nix packages cannot
+// do -- they build inside a sandbox and copy the result into their own store.
 //
 // The shebang is `sh -c 'exec odin run "$0" -file -- "$@"'` rather than a direct
 // `odin run -file`, because a direct shebang cannot forward arguments: `env -S`
@@ -19,9 +36,14 @@ package main
 // what puts the `--` in the right place. VYPER_MODE still works for the mode.
 //
 // debug (default) is -o:none with frame pointers, symbols and bounds checks.
-// release and install are -o:aggressive. None passes -no-bounds-check: it
+// release and install are -o:aggressive. Neither passes -no-bounds-check: it
 // cancels the debug build's bounds checking, so an out-of-range index prints
 // garbage instead of failing.
+//
+// Each mode writes its own binary: debug to target/debug, release to
+// target/release. VYPER_OUT overrides the path, which is how `gate.sh` keeps one
+// stable location (it names the binary in 66 places and checks its freshness)
+// while nix takes the per-mode default.
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -40,7 +62,7 @@ RELEASE_FLAGS := []string{"-o:aggressive"}
 // Editing a .frag and building without recompiling keeps the OLD SPIR-V and the
 // run reports the previous shader's results as the new one. That happened here,
 // so an unlisted shader fails the build.
-SHADERS := [8]string{
+SHADERS := [?]string{
 	"rounded_rect.vert",
 	"rounded_rect.frag",
 	"quad.vert",
@@ -51,132 +73,88 @@ SHADERS := [8]string{
 	"nv12_chroma.frag",
 }
 
-// The vendored C files. Where the object lands is per-platform (see clay_obj),
-// because the archive directory is named after the OS.
-C_SOURCES := [2]string{
+// The vendored C files. Where each one's object lands is DERIVED from its source
+// (see object_for), so adding a file here cannot compile and then fail at run
+// time against a parallel list nobody updated.
+C_SOURCES := [?]string{
 	PKG + "/vendor/nanosvg/nanosvg.c",
 	PKG + "/vendor/clay.c",
 }
 
 main :: proc() {
 	mode := resolve_mode()
-	// An install builds into <prefix>/build and copies from there, so the build
-	// tree and the installed tree stay separate and a re-run cannot half-update
-	// an installed copy.
-	prefix := install_prefix() if mode == "install" else ""
-	opt := mode_flags(mode)
-	odin := join_or_empty({resolve_odin_root(), "odin"})
-	out := output_path()
-	if prefix != "" {
-		out = join_or_empty({prefix, "build", strings.concatenate({"vyper", exe_ext()}, context.temp_allocator)})
-	} else if !strings.has_suffix(out, exe_ext()) {
-		// The default output is a bare name, and on Windows that needs the .exe.
-		out = strings.concatenate({out, exe_ext()}, context.temp_allocator)
+	switch mode {
+	case "check":
+		check_mode()
+	case "run":
+		run_mode()
+	case "debug":
+		build_mode("debug")
+	case "release":
+		build_mode("release")
+	case "install":
+		install_mode()
+	case:
+		// No braces: Odin's fmt reads `{` as a placeholder.
+		fmt.eprintf(
+			"error: unknown build mode '%s' (expected: check | debug | release | run | install)\n",
+			mode,
+		)
+		os.exit(2)
 	}
+}
 
-	if mode != "check" {
-		build_shaders()
-		build_c_deps()
-	}
-
-	// -debug here is load-bearing: odin check does not compile a
-	// `when ODIN_DEBUG` branch without it, so this would validate the release
-	// view and report clean while the default build went unverified.
+check_mode :: proc() {
 	fmt.println("==> Checking Odin")
+	// -debug is load-bearing: `odin check` without it does not compile a
+	// `when ODIN_DEBUG` branch, so this would validate the release view and
+	// report clean while the default build went unverified.
 	run_or_die(
-		odin,
+		odin_tool(),
 		{"check", PKG, "-debug", "-strict-style", "-vet-using-param", "-vet-using-stmt"},
 		"check",
 	)
-	if mode == "check" {
-		// The flags above are the only copy of them now. gate.sh used to spell
-		// this command out again, which meant the gate validated one flag set
-		// while the build used another, and nothing noticed when they diverged.
-		return
-	}
+}
 
-	fmt.println("==> Building Vyper")
+run_mode :: proc() {
+	run_or_die(odin_tool(), odin_args("run", "", DEBUG_FLAGS[:]), "run")
+}
+
+// build_mode compiles to output_path, after the shader and C prerequisites. One
+// place assembles the argument vector, so debug and release cannot drift apart in
+// a flag, and one place reports where the binary landed.
+build_mode :: proc(mode: string) {
+	opt := mode_flags(mode)
+	// A release binary must carry no probe, and the guarantee is a scan rather
+	// than a convention (see assert_probes_gated). Named by mode, not inferred
+	// from a flag count: two modes sharing flags is exactly when that inference
+	// starts asserting the wrong thing.
+	if mode == "release" {
+		assert_probes_gated()
+	}
+	build_shaders()
+	build_c_deps()
+	out := output_path(mode)
 	mkdir_of(out)
-	build_args: [dynamic]string
-	append(&build_args, "build", PKG)
-	append(&build_args, strings.concatenate({"-out:", out}, context.temp_allocator))
-	// No `append(xs, ys...)` in Odin, and each group is conditionally present.
-	for f in opt {
-		append(&build_args, f)
-	}
-	for f in odin_extra_flags() {
-		append(&build_args, f)
-	}
-	append(
-		&build_args,
-		strings.concatenate({"-extra-linker-flags:", linker_flags()}, context.temp_allocator),
-	)
-	run_or_die(odin, build_args[:], "build")
-
-	if prefix != "" {
-		install_files(prefix, out)
-	}
+	run_or_die(odin_tool(), odin_args("build", out, opt), "build")
 	fmt.printf("==> Done: %s\n", out)
 }
 
-import "core:fmt"
-import "core:os"
-import "core:path/filepath"
-import "core:slice"
-import "core:strings"
-
-// Backing for the strings that cross a proc boundary as views.
-MODE_BUF: [64]u8
-ROOT_BUF: [1024]u8
-OUT_BUF:  [1024]u8
-INST_BUF: [1024]u8
-
-// ---------------------------------------------------------------------------
-// Mode and paths
-// ---------------------------------------------------------------------------
-
-resolve_mode :: proc() -> string {
-	if len(os.args) > 1 {
-		return os.args[1]
+// install_mode is a release build plus the FHS copy, which is what the nix
+// packages cannot do for themselves: they build in a sandbox and copy the result
+// into their own store. It installs the binary THIS run wrote, named the way
+// install(1) wants it, so an install cannot ship a stale path -- which is what the
+// earlier version did, installing whatever `out` had been left as.
+install_mode :: proc() {
+	build_mode("release")
+	prefix := install_prefix()
+	binary := output_path("release")
+	if !strings.has_suffix(binary, exe_ext()) {
+		// VYPER_OUT may already carry it (Windows CI sets "vyper.exe"), and
+		// appending unconditionally produced vyper.exe.exe.
+		binary = strings.concatenate({binary, exe_ext()}, context.temp_allocator)
 	}
-	mode := os.get_env("VYPER_MODE", context.allocator)
-	defer delete(mode)
-	if mode == "" {
-		return "debug"
-	}
-	// Copied out: the get_env string is deleted here, so returning it hands the
-	// caller freed memory.
-	n := min(len(mode), len(MODE_BUF) - 1)
-	copy(MODE_BUF[:n], mode[:n])
-	return transmute(string)MODE_BUF[:n]
-}
-
-// A view into OUT_BUF, so the caller owns nothing and the CONSTANT default
-// never reaches `delete`.
-output_path :: proc() -> string {
-	out := os.get_env("VYPER_OUT", context.allocator)
-	defer delete(out)
-	if out == "" {
-		return "target/vyper"
-	}
-	n := copy(OUT_BUF[:], out)
-	return transmute(string)OUT_BUF[:n]
-}
-
-mode_flags :: proc(mode: string) -> []string {
-	switch mode {
-	case "debug":
-		return DEBUG_FLAGS[:]
-	case "release", "install":
-		assert_probes_gated()
-		return RELEASE_FLAGS[:]
-	case "check":
-		// Typecheck only; nothing is compiled, so no build flags apply.
-		return {}
-	case:
-		fmt.eprintf("error: unknown build mode '%s' (expected: check | debug | release)\n", mode)
-		os.exit(2)
-	}
+	install_files(prefix, binary)
 }
 
 // install_prefix is where `install` puts things: $INSTALL_PREFIX, or ~/.local.
@@ -185,7 +163,8 @@ mode_flags :: proc(mode: string) -> []string {
 // an install people do not run, and it matches the per-user convention the proxy
 // cache already uses here.
 //
-// A view into a buffer, like the other two: the env strings are deleted here.
+// A view into a buffer, like the other path helpers: the env strings are
+// deleted here.
 install_prefix :: proc() -> string {
 	prefix := os.get_env("INSTALL_PREFIX", context.allocator)
 	defer delete(prefix)
@@ -220,6 +199,111 @@ install_files :: proc(prefix, binary: string) {
 		mode := strings.concatenate({"-Dm", f.mode}, context.temp_allocator)
 		run_or_die("install", {mode, f.src, dst}, "install")
 		fmt.printf("    %s\n", dst)
+	}
+}
+
+// odin_args is the one argv builder. `out` empty means no -out:, which is what
+// `run` wants; flags the platform needs come after the mode's own.
+odin_args :: proc(kind, out: string, opt: []string) -> []string {
+	args := make([dynamic]string, 0, 12, context.temp_allocator)
+	append(&args, kind, PKG)
+	if out != "" {
+		append(&args, strings.concatenate({"-out:", out}, context.temp_allocator))
+	}
+	// No `append(xs, ys...)` in Odin, hence the loops rather than two appends.
+	for f in opt {
+		append(&args, f)
+	}
+	for f in odin_extra_flags() {
+		append(&args, f)
+	}
+	append(
+		&args,
+		strings.concatenate({"-extra-linker-flags:", linker_flags()}, context.temp_allocator),
+	)
+	return args[:]
+}
+
+odin_tool :: proc() -> string {
+	return join_or_empty({resolve_odin_root(), "odin"})
+}
+
+import "core:fmt"
+import "core:os"
+import "core:path/filepath"
+import "core:slice"
+import "core:strings"
+
+// Backing for the strings that cross a proc boundary as views.
+MODE_BUF: [64]u8
+ROOT_BUF: [1024]u8
+OUT_BUF:  [1024]u8
+INST_BUF: [1024]u8
+
+// ---------------------------------------------------------------------------
+// Mode and paths
+// ---------------------------------------------------------------------------
+
+resolve_mode :: proc() -> string {
+	if len(os.args) > 1 {
+		return os.args[1]
+	}
+	mode := os.get_env("VYPER_MODE", context.allocator)
+	defer delete(mode)
+	if mode == "" {
+		// debug, because `./build.odin` with no arguments is how `gate.sh build`
+		// and the nix debug package build, and both want the debug binary.
+		return "debug"
+	}
+	// Copied out: the get_env string is deleted here, so returning it hands the
+	// caller freed memory.
+	n := min(len(mode), len(MODE_BUF) - 1)
+	copy(MODE_BUF[:n], mode[:n])
+	return transmute(string)MODE_BUF[:n]
+}
+
+// output_path is where `mode`'s binary lands. A view into OUT_BUF, so the caller
+// owns nothing and the constructed default never reaches `delete`.
+output_path :: proc(mode: string) -> string {
+	if out := os.get_env("VYPER_OUT", context.allocator); out != "" {
+		defer delete(out)
+		n := copy(OUT_BUF[:], out)
+		return transmute(string)OUT_BUF[:n]
+	}
+	def := strings.concatenate(
+		{"target/", mode_output_dir(mode), "/vyper", exe_ext()},
+		context.temp_allocator,
+	)
+	n := copy(OUT_BUF[:], def)
+	return transmute(string)OUT_BUF[:n]
+}
+
+// mode_output_dir is the directory under target/ that a mode's binary goes in.
+// `install` builds a release, so it shares that directory; `run` writes no binary
+// at all, so it never asks.
+mode_output_dir :: proc(mode: string) -> string {
+	switch mode {
+	case "release", "install":
+		return "release"
+	case:
+		return "debug"
+	}
+}
+
+// mode_flags is a lookup, and deliberately has no side effects: the probe gate
+// is asserted from build_mode, where the mode actually means something, rather
+// than from the proc that answers "which flags does this mode use".
+mode_flags :: proc(mode: string) -> []string {
+	switch mode {
+	case "debug", "run":
+		return DEBUG_FLAGS[:]
+	case "release", "install":
+		return RELEASE_FLAGS[:]
+	case "check":
+		// Typecheck only; nothing is compiled, so no build flags apply.
+		return {}
+	case:
+		return {}
 	}
 }
 
@@ -425,27 +509,28 @@ build_shaders :: proc() {
 	}
 }
 
-// clay_obj is where the clay object goes. The archive sits beside it, in a
-// directory named after the OS, which is the naming the prebuilt archives used.
-clay_obj :: proc() -> string {
+// obj_ext is the platform's C object extension.
+obj_ext :: proc() -> string {
 	when ODIN_OS == .Windows {
-		return join_or_empty({PKG, "clay-odin", "windows", "clay.obj"})
+		return "obj"
 	}
-	return join_or_empty({PKG, "clay-odin", "linux", "clay.o"})
+	return "o"
 }
 
+// object_for is where one C source's object goes: the source path with its .c
+// replaced by the object extension, so `vyper/vendor/clay.c` lands on
+// `vyper/vendor/clay.o` -- the path .gitignore lists.
+object_for :: proc(src: string) -> string {
+	return strings.concatenate({strings.trim_suffix(src, ".c"), ".", obj_ext()}, context.temp_allocator)
+}
+
+// clay_lib is where the clay archive goes, in a directory named after the OS,
+// which is the naming the prebuilt archives used.
 clay_lib :: proc() -> string {
 	when ODIN_OS == .Windows {
 		return join_or_empty({PKG, "clay-odin", "windows", "clay.lib"})
 	}
 	return join_or_empty({PKG, "clay-odin", "linux", "clay.a"})
-}
-
-nanosvg_obj :: proc() -> string {
-	when ODIN_OS == .Windows {
-		return join_or_empty({PKG, "vendor", "nanosvg", "nanosvg.obj"})
-	}
-	return join_or_empty({PKG, "vendor", "nanosvg", "nanosvg.o"})
 }
 
 // compile_c builds one vendored C file.
@@ -473,22 +558,32 @@ build_c_deps :: proc() {
 		}
 	}
 
-	// Both files, every build: reusing a leftover .o made the output depend on
+	// Every source, every build: reusing a leftover .o made the output depend on
 	// what was in the tree.
-	objs := [2]string{nanosvg_obj(), clay_obj()}
-	for src, i in C_SOURCES {
-		obj := objs[i]
+	clay_obj := ""
+	for src in C_SOURCES {
+		obj := object_for(src)
 		mkdir_of(obj)
 		compile_c(src, obj)
+		if strings.has_suffix(src, "clay.c") {
+			clay_obj = obj
+		}
+	}
+	if clay_obj == "" {
+		// The archive below is built from exactly this object, so without it there
+		// is nothing to archive and the failure would surface as a link error a
+		// long way from the cause.
+		fmt.eprintf("error: C_SOURCES has no clay.c, so %s cannot be built\n", clay_lib())
+		os.exit(1)
 	}
 
 	lib := clay_lib()
 	when ODIN_OS == .Windows {
 		out := strings.concatenate({"/OUT:", lib}, context.temp_allocator)
-		run_or_die("lib", {"/nologo", out, clay_obj()}, "C dependencies")
+		run_or_die("lib", {"/nologo", out, clay_obj}, "C dependencies")
 		return
 	}
-	run_or_die("ar", {"rcs", lib, clay_obj()}, "C dependencies")
+	run_or_die("ar", {"rcs", lib, clay_obj}, "C dependencies")
 }
 
 // ---------------------------------------------------------------------------

@@ -41,7 +41,7 @@
             # SDL3/vulkan/glib and shells out to ffmpeg, so it cannot run from a
             # bare result/ dir.
             mkdir -p $out/libexec/vyper
-            cp target/vyper $out/libexec/vyper/vyper
+            cp target/release/vyper $out/libexec/vyper/vyper
             wrapProgram $out/libexec/vyper/vyper \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader pkgs.glib pkgs.ffmpeg ]}" \
               --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
@@ -75,7 +75,7 @@
             # SDL3/vulkan/glib and shells out to ffmpeg, so it cannot run from a
             # bare result/ dir.
             mkdir -p $out/libexec/vyper
-            cp target/vyper $out/libexec/vyper/vyper
+            cp target/debug/vyper $out/libexec/vyper/vyper
             wrapProgram $out/libexec/vyper/vyper \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath [ pkgs.sdl3 pkgs.sdl3-ttf pkgs.vulkan-loader pkgs.glib pkgs.ffmpeg ]}" \
               --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.ffmpeg ]}"
