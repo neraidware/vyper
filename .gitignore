@@ -16,8 +16,11 @@
 /vyper/vendor/nanosvg/*.obj
 
 # Clay C TU + linked archive, produced by flake.nix / CI / local build from
-# the vendored single-header vendor/clay.h (never ship prebuilt clay binaries)
+# the vendored single-header vendor/clay.h (never ship prebuilt clay binaries).
+# Two object paths: Linux derives it beside the source, Windows beside the
+# archive (MSVC `lib` resolves objects relative to the archive). See object_for.
 /vyper/vendor/clay.o
+/vyper/clay.obj
 /vyper/clay-odin/*/clay.a
 /vyper/clay-odin/*/clay.lib
 /vyper/clay-odin/*/clay.o

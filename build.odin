@@ -517,10 +517,24 @@ obj_ext :: proc() -> string {
 	return "o"
 }
 
-// object_for is where one C source's object goes: the source path with its .c
-// replaced by the object extension, so `vyper/vendor/clay.c` lands on
-// `vyper/vendor/clay.o` -- the path .gitignore lists.
+// object_for is where one C source's object goes.
+//
+// Linux derives it from the source: `vyper/vendor/clay.c` -> `vyper/vendor/clay.o`,
+// beside the source, which is the path .gitignore lists.
+//
+// Windows cannot: MSVC's `lib` builds an archive from objects RELATIVE TO THE
+// ARCHIVE, so clay's object has to sit beside clay-odin/windows/clay.lib at
+// `vyper/clay.obj`, not beside its source. Naming the one divergent path here,
+// rather than deriving a wrong one, is why this returns different answers per
+// platform. Caught by CI: the derived path made `lib` exit 1104.
+// ar has no such rule (it takes the archive and the object as arguments), which
+// is why the same code is fine on Linux and was never caught locally.
 object_for :: proc(src: string) -> string {
+	when ODIN_OS == .Windows {
+		if strings.has_suffix(src, "clay.c") {
+			return join_or_empty({PKG, "clay", ".", obj_ext()})
+		}
+	}
 	return strings.concatenate({strings.trim_suffix(src, ".c"), ".", obj_ext()}, context.temp_allocator)
 }
 
