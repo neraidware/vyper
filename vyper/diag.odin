@@ -134,3 +134,14 @@ when ODIN_DEBUG {
 		}
 	}
 }
+
+// flush_stdout drains stdout. Every probe prints its result and then calls
+// os.exit, which does not flush: a redirected stdout on Windows is block
+// buffered, so the result line never reaches the file and a job that reads it
+// sees an EMPTY log -- indistinguishable from a probe that printed nothing at
+// all. Probes must call this immediately before os.exit.
+flush_stdout :: proc() {
+	if os.stdout != nil {
+		os.flush(os.stdout)
+	}
+}

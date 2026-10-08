@@ -6103,6 +6103,11 @@ preview_framecheck_run :: proc(v: string) {
 		max_ms,
 		bad > 40 ? " (rest suppressed)" : "",
 	)
+	// Flush before exiting. os.exit does not drain a buffered stdout, and the
+	// Windows smoke job reads this exact line out of a redirected file: without
+	// the flush the file is EMPTY, the line is lost, and the check that reads it
+	// cannot tell "probe ran and passed" from "probe printed nothing at all".
+	flush_stdout()
 	os.exit(bad == 0 ? 0 : 1)
 }
 

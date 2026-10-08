@@ -177,6 +177,7 @@ when ODIN_DEBUG {
 		}
 		os.remove(string(proxy))
 		fmt.println("[proxy-probe] OK: proxy transcoded, picked, decoded, matches source content")
+		flush_stdout() // os.exit does not flush; see flush_stdout.
 		os.exit(0)
 	}
 
