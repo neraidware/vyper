@@ -627,18 +627,14 @@ apply_command :: proc() {
 			return
 		}
 		if project_path_is_project(arg) {
-			// Nothing on success. The app bar already carries the project name
-			// permanently, so a toast repeating it only covers the timeline the
-			// user opened the project to look at. A FAILED load still reports
-			// itself -- that is information, not confirmation.
 			if err := project_file_open(arg); len(err) > 0 {
 				defer delete(err)
-				show_ui_notice(err, 4000)
+				show_ui_notice(err, 1000)
 			}
 			return
 		}
 		if !os.exists(arg) {
-			show_ui_noticef(4000, "No such file '%s'", arg)
+			show_ui_noticef(1000, "No such file '%s'", arg)
 			return
 		}
 		// open_file_at only reads `cpath` (the bin clones it), so the scratch
