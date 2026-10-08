@@ -8498,6 +8498,14 @@ crossed them.
   throwing away 19200 samples. With varispeed the producer already tracks a forward
   drag, so the forward re-anchor is gone; the backward case only rewinds audio that was
   already fed, so it costs no samples. Measured after: **0 gaps, 0% lost.**
+- [x] **The rate is quantized to 0.1x steps.** Raw pointer velocity jitters frame
+  to frame, and EVERY distinct rate rebuilds the atempo graph -- measured 485
+  rebuilds in one drag, each one destroying and recreating the filter graph and
+  blocking the producer. That is the chopping the user heard at 60 fps
+  ("completely chopped, unlistenable"). Quantizing to discrete steps means the
+  graph rebuilds only when the drag actually crosses a boundary. 0.1x steps keep
+  the rate within 0.05x of the drag: at 2.4x that is 2%, about half a frame of
+  lead over a second of dragging.
 
 ### Verified
 

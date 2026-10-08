@@ -1873,13 +1873,19 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 				if rate > SCRUB_MAX_RATE {
 					rate = SCRUB_MAX_RATE
 				}
-				// Published raw (clamped above), NOT quantized. Quantizing to 0.5x
-				// steps was measured destroying slow drags: a 3 fps drag is 0.12x, and
-				// 0.5-step quantization rounded that to the 0.05x floor, so the audio
-				// played slower than the pointer, the producer fell behind, and the
-				// re-anchor skipped the frames in between -- 21% of the drag never
-				// played. The rate has to BE the drag's rate, not a step near it.
-				sync.atomic_store(&audio_prod.scrub_rate, rate)
+				// Quantized to 0.1x steps. Raw pointer velocity jitters frame to
+				// frame, and EVERY distinct rate rebuilds the atempo graph --
+				// measured 485 rebuilds in one drag, each one blocking the
+				// producer, which is the chopping. Quantizing to a few discrete
+				// rates means the graph rebuilds only when the drag actually
+				// crosses a step boundary. 0.1x steps keep the rate within 0.05x
+				// of the drag: at 2.4x that is 2%, about half a frame of lead
+				// over a second of dragging.
+				quantized := f64(i64(rate * 10 + 0.5)) / 10.0
+				if quantized < SCRUB_MIN_RATE {
+					quantized = SCRUB_MIN_RATE
+				}
+				sync.atomic_store(&audio_prod.scrub_rate, quantized)
 			}
 		}
 		playhead_scrub.last_frame = frame
