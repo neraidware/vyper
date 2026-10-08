@@ -1,18 +1,9 @@
-# swsbench binary from `./scripts/gate.sh bench`
-/bin_swsbench
+# Build output. build.odin writes target/<mode>/; gate.sh and nix write beside
+# it. `target/` rather than the mode dirs, so a new mode needs no entry.
+/target
+/target/
 
-# The binary build.sh used to leave in the root. build.odin writes target/;
-/build
-
-# Render / probe output artifacts
-/render.mp4
-
-# Valgrind core dumps. A crashed run leaves one in the cwd and it is ~650MB;
-# `git add -A` will otherwise commit it alongside the change that caused the
-# crash. The log under target/valgrind/ is the artifact worth keeping.
 /vgcore.*
-
-# nix build result symlink
 /result
 
 # Local git worktrees. Each is a FULL checkout with its own build output, so
@@ -33,5 +24,4 @@
 
 # gate.sh keyed_export scratch: synthetic source and A/B encodes, regenerated
 # per run and never inputs.
-target/
 __pycache__/

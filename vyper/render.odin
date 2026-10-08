@@ -4305,7 +4305,7 @@ render_eval_keyed_geom :: proc(
 		// source of the "50x slower when scaling" symptom. The in-tree kernel
 		// is 1.4 ms on that case (10.8x) and byte-comparable to swscale:
 		// exact at 1:1, mean 0.11/255 at 0.5x, mean 1.16/255 at 2x
-		// (swsbench's kf_vs_swscale asserts those bounds). It also allocates
+		// (the swscale comparison in gpu_resample_probe asserts those bounds). It also allocates
 		// nothing per frame, so v.kres_scratch is the only buffer needed.
 		//
 		// The context was never the cost -- sws_getContext/free measured at

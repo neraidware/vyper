@@ -7,10 +7,15 @@ package vyper
 // scaled quad so the hardware sampler filters it, read the render target back,
 // and compare against the committed CPU kernel (yuv.rgba_resample).
 //
-// The CPU kernel is the reference on purpose. It is already gated against
-// swscale per geometry in swsbench's kf_vs_swscale, so a mean_abs here that
-// matches swsbench's numbers means the GPU path agrees with the thing we
-// already trust, rather than agreeing with a fresh unvalidated expectation.
+// The CPU kernel is the reference on purpose: a GPU mean_abs close to the CPU
+// kernel's own means the hardware path agrees with the path the export already
+// runs, rather than agreeing with a fresh unvalidated expectation.
+//
+// That oracle used to be swsbench's kf_vs_swscale, a separate microbenchmark
+// that held the CPU kernel against libswscale per geometry. It was deleted as an
+// unused system, so the claim above no longer has a second opinion behind it --
+// this probe now stands alone. If that second opinion matters again, it is one
+// swscale comparison away.
 //
 // Every failure mode returns ok=false with a printed reason and the caller
 // falls back to the CPU path -- that is the same contract the export will use,
