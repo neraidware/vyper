@@ -597,6 +597,11 @@ build_c_deps :: proc() {
 	}
 
 	lib := clay_lib()
+	// The archive's own directory has to exist first. clay's object no longer
+	// lands inside it (see object_for), so nothing else creates it, and `lib`
+	// does not create its /OUT: directory either -- it just fails, which cost
+	// three CI round trips before the message was read closely.
+	mkdir_of(lib)
 	when ODIN_OS == .Windows {
 		out := strings.concatenate({"/OUT:", lib}, context.temp_allocator)
 		run_or_die("lib", {"/nologo", out, clay_obj}, "C dependencies")
