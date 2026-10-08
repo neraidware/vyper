@@ -374,9 +374,11 @@ kf_apply_interp :: proc(l, r: f32, t: f32, interp: Kf_Interp, m0, m1: f32, span:
 // on its own frame.
 //
 // The two ends differ, and the difference is the point:
-//   - BEFORE the first key the property is INACTIVE and the caller keeps its
-//     own (base/resting) value, so direct edits and drags apply there. The
-//     animation has not started, so there is nothing to hold.
+//   - BEFORE the first key the property is INACTIVE -- no key is being read, so
+//     direct edits and drags still go to the caller's base/resting value -- but
+//     the value itself INTERPOLATES from that base at offset 0 to the first key
+//     on the first key's frame. The run-up is a segment like any other; only the
+//     key routing stays on base.
 //   - PAST the last key the track HOLDS its final value. A clip animated to a
 //     new position stays there for the rest of its span rather than snapping
 //     back to the pose it had before any key existed.
@@ -389,7 +391,37 @@ kf_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, boo
 		active -= 1
 	}
 	if active < 0 {
-		return base, false
+		// The run-up from offset 0 to the first key is a real segment: the caller's
+		// base on the clip's first frame, the first key's value on the first key's
+		// frame, shaped by that first key's mode (we ease INTO it, as everywhere
+		// else). A track whose first key is late used to sit at base for the whole
+		// run-up, so the value jumped on the first key instead of arriving there.
+		//
+		// Still INACTIVE, and deliberately: `active` means the sampler is reading a
+		// KEY here, and there is no key before the first one. That is what keeps a
+		// pre-first-key write going to the resting field (clip_geom_set case 2)
+		// instead of sprouting keys -- and the edit is still visible, because base is
+		// this segment's starting value, so changing it moves the curve.
+		//
+		// Offset 0 is the segment's start, so an offset at or left of the clip edge
+		// has nothing to interpolate over and is the base itself.
+		first_key := keys[0]
+		if frame_off <= 0 {
+			return base, false
+		}
+		lead_span := f32(first_key.frame_off)
+		lead_lv := base
+		lead_rv := first_key.value.(f32)
+		lead_t := f32(frame_off) / lead_span
+		// Tangents with no outside neighbour fall back to the chord, the same edge
+		// condition the interior segments use. The right tangent can use the key
+		// after the first one, measured from this segment's own start.
+		lead_m0 := (lead_rv - lead_lv) / lead_span
+		lead_m1 := lead_m0
+		if len(keys) > 1 {
+			lead_m1 = (keys[1].value.(f32) - lead_lv) / f32(keys[1].frame_off)
+		}
+		return kf_apply_interp(lead_lv, lead_rv, lead_t, first_key.interp, lead_m0, lead_m1, lead_span), false
 	}
 	active_key := keys[active]
 	if frame_off == active_key.frame_off {
@@ -473,14 +505,10 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 			have_prev = true
 		}
 	}
-	if !have_prev {
-		return base, false
-	}
-	if v, _ := kf_lane_value(prev, idx); prev.frame_off == frame_off {
-		return v, true // the knot applies ITS value on its own frame
-	}
 	// Forward scan: the first covering knot after the frame (next) and the one
-	// after it (next2) for the spline's right tangent.
+	// after it (next2) for the spline's right tangent. It runs even when there is
+	// no `prev`: with nothing covering the frame at or before it, `next` IS the
+	// lane's first covering knot, which is the far end of the run-up.
 	next: Keyframe
 	next2: Keyframe
 	have_next := false
@@ -499,6 +527,30 @@ kf_sample_packed_lane :: proc(track: ^Kf_Track, frame_off: i32, idx: int, base: 
 			next = k
 			have_next = true
 		}
+	}
+	if !have_prev {
+		// The lane's run-up from offset 0 to its FIRST COVERING knot, the packed twin
+		// of kf_sample_keys' leading segment. The knot is not necessarily keys[0]: a
+		// knot that skips this lane is not a breakpoint for it, so the run-up ends at
+		// the first knot that actually covers the lane. Inactive, as there, for the
+		// same reason: no key is being read yet, and base is where the run-up starts.
+		if frame_off <= 0 || !have_next {
+			return base, false
+		}
+		lead_lv := base
+		lead_rv, _ := kf_lane_value(next, idx)
+		lead_span := f32(next.frame_off)
+		lead_t := f32(frame_off) / lead_span
+		lead_m0 := (lead_rv - lead_lv) / lead_span
+		lead_m1 := lead_m0
+		if have_next2 {
+			lead_n2v, _ := kf_lane_value(next2, idx)
+			lead_m1 = (lead_n2v - lead_lv) / f32(next2.frame_off)
+		}
+		return kf_apply_interp(lead_lv, lead_rv, lead_t, next.interp, lead_m0, lead_m1, lead_span), false
+	}
+	if v, _ := kf_lane_value(prev, idx); prev.frame_off == frame_off {
+		return v, true // the knot applies ITS value on its own frame
 	}
 	if !have_next {
 		// Past the lane's last covering knot the lane HOLDS, for the same reason

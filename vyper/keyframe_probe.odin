@@ -153,7 +153,7 @@ when ODIN_DEBUG {
 		v, ok := kf_sample(gain, 0, 7.0)
 		kf_probe_check(!ok && v == 7.0, "before first key: inactive, base kept (v=%v ok=%v)", v, ok)
 		v, ok = kf_sample(gain, 9, 7.0)
-		kf_probe_check(!ok && v == 7.0, "still before first key at off 9: base kept")
+		kf_probe_check(!ok && kf_approx(v, 5.2), "before the first key at off 9 the run-up is 90% of the way (got %v)", v)
 		// first key at 10 target 5.
 		v, ok = kf_sample(gain, 10, 7.0)
 		kf_probe_check(ok && v == 5.0, "a key applies ITS value on its own frame (got %v)", v)
@@ -176,6 +176,74 @@ when ODIN_DEBUG {
 		// stays there instead of snapping back to the resting 7.0.
 		v, ok = kf_sample(gain, 31, 7.0)
 		kf_probe_check(ok && v == 8.0, "past the last key: holds the final value (v=%v ok=%v)", v, ok)
+
+		// --- leading segment: offset 0 to the first key -------------------------
+		// A track whose first key is late used to sit at the caller's base for the
+		// whole run-up, so a clip animated from its second second snapped to its
+		// resting pose the instant it started and again jumped at the first key. The
+		// run-up is a real segment now: base at offset 0, the first key's value on
+		// the first key's frame, shaped by the ARRIVING (first) key's mode.
+		lead := Clip {}
+		kf_set_key(&lead, "gain", 10, 5.0)
+		kf_set_key(&lead, "gain", 20, 2.0)
+		kf_set_lane_interp(&lead, "gain", .Linear)
+		lt := session_trk_view(lead.keyframe_tracks, kf_track_index(lead, "gain"))
+		// base 7.0 -> 5.0 across [0,10].
+		v, ok = kf_sample(lt, 0, 7.0)
+		kf_probe_check(!ok && kf_approx(v, 7.0), "leading: offset 0 is the base itself (v=%v ok=%v)", v, ok)
+		v, ok = kf_sample(lt, 5, 7.0)
+		kf_probe_check(!ok && kf_approx(v, 6.0), "leading: halfway to the first key (got %v)", v)
+		v, ok = kf_sample(lt, 9, 7.0)
+		kf_probe_check(!ok && kf_approx(v, 5.2), "leading: near the first key (got %v)", v)
+		v, ok = kf_sample(lt, 10, 7.0)
+		kf_probe_check(ok && v == 5.0, "leading: the first key still applies on its own frame (got %v)", v)
+		// The run-up is still INACTIVE: it reads no key, so a write there goes to the
+		// resting field. That is what keeps a pre-first-key drag editing base rather
+		// than sprouting keys, and it stays true because base is the segment's start.
+		v, ok = kf_sample(lt, 4, 99.0)
+		kf_probe_check(!ok && kf_approx(v, 99.0 - 94.0 * 0.4), "leading: a resting write moves the curve, still inactive (got %v ok=%v)", v, ok)
+		// Offsets at or left of the clip edge have no run-up to interpolate over.
+		v, ok = kf_sample(lt, -1, 7.0)
+		kf_probe_check(!ok && kf_approx(v, 7.0), "leading: a negative offset clamps to base (got %v ok=%v)", v, ok)
+		// The ARRIVING key owns the run-up's curve, exactly as it owns every other
+		// segment it ends.
+		ease := Clip {}
+		kf_set_key(&ease, "gain", 10, 100.0)
+		kf_set_lane_interp(&ease, "gain", .Ease_In)
+		et := session_trk_view(ease.keyframe_tracks, kf_track_index(ease, "gain"))
+		v, _ = kf_sample(et, 5, 0.0)
+		kf_probe_check(kf_approx(v, 12.5), "leading: Ease_In on the first key shapes the run-up (got %v)", v)
+		// Cubic with only chord tangents available must still land on the chord.
+		cub := Clip {}
+		kf_set_key(&cub, "gain", 10, 100.0)
+		ct := session_trk_view(cub.keyframe_tracks, kf_track_index(cub, "gain"))
+		v, _ = kf_sample(ct, 5, 0.0)
+		kf_probe_check(kf_approx(v, 50.0), "leading: cubic collapses to the chord with no outside neighbour (got %v)", v)
+		// With a later key the right tangent is measured from THIS segment's start,
+		// the same edge condition the interior segments use, so the run-up curves the
+		// same way a segment that begins at a key does.
+		kf_set_key(&cub, "gain", 20, 0.0)
+		ct = session_trk_view(cub.keyframe_tracks, kf_track_index(cub, "gain"))
+		v, _ = kf_sample(ct, 5, 0.0)
+		kf_probe_check(kf_approx(v, 62.5), "leading: cubic uses the later key as its right tangent (got %v)", v)
+		// The user-visible consequence on the audio path: a clip whose static gain is
+		// 0 dB fades up from unity to its first key instead of jumping there.
+		fade := Clip{}
+		kf_set_key(&fade, "gain", 10, -40.0)
+		kf_set_lane_interp(&fade, "gain", .Linear)
+		db_keys: [2]Keyframe
+		kn, _ := kf_fill_snapshot(&fade, "gain", db_keys[:])
+		kf_probe_check(kn > 0, "leading: gain snapshot filled")
+		kf_probe_check(
+			kf_approx(kf_gain_linear(db_keys[:kn], 0, 0), 1.0),
+			"leading gain: offset 0 is still the static level",
+		)
+		kf_probe_check(
+			kf_approx(kf_gain_linear(db_keys[:kn], 5, 0), db_to_linear(-20.0)),
+			"leading gain: fades in from static instead of jumping at the key (got %.5f want %.5f)",
+			kf_gain_linear(db_keys[:kn], 5, 0),
+			db_to_linear(-20.0),
+		)
 		v, _ = kf_sample(gain, 100, 7.0)
 		kf_probe_check(v == 8.0, "far past the last key: still holds (got %v)", v)
 
@@ -190,7 +258,7 @@ when ODIN_DEBUG {
 			dx = session_trk_view(d.keyframe_tracks, dt)
 		}
 		v, ok = kf_sample(dx, 4, 10.0)
-		kf_probe_check(!ok && v == 10.0, "before a lone key: base rules (v=%v ok=%v)", v, ok)
+		kf_probe_check(!ok && kf_approx(v, 2.0), "before a lone key the run-up still reaches base (v=%v ok=%v)", v, ok)
 		v, ok = kf_sample(dx, 5, 10.0)
 		kf_probe_check(ok && v == 0.0, "lone key pins its frame (got %v)", v)
 		v, ok = kf_sample(dx, 6, 10.0)
@@ -672,8 +740,13 @@ when ODIN_DEBUG {
 		// Lane 3 (crop.b) last covers frame 30 with 9.0, so past it the lane holds
 		// 9.0 rather than the base 0.0 — the lane's own end state, not the section's.
 		kf_probe_check(ok && v == 9.0, "packed: past the last key a lane holds (v=%v ok=%v)", v, ok)
+		// Frame 5 is on the run-up to the lane's first covering knot (11.0 at frame
+		// 10), so it is neither the base nor the knot's value. Still inactive.
 		v, ok = kf_geom_sample_lane(&crop, "crop.l", 5, 0.0)
-		kf_probe_check(!ok && v == 0.0, "packed: before the first key, base (v=%v ok=%v)", v, ok)
+		kf_probe_check(
+			!ok && v > 0.0 && v < 11.0,
+			"packed: the run-up to the first covering knot interpolates (v=%v ok=%v)", v, ok,
+		)
 
 		// --- partial pack: n < section width leaves uncovered lanes resting -----
 		pp := Clip {}
@@ -797,16 +870,33 @@ when ODIN_DEBUG {
 			kf_probe_profile_match(fo_b, or_b),
 			"fold: packed section samples identically to the pre-fold lanes + the group edit",
 		)
-		// Rest-before-first-key: a lane whose first key is late keeps its resting
-		// base at early union frames — the fold must not lift it to the set value.
+		// Run-up to a late first key: the fold must not change the lane's curve, and
+		// must not lift it onto the group-edit value early.
+		//
+		// This used to compare a pre-fold and post-fold read against the resting base,
+		// which only agreed because both sat at base. Now the two timelines genuinely
+		// differ (the group edit at 20 IS a crop.r knot after the fold), so the
+		// invariant to pin is faithfulness: the folded lane reads exactly what the
+		// equivalent scalar lane track reads, and still does not jump to 4.0 on a frame
+		// before that knot.
+		ref := Clip {}
+		kf_geom_set_lane_key(&ref, "crop.r", 20, 4.0)
+		kf_geom_set_lane_key(&ref, "crop.r", 40, 9.0)
+		want_rr, want_rok := kf_geom_sample_lane(&ref, "crop.r", 12, 1.0)
+		kf_probe_check(!want_rok, "run-up setup: no key is read at frame 12")
 		rb := Clip {}
 		kf_geom_set_lane_key(&rb, "crop.l", 10, 2.0)
-		kf_geom_set_lane_key(&rb, "crop.r", 40, 9.0) // first key LATER than frame 10's union knot
-		br, brok := kf_geom_sample_lane(&rb, "crop.r", 12, 1.0)
-		kf_probe_check(!brok && br == 1.0, "fold setup: crop.r rests pre-edit, base 1 (got %v)", br)
+		kf_geom_set_lane_key(&rb, "crop.r", 40, 9.0)
 		kf_geom_set_packed(&rb, "crop", 20, {3.0, 4.0, 0, 0, 0, 0, 0}, 0b11)
 		rr, rrok := kf_geom_sample_lane(&rb, "crop.r", 12, 1.0)
-		kf_probe_check(!rrok && rr == 1.0, "fold: crop.r keeps resting base 1 before its first key (got %v)", rr)
+		kf_probe_check(
+			kf_approx(rr, want_rr) && rrok == want_rok,
+			"run-up: the folded lane reads what the scalar lane reads (got %v want %v)", rr, want_rr,
+		)
+		kf_probe_check(
+			rr != 4.0,
+			"run-up: the fold must not lift crop.r onto the set value before its first knot (got %v)", rr,
+		)
 
 		// --- del / trim / split on a packed section (n survives remaps) ----------
 		pc := Clip {}

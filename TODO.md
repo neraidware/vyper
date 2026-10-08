@@ -8219,3 +8219,76 @@ files on every one of 43 cuts and every scrub position.
   have sent the fix to the wrong place. Re-run with the new piece disabled.
 - **`~/…/session.vya` is overwritten by every debug launch, including gate runs.** Copy a
   recording to a named file before running anything else.
+
+## Active 45 — Keyframes did not interpolate from offset 0 to the first key
+
+**Status: FIXED.** A track whose first key is late held the caller's base for the
+whole run-up, so the value sat at the resting pose and then jumped on the first
+key instead of arriving there. Previously implemented in a worktree that was
+deleted; redone here from the sampler's own contract.
+
+### Steps
+
+- [x] `kf_sample_keys` gained the run-up as a real segment: base at offset 0, the
+  first key's value on the first key's frame, shaped by the ARRIVING (first) key's
+  mode — the same "we ease into it" rule every other segment already used, which
+  also makes the first key's mode live instead of inert. Cubic falls back to the
+  chord at whichever end has no outside neighbour, and the right tangent is
+  measured from this segment's own start, so a run-up curves exactly like a
+  segment beginning at a key.
+- [x] `kf_sample_packed_lane` got the packed twin. The run-up ends at the lane's
+  first COVERING knot, not `keys[0]`: a knot that skips the lane is not a
+  breakpoint for it.
+- [x] Still INACTIVE (returns `false`) across the run-up. That flag means "the
+  sampler is reading a key here", and no key exists before the first one, so a
+  write there still routes to the resting field instead of minting keys. `base` is
+  the run-up's starting value, so a resting edit still moves the curve.
+
+### Probe
+
+- [x] `keyframe_probe` gained a leading-segment block: offset 0 is base, the
+  midpoint and near-key values interpolate, the first key still applies on its own
+  frame, a resting write moves the curve while staying inactive, a negative offset
+  clamps to base, `Ease_In` on the first key shapes the run-up, cubic collapses to
+  the chord with no outside neighbour and uses a later key as its right tangent,
+  and the audio path fades in from the static gain instead of jumping at the key.
+  Red before the change (6 failures), green after.
+- [x] Mutation-checked: dropping the scalar run-up turns 12 assertions red;
+  dropping only the packed one turns the packed run-up and the fold checks red.
+- [x] `geom_key_probe`: three assertions encoded "before the first key the resting
+  base rules" and now encode the run-up, keeping each one's original intent —
+  a resting edit is still VISIBLE, and the knot still carries what is ON SCREEN.
+
+### Accept
+
+- [x] `keyframe_probe`, `geom_key_probe`, `render_kf_probe`, `session_kf_probe`,
+  `timeline_probe`, `render_live_probe`, `keyed_export`, `zorder`, `opacity`,
+  `smoke`, `probe` pass; the audio gates (`audio_probe`, `audio_mix_parity`,
+  `audio_drift_parity`, `audio_clip_tempo*`, `audio_clip_pitch`,
+  `audio_decode_integrity`, `audio_seek_landing`, `audio_backward_scrub`,
+  `audio_stall_gap`) and `still_switch` pass; `valgrind`, `undo_valgrind`,
+  `render_live_valgrind` report 0 lost and no invalid access.
+
+### Tradeoff to confirm with the user
+
+- **A resting edit made before the first keyframe now reads back interpolated, not
+  as the number typed.** Setting crop.left to 0.4 at frame 50 of a run-up that ends
+  at 0.05 on frame 100 shows 0.203, because the value on screen is the run-up from
+  the new base. The edit is visible (the value moves) and keying it mints a knot
+  carrying what is on screen — but the inspector no longer echoes the typed number
+  mid-run-up. Both behaviours cannot hold at once: interpolation means the base is
+  a starting value, not the value everywhere. Confirm this is the intent, or
+  anchor the run-up at the edit frame instead.
+
+### Rules from this workstream
+
+- **"Where does the resting value go?" is a question every sampler change has to
+  answer for all three ends.** Before the first key, past the last, and inside a
+  segment each behave differently, and the flag that says "a key is being read" is
+  load-bearing for write routing — independent of the value returned.
+- **Write the probe for the requested behaviour, then let the old probe disagree
+  loudly.** Three existing assertions were the ones that found the real conflict
+  here; rewriting them first would have hidden it.
+- **`zorder` and `subtitle_probe` need `keyed_export`'s fixture.** In a fresh
+  worktree they fail with "render range is empty" / "No such file or directory",
+  which reads like a code failure and is not one.

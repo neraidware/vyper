@@ -498,12 +498,16 @@ when ODIN_DEBUG {
 				kf_track_index(cl^, "crop") >= 0,
 				"fixture: the packed crop section must exist",
 			)
+			// Ahead of the animation the lane is on its run-up: the resting base is
+			// where the run-up STARTS (offset 0), so the playhead reads part of the way
+			// to the first knot rather than the base outright.
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_L), 0.1),
-				"before the first key the resting base rules (got %v)",
+				clip_geom_get(cl, .Crop_L) > 0.05 && clip_geom_get(cl, .Crop_L) < 0.1,
+				"ahead of the first knot the run-up interpolates from the base (got %v)",
 				clip_geom_get(cl, .Crop_L),
 			)
 			// A pan ahead of the animation: visible resting edit, lane marked pending.
+			pre_edit_l := clip_geom_get(cl, .Crop_L)
 			clip_geom_set(cl, .Crop_L, 0.4)
 			geom_key_check(
 				clip_geom_key_modified(cl, .Crop_L),
@@ -516,10 +520,16 @@ when ODIN_DEBUG {
 			before_r := clip_geom_get(cl, .Crop_R)
 			n := clip_geom_key_all_modified(cl)
 			geom_key_check(n == 1, "one pending lane must key exactly one lane, got %d", n)
+			// The resting write moved the run-up, so the edit is visible -- but the
+			// lane is mid-run-up, so what is on screen is the run-up from the NEW base,
+			// not 0.4 outright. That is the cost of interpolating ahead of the first
+			// key, and it is the number the knot must then carry.
+			on_screen_l := clip_geom_get(cl, .Crop_L)
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_L), 0.4),
-				"the keyed lane must carry the value ON SCREEN (got %v)",
-				clip_geom_get(cl, .Crop_L),
+				on_screen_l > 0.05 && on_screen_l < 0.4 && !kf_approx(on_screen_l, pre_edit_l),
+				"a resting edit ahead of the first key must move the run-up (got %v, was %v)",
+				on_screen_l,
+				pre_edit_l,
 			)
 			geom_key_check(
 				kf_approx(clip_geom_get(cl, .Crop_R), before_r),
@@ -569,9 +579,10 @@ when ODIN_DEBUG {
 							k.mask,
 						)
 						geom_key_check(
-							kf_approx(v[0], 0.4),
-							"the knot must carry the pending lane's on-screen value (got %v)",
+							kf_approx(v[0], on_screen_l),
+							"the knot must carry the pending lane's on-screen value (got %v want %v)",
 							v[0],
+							on_screen_l,
 						)
 					}
 				}
