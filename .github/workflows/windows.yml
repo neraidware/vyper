@@ -160,34 +160,41 @@ jobs:
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_frame.log
           $env:VYPER_FRAME_PROBE = "sample.mp4|0-239|30"
-          & .\vyper-probe.exe > .\smoke_frame.log 2>&1
+          # Start-Process -Wait, not `&`: a /SUBSYSTEM:WINDOWS process launched with
+          # the call operator does not have its redirect honoured reliably, and the
+          # log came out EMPTY while the probe itself had run and passed.
+          $p = Start-Process -FilePath .\vyper-probe.exe -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput .\smoke_frame.log -RedirectStandardError .\smoke_frame.err
+          Write-Host "frame-probe exit=$($p.ExitCode) log_bytes=$((Get-Item .\smoke_frame.log).Length)"
           # The probe's OWN result, not just its exit code. The binary is
           # /SUBSYSTEM:WINDOWS, so when a probe is compiled out it exits 0 and prints
           # nothing at all -- indistinguishable from a pass. A missing
           # "[frame-probe] checked=" is that case, and must fail here rather than
           # green a smoke test that decoded nothing.
-          if (-not (Select-String -Quiet -Path .\smoke_frame.log -Pattern '\[frame-probe\] checked=')) {
-            Get-Content .\smoke_frame.log
+          if (-not (Select-String -Quiet -Path .\smoke_frame.log -Pattern 'checked=')) {
+            Get-Content .\smoke_frame.log, .\smoke_frame.err
             throw "frame-probe produced no result line -- the probe is not in this binary"
           }
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content .\smoke_frame.log
+          if ($p.ExitCode -ne 0) {
+            Get-Content .\smoke_frame.log, .\smoke_frame.err
             if (Test-Path .\vyper_crash.log) { Get-Content .\vyper_crash.log }
-            throw "frame-probe failed (exit $LASTEXITCODE)"
+            throw "frame-probe failed (exit $($p.ExitCode))"
           }
           Remove-Item Env:VYPER_FRAME_PROBE
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_proxy.log
           $env:VYPER_PROXY_PROBE = "sample.mp4"
-          & .\vyper-probe.exe > .\smoke_proxy.log 2>&1
-          if (-not (Select-String -Quiet -Path .\smoke_proxy.log -Pattern '\[proxy-probe\] OK')) {
-            Get-Content .\smoke_proxy.log
+          $q = Start-Process -FilePath .\vyper-probe.exe -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput .\smoke_proxy.log -RedirectStandardError .\smoke_proxy.err
+          Write-Host "proxy-probe exit=$($q.ExitCode) log_bytes=$((Get-Item .\smoke_proxy.log).Length)"
+          if (-not (Select-String -Quiet -Path .\smoke_proxy.log -Pattern 'proxy-probe\] OK')) {
+            Get-Content .\smoke_proxy.log, .\smoke_proxy.err
             throw "proxy-probe produced no OK line -- the probe is not in this binary"
           }
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content .\smoke_proxy.log
+          if ($q.ExitCode -ne 0) {
+            Get-Content .\smoke_proxy.log, .\smoke_proxy.err
             if (Test-Path .\vyper_crash.log) { Get-Content .\vyper_crash.log }
-            throw "proxy-probe failed (exit $LASTEXITCODE)"
+            throw "proxy-probe failed (exit $($q.ExitCode))"
           }
 
           if (Test-Path .\vyper_crash.log) {
