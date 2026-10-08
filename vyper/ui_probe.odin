@@ -956,8 +956,8 @@ when ODIN_DEBUG {
 		sync.atomic_store(&playback.dev_resync, saved_resync)
 		sync.atomic_store(&playback.dev_frame, 400)
 		press_at(px_for_frame(ruler, 400), ry)
-		if !playhead.playing {
-			fmt.eprintf("[ui-probe] arming a scrub stopped playback (the removed workaround)\n")
+		if playhead.playing {
+			fmt.eprintf("[ui-probe] arming a scrub must HOLD playback (stop the clock, video, and audio engine)\n")
 			ok = false
 		}
 		drag_tick(px_for_frame(ruler, 120), ry)

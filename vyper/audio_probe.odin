@@ -746,13 +746,12 @@ when ODIN_DEBUG {
 			return false
 		}
 		playhead_scrub.moved = false
-		// Arming must NOT stop playback. Stopping is the workaround that was tried and
-		// removed: it makes the drag unobservable, because a suspended playhead has
-		// nothing to fight, so the live-path fault this probe exists to find goes unseen.
-		// So the contract is the opposite -- playback continues, and the drag tells the
-		// audio engine where the playhead is instead.
-		if !playhead.playing {
-			fmt.println("[ap] backward scrub: FAIL: arming a scrub stopped playback (the removed workaround)")
+		// Arming HOLDS playback. The transport, the video, and the audio engine all
+		// stop for the duration of the drag: a playhead the pointer owns must not also
+		// be advanced by a clock, and the scrub audio is the only sound there is.
+		// Release restores whatever the transport was doing.
+		if playhead.playing {
+			fmt.println("[ap] backward scrub: FAIL: arming a scrub must HOLD playback (stop the clock, video, and audio engine)")
 			return false
 		}
 		audio_update()
@@ -2976,9 +2975,11 @@ when ODIN_DEBUG {
 		}
 		saved_active := sync.atomic_load(&audio_prod.scrub_active)
 		saved_ph := sync.atomic_load(&audio_prod.scrub_playhead)
+		saved_rate := sync.atomic_load(&audio_prod.scrub_rate)
 		defer {
 			sync.atomic_store(&audio_prod.scrub_active, saved_active)
 			sync.atomic_store(&audio_prod.scrub_playhead, saved_ph)
+			sync.atomic_store(&audio_prod.scrub_rate, saved_rate)
 		}
 
 		// One long clip, so "the playhead is at frame N" and "the audio under frame
@@ -3110,6 +3111,21 @@ when ODIN_DEBUG {
 			fmt.println("[ap] scrub-follow: FAIL: playback must still run the producer")
 			return false
 		}
+
+		// Varispeed: the rate the crossed frames play at is the drag's velocity, so
+		// the producer must time-stretch to whatever rate the pointer published. This
+		// is the property that makes a fast drag keep up instead of leaving the audio
+		// behind -- without it the graph stays at 1x and the sound lags the pointer.
+		sync.atomic_store(&audio_prod.scrub_rate, 2.0)
+		audio_producer_feed()
+		if audio_atempo.rate != 2.0 {
+			fmt.printf(
+				"[ap] scrub-follow: FAIL: the producer must time-stretch to the scrub rate, the graph is at %f\n",
+				audio_atempo.rate,
+			)
+			return false
+		}
+		fmt.println("[ap] scrub-follow: varispeed ok (the graph time-stretches to the scrub rate)")
 		return true
 	}
 

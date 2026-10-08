@@ -8472,9 +8472,45 @@ the producer runs -- but it was not the bug.
   block's content sample within one frame of the frame it was fed for.
 - All audio and render gates green under both `dev-2026-09` and `dev-2026-10`.
 
+### Varispeed: the crossed frames play at the drag's rate
+
+The remaining complaint was that forward scrubbing did not match the scrubbing speed,
+and that samples were lost. Both trace to the device being a real-time sink: it drains
+at 1x whatever the pointer does, so at any other rate a fast drag leaves the audio
+behind and a slow drag leaves it ahead. The fix is to drive the existing atempo graph
+from the drag's velocity -- the rate the crossed frames play at is the rate the pointer
+crossed them.
+
+- [x] **`audio_want_rate()` feeds the atempo graph the drag's rate during a scrub.**
+  Pointer velocity (frames/sec / fps) is measured in the move handler and published
+  atomically; `want_ratio`, `audio_rate_scale`, and the audible-position transport all
+  read it. A scrub that has not published a rate yet falls back to `playback.rate`.
+- [x] **Playback is HELD for the duration of a scrub.** The transport, the video, and
+  the audio engine all stop on arm and are restored on release -- a playhead the pointer
+  owns must not also be advanced by a clock, and the scrub audio is the only sound there
+  is. This is what the user asked for explicitly ("not pause, unpause ... literally put
+  on hold"), and it is also what fixed the `audio_probe` content regression: with the
+  clock stopped, the forward-hop guard no longer drags the playhead back to the
+  pre-scrub position.
+- [x] **The re-anchor no longer drops the queue, and is backward-only.** Dropping the
+  queue discarded mixed audio that was never heard. The forward case was then measured
+  skipping frames that had never been fed at all -- 19.7% of a drag, six re-anchors
+  throwing away 19200 samples. With varispeed the producer already tracks a forward
+  drag, so the forward re-anchor is gone; the backward case only rewinds audio that was
+  already fed, so it costs no samples. Measured after: **0 gaps, 0% lost.**
+
+### Verified
+
+- Replay of the user's recording: 0 fed gaps, 0% of the drag lost, lead median 4
+  frames (min -27 during flicks faster than the 16x rate cap, max 14).
+- All audio, UI, render, and GPU gates green under `dev-2026-10`; valgrind clean at
+  0 definitely/indirectly lost.
+
 ### Still open
 
 - [ ] **Reverse playback is untouched.** `playback.dir == -1` still mutes audio; this
   work made *scrubbing* audible, not 1x rewind. Unresolved whether the user meant
   that by "playing audio backwards".
-- [ ] Not yet heard by the user in the editor.
+- [ ] Not yet heard by the user in the editor. The 16x rate cap means a flick faster
+  than that leaves the audio behind (lead min -27); raising it trades pitch for
+  catch-up.

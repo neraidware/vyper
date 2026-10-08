@@ -945,6 +945,21 @@ SCRUB_DECIMATION :: 4
 Playhead_Scrub_State :: struct {
 	moved: bool,
 	requested_resync: i64,
+	// last_frame/last_ns are the previous scrub move's playhead frame and the
+	// monotonic_ns() it happened at. The drag's velocity is the only clock a scrub
+	// has -- the device drains at 1x whatever the pointer does -- so the rate the
+	// crossed frames play at is derived from them.
+	last_frame: i64,
+	last_ns:     u64,
+	// smoothed_rate is the EMA of the drag's rate. The pointer's velocity is noisy
+	// and every rate change rebuilds the atempo graph, so the published rate is
+	// smoothed and quantized rather than passed through raw.
+	smoothed_rate: f64,
+	// was_playing is the transport state on entry to the gesture. A scrub HOLDS
+	// playback -- the clock, the video, and the audio engine all stop for the
+	// duration of the drag, because a playhead the pointer owns must not also be
+	// advanced by a clock. Release restores it.
+	was_playing: bool,
 }
 playhead_scrub: Playhead_Scrub_State
 // DRAG_LANE_DWELL_FRAMES is how many consecutive frames the pointer must rest

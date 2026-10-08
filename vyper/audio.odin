@@ -1027,6 +1027,10 @@ Audio_Producer :: struct {
 	// EVERY drag move rather than through audio_seek's coalescing — the producer
 	// reads it to aim and to decide when it has fallen behind (atomic).
 	scrub_playhead: i64,
+	// scrub_rate is the drag's velocity in timeline-frames per real second, divided
+	// by fps -- the rate the crossed frames play at. Written by the UI thread on every
+	// scrub move, read by the producer. Only consulted while scrub_active.
+	scrub_rate: f64,
 	// anchor_frame is the playhead frame the UI last seeded for a resync
 	// (atomic); anchor_now is monotonic_ns() when that frame was seeded.
 	anchor_frame: i64,
@@ -1952,11 +1956,30 @@ audio_provision :: proc(play_frame: i64) {
 // of content, so the cushion has to be measured in the same units. Named because
 // audio_reconcile_is_seeked has to compute the same tolerance the feed loop uses,
 // and a second copy of that arithmetic is how the two drift apart.
+// audio_want_rate is the rate the mix should be time-stretched to. During a scrub it
+// is the drag's velocity, because the crossed frames have to play at the speed the
+// pointer crossed them -- the device drains at 1x, so any other rate leaves the audio
+// behind a fast drag or ahead of a slow one. Otherwise it is the selected playback
+// rate, clamped to >= 1x as before (a scrub may be slower than 1x; playback may not).
+audio_want_rate :: proc() -> f64 {
+	if sync.atomic_load(&audio_prod.scrub_active) {
+		r := sync.atomic_load(&audio_prod.scrub_rate)
+		// A scrub that has not published a rate yet (the probe sets playhead.frame
+		// directly, without the move handler that computes velocity) must not ask
+		// for a zero tempo -- atempo clamps it to 1x but the caller still rebuilds
+		// the graph every pass and the audible-position assert sees a mismatch.
+		if r > 0 {
+			return r
+		}
+	}
+	return max(1.0, playback.rate)
+}
+
 audio_rate_scale :: proc() -> f64 {
 	if audio_atempo.graph == nil {
 		return 1.0
 	}
-	return max(1.0, max(1.0, playback.rate))
+	return audio_want_rate()
 }
 
 // audio_reconcile_is_seeked reports whether serving `play_frame` is a PLAYHEAD
@@ -2903,6 +2926,13 @@ SCRUB_CUSHION_FRAMES :: 4
 // audio the listener has already scrolled past.
 SCRUB_REANCHOR_SLACK_FRAMES :: 8
 
+// SCRUB_MIN_RATE / SCRUB_MAX_RATE bound the varispeed rate a scrub can ask for. The
+// floor keeps atempo's tempo positive and the graph moving when the pointer is nearly
+// still; the ceiling is past the point where time-stretched audio stops being
+// intelligible and becomes a artifact. Both are about the drag, not the content.
+SCRUB_MIN_RATE :: 0.05
+SCRUB_MAX_RATE :: 16.0
+
 // audio_producer_feed mixes whole timeline frames up to a target derived from
 // the sound device's own consumption: everything pushed minus what is still in
 // the stream queue is what the device has actually played, and that position
@@ -2966,7 +2996,7 @@ audio_producer_feed :: proc() {
 	// Applied lazily — only when the rate changes — because the producer runs
 	// every ~2ms, and rebuilding a filter graph is cheap (a few ms) but not
 	// free per feed.
-	want_ratio := max(1.0, playback.rate)
+	want_ratio := audio_want_rate()
 	if audio_atempo.rate != want_ratio || (audio_atempo.graph == nil) != (want_ratio == 1.0) {
 		// Capture audible position using OLD graph rate and old queue before either is
 		// destroyed. The new graph's sample counters cannot account for output already
@@ -3157,14 +3187,34 @@ audio_producer_feed :: proc() {
 	// primitive, and the seek-landing probes already cover what it produces.
 	if scrubbing {
 		scrub_ph := sync.atomic_load(&audio_prod.scrub_playhead)
-		if audio_src.next_frame > scrub_ph + SCRUB_REANCHOR_SLACK_FRAMES {
+		skew := audio_src.next_frame - scrub_ph
+		// BOTH directions, and the backward case is not a refinement of the forward
+		// one -- it is the common one. The device is a real-time sink: it drains at
+		// 1x whatever the pointer does, so the producer can only advance at 1x too.
+		// Drag forward SLOWER than real time and the playhead stops while the
+		// producer does not: it is already past the target, the fill loop does not
+		// run, and the device keeps playing frames the pointer has scrolled off.
+		// The sound then leads the cursor by more the slower the drag, which is the
+		// whole of "the audio does not match the scrubbing speed". Drag faster and
+		// the same argument runs the other way. So skew is measured signed and
+		// corrected either side of the playhead.
+		// Backward only. The forward case (producer fell behind) was measured
+		// skipping frames that had never been fed -- 19.7% of a drag, six re-anchors
+		// throwing away 19200 samples. With varispeed the producer already tracks a
+		// forward drag, so there is nothing to catch up to. The backward case only
+		// rewinds audio that was already fed, so it costs no samples.
+		if skew > SCRUB_REANCHOR_SLACK_FRAMES {
 			rep := audio_reconcile(scrub_ph, true)
 			audio_rpt.scrub_reanchors += 1
-			audio_rpt.scrub_last_gap = audio_src.next_frame - scrub_ph
-			if rep.touched_window {
-				audio_device_clear()
-				audio_rpt.queue_clears += 1
-			}
+			audio_rpt.scrub_last_gap = skew
+			// The queue is NOT dropped. Dropping it discards mixed audio that was
+			// never heard -- measured 23.8% of a drag lost to exactly this, six
+			// re-anchors throwing away 23200 samples. The user's complaint is that
+			// samples do not play, so the queued audio plays and the producer
+			// re-anchors the decoders underneath it. A backward re-anchor means the
+			// tail of the old position sounds before the new one; that is a fair
+			// price for not losing the audio.
+			_ = rep
 			target = sync.atomic_load(&audio_prod.scrub_playhead) + SCRUB_CUSHION_FRAMES
 		}
 	}

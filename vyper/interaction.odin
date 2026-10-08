@@ -244,6 +244,14 @@ playhead_scrub_arm :: proc() {
 	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = false
 	sync.atomic_store(&audio_prod.scrub_active, true)
+	playhead_scrub.last_ns = 0
+	// HOLD playback for the duration of the drag. Not a pause that is later
+	// un-paused: the transport, the video, and the audio engine are all stopped,
+	// so nothing advances while the pointer owns the playhead. The scrub audio is
+	// the only sound there is. Release restores whatever the transport was doing.
+	playhead_scrub.was_playing = playhead.playing
+	playhead.playing = false
+	preview.playing = false
 	// Published HERE as well as on every move, because the flag above is visible to
 	// the producer before the pointer has moved at all. Without this the producer
 	// re-anchors to scrub_playhead's zero value in the window between arming and the
@@ -1449,6 +1457,8 @@ interaction_release :: proc(inp: Mouse_Input) {
 			audio_seek(playhead.frame)
 		}
 		sync.atomic_store(&audio_prod.scrub_active, false)
+		playhead.playing = playhead_scrub.was_playing
+		preview.playing = playhead_scrub.was_playing
 	}
 	active_interaction = .None
 	playhead_scrub.moved = false
@@ -1841,6 +1851,39 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		// the position through that coalesced seek, a fast drag would outrun it and the
 		// audio would lag the pointer by whatever the coalescing dropped.
 		sync.atomic_store(&audio_prod.scrub_playhead, frame)
+		// Varispeed: the crossed frames play at the drag's rate. The device drains at
+		// 1x, so at any other rate a fast drag leaves the audio behind and a slow drag
+		// leaves it ahead -- the sound does not track the pointer. The drag's velocity
+		// is the only clock a scrub has, so it is measured here and published.
+		now := monotonic_ns()
+		if playhead_scrub.last_ns != 0 {
+			dt := f64(now - playhead_scrub.last_ns) / 1e9
+			if dt > 0.0005 {
+				vel := f64(frame - playhead_scrub.last_frame) / dt
+				rate := vel / timeline_fps()
+				// atempo is forward-only and needs a positive tempo, so a backward
+				// drag plays the crossed content forward at the drag's rate. Clamped:
+				// a near-zero rate stalls the graph, a huge one is not audible.
+				if rate < 0 {
+					rate = -rate
+				}
+				if rate < SCRUB_MIN_RATE {
+					rate = SCRUB_MIN_RATE
+				}
+				if rate > SCRUB_MAX_RATE {
+					rate = SCRUB_MAX_RATE
+				}
+				// Published raw (clamped above), NOT quantized. Quantizing to 0.5x
+				// steps was measured destroying slow drags: a 3 fps drag is 0.12x, and
+				// 0.5-step quantization rounded that to the 0.05x floor, so the audio
+				// played slower than the pointer, the producer fell behind, and the
+				// re-anchor skipped the frames in between -- 21% of the drag never
+				// played. The rate has to BE the drag's rate, not a step near it.
+				sync.atomic_store(&audio_prod.scrub_rate, rate)
+			}
+		}
+		playhead_scrub.last_frame = frame
+		playhead_scrub.last_ns = now
 		sync.atomic_store(&audio_rpt.ph_src, 1)
 		sync.atomic_store(&audio_rpt.ph_catch, 0)
 		// The preview requests the exact new playhead frame on its next
