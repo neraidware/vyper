@@ -3112,10 +3112,20 @@ when ODIN_DEBUG {
 			return false
 		}
 
-		// The scrub device plays at 1x pitch -- no atempo, no varispeed. The producer
-		// bypasses the graph during a scrub, so the audio is recognizable. Varispeed
-		// was the price of sharing the real-time playback device; the separate scrub
-		// device removes it.
+		// Varispeed: the scrub audio is time-stretched to the drag's rate, so the
+		// crossed frames are consumed at the speed the pointer crossed them. The
+		// graph must be AT the scrub rate, and the output must be time-stretched
+		// (more output samples than the mix fed in, at a rate above 1x).
+		sync.atomic_store(&audio_prod.scrub_rate, 2.0)
+		audio_producer_feed()
+		if audio_atempo.rate != 2.0 {
+			fmt.printf(
+				"[ap] scrub-follow: FAIL: the graph must time-stretch to the drag's rate, it is at %f\n",
+				audio_atempo.rate,
+			)
+			return false
+		}
+		fmt.println("[ap] scrub-follow: varispeed ok (the graph time-stretches to the drag's rate)")
 		return true
 	}
 

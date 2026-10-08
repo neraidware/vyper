@@ -8521,10 +8521,13 @@ not for scrubbing.
   the playback device -- that separation is what removes the 1x constraint that
   forced varispeed. (A shared context cannot open a second playback device on
   this backend; the scrub device gets its own.)
-- [x] **The producer bypasses atempo during scrubbing.** 1x pitch, always. The
-  scrub audio is recognizable; there is nothing to time-stretch. The scrub rate
-  (velocity) is now unused by the audio path -- it is kept for the position
-  tracking that still uses it.
+- [x] **The producer time-stretches the scrub audio to the drag's rate.** The
+  mix runs through atempo at whatever rate the pointer published, so the crossed
+  frames are consumed at the speed the pointer crossed them. The scrub device
+  plays the time-stretched output at 1x with nothing left over: a 2.4x drag asks
+  for 2.4x worth of audio, atempo hands back 1x worth, and the device keeps up.
+  That is "faster scrub = consume samples faster" -- the rate is the drag's, and
+  no sample is left unconsumed.
 
 ### Verified
 

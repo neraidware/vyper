@@ -3259,10 +3259,13 @@ audio_producer_feed :: proc() {
 		// through verbatim, identical to the pre-atempo path.
 		push_frames := cur_spf
 		src := mix[:]
-		// Scrubbing bypasses atempo entirely: the scrub device plays at 1x pitch,
-		// so there is nothing to time-stretch. Varispeed was the price of sharing
-		// the real-time playback device; a separate scrub device removes it.
-		if !scrubbing && audio_atempo.graph != nil {
+		// Scrubbing runs the mix through atempo at the DRAG's rate, so the crossed
+		// frames are consumed at the speed the pointer crossed them. The scrub
+		// device then plays the time-stretched output at 1x with nothing left over:
+		// a 2.4x drag asks for 2.4x worth of audio, atempo hands back 1x worth, and
+		// the device keeps up. That is "faster scrub = consume samples faster" --
+		// the rate is the drag's, and no sample is left unconsumed.
+		if audio_atempo.graph != nil {
 			// Let atempo buffer real input until its first overlap-add is ready.
 			// Feeding synthetic silence first advances the graph's own timeline; the
 			// old prime/discard path then threw away real opening samples and made the
