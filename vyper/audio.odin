@@ -1023,6 +1023,10 @@ Audio_Producer :: struct {
 	// owns playhead position. Producer-side anomaly checks ignore that requested
 	// mismatch and resume checking when release commits the final seek.
 	scrub_active: bool,
+	// scrub_playhead is the playhead frame as the pointer sees it, published on
+	// EVERY drag move rather than through audio_seek's coalescing — the producer
+	// reads it to aim and to decide when it has fallen behind (atomic).
+	scrub_playhead: i64,
 	// anchor_frame is the playhead frame the UI last seeded for a resync
 	// (atomic); anchor_now is monotonic_ns() when that frame was seeded.
 	anchor_frame: i64,
@@ -1078,6 +1082,10 @@ Audio_Report :: struct {
 	head_clamp_max: i64,
 	// Monotonic totals, never cleared by reseeds.
 	total_fed_frames: u64,
+	// scrub_reanchors counts the producer re-aiming at the playhead because a scrub
+	// ran past it; scrub_last_gap is how far behind it had fallen, in frames.
+	scrub_reanchors:  u64,
+	scrub_last_gap:   i64,
 	// playhead-writer labels for the drift diagnostics: ph_src is the last
 	// writer of playhead.frame (1=mouse scrub, 2=auto catch-up burst); ph_catch
 	// is the frames jumped in the last auto catch-up burst (atomic on writer
@@ -2882,6 +2890,19 @@ repro_summary :: proc() {
 	repro_last_resync = 0
 }
 
+// SCRUB_CUSHION_FRAMES is how far ahead of the playhead the producer aims while
+// the pointer owns it. Deliberately a few frames, not AUDIO_CUSHION_SEC: the drag
+// cushion only has to absorb producer jitter, because the audible position is
+// supposed to BE the playhead during a scrub. Sized in frames because a scrub is
+// about frames, and a time-based cushion would grow with both rate and clip rate.
+SCRUB_CUSHION_FRAMES :: 4
+
+// SCRUB_REANCHOR_SLACK_FRAMES is how far the playhead may fall behind the producer
+// before it re-anchors. Slack absorbs the pointer's own jitter so a hand that
+// wobbles a pixel does not re-seek every decoder; past it, the producer is mixing
+// audio the listener has already scrolled past.
+SCRUB_REANCHOR_SLACK_FRAMES :: 8
+
 // audio_producer_feed mixes whole timeline frames up to a target derived from
 // the sound device's own consumption: everything pushed minus what is still in
 // the stream queue is what the device has actually played, and that position
@@ -3091,6 +3112,17 @@ audio_producer_feed :: proc() {
 	// on from where it left off. There is no second clock to disagree with.
 	ph := dev_pos
 	target := ph + cushion_frames
+	// A scrub is the one mode where the listener is looking AT the playhead, so the
+	// producer aims AT IT rather than at the device. Filling to dev_pos + 0.25s is
+	// right for playback -- that cushion is what keeps a producer stall from being
+	// audible -- but during a drag it means the audio is a quarter second ahead of the
+	// frame under the pointer, which is the sound of the drag not being followed at
+	// all. A small cushion is kept instead: it is only jitter protection now, and the
+	// audible position has to stay within a few frames of the playhead to track it.
+	scrubbing := sync.atomic_load(&audio_prod.scrub_active)
+	if scrubbing {
+		target = sync.atomic_load(&audio_prod.scrub_playhead) + SCRUB_CUSHION_FRAMES
+	}
 	// Wedge watchdog: at the queue cap, prod is throttled to the device drain
 	// rate — exactly the playhead's rate — so any deficit born while the device
 	// kept running and prod didn't (a producer block, e.g. the atempo graph
@@ -3115,6 +3147,27 @@ audio_producer_feed :: proc() {
 	// clock inversion removed. It is deleted rather than fixed: with the device as
 	// the clock there is no backlog to drop, because the producer's target IS the
 	// device position.
+	// A scrub that has run PAST the producer leaves it mixing audio the pointer has
+	// already moved off, and nothing else fixes that in time: the UI's seek is
+	// coalesced to one outstanding request, so a fast drag outruns it and the
+	// producer stays several frames ahead of the playhead with audio queued for
+	// frames the listener left a moment ago. The producer owns next_frame, so it
+	// re-anchors itself here -- reusing the reconcile a release already uses, which
+	// is the "not too complicated" part: no new decoder path, no new ring
+	// primitive, and the seek-landing probes already cover what it produces.
+	if scrubbing {
+		scrub_ph := sync.atomic_load(&audio_prod.scrub_playhead)
+		if audio_src.next_frame > scrub_ph + SCRUB_REANCHOR_SLACK_FRAMES {
+			rep := audio_reconcile(scrub_ph, true)
+			audio_rpt.scrub_reanchors += 1
+			audio_rpt.scrub_last_gap = audio_src.next_frame - scrub_ph
+			if rep.touched_window {
+				audio_device_clear()
+				audio_rpt.queue_clears += 1
+			}
+			target = sync.atomic_load(&audio_prod.scrub_playhead) + SCRUB_CUSHION_FRAMES
+		}
+	}
 	if target <= audio_src.next_frame {
 		return
 	}
@@ -3614,7 +3667,16 @@ audio_update :: proc() {
 	// Backward playback runs video only: the audio producer/decoders/stream are
 	// forward-only, so while playback.dir is -1 treat audio as paused (muted).
 	// audio_prod.was_playing is cleared so a later flip to forward re-seeks cleanly.
-	if !playhead.playing || playback.dir == -1 {
+	//
+	// A SCRUB is the exception, and it is the whole point of scrubbing audio: the
+	// transport is usually stopped while the pointer is dragging, and a stopped
+	// transport mutes the producer -- so scrubbing a stopped project was silent no
+	// matter what the producer was aiming at. Dragging is the user asking to hear
+	// the timeline, so the producer runs for the duration of the gesture and is
+	// released again on release. Idle (not dragging, not playing) stays silent, so
+	// this does not turn a parked playhead into a running stream.
+	scrubbing := active_interaction == .Playhead_Scrub
+	if (!playhead.playing && !scrubbing) || playback.dir == -1 {
 		sync.atomic_store(&audio_prod.run, false)
 		audio_prod.was_playing = false
 		audio_prod.last_ui_frame = playhead.frame

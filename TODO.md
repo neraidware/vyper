@@ -8428,3 +8428,53 @@ All three of these were live in the sense that something still called them.
 - [ ] **`flake.nix` is still unverified.** Nix is not installed here, so its two `cp`
   path changes have never been run. A wrong path fails the sandbox build, not a local
   one. Run `nix build` before trusting this.
+
+## Active 48 — Scrubbing the timeline made no sound at all
+
+**Status: FIXED, uncommitted.** Found by replaying the user's own action recording
+after being told "I literally don't hear any audio while scrubbing".
+
+### The actual cause was not the one the feature was built on
+
+The first implementation aimed the producer at the playhead during a scrub and made
+it re-anchor when the pointer outran it. Measured lead went from 200 frames to 4, and
+every audio gate stayed green -- and the drag was still silent. The recording says why:
+
+    [pb] scrub ph=15 (was 48) playing=false      (208 such lines, every one)
+
+`playing=false` for the whole gesture. `audio_update` returns early when the transport
+is stopped, so the producer was never started and no aiming could happen. Scrubbing a
+stopped project had never made a sound, and no amount of aiming could change that.
+The aiming work was still correct -- it is what makes the drag track the pointer once
+the producer runs -- but it was not the bug.
+
+- [x] **`audio_update` runs the producer for a scrub on a stopped transport.**
+  `active_interaction == .Playhead_Scrub` counts as running. Idle-and-stopped stays
+  silent, so a parked playhead does not become a running stream. Covered by the
+  probe's three-case run-gate assertion (below), which is red without this line.
+- [x] **Producer aims at the playhead while scrubbing.** `target = scrub_playhead +
+  SCRUB_CUSHION_FRAMES` (4 frames) instead of the 0.25 s playback cushion, which put
+  audio a quarter-second ahead of the frame under the pointer.
+- [x] **Producer re-anchors itself when the pointer outruns it.** A fast drag outruns
+  the UI's coalesced seek, leaving audio queued for frames already passed. Reuses
+  `audio_reconcile(ph, true)` -- the same call a release makes -- so no new decoder
+  path and no new ring primitive.
+- [x] **`scrub_playhead` is published at ARM time, not only on move.** Caught by
+  `audio_probe`: arming raises `scrub_active` before the pointer moves, so the
+  producer re-anchored to the zero value and a drag ending on frame 9 fed frame 0.
+- [x] New probe `audio_scrub_follow` (`gate.sh audio_scrub_follow`, and added to
+  `target_all`). Asserts aim, backward re-anchor, and the three-case run gate. Verified
+  red by reverting each half of the fix, not just asserted.
+
+### Verified
+
+- Replay of the user's recording: 474 blocks fed across 180 playhead positions, every
+  block's content sample within one frame of the frame it was fed for.
+- All audio and render gates green under both `dev-2026-09` and `dev-2026-10`.
+
+### Still open
+
+- [ ] **Reverse playback is untouched.** `playback.dir == -1` still mutes audio; this
+  work made *scrubbing* audible, not 1x rewind. Unresolved whether the user meant
+  that by "playing audio backwards".
+- [ ] Not yet heard by the user in the editor.

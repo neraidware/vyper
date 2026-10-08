@@ -2312,6 +2312,14 @@ main :: proc() {
 			os.exit(ok ? 0 : 1)
 		}
 	}
+	// VYPER_AUDIO_SCRUB_FOLLOW -- during a scrub the audio must AIM AT the playhead
+	// and FOLLOW it when it runs behind, rather than trailing by the playback cushion.
+	when ODIN_DEBUG {
+		if sf, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_FOLLOW", context.temp_allocator); sf != "" {
+			ok: bool = audio_probe_scrub_tracks_playhead(sf)
+			os.exit(ok ? 0 : 1)
+		}
+	}
 	// VYPER_AUDIO_BACKWARD_SCRUB=<path> -- proves a playhead move reaches the AUDIO:
 	// the producer is rewound, the device queue dropped, and the decoder re-anchored
 	// at the new playhead's content. Separate from the playhead's own position,

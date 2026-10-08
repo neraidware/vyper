@@ -244,6 +244,11 @@ playhead_scrub_arm :: proc() {
 	active_interaction = .Playhead_Scrub
 	playhead_scrub.moved = false
 	sync.atomic_store(&audio_prod.scrub_active, true)
+	// Published HERE as well as on every move, because the flag above is visible to
+	// the producer before the pointer has moved at all. Without this the producer
+	// re-anchors to scrub_playhead's zero value in the window between arming and the
+	// first move -- which is exactly how a drag that ends on frame 9 fed frame 0.
+	sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
 	when ODIN_DEBUG {
 		if play_trace {
 			// Arming is where the playhead stops being a readout and becomes the pointer's,
@@ -1830,6 +1835,12 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 			audio_seek(frame, false)
 			playhead_scrub.requested_resync = sync.atomic_load(&audio_prod.resync)
 		}
+		// Published UNCONDITIONALLY, every move, where the coalesced seek above is
+		// deliberately rate-limited. The producer aims at the playhead during a drag
+		// and re-anchors itself when the playhead leaves it behind; if it only learned
+		// the position through that coalesced seek, a fast drag would outrun it and the
+		// audio would lag the pointer by whatever the coalescing dropped.
+		sync.atomic_store(&audio_prod.scrub_playhead, frame)
 		sync.atomic_store(&audio_rpt.ph_src, 1)
 		sync.atomic_store(&audio_rpt.ph_catch, 0)
 		// The preview requests the exact new playhead frame on its next

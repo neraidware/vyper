@@ -2938,6 +2938,181 @@ when ODIN_DEBUG {
 		return true
 	}
 
+	// audio_probe_scrub_tracks_playhead is the scrub-audio property: while the
+	// pointer owns the playhead, the audio is AT the playhead.
+	//
+	// Two halves, and the second is the one the old engine failed:
+	//   1. AIM. Fed with the scrub published, the producer must settle near
+	//      playhead + SCRUB_CUSHION_FRAMES, not playhead + AUDIO_CUSHION_SEC. The
+	//      playback cushion is right for playback and wrong for a drag, where it
+	//      puts the sound a quarter second ahead of the frame being looked at.
+	//   2. FOLLOW. When the playhead ends up BEHIND the producer, the producer
+	//      re-anchors itself. The UI's seek is coalesced to one outstanding
+	//      request, so a fast drag can outrun it and leave audio queued for frames
+	//      the listener already left; the producer owns next_frame, so it has to
+	//      notice itself.
+	audio_probe_scrub_tracks_playhead :: proc(path: string) -> bool {
+		defer audio_probe_timeline_reset()
+		fmt.println("[ap] --- scrub audio follows the playhead ---")
+		audio_reset_play()
+		buf: [4096]u8
+		cn := 0
+		for cn < len(path) && cn < len(buf) - 1 {
+			buf[cn] = u8(path[cn])
+			cn += 1
+		}
+		buf[cn] = 0
+		cpath := cstring(&buf[0])
+		fps := timeline_fps()
+		frame_samples := i64(f64(AUDIO_BUS_RATE) / f64(fps))
+		// Explicit parameter, not a closure: an Odin proc literal does not capture
+		// enclosing locals without a #capture marker, and silently reading a zero
+		// here would feed nothing.
+		feed_ahead :: proc(frames: int, per: i64) {
+			for _ in 0 ..< frames {
+				audio_device_sim_consume(per)
+				audio_producer_feed()
+			}
+		}
+		saved_active := sync.atomic_load(&audio_prod.scrub_active)
+		saved_ph := sync.atomic_load(&audio_prod.scrub_playhead)
+		defer {
+			sync.atomic_store(&audio_prod.scrub_active, saved_active)
+			sync.atomic_store(&audio_prod.scrub_playhead, saved_ph)
+		}
+
+		// One long clip, so "the playhead is at frame N" and "the audio under frame
+		// N" are the same statement for every N in range, and a drag has somewhere
+		// to travel in both directions.
+		timeline.tracks = make([dynamic]Track, 0, 1)
+		timeline.track_order = make([dynamic]int, 0, 1)
+		track := Track {name = "t", clips = make([dynamic]Clip, 0, 1)}
+		append(
+			&track.clips,
+			Clip {
+				clip_id = new_clip_id(),
+				path = cpath,
+				kind = .Audio,
+				name = session_str_intern("scrub-follow"),
+				timeline_start_frame = 0,
+				source_length_frames = 900,
+				source_start_frame = 0,
+				stream_index = 0,
+			},
+		)
+		append(&timeline.tracks, track)
+		sync_track_order()
+		selection.track, selection.index = -1, -1
+		audio_geometry_commit()
+
+		// Headroom over the fixture: the producer also fills the cushion, and the
+		// simulated ring asserts rather than growing, so a cap sized to the fixture
+		// alone overflows on the last few frames.
+		audio_device_sim_enable(500 * frame_samples)
+		defer audio_device_sim_disable()
+		audio_provision(0)
+		feed_ahead(400, frame_samples)
+		if audio_src.next_frame <= 0 {
+			fmt.println("[ap] scrub-follow: SKIP: the fixture fed nothing")
+			return true
+		}
+		// Park the playhead somewhere the producer has already passed, which is the
+		// state a drag starts from, then publish the scrub the way the drag does.
+		parked := audio_src.next_frame - 200
+		if parked < 1 {
+			fmt.println("[ap] scrub-follow: SKIP: producer did not run far enough ahead")
+			return true
+		}
+		playhead.frame = parked
+		sync.atomic_store(&audio_prod.scrub_active, true)
+		sync.atomic_store(&audio_prod.scrub_playhead, parked)
+
+		// (1) AIM. One pass is enough: the producer is re-targeted at the playhead
+		// and fills to it.
+		audio_producer_feed()
+		lead := audio_src.next_frame - parked
+		fmt.printf(
+			"[ap] scrub-follow: aim -- producer %d, playhead %d, lead %d (scrub cushion %d)\n",
+			audio_src.next_frame, parked, lead, SCRUB_CUSHION_FRAMES,
+		)
+		if lead < 0 || lead > SCRUB_CUSHION_FRAMES * 4 {
+			fmt.printf(
+				"[ap] scrub-follow: FAIL: during a scrub the producer must sit within %d frames of the playhead, it is %d\n",
+				SCRUB_CUSHION_FRAMES * 4, lead,
+			)
+			return false
+		}
+
+		// (2) FOLLOW. Drag well behind the producer -- further than the slack -- and
+		// the producer must re-anchor onto the new playhead by itself.
+		reanchors_before := audio_rpt.scrub_reanchors
+		behind := parked - 120
+		if behind < 1 {
+			fmt.println("[ap] scrub-follow: SKIP: no room to drag backwards")
+			return true
+		}
+		playhead.frame = behind
+		sync.atomic_store(&audio_prod.scrub_playhead, behind)
+		for _ in 0 ..< 8 {
+			audio_device_sim_consume(frame_samples)
+			audio_producer_feed()
+		}
+		behind_lead := audio_src.next_frame - behind
+		fmt.printf(
+			"[ap] scrub-follow: follow -- playhead moved to %d, producer %d, lead %d, reanchors=%d\n",
+			behind, audio_src.next_frame, behind_lead, audio_rpt.scrub_reanchors - reanchors_before,
+		)
+		if audio_rpt.scrub_reanchors == reanchors_before {
+			fmt.println("[ap] scrub-follow: FAIL: the playhead ran behind the producer and nothing re-anchored")
+			return false
+		}
+		if behind_lead < 0 || behind_lead > SCRUB_CUSHION_FRAMES * 4 {
+			fmt.printf(
+				"[ap] scrub-follow: FAIL: after re-anchoring the producer must sit within %d frames of the playhead, it is %d\n",
+				SCRUB_CUSHION_FRAMES * 4, behind_lead,
+			)
+			return false
+		}
+		fmt.println("[ap] scrub-follow: ok (audio aims at, and follows, the playhead)")
+
+		// The gate that decides whether the producer runs AT ALL. This is the part the
+		// feed assertions above cannot see, because they call audio_producer_feed
+		// directly: a producer that aims correctly but is never started makes no
+		// sound, which is exactly how scrubbing was silent -- the transport was
+		// stopped, so audio_update bailed before any aiming happened. Three cases:
+		// stopped+dragging runs, stopped+idle does not, playing+idle does.
+		playhead.playing = false
+		active_interaction = .Playhead_Scrub
+		audio_update()
+		scrub_runs := sync.atomic_load(&audio_prod.run)
+		active_interaction = .None
+		audio_update()
+		idle_stopped_runs := sync.atomic_load(&audio_prod.run)
+		playhead.playing = true
+		audio_update()
+		playing_runs := sync.atomic_load(&audio_prod.run)
+		playhead.playing = false
+		audio_update()
+		sync.atomic_store(&audio_prod.run, false)
+		fmt.printf(
+			"[ap] scrub-follow: run gate -- stopped+dragging=%t stopped+idle=%t playing=%t\n",
+			scrub_runs, idle_stopped_runs, playing_runs,
+		)
+		if !scrub_runs {
+			fmt.println("[ap] scrub-follow: FAIL: scrubbing a STOPPED project must run the producer, or the drag is silent")
+			return false
+		}
+		if idle_stopped_runs {
+			fmt.println("[ap] scrub-follow: FAIL: a stopped, idle transport must stay silent (a parked playhead is not a stream)")
+			return false
+		}
+		if !playing_runs {
+			fmt.println("[ap] scrub-follow: FAIL: playback must still run the producer")
+			return false
+		}
+		return true
+	}
+
 	// audio_probe_backward_scrub_seeks proves that a playhead move actually MOVES THE
 	// AUDIO, which is a different question from whether the playhead line moves.
 	//

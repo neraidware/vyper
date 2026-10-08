@@ -1875,6 +1875,23 @@ target_audio_clip_stretch() {
 # share one resync counter, so routing seeks through the reconcile silently redefined
 # them, and a seek is invisible to a comparison of the geometry before and after because
 # a seek changes neither.
+target_audio_scrub_follow() {
+	require_fresh_binary audio-scrub-follow || return 1
+	local src=target/mixparity/tempo_clicks_125ms.wav
+	mkdir -p target/mixparity
+	if [ ! -s "$src" ]; then
+		target_audio_clip_tempo_alignment || return 1
+	fi
+	local out
+	if ! out=$(VYPER_AUDIO_SCRUB_FOLLOW="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
+		echo "$out" >&2
+		echo "audio-scrub-follow: FAILED -- see the [ap] scrub-follow lines above" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[ap\] scrub-follow'
+	echo "audio-scrub-follow: ok (scrubbing aims at and follows the playhead, and makes sound on a stopped transport)"
+}
+
 target_audio_backward_scrub() {
 	require_fresh_binary audio-backward-scrub || return 1
 	local src=target/mixparity/tempo_clicks_125ms.wav
@@ -2168,7 +2185,7 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_decode_integrity still_switch audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_scrub_follow audio_decode_integrity still_switch audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		"$SELF" "$t" || return 1
 	done
@@ -2209,6 +2226,7 @@ main() {
 	audio_clip_tempo_alignment_valgrind) target_audio_clip_tempo_alignment_valgrind ;;
 	audio_clip_stretch) target_audio_clip_stretch ;;
 	audio_scrub_exact) target_audio_scrub_exact ;;
+	audio_scrub_follow) target_audio_scrub_follow ;;
 	audio_backward_scrub) target_audio_backward_scrub ;;
 	still_switch) target_still_switch ;;
 	audio_decode_integrity) target_audio_decode_integrity ;;
