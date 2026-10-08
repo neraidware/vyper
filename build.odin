@@ -532,10 +532,12 @@ obj_ext :: proc() -> string {
 object_for :: proc(src: string) -> string {
 	when ODIN_OS == .Windows {
 		if strings.has_suffix(src, "clay.c") {
-			// Concatenated, not joined: filepath.join reads a "." element as a path
-			// SEGMENT and absorbs it, which yields `vyper/clay.obj` -- the very path
-			// this branch exists to avoid. The second CI failure caught that.
-			return strings.concatenate({PKG, "/clay.", obj_ext()}, context.temp_allocator)
+			// Concatenated, never joined, and with a BACKSLASH: filepath.join reads a
+			// "." element as a path segment and absorbs it (yielding vyper\clay.obj,
+			// the very path this branch avoids), and it emits the host separator, so on
+			// Windows it produced the forward-slash `vyper/clay.obj` -- which `lib`
+			// would not resolve beside the archive. CI caught that one too.
+			return strings.concatenate({PKG, "\\clay.", obj_ext()}, context.temp_allocator)
 		}
 	}
 	return strings.concatenate({strings.trim_suffix(src, ".c"), ".", obj_ext()}, context.temp_allocator)
