@@ -252,6 +252,13 @@ playhead_scrub_arm :: proc() {
 	playhead_scrub.was_playing = playhead.playing
 	playhead.playing = false
 	preview.playing = false
+	// The scrub device is a SEPARATE miniaudio device, opened only for the
+	// duration of the drag. Scrub audio never touches the real-time playback
+	// device -- that separation is the whole point: the playback device drains
+	// at 1x, which is what forced varispeed (pitch shift) on the scrub path.
+	if !scrub_device_open() {
+		fmt.println("[ui] scrub device unavailable; scrubbing will be silent")
+	}
 	// Published HERE as well as on every move, because the flag above is visible to
 	// the producer before the pointer has moved at all. Without this the producer
 	// re-anchors to scrub_playhead's zero value in the window between arming and the
@@ -1459,6 +1466,7 @@ interaction_release :: proc(inp: Mouse_Input) {
 		sync.atomic_store(&audio_prod.scrub_active, false)
 		playhead.playing = playhead_scrub.was_playing
 		preview.playing = playhead_scrub.was_playing
+		scrub_device_close()
 	}
 	active_interaction = .None
 	playhead_scrub.moved = false

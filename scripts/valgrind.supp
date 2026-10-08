@@ -1,0 +1,7 @@
+{
+   dlopen_backend_leak
+   Memcheck:Leak
+   match-leak-kinds: definite
+   ...
+   fun:dl_open_worker
+}

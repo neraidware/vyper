@@ -3259,7 +3259,10 @@ audio_producer_feed :: proc() {
 		// through verbatim, identical to the pre-atempo path.
 		push_frames := cur_spf
 		src := mix[:]
-		if audio_atempo.graph != nil {
+		// Scrubbing bypasses atempo entirely: the scrub device plays at 1x pitch,
+		// so there is nothing to time-stretch. Varispeed was the price of sharing
+		// the real-time playback device; a separate scrub device removes it.
+		if !scrubbing && audio_atempo.graph != nil {
 			// Let atempo buffer real input until its first overlap-add is ready.
 			// Feeding synthetic silence first advances the graph's own timeline; the
 			// old prime/discard path then threw away real opening samples and made the
@@ -3298,11 +3301,15 @@ audio_producer_feed :: proc() {
 			//
 			// Deferring is free: next_frame advances after the push, so leaving
 			// here re-mixes this frame on the next pass. It is not a drop.
-			if i64(push_frames) > audio_device_available() {
+			if i64(push_frames) > (scrubbing ? scrub_device_available() : audio_device_available()) {
 				audio_rpt.skip_full += 1
 				break
 			}
-			audio_device_push(pcm[:], push_frames)
+			if scrubbing {
+				scrub_device_push(pcm[:], push_frames)
+			} else {
+				audio_device_push(pcm[:], push_frames)
+			}
 			audio_rpt.total_fed_frames += u64(push_frames)
 		}
 		audio_rpt.push += 1

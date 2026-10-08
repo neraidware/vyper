@@ -939,6 +939,7 @@ target_valgrind() {
 	mkdir -p target/valgrind
 	local log=target/valgrind/probe.log
 	env $PROBE_ENV timeout 900 valgrind --leak-check=full \
+		--suppressions="$PWD/scripts/valgrind.supp" \
 		--error-exitcode=99 "$VALGRIND_BIN" >"$log" 2>&1
 	local rc=$?
 	echo "valgrind: exit=$rc (expected 99: FFmpeg/Odin noise)"

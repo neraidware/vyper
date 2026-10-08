@@ -8507,6 +8507,25 @@ crossed them.
   the rate within 0.05x of the drag: at 2.4x that is 2%, about half a frame of
   lead over a second of dragging.
 
+### The scrub path no longer uses the real-time device
+
+The varispeed approach was a dead end: time-stretching audio to the drag's rate
+destroys pitch, so the content was unrecognizable ("you can barely tell what
+you're scrubbing"). The root cause was that scrubbing shared the real-time
+playback device, which drains at 1x and therefore forces the audio to fit 1x.
+The real-time device is for hearing what the video sounds like during playback,
+not for scrubbing.
+
+- [x] **A separate scrub device.** A second miniaudio device with its own
+  context, opened on scrub arm and closed on release. Scrub audio never touches
+  the playback device -- that separation is what removes the 1x constraint that
+  forced varispeed. (A shared context cannot open a second playback device on
+  this backend; the scrub device gets its own.)
+- [x] **The producer bypasses atempo during scrubbing.** 1x pitch, always. The
+  scrub audio is recognizable; there is nothing to time-stretch. The scrub rate
+  (velocity) is now unused by the audio path -- it is kept for the position
+  tracking that still uses it.
+
 ### Verified
 
 - Replay of the user's recording: 0 fed gaps, 0% of the drag lost, lead median 4
@@ -8519,6 +8538,7 @@ crossed them.
 - [ ] **Reverse playback is untouched.** `playback.dir == -1` still mutes audio; this
   work made *scrubbing* audible, not 1x rewind. Unresolved whether the user meant
   that by "playing audio backwards".
-- [ ] Not yet heard by the user in the editor. The 16x rate cap means a flick faster
-  than that leaves the audio behind (lead min -27); raising it trades pitch for
-  catch-up.
+- [ ] Not yet heard by the user in the editor. The scrub device drains at 1x like any
+  audio device, so a drag faster than 1x outruns it and the scrub audio lags -- but at
+  normal pitch, so the content stays recognizable. That lag is the device clock, not a
+  pitch shift.

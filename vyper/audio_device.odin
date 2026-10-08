@@ -50,6 +50,10 @@ AUDIO_BRIDGE_FRAMES :: 32768
 // whole point of pre-sizing it: the producer pushes on a hot path and the
 // callback must never be the thing that calls malloc.
 audio_bridge_storage: [AUDIO_BRIDGE_FRAMES * AUDIO_BUS_CHANNELS]i16
+// scrub_bridge_storage backs the SCRUB device's ring -- a separate miniaudio
+// device used only for scrubbing, so the scrub path never touches the real-time
+// playback device. Same shape, same rationale (allocated once, statically).
+scrub_bridge_storage: [AUDIO_BRIDGE_FRAMES * AUDIO_BUS_CHANNELS]i16
 
 // AUDIO_CUSHION_SEC is how far ahead of the playhead the producer keeps the
 // device, and the queue-fill ceiling. On the producer thread this absorbs the
@@ -615,4 +619,211 @@ audio_device_clear_pending :: proc() -> bool {
 // non-zero one-off is a scheduling hiccup. Zero is the healthy state.
 audio_device_underruns :: proc() -> u64 {
 	return sync.atomic_load(&audio_dev.underruns)
+}
+
+// ---------------------------------------------------------------------------
+// Scrub device: a SECOND miniaudio device, separate from the real-time playback
+// device, used ONLY for scrubbing.
+//
+// The playback device is a real-time sink: it drains at 1x, so scrubbing through
+// it forces the audio to fit 1x -- which is why varispeed (pitch shift) existed,
+// and why it was unrecognizable. This is the "adjacent system" the scrub path
+// needs: it plays the same mixed audio at 1x pitch, produced at the drag's rate,
+// and is not the playback device. Opened on scrub arm, closed on release.
+// ---------------------------------------------------------------------------
+
+Scrub_Device :: struct {
+	ctx:        ma.context_type,
+	device:     ma.device,
+	rb:         ma.pcm_rb,
+	ready:      bool,
+	active:     bool,
+	rate:       u32,
+	channels:   u32,
+	resampling: bool,
+	rs:         ma.resampler,
+	underruns:  u64,
+}
+
+scrub_dev: Scrub_Device
+
+scrub_device_data :: proc "c" (pDevice: ^ma.device, pOutput, pInput: rawptr, frameCount: u32) {
+	if !scrub_dev.ready {
+		return
+	}
+	if !sync.atomic_load(&scrub_dev.active) {
+		avail: u32 = ma.pcm_rb_available_read(&scrub_dev.rb)
+		buf: rawptr
+		if avail > 0 && ma.pcm_rb_acquire_read(&scrub_dev.rb, &avail, &buf) == ma.result.SUCCESS {
+			ma.pcm_rb_commit_read(&scrub_dev.rb, avail)
+		}
+		return
+	}
+	if scrub_dev.resampling {
+		scrub_device_pull_resampled(pOutput, frameCount)
+		return
+	}
+	out := mem.slice_ptr(cast([^]i16)pOutput, int(frameCount) * AUDIO_BUS_CHANNELS)
+	filled := 0
+	for filled < int(frameCount) {
+		avail: u32 = u32(int(frameCount) - filled)
+		buf: rawptr
+		if ma.pcm_rb_acquire_read(&scrub_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
+			break
+		}
+		n := min(int(frameCount) - filled, int(avail))
+		samples := n * AUDIO_BUS_CHANNELS
+		ob := filled * AUDIO_BUS_CHANNELS
+		copy(out[ob:ob+samples], mem.slice_ptr(cast([^]i16)buf, samples)[:samples])
+		ma.pcm_rb_commit_read(&scrub_dev.rb, u32(n))
+		filled += n
+	}
+	if filled < int(frameCount) {
+		sync.atomic_add(&scrub_dev.underruns, 1)
+	}
+}
+
+scrub_device_pull_resampled :: proc "c" (pOutput: rawptr, frameCount: u32) {
+	produced := 0
+	for produced < int(frameCount) {
+		need: u64
+		if ma.resampler_get_required_input_frame_count(
+			&scrub_dev.rs,
+			u64(int(frameCount) - produced),
+			&need,
+		) != ma.result.SUCCESS {
+			break
+		}
+		avail: u32 = u32(min(need, u64(AUDIO_BRIDGE_FRAMES)))
+		buf: rawptr
+		if ma.pcm_rb_acquire_read(&scrub_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
+			break
+		}
+		in_frames := u64(avail)
+		out_frames := u64(int(frameCount) - produced)
+		if ma.resampler_process_pcm_frames(
+			&scrub_dev.rs,
+			buf,
+			&in_frames,
+			cast(^u8)(uintptr(pOutput) + uintptr(produced * AUDIO_BUS_FRAME_BYTES)),
+			&out_frames,
+		) != ma.result.SUCCESS {
+			break
+		}
+		ma.pcm_rb_commit_read(&scrub_dev.rb, u32(in_frames))
+		produced += int(out_frames)
+		if in_frames == 0 && out_frames == 0 {
+			break
+		}
+	}
+	if produced < int(frameCount) {
+		sync.atomic_add(&scrub_dev.underruns, 1)
+	}
+}
+
+scrub_device_open :: proc() -> bool {
+	if scrub_dev.ready {
+		return true
+	}
+	cfg := ma.device_config_init(ma.device_type.playback)
+	cfg.playback.format = AUDIO_BUS_FORMAT
+	cfg.playback.channels = AUDIO_BUS_CHANNELS
+	cfg.sampleRate = AUDIO_BUS_RATE
+	cfg.periodSizeInMilliseconds = AUDIO_DEVICE_PERIOD_MS
+	cfg.periods = AUDIO_DEVICE_PERIOD_COUNT
+	cfg.dataCallback = scrub_device_data
+	ctx_cfg := ma.context_config_init()
+	res := ma.context_init(nil, 0, &ctx_cfg, &scrub_dev.ctx)
+	if res != ma.result.SUCCESS {
+		fmt.println("miniaudio scrub context_init failed:", ma.result_description(res))
+		return false
+	}
+	res = ma.device_init(&scrub_dev.ctx, &cfg, &scrub_dev.device)
+	if res != ma.result.SUCCESS {
+		fmt.println("miniaudio scrub device_init failed:", ma.result_description(res))
+		return false
+	}
+	scrub_dev.rate = scrub_dev.device.sampleRate
+	scrub_dev.channels = scrub_dev.device.playback.channels
+	assert(
+		scrub_dev.rate > 0 &&
+		scrub_dev.channels == AUDIO_BUS_CHANNELS &&
+		scrub_dev.device.playback.playback_format == AUDIO_BUS_FORMAT,
+		"miniaudio scrub device negotiated an unexpected shape",
+	)
+	scrub_dev.resampling = scrub_dev.rate != AUDIO_BUS_RATE
+	res = ma.pcm_rb_init(
+		AUDIO_BUS_FORMAT,
+		AUDIO_BUS_CHANNELS,
+		AUDIO_BRIDGE_FRAMES,
+		raw_data(scrub_bridge_storage[:]),
+		nil,
+		&scrub_dev.rb,
+	)
+	if res != ma.result.SUCCESS {
+		fmt.println("miniaudio scrub ring init failed:", ma.result_description(res))
+		ma.device_uninit(&scrub_dev.device)
+		ma.context_uninit(&scrub_dev.ctx)
+		return false
+	}
+	res = ma.device_start(&scrub_dev.device)
+	if res != ma.result.SUCCESS {
+		fmt.println("miniaudio scrub device_start failed:", ma.result_description(res))
+		ma.pcm_rb_uninit(&scrub_dev.rb)
+		ma.device_uninit(&scrub_dev.device)
+		ma.context_uninit(&scrub_dev.ctx)
+		return false
+	}
+	scrub_dev.ready = true
+	scrub_dev.active = true
+	return true
+}
+
+scrub_device_close :: proc() {
+	if !scrub_dev.ready {
+		return
+	}
+	ma.device_stop(&scrub_dev.device)
+	ma.pcm_rb_uninit(&scrub_dev.rb)
+	ma.device_uninit(&scrub_dev.device)
+	ma.context_uninit(&scrub_dev.ctx)
+	scrub_dev.ready = false
+	scrub_dev.active = false
+}
+
+scrub_device_push :: proc(pcm: []i16, frames: int) {
+	if !scrub_dev.ready || frames <= 0 {
+		return
+	}
+	assert(
+		audio_ring_write_scrub(pcm, frames) == frames,
+		"scrub_device_push: ring could not take a whole block",
+	)
+}
+
+scrub_device_available :: proc() -> i64 {
+	if !scrub_dev.ready {
+		return 0
+	}
+	return i64(ma.pcm_rb_available_write(&scrub_dev.rb))
+}
+
+audio_ring_write_scrub :: proc(src: []i16, frames: int) -> int {
+	written := 0
+	for written < frames {
+		avail: u32 = u32(frames - written)
+		buf: rawptr
+		if ma.pcm_rb_acquire_write(&scrub_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
+			break
+		}
+		n := min(frames - written, int(avail))
+		samples := n * AUDIO_BUS_CHANNELS
+		copy(
+			mem.slice_ptr(cast([^]i16)buf, samples)[:samples],
+			src[written * AUDIO_BUS_CHANNELS:(written + n) * AUDIO_BUS_CHANNELS],
+		)
+		ma.pcm_rb_commit_write(&scrub_dev.rb, u32(n))
+		written += n
+	}
+	return written
 }
