@@ -1747,6 +1747,12 @@ selected_clip :: proc() -> (^Track, ^Clip, bool) {
 // the set reads as "gone" rather than aliasing whatever slid into its slot.
 selected_clip_ids :: proc() -> [dynamic]u64 {
 	ids := make([dynamic]u64, 0, len(selection.extra_set) + 1, context.temp_allocator)
+	// The anchor leads unconditionally. Five paths set selection.track/.index to
+	// mean "this clip is the current one" without touching extra_set (resize arm,
+	// media auto-place, the split coverage fallback, move-to-track), so filtering
+	// the anchor out of the set by membership would make a later action see an
+	// empty selection after any of them. The deselect bug is fixed at the
+	// shift+click that CAUSED it, not by weakening the anchor's meaning here.
 	if _, anchor, ok := selected_clip(); ok && anchor != nil {
 		append(&ids, anchor.clip_id)
 	}
@@ -1809,6 +1815,60 @@ append_unique_id :: proc(list: ^[dynamic]u64, id: u64) {
 		}
 	}
 	append(list, id)
+}
+
+// toggle_clip_selection adds or removes `cid` AND every clip linked to it.
+//
+// Linked clips are one unit to every per-clip action, so selecting a member
+// without its partner builds a selection no action can honour: a ripple cut
+// would strand the partner, which is the A/V desync linking exists to prevent.
+// Selecting the group here means selection_targets never has to expand a
+// half-built selection at action time.
+//
+// The direction is decided ONCE for the whole group, from whether the CLICKED
+// clip is currently selected. Toggling each member independently would let one
+// click on a partially-selected group add some of it and remove the rest, which
+// is a state no click sequence should be able to reach.
+//
+// The anchor is left alone: shift+click already re-anchors to the clicked clip,
+// and the anchor is itself a member of extra_set, so it is toggled with the rest.
+toggle_clip_selection :: proc(cid: u64) {
+	_, c, ok := find_clip_by_id(cid)
+	link := u64(0)
+	if ok && c.link_id != 0 {
+		link = c.link_id
+	}
+	members := make([dynamic]u64, 0, 4, context.temp_allocator)
+	if link == 0 {
+		append(&members, cid)
+	} else {
+		for ti in 0 ..< len(timeline.tracks) {
+			for &other in timeline.tracks[ti].clips {
+				if other.link_id == link {
+					append(&members, other.clip_id)
+				}
+			}
+		}
+	}
+	removing := cid in selection.extra_set
+	for m in members {
+		if removing {
+			delete_key(&selection.extra_set, m)
+		} else {
+			selection.extra_set[m] = true
+		}
+	}
+	when ODIN_DEBUG {
+		if vyper_trace {
+			fmt.printf(
+				"[tl] shift-select %s clip %d (+%d linked): set now %d\n",
+				removing ? "deselect" : "select",
+				cid,
+				len(members) - 1,
+				len(selection.extra_set),
+			)
+		}
+	}
 }
 
 // clip_at_frame returns the first clip across all tracks whose timeline span

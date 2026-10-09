@@ -8666,3 +8666,92 @@ Gates: `check`, `timeline_probe`, `transform_probe`, `geom_key_probe`,
 - [ ] `delete_clip_at` (the click-through delete path) still branches on
   `link_id` itself rather than going through the gate.
 - [ ] Not exercised by hand in the editor — every check above is a probe.
+
+### Active 50b — Shift+click could select half a linked pair
+
+**Status: FIXED, uncommitted.** "Shift click to select a clip should select all
+linked clips as well."
+
+`selection.extra_set` is the whole of multi-selection, and shift+click added
+exactly one clip id to it. So a linked video/audio pair could be selected on one
+lane only — and that is a selection **no per-clip action can honour**: every
+action in `apply_to_selection` works through `selection_targets`, so it would
+have expanded to the group at action time and acted on a clip the user never
+pointed at, or (for a selection built some other way) stranded the partner.
+
+- [x] **`toggle_clip_selection(cid)`** — toggles the clip AND its whole link
+  group. Shift+click calls it; the inline one-clip toggle is gone.
+- [x] **The direction is decided once for the group**, from whether the CLICKED
+  clip is currently selected. Toggling members independently would let one click
+  on a partially-selected group add some of it and remove the rest, reaching a
+  state no click sequence should produce.
+- [x] The anchor is untouched: shift+click already re-anchors to the clicked
+  clip, and the anchor is itself a member of `extra_set`, so it toggles with the
+  group.
+
+Verified: new `timeline_probe` test covering the unlinked case, the linked case
+(partner selected alongside), deselect-the-whole-group, the partial group in both
+directions, and agreement with `selection_targets`. **Red proof**: disabling the
+linked expansion fails four assertions, including
+`shift linked: want exactly the 2 group members, got 1`.
+
+A probe bug surfaced here and is worth naming, because it was hiding a false
+assumption in the tests written in Active 50: the `select_clips` helper left the
+anchor OUT of `extra_set`, while the real `select_clip` puts it IN. The multi-select
+tests therefore ran against a selection state the editor never produces. The helper
+now mirrors `select_clip`, and the earlier tests still pass unchanged.
+
+Gates: `check`, `timeline_probe`, `action_log`, `dnd_probe`, `transform_probe`,
+`session_trk_probe`, `smoke`, `probe`, `undo_valgrind`.
+
+### Active 50c — Shift+click toggled clips it had never been shown
+
+**Status: FIXED, uncommitted.** "not all clicked clips were actually selected."
+
+Two defects, found by replaying the user's own recording and reading the
+`shift-select` trace:
+
+- [x] **A deselected clip stayed in every action's target set.** `selected_clip_ids`
+  appended the anchor unconditionally, and shift+click re-anchored to the clicked
+  clip BEFORE toggling -- so deselecting a clip left it as the anchor, and a clip
+  the user had just removed came straight back into the set. The click looked like
+  it removed six clips and then acted on one of them anyway. Fixed at the
+  shift+click that caused it: the anchor is only set when the clicked clip is
+  actually selected. (An earlier attempt filtered the anchor out of
+  `selected_clip_ids` by `extra_set` membership instead; that was reverted --
+  five paths set `selection.track/.index` to mean "this clip is current" without
+  touching `extra_set`, so filtering would have emptied the selection after any
+  of them.)
+- [x] **Shift+click was a toggle, and the toggle was invisible.** Clicking a clip
+  already in the set only as a LINK PARTNER removed five clips the user had never
+  pointed at. The toggle is kept -- clicking a selected member SHOULD drop its
+  whole group, because the group is the unit every action works in -- but the
+  anchor is now only set when the clicked clip is actually selected, so a
+  deselected clip stops being force-fed back into every action's target set.
+
+- [x] **A plain press on empty timeline space deselects every clip.** The toggle
+  can only remove the group you point at, so without this there is no way to
+  clear a selection that has no clip under the pointer -- and "click away from
+  the selection" is the gesture every editor has for that. It routes through
+  `clear_clip_selection` in the click fallback; the probe asserts that action's
+  effect (set empty, anchor cleared, `selected_clip_ids` empty).
+
+  An intermediate version of this change made shift+click ADD-only and added
+  the empty-space deselect to compensate. That was the wrong call: it removed
+  the one gesture that could unselect a linked group. The toggle was restored
+  and the empty-space deselect kept, since it is wanted in its own right.
+
+Verified: the replay's five shift-clicks behave as a toggle over whole link
+groups (6 -> 7 -> 13, then two deselects back to 1), and the deselects now
+actually take effect. Probe asserts: clicking a selected member clears the group,
+the direction is decided once for the group from the clicked clip (so a
+partially-selected group cannot be half-added), and `selection_targets` agrees
+with the selection. `timeline_probe` green.
+
+One flake surfaced and was NOT mine: `SDL_SetGPUScissor_REAL` asserting
+"Scissor rectangle size exceeds current render target dimensions" fired once in
+two replay runs. It is nondeterministic (0/5 on a later sweep), the render gates
+(`gpu_probe`, `gpu_composite`, `yuv_exact`) are green, and the clean tree was
+0/3. Left alone rather than chased -- a scissor-rect assertion in the GPU backend
+is not something a selection change should be able to reach, and "fixing" it
+without a reproduction would be a workaround, which AGENTS.md §3b forbids.

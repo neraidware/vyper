@@ -870,18 +870,26 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				kf_clear()
 
 					if inp.shift {
+					// Shift+click toggles the clip and its whole LINK GROUP into/out
+					// of the multi-selection without dragging: a selection holding
+					// one member of a linked pair is a selection no per-clip action
+					// can honour.
+					cid := track.clips[index].clip_id
+					toggle_clip_selection(cid)
+					// The anchor leads the selection set UNCONDITIONALLY, so a
+					// deselected clip left as the anchor comes straight back into
+					// every action's target set -- the click appeared to remove six
+					// clips and then acted on one of them anyway. Anchor to the clip
+					// only when it is actually selected, or to nothing.
+					if cid in selection.extra_set {
 						selection.track = track_idx
 						selection.index = index
-						// Shift+click toggles the clip into/out of the
-						// multi-selection (for U linking) without dragging.
-						cid := track.clips[index].clip_id
-						if cid in selection.extra_set {
-							delete_key(&selection.extra_set, cid)
-						} else {
-							selection.extra_set[cid] = true
-						}
-						return true
+					} else {
+						selection.track = -1
+						selection.index = -1
 					}
+					return true
+				}
 					// Plain click = sole selection. Keep the anchor in extra_set
 					// so the next Shift+click preserves it when changing anchor.
 					select_clip(track_idx, index)
@@ -910,6 +918,27 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			}
 		}
 		return false
+	},
+	// A plain press on timeline space that holds no clip deselects every clip.
+	//
+	// This is the other half of the shift+click toggle: the toggle can only ever
+	// remove the group you point at, so without an empty-space press there is no
+	// way to clear a selection that has no clip under the pointer -- and "click
+	// away from the selection" is the gesture every editor has for that.
+	//
+	// Shift is excluded so it falls through to the keyframe brush below, and
+	// TrackArea excludes the ruler and the name gutter, which have their own
+	// presses. It sits after the clip press, which is what makes "no clip under
+	// the pointer" the condition.
+	proc(inp: Mouse_Input) -> bool {
+		if inp.shift {
+			return false
+		}
+		if !clay.PointerOver(clay.ID("TrackArea")) {
+			return false
+		}
+		clear_clip_selection()
+		return true
 	},
 	// Shift+press on timeline area that holds no clip ARMS the keyframe brush:
 	// from here, every keyframe the pointer passes over joins the selection, with

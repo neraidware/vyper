@@ -2267,6 +2267,16 @@ when ODIN_DEBUG {
 		selection.track = anchor_track
 		selection.index = anchor_index
 		clear(&selection.extra_set)
+		// The anchor is a member of extra_set as well: that is what select_clip
+		// does, and it is why a Shift+click "preserves" the clip a plain click
+		// landed on. A probe helper that left it out would be asserting a state
+		// the editor never produces.
+		if anchor_track >= 0 &&
+		   anchor_track < len(timeline.tracks) &&
+		   anchor_index >= 0 &&
+		   anchor_index < len(timeline.tracks[anchor_track].clips) {
+			selection.extra_set[timeline.tracks[anchor_track].clips[anchor_index].clip_id] = true
+		}
 		for id in extra {
 			selection.extra_set[id] = true
 		}
@@ -2407,6 +2417,69 @@ when ODIN_DEBUG {
 		}
 		tl_probe_check(right0 != 0 && right1 != 0, "multi-split: both linked clips should keep a link on their right half, got %d/%d", right0, right1)
 		tl_probe_check(right0 != right1, "multi-split: splitting two groups linked them together (both right halves got %d)", right0)
+	}
+
+	// Shift+clicking a clip selects its WHOLE link group, so the selection can
+	// never hold half of a linked pair -- a state no per-clip action can honour.
+	test_shift_click_takes_link_group :: proc() {
+		// Shift-click an unlinked clip: just that one.
+		tl_multi_scene()
+		select_clips(0, 0)
+		toggle_clip_selection(4003)
+		tl_probe_check(len(selection.extra_set) == 2, "shift unlinked: want anchor+4003 = 2, got %d", len(selection.extra_set))
+		tl_probe_check(4003 in selection.extra_set, "shift unlinked: 4003 should be selected")
+		_, picked := selection.extra_set[4004]
+		tl_probe_check(!picked, "shift unlinked: 4004 must NOT be selected (different lane, unlinked)")
+
+		// Shift-click ONE member of the linked pair 42: the partner comes too.
+		tl_multi_scene()
+		select_clips(0, 0)
+		toggle_clip_selection(4002)
+		tl_probe_check(4001 in selection.extra_set, "shift linked: 4001 (the partner) should have been selected")
+		tl_probe_check(4002 in selection.extra_set, "shift linked: the clicked clip should be selected")
+		tl_probe_check(len(selection.extra_set) == 2, "shift linked: want exactly the 2 group members, got %d", len(selection.extra_set))
+
+		// TOGGLE. Clicking a clip that is already selected removes its WHOLE link
+		// group -- the user pointed at one member, and the group is the unit every
+		// action works in, so half of it is not theirs to leave behind.
+		tl_multi_scene()
+		select_clips(0, 0)
+		toggle_clip_selection(4002)
+		toggle_clip_selection(4002)
+		tl_probe_check(len(selection.extra_set) == 0, "shift toggle: clicking a selected member should clear the group, got %d", len(selection.extra_set))
+
+		// The direction is decided ONCE for the group, from the CLICKED clip, so a
+		// partially-selected group cannot end up half-added by one click.
+		tl_multi_scene()
+		select_clips(0, 0)
+		delete_key(&selection.extra_set, 4002) // 4001 present, partner absent
+		toggle_clip_selection(4002)
+		tl_probe_check(
+			len(selection.extra_set) == 2,
+			"shift partial: clicking the absent member should take the group, got %d",
+			len(selection.extra_set),
+		)
+		toggle_clip_selection(4001)
+		tl_probe_check(
+			len(selection.extra_set) == 0,
+			"shift partial: clicking a present member should drop the whole group, got %d",
+			len(selection.extra_set),
+		)
+
+		// Selection and action agree: a group selected this way is one target set.
+		tl_multi_scene()
+		select_clips(0, 0)
+		toggle_clip_selection(4002)
+		targets := selection_targets()
+		tl_probe_check(len(targets) == 2, "shift linked: targets want 2, got %d", len(targets))
+
+		// A plain press on empty timeline space deselects everything. The press
+		// routes through the click fallback in interaction.odin; what is asserted
+		// here is the action it performs, which is the part with state to get wrong.
+		clear_clip_selection()
+		tl_probe_check(len(selection.extra_set) == 0, "empty-space deselect: want 0 selected, got %d", len(selection.extra_set))
+		tl_probe_check(selection.track == -1 && selection.index == -1, "empty-space deselect: anchor should be cleared")
+		tl_probe_check(len(selected_clip_ids()) == 0, "empty-space deselect: selected_clip_ids should be empty, got %d", len(selected_clip_ids()))
 	}
 
 	timeline_probe_run :: proc(_: string) {
@@ -2553,6 +2626,10 @@ when ODIN_DEBUG {
 		tl_multi_scene()
 		test_multi_select_split()
 		fmt.println("[tl-probe] multi-select-split ok")
+
+		tl_multi_scene()
+		test_shift_click_takes_link_group()
+		fmt.println("[tl-probe] shift-click-takes-link-group ok")
 
 		// Reorder-by-gap semantics of move_track_to_row: target_row is the visual
 		// stack position (0 = top, len = bottom); the same-row gap (src_row) and the
