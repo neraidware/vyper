@@ -8587,3 +8587,82 @@ stderr and were being discarded; they are visible now.
 dir`, `[flash-rec] ENABLED`, miniaudio device ready, `[audio] producer thread up`, 9
 `[ui] fps=` ticks over ~18 s, then a clean `[action-log] recorded 2412 frames` on
 window close (exit 0, not a crash). `./scripts/gate.sh check` clean.
+
+## Active 50 — Clip actions acted on one clip and silently ignored the rest of the selection
+
+**Status: FIXED, uncommitted.** "Ripple delete should apply to all selected clips."
+The selection already held a SET (anchor + every Shift-clicked clip, in
+`selection.extra_set`) — but only the link/toggle actions read it. Delete, ripple
+and split all read the single anchor, so Shift-clicking four clips and pressing
+Backspace edited one of them and left the other three sitting there.
+
+### The one place "what does this act on" is answered
+
+- [x] **`selected_clip_ids()`** — the anchor first, then every Shift+clicked clip,
+  deduplicated. Clip IDs, never `(track, index)`: every action fed by it removes or
+  splits clips, and the first removal invalidates every later index on that track.
+  An id resolves through `find_clip_by_id`, so a clip deleted mid-action reads as
+  "gone" instead of aliasing whatever slid into its slot.
+- [x] **`selection_targets()`** — that set, each clip expanded to its WHOLE link
+  group. Links mean "these move together", so a cut leaving the partner behind is
+  the A/V desync linking exists to prevent. Two selected members of one group
+  collapse to that group once, so a group is never acted on twice.
+- [x] `toggle_links_for_selection` was carrying its own inline copy of the
+  anchor-then-dedup loop; it now calls `selected_clip_ids()` (the raw set, NOT the
+  link-expanded one — it is the action that *builds* groups, so expanding through
+  existing links would drag in partners the user never clicked).
+
+### The gate
+
+- [x] **`apply_to_selection(act)`** in `event.odin`: the single route for per-clip
+  actions, so the selection question is answered once instead of once per action.
+  A long `switch` over the existing `Action` enum — deliberately NOT a
+  `map[Action]proc` registry: the action set is closed and owned here, so every
+  case is visible at once and a direct call beats an indirect one.
+- [x] Non-per-clip actions are NAMED in that switch rather than defaulted.
+  `-strict-style` refuses `case:` on an exhaustible enum, which is the point:
+  adding an action to `Action` and forgetting the gate is a compile error, not a
+  key that silently does nothing.
+
+### Per-action behaviour
+
+- [x] **Ripple delete** — `ripple_delete_selected`. One unlinked clip keeps the
+  every-track region edit it has always been (a separate, deliberate operation);
+  once the selection is more than one clip, or the clip is linked, each target
+  rips its OWN region on its OWN track. Applied **rightmost-first within a track**:
+  a ripple at `start` only shifts clips at or after `start+length`, so removing
+  the rightmost first is what keeps the captured spans valid. Left-to-right deletes
+  the wrong footage.
+- [x] **Raw delete** — every selected clip plus partners, descending `(track,index)`
+  so a removal never invalidates a pending target, no gap closed, one undo node.
+- [x] **Split** — every selected clip that straddles the playhead; a clip the
+  playhead is not inside is left whole rather than cut somewhere else. **One fresh
+  link id per original group** — a single shared id would give two never-linked
+  groups the same group on their right halves, silently LINKING them.
+- [x] One `undo_begin`/`undo_push` per action regardless of how many clips it
+  touched, and the whole selection (anchor + `extra_set`) is cleared afterwards, so
+  the next action does not resolve to a dead id.
+
+### Verified
+
+Five new `timeline_probe` tests — multi-select ripple, single-clip every-track,
+link dedup, multi-select raw delete, multi-select split (including the two-group
+link case) — each asserting clip positions AND `undo_count()` delta == 1.
+`timeline_probe` green. **Red proof run**: patching the ripple back to single-clip
+target selection fails `multi-ripple t1: want 0 clips, got 2` and
+`link-dedup t1: want 1 clip, got 2`, so the assertions discriminate rather than
+always passing.
+
+Gates: `check`, `timeline_probe`, `transform_probe`, `geom_key_probe`,
+`session_trk_probe`, `session_str_probe`, `session_kf_probe`,
+`session_marker_probe`, `action_log`, `dnd_probe`, `still_switch`,
+`keyframe_probe`, `audio_probe`, `audio_mix_parity`, `audio_drift_parity`,
+`audio_scrub_exact`, `audio_backward_scrub`, `smoke`, `probe`, `undo_valgrind`.
+
+### Still open
+
+- [ ] `begin_clip_rename` (`Begin_Rename`) is still anchor-only and deliberately
+  so: renaming is one text field, and a multi-clip rename has no agreed meaning.
+- [ ] `delete_clip_at` (the click-through delete path) still branches on
+  `link_id` itself rather than going through the gate.
+- [ ] Not exercised by hand in the editor — every check above is a probe.

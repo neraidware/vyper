@@ -2260,6 +2260,155 @@ when ODIN_DEBUG {
 		)
 	}
 
+	// select_clips points the selection at `anchor` (track,index) and puts every
+	// id in `extra` into the Shift multi-selection, which is exactly the state a
+	// shift-click drag leaves behind.
+	select_clips :: proc(anchor_track, anchor_index: int, extra: ..u64) {
+		selection.track = anchor_track
+		selection.index = anchor_index
+		clear(&selection.extra_set)
+		for id in extra {
+			selection.extra_set[id] = true
+		}
+	}
+
+	// tl_multi_scene: two lanes, each carrying a linked pair at the front and an
+	// unrelated clip behind it.
+	//   track 0: 4001(link 42) [0,50)   4003 [100,150)
+	//   track 1: 4002(link 42) [0,50)   4004 [100,150)
+	tl_multi_scene :: proc() {
+		timeline = Timeline {
+			tracks = make([dynamic]Track, 0, 2, context.temp_allocator),
+		}
+		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+		append(&timeline.tracks[0].clips, mk_tl_clip(4001, 42, 0, 50, 0, .Video))
+		append(&timeline.tracks[0].clips, mk_tl_clip(4003, 0, 0, 50, 100, .Video))
+		append(&timeline.tracks[1].clips, mk_tl_clip(4002, 42, 0, 50, 0, .Audio))
+		append(&timeline.tracks[1].clips, mk_tl_clip(4004, 0, 0, 50, 100, .Audio))
+		selection.track = -1
+		selection.index = -1
+		clear(&selection.extra_set)
+		timeline_view.start = 0
+	}
+
+	// A selection-wide ripple removes EVERY selected clip's own area from its own
+	// track, leaves unselected lanes alone, and lands as ONE undo node. This is
+	// the case that used to exist only for a single clip or a single link group.
+	test_multi_select_ripple :: proc() {
+		tl_multi_scene()
+		// 4001 and 4004: one linked member, one unrelated clip. The group
+		// expansion brings 4002 along; 4003 is not selected and not linked.
+		select_clips(0, 0, 4004)
+		before := undo_count()
+		ripple_delete_selected()
+		tl_probe_check(undo_count() == before + 1, "multi-ripple: want 1 undo node, got %d", undo_count() - before)
+		// Track 0: 4001's region gone, 4003 slid left into its place.
+		tl_probe_check(len(timeline.tracks[0].clips) == 1, "multi-ripple t0: want 1 clip, got %d", len(timeline.tracks[0].clips))
+		if len(timeline.tracks[0].clips) == 1 {
+			c := timeline.tracks[0].clips[0]
+			tl_probe_check(c.clip_id == 4003 && c.timeline_start_frame == 50, "multi-ripple t0: want 4003 at 50, got %d at %d", c.clip_id, c.timeline_start_frame)
+		}
+		// Track 1: the linked partner 4002 was ripped too, and 4004 (selected)
+		// was ripped, leaving nothing.
+		tl_probe_check(len(timeline.tracks[1].clips) == 0, "multi-ripple t1: want 0 clips, got %d", len(timeline.tracks[1].clips))
+		tl_probe_check(selection.track == -1 && selection.index == -1 && len(selection.extra_set) == 0, "multi-ripple: selection should be fully cleared")
+	}
+
+	// One unlinked clip still rips EVERY track -- the established "delete this
+	// area of the timeline" edit. Named here because it is the one place the
+	// selection count changes the blast radius, and it is deliberate.
+	test_single_clip_ripple_hits_every_track :: proc() {
+		tl_multi_scene()
+		// Unlink the front pair so the anchor is a lone clip.
+		timeline.tracks[0].clips[0].link_id = 0
+		timeline.tracks[1].clips[0].link_id = 0
+		select_clips(0, 0)
+		ripple_delete_selected()
+		// [0,50) is removed everywhere: 4003/4004 slide to 50, the two clips that
+		// were inside the region are gone.
+		tl_probe_check(len(timeline.tracks[0].clips) == 1 && len(timeline.tracks[1].clips) == 1, "every-track: want 1 clip per track, got %d/%d", len(timeline.tracks[0].clips), len(timeline.tracks[1].clips))
+	}
+
+	// Two members of ONE link group, both selected, act as the group ONCE. If the
+	// expansion emitted 4002 twice, track 1's region would be ripped twice and
+	// 4004 would slide from 100 to 0 instead of 50.
+	test_multi_select_link_dedup :: proc() {
+		tl_multi_scene()
+		select_clips(0, 0, 4002)
+		ripple_delete_selected()
+		tl_probe_check(len(timeline.tracks[1].clips) == 1, "link-dedup t1: want 1 clip, got %d", len(timeline.tracks[1].clips))
+		if len(timeline.tracks[1].clips) == 1 {
+			c := timeline.tracks[1].clips[0]
+			tl_probe_check(c.clip_id == 4004 && c.timeline_start_frame == 50, "link-dedup: 4004 ripped twice, got it at %d", c.timeline_start_frame)
+		}
+	}
+
+	// Raw delete removes the whole selection (plus partners) and closes no gap,
+	// as one undo node.
+	test_multi_select_raw_delete :: proc() {
+		tl_multi_scene()
+		select_clips(0, 0, 4004)
+		before := undo_count()
+		delete_selected_clip_raw()
+		tl_probe_check(undo_count() == before + 1, "multi-raw: want 1 undo node, got %d", undo_count() - before)
+		// 4001 + its partner 4002 + selected 4004 gone; 4003 untouched AT 100,
+		// because a raw delete does not close the gap.
+		tl_probe_check(len(timeline.tracks[0].clips) == 1, "multi-raw t0: want 1 clip, got %d", len(timeline.tracks[0].clips))
+		if len(timeline.tracks[0].clips) == 1 {
+			c := timeline.tracks[0].clips[0]
+			tl_probe_check(c.clip_id == 4003 && c.timeline_start_frame == 100, "multi-raw t0: want 4003 still at 100, got %d", c.timeline_start_frame)
+		}
+		// Track 1 held 4002 (a partner of the anchor's group) and the selected
+		// 4004, so it is left empty.
+		tl_probe_check(len(timeline.tracks[1].clips) == 0, "multi-raw t1: want 0 clips, got %d", len(timeline.tracks[1].clips))
+	}
+
+	// Split cuts every selected clip that straddles the playhead, and skips the
+	// ones it does not -- "split at the playhead" means one thing.
+	test_multi_select_split :: proc() {
+		tl_multi_scene()
+		playhead.frame = 25
+		select_clips(0, 0, 4002)
+		before := undo_count()
+		split_clip_at_playhead()
+		tl_probe_check(undo_count() == before + 1, "multi-split: want 1 undo node, got %d", undo_count() - before)
+		tl_probe_check(len(timeline.tracks[0].clips) == 3, "multi-split t0: want 3 clips (4001 halves + 4003), got %d", len(timeline.tracks[0].clips))
+		tl_probe_check(len(timeline.tracks[1].clips) == 3, "multi-split t1: want 3 clips, got %d", len(timeline.tracks[1].clips))
+		// A clip the playhead is not inside is left whole.
+		found_whole := false
+		for &c in timeline.tracks[0].clips {
+			if c.clip_id == 4003 && c.source_length_frames == 50 {
+				found_whole = true
+			}
+		}
+		tl_probe_check(found_whole, "multi-split: 4003 does not straddle the playhead and must not be cut")
+
+		// Two clips from DIFFERENT groups must not be linked together by the
+		// split: each group's right half gets its own fresh link id.
+		tl_multi_scene()
+		timeline.tracks[1].clips[0].link_id = 43
+		playhead.frame = 25
+		select_clips(0, 0, 4002)
+		split_clip_at_playhead()
+		// The right half is the piece that now begins AT the playhead. Keying on
+		// "not the original id" would also match the unrelated 4003, whose link id
+		// is 0 and would overwrite what we are reading.
+		right0, right1: u64 = 0, 0
+		for &c in timeline.tracks[0].clips {
+			if c.timeline_start_frame == playhead.frame {
+				right0 = c.link_id
+			}
+		}
+		for &c in timeline.tracks[1].clips {
+			if c.timeline_start_frame == playhead.frame {
+				right1 = c.link_id
+			}
+		}
+		tl_probe_check(right0 != 0 && right1 != 0, "multi-split: both linked clips should keep a link on their right half, got %d/%d", right0, right1)
+		tl_probe_check(right0 != right1, "multi-split: splitting two groups linked them together (both right halves got %d)", right0)
+	}
+
 	timeline_probe_run :: proc(_: string) {
 		tl_scene()
 		test_fps_reflow()
@@ -2384,6 +2533,26 @@ when ODIN_DEBUG {
 		tl_scene()
 		test_ripple_playhead_follow()
 		fmt.println("[tl-probe] ripple-playhead-follow ok")
+
+		tl_multi_scene()
+		test_multi_select_ripple()
+		fmt.println("[tl-probe] multi-select-ripple ok")
+
+		tl_multi_scene()
+		test_single_clip_ripple_hits_every_track()
+		fmt.println("[tl-probe] single-clip-ripple-every-track ok")
+
+		tl_multi_scene()
+		test_multi_select_link_dedup()
+		fmt.println("[tl-probe] multi-select-link-dedup ok")
+
+		tl_multi_scene()
+		test_multi_select_raw_delete()
+		fmt.println("[tl-probe] multi-select-raw-delete ok")
+
+		tl_multi_scene()
+		test_multi_select_split()
+		fmt.println("[tl-probe] multi-select-split ok")
 
 		// Reorder-by-gap semantics of move_track_to_row: target_row is the visual
 		// stack position (0 = top, len = bottom); the same-row gap (src_row) and the

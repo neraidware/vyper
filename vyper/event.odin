@@ -301,31 +301,29 @@ dispatch_action :: proc(act: Action) {
 	case .Begin_Rename:
 		begin_clip_rename()
 	case .Split_At_Playhead:
-		split_clip_at_playhead()
+		// Through the gate, so a multi-selection splits every selected clip at
+		// the playhead rather than only the anchor.
+		apply_to_selection(.Split_At_Playhead)
 	case .Toggle_Links:
 		// Toggle link state across the selection: a lone clip unlinks its
 		// group; several Shift+clicked clips join into one link group (or all
-		// split apart when already linked).
+		// split apart when already linked). Already selection-wide by
+		// construction -- it is the action that BUILDS groups -- so it reads
+		// the raw selection rather than going through the gate.
 		toggle_links_for_selection()
 	case .Delete_At_Playhead:
 		if !delete_selected_keyframe() {
-			// Delete the selected clip's timeline area and close the gap
-			// (ripple). A linked clip rips the WHOLE group: every member's own
-			// span on its own track, so a ripple cut never leaves the partner
-			// clip behind (rippling only the selected member's region would
-			// strand the rest).
-			if tr, clip, ok := selected_clip(); ok {
-				if clip.link_id != 0 {
-					ripple_delete_linked_group(clip.link_id)
-				} else {
-					ripple_delete_region(clip.timeline_start_frame, clip.source_length_frames)
-				}
-			}
+			// Ripple-delete every selected clip's own timeline area and close each
+			// track's gap, as one undo. A linked clip still rips its whole group:
+			// selection_targets expands each selected clip to its partners, so a
+			// ripple cut never strands the partner clip that link exists to keep in
+			// sync. One unlinked clip keeps the every-track region edit.
+			apply_to_selection(.Delete_At_Playhead)
 		}
 	case .Delete_Selection:
 		if !delete_selected_keyframe() {
-			// Delete the clip raw, nothing else.
-			delete_selected_clip_raw()
+			// Delete the clips raw, nothing else -- no gap closed.
+			apply_to_selection(.Delete_Selection)
 		}
 	case .Key_All_Modified:
 		// Keys every geometry lane that was edited without a keyframe, as one
@@ -357,6 +355,52 @@ dispatch_action :: proc(act: Action) {
 			project.end_frame = -1
 		}
 	case .None:
+	}
+}
+
+// apply_to_selection is where every per-clip action goes through, so "this acts
+// on the whole selection" is answered in ONE place instead of once per action.
+//
+// The set is the selection expanded to each member's whole link group
+// (selection_targets), resolved to clip ids before anything mutates the clip
+// arrays, and each action consumes that set as a single edit and a single undo
+// node. A long switch over the existing Action enum, deliberately not a
+// `map[Action]proc` registry: the set of actions is closed and owned here, so
+// every case is visible in one screen and a direct call beats an indirect one.
+//
+// An action that is NOT per-clip never reaches this -- transport, undo/redo,
+// in/out points and the auto-key flag mean something on their own, and
+// repeating them per clip would be a different action wearing the same name.
+apply_to_selection :: proc(act: Action) {
+	switch act {
+	case .Delete_At_Playhead:
+		ripple_delete_selected()
+	case .Delete_Selection:
+		delete_selected_clip_raw()
+	case .Split_At_Playhead:
+		split_clip_at_playhead()
+	// Every action that is NOT per-clip, named rather than defaulted: this is an
+	// exhaustible enum and -strict-style refuses a `case:`, which is the point.
+	// Spelling them out means adding an action to Action and forgetting this
+	// function is a COMPILE error, not a key that silently does nothing.
+	// Transport, undo/redo, panels, the auto-key flag and the in/out points mean
+	// something on their own; repeating them per clip would be a different
+	// action wearing the same name.
+	case
+	.None,
+	.Open_Command_Line,
+	.Toggle_Help,
+	.Undo,
+	.Redo,
+	.Toggle_Playback,
+	.Play_Project_Area,
+	.Begin_Rename,
+	.Toggle_Links,
+	.Key_All_Modified,
+	.Toggle_Auto_Keyframe,
+	.Set_In_Point,
+	.Set_Out_Point:
+		assert(false, "apply_to_selection called with a non-per-clip action")
 	}
 }
 

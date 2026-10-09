@@ -1059,32 +1059,34 @@ split_clip_at_playhead :: proc() {
 	if local <= 0 || local >= clip.source_length_frames {
 		return
 	}
-	undo_begin()
-	link := clip.link_id
-	right_link := u64(0)
-	if link != 0 {
-		right_link = new_clip_id()
-	}
+	// Every selected clip, expanded through links, that actually straddles the
+	// playhead. A clip the playhead is not inside cannot be split AT the
+	// playhead, so a multi-clip split leaves it alone rather than cutting it
+	// somewhere the user did not ask for.
 	SplitTarget :: struct {
 		track, index: int,
+		link:         u64,
 	}
 	targets := make([dynamic]SplitTarget, 0, 4, context.temp_allocator)
-	if link != 0 {
-		for t := 0; t < len(timeline.tracks); t += 1 {
-			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
-				c := &timeline.tracks[t].clips[i]
-				if c.link_id == link &&
-				   clip_visible_at(frame, c.timeline_start_frame, c.source_length_frames) {
-					append(&targets, SplitTarget{t, i})
-				}
-			}
+	for id in selection_targets() {
+		tr, c, ok := find_clip_by_id(id)
+		if !ok {
+			continue
 		}
-	} else {
-		append(&targets, SplitTarget{selection.track, selection.index})
+		if !clip_visible_at(frame, c.timeline_start_frame, c.source_length_frames) {
+			continue
+		}
+		append(&targets, SplitTarget{track_index_of(tr), clip_index_on_track(tr, c), c.link_id})
 	}
 	if len(targets) == 0 {
 		return
 	}
+	// One fresh link id per ORIGINAL group. A single shared id would give every
+	// selected group's right halves the same group, so splitting two clips that
+	// were never linked would silently LINK those two groups together.
+	right_links := make(map[u64]u64, context.temp_allocator)
+	defer delete(right_links)
+	undo_begin()
 	// Descending index order per track so injecting a right half never
 	// invalidates a still-pending target's index on the same track.
 	for t in 0 ..< len(targets) {
@@ -1104,6 +1106,11 @@ split_clip_at_playhead :: proc() {
 			continue
 		}
 		c := &tt.clips[target.index]
+		if target.link != 0 {
+			if _, seen := right_links[target.link]; !seen {
+				right_links[target.link] = new_clip_id()
+			}
+		}
 		left_len := frame - c.timeline_start_frame
 		right_len := c.source_length_frames - left_len
 		if left_len <= 0 || right_len <= 0 {
@@ -1119,7 +1126,7 @@ split_clip_at_playhead :: proc() {
 		// every clip_id-keyed path -- preview slot identity, find_preview_slot,
 		// the prewarm decoder handoff).
 		right.clip_id = new_clip_id()
-		right.link_id = right_link
+		right.link_id = right_links[target.link]
 		// A still image shows the same frame everywhere; its source offset must
 		// stay 0 or the right half would ask the decoder for a frame the image
 		// doesn't have. Only time-varying sources advance the right half's start.
@@ -1151,7 +1158,7 @@ split_clip_at_playhead :: proc() {
 	}
 	when ODIN_DEBUG {
 		if vyper_trace {
-			fmt.printf("[tl] split group link=%d (%d clips) @ %d\n", link, len(targets), frame)
+			fmt.printf("[tl] split %d selected clip(s) @ %d\n", len(targets), frame)
 		}
 	}
 	undo_push(.Split, "Split clip(s)")
@@ -1197,22 +1204,11 @@ unlink_selected_clips :: proc() {
 // cuts/moves/deletes treat them as one unit.
 toggle_links_for_selection :: proc() {
 	_, anchor, ok := selected_clip()
-	ids := make([dynamic]u64, 0, len(selection.extra_set) + 1, context.temp_allocator)
-	if ok && anchor != nil {
-		append(&ids, anchor.clip_id)
-	}
-	for id in selection.extra_set {
-		dup := false
-		for o in ids {
-			if o == id {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			append(&ids, id)
-		}
-	}
+	// The selection, NOT selection_targets(): linking is the action that
+	// CREATES and destroys groups, so expanding through existing links here
+	// would make "join these clips" silently drag in every partner of every
+	// member instead of just the clips the user Shift-clicked.
+	ids := selected_clip_ids()
 	if len(ids) == 0 {
 		return
 	}
@@ -1326,30 +1322,26 @@ clip_ranges_release :: proc(c: ^Clip) {
 // showing the clip(s) (a gap stays where they were). The group scope keeps a cut
 // from leaving its video behind with no audio (or vice versa).
 delete_selected_clip_raw :: proc() {
-	if selection.track < 0 || selection.track >= len(timeline.tracks) {
-		return
-	}
-	track := &timeline.tracks[selection.track]
-	if selection.index < 0 || selection.index >= len(track.clips) {
-		return
-	}
-	undo_begin()
-	link := track.clips[selection.index].link_id
+	// Every selected clip, each expanded to its whole link group, so this is one
+	// edit over one undo node rather than a delete that quietly ignores the rest
+	// of the selection. The targets are resolved to (track, index) HERE, in one
+	// pass, because the removal loop below shifts indices as it goes.
 	Target :: struct {
 		track, index: int,
 	}
 	targets := make([dynamic]Target, 0, 4, context.temp_allocator)
-	if link != 0 {
-		for t := 0; t < len(timeline.tracks); t += 1 {
-			for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
-				if timeline.tracks[t].clips[i].link_id == link {
-					append(&targets, Target{t, i})
-				}
-			}
+	for id in selection_targets() {
+		tr, c, ok := find_clip_by_id(id)
+		if !ok {
+			continue
 		}
-	} else {
-		append(&targets, Target{selection.track, selection.index})
+		ti := track_index_of(tr)
+		append(&targets, Target{ti, clip_index_on_track(tr, c)})
 	}
+	if len(targets) == 0 {
+		return
+	}
+	undo_begin()
 	// Descending (track, index) so a removal on one track never invalidates a
 	// still-pending target's index on the same track.
 	for t in 0 ..< len(targets) {
@@ -1389,11 +1381,10 @@ delete_selected_clip_raw :: proc() {
 	}
 	when ODIN_DEBUG {
 		if vyper_trace {
-			fmt.printf("[tl] deleted clip group link=%d (%d clips)\n", link, len(targets))
+			fmt.printf("[tl] deleted %d selected clip(s) raw\n", len(targets))
 		}
 	}
-	selection.track = -1
-	selection.index = -1
+	clear_clip_selection()
 	// CRITICAL: invalidation MUST follow every delete. The timeline no longer
 	// references `removed`, but the per-clip preview slots still hold this
 	// clip's decoded frames, open decoder, and GPU texture. Without
@@ -1588,39 +1579,84 @@ ripple_delete_linked_group :: proc(link: u64) {
 	if link == 0 {
 		return
 	}
-	MemberSpan :: struct {
-		track:         int,
-		start, length: i64,
-	}
-	spans := make([dynamic]MemberSpan, 0, 4, context.temp_allocator)
+	spans := make([dynamic]Clip_Span, 0, 4, context.temp_allocator)
 	for ti in 0 ..< len(timeline.tracks) {
 		for &c in timeline.tracks[ti].clips {
 			if c.link_id == link {
-				append(&spans, MemberSpan{ti, c.timeline_start_frame, c.source_length_frames})
+				append(&spans, Clip_Span{ti, c.timeline_start_frame, c.source_length_frames})
 			}
 		}
 	}
 	if len(spans) == 0 {
 		return
 	}
-	undo_begin()
-	// Capture the anchor span (the clip the user deleted) before the ripple
-	// invalidates indices and before the selection is cleared below. The
-	// playhead follows that span's shift, the same way the single-region ripple
-	// moves it -- the other members ripple their own lanes, not the playhead's
-	// frame of reference.
-	anchor_start, anchor_len: i64
-	have_anchor := false
-	if selection.track >= 0 &&
-	   selection.track < len(timeline.tracks) &&
-	   selection.index >= 0 &&
-	   selection.index < len(timeline.tracks[selection.track].clips) {
-		anchor := timeline.tracks[selection.track].clips[selection.index]
-		if anchor.link_id == link {
-			anchor_start = anchor.timeline_start_frame
-			anchor_len = anchor.source_length_frames
-			have_anchor = true
+	// The playhead follows the member the user actually clicked, which is the
+	// selection anchor -- the others ripple their own lanes and are not the
+	// playhead's frame of reference.
+	anchor := Clip_Span{-1, 0, 0}
+	if tr, c, ok := selected_clip(); ok && c.link_id == link {
+		anchor = Clip_Span{track_index_of(tr), c.timeline_start_frame, c.source_length_frames}
+	}
+	ripple_delete_spans(spans, anchor, "Delete group", "group")
+}
+
+// ripple_delete_selected deletes every selected clip's timeline area and closes
+// the gap, as one edit.
+//
+// A single UNLINKED clip keeps the every-track region edit it has always been
+// (`ripple_delete_region`): that is a deliberate, separate operation -- remove
+// this range of the timeline everywhere -- and narrowing it to one lane would
+// silently change an established edit. Once the selection is more than one clip,
+// or the clip is linked, each target rips its OWN region on its OWN track, which
+// is what a linked cut already did and what "delete these clips" has to mean: a
+// clip's length is the only thing that says how much timeline it occupied.
+ripple_delete_selected :: proc() {
+	targets := selection_targets()
+	if len(targets) == 0 {
+		return
+	}
+	spans := make([dynamic]Clip_Span, 0, len(targets), context.temp_allocator)
+	for id in targets {
+		tr, c, ok := find_clip_by_id(id)
+		if !ok {
+			continue
 		}
+		append(
+			&spans,
+			Clip_Span{track_index_of(tr), c.timeline_start_frame, c.source_length_frames},
+		)
+	}
+	if len(spans) == 0 {
+		return
+	}
+	// The lone unlinked clip is the every-track edit. `unlinked` is checked from
+	// the resolved clip rather than assumed from len(spans): a selection whose
+	// only member is linked still produced one span per partner.
+	if len(spans) == 1 {
+		if _, c, ok := find_clip_by_id(targets[0]); ok && c.link_id == 0 {
+			ripple_delete_region(spans[0].start, spans[0].length)
+			return
+		}
+	}
+	ripple_delete_spans(spans, spans[0], "Delete selection", "selection")
+}
+
+// ripple_delete_spans is the shared core: remove each span on its own track and
+// close that track's gap, as ONE undo node.
+//
+// Rightmost-first WITHIN a track. That order is what makes the captured spans
+// stay valid: a ripple at `start` only shifts clips at or after `start+length`,
+// so removing the rightmost one first cannot move the region a pending span
+// describes. Left-to-right would delete the wrong footage -- the second span
+// would name coordinates the first ripple had already slid left.
+ripple_delete_spans :: proc(
+	spans: [dynamic]Clip_Span,
+	anchor: Clip_Span,
+	label: string,
+	what: string,
+) {
+	if len(spans) == 0 {
+		return
 	}
 	// Sort by (track asc, start DESC).
 	for a in 0 ..< len(spans) {
@@ -1633,16 +1669,19 @@ ripple_delete_linked_group :: proc(link: u64) {
 			}
 		}
 	}
+	undo_begin()
 	for s in spans {
+		if s.track < 0 || s.track >= len(timeline.tracks) || s.length <= 0 {
+			continue
+		}
 		ripple_delete_track_region(s.track, s.start, s.length)
 	}
-	if have_anchor {
-		ripple_playhead_after_region(
-			anchor_start,
-			anchor_start + anchor_len,
-			anchor_len,
-		)
+	if anchor.track >= 0 && anchor.length > 0 {
+		ripple_playhead_after_region(anchor.start, anchor.start + anchor.length, anchor.length)
 	}
+	// The edit may have removed the dragged clip and the decoded state cached
+	// for it: cancel any in-flight drag and drop the preview slots so the next
+	// update re-derives them purely from the edited timeline.
 	active_interaction = .None
 	clip_move.clip = nil
 	clip_move.source_track = -1
@@ -1651,13 +1690,29 @@ ripple_delete_linked_group :: proc(link: u64) {
 	invalidate_preview_slots()
 	when ODIN_DEBUG {
 		if vyper_trace {
-			fmt.printf("[tl] ripple delete linked group link=%d (%d members)\n", link, len(spans))
+			fmt.printf("[tl] ripple delete %s: %d span(s)\n", what, len(spans))
 		}
 	}
+	// Every selected clip is gone, so the whole selection goes: leaving a
+	// Shift-clicked id behind would have the next action resolve to nothing and
+	// report an empty edit.
+	clear_clip_selection()
+	undo_push(.Delete, label)
+	audio_note_edit()
+}
+
+// Clip_Span is one target's own footprint on one track: the region to remove,
+// and by how much that track's gap closes.
+Clip_Span :: struct {
+	track:         int,
+	start, length: i64,
+}
+
+// clear_clip_selection drops the anchor and every Shift-clicked clip.
+clear_clip_selection :: proc() {
 	selection.track = -1
 	selection.index = -1
-	undo_push(.Delete, "Delete group")
-	audio_note_edit()
+	clear(&selection.extra_set)
 }
 
 // ruler_steps returns minor/major tick strides (in frames) for a timeline of the
@@ -1679,6 +1734,81 @@ selected_clip :: proc() -> (^Track, ^Clip, bool) {
 		}
 	}
 	return nil, nil, false
+}
+
+// selected_clip_ids returns the clip selection as clip IDs: the anchor first,
+// then every Shift+clicked clip, deduplicated. Shared by every per-clip action,
+// so "what does Backspace act on" has one answer in the editor rather than one
+// per action.
+//
+// IDs, never (track, index) pairs: every action this feeds REMOVES or SPLITS
+// clips, and the first removal invalidates every later index on that track. An
+// id survives -- find_clip_by_id resolves it, and a clip deleted out from under
+// the set reads as "gone" rather than aliasing whatever slid into its slot.
+selected_clip_ids :: proc() -> [dynamic]u64 {
+	ids := make([dynamic]u64, 0, len(selection.extra_set) + 1, context.temp_allocator)
+	if _, anchor, ok := selected_clip(); ok && anchor != nil {
+		append(&ids, anchor.clip_id)
+	}
+	for id in selection.extra_set {
+		dup := false
+		for o in ids {
+			if o == id {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			append(&ids, id)
+		}
+	}
+	return ids
+}
+
+// selection_targets returns the clips a per-clip action actually applies to:
+// the selection, each expanded to its WHOLE link group.
+//
+// The expansion is why acting on one member of a linked group is not the user
+// acting on that member alone -- a link says these move together, so a cut that
+// left the partner behind would desync A/V, which is the whole thing linking
+// exists to prevent. Two selected members of one group collapse to that group
+// once, so a group is never acted on twice.
+//
+// Order is anchor-first and then discovery order, which is what makes the
+// FIRST entry the clip the user actually clicked: actions that need a reference
+// span (the playhead follows the deleted region) read entry 0.
+selection_targets :: proc() -> [dynamic]u64 {
+	ids := selected_clip_ids()
+	out := make([dynamic]u64, 0, len(ids) + 2, context.temp_allocator)
+	for id in ids {
+		tr, c, ok := find_clip_by_id(id)
+		if !ok {
+			// Selected, then deleted by an earlier step of the same action.
+			continue
+		}
+		if c.link_id == 0 {
+			append_unique_id(&out, id)
+			continue
+		}
+		link := c.link_id
+		for ti in 0 ..< len(timeline.tracks) {
+			for &other in timeline.tracks[ti].clips {
+				if other.link_id == link {
+					append_unique_id(&out, other.clip_id)
+				}
+			}
+		}
+	}
+	return out
+}
+
+append_unique_id :: proc(list: ^[dynamic]u64, id: u64) {
+	for o in list^ {
+		if o == id {
+			return
+		}
+	}
+	append(list, id)
 }
 
 // clip_at_frame returns the first clip across all tracks whose timeline span
