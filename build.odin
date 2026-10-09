@@ -21,7 +21,8 @@ package main
 //	check    typecheck only; nothing is compiled, no build flags apply
 //	debug    a debug binary (the default)
 //	release  an optimised binary, with every probe proven gated out
-//	run      compile and run without writing a binary
+//	run      a debug build run in place -- same prerequisites and flags as
+//	         debug, but no binary is written
 //	install  a release binary, plus the FHS copy into $INSTALL_PREFIX
 //
 // There is no separate "build" mode: it named the same thing as debug, and two
@@ -117,6 +118,7 @@ check_mode :: proc() {
 }
 
 run_mode :: proc() {
+	build_prereqs()
 	run_or_die(odin_tool(), odin_args("run", "", DEBUG_FLAGS[:]), "run")
 }
 
@@ -132,12 +134,25 @@ build_mode :: proc(mode: string) {
 	if mode == "release" {
 		assert_probes_gated()
 	}
-	build_shaders()
-	build_c_deps()
+	build_prereqs()
 	out := output_path(mode)
 	mkdir_of(out)
 	run_or_die(odin_tool(), odin_args("build", out, opt), "build")
 	fmt.printf("==> Done: %s\n", out)
+}
+
+// build_prereqs is what every compiling mode owes the run: current SPIR-V and a
+// current clay archive, built from source, every time.
+//
+// `run` skipping these is what it used to do, and it made a run's output depend
+// on whatever was left in the tree -- edit a .frag, run, and the previous
+// shader's results come back labelled as the new ones. That is the same
+// stale-.spv dependency build_mode's comment says was removed, reappearing in the
+// one mode nobody diffs. One proc, so `run` and the build modes cannot drift
+// apart again.
+build_prereqs :: proc() {
+	build_shaders()
+	build_c_deps()
 }
 
 // install_mode is a release build plus the FHS copy, which is what the nix
@@ -622,7 +637,22 @@ run :: proc(tool: string, args: []string) -> int {
 	for a in args {
 		append(&command, a)
 	}
-	process, err := os.process_start({command = command[:]})
+	// stdin/stdout/stderr are handed over EXPLICITLY, and that is load-bearing.
+	// os.process_start does NOT inherit this process' terminal: a nil stream
+	// field makes core:os open /dev/null for it (process_linux.odin, the
+	// `desc.stdout != nil` fork), and the docs say it outright -- "Passing a nil
+	// will shut down the process' stdout output". So a nil here does not merely
+	// drop the child's output, it sends the app to /dev/null: `./build.odin run`
+	// started the editor and returned a silent exit with not one log line, while
+	// the same binary run directly logged normally. Every child here inherits,
+	// because a build script that cannot see what its compiler is saying is
+	// guessing, and `run` is the mode that exists to show output.
+	process, err := os.process_start({
+		command = command[:],
+		stdin   = os.stdin,
+		stdout  = os.stdout,
+		stderr  = os.stderr,
+	})
 	if err != nil {
 		fmt.eprintf("error: could not run %s: %v\n", tool, err)
 		return -1

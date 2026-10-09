@@ -8551,3 +8551,39 @@ not for scrubbing.
   audio device, so a drag faster than 1x outruns it and the scrub audio lags -- but at
   normal pitch, so the content stays recognizable. That lag is the device clock, not a
   pitch shift.
+
+## Active 49 — `./build.odin run` produced no output at all, and skipped its prerequisites
+
+**Status: FIXED, uncommitted.** Reported as "i dont see any logging at all".
+
+### Two separate defects, both in the same proc
+
+- [x] **`run` did not build the prerequisites.** `run_mode` jumped straight to the
+  compile, skipping `build_shaders()` and `build_c_deps()`. `build_mode` calls both, so
+  a `run` consumed whatever `.spv` and `clay.a` were already in the tree -- the exact
+  stale-SPIR-V dependency that `build_mode`'s own comment says was removed ("edit a
+  .frag, build without recompiling, and the run reports the previous shader's results
+  as the new one"). Both modes now call one `build_prereqs()`, so they cannot drift
+  apart again.
+- [x] **Every child process ran with all three streams on `/dev/null`.**
+  `os.process_start({command = ...})` leaves `stdin`/`stdout`/`stderr` nil, and
+  core:os does not inherit this process' terminal for a nil stream: it opens
+  `/dev/null` (`process_linux.odin`, the `desc.stdout != nil` fork branch). The docs
+  say so directly -- "Passing a `nil` will shut down the process' stdout output."
+  So the editor started and returned a **silent** exit, while the same binary run
+  directly logged normally. `run()` now passes `os.stdin/stdout/stderr`.
+
+### Why this was invisible for so long
+
+It was not specific to `run`. Every child this script spawns was muted the same way:
+`odin`, `glslangValidator`, `clang`, `ar`, `install`. `run_or_die` prints its own
+message on a non-zero exit, so a *failing* child was still legible -- it was only the
+success path, which is all output, that went dark. `glslang`'s shader names landed on
+stderr and were being discarded; they are visible now.
+
+### Verified
+
+`./build.odin run`: 67 bytes of output before, 297,995 bytes after -- `[diag] temp
+dir`, `[flash-rec] ENABLED`, miniaudio device ready, `[audio] producer thread up`, 9
+`[ui] fps=` ticks over ~18 s, then a clean `[action-log] recorded 2412 frames` on
+window close (exit 0, not a crash). `./scripts/gate.sh check` clean.
