@@ -8755,3 +8755,45 @@ two replay runs. It is nondeterministic (0/5 on a later sweep), the render gates
 0/3. Left alone rather than chased -- a scissor-rect assertion in the GPU backend
 is not something a selection change should be able to reach, and "fixing" it
 without a reproduction would be a workaround, which AGENTS.md §3b forbids.
+
+### Active 50d — A multi-selection could not be dragged
+
+**Status: FIXED, uncommitted.** "clicking + drag should not single select clip.
+currently you cant drag multiple selected clips."
+
+The clip press called `select_clip(track_idx, index)` unconditionally, which
+REPLACES the whole selection with the one clip under the pointer. So pressing a
+clip that was already part of a multi-selection threw the rest of it away before
+the drag began, and the drag set was captured from that single clip. Dragging one
+clip of a selection moved exactly one clip.
+
+- [x] **The press keeps the selection when the pressed clip is already in it.**
+  A clip outside the selection still becomes the sole selection, so a drag moves
+  exactly what the user can see is selected. The drag set is then
+  `selection_targets()` -- the whole selection, each clip expanded to its link
+  group -- rather than the anchor's link group alone.
+- [x] **`capture_drag_orig(ids)`** is the shared capture: it snapshots the
+  original (track, start, length) of a set of clip ids, anchor first, because the
+  drag delta is measured from `group_orig[0].start`. `capture_link_group` is now
+  a special case of it, so a link group and a multi-selection cannot drift apart
+  in how they are captured.
+- [x] **A click collapses; a drag does not.** A press that never moved is a CLICK,
+  and releasing it on a member of a multi-selection narrows the selection to that
+  clip -- so the next action (delete, split, rename) applies to what is under
+  the pointer rather than to a selection the user may have forgotten was there.
+  A drag keeps the whole set and moves it together. The decision is
+  `click_collapses_selection(moved)`, extracted so it is testable without the
+  SDL/Clay press-release path.
+- [x] **A vertical drop of a multi-selection moves clip by clip.** It used to test
+  `len(group_orig) > 1` and call `move_linked_group`, which is wrong for a set of
+  unrelated clips. `drag_set_is_link_group()` now decides: one linked group moves
+  as a unit, anything else is moved clip by clip (re-resolved by id, because each
+  move shifts the indices behind it).
+
+Verified: `timeline_probe` green with two new tests -- a three-clip
+multi-selection drag where every member follows the anchor's delta, and the
+click/drag collapse decision. The user's recording contains no drags (0 drag
+lines, 5 shift-clicks, 1 scrub), so the replay cannot exercise this path; the
+probe is the coverage. Gates: `check`, `timeline_probe`, `action_log`,
+`dnd_probe`, `transform_probe`, `session_trk_probe`, `still_switch`,
+`keyframe_probe`, `smoke`, `probe`, `undo_valgrind`.

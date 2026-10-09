@@ -890,21 +890,38 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 					}
 					return true
 				}
-					// Plain click = sole selection. Keep the anchor in extra_set
-					// so the next Shift+click preserves it when changing anchor.
+				// A clip that is ALREADY part of the multi-selection keeps the whole
+				// selection and drags it together; a clip outside the selection
+				// becomes the sole selection. Either way a drag moves exactly what the
+				// user can see is selected. Collapsing to one clip here is what made
+				// a multi-selection undraggable: the press threw the rest of it away
+				// before the drag had begun.
+				cid := track.clips[index].clip_id
+				in_selection := cid in selection.extra_set
+				if !in_selection {
+					// Keep the anchor in extra_set so the next Shift+click
+					// preserves it when changing anchor.
 					select_clip(track_idx, index)
-					clip_move.group_delta = 0
-					clip_move.lane_dwell = 0
-					clip_move.clip = &track.clips[index]
-					clip_move.source_track = track_idx
-					clip_move.source_index = index
-					clip_move.hover_track = track_idx
-					undo_begin()
-					active_interaction = .Clip_Move
-					clip_move.offset =
-						inp.x -
-						clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox.x
+				}
+				clip_move.group_delta = 0
+				clip_move.lane_dwell = 0
+				clip_move.clip = &track.clips[index]
+				clip_move.source_track = track_idx
+				clip_move.source_index = index
+				clip_move.hover_track = track_idx
+				undo_begin()
+				active_interaction = .Clip_Move
+				clip_move.offset =
+					inp.x -
+					clay.GetElementData(clay.ID("TimelineClip", u32(track_idx * 1000 + index))).boundingBox.x
+				// The drag set is the whole selection when the pressed clip belongs to
+				// it, so a multi-selection drags as one; otherwise it is the clip's
+				// own link group.
+				if in_selection {
+					capture_drag_orig(selection_targets())
+				} else {
 					capture_link_group(clip_move.clip, track_idx)
+				}
 					// Alt at PRESS latches the gesture as a ripple move: every
 					// clip at or after the anchor shifts with it. Captured here,
 					// before any frame of live movement, so the set is the
@@ -1318,6 +1335,33 @@ if inp.left && !prev_mouse_down {
 }
 }
 
+// clip_move_drag_moved reports whether the gesture actually relocated anything.
+// A press that never moved is a CLICK, not a drag, and the two mean different
+// things for the selection: a click on a member of a multi-selection collapses
+// the selection to that clip, a drag moves the whole set.
+clip_move_drag_moved :: proc() -> bool {
+	if clip_move.ripple {
+		// The applied delta IS the change: a ripple that clamped to delta 0
+		// moved nothing, and a vertical staging that ended on the source lane
+		// moved nothing. Read it rather than the anchor's live start -- a
+		// vertical drop has already relocated the anchor by the time this runs,
+		// so its start no longer says anything about what the drag did.
+		return clip_move.ripple_delta != 0 ||
+			(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
+	}
+	if len(clip_move.group_orig) > 1 {
+		return clip_move.group_delta != 0 ||
+			(clip_move.hover_track >= 0 &&
+				clip_move.hover_track != clip_move.source_track &&
+				order_row_of(clip_move.hover_track) != order_row_of(clip_move.source_track))
+	}
+	if len(clip_move.group_orig) > 0 && clip_move.clip != nil {
+		return clip_move.clip.timeline_start_frame != clip_move.group_orig[0].start ||
+			(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
+	}
+	return false
+}
+
 // Release path: run the per-gesture commit, then drop the gesture payload.
 // #partial because several gestures need no commit on release.
 interaction_release :: proc(inp: Mouse_Input) {
@@ -1330,18 +1374,45 @@ interaction_release :: proc(inp: Mouse_Input) {
 	case .Track_Drag:
 		end_track_drag()
 	case .Clip_Move:
+		moved := clip_move_drag_moved()
+		// A press that never moved is a CLICK, not a drag. Clicking a clip that is
+		// part of a multi-selection collapses the selection to that one clip, so the
+		// next action (delete, split, rename) applies to the clip under the pointer
+		// rather than to a selection the user may have forgotten was there. A drag
+		// keeps the whole selection and moves it together -- the press already
+		// captured the whole set for exactly that.
+		if click_collapses_selection(moved) {
+			select_clip(clip_move.source_track, clip_move.source_index)
+		}
 		// Commit a vertical drop if the ghost hovers another track;
 		// horizontal drags already applied their new start live.
 		if clip_move.hover_track != clip_move.source_track &&
 		   clip_move.hover_track >= 0 &&
 		   clip_move.source_track >= 0 {
-			if len(clip_move.group_orig) > 1 {
+			if drag_set_is_link_group() {
 				// Vertical drop for a linked group is measured in VISUAL rows:
 				// the group shifts by the number of stack rows between the
 				// anchor's source track and the hovered lane, regardless of
 				// storage order.
 				delta_rows := order_row_of(clip_move.hover_track) - order_row_of(clip_move.source_track)
 				move_linked_group(delta_rows)
+			} else if len(clip_move.group_orig) > 1 {
+				// A multi-selection of unrelated clips has no unit to move, so each
+				// clip goes on its own. Re-resolved by id because every move shifts
+				// the indices behind it, and each keeps its own start so the
+				// selection's relative layout survives the drop.
+				for orig in clip_move.group_orig {
+					tr, c, ok := find_clip_by_id(orig.clip_id)
+					if !ok {
+						continue
+					}
+					move_clip_to_track(
+						track_index_of(tr),
+						clip_index_on_track(tr, c),
+						clip_move.hover_track,
+						orig.start,
+					)
+				}
 			} else {
 				move_clip_to_track(
 					clip_move.source_track,
@@ -1355,28 +1426,6 @@ interaction_release :: proc(inp: Mouse_Input) {
 		// same-track drags already applied their start live, so compare
 		// against the capture-time snapshot.
 		{
-			moved := false
-			if clip_move.ripple {
-				// The applied delta IS the change: a ripple that clamped to
-				// delta 0 moved nothing, and a vertical staging that ended on
-				// the source lane moved nothing. Read it rather than the
-				// anchor's live start — a vertical drop has already relocated
-				// the anchor by the time this runs, so its start no longer
-				// says anything about what the drag did.
-				moved =
-					clip_move.ripple_delta != 0 ||
-					(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
-			} else if len(clip_move.group_orig) > 1 {
-				moved =
-					clip_move.group_delta != 0 ||
-					(clip_move.hover_track >= 0 &&
-						clip_move.hover_track != clip_move.source_track &&
-						order_row_of(clip_move.hover_track) != order_row_of(clip_move.source_track))
-			} else if len(clip_move.group_orig) > 0 && clip_move.clip != nil {
-				moved =
-					clip_move.clip.timeline_start_frame != clip_move.group_orig[0].start ||
-					(clip_move.hover_track >= 0 && clip_move.hover_track != clip_move.source_track)
-			}
 			if moved {
 				label := "Move clip"
 				if clip_move.ripple {

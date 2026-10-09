@@ -2482,6 +2482,68 @@ when ODIN_DEBUG {
 		tl_probe_check(len(selected_clip_ids()) == 0, "empty-space deselect: selected_clip_ids should be empty, got %d", len(selected_clip_ids()))
 	}
 
+	// A multi-selection drags as ONE. The press captures the whole selection and
+	// every member follows the anchor's delta. This is the case that used to be
+	// impossible: the press collapsed the selection to the anchor before the drag
+	// began, so dragging one clip of a selection moved exactly one clip.
+	test_multi_selection_drag :: proc() {
+		timeline = Timeline {
+			tracks = make([dynamic]Track, 0, 1, context.temp_allocator),
+		}
+		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 4, context.temp_allocator)})
+		append(&timeline.tracks[0].clips, mk_tl_clip(5001, 0, 0, 50, 0, .Video))
+		append(&timeline.tracks[0].clips, mk_tl_clip(5002, 0, 0, 50, 100, .Video))
+		append(&timeline.tracks[0].clips, mk_tl_clip(5003, 0, 0, 50, 200, .Video))
+		selection.track = 0
+		selection.index = 0
+		clear(&selection.extra_set)
+		selection.extra_set[5001] = true
+		selection.extra_set[5002] = true
+		selection.extra_set[5003] = true
+
+		capture_drag_orig(selection_targets())
+		tl_probe_check(len(clip_move.group_orig) == 3, "drag set: want 3 clips, got %d", len(clip_move.group_orig))
+		tl_probe_check(clip_move.group_orig[0].clip_id == 5001, "drag set: the anchor must lead")
+
+		clip_move.clip = &timeline.tracks[0].clips[0]
+		clip_move.clip.timeline_start_frame = 10
+		apply_group_drag_to_members(10)
+		tl_probe_check(
+			timeline.tracks[0].clips[0].timeline_start_frame == 10,
+			"drag: anchor should be at 10, got %d",
+			timeline.tracks[0].clips[0].timeline_start_frame,
+		)
+		tl_probe_check(
+			timeline.tracks[0].clips[1].timeline_start_frame == 110,
+			"drag: member should follow to 110, got %d",
+			timeline.tracks[0].clips[1].timeline_start_frame,
+		)
+		tl_probe_check(
+			timeline.tracks[0].clips[2].timeline_start_frame == 210,
+			"drag: member should follow to 210, got %d",
+			timeline.tracks[0].clips[2].timeline_start_frame,
+		)
+	}
+
+	// A press that never moved is a click, and a click on a member of a
+	// multi-selection narrows the selection to that clip. A drag does not.
+	test_click_collapses_selection :: proc() {
+		tl_multi_scene()
+		select_clips(0, 0, 4002)
+		capture_drag_orig(selection_targets())
+		tl_probe_check(click_collapses_selection(false), "click: a press that never moved on a multi-selection should collapse")
+		tl_probe_check(!click_collapses_selection(true), "drag: a press that moved must NOT collapse")
+
+		// A single clip is already the whole selection; collapsing it is a no-op
+		// and must not be reported as one. 4003 is the unlinked clip in
+		// tl_multi_scene -- 4001 is linked to 4002, so selecting it alone would
+		// expand to a group of two and is not the lone-clip case at all.
+		tl_multi_scene()
+		select_clips(0, 1)
+		capture_drag_orig(selection_targets())
+		tl_probe_check(!click_collapses_selection(false), "click: a lone clip is already sole-selected")
+	}
+
 	timeline_probe_run :: proc(_: string) {
 		tl_scene()
 		test_fps_reflow()
@@ -2630,6 +2692,12 @@ when ODIN_DEBUG {
 		tl_multi_scene()
 		test_shift_click_takes_link_group()
 		fmt.println("[tl-probe] shift-click-takes-link-group ok")
+
+		test_multi_selection_drag()
+		fmt.println("[tl-probe] multi-selection-drag ok")
+
+		test_click_collapses_selection()
+		fmt.println("[tl-probe] click-collapses-selection ok")
 
 		// Reorder-by-gap semantics of move_track_to_row: target_row is the visual
 		// stack position (0 = top, len = bottom); the same-row gap (src_row) and the

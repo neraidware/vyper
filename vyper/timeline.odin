@@ -2030,20 +2030,70 @@ drag_orig_of :: proc(clip: ^Clip, track: int) -> Drag_Group_Orig {
 // its own whole group, e.g. single-lane media). Call at gesture start, before any
 // mutation: the captured originals are the invariant the group delta is computed
 // against on every following frame.
-capture_link_group :: proc(clip: ^Clip, track: int) {
+// click_collapses_selection decides whether releasing a Clip_Move that never
+// moved should collapse a multi-selection down to the clicked clip.
+//
+// A press that never moved is a CLICK, not a drag, and the two mean different
+// things for the selection: a click on a member of a multi-selection narrows to
+// that clip so the next action applies to what is under the pointer, while a
+// drag moves the whole set. Extracted so the decision is testable without the
+// SDL/Clay press-release path that drives it.
+click_collapses_selection :: proc(moved: bool) -> bool {
+	return !moved && len(clip_move.group_orig) > 1 && clip_move.clip != nil
+}
+
+// capture_drag_orig snapshots the original (track, start, length) of every clip
+// in `ids`, in the order given. This is the set a drag shifts: the anchor leads
+// because the drag delta is measured from group_orig[0].start.
+capture_drag_orig :: proc(ids: [dynamic]u64) {
 	clear(&clip_move.group_orig)
+	for id in ids {
+		tr, c, ok := find_clip_by_id(id)
+		if !ok {
+			continue
+		}
+		append(&clip_move.group_orig, drag_orig_of(c, track_index_of(tr)))
+	}
+}
+
+ capture_link_group :: proc(clip: ^Clip, track: int) {
 	if clip.link_id == 0 {
+		ids := make([dynamic]u64, 0, 1, context.temp_allocator)
+		append(&ids, clip.clip_id)
+		capture_drag_orig(ids)
 		return
 	}
-	append(&clip_move.group_orig, drag_orig_of(clip, track))
+	ids := make([dynamic]u64, 0, 4, context.temp_allocator)
+	append(&ids, clip.clip_id)
 	for t := 0; t < len(timeline.tracks); t += 1 {
 		for i := 0; i < len(timeline.tracks[t].clips); i += 1 {
 			c := &timeline.tracks[t].clips[i]
 			if c.link_id == clip.link_id && c.clip_id != clip.clip_id {
-				append(&clip_move.group_orig, drag_orig_of(c, t))
+				append(&ids, c.clip_id)
 			}
 		}
 	}
+	capture_drag_orig(ids)
+}
+
+// drag_set_is_link_group reports whether the captured drag set is ONE linked
+// group, which is the only case a vertical drop can move as a unit. A
+// multi-selection of unrelated clips is not, and has to move clip by clip.
+drag_set_is_link_group :: proc() -> bool {
+	if len(clip_move.group_orig) < 2 {
+		return false
+	}
+	_, anchor, ok := find_clip_by_id(clip_move.group_orig[0].clip_id)
+	if !ok || anchor.link_id == 0 {
+		return false
+	}
+	for o in clip_move.group_orig {
+		_, c, ok := find_clip_by_id(o.clip_id)
+		if !ok || c.link_id != anchor.link_id {
+			return false
+		}
+	}
+	return true
 }
 
 // apply_group_drag_to_members shifts every non-anchor member by the anchor's
