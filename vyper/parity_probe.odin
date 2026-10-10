@@ -1190,16 +1190,16 @@ when ODIN_DEBUG {
 			source_h = 96,
 		})
 		clip := &timeline.tracks[nt].clips[0]
-		// transform as one packed section, which is the form a user's own
-		// "keyframe transform" press mints: two lanes in a single knot, so the
-		// snapshot has to unpack it per lane.
-		packed: [KF_PACK_MAX]f32
-		packed[0] = 40
-		packed[1] = 60
-		keyframe_geom_set_packed(clip, "transform", 0, packed, 0b11)
-		packed[0] = 200
-		packed[1] = 140
-		keyframe_geom_set_packed(clip, "transform", 19, packed, 0b11)
+		// transform as a section, which is the form a user's own "keyframe
+		// transform" press mints: one track owning both axes as separate lanes.
+		transform_start: [KF_GEOM_GROUP_MAX]f32
+		transform_start[0] = 40
+		transform_start[1] = 60
+		keyframe_geom_set_group_value(clip, "transform", 0, transform_start)
+		transform_end: [KF_GEOM_GROUP_MAX]f32
+		transform_end[0] = 200
+		transform_end[1] = 140
+		keyframe_geom_set_group_value(clip, "transform", 19, transform_end)
 		// opacity as its own scalar lane, so both storage forms are in the snapshot.
 		keyframe_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 0, 1.0)
 		keyframe_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 19, 0.25)

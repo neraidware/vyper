@@ -244,9 +244,10 @@ when ODIN_DEBUG {
 			"keyframe selection recorded",
 			fail,
 		)
-		if kcl, klane, k, kok := keyframe_selected(); kok {
+		if kcl, track_index, lane_index, k, kok := keyframe_selected(); kok {
 			rcheck(
-				kcl == clip0 && klane == 0 && k.frame_off == 5 && k.value == 100.0,
+				kcl == clip0 && track_index == 0 && lane_index == 0 &&
+				k.frame_off == 5 && k.value == 100.0,
 				"keyframe_selected resolves the picked key",
 				fail,
 			)
@@ -322,7 +323,7 @@ when ODIN_DEBUG {
 		// OLD indices would alias the newly inserted key.
 		keyframe_select(0, 0, 0, 0, 0)
 		keyframe_geom_set_lane_key(clip0, "transform.x", 1, 60.0)
-		_, _, _, stale_ok := keyframe_selected()
+		_, _, _, _, stale_ok := keyframe_selected()
 		rcheck(!stale_ok, "insert before the selected key kills the selection (structure gen)", fail)
 
 		// --- S4: add / move / delete round-trips + the no-op click --------------
@@ -378,20 +379,28 @@ when ODIN_DEBUG {
 		base_fixture :: proc() {
 			cl := &timeline.tracks[0].clips[0]
 			cl.timeline_start_frame = 10
-			// Return exclusive keys and track slots before resetting fixture's rows.
+			// Return exclusive key arrays and track slots before resetting the
+			// fixture's rows. The release goes through keyframe_track_release_lanes,
+			// which walks LANES: a track owns one key array per lane now, so freeing
+			// only lane 0 would leak the rest.
 			for i in 0..<cl.keyframe_tracks.n {
-				tr := session_trk_view_mut(&cl.keyframe_tracks, i)
-				// Lane names are pool handles (TODO.md Active 19); only keys are owned.
-				if !tr.keys.shared { session_kf_release(tr.keys) }
+				keyframe_track_release_lanes(session_trk_view_mut(&cl.keyframe_tracks, i))
 			}
 			session_trk_release_range(cl.keyframe_tracks)
 			cl.keyframe_tracks = Keyframe_Track_Range{}
-			session_trk_push(&cl.keyframe_tracks, Keyframe_Track{name = session_str_intern("transform.x")})
+			// "transform.x" is a LANE name: the store keys it on the section track
+			// "transform" at lane 0, so that is the track the fixture seeds. Pushing
+			// a track literally named "transform.x" would create an orphan row no
+			// consumer ever samples.
+			session_trk_push(&cl.keyframe_tracks, Keyframe_Track{name = session_str_intern("transform")})
 			session_trk_push(&cl.keyframe_tracks, Keyframe_Track{name = session_str_intern("scale")})
 			keyframe_geom_set_lane_key(cl, "transform.x", 10, 1.0)
 			keyframe_geom_set_lane_key(cl, "transform.x", 20, 2.0)
 			keyframe_geom_set_lane_key(cl, "scale", 5, 1.0)
-			session_kf_at_ptr(session_trk_view(cl.keyframe_tracks,0).keys,1).interp = .Elastic
+			session_kf_at_ptr(
+				keyframe_lane_view(session_trk_view(cl.keyframe_tracks, 0), 0),
+				1,
+			).interp = .Elastic
 			keyframe_geom_set_lane_key(cl, "transform.x", 50, 3.0)
 			undo_init()
 		}
@@ -402,12 +411,24 @@ when ODIN_DEBUG {
 		// as the user's action rather than as index arithmetic. keyframe_select_add is the
 		// Shift+click path's body; the HOVERED SET comes from keyframe_keys_at, which
 		// needs a laid-out frame the probe has no run of.
-		all4 := [4]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 1, 0}}
-		pair := [2]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 1}}
+		// Track 0 is "transform" (lane 0 = transform.x), track 1 is "scale".
+		all4 := [4]Keyframe_Ref{
+			{0, 0, 0, 0, 0},
+			{0, 0, 0, 0, 1},
+			{0, 0, 0, 0, 2},
+			{0, 0, 1, 0, 0},
+		}
+		pair := [2]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 0, 1}}
 		keyframe_select_all :: proc(refs: []Keyframe_Ref) {
 			// A press: sole selection on the first, union for the rest, then arm the
 			// move exactly as the press handler does.
-			keyframe_select(refs[0].track_idx, refs[0].clip_index, refs[0].lane, refs[0].key)
+			keyframe_select(
+				refs[0].track_idx,
+				refs[0].clip_index,
+				refs[0].keyframe_track,
+				refs[0].keyframe_lane,
+				refs[0].key,
+			)
 			if len(refs) > 1 {
 				keyframe_select_add(refs[1:])
 			}
@@ -426,7 +447,7 @@ when ODIN_DEBUG {
 		)
 		keyframe_select_add(all4[1:2])
 		rcheck(keyframe_sel_count() == 4, "adding an already-selected key is a no-op (no duplicate)", fail)
-		_, _, _, multi_one := keyframe_selected()
+		_, _, _, _, multi_one := keyframe_selected()
 		rcheck(!multi_one, "keyframe_selected refuses a multi-selection (no half-resolve to key[0])", fail)
 		rcheck(
 			selection.track == -1 && selection.index == -1,
@@ -518,12 +539,19 @@ when ODIN_DEBUG {
 		)
 		rcheck(keyframe_sel_count() == 4, "the whole set is re-selected after the move", fail)
 		sorted_ok := true
-		for lane in 0 ..< clip0.keyframe_tracks.n {
-			keys := session_trk_view(clip0.keyframe_tracks,lane).keys
-			kn := keys.n
-			for ki in 1..<kn {
-				sorted_ok &= session_kf_at(keys, ki-1).frame_off < session_kf_at(keys, ki).frame_off
+		for row in 0 ..< keyframe_clip_rows(clip0.keyframe_tracks) {
+			track_index, lane_index := keyframe_clip_row(clip0.keyframe_tracks, row)
+			keys := keyframe_lane_view(
+				session_trk_view(clip0.keyframe_tracks, track_index),
+				lane_index,
+			)
+			keys_view := session_kf_view(keys)
+			for key_index in 1 ..< keys.n {
+				sorted_ok &=
+					session_kf_at(keys, key_index - 1).frame_off <
+					session_kf_at(keys, key_index).frame_off
 			}
+			_ = keys_view
 		}
 		rcheck(sorted_ok, "every lane comes back sorted and frame-unique", fail)
 		keyframe_snaps_drop(&keyframe_move.snaps)
@@ -590,7 +618,7 @@ when ODIN_DEBUG {
 			fail,
 		)
 		keyframe_snaps_drop(&keyframe_move.snaps)
-		wide_clamp := [2]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 2}}
+		wide_clamp := [2]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 0, 2}}
 		keyframe_select_all(wide_clamp[:])
 		keyframe_probe_commit_move(10)
 		rcheck(undo_count() == 1, "the same delta over a wider selection DOES commit", fail)

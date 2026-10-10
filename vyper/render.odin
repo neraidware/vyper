@@ -701,6 +701,43 @@ keyframe_geom_set_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, va
 	keyframe_set_key(clip, name, frame_off, value)
 }
 
+// keyframe_geom_lane_location resolves a consumer property name to the (track
+// index, lane index) its curve lives at, or found=false when the clip has no
+// such curve yet. Every read and write of a keyed geometry property goes through
+// this or one of the set/sample wrappers, so "which lane is transform.y" is
+// answered in exactly one place.
+keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track, lane: int, found: bool) {
+	track_name := name
+	lane_index := 0
+	if sec_index, lane_of_section, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		track_name = defs[sec_index].name
+		lane_index = lane_of_section
+	}
+	track_index := keyframe_track_index(clip^, track_name)
+	if track_index < 0 {
+		return -1, -1, false
+	}
+	if lane_index >= len(session_trk_view(clip.keyframe_tracks, track_index).lanes) {
+		return -1, -1, false
+	}
+	return track_index, lane_index, true
+}
+
+// keyframe_geom_del_lane_key is the delete twin of keyframe_geom_set_lane_key: it
+// removes the key at frame_off from the lane `name` identifies. A lane name
+// resolves to its section's track and lane index; a plain property deletes from
+// its own track. The geometry layer owns that mapping, so the store keeps
+// accepting track names only.
+keyframe_geom_del_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		keyframe_del_lane_key(clip, defs[sec_index].name, i32(lane_index), frame_off)
+		return
+	}
+	keyframe_del_key(clip, name, frame_off)
+}
+
 // keyframe_geom_set_group_value records a WHOLE-GROUP key: every lane of section `sec`
 // gets a key at frame_off. This is the old keyframe_geom_set_packed with no mask and
 // no union — a group key is N independent scalar writes, so a lane that is not
@@ -773,7 +810,9 @@ keyframe_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) 
 		if si < 0 {
 			return 0, 0
 		}
-		keys := session_kf_view(keyframe_lane_view(&session_trk_view(clip.keyframe_tracks, si), li))
+		keys := session_kf_view(
+			keyframe_lane_view(session_trk_view(clip.keyframe_tracks, si), li),
+		)
 		total = len(keys)
 		n = min(total, len(dst))
 		if n > 0 {
@@ -3306,8 +3345,8 @@ render_worker_run :: proc() {
 			// be present every frame) nor the static crop resampler is built.
 			stage_scale := v.geom.base[int(Render_Geom_Prop.Scale)]
 			for k in v.geom.keys[int(Render_Geom_Prop.Scale)].keys[:v.geom.keys[int(Render_Geom_Prop.Scale)].n] {
-				if k.value.(f32) > stage_scale {
-					stage_scale = k.value.(f32)
+				if k.value > stage_scale {
+					stage_scale = k.value
 				}
 			}
 			v.stage_scale = max(stage_scale, 0.0001)

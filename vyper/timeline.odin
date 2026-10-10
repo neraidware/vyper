@@ -510,32 +510,47 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 	// rewritten under the other clip.
 	out := Keyframe_Track_Range{}
 	for si in 0 ..< clip.keyframe_tracks.n {
-		st := session_trk_view(clip.keyframe_tracks, si)
-		r := Keyframe_Keys_Range{}
-		prev := i32(-1)
-		for ki in 0 ..< st.keys.n {
-			k := session_kf_at(st.keys, ki)
-			off := i32(math.round(f64(k.frame_off) * ratio))
-			off = clamp(off, 0, i32(new_len - 1))
-			// Enforce strict ascent. A shrinking clip folds keys together, and a
-			// duplicate offset breaks the sorted-ascending invariant every
-			// interpolating sampler depends on; equal offsets would make the
-			// interpolation between them a zero-length span.
-			if off <= prev {
-				off = prev + 1
+		source := session_trk_view(clip.keyframe_tracks, si)
+		// Each lane is rescaled independently, so a section keeps only the lanes that
+		// still hold a key in the new extent.
+		rebuilt: Keyframe_Track
+		rebuilt.name = source.name // pool handle
+		for lane in 0 ..< len(source.lanes) {
+			source_keys := source.lanes[lane].keys
+			rescaled := Keyframe_Keys_Range{}
+			prev := i32(-1)
+			for ki in 0 ..< source_keys.n {
+				k := session_kf_at(source_keys, ki)
+				off := i32(math.round(f64(k.frame_off) * ratio))
+				off = clamp(off, 0, i32(new_len - 1))
+				// Enforce strict ascent. A shrinking clip folds keys together, and a
+				// duplicate offset breaks the sorted-ascending invariant every
+				// interpolating sampler depends on; equal offsets would make the
+				// interpolation between them a zero-length span.
+				if off <= prev {
+					off = prev + 1
+				}
+				if i64(off) >= new_len {
+					off = i32(new_len - 1)
+				}
+				prev = off
+				// The interpolation mode rides along: a key that survives the rescale
+				// is still the same easing the user set.
+				session_kf_push(
+					&rescaled,
+					Keyframe {frame_off = off, value = k.value, interp = k.interp},
+				)
 			}
-			if i64(off) >= new_len {
-				off = i32(new_len - 1)
+			if rescaled.n > 0 {
+				append(&rebuilt.lanes, Keyframe_Lane{keys = rescaled})
+			} else {
+				session_kf_release(rescaled)
 			}
-			prev = off
-			// mask, value and interp ride along untouched: a packed section key
-			// keeps its own curve and its lane mask through the rescale.
-			session_kf_push(&r, Keyframe{frame_off = off, mask = k.mask, value = k.value, interp = k.interp})
 		}
-		if r.n > 0 {
-			session_trk_push(&out, Keyframe_Track{name = st.name, keys = r})
+		if len(rebuilt.lanes) > 0 {
+			session_trk_push(&out, rebuilt)
 		} else {
-			session_kf_release(r)
+			delete(rebuilt.lanes)
 		}
 	}
 	old := clip.keyframe_tracks

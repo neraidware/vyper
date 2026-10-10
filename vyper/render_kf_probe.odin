@@ -194,8 +194,8 @@ when ODIN_DEBUG {
 		clipC := Clip{}
 		keyframe_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
 		keyframe_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-		keyframe_key_mut(&clipC, 0, 0).interp = .Ease_Out
-		keyframe_key_mut(&clipC, 0, 1).interp = .Ease_In
+		keyframe_key_mut(&clipC, 0, 0, 0).interp = .Ease_Out
+		keyframe_key_mut(&clipC, 0, 0, 1).interp = .Ease_In
 		geomC: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
@@ -224,9 +224,9 @@ when ODIN_DEBUG {
 		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 21, 250)
 		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 31, 350)
 		dtk := session_trk_view_mut(&clipD.keyframe_tracks, 0)
-		keyframe_key_mut(&clipD, 0, 1).interp = .Cubic
-		keyframe_key_mut(&clipD, 0, 2).interp = .Cubic
-		keyframe_key_mut(&clipD, 0, 3).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, 0, 1).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, 0, 2).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, 0, 3).interp = .Cubic
 		geomD: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
@@ -240,25 +240,31 @@ when ODIN_DEBUG {
 
 		// Case E — the PREVIEW (GPU) seam, keyframe_geom_sample_lane, the exact call the
 		// per-frame preview_state sampling makes before handing floats to the GPU.
-		// E1: scalar eased track. E2: a PACKED "transform" section (the grouped
-		// form) whose lane is sampled; both must ride the arriving key's mode.
+		// E1 keys the lane directly; E2 writes it as part of a WHOLE-GROUP key on the
+		// "transform" section. Both must ride the arriving key's mode and agree --
+		// before per-lane storage these were two separate storage forms with their own
+		// samplers, and the risk was the two disagreeing. Now they are the same scalar
+		// curve reached by two writers, so the assertion is that they agree.
 		clipE1 := Clip{}
-		keyframe_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
-		keyframe_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-		keyframe_key_mut(&clipE1, 0, 1).interp = .Ease_In
+		// "transform.x" is a LANE name: the geometry layer resolves it to the section
+		// track and its lane index. keyframe_set_key would mint a track literally named
+		// "transform.x", which no consumer samples.
+		keyframe_geom_set_lane_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+		keyframe_geom_set_lane_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
+		keyframe_key_mut(&clipE1, 0, 0, 1).interp = .Ease_In
 		pe1, _ := keyframe_geom_sample_lane(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 		render_kf_probe_check_near(pe1, 12.5, 0.001, "E1 preview scalar eased")
 
 		clipE2 := Clip{}
-		lanesL := [KF_PACK_MAX]f32{}
-		lanesH := [KF_PACK_MAX]f32{}
-		lanesL[0] = 0
-		lanesH[0] = 100
-		keyframe_geom_set_packed(&clipE2, "transform", 1, lanesL, 1)
-		keyframe_geom_set_packed(&clipE2, "transform", 21, lanesH, 1)
-		keyframe_key_mut(&clipE2, 0, 1).interp = .Ease_In
+		low_values: [KF_GEOM_GROUP_MAX]f32
+		high_values: [KF_GEOM_GROUP_MAX]f32
+		low_values[0] = 0
+		high_values[0] = 100
+		keyframe_geom_set_group_value(&clipE2, "transform", 1, low_values)
+		keyframe_geom_set_group_value(&clipE2, "transform", 21, high_values)
+		keyframe_key_mut(&clipE2, 0, 0, 1).interp = .Ease_In
 		pe2, _ := keyframe_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
-		render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview packed lane eased")
+		render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview group-written lane eased")
 
 		// Case F — a KEYED opacity lane sampled through the worker's own rect call.
 		// This is the end-to-end shape of the feature: the opacity keyframe has to
@@ -340,18 +346,18 @@ when ODIN_DEBUG {
 			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 20, 2)
 			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 5, 1)
 			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 15, 0.25)
-			lanes0: [KF_PACK_MAX]f32
-			lanes0[0] = 0.1
-			lanes0[1] = 0.2
-			lanes0[2] = 0.05
-			lanes0[3] = 0.15
-			lanes1: [KF_PACK_MAX]f32
-			lanes1[0] = 0.3
-			lanes1[1] = 0.4
-			lanes1[2] = 0.25
-			lanes1[3] = 0.35
-			keyframe_geom_set_packed(&clipG, "crop", 0, lanes0, 0xF)
-			keyframe_geom_set_packed(&clipG, "crop", 20, lanes1, 0xF)
+			crop_start: [KF_GEOM_GROUP_MAX]f32
+			crop_start[0] = 0.1
+			crop_start[1] = 0.2
+			crop_start[2] = 0.05
+			crop_start[3] = 0.15
+			crop_end: [KF_GEOM_GROUP_MAX]f32
+			crop_end[0] = 0.3
+			crop_end[1] = 0.4
+			crop_end[2] = 0.25
+			crop_end[3] = 0.35
+			keyframe_geom_set_group_value(&clipG, "crop", 0, crop_start)
+			keyframe_geom_set_group_value(&clipG, "crop", 20, crop_end)
 
 			flatG: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 			baseG: Geom_Sample

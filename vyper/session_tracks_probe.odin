@@ -31,23 +31,33 @@ when ODIN_DEBUG {
 		// A copied Clip starts by sharing its track range. First track mutation
 		// duplicates rows and marks key ranges shared; first key mutation then
 		// duplicates key payload, leaving original untouched.
-		keys := Keyframe_Keys_Range{}
-		session_kf_push(&keys, Keyframe{frame_off=10, value=1.0})
+		lane := Keyframe_Lane{}
+		session_kf_push(&lane.keys, Keyframe{frame_off=10, value=1.0})
 		source := Keyframe_Track_Range{}
-		session_trk_push(&source, Keyframe_Track{name=session_str_intern("probe"), keys=keys})
+		session_trk_push(&source, Keyframe_Track{name=session_str_intern("probe"), lanes=make([dynamic]Keyframe_Lane, 1, 1)})
+		session_trk_view_mut(&source, 0).lanes[0] = lane
 		copy := session_trk_share(&source)
 		session_trk_check(source.shared && copy.shared && source.first == copy.first,
 			"copy shares initial track span")
 		copy_track := session_trk_view_mut(&copy, 0)
 		session_trk_check(copy.first != source.first && !copy.shared,
 			"first write clones track rows only")
-		session_trk_check(session_trk_view(source,0).keys.shared && copy_track.keys.shared,
+		// The lane array is part of the cloned row, and the key range inside it is
+		// marked shared, so the source and the copy still address one key array
+		// until one of them writes.
+		session_trk_check(
+			keyframe_lane_view(session_trk_view(source, 0), 0).shared &&
+			keyframe_lane_view(copy_track, 0).shared,
 			"track clone marks key ranges shared")
-		session_kf_make_unique(&copy_track.keys)
-		session_kf_at_ptr(copy_track.keys,0).value = 9.0
-		session_trk_check(session_kf_at(session_trk_view(source,0).keys,0).value == 1.0,
+		copy_lane := copy_track.lanes[0].keys
+		session_kf_make_unique(&copy_lane)
+		session_kf_at_ptr(copy_lane, 0).value = 9.0
+		copy_track.lanes[0].keys = copy_lane
+		session_trk_check(
+			session_kf_at(keyframe_lane_view(session_trk_view(source, 0), 0), 0).value == 1.0,
 			"key COW preserves source value")
-		session_trk_check(session_kf_at(copy_track.keys,0).value == 9.0,
+		session_trk_check(
+			session_kf_at(keyframe_lane_view(copy_track, 0), 0).value == 9.0,
 			"mutated copy gets independent key value")
 
 		// Freed exclusive track blocks are reusable and coalesce; this keeps edits

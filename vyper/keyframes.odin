@@ -137,8 +137,10 @@ keyframe_lane_view :: proc(t: ^Keyframe_Track, i: int) -> Keyframe_Keys_Range {
 // consumer that already holds indices -- never has to walk the
 // track->lane->range chain itself and get the nesting wrong.
 keyframe_lane_key :: proc(clip: ^Clip, track_index, lane, key_index: int) -> Keyframe {
-	track := session_trk_view(clip.keyframe_tracks, track_index)
-	return session_kf_at(keyframe_lane_view(&track, lane), key_index)
+	return session_kf_at(
+		keyframe_lane_view(session_trk_view(clip.keyframe_tracks, track_index), lane),
+		key_index,
+	)
 }
 
 // keyframe_lane_total is how many keys lane `i` holds -- the `total` a snapshot returns.
@@ -232,11 +234,9 @@ keyframe_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) 
 	keyframe_set_lane_key(clip, name, 0, frame_off, value)
 }
 
-// keyframe_set_lane_key is keyframe_set_key on lane `lane` of `name`'s track, growing the
-// track's lane list to reach it. A named scalar property uses lane 0; a group
-// track (transform.x/.y, crop.l/.r/.t/.b) uses the lane's index in the group.
-// Grow-then-write rather than assuming the lane exists, so a group's first key
-// can arrive on any of its lanes.
+// keyframe_set_lane_key records a scalar key on lane `lane` of `name`'s track with
+// the default interpolation mode. See keyframe_set_lane_key_interp for the
+// mode-preserving form the project loader uses.
 keyframe_set_lane_key :: proc(
 	clip: ^Clip,
 	name: string,
@@ -244,7 +244,29 @@ keyframe_set_lane_key :: proc(
 	frame_off: i32,
 	value: f32,
 ) {
-	assert(lane >= 0, "keyframe_set_lane_key: lane must be >= 0")
+	keyframe_set_lane_key_interp(clip, name, lane, frame_off, value, .Cubic)
+}
+
+// keyframe_set_lane_key_interp records a scalar key on lane `lane` of `name`'s
+// track, growing the track's lane list to reach it and keeping the key's own
+// interpolation mode. A named scalar property uses lane 0; a group track
+// (transform.x/.y, crop.l/.r/.t/.b) uses the lane's index in the group.
+// Grow-then-write rather than assuming the lane exists, so a group's first key
+// can arrive on any of its lanes.
+//
+// The interp parameter is why this is a proc of its own rather than a default
+// argument: the project loader reads keys back with the easing the user set, and
+// inserting them under the default would silently straighten every eased key on
+// load.
+keyframe_set_lane_key_interp :: proc(
+	clip: ^Clip,
+	name: string,
+	lane: int,
+	frame_off: i32,
+	value: f32,
+	interp: Keyframe_Interp,
+) {
+	assert(lane >= 0, "keyframe_set_lane_key_interp: lane must be >= 0")
 	keyframe_bump_structure()
 	ti := keyframe_track_index(clip^, name)
 	if ti < 0 {
@@ -268,29 +290,70 @@ keyframe_set_lane_key :: proc(
 	}
 	if ip > 0 && session_kf_at(keys, ip - 1).frame_off == frame_off {
 		session_kf_at_ptr(keys, ip - 1).value = value
+		session_kf_at_ptr(keys, ip - 1).interp = interp
+		track.lanes[lane].keys = keys
 		return
 	}
 	// One call, replacing the append-a-sentinel-then-slide-the-tail dance. That
 	// dance had to grow the array before the mem.copy so there would be a slot to
 	// land in; get the order wrong and the key is silently dropped.
-	session_kf_insert(&keys, ip, Keyframe {frame_off = frame_off, value = value})
+	session_kf_insert(
+		&keys,
+		ip,
+		Keyframe {frame_off = frame_off, value = value, interp = interp},
+	)
 	// keys was re-windowed by the insert (the range can move); write it back so
 	// the lane's own range tracks the new window.
 	track = session_trk_view_mut(&clip.keyframe_tracks, ti)
 	track.lanes[lane].keys = keys
 }
 
-// keyframe_del_key removes the key at frame_off from `name`'s track; drops the track
-// once it empties (a track exists <=> it holds a key).
+// keyframe_track_has_keys reports whether any lane of `track` still holds a key.
+// It is the liveness test for dropping a track: a section track with one keyed
+// lane must survive, which is why this asks the lanes rather than lane 0.
+keyframe_track_has_keys :: proc(track: ^Keyframe_Track) -> bool {
+	for lane in 0 ..< len(track.lanes) {
+		if track.lanes[lane].keys.n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// keyframe_track_release_lanes frees every exclusively-held key array a track
+// owns and drops the lane array itself. A shared array stays session-owned
+// because another clip may still address it.
+keyframe_track_release_lanes :: proc(track: ^Keyframe_Track) {
+	for lane in 0 ..< len(track.lanes) {
+		keys := track.lanes[lane].keys
+		if keys.slots > 0 && !keys.shared {
+			session_kf_release(keys)
+		}
+	}
+	delete(track.lanes)
+	track.lanes = nil
+}
+
+// keyframe_del_key removes the key at frame_off from `name`'s lane 0, where
+// `name` is a TRACK name -- a section ("crop") or a plain property ("gain"). It
+// drops the track once every lane empties (a track exists <=> it holds a key).
 keyframe_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
+	keyframe_del_lane_key(clip, name, 0, frame_off)
+}
+
+// keyframe_del_lane_key removes the key at frame_off from one lane of `name`'s
+// track. It is what a caller holding a LANE identity needs: the geometry layer
+// resolves a property name to (section track, lane index) and deletes there, so
+// dragging transform.y does not reach into transform.x's curve.
+keyframe_del_lane_key :: proc(clip: ^Clip, name: string, lane, frame_off: i32) {
 	keyframe_bump_structure()
 	ti := keyframe_track_index(clip^, name)
 	if ti < 0 {
 		return
 	}
 	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
-	if len(track.lanes) > 0 {
-		keys := track.lanes[0].keys
+	if lane >= 0 && lane < i32(len(track.lanes)) {
+		keys := track.lanes[lane].keys
 		session_kf_make_unique(&keys)
 		for i in 0 ..< keys.n {
 			if session_kf_at(keys, i).frame_off == frame_off {
@@ -298,11 +361,11 @@ keyframe_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 				break
 			}
 		}
-		track.lanes[0].keys = keys
+		track.lanes[lane].keys = keys
 	}
 	if !keyframe_track_has_keys(track) {
-		// The track owns its key array, and the deletion above only POPPED it:
-		// pop shortens without releasing the buffer, so track.keys still holds a
+		// The lanes own their key arrays, and the deletion above only POPPED one:
+		// pop shortens without releasing the buffer, so the lane still holds a
 		// live allocation here. Dropping the row with ordered_remove then shifted
 		// the tracks over it, orphaning that buffer for the life of the process —
 		// one leaked key array per track that ever lost its last key, which the
@@ -520,11 +583,14 @@ keyframe_sample_lane :: proc(track: ^Keyframe_Track, lane: int, frame_off: i32, 
 // before the first key the property is inactive and the caller keeps its own —
 // direct edits and drags apply there. See keyframe_sample_keys for why the two ends
 // differ.
+// keyframe_sample samples lane 0 of a track. A plain property is one lane, so this
+// is its whole curve; a section's other lanes are sampled through
+// keyframe_sample_lane, which names the lane.
 keyframe_sample :: proc(track: ^Keyframe_Track, frame_off: i32, base: f32) -> (f32, bool) {
-	if track == nil || track.keys.n == 0 {
+	if track == nil || len(track.lanes) == 0 || track.lanes[0].keys.n == 0 {
 		return base, false
 	}
-	return keyframe_sample_keys(session_kf_view(track.keys), frame_off, base)
+	return keyframe_sample_keys(session_kf_view(track.lanes[0].keys), frame_off, base)
 }
 
 // keyframe_sample_for resolves `name` against the clip and samples at a TIMELINE
@@ -546,7 +612,8 @@ keyframe_free_tracks :: proc(r: Keyframe_Track_Range) {
 		return
 	}
 	for i in 0..<r.n {
-		keyframe_track_release_lanes(session_trk_view_mut(&r, i))
+		tracks := r
+		keyframe_track_release_lanes(session_trk_view_mut(&tracks, i))
 	}
 	session_trk_release_range(r)
 }
@@ -560,34 +627,44 @@ keyframe_rebuild_tracks :: proc(src: Keyframe_Track_Range, lo, hi: i32) -> Keyfr
 	out := Keyframe_Track_Range{}
 	sn := src.n
 	for si in 0..<sn {
-		st := session_trk_view(src, si)^
-		if st.keys.n == 0 {
+		source := session_trk_view(src, si)^
+		if !keyframe_track_has_keys(&source) {
 			continue
 		}
-		r := Keyframe_Keys_Range{}
-		for i in 0 ..< st.keys.n {
-			k := session_kf_at(st.keys, i)
-			if k.frame_off >= lo && k.frame_off < hi {
-				// Preserve mask + union payload + interpolation mode: a packed
-				// (section) key rides the split/trim remap intact with its own
-				// curve, mask=0 -> scalar comes along for free. Dropping interp
-				// here (as each half is a NEW key) would silently reset every
-				// eased/spline mode to Linear on split or trim.
-				session_kf_push(
-					&r,
-					Keyframe {
-						frame_off = k.frame_off - lo,
-						mask      = k.mask,
-						value     = k.value,
-						interp    = k.interp,
-					},
-				)
+		// Each lane is filtered and re-relativized independently, so a section keeps
+		// only the lanes that still have a key in the window -- a split that cuts
+		// between two lanes' keys does not resurrect an empty one.
+		rebuilt: Keyframe_Track
+		rebuilt.name = source.name // pool handle
+		for lane in 0 ..< len(source.lanes) {
+			source_keys := source.lanes[lane].keys
+			kept := Keyframe_Keys_Range{}
+			for i in 0 ..< source_keys.n {
+				k := session_kf_at(source_keys, i)
+				if k.frame_off >= lo && k.frame_off < hi {
+					// Preserve the interpolation mode: this is a NEW key, so dropping
+					// interp would silently reset every eased/spline mode to the
+					// default on split or trim.
+					session_kf_push(
+						&kept,
+						Keyframe {
+							frame_off = k.frame_off - lo,
+							value     = k.value,
+							interp    = k.interp,
+						},
+					)
+				}
+			}
+			if kept.n > 0 {
+				append(&rebuilt.lanes, Keyframe_Lane{keys = kept})
+			} else {
+				session_kf_release(kept)
 			}
 		}
-		if r.n > 0 {
-			session_trk_push(&out, Keyframe_Track {name = st.name, keys = r}) // pool handle
+		if len(rebuilt.lanes) > 0 {
+			session_trk_push(&out, rebuilt)
 		} else {
-			session_kf_release(r)
+			delete(rebuilt.lanes)
 		}
 	}
 	return out
@@ -754,37 +831,90 @@ keyframe_trim_tail :: proc(clip: ^Clip, keep: i32) {
 // need their own diamond and their own gutter label, so the flattened row index
 // is what the painter, the hit-test and the gutter all speak (TODO.md Active 52).
 
+// The three helpers take the clip's keyframe track RANGE, not the clip: rows are
+// a property of the tracks alone, and a range is a plain value that a `for ... in`
+// loop can hand over without asking for an addressable clip.
+
 // keyframe_clip_rows is how many lane rows a clip draws.
-keyframe_clip_rows :: proc(clip: ^Clip) -> int {
+keyframe_clip_rows :: proc(tracks: Keyframe_Track_Range) -> int {
 	rows := 0
-	for tr in 0 ..< clip.keyframe_tracks.n {
-		rows += len(session_trk_view(clip.keyframe_tracks, tr).lanes)
+	for track_index in 0 ..< tracks.n {
+		rows += len(session_trk_view(tracks, track_index).lanes)
 	}
 	return rows
 }
 
-// keyframe_clip_row resolves a flat row index to the (track, lane) it draws. Returns
-// (-1, -1) for a row past the clip's last, so a caller bounding its row count
-// separately cannot read out of range.
-keyframe_clip_row :: proc(clip: ^Clip, row: int) -> (track, lane: int) {
-	for tr in 0 ..< clip.keyframe_tracks.n {
-		n := len(session_trk_view(clip.keyframe_tracks, tr).lanes)
-		if row < n {
-			return tr, row
+// keyframe_clip_row resolves a flat row index to the (track, lane) it draws.
+// Returns (-1, -1) for a row past the clip's last, so a caller bounding its row
+// count separately cannot read out of range.
+keyframe_clip_row :: proc(tracks: Keyframe_Track_Range, row_index: int) -> (track, lane: int) {
+	remaining := row_index
+	for track_index in 0 ..< tracks.n {
+		n := len(session_trk_view(tracks, track_index).lanes)
+		if remaining < n {
+			return track_index, remaining
 		}
-		row -= n
+		remaining -= n
 	}
 	return -1, -1
 }
 
 // keyframe_clip_row_name is the consumer name of a row's lane -- the label the
 // timeline gutter shows and the name a lane's resting value resolves under.
-keyframe_clip_row_name :: proc(clip: ^Clip, row: int) -> string {
-	tr, li := keyframe_clip_row(clip, row)
-	if tr < 0 {
+keyframe_clip_row_name :: proc(tracks: Keyframe_Track_Range, row: int) -> string {
+	track_index, lane_index := keyframe_clip_row(tracks, row)
+	if track_index < 0 {
 		return ""
 	}
-	return keyframe_track_lane_name(&session_trk_view(clip.keyframe_tracks, tr), li)
+	return keyframe_track_lane_name(session_trk_view(tracks, track_index), lane_index)
+}
+
+// --- file mapping -----------------------------------------------------------
+//
+// The project file stores a keyframe track as a NAME plus a key array
+// (Saved_Kf_Track); it has no notion of a group. A section track owns several
+// lanes, so it crosses the boundary as SEVERAL named entries -- one per lane,
+// each named after the property that lane is. The mapping is the same one the
+// geometry layer uses, so a lane's file name and its on-screen name cannot drift.
+
+// keyframe_file_track_lanes is how many file entries a track saves as.
+keyframe_file_track_lanes :: proc(tracks: Keyframe_Track_Range, track_index: int) -> int {
+	return len(session_trk_view(tracks, track_index).lanes)
+}
+
+// keyframe_file_lane_name is the name a lane saves under: the section lane's
+// property name for a section track, the track's own name for a plain property.
+keyframe_file_lane_name :: proc(tracks: Keyframe_Track_Range, track_index, lane: int) -> string {
+	return keyframe_track_lane_name(session_trk_view(tracks, track_index), lane)
+}
+
+// keyframe_file_lane_keys copies one lane's keys into `dst`, returning
+// (copied, total). The copy is a plain byte copy of scalar keys, so the encode
+// does not depend on the session staying alive.
+keyframe_file_lane_keys :: proc(
+	tracks: Keyframe_Track_Range,
+	track_index,
+	lane: int,
+	dst: []Keyframe,
+) -> (n, total: int) {
+	keys := session_kf_view(keyframe_lane_view(session_trk_view(tracks, track_index), lane))
+	total = len(keys)
+	n = min(total, len(dst))
+	if n > 0 {
+		mem.copy(raw_data(dst[:n]), raw_data(keys), n * size_of(Keyframe))
+	}
+	return
+}
+
+// keyframe_file_name_lane resolves a file entry's name to the (section track,
+// lane index) it loads into, or ok=false for a plain property that loads into a
+// track of its own name.
+keyframe_file_name_lane :: proc(name: string) -> (section: string, lane: int, ok: bool) {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		return defs[sec_index].name, lane_index, true
+	}
+	return "", 0, false
 }
 
 // keyframe_rows_for is how many keyframe rows a track's lane strip shows: the most
@@ -794,7 +924,7 @@ keyframe_clip_row_name :: proc(clip: ^Clip, row: int) -> string {
 keyframe_rows_for :: proc(track: ^Track) -> int {
 	rows := 0
 	for &c in track.clips {
-		if n := keyframe_clip_rows(c); n > rows {
+		if n := keyframe_clip_rows(c.keyframe_tracks); n > rows {
 			rows = n
 		}
 	}

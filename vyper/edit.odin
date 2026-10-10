@@ -113,18 +113,18 @@ edit_commit :: proc() {
 	// keyframe_geom_set_value, then lands the scalar on that lane. Undo snapshots the
 	// whole timeline, so the replace is a plain commit.
 	if edit_state.field == .Keyframe_Value {
-		kcl, klane, k, kok := keyframe_selected()
+		kcl, track_index, lane_index, k, kok := keyframe_selected()
 		if !kok {
 			return
 		}
-		lane_name := keyframe_track_name(session_trk_view(kcl.keyframe_tracks, klane))
+		lane_name := keyframe_track_lane_name(
+			session_trk_view(kcl.keyframe_tracks, track_index),
+			lane_index,
+		)
 		frame := k.frame_off
-		v0: f32
-		if k.mask != 0 {
-			v0, _ = keyframe_lane_value(k^, 0)
-		} else {
-			v0 = k.value.(f32)
-		}
+		// A key is a scalar on its own lane, so the readout and the edit agree by
+		// construction: both read k.value.
+		v0 := k.value
 		if v0 == val {
 			return
 		}

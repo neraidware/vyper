@@ -927,7 +927,10 @@ draw_keyframes :: proc(
 			),
 		)
 		for clip, index in track.clips {
-			rows := clip.keyframe_tracks.n
+			// One row per keyframe LANE, not per track: a section track owns several
+			// curves and each needs its own diamond on its own row, or a crop's four
+			// edges would be drawn stacked on one line and only one could be picked.
+			rows := keyframe_clip_rows(clip.keyframe_tracks)
 			if rows == 0 {
 				continue
 			}
@@ -936,19 +939,26 @@ draw_keyframes :: proc(
 			if box.width <= 0 || box.height <= 0 {
 				continue
 			}
-			for tr in 0 ..< rows {
-				v := session_kf_view(session_trk_view(clip.keyframe_tracks,tr).keys)
-				for k_idx in 0 ..< session_trk_view(clip.keyframe_tracks,tr).keys.n {
-					k := v[k_idx]
+			for row in 0 ..< rows {
+				track_index, lane_index := keyframe_clip_row(clip.keyframe_tracks, row)
+				keys := keyframe_lane_view(
+					session_trk_view(clip.keyframe_tracks, track_index),
+					lane_index,
+				)
+				keys_view := session_kf_view(keys)
+				for key_index in 0 ..< keys.n {
+					k := keys_view[key_index]
 					// keyframe_sel_frame answers both questions the paint asks of
 					// every diamond — is this key selected, and where should it
 					// be — in one scan. During a drag the frame it returns is the
 					// previewed destination, not k.frame_off: the gesture writes
 					// nothing until its release, so the store still holds where
 					// the key will be normalized FROM (see Keyframe_Move).
-					frame, selected :=
-						keyframe_sel_frame(Keyframe_Ref{track_idx, index, tr, k_idx}, k.frame_off)
-					cx, cy := keyframe_key_center(box, tr, frame)
+					frame, selected := keyframe_sel_frame(
+						Keyframe_Ref{track_idx, index, track_index, lane_index, key_index},
+						k.frame_off,
+					)
+					cx, cy := keyframe_key_center(box, row, frame)
 					// Cull keys scrolled out of the lane's visible range. The
 					// scissor rejects these quads anyway, but each still costs two
 					// uniform uploads and two draws, and at TIMELINE_MIN_ZOOM a

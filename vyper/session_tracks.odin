@@ -107,8 +107,21 @@ session_trk_clone_range :: proc(src: Keyframe_Track_Range) -> Keyframe_Track_Ran
 	off := session_trk_alloc(slots)
 	for i in 0..<src.n {
 		session_trk_rows[off+i] = session_trk_rows[src.first+i]
-		session_trk_rows[src.first+i].keys.shared = true
-		session_trk_rows[off+i].keys.shared = true
+		// The lane ARRAY is deep-copied: it is a [dynamic] buffer owned by the row,
+		// and keyframe_track_release_lanes deletes it. Two rows sharing one buffer
+		// would leave the other dangling the moment one is released. The key RANGES
+		// inside stay shared -- that is the COW -- but each row needs its own headers,
+		// or writing a lane back through one row would be visible through the other.
+		lanes := session_trk_rows[src.first+i].lanes
+		cloned_lanes := make([dynamic]Keyframe_Lane, len(lanes))
+		for lane in 0 ..< len(lanes) {
+			cloned_lanes[lane] = lanes[lane]
+		}
+		session_trk_rows[off+i].lanes = cloned_lanes
+		for lane in 0 ..< len(cloned_lanes) {
+			session_trk_rows[src.first+i].lanes[lane].keys.shared = true
+			cloned_lanes[lane].keys.shared = true
+		}
 	}
 	return Keyframe_Track_Range{first=off, slots=slots, n=src.n}
 }

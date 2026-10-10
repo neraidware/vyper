@@ -499,12 +499,36 @@ session_rebuild :: proc(pf: ^Project_File) {
 					})
 				}
 			}
-			// Rebuild session ranges from the plain-string/key-array file DTO.
+			// Rebuild session ranges from the plain-string/key-array file DTO. A
+			// saved entry names a LANE, so a section's entries resolve back into
+			// one track owning one curve per edge; a plain property loads into a
+			// track of its own name.
 			if len(sc.keyframe_tracks) > 0 {
 				c.keyframe_tracks = Keyframe_Track_Range{}
 				for kt in sc.keyframe_tracks {
-					r := session_kf_make(kt.keys[:])
-					session_trk_push(&c.keyframe_tracks, Keyframe_Track{name=session_str_intern(kt.name), keys=r})
+					if section_name, lane_index, is_lane := keyframe_file_name_lane(kt.name); is_lane {
+						for key in kt.keys {
+							keyframe_set_lane_key_interp(
+								&c,
+								section_name,
+								lane_index,
+								key.frame_off,
+								key.value,
+								key.interp,
+							)
+						}
+						continue
+					}
+					for key in kt.keys {
+						keyframe_set_lane_key_interp(
+							&c,
+							kt.name,
+							0,
+							key.frame_off,
+							key.value,
+							key.interp,
+						)
+					}
 				}
 			}
 			append(&tr.clips, c)
@@ -693,19 +717,28 @@ saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
 	return out
 }
 
-// saved_kf_tracks renders a clip's keyframe tracks as the file DTO. The lane
-// names are borrowed views of the session pool, valid for the whole save; the
-// key arrays are copies, because the live ones are freed by keyframe_free_tracks and
-// the encode must not depend on the session staying put. The arrays are freed by
-// project_file_free_containers.
+// saved_kf_tracks renders a clip's keyframe tracks as the file DTO. A track saves
+// as one entry PER LANE, each named after the property that lane is, because the
+// DTO has no group concept; the loader resolves those names back into a section
+// track. The names are borrowed views of the session pool, valid for the whole
+// save; the key arrays are copies, because the live ones are freed by
+// keyframe_free_tracks and the encode must not depend on the session staying put.
+// The arrays are freed by project_file_free_containers.
 saved_kf_tracks :: proc(c: ^Clip) -> [dynamic]Saved_Kf_Track {
-	out := make([dynamic]Saved_Kf_Track, c.keyframe_tracks.n)
-	for i in 0..<c.keyframe_tracks.n {
-		t := session_trk_view(c.keyframe_tracks, i)
-		vv := session_kf_view(t.keys)
-		keys := make([dynamic]Keyframe, len(vv))
-		for j in 0..<len(vv) { keys[j] = vv[j] }
-		out[i] = Saved_Kf_Track {name = keyframe_track_name(t), keys = keys}
+	out: [dynamic]Saved_Kf_Track
+	for track_index in 0 ..< c.keyframe_tracks.n {
+		for lane in 0 ..< keyframe_file_track_lanes(c.keyframe_tracks, track_index) {
+			_, total := keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane, nil)
+			keys := make([dynamic]Keyframe, total)
+			keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane, keys[:])
+			append(
+				&out,
+				Saved_Kf_Track {
+					name  = keyframe_file_lane_name(c.keyframe_tracks, track_index, lane),
+					keys = keys,
+				},
+			)
+		}
 	}
 	return out
 }

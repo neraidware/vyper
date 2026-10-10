@@ -1771,14 +1771,27 @@ when ODIN_DEBUG {
 		}
 		session_marker_push(&vclip.markers, Clip_Marker {source_frame = 12, label = session_str_intern("chapter")})
 		vclip.keyframe_tracks = Keyframe_Track_Range{}
-		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("scale"), keys = Keyframe_Keys_Range{}})
-		track0 := session_trk_view_mut(&vclip.keyframe_tracks, 0)
-		session_kf_push(&track0.keys, Keyframe{frame_off=0,value=1.0})
-		session_kf_push(&track0.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
-		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("crop"), keys = Keyframe_Keys_Range{}})
-		// A packed key: mask != 0, value carries the [KF_PACK_MAX]f32 payload.
-		track1 := session_trk_view_mut(&vclip.keyframe_tracks, 1)
-		session_kf_push(&track1.keys, Keyframe{frame_off=10,mask=0b101,value=[KF_PACK_MAX]f32{1,2,3,4,5,6,7}})
+		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("scale")})
+		scale_track := session_trk_view_mut(&vclip.keyframe_tracks, 0)
+		scale_lane := Keyframe_Lane{}
+		session_kf_push(&scale_lane.keys, Keyframe{frame_off=0,value=1.0})
+		session_kf_push(&scale_lane.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
+		append(&scale_track.lanes, scale_lane)
+		// A section track: "crop" owns one scalar lane per edge, four curves side by
+		// side. This is what the packed [KF_PACK_MAX]f32 knot used to be, except the
+		// edges are separate keys with separate frames instead of four slots in one.
+		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("crop")})
+		crop_track := session_trk_view_mut(&vclip.keyframe_tracks, 1)
+		for edge in 0 ..< 4 {
+			crop_lane := Keyframe_Lane{}
+			// Lanes 0 and 2 also carry a second key, so the fixture distinguishes a
+			// lane with a curve from a lane holding a single constant.
+			session_kf_push(&crop_lane.keys, Keyframe{frame_off=10,value=f32(edge)+1.0})
+			if edge % 2 == 0 {
+				session_kf_push(&crop_lane.keys, Keyframe{frame_off=40,value=f32(edge)+1.5})
+			}
+			append(&crop_track.lanes, crop_lane)
+		}
 
 		tr0 := Track {name = strings.clone("V1"), clips = make([dynamic]Clip, 0, 1)}
 		append(&tr0.clips, vclip)
@@ -1987,21 +2000,33 @@ when ODIN_DEBUG {
 			fmt.eprintf("[ui-probe] %d keyframe tracks want 2\n", c.keyframe_tracks.n)
 			ok = false
 		} else {
-			sk := session_trk_view(c.keyframe_tracks, 0)
-			if keyframe_track_name(sk) != "scale" || sk.keys.n != 2 {
+			scale_track := session_trk_view(c.keyframe_tracks, 0)
+			scale_lane := keyframe_lane_view(scale_track, 0)
+			if keyframe_track_name(scale_track) != "scale" || scale_lane.n != 2 {
 				fmt.eprintf("[ui-probe] scalar keyframe track mismatch\n")
 				ok = false
-			} else if session_kf_at(sk.keys,1).value != 2.0 || session_kf_at(sk.keys,1).interp != .Elastic {
+			} else if session_kf_at(scale_lane, 1).value != 2.0 ||
+					 session_kf_at(scale_lane, 1).interp != .Elastic {
 				fmt.eprintf("[ui-probe] scalar key value/interp mismatch\n")
 				ok = false
 			}
-			packed := session_trk_view(c.keyframe_tracks, 1)
-			if packed.keys.n != 1 || session_kf_at(packed.keys,0).mask != 0b101 {
-				fmt.eprintf("[ui-probe] packed key mask mismatch\n")
+			// The section track round-trips as four independent curves: arity from
+			// len(lanes), each lane holding its own scalar value.
+			crop_track := session_trk_view(c.keyframe_tracks, 1)
+			if keyframe_track_name(crop_track) != "crop" || len(crop_track.lanes) != 4 {
+				fmt.eprintf("[ui-probe] section track lane count mismatch\n")
 				ok = false
-			} else if v, is_packed := session_kf_at(packed.keys,0).value.([KF_PACK_MAX]f32); !is_packed || v[6] != 7 {
-				fmt.eprintf("[ui-probe] packed key payload mismatch\n")
-				ok = false
+			} else {
+				for edge in 0 ..< 4 {
+					edge_keys := keyframe_lane_view(crop_track, edge)
+					want_keys := edge % 2 == 0 ? 2 : 1
+					if edge_keys.n != want_keys ||
+					   session_kf_at(edge_keys, 0).frame_off != 10 ||
+					   session_kf_at(edge_keys, 0).value != f32(edge)+1.0 {
+						fmt.eprintf("[ui-probe] section lane %d mismatch\n", edge)
+						ok = false
+					}
+				}
 			}
 		}
 
@@ -2349,8 +2374,10 @@ when ODIN_DEBUG {
 		// index-based fixture would be testing the normalization, not the brush.
 		lane, k_first, k_second := -1, -1, -1
 		for li in 0 ..< cl.keyframe_tracks.n {
-			n := session_trk_view(cl.keyframe_tracks,li).keys.n
-			if n >= 2 && (lane < 0 || n > keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0).n) {
+			n := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, li), 0).n
+			if n >= 2 &&
+			   (lane < 0 ||
+					   n > keyframe_lane_view(session_trk_view(cl.keyframe_tracks, lane), 0).n) {
 				lane, k_first, k_second = li, 0, 1
 			}
 		}
@@ -2522,7 +2549,7 @@ when ODIN_DEBUG {
 		// tests that normalization instead of the gesture.
 		lane := -1
 		for li in 0 ..< cl.keyframe_tracks.n {
-			if session_trk_view(cl.keyframe_tracks,li).keys.n >= 2 {
+			if keyframe_lane_view(session_trk_view(cl.keyframe_tracks, li), 0).n >= 2 {
 				lane = li
 				break
 			}
@@ -2682,9 +2709,9 @@ when ODIN_DEBUG {
 	keyframe_frames_by_name :: proc(cl: Clip, name: string) -> [2]i32 {
 		li, ok := keyframe_lane_by_name(cl, name)
 		assert(ok, "keyframe_frames_by_name: the probe's lane vanished from the store")
-		keys := session_trk_view(cl.keyframe_tracks,li).keys
+		keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, li), 0)
 		assert(keys.n == 2, "keyframe_frames_by_name wants exactly the 2 keys its fixture selected")
-		return [2]i32{session_kf_at(keys,0).frame_off, session_kf_at(keys,1).frame_off}
+		return [2]i32{session_kf_at(keys, 0).frame_off, session_kf_at(keys, 1).frame_off}
 	}
 	// ui_probe_clip_tile_width_asserts holds the tile to the model's width. A tile
 	// sized by its content (label text + padding) instead of by frames*zoom drew
@@ -3104,13 +3131,16 @@ when ODIN_DEBUG {
 		// names, exactly as a real session's are freed.
 		fixture_clip := &timeline.tracks[0].clips[0]
 		fixture_clip.keyframe_tracks = Keyframe_Track_Range{}
-		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("transform.x"), keys = Keyframe_Keys_Range{}})
-		track0 := session_trk_view_mut(&fixture_clip.keyframe_tracks, 0)
-		session_kf_push(&track0.keys, Keyframe{frame_off=0,value=0})
-		session_kf_push(&track0.keys, Keyframe{frame_off=120,value=1})
-		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("zoom"), keys = Keyframe_Keys_Range{}})
-		track1 := session_trk_view_mut(&fixture_clip.keyframe_tracks, 1)
-		session_kf_push(&track1.keys, Keyframe{frame_off=30,value=1})
+		// "transform" is the section track; lane 0 is transform.x.
+		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("transform")})
+		transform_lane := Keyframe_Lane{}
+		session_kf_push(&transform_lane.keys, Keyframe{frame_off=0,value=0})
+		session_kf_push(&transform_lane.keys, Keyframe{frame_off=120,value=1})
+		append(&session_trk_view_mut(&fixture_clip.keyframe_tracks, 0).lanes, transform_lane)
+		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("zoom")})
+		zoom_lane := Keyframe_Lane{}
+		session_kf_push(&zoom_lane.keys, Keyframe{frame_off=30,value=1})
+		append(&session_trk_view_mut(&fixture_clip.keyframe_tracks, 1).lanes, zoom_lane)
 
 		sync_track_order()
 

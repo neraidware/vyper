@@ -8942,10 +8942,10 @@ Gates: `check`, `keyframe_probe`, `geom_key_probe`, `timeline_probe`,
 
 ### Active 52 — The keyframe store: delete the collapse, per-lane scalar only
 
-**Status: DESIGNED, work starting.** The scalar/packed union and the two-way
-value-exact collapse between the forms is the root of the trap fixed in 871c444
-and of the still-open "packed section is severed by a split" gap. The user
-directed: scalars only, delete collapse.
+**Status: DONE.** The scalar/packed union and the two-way value-exact collapse
+between the forms was the root of the trap fixed in 871c444 and of the
+"packed section is severed by a split" gap. Both are gone: the union is deleted
+and the split gap closed by making continuity per-lane.
 
 #### Why collapse exists at all, and why deleting it is a simplification not a loss
 
@@ -8995,3 +8995,45 @@ of the form ambiguity are worth more than key count, and the keys are tiny.
 interaction, render, event, timeline, edit; ~53 in the store (keyframes.odin).
 The store's arena API (session_kf, ~20 procs) and the track store (session_trk) are
 both well-contained.
+
+#### What landed
+
+`Keyframe` is `{frame_off, interp, value: f32}` — the `mask` field and the
+`union {f32, [KF_PACK_MAX]f32}` payload are deleted, so a key cannot be the wrong
+type and the trap fixed in 871c444 is unrepresentable rather than guarded.
+
+`Keyframe_Track` owns `lanes: [dynamic]Keyframe_Lane`, each lane a
+`Keyframe_Keys_Range` window into the same session arena. Arity is
+`len(track.lanes)` — structural, knowable without inspecting any key. A section
+track ("crop") owns 4 lanes, "transform" 2, a plain property ("gain") 1.
+
+The section table (`kf_geom_sections`) is now a UI-ONLY grouping: it maps a
+property name to (section track, lane index) and owns the gutter label and the
+group-key write. It has no storage consequence — no fold, no unwrap, no mask.
+
+The collapse layer is deleted outright: `kf_geom_unwrap_section`,
+`kf_geom_fold_lanes`, `kf_geom_set_packed`, `kf_geom_full_mask`,
+`kf_lane_value`, `kf_sample_packed_lane`, `kf_set_packed_key`, `is_packed_track`,
+`KF_PACK_MAX`. Every one existed only to reconcile two forms.
+
+**The split gap is closed as a side effect.** `keyframe_split_preserve_continuity`
+iterates (track, lane) pairs instead of tracks, so a section whose lanes straddle
+a cut is seeded per lane. The packed skip it used to carry (`if false { continue }`)
+is gone rather than implemented around.
+
+Two bugs the migration forced, both worth naming:
+
+- `session_trk_clone_range` deep-copies the lane **array** but shares the key
+  **ranges** — the COW shape. It originally copied only the headers, so two rows
+  shared one `[dynamic]Keyframe_Lane` buffer: writing a lane back through one row
+  was visible through the other, which is exactly what the keyframe COW probe
+  caught. Lane headers are per-row; only key ranges are shared.
+- The project loader dropped `interp` on the plain-property path, silently
+  straightening every eased key on load. `keyframe_set_lane_key_interp` now
+  carries it. The file DTO did not change: `Saved_Kf_Track` has no group concept,
+  so a section saves as one entry per lane, each named after the property, and
+  the loader resolves those names back into one track.
+
+The timeline draws one row per LANE, not per track (`keyframe_clip_rows` /
+`keyframe_clip_row`), so a crop's four edges each get their own diamond row and
+their own gutter label instead of four curves stacked on one line.

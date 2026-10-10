@@ -114,9 +114,14 @@ when ODIN_DEBUG {
 			return
 		}
 		tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
-		// Name is interned; shared key ranges remain with their other holder.
-		if tr.keys.slots > 0 && !tr.keys.shared {
-			session_kf_release(tr.keys)
+		// Name is interned; shared key ranges remain with their other holder. Every
+		// lane's array is released: a section track owns one per lane, and freeing
+		// only lane 0 would leak the rest.
+		for lane in 0 ..< len(tr.lanes) {
+			keys := keyframe_lane_view(tr, lane)
+			if keys.slots > 0 && !keys.shared {
+				session_kf_release(keys)
+			}
 		}
 		session_trk_erase(&cl.keyframe_tracks, ti)
 	}
@@ -345,8 +350,8 @@ when ODIN_DEBUG {
 			for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
 				tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
 				// name is a pool handle: nothing to free here.
-				if tr.keys.slots > 0 && !tr.keys.shared {
-					session_kf_release(tr.keys)
+				if keyframe_lane_view(tr, 0).slots > 0 && !keyframe_lane_view(tr, 0).shared {
+					session_kf_release(keyframe_lane_view(tr, 0))
 				}
 				session_trk_erase(&cl.keyframe_tracks, ti)
 			}
@@ -429,8 +434,9 @@ when ODIN_DEBUG {
 			)
 			// A no-op commit must not stamp a key: the field was seeded from the
 			// sampled value, so re-committing it unchanged changes nothing visible.
-			ti := keyframe_track_index(cl^, "crop.l")
-			keys_before := session_trk_view(cl.keyframe_tracks,ti).keys.n
+			// "crop" is the section track; crop.l is its lane 0.
+			ti := keyframe_track_index(cl^, "crop")
+			keys_before := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n
 			edit_begin(.Crop_L, clip_geom_get(cl, .Crop_L))
 			for i in 0 ..< len(edit_state.chars) {
 				edit_state.chars[i] = 0
@@ -441,62 +447,55 @@ when ODIN_DEBUG {
 			}
 			edit_commit()
 			geom_key_check(
-				session_trk_view(cl.keyframe_tracks,ti).keys.n == keys_before,
+				keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n == keys_before,
 				"committing the value already on screen must not add a key (%d -> %d)",
 				keys_before,
-				session_trk_view(cl.keyframe_tracks,ti).keys.n,
+				keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n,
 			)
+			_ = keys_before
 		}
 
-		// --- the button against a PACKED section. Keying a whole group mints one
-		// packed "crop" track owning all four lanes; keying a single lane then has
-		// to UNWRAP it first. A pending set is routinely a subset of a section, so
-		// the button walks that migration for a lane whose neighbours it must not
-		// touch — and the two forms are asserted never to coexist. This is the
-		// case most likely to trip a packed/scalar invariant, so it is pinned
-		// rather than assumed.
+		// --- the button against a SECTION. A whole-group key writes every lane of
+		// the "crop" track; keying a single lane writes that lane only. A pending set
+		// is routinely a subset of a section, so the button must not stamp keys on
+		// the lanes the user never touched — and no separate per-lane track may be
+		// minted. This is the case most likely to trip a lane/track invariant, so it
+		// is pinned rather than assumed.
 		{
 			cl := geom_key_fixture()
-			// Replace the per-lane tracks with one packed crop section.
-			for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
-				tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
-				if keyframe_track_name(tr) == "crop" {
-					if tr.keys.slots > 0 && !tr.keys.shared {
-						session_kf_release(tr.keys)
-					}
-					session_trk_erase(&cl.keyframe_tracks, ti)
-				}
-			}
-			geom_key_drop_track(cl, "crop.l")
-			geom_key_drop_track(cl, "crop.r")
-			geom_key_drop_track(cl, "crop.t")
-			geom_key_drop_track(cl, "crop.b")
+			// The fixture keys EVERY lane at the clip's start and end, so this case
+			// starts from a clip with no crop keys at all: the run-up, the pending
+			// set and the "key only what is pending" assertion all need a lane whose
+			// first key is the one this case writes.
+			geom_key_drop_track(cl, "crop")
 			geom_key_check(
 				keyframe_track_index(cl^, "crop") < 0,
-				"fixture: the packed case must start with no crop section",
+				"fixture: this case must start with no crop section",
 			)
 			// Keys span [100, 200] and the playhead sits at 50 — BEFORE the first
-			// key, which is the only way a lane on a packed clip becomes pending at
-			// all. Inside the span the packed section owns the value, so a resting
-			// edit there is invisible by design and clip_geom_set would have written
-			// a key instead of a pending resting value; past the last key the
-			// section now HOLDS its final knot, so that region is likewise keyed.
-			// Only ahead of the animation does the resting base rule, so the edit is
-			// visible and pending there — and the A shortcut is what turns it into a
-			// key.
+			// key, which is the only way a lane becomes pending at all. Inside the
+			// span the section owns the value, so a resting edit there is invisible
+			// by design and clip_geom_set would have written a key instead of a
+			// pending resting value; past the last key the lane HOLDS its final value,
+			// so that region is likewise keyed. Only ahead of the animation does the
+			// resting base rule, so the edit is visible and pending there — and the A
+			// shortcut is what turns it into a key.
 			playhead.frame = 50
-			for off in ([]i32{100, 200}) {
-				keyframe_geom_set_packed(
-					cl,
-					"crop",
-					off,
-					[KF_PACK_MAX]f32{0.05, 0.05, 0.05, 0.05, 0, 0, 0},
-					keyframe_geom_full_mask("crop"),
-				)
-			}
+			crop_100: [KF_GEOM_GROUP_MAX]f32
+			crop_100[0] = 0.05
+			crop_100[1] = 0.05
+			crop_100[2] = 0.05
+			crop_100[3] = 0.05
+			crop_200: [KF_GEOM_GROUP_MAX]f32
+			crop_200[0] = 0.05
+			crop_200[1] = 0.05
+			crop_200[2] = 0.05
+			crop_200[3] = 0.05
+			keyframe_geom_set_group_value(cl, "crop", 100, crop_100)
+			keyframe_geom_set_group_value(cl, "crop", 200, crop_200)
 			geom_key_check(
 				keyframe_track_index(cl^, "crop") >= 0,
-				"fixture: the packed crop section must exist",
+				"fixture: the crop section track must exist",
 			)
 			// Ahead of the animation the lane is on its run-up: the resting base is
 			// where the run-up STARTS (offset 0), so the playhead reads part of the way
@@ -523,7 +522,7 @@ when ODIN_DEBUG {
 			// The resting write moved the run-up, so the edit is visible -- but the
 			// lane is mid-run-up, so what is on screen is the run-up from the NEW base,
 			// not 0.4 outright. That is the cost of interpolating ahead of the first
-			// key, and it is the number the knot must then carry.
+			// key, and it is the number the key must then carry.
 			on_screen_l := clip_geom_get(cl, .Crop_L)
 			geom_key_check(
 				on_screen_l > 0.05 && on_screen_l < 0.4 && !keyframe_approx(on_screen_l, pre_edit_l),
@@ -536,61 +535,71 @@ when ODIN_DEBUG {
 				"an untouched lane must keep its value after the shortcut (got %v)",
 				clip_geom_get(cl, .Crop_R),
 			)
-			// The point of the grouping: a pending SUBSET of a section becomes one
-			// knot on the section itself, and the section STAYS packed. Writing the
-			// lane as a track of its own would fan the user's whole-crop animation
-			// out to four per-lane tracks, a storage they did not ask for, as a
-			// side effect of asking to key one edge.
+			// Keying one lane must leave the section intact: the crop track stays, and
+			// no per-lane track is minted. Writing the lane as a track of its own
+			// would fan the user's whole-crop animation out to four per-lane tracks, a
+			// storage they did not ask for, as a side effect of asking to key one edge.
 			geom_key_check(
 				keyframe_track_index(cl^, "crop") >= 0,
-				"keying one lane of a packed section must leave the section packed",
+				"keying one lane must leave the section track in place",
 			)
 			geom_key_check(
 				keyframe_track_index(cl^, "crop.l") < 0,
-				"the section must not have been unwrapped into a 'crop.l' track",
+				"no separate crop.l track may be minted",
 			)
-			// The section and its lanes must never both exist: that coexistence is
-			// what keyframe_geom_sample_lane asserts against, so a shortcut press that
-			// left both would crash the next preview frame rather than this probe.
-			geom_key_check(
-				!(keyframe_track_index(cl^, "crop") >= 0 && keyframe_track_index(cl^, "crop.l") >= 0),
-				"the packed section and its lane must not coexist after the shortcut",
-			)
-			// The new knot carries ONLY the lane that was pending. A full-mask knot
-			// here would key breakpoints on three edges the user never panned, and
-			// would pin them to whatever the sampler happened to read — the exact
-			// "stamps keys nobody asked for" failure clip_geom_drag exists to avoid.
+			// The pending lane gains a key on the playhead carrying its on-screen
+			// value; the lanes the user never panned must NOT gain one. Keying all
+			// four would pin three edges to whatever the sampler happened to read —
+			// the exact "stamps keys nobody asked for" failure clip_geom_drag exists
+			// to avoid.
 			crop_ti := keyframe_track_index(cl^, "crop")
 			if crop_ti >= 0 {
-				keys := session_trk_view(cl.keyframe_tracks,crop_ti).keys
 				off_new := i32(playhead.frame - cl.timeline_start_frame)
 				found := false
-				kv := session_kf_view(keys)
-				for i in 0 ..< keys.n {
-					k := kv[i]
-					if k.frame_off != off_new {
-						continue
+				for lane_index in 0 ..< 4 {
+					keys := keyframe_lane_view(
+						session_trk_view(cl.keyframe_tracks, crop_ti),
+						lane_index,
+					)
+					kv := session_kf_view(keys)
+					has_key_here := false
+					for i in 0 ..< keys.n {
+						if kv[i].frame_off == off_new {
+							has_key_here = true
+							break
+						}
 					}
-					found = true
-					if v, is_pack := k.value.([KF_PACK_MAX]f32); is_pack {
+					if lane_index == 0 {
 						geom_key_check(
-							k.mask == 0b0001,
-							"the new knot must key the pending lane alone (mask %d)",
-							k.mask,
+							has_key_here,
+							"the pending lane must gain a key on the playhead (off %d)",
+							off_new,
 						)
+						if has_key_here {
+							found = true
+							written: f32
+							for i in 0 ..< keys.n {
+								if kv[i].frame_off == off_new {
+									written = kv[i].value
+									break
+								}
+							}
+							geom_key_check(
+								keyframe_approx(written, on_screen_l),
+								"the key must carry the pending lane's on-screen value (got %v want %v)",
+								written,
+								on_screen_l,
+							)
+						}
+					} else {
 						geom_key_check(
-							keyframe_approx(v[0], on_screen_l),
-							"the knot must carry the pending lane's on-screen value (got %v want %v)",
-							v[0],
-							on_screen_l,
+							!has_key_here,
+							"lane %d must not gain a key the user never asked for",
+							lane_index,
 						)
 					}
 				}
-				geom_key_check(
-					found,
-					"the packed section must have gained a knot on the playhead (off %d)",
-					off_new,
-				)
+				geom_key_check(found, "the pending lane's key was written")
 			}
 			// Every lane must still sample without tripping an assert: this is the
 			// check the preview draw makes on the next frame.
@@ -598,7 +607,7 @@ when ODIN_DEBUG {
 				prop := Render_Geom_Prop(i)
 				_ = clip_geom_get(cl, prop)
 			}
-			geom_key_check(true, "sampling every lane after the grouped key did not assert")
+			geom_key_check(true, "sampling every lane after the one-lane key did not assert")
 		}
 
 		// --- the playhead guard. keyframe_sample_keys holds from the first key onward, so
@@ -611,10 +620,11 @@ when ODIN_DEBUG {
 			// 40 frames past the end of a 300-frame clip.
 			playhead.frame = 340
 			clip_geom_set(cl, .Crop_L, 0.4)
-			ti := keyframe_track_index(cl^, "crop.l")
-			geom_key_check(ti >= 0, "fixture: the guard case still has a crop.l track")
+			// "crop" is the section track; crop.l is its lane 0.
+			ti := keyframe_track_index(cl^, "crop")
+			geom_key_check(ti >= 0, "fixture: the guard case still has a crop track")
 			if ti >= 0 {
-				keys := session_trk_view(cl.keyframe_tracks,ti).keys
+				keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0)
 				geom_key_check(
 					keys.n == 2,
 					"an off-clip edit must not mint a key (2 fixture keys expected, got %d)",
@@ -787,45 +797,61 @@ when ODIN_DEBUG {
 			geom_key_check(clip_geom_key_all_modified(cl) == 0, "a second press must key nothing")
 		}
 
-		// --- an ALREADY UNWRAPPED section stays unwrapped. Grouping is for a section
-		// the user never split up. Once a lane carries its own track, that shape is
-		// already on the clip — the user keyed or edited that lane individually, and
-		// keyframe_geom_set_lane_key is what unwrapped it — so re-packing on the next
-		// grouped press would delete a real track and rewrite an animation the user
-		// built, as a side effect of asking to key a DIFFERENT edge.
+		// --- keying lanes of a section builds ONE track, and siblings do not disturb
+		// each other. There is no per-lane storage to preserve and no migration to
+		// avoid: a section track owns its lanes, so keying a second edge adds a lane
+		// rather than minting a track, and the first edge's curve is untouched.
 		{
 			cl := geom_key_unkeyed_fixture()
 			playhead.frame = 150
-			// Key one crop edge on its own. This is the unwrap.
+			// Key one crop edge on its own: this mints the section track with one lane.
 			clip_geom_add_lane_key(cl, .Crop_L)
+			crop_track := keyframe_track_index(cl^, "crop")
 			geom_key_check(
-				keyframe_track_index(cl^, "crop") < 0,
-				"fixture: keying one crop lane on its own must not make a section track",
+				crop_track >= 0,
+				"keying one crop lane must mint the section track",
 			)
 			geom_key_check(
-				keyframe_track_index(cl^, "crop.l") >= 0,
-				"fixture: the individual lane key must own a 'crop.l' track",
+				keyframe_track_index(cl^, "crop.l") < 0,
+				"no separate per-lane track may exist",
 			)
+			lane_l := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), 0)
+			geom_key_check(lane_l.n == 1, "the first edge holds its own key (got %d)", lane_l.n)
 			// A different edge is panned, so it is pending.
 			clip_geom_mark_modified(cl, .Crop_T)
 			n := clip_geom_key_all_modified(cl)
 			geom_key_check(n == 1, "one pending lane must key exactly one lane, got %d", n)
 			geom_key_check(
-				keyframe_track_index(cl^, "crop") < 0,
-				"an already-unwrapped section must NOT be re-packed into a section track",
+				keyframe_track_index(cl^, "crop") >= 0,
+				"keying a sibling lane must keep the one section track",
+			)
+			// The lane list stays DENSE: a lane's index is its position in the
+			// section, so keying crop.t (lane 2) after crop.l (lane 0) must leave an
+			// empty lane 1 behind rather than compacting -- otherwise crop.t's key
+			// would land on crop.r's index.
+			crop_lanes := session_trk_view(cl.keyframe_tracks, crop_track).lanes
+			geom_key_check(
+				len(crop_lanes) == 3,
+				"the sibling key must grow the lane list densely (got %d)",
+				len(crop_lanes),
 			)
 			geom_key_check(
-				keyframe_track_index(cl^, "crop.t") >= 0,
-				"the pending lane of an unwrapped section must be keyed on its own track",
+				crop_lanes[1].keys.n == 0 && crop_lanes[2].keys.n == 1,
+				"the gap lane stays empty and the keyed lane holds its key (%d/%d)",
+				crop_lanes[1].keys.n,
+				crop_lanes[2].keys.n,
 			)
+			// The first edge's curve is untouched by the sibling's key.
+			lane_l_after := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), 0)
 			geom_key_check(
-				keyframe_track_index(cl^, "crop.l") >= 0,
-				"the per-lane key already on the clip must survive a write to a sibling lane",
+				lane_l_after.n == lane_l.n &&
+				session_kf_at(lane_l_after, 0).value == session_kf_at(lane_l, 0).value,
+				"the first edge's key must survive a write to a sibling lane",
 			)
 			for name in ([]string{"crop.r", "crop.b"}) {
 				geom_key_check(
 					keyframe_track_index(cl^, name) < 0,
-					"keying one lane of an unwrapped section must not mint %q",
+					"keying lanes of a section must not mint %q",
 					name,
 				)
 			}
@@ -898,40 +924,35 @@ when ODIN_DEBUG {
 			)
 		}
 
-		// --- auto-key must not unwrap a packed section. The toggle means "record my
-		// edits on the timeline"; it is not a request to change how the animation is
-		// STORED. But auto-key's write went through keyframe_geom_set_lane_key, which
-		// unwraps a packed section on any lane write ("you keyed an individual
-		// value, so the array unwraps"). So one auto-keyed crop drag deleted the
-		// user's whole-crop section track and replaced it with four per-lane tracks
-		// they never asked for.
+		// --- auto-key writes into the section, never beside it. The toggle means
+		// "record my edits on the timeline"; it is not a request to change how the
+		// animation is STORED. One auto-keyed crop drag must not replace the user's
+		// whole-crop section track with four per-lane tracks they never asked for.
 		{
 			cl := geom_key_fixture()
 			playhead.frame = 150
+			crop_edges: [KF_GEOM_GROUP_MAX]f32
+			crop_edges[0] = 0.05
+			crop_edges[1] = 0.05
+			crop_edges[2] = 0.05
+			crop_edges[3] = 0.05
 			for off in ([]i32{0, 300}) {
-				keyframe_geom_set_packed(
-					cl,
-					"crop",
-					off,
-					[KF_PACK_MAX]f32{0.05, 0.05, 0.05, 0.05, 0, 0, 0},
-					keyframe_geom_full_mask("crop"),
-				)
+				keyframe_geom_set_group_value(cl, "crop", off, crop_edges)
 			}
 			geom_key_check(
 				keyframe_track_index(cl^, "crop") >= 0 && keyframe_track_index(cl^, "crop.l") < 0,
-				"fixture: crop must start packed, with no per-lane track",
+				"fixture: the crop section track must exist, with no per-lane track",
 			)
-			// Pre-place a FULL-mask knot exactly on the playhead, as a section the
-			// user keyed wholesale would have, so the auto-key has to merge into it.
-			keyframe_geom_set_packed(
-				cl,
-				"crop",
-				150,
-				[KF_PACK_MAX]f32{0.05, 0.07, 0.05, 0.05, 0, 0, 0},
-				keyframe_geom_full_mask("crop"),
-			)
+			// Pre-place a group key exactly on the playhead, as a section the user
+			// keyed wholesale would have, so the auto-key has to merge into it.
+			crop_playhead: [KF_GEOM_GROUP_MAX]f32
+			crop_playhead[0] = 0.05
+			crop_playhead[1] = 0.07
+			crop_playhead[2] = 0.05
+			crop_playhead[3] = 0.05
+			keyframe_geom_set_group_value(cl, "crop", 150, crop_playhead)
 			editor_flags.auto_keyframe = true
-			// One lane moves, toggle on, playhead inside the packed span. Both
+			// One lane moves, toggle on, playhead inside the section's span. Both
 			// auto-key entry points are exercised: keyframe_auto_key (the gain path and
 			// anything still calling it) and clip_geom_set, which is where every
 			// shipped geometry write -- drag, Alt+wheel, typed field -- lands.
@@ -939,20 +960,29 @@ when ODIN_DEBUG {
 				keyframe_auto_key(cl, keyframe_lane_name(.Crop_L), 0.4),
 				"auto-key must write a key for a lane that is already keyed",
 			)
+			keyframe_geom_set_lane_key(cl, keyframe_lane_name(.Crop_T), 150, 0.2)
+			crop_t_value, crop_t_ok := keyframe_geom_sample_lane(
+				cl,
+				keyframe_lane_name(.Crop_T),
+				150,
+				0.0,
+			)
 			geom_key_check(
-				keyframe_geom_set_packed_lane_key(cl, keyframe_lane_name(.Crop_T), 150, 0.2),
-				"a lane write on a packed section must land in the section",
+				crop_t_ok && keyframe_approx(crop_t_value, 0.2),
+				"a lane write must land in the section track (got %v ok=%v)",
+				crop_t_value,
+				crop_t_ok,
 			)
 			cl.crop_b = 0.33
 			keyed := clip_geom_set(cl, .Crop_B, 0.33)
 			geom_key_check(keyed, "an auto-keyed drag lane must report as keyed")
 			geom_key_check(
 				keyframe_track_index(cl^, "crop") >= 0,
-				"auto-key must NOT unwrap a packed section — the 'crop' section track is gone",
+				"auto-key must NOT replace the section track",
 			)
 			geom_key_check(
 				keyframe_track_index(cl^, "crop.l") < 0,
-				"auto-key must NOT mint per-lane tracks on a packed section",
+				"auto-key must NOT mint per-lane tracks",
 			)
 			geom_key_check(
 				keyframe_approx(clip_geom_get(cl, .Crop_L), 0.4),

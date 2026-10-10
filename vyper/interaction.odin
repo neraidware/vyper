@@ -549,17 +549,12 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			// it were the only one. The field is not even offered for a
 			// multi-selection (keyframes_readout), so this is a belt-and-braces
 			// read of the same contract.
-			if _, _, k, ok := keyframe_selected(); ok {
-				// A packed (section) key's readout shows lane 0; edit_begin
-				// seeds the field with that lane so the typed value and the
-				// displayed one agree (commit unwraps and edits that lane).
-				v0: f32
-				if k.mask != 0 {
-					v0, _ = keyframe_lane_value(k^, 0)
-				} else {
-					v0 = k.value.(f32)
-				}
-				edit_begin(.Keyframe_Value, v0)
+			if _, _, _, k, ok := keyframe_selected(); ok {
+				// A key is a scalar on its own lane, so the field is seeded with
+				// that value and the commit edits the same lane. The packed branch
+				// this used to have (read lane 0 of a group knot) existed only
+				// because a key could carry several lanes at once.
+				edit_begin(.Keyframe_Value, k.value)
 				return true
 			}
 		}
@@ -747,7 +742,13 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			// a drag from it moves the key it grabbed rather than the old run.
 			narrow_click := keyframe_sel_contains(grab)
 			if !narrow_click {
-				keyframe_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+				keyframe_select(
+					grab.track_idx,
+					grab.clip_index,
+					grab.keyframe_track,
+					grab.keyframe_lane,
+					grab.key,
+				)
 			}
 			if inp.shift {
 				// A Shift+click ON a keyframe is just a selection: it narrows to
@@ -760,7 +761,13 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				// It narrows unconditionally, including for a key that was already
 				// selected — the deferred narrow above is for the PLAIN press,
 				// whose drag has to carry the run, and there is no run to carry here.
-				keyframe_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+				keyframe_select(
+					grab.track_idx,
+					grab.clip_index,
+					grab.keyframe_track,
+					grab.keyframe_lane,
+					grab.key,
+				)
 				keyframe_brush_disarm()
 				// The go-to-keyframe double-click is deliberately not reachable
 				// with Shift held: a Shift+click is a selection, and pairing it
@@ -785,14 +792,21 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			   now - keyframe_dbl_click.ns <= KF_DBL_CLICK_NS &&
 			   grab.track_idx == keyframe_dbl_click.track &&
 			   grab.clip_index == keyframe_dbl_click.clip &&
-			   grab.lane == keyframe_dbl_click.lane &&
+			   grab.keyframe_track == keyframe_dbl_click.keyframe_track &&
+			   grab.keyframe_lane == keyframe_dbl_click.keyframe_lane &&
 			   keyframe_frame == keyframe_dbl_click.frame {
 				// This press is a seek, not a selection, and it arms no move — so
 				// the deferred narrow will never be reached. Settle it here or a
 				// double-click on a key inside a run would leave the whole run
 				// selected, which is the one case the deferral above changed.
 				if narrow_click {
-					keyframe_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+					keyframe_select(
+					grab.track_idx,
+					grab.clip_index,
+					grab.keyframe_track,
+					grab.keyframe_lane,
+					grab.key,
+				)
 				}
 				f := clamp(
 					gcl.timeline_start_frame + i64(keyframe_frame),
@@ -809,7 +823,8 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			keyframe_dbl_click.ns = now
 			keyframe_dbl_click.track = grab.track_idx
 			keyframe_dbl_click.clip = grab.clip_index
-			keyframe_dbl_click.lane = grab.lane
+			keyframe_dbl_click.keyframe_track = grab.keyframe_track
+			keyframe_dbl_click.keyframe_lane = grab.keyframe_lane
 			keyframe_dbl_click.frame = keyframe_frame
 			// The same press that selects ALSO arms the horizontal move gesture
 			// (S4). A drag is only distinguishable from a click at release, so
@@ -1180,7 +1195,13 @@ commit_keyframe_drag :: proc() {
 	if !keyframe_move.engaged {
 		if keyframe_move.narrow_click {
 			a := keyframe_move.anchor
-			keyframe_select(a.track_idx, a.clip_index, a.lane, a.key)
+			keyframe_select(
+				a.track_idx,
+				a.clip_index,
+				a.keyframe_track,
+				a.keyframe_lane,
+				a.key,
+			)
 		}
 		return
 	}
@@ -1208,7 +1229,7 @@ commit_keyframe_drag :: proc() {
 		if !ok {
 			continue
 		}
-		keyframe_del_key(cl, s.name, s.start)
+		keyframe_geom_del_lane_key(cl, s.name, s.start)
 	}
 	// Phase 2: re-land each key at its destination, form-preserving.
 	for s in keyframe_move.snaps {
@@ -1216,20 +1237,11 @@ commit_keyframe_drag :: proc() {
 		if !ok {
 			continue
 		}
-		if s.mask != 0 {
-			sec_idx, is_sec := keyframe_geom_section_index(s.name)
-			assert(is_sec, "a packed section key drag must source a section track name")
-			sdefs := keyframe_geom_sections
-			for lane_prop in sdefs[sec_idx].lanes {
-				assert(
-					keyframe_track_index(cl^, keyframe_lane_name(lane_prop)) < 0,
-					"a packed section and its lanes may not coexist during a drag re-land",
-				)
-			}
-			keyframe_set_packed_key(cl, s.name, s.final, s.value, s.mask)
-		} else {
-			keyframe_geom_set_lane_key(cl, s.name, s.final, s.value[0])
-		}
+		// The re-land is a scalar write to the lane the snap names. There is no
+		// packed form to preserve across the delete + insert: a lane's curve is
+		// re-created as itself, so the delete in phase 1 and this write address the
+		// same (track, lane) without any reconciliation.
+		keyframe_geom_set_lane_key(cl, s.name, s.final, s.value)
 	}
 	// Phase 3: re-stamp each key's easing and rebuild the selection, both under
 	// the fresh structure gen. The insert path zero-initializes interp, so
@@ -1245,18 +1257,28 @@ commit_keyframe_drag :: proc() {
 		if !ok {
 			continue
 		}
-		li := keyframe_track_index(cl^, s.name)
-		if li < 0 {
+		track_index, lane_index, found := keyframe_geom_lane_location(cl, s.name)
+		if !found {
 			continue
 		}
-		trk := session_trk_view_mut(&cl.keyframe_tracks, li)
-		session_kf_make_unique(&trk.keys)
-		keys := &trk.keys
-		for ki in 0 ..< keys.n {
-			v := session_kf_view(keys^)
-			if v[ki].frame_off == s.final {
-				vm := session_kf_view_mut(keys^); vm[ki].interp = s.interp
-				append(&picked, Keyframe_Ref{s.ref.track_idx, s.ref.clip_index, li, ki})
+		track := session_trk_view_mut(&cl.keyframe_tracks, track_index)
+		keys := track.lanes[lane_index].keys
+		session_kf_make_unique(&keys)
+		keys_view := session_kf_view(keys)
+		for key_index in 0 ..< len(keys_view) {
+			if keys_view[key_index].frame_off == s.final {
+				session_kf_view_mut(keys)[key_index].interp = s.interp
+				track.lanes[lane_index].keys = keys
+				append(
+					&picked,
+					Keyframe_Ref{
+						s.ref.track_idx,
+						s.ref.clip_index,
+						track_index,
+						lane_index,
+						key_index,
+					},
+				)
 				break
 			}
 		}

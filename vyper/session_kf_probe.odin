@@ -60,7 +60,7 @@ when ODIN_DEBUG {
 				got[1].frame_off,
 				got[2].frame_off,
 			)
-			session_kf_check(got[1].value.(f32) == 1.0, "value[1]=%v, want 1", got[1].value)
+			session_kf_check(got[1].value == 1.0, "value[1]=%v, want 1", got[1].value)
 		}
 
 		// --- growth is AMORTIZED, not per-insert --------------------------------
@@ -89,7 +89,7 @@ when ODIN_DEBUG {
 			got := session_kf_view(r)
 			ok := true
 			for i in 0 ..< 40 {
-				if got[i].frame_off != i32(i) || got[i].value.(f32) != f32(i) {
+				if got[i].frame_off != i32(i) || got[i].value != f32(i) {
 					ok = false
 					break
 				}
@@ -159,7 +159,7 @@ when ODIN_DEBUG {
 			session_kf_check(b.first != a.first, "b and a still alias after the write")
 			av := session_kf_view(a)
 			session_kf_check(
-				av[0].value.(f32) == 50.0,
+				av[0].value == 50.0,
 				"writing the shared copy changed the original: a[0]=%v, want 50",
 				av[0].value,
 			)
@@ -203,7 +203,7 @@ when ODIN_DEBUG {
 					session_kf_push(&r, session_kf_key(i32(round), f32(i)))
 				}
 				session_kf_check(
-					session_kf_view(r)[3].value.(f32) == 3.0,
+					session_kf_view(r)[3].value == 3.0,
 					"round %d: keys did not survive reuse",
 					round,
 				)

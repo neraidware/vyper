@@ -1004,8 +1004,7 @@ keyframe_resolve_value :: proc(r: Keyframe_Ref) -> (cl: ^Clip, keyframe_track: i
 	if r.keyframe_track < 0 || r.keyframe_track >= clip.keyframe_tracks.n {
 		return nil, -1, {}, false
 	}
-	track := session_trk_view(clip.keyframe_tracks, r.keyframe_track)
-	keys := keyframe_lane_view(&track, r.keyframe_lane)
+	keys := keyframe_lane_view(session_trk_view(clip.keyframe_tracks, r.keyframe_track), r.keyframe_lane)
 	if r.key < 0 || r.key >= keys.n {
 		return nil, -1, {}, false
 	}
@@ -1033,11 +1032,18 @@ keyframe_resolve :: proc(r: Keyframe_Ref) -> (cl: ^Clip, keyframe_track: int, k:
 // inspector's value field and its click handler) use it so a multi-selection can
 // never half-resolve into the first ref and then be edited as though it were
 // the only one.
-keyframe_selected :: proc() -> (cl: ^Clip, keyframe_track: int, k: ^Keyframe, ok: bool) {
+keyframe_selected :: proc() -> (
+	cl: ^Clip,
+	keyframe_track: int,
+	keyframe_lane: int,
+	k: ^Keyframe,
+	ok: bool,
+) {
 	if keyframe_sel_count() != 1 {
-		return nil, -1, nil, false
+		return nil, -1, -1, nil, false
 	}
-	return keyframe_resolve(keyframe_sel.items[0])
+	clip, track_index, key, found := keyframe_resolve(keyframe_sel.items[0])
+	return clip, track_index, keyframe_sel.items[0].keyframe_lane, key, found
 }
 
 // keyframe_sel_contains reports whether `r` is in the LIVE selection. Short scan over
@@ -1239,7 +1245,7 @@ keyframe_capture_sel :: proc(dst: ^[dynamic]Keyframe_Snap) -> int {
 		// the track name would point at a group whose lanes are separate curves.
 		s.name = strings.clone(
 			keyframe_track_lane_name(
-				&session_trk_view(cl.keyframe_tracks, keyframe_track),
+				session_trk_view(cl.keyframe_tracks, keyframe_track),
 				item.keyframe_lane,
 			),
 		)
@@ -1335,15 +1341,11 @@ keyframe_auto_key :: proc(clip: ^Clip, name: string, value: f32) -> bool {
 		return false
 	}
 	off := i32(playhead.frame - clip.timeline_start_frame)
-	// Auto-key EXTENDS the animation the user already built, so a lane of a
-	// packed section is written into the packed track — the section the user
-	// keyed must survive their own toggle. The scalar path here would unwrap it
-	// ("you keyed an individual value"), which is the right rule for the
-	// inspector's per-lane Key button and the wrong one for a background
-	// recording of every edit.
-	if keyframe_geom_set_packed_lane_key(clip, name, off, value) {
-		return true
-	}
+	// Auto-key EXTENDS the animation the user already built, so a lane of a section
+	// is written into the section's track — the group the user keyed must survive
+	// their own toggle. There is no second storage form to choose between: the write
+	// lands on the lane the name resolves to, whether or not the group was keyed
+	// first.
 	keyframe_geom_set_lane_key(clip, name, off, value)
 	return true
 }
@@ -1423,7 +1425,7 @@ clip_under_pointer :: proc() -> (int, int) {
 // frames do that horizontally.
 keyframe_keys_at :: proc(mx, my: f32, dst: ^[dynamic]Keyframe_Ref) {
 	for track, ti in timeline.tracks {
-		for clip, ci in track.clips {
+		for &clip, ci in track.clips {
 			if clip.keyframe_tracks.n == 0 {
 				continue
 			}
@@ -1432,11 +1434,12 @@ keyframe_keys_at :: proc(mx, my: f32, dst: ^[dynamic]Keyframe_Ref) {
 			if box.width <= 0 || box.height <= 0 {
 				continue
 			}
-			for row in 0 ..< keyframe_clip_rows(clip) {
-				track_index, lane_index := keyframe_clip_row(clip, row)
+			for row in 0 ..< keyframe_clip_rows(clip.keyframe_tracks) {
+				track_index, lane_index := keyframe_clip_row(clip.keyframe_tracks, row)
 				track := session_trk_view(clip.keyframe_tracks, track_index)
-				keys := session_kf_view(keyframe_lane_view(&track, lane_index))
-				for key_index in 0 ..< keys.n {
+				lane_keys := keyframe_lane_view(track, lane_index)
+				keys := session_kf_view(lane_keys)
+				for key_index in 0 ..< len(keys) {
 					cx, cy := keyframe_key_center(box, row, keys[key_index].frame_off)
 					if abs(mx - cx) <= KF_HIT_MARGIN && abs(my - cy) <= KF_HIT_MARGIN {
 						append(dst, Keyframe_Ref{ti, ci, track_index, lane_index, key_index})

@@ -157,17 +157,11 @@ clip_geom_set :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) -> (keyed: bo
 	if clip_geom_keyed_at(clip, prop) ||
 	   (editor_flags.auto_keyframe && keyframe_geom_prop_keyed(clip, name)) {
 		off := i32(playhead.frame - clip.timeline_start_frame)
-		// Write into the section's PACKED track when it has one. This branch
-		// overwrites a value the user already keyed — either a key sits on this
-		// frame, or the toggle extends their animation — so unwrapping here
-		// means a drag or a typed value reshapes how their animation is STORED
-		// (their whole-crop section becomes four per-lane tracks they never
-		// asked for). The scalar path remains for the lanes with no packed
-		// section to write into, and for the explicit per-lane Key buttons,
-		// which are the opposite intent and do unwrap.
-		if !keyframe_geom_set_packed_lane_key(clip, name, off, v) {
-			keyframe_geom_set_lane_key(clip, name, off, v)
-		}
+		// Write the lane the name resolves to. There is no second storage form to
+		// choose between: a drag or a typed value on a keyed lane overwrites that
+		// lane's key, whether the group was keyed first or not, so an edit can never
+		// reshape how the animation is stored.
+		keyframe_geom_set_lane_key(clip, name, off, v)
 		clip.geom_modified &= ~(1 << uint(prop))
 		return true
 	}
@@ -240,11 +234,11 @@ clip_geom_add_group_key :: proc(clip: ^Clip, sec: string) {
 	// constant, and Odin will not index a constant with a variable.
 	defs := keyframe_geom_sections
 	sec_lanes := defs[sec_index].lanes
-	lanes: [KF_PACK_MAX]f32
+	values: [KF_GEOM_GROUP_MAX]f32
 	for i in 0 ..< len(sec_lanes) {
-		lanes[i] = clip_geom_get(clip, sec_lanes[i])
+		values[i] = clip_geom_get(clip, sec_lanes[i])
 	}
-	keyframe_add_group_prop(clip, sec, lanes)
+	keyframe_add_group_prop(clip, sec, values)
 	for i in 0 ..< len(sec_lanes) {
 		clip_geom_mark_keyed(clip, sec_lanes[i])
 	}
@@ -340,54 +334,18 @@ clip_geom_key_all_modified :: proc(clip: ^Clip) -> (n: int) {
 		if pending_count == 0 {
 			continue
 		}
-		if keyframe_geom_any_lane_tracked(clip, sec) {
-			// Already unwrapped: keep the shape, key only what is pending.
-			for li in 0 ..< len(sec.lanes) {
-				if pending_bits & (1 << uint(li)) == 0 {
-					continue
-				}
-				lane := sec.lanes[li]
-				keyframe_geom_set_lane_key(clip, keyframe_lane_name(lane), off, sampled[int(lane)])
-			}
-			n += pending_count
-			continue
-		}
-		if keyframe_track_index(clip^, sec.name) >= 0 {
-			// A packed section is already there, so extend its key AT THIS
-			// FRAME through the lane writer, one lane at a time. That writer
-			// MERGES into a knot already on the frame (mask |= bit) where
-			// keyframe_set_packed_key replaces mask and value wholesale — so a
-			// full-mask knot the user placed keeps the lanes this press does
-			// not mention.
-			for li in 0 ..< len(sec.lanes) {
-				if pending_bits & (1 << uint(li)) == 0 {
-					continue
-				}
-				lane := sec.lanes[li]
-				written := keyframe_geom_set_packed_lane_key(
-					clip,
-					keyframe_lane_name(lane),
-					off,
-					sampled[int(lane)],
-				)
-				assert(
-					written,
-					"a packed section must accept a lane write for one of its own lanes",
-				)
-			}
-			n += pending_count
-			continue
-		}
-		// Never keyed, so there is no knot on this frame to merge with: one
-		// packed write for the group, masked to the pending lanes. The slots the
-		// mask leaves out are filled with what is on screen anyway — the sampler
-		// never reads them, but a stored array holding stale zeros in an unkeyed
-		// slot is a trap for the next thing that does.
-		lanes: [KF_PACK_MAX]f32
+		// Key ONLY the pending lanes, one lane at a time, whatever the section's
+		// current shape. There is no packed form to merge into and no per-lane
+		// storage to preserve: a section track owns its lanes either way, so
+		// keying one edge of a group leaves the other edges' curves exactly where
+		// they were instead of stamping breakpoints the user never asked for.
 		for li in 0 ..< len(sec.lanes) {
-			lanes[li] = sampled[int(sec.lanes[li])]
+			if pending_bits & (1 << uint(li)) == 0 {
+				continue
+			}
+			lane := sec.lanes[li]
+			keyframe_geom_set_lane_key(clip, keyframe_lane_name(lane), off, sampled[int(lane)])
 		}
-		keyframe_geom_set_packed(clip, sec.name, off, lanes, pending_bits)
 		n += pending_count
 	}
 	// Properties that group with nothing are always scalar, so the section loop
