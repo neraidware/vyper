@@ -4,7 +4,7 @@ package vyper
 
 import "core:mem"
 
-Kf_Track_Range :: struct {
+Keyframe_Track_Range :: struct {
 	first:  int,
 	slots:  int,
 	n:      int,
@@ -19,7 +19,7 @@ Session_Trk_Free :: struct {
 	slots: int,
 }
 
-session_trk_rows: [dynamic]Kf_Track
+session_trk_rows: [dynamic]Keyframe_Track
 session_trk_free_spans: [dynamic]Session_Trk_Free
 session_trk_live: int
 
@@ -47,7 +47,7 @@ session_trk_alloc :: proc(slots: int) -> int {
 	assert(session_trk_live + slots <= SESSION_TRK_MAX, "session track arena exhausted")
 	off := len(session_trk_rows)
 	for _ in 0..<slots {
-		append(&session_trk_rows, Kf_Track{})
+		append(&session_trk_rows, Keyframe_Track{})
 	}
 	session_trk_live += slots
 	return off
@@ -85,45 +85,58 @@ session_trk_free :: proc(off, slots: int) {
 	}
 }
 
-session_trk_view :: proc(r: Kf_Track_Range, idx: int) -> ^Kf_Track {
+session_trk_view :: proc(r: Keyframe_Track_Range, idx: int) -> ^Keyframe_Track {
 	assert(r.n >= 0 && r.n <= r.slots && r.first+r.slots <= len(session_trk_rows), "session_trk_view: stale/out-of-bounds range")
 	assert(idx >= 0 && idx < r.n, "session_trk_view: index out of range")
 	return &session_trk_rows[r.first+idx]
 }
 
-session_trk_view_mut :: proc(r: ^Kf_Track_Range, idx: int) -> ^Kf_Track {
+session_trk_view_mut :: proc(r: ^Keyframe_Track_Range, idx: int) -> ^Keyframe_Track {
 	session_trk_make_unique(r)
 	return session_trk_view(r^, idx)
 }
 
-session_trk_share :: proc(r: ^Kf_Track_Range) -> Kf_Track_Range {
+session_trk_share :: proc(r: ^Keyframe_Track_Range) -> Keyframe_Track_Range {
 	r.shared = true
 	return r^
 }
 
-session_trk_clone_range :: proc(src: Kf_Track_Range) -> Kf_Track_Range {
+session_trk_clone_range :: proc(src: Keyframe_Track_Range) -> Keyframe_Track_Range {
 	if src.n == 0 && src.slots == 0 { return {} }
 	slots := max(src.slots, SESSION_TRK_MIN_CAP)
 	off := session_trk_alloc(slots)
 	for i in 0..<src.n {
 		session_trk_rows[off+i] = session_trk_rows[src.first+i]
-		session_trk_rows[src.first+i].keys.shared = true
-		session_trk_rows[off+i].keys.shared = true
+		// The lane ARRAY is deep-copied: it is a [dynamic] buffer owned by the row,
+		// and keyframe_track_release_lanes deletes it. Two rows sharing one buffer
+		// would leave the other dangling the moment one is released. The key RANGES
+		// inside stay shared -- that is the COW -- but each row needs its own headers,
+		// or writing a lane back through one row would be visible through the other.
+		lanes := session_trk_rows[src.first+i].lanes
+		cloned_lanes := make([dynamic]Keyframe_Lane, len(lanes))
+		for lane in 0 ..< len(lanes) {
+			cloned_lanes[lane] = lanes[lane]
+		}
+		session_trk_rows[off+i].lanes = cloned_lanes
+		for lane in 0 ..< len(cloned_lanes) {
+			session_trk_rows[src.first+i].lanes[lane].keys.shared = true
+			cloned_lanes[lane].keys.shared = true
+		}
 	}
-	return Kf_Track_Range{first=off, slots=slots, n=src.n}
+	return Keyframe_Track_Range{first=off, slots=slots, n=src.n}
 }
 
-session_trk_make_unique :: proc(r: ^Kf_Track_Range) {
+session_trk_make_unique :: proc(r: ^Keyframe_Track_Range) {
 	if !r.shared { return }
 	r^ = session_trk_clone_range(r^)
 }
 
-session_trk_release_range :: proc(r: Kf_Track_Range) {
+session_trk_release_range :: proc(r: Keyframe_Track_Range) {
 	if r.shared || r.slots == 0 { return }
 	session_trk_free(r.first, r.slots)
 }
 
-session_trk_push :: proc(r: ^Kf_Track_Range, t: Kf_Track) {
+session_trk_push :: proc(r: ^Keyframe_Track_Range, t: Keyframe_Track) {
 	session_trk_make_unique(r)
 	if r.n == r.slots {
 		new_slots := max(r.slots*2, SESSION_TRK_MIN_CAP)
@@ -139,20 +152,20 @@ session_trk_push :: proc(r: ^Kf_Track_Range, t: Kf_Track) {
 	r.n += 1
 }
 
-session_trk_erase :: proc(r: ^Kf_Track_Range, idx: int) {
+session_trk_erase :: proc(r: ^Keyframe_Track_Range, idx: int) {
 	session_trk_make_unique(r)
 	assert(idx >= 0 && idx < r.n, "session_trk_erase: index out of range")
-	mem.copy(&session_trk_rows[r.first+idx], &session_trk_rows[r.first+idx+1], (r.n-idx-1)*size_of(Kf_Track))
+	mem.copy(&session_trk_rows[r.first+idx], &session_trk_rows[r.first+idx+1], (r.n-idx-1)*size_of(Keyframe_Track))
 	r.n -= 1
 }
 
-session_trk_set :: proc(r: ^Kf_Track_Range, idx: int, t: Kf_Track) {
+session_trk_set :: proc(r: ^Keyframe_Track_Range, idx: int, t: Keyframe_Track) {
 	session_trk_make_unique(r)
 	assert(idx >= 0 && idx < r.n, "session_trk_set: index out of range")
 	session_trk_rows[r.first+idx] = t
 }
 
-session_trk_insert :: proc(r: ^Kf_Track_Range, idx: int, t: Kf_Track) {
+session_trk_insert :: proc(r: ^Keyframe_Track_Range, idx: int, t: Keyframe_Track) {
 	session_trk_make_unique(r)
 	assert(idx >= 0 && idx <= r.n, "session_trk_insert: index out of range")
 	if r.n == r.slots {
@@ -164,7 +177,7 @@ session_trk_insert :: proc(r: ^Kf_Track_Range, idx: int, t: Kf_Track) {
 		r.first = new_off
 		r.slots = new_slots
 	} else {
-		mem.copy(&session_trk_rows[r.first+idx+1], &session_trk_rows[r.first+idx], (r.n-idx)*size_of(Kf_Track))
+		mem.copy(&session_trk_rows[r.first+idx+1], &session_trk_rows[r.first+idx], (r.n-idx)*size_of(Keyframe_Track))
 	}
 	session_trk_rows[r.first+idx] = t
 	r.n += 1

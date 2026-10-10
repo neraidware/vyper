@@ -66,16 +66,16 @@ UI_Text_Buffers :: struct {
 	rate:        [64]u8,
 	hint:        [512]u8,
 	// keyframe readout scratch: lane name, absolute timeline frame, value text.
-	kf_name:     [128]u8,
-	kf_frame:    [64]u8,
-	kf_val:      [64]u8,
+	keyframe_name:     [128]u8,
+	keyframe_frame:    [64]u8,
+	keyframe_val:      [64]u8,
 	// "keyframe all modified" row: the heading and the pending-lane list.
 	// Eleven lanes plus separators is 47 bytes (28 of names, 20 of ", "), so 64
 	// still fits with room for the NUL. The bound is asserted at the write rather
 	// than trusted from this comment — the comment was what said "seven lanes"
 	// while the table behind it had eight and the enum had eleven.
-	kf_pending:      [64]u8,
-	kf_pending_list: [64]u8,
+	keyframe_pending:      [64]u8,
+	keyframe_pending_list: [64]u8,
 	// The inspector's clip-name label, cut to fit the name field. A display
 	// name is a file name, so PATH_MAX is the honest bound; 256 covers every
 	// path an editor meets and keeps the buffer off the heap.
@@ -251,18 +251,18 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	return clay.EndLayout(0)
 }
 
-// kf_gutter_names collects the distinct keyframe-track names the track-name
-// gutter (KfGutterNames) labels one visible lane each: every clip's tracks in
+// keyframe_gutter_names collects the distinct keyframe-track names the track-name
+// gutter (KeyframeGutterNames) labels one visible lane each: every clip's tracks in
 // clip order, deduplicated. Capped at `rows` (the row only has room for that
 // many lines); clips keyframing paths others omit still read because each
 // label row is aligned to the same KF_ROW_H lanes above the tiles.
-kf_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
+keyframe_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 	n := 0
 	for &c in track.clips {
 		for i in 0..<c.keyframe_tracks.n {
 			t := session_trk_view(c.keyframe_tracks,i)
 			dup := false
-			lane := kf_track_name(t)
+			lane := keyframe_track_name(t)
 			for i in 0 ..< n {
 				if out[i] == lane {
 					dup = true
@@ -469,11 +469,11 @@ prop_field :: proc(id_name: string, label, value: string, focused: bool) {
 	}
 }
 
-// kf_add_button is the inspector's "key this property at the playhead"
+// keyframe_add_button is the inspector's "key this property at the playhead"
 // control: a transparent click pad sized to the diamond glyph (KF_BTN_R*2
 // plus KF_BTN_PAD). The diamond itself is painted over it in the overlay pass
 // (draw_kf_add_buttons) so the button looks exactly like a keyframe.
-kf_add_button :: proc(id_name: string) {
+keyframe_add_button :: proc(id_name: string) {
 	pad := KF_BTN_R * 2 + KF_BTN_PAD * 2
 	if clay.UI(clay.ID(id_name))(
 	{
@@ -502,13 +502,13 @@ prop_field_row :: proc(id_name, field_id, label, value: string, focused: bool, b
 	},
 	) {
 		prop_field(field_id, label, value, focused)
-		kf_add_button(btn_id)
+		keyframe_add_button(btn_id)
 	}
 }
 
 // group_caption_row is a property-section header (Transform, Crop) with the
 // whole-group keyframe button on the right: one click keys every lane of the
-// section at the playhead. The group button uses the same kf_add_button pad,
+// section at the playhead. The group button uses the same keyframe_add_button pad,
 // so the diamond cluster painted over it in gpu_draw.odin (KF_GROUP_BTN_IDS)
 // is hit-tested exactly like a single-lane button.
 group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
@@ -526,7 +526,7 @@ group_caption_row :: proc(caption_id, spacer_id, label, btn_id: string) {
 		if clay.UI(clay.ID(spacer_id))( // stretch: pushes the button to the right
 			{layout = {sizing = {width = clay.SizingGrow({}), height = clay.SizingGrow({})}}},
 		) {}
-		kf_add_button(btn_id)
+		keyframe_add_button(btn_id)
 	}
 }
 
@@ -586,7 +586,7 @@ caption_row :: proc(caption_id, spacer_id, label: string) {
 // of this file uses.
 geom_key_all_modified_row :: proc(cl: ^Clip) {
 	any := clip_geom_any_modified(cl)
-	if clay.UI(clay.ID("KfAllModifiedRow"))(
+	if clay.UI(clay.ID("KeyframeAllModifiedRow"))(
 		{
 			layout = {
 				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
@@ -598,7 +598,7 @@ geom_key_all_modified_row :: proc(cl: ^Clip) {
 	) {
 		// Short labels for the pending lanes, formatted into the fixed ui_text
 		// buffer so the row does not allocate a string every inspector frame.
-		buf := ui_text.kf_pending[:]
+		buf := ui_text.keyframe_pending[:]
 		label := fmt.bprintf(buf[:], "A  Key %s", geom_key_pending_labels(cl, any))
 		col := any ? TEXT : CMDLINE_PLACEHOLDER
 		clay.Text(label, clay.TextElementConfig{textColor = col, fontSize = FONT_SMALL})
@@ -613,7 +613,7 @@ geom_key_pending_labels :: proc(cl: ^Clip, any: bool) -> string {
 	if !any {
 		return "none"
 	}
-	buf := ui_text.kf_pending_list[:]
+	buf := ui_text.keyframe_pending_list[:]
 	n := 0
 	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
 		if !clip_geom_key_modified(cl, Render_Geom_Prop(i)) {
@@ -627,7 +627,7 @@ geom_key_pending_labels :: proc(cl: ^Clip, any: bool) -> string {
 	// fmt.bprintf truncates silently, so a lane too long for the buffer would draw
 	// a clipped list with nothing on screen to say so. Assert instead: the whole
 	// set must render, or the buffer needs sizing against _COUNT.
-	assert(n <= len(buf), "ui: pending-lane list truncated — size kf_pending_list from _COUNT")
+	assert(n <= len(buf), "ui: pending-lane list truncated — size keyframe_pending_list from _COUNT")
 	return string(buf[:n])
 }
 
@@ -727,7 +727,7 @@ clip_card :: proc() {
 		// readout (property, frame, editable value — or, for a multi-selection,
 		// the properties the whole set shares). The clip fields below are
 		// skipped because the two selections never coexist (S3).
-		if kf_sel_active() {
+		if keyframe_sel_active() {
 			keyframe_readout()
 			return
 		}
@@ -827,20 +827,20 @@ clip_card :: proc() {
 			if edit_state.field == .X {
 				x_val = string(edit_state.chars[:edit_state.len])
 			}
-			group_caption_row("TransCaption", "TransCaptionSpacer", "Transform", "KfAddTrans")
-			prop_field_row("PropRowX", "PropFieldX", "X", x_val, edit_state.field == .X, "KfAddX")
+			group_caption_row("TransCaption", "TransCaptionSpacer", "Transform", "KeyframeAddTrans")
+			prop_field_row("PropRowX", "PropFieldX", "X", x_val, edit_state.field == .X, "KeyframeAddX")
 			y_buf := ui_text.y[:]
 			y_val := fmt.bprintf(y_buf[:], "%.0f", clip_geom_get(cl, .Trans_Y))
 			if edit_state.field == .Y {
 				y_val = string(edit_state.chars[:edit_state.len])
 			}
-			prop_field_row("PropRowY", "PropFieldY", "Y", y_val, edit_state.field == .Y, "KfAddY")
+			prop_field_row("PropRowY", "PropFieldY", "Y", y_val, edit_state.field == .Y, "KeyframeAddY")
 			s_buf := ui_text.s[:]
 			scl_val := fmt.bprintf(s_buf[:], "%.2f", clip_geom_get(cl, .Scale))
 			if edit_state.field == .Scale {
 				scl_val = string(edit_state.chars[:edit_state.len])
 			}
-			prop_field_row("PropRowS", "PropFieldS", "Scale", scl_val, edit_state.field == .Scale, "KfAddS")
+			prop_field_row("PropRowS", "PropFieldS", "Scale", scl_val, edit_state.field == .Scale, "KeyframeAddS")
 			// Opacity: a horizontal slider plus a percent field. The track is
 			// clay, not a custom paint pass -- the value is the filled child's
 			// percent width, so it needs no overlay drawing like the gain knob.
@@ -913,7 +913,7 @@ clip_card :: proc() {
 					}
 				}
 				op_hovered := op_active
-				kf_add_button("KfAddOpacity")
+				keyframe_add_button("KeyframeAddOpacity")
 				prop_field("PropFieldOpacity", "Opacity", op_val, edit_state.field == .Opacity || op_hovered)
 			}
 			// Canvas-center snap belongs with the transform settings it governs.
@@ -929,7 +929,7 @@ clip_card :: proc() {
 			) {
 				switch_toggle("SnapCenter", "Snap center", editor_flags.snap_center_to_canvas)
 			}
-			group_caption_row("CropCaption", "CropCaptionSpacer", "Crop (percent of box)", "KfAddCrop")
+			group_caption_row("CropCaption", "CropCaptionSpacer", "Crop (percent of box)", "KeyframeAddCrop")
 			l_buf := ui_text.l[:]
 			l_val := fmt.bprintf(l_buf[:], "%.0f%%", clip_geom_get(cl, .Crop_L) * 100)
 			if edit_state.field == .Crop_L {
@@ -960,9 +960,9 @@ clip_card :: proc() {
 			},
 			) {
 				prop_field("PropCropL", "L", l_val, edit_state.field == .Crop_L)
-				kf_add_button("KfAddCropL")
+				keyframe_add_button("KeyframeAddCropL")
 				prop_field("PropCropR", "R", r_val, edit_state.field == .Crop_R)
-				kf_add_button("KfAddCropR")
+				keyframe_add_button("KeyframeAddCropR")
 			}
 			if clay.UI(clay.ID("CropRowBot"))(
 			{
@@ -974,9 +974,9 @@ clip_card :: proc() {
 			},
 			) {
 				prop_field("PropCropT", "T", t_val, edit_state.field == .Crop_T)
-				kf_add_button("KfAddCropT")
+				keyframe_add_button("KeyframeAddCropT")
 				prop_field("PropCropB", "B", b_val, edit_state.field == .Crop_B)
-				kf_add_button("KfAddCropB")
+				keyframe_add_button("KeyframeAddCropB")
 			}
 			// Zoom and Pan: the content window's magnification and offset. Their own
 			// row rather than more crop fields, because they are a different
@@ -1008,11 +1008,11 @@ clip_card :: proc() {
 			},
 			) {
 				prop_field("PropFieldZoom", "Z", z_val, edit_state.field == .Zoom)
-				kf_add_button("KfAddZoom")
+				keyframe_add_button("KeyframeAddZoom")
 				prop_field("PropFieldPanX", "X", px_val, edit_state.field == .Pan_X)
-				kf_add_button("KfAddPanX")
+				keyframe_add_button("KeyframeAddPanX")
 				prop_field("PropFieldPanY", "Y", py_val, edit_state.field == .Pan_Y)
-				kf_add_button("KfAddPanY")
+				keyframe_add_button("KeyframeAddPanY")
 			}
 			geom_key_all_modified_row(cl)
 		} else {
@@ -1079,7 +1079,7 @@ clip_card :: proc() {
 						clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 					)
 				}
-				kf_add_button("KfAddGain")
+				keyframe_add_button("KeyframeAddGain")
 			}
 
 			// SPEED and PITCH, audio clips only. Two fields rather than one, and
@@ -1089,7 +1089,7 @@ clip_card :: proc() {
 			// would force the user to pick which one they meant, and in this engine
 			// both can be set at once.
 			//
-			// Neither is keyframable yet, so there is no KfAdd button -- an autofill
+			// Neither is keyframable yet, so there is no KeyframeAdd button -- an autofill
 			// button that writes nothing is worse than no button. Both mirror the
 			// playhead-sampled value (clip_pitch_at_playhead / clip_speed) so the
 			// readout shows what playback uses, like the gain lane above.
@@ -1150,25 +1150,31 @@ ui_prop_value :: proc(id: string, text: string, field: Edit_Field) {
 keyframe_readout :: proc() {
 	panel_caption("Keyframe")
 	// Dispatch on whether the selection resolves as EXACTLY one key, not on the
-	// count: kf_selected already carries that contract, and a sole selection
+	// count: keyframe_selected already carries that contract, and a sole selection
 	// whose ref no longer resolves has no clip to name a lane from, so it reads
 	// as the set readout too.
-	cl, lane, kf, one := kf_selected()
+	cl, track_index, lane_index, keyframe, one := keyframe_selected()
 	if !one {
 		keyframes_readout()
 		return
 	}
-	name_buf := ui_text.kf_name[:]
+	// The header names the key's LANE, not its track: a section track holds several
+	// curves, so the track name alone does not say which property is being shown.
+	name_buf := ui_text.keyframe_name[:]
 	clay.Text(
-		fmt.bprintf(name_buf[:], "%s", kf_track_name(session_trk_view(cl.keyframe_tracks,lane))),
+		fmt.bprintf(
+			name_buf[:],
+			"%s",
+			keyframe_track_lane_name(session_trk_view(cl.keyframe_tracks, track_index), lane_index),
+		),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
 	)
-	frame_buf := ui_text.kf_frame[:]
+	frame_buf := ui_text.keyframe_frame[:]
 	clay.Text(
-		fmt.bprintf(frame_buf[:], "frame %d", cl.timeline_start_frame + i64(kf.frame_off)),
+		fmt.bprintf(frame_buf[:], "frame %d", cl.timeline_start_frame + i64(keyframe.frame_off)),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA},
 	)
-	if clay.UI(clay.ID("KfValRow"))(
+	if clay.UI(clay.ID("KeyframeValRow"))(
 	{
 		layout = {
 			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
@@ -1182,17 +1188,14 @@ keyframe_readout :: proc() {
 			"Value",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
-		v_buf := ui_text.kf_val[:]
-		// A packed (section) key shows lane 0 — the lane an edit would
-		// unwrap-and-target — so the readout and the commit agree.
-		rval: f32
-		if kf.mask != 0 {
-			rval, _ = kf_lane_value(kf^, 0)
-		} else {
-			rval = kf.value.(f32)
-		}
+		v_buf := ui_text.keyframe_val[:]
+		// A key is a scalar on the lane that owns it (TODO.md Active 52), so the
+		// readout is just that value. It used to branch on a packed mask and show
+		// lane 0 -- a key now cannot be packed, so the branch is gone rather than
+		// defaulted.
+		rval := keyframe.value
 		v_str := fmt.bprintf(v_buf[:], "%.2f", rval)
-		if edit_state.field == .Kf_Value {
+		if edit_state.field == .Keyframe_Value {
 			v_str = string(edit_state.chars[:edit_state.len])
 		}
 		if clay.UI(clay.ID("PropFieldKf"))(
@@ -1202,10 +1205,10 @@ keyframe_readout :: proc() {
 				childAlignment = {x = .Left, y = .Center},
 				padding = clay.PaddingAll(6),
 			},
-			backgroundColor = edit_state.field == .Kf_Value ? BUTTON_HOVER : BUTTON,
+			backgroundColor = edit_state.field == .Keyframe_Value ? BUTTON_HOVER : BUTTON,
 			border = {
-				color = edit_state.field == .Kf_Value ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-				width = clay.BorderOutside(edit_state.field == .Kf_Value ? 2 : 1),
+				color = edit_state.field == .Keyframe_Value ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+				width = clay.BorderOutside(edit_state.field == .Keyframe_Value ? 2 : 1),
 			},
 			cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 		},
@@ -1216,7 +1219,7 @@ keyframe_readout :: proc() {
 			)
 		}
 	}
-	if clay.UI(clay.ID("KfInterpRow"))(
+	if clay.UI(clay.ID("KeyframeInterpRow"))(
 	{
 		layout = {
 			sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
@@ -1230,8 +1233,8 @@ keyframe_readout :: proc() {
 			"Interp",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
-		interp, mixed, _ := kf_sel_interp()
-		kf_interp_dropdown(interp, mixed)
+		interp, mixed, _ := keyframe_sel_interp()
+		keyframe_interp_dropdown(interp, mixed)
 	}
 }
 
@@ -1242,7 +1245,7 @@ keyframe_readout :: proc() {
 // worth stating: a property is shared when one value means the same thing on
 // every selected key. Interpolation qualifies — it eases the segment arriving at
 // a key, so it is a property of the key wherever it sits, and the dropdown
-// writes all of them (kf_set_interp_all). The VALUE does not: it is one key's
+// writes all of them (keyframe_set_interp_all). The VALUE does not: it is one key's
 // number for one lane, so with keys on different lanes there is no value that
 // means anything, and with keys on the same lane the only "set them all" is
 // flattening the animation. So the value field is not offered here at all — a
@@ -1252,11 +1255,11 @@ keyframe_readout :: proc() {
 // property: shown when the whole selection is on one lane (where it is true of
 // every key) and replaced by the count otherwise.
 keyframes_readout :: proc() {
-	count := kf_sel_count()
-	name_buf := ui_text.kf_name[:]
+	count := keyframe_sel_count()
+	name_buf := ui_text.keyframe_name[:]
 	// The name is only meaningful as a header when it names EVERY selected key,
 	// which is exactly the shared-property test: one lane, or many.
-	if name, ok := kf_sel_same_lane(); ok {
+	if name, ok := keyframe_sel_same_lane(); ok {
 		clay.Text(
 			fmt.bprintf(name_buf[:], "%s", name),
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
@@ -1270,8 +1273,8 @@ keyframes_readout :: proc() {
 	// The absolute frame span, which is the one frame-shaped fact true of the
 	// whole set. Clips start at different points, so each key's absolute frame
 	// is its own clip's start plus its clip-relative offset.
-	frame_buf := ui_text.kf_frame[:]
-	lo, hi := kf_sel_frame_span()
+	frame_buf := ui_text.keyframe_frame[:]
+	lo, hi := keyframe_sel_frame_span()
 	if lo == hi {
 		clay.Text(
 			fmt.bprintf(frame_buf[:], "frame %d", lo),
@@ -1286,9 +1289,9 @@ keyframes_readout :: proc() {
 	// The shared property. No row at all when not one ref resolved: a dropdown
 	// naming a mode belongs to no selected key then, and an empty label would be
 	// the only honest thing to draw.
-	interp, mixed, seen := kf_sel_interp()
+	interp, mixed, seen := keyframe_sel_interp()
 	if seen &&
-	   clay.UI(clay.ID("KfInterpRow"))(
+	   clay.UI(clay.ID("KeyframeInterpRow"))(
 		{
 			layout = {
 				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
@@ -1302,12 +1305,12 @@ keyframes_readout :: proc() {
 			"Interp",
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
-		kf_interp_dropdown(interp, mixed)
+		keyframe_interp_dropdown(interp, mixed)
 	}
 }
 
-// kf_interp_label is the keyframe interpolation dropdown's display text.
-kf_interp_label :: proc(interp: Kf_Interp) -> string {
+// keyframe_interp_label is the keyframe interpolation dropdown's display text.
+keyframe_interp_label :: proc(interp: Keyframe_Interp) -> string {
 	switch interp {
 	case .Linear:
 		return "Linear"
@@ -1325,14 +1328,14 @@ kf_interp_label :: proc(interp: Kf_Interp) -> string {
 	return "Linear"
 }
 
-// kf_interp_mixed_label is what a multi-selection's interpolation dropdown shows
+// keyframe_interp_mixed_label is what a multi-selection's interpolation dropdown shows
 // when the selected keys do NOT agree: no single mode is current, so naming one
 // would be a lie about the set. A named constant because the literal and the
 // reasoning travel together — the menu still offers every mode, and picking one
-// writes the whole selection (kf_set_interp_all).
+// writes the whole selection (keyframe_set_interp_all).
 KF_INTERP_MIXED_LABEL :: "-"
 
-// kf_interp_dropdown renders the interpolation selector as a collapsed button
+// keyframe_interp_dropdown renders the interpolation selector as a collapsed button
 // toggling a floating menu, the same toggle/select/dismiss shape as the
 // export-encoder dropdown. Picking a mode sets how the segment ARRIVING at the
 // key eases (we ease into a breakpoint, so the key you're heading to owns the
@@ -1341,8 +1344,8 @@ KF_INTERP_MIXED_LABEL :: "-"
 // `mixed` is the multi-selection case: the keys disagree, so the button shows "-"
 // and no menu entry is marked current, but the menu is the full list and any pick
 // applies to the whole set.
-kf_interp_dropdown :: proc(interp: Kf_Interp, mixed: bool) {
-	if clay.UI(clay.ID("KfInterpButton"))(
+keyframe_interp_dropdown :: proc(interp: Keyframe_Interp, mixed: bool) {
+	if clay.UI(clay.ID("KeyframeInterpButton"))(
 	{
 		layout = {
 			sizing = {width = clay.SizingFixed(120), height = clay.SizingFixed(BUTTON_HEIGHT)},
@@ -1351,22 +1354,22 @@ kf_interp_dropdown :: proc(interp: Kf_Interp, mixed: bool) {
 		},
 		backgroundColor = clay.Hovered() ? BUTTON_HOVER : BUTTON,
 		border = {
-			color = kf_view.interp_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
+			color = keyframe_view.interp_menu_open ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
 			width = clay.BorderOutside(1),
 		},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	},
 	) {
 		clay.Text(
-			mixed ? KF_INTERP_MIXED_LABEL : kf_interp_label(interp),
+			mixed ? KF_INTERP_MIXED_LABEL : keyframe_interp_label(interp),
 			clay.TextElementConfig {
-				textColor = kf_view.interp_menu_open ? BUTTON_BORDER_HOVER : TEXT,
+				textColor = keyframe_view.interp_menu_open ? BUTTON_BORDER_HOVER : TEXT,
 				fontSize = FONT_SMALL,
 			},
 		)
 	}
-	if kf_view.interp_menu_open {
-		if clay.UI(clay.ID("KfInterpMenu"))(
+	if keyframe_view.interp_menu_open {
+		if clay.UI(clay.ID("KeyframeInterpMenu"))(
 		{
 			layout = {
 				sizing = {width = clay.SizingFixed(120), height = clay.SizingFit({})},
@@ -1379,7 +1382,7 @@ kf_interp_dropdown :: proc(interp: Kf_Interp, mixed: bool) {
 			cornerRadius = clay.CornerRadiusAll(4),
 			floating = {
 				offset = {0, 4},
-				parentId = clay.ID("KfInterpButton").id,
+				parentId = clay.ID("KeyframeInterpButton").id,
 				zIndex = 1000,
 				attachment = {element = .LeftTop, parent = .LeftBottom},
 				attachTo = .ElementWithId,
@@ -1391,38 +1394,38 @@ kf_interp_dropdown :: proc(interp: Kf_Interp, mixed: bool) {
 			// No entry is marked current when the selection is mixed: the whole
 			// list is offered, and a pick writes every selected key.
 			settings_button(
-				"KfInterpLinear",
-				kf_interp_label(.Linear),
+				"KeyframeInterpLinear",
+				keyframe_interp_label(.Linear),
 				!mixed && interp == .Linear,
 				fill_width = true,
 			)
 			settings_button(
-				"KfInterpCubic",
-				kf_interp_label(.Cubic),
+				"KeyframeInterpCubic",
+				keyframe_interp_label(.Cubic),
 				!mixed && interp == .Cubic,
 				fill_width = true,
 			)
 			settings_button(
-				"KfInterpEaseIn",
-				kf_interp_label(.Ease_In),
+				"KeyframeInterpEaseIn",
+				keyframe_interp_label(.Ease_In),
 				!mixed && interp == .Ease_In,
 				fill_width = true,
 			)
 			settings_button(
-				"KfInterpEaseOut",
-				kf_interp_label(.Ease_Out),
+				"KeyframeInterpEaseOut",
+				keyframe_interp_label(.Ease_Out),
 				!mixed && interp == .Ease_Out,
 				fill_width = true,
 			)
 			settings_button(
-				"KfInterpEaseInOut",
-				kf_interp_label(.Ease_In_Out),
+				"KeyframeInterpEaseInOut",
+				keyframe_interp_label(.Ease_In_Out),
 				!mixed && interp == .Ease_In_Out,
 				fill_width = true,
 			)
 			settings_button(
-				"KfInterpElastic",
-				kf_interp_label(.Elastic),
+				"KeyframeInterpElastic",
+				keyframe_interp_label(.Elastic),
 				!mixed && interp == .Elastic,
 				fill_width = true,
 			)
@@ -3140,13 +3143,13 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 					}
 					ti := timeline.track_order[r]
 					track := &timeline.tracks[ti]
-					kf_rows := kf_rows_for(track)
+					keyframe_rows := keyframe_rows_for(track)
 					if clay.UI(clay.ID("TrackRow", u32(ti)))(
 					{
 						layout = {
 							sizing = {
 								width = clay.SizingGrow({}),
-								height = clay.SizingFixed(TRACK_ROW_H + f32(kf_rows) * KF_ROW_H),
+								height = clay.SizingFixed(TRACK_ROW_H + f32(keyframe_rows) * KF_ROW_H),
 							},
 							layoutDirection = .LeftToRight,
 							childGap = SECTION_GAP,
@@ -3177,13 +3180,13 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 							// No per-track buttons here: duplicate/delete moved
 							// to the track menu (right-click the gutter), which
 							// keeps the row short enough to fit more tracks.
-							if kf_rows > 0 {
+							if keyframe_rows > 0 {
 								// Keyframe property labels: one KF_ROW_H line per
 								// visible lane, stacked under the buttons so they
 								// line up with the diamond lanes beside them.
-								kf_names: [32]string
-								kf_count := kf_gutter_names(track, kf_rows, kf_names[:])
-								if clay.UI(clay.ID("KfGutterNames", u32(ti)))(
+								keyframe_names: [32]string
+								keyframe_count := keyframe_gutter_names(track, keyframe_rows, keyframe_names[:])
+								if clay.UI(clay.ID("KeyframeGutterNames", u32(ti)))(
 								{
 									layout = {
 										sizing = {
@@ -3194,8 +3197,8 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 									},
 								},
 								) {
-									for i in 0 ..< kf_count {
-										if clay.UI(clay.ID("KfGutterName", u32(ti * 1000 + i)))(
+									for i in 0 ..< keyframe_count {
+										if clay.UI(clay.ID("KeyframeGutterName", u32(ti * 1000 + i)))(
 										{
 											layout = {
 												sizing = {
@@ -3207,7 +3210,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 										},
 										) {
 											clay.Text(
-												kf_names[i],
+												keyframe_names[i],
 												clay.TextElementConfig {
 													textColor = RULER_LABEL_COLOR,
 													fontSize = FONT_SMALL,
@@ -3307,7 +3310,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 								// the diamond overlay (draw_keyframes) paints into and
 								// give the interaction slice click targets; a hairline
 								// on each lane's top makes the stack read as a strip.
-								kf_n := timeline_clip.keyframe_tracks.n
+								keyframe_n := timeline_clip.keyframe_tracks.n
 								if clay.UI(
 									clay.ID(
 										"TimelineClipWrap",
@@ -3319,7 +3322,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 											sizing = {
 												width = clay.SizingFixed(clip_width),
 												height = clay.SizingFixed(
-													CLIP_TILE_HEIGHT + f32(kf_n) * KF_ROW_H,
+													CLIP_TILE_HEIGHT + f32(keyframe_n) * KF_ROW_H,
 												),
 											},
 											layoutDirection = .TopToBottom,
@@ -3365,7 +3368,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 											},
 										)
 									}
-									for tr in 0 ..< kf_n {
+									for tr in 0 ..< keyframe_n {
 										if clay.UI(
 											clay.ID(
 												"KeyframeLane",

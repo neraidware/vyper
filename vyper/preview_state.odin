@@ -172,20 +172,20 @@ prewarm_next_clip :: proc() {
 		warm.valid = true
 		return
 	}
-	for kf in i64(1) ..< 4 {
+	for keyframe in i64(1) ..< 4 {
 		// The frames this clip will really show next, which under conform are not
 		// the next few source frames: holding (project faster than source) repeats
-		// one, dropping (project slower) skips. Warming source_start+kf would
+		// one, dropping (project slower) skips. Warming source_start+keyframe would
 		// decode frames the clip never displays and miss ones it is about to.
 		wf := clip_source_frame(
 			best.source_start_frame,
 			best.timeline_start_frame,
-			playhead.frame + kf,
+			playhead.frame + keyframe,
 			false,
 			best.src_fps,
 		)
-		if wf <= best.source_start_frame + kf - 1 {
-			wf = best.source_start_frame + kf // never warm behind the current frame
+		if wf <= best.source_start_frame + keyframe - 1 {
+			wf = best.source_start_frame + keyframe // never warm behind the current frame
 		}
 		warm_pick, warm_base = proxy_pick_for_frame(
 			best.path,

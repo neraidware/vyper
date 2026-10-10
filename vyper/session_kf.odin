@@ -1,7 +1,7 @@
 // Session keyframe store: the key ranges that make `Clip` POD (TODO.md
 // Active 19, S2b).
 //
-// A `Kf_Track` no longer owns its keys. It holds a `Kf_Keys_Range` — a window
+// A `Keyframe_Track` no longer owns its keys. It holds a `Keyframe_Keys_Range` — a window
 // into one flat `[dynamic]Keyframe` owned by the session — so copying a clip is
 // a struct copy and there is no per-clip payload to free. Every slot belongs to
 // the session; a track's keys are a window onto it, and the window is what
@@ -26,7 +26,7 @@
 // hands out long-lived aliases that callers capture all over the tree. Keys have
 // the opposite shape: every read goes through a snapshot seam into a
 // caller-owned fixed array (`Audio_Gain_Snapshot.keys`,
-// `kf_geom_fill_snapshot`'s `slot.keys`), and the census found twelve borrowed
+// `keyframe_geom_fill_snapshot`'s `slot.keys`), and the census found twelve borrowed
 // key views, all consumed by the very next expression. So keys can live in
 // relocatable storage, and reusing freed space matters more here than it did for
 // strings. That asymmetry is the reason this file exists rather than a second
@@ -49,13 +49,13 @@ SESSION_KF_MAX_KEYS :: 1 << 20
 // 200-lane clip from paying 200 separate growth moves.
 SESSION_KF_MIN_CAP :: 8
 
-// Kf_Keys_Range locates one track's keys in the session store. It travels inside
-// a `Kf_Track`, which travels inside a `Clip`, which is why it must be POD: two
+// Keyframe_Keys_Range locates one track's keys in the session store. It travels inside
+// a `Keyframe_Track`, which travels inside a `Clip`, which is why it must be POD: two
 // ints of length, no pointer, nothing to free.
 //
-// The zero value is a valid empty range (no keys), so a fresh `Kf_Track` is
+// The zero value is a valid empty range (no keys), so a fresh `Keyframe_Track` is
 // usable without an init.
-Kf_Keys_Range :: struct {
+Keyframe_Keys_Range :: struct {
 	// first: index of the first reserved slot in `session_kf_keys`.
 	first: int,
 	// slots: reserved capacity. Always >= n. The slack is what makes insert
@@ -283,7 +283,7 @@ session_kf_grow :: proc(off: int, slots: int, need: int) -> (int, int) {
 // `session_kf_keys` inline skips the check -- and the bounds check that
 // `session_kf_erase`'s inline slice skipped is how an out-of-range window
 // reached mem.copy instead of the assert naming it.
-session_kf_window :: proc(r: Kf_Keys_Range, n: int) -> []Keyframe {
+session_kf_window :: proc(r: Keyframe_Keys_Range, n: int) -> []Keyframe {
 	assert(
 		n >= 0 && n <= r.slots && r.first + r.slots <= len(session_kf_keys),
 		"session range is out of bounds (stale handle after a reset?)",
@@ -291,7 +291,7 @@ session_kf_window :: proc(r: Kf_Keys_Range, n: int) -> []Keyframe {
 	return session_kf_keys[r.first : r.first + n]
 }
 
-session_kf_view :: proc(r: Kf_Keys_Range) -> []Keyframe {
+session_kf_view :: proc(r: Keyframe_Keys_Range) -> []Keyframe {
 	return session_kf_window(r, r.n)
 }
 
@@ -300,7 +300,7 @@ session_kf_view :: proc(r: Kf_Keys_Range) -> []Keyframe {
 // one illegal mutation (writing through a shared range, which another clip or
 // undo snapshot can also see) fails at the mutation site instead of silently
 // corrupting a copy.
-session_kf_view_mut :: proc(r: Kf_Keys_Range) -> []Keyframe {
+session_kf_view_mut :: proc(r: Keyframe_Keys_Range) -> []Keyframe {
 	assert(!r.shared, "session_kf_view_mut: range is shared; make it unique first")
 	return session_kf_view(r)
 }
@@ -311,7 +311,7 @@ session_kf_view_mut :: proc(r: Kf_Keys_Range) -> []Keyframe {
 // track does not pay for the copy. The copy starts at the same length, not a
 // doubled capacity: this is a migration, not a growth, and the next insert will
 // grow it if it needs to.
-session_kf_make_unique :: proc(r: ^Kf_Keys_Range) {
+session_kf_make_unique :: proc(r: ^Keyframe_Keys_Range) {
 	if !r.shared {
 		return
 	}
@@ -325,13 +325,13 @@ session_kf_make_unique :: proc(r: ^Kf_Keys_Range) {
 		raw_data(src),
 		r.n * size_of(Keyframe),
 	)
-	r^ = Kf_Keys_Range{first = off, slots = slots, n = r.n}
+	r^ = Keyframe_Keys_Range{first = off, slots = slots, n = r.n}
 }
 
 // session_kf_reserve grows a unique range so it can hold `need` keys, updating
 // the handle. Split out from the grow sites because the handle lives inside a
-// `Kf_Track` and every append has to write it back.
-session_kf_reserve :: proc(r: ^Kf_Keys_Range, need: int) {
+// `Keyframe_Track` and every append has to write it back.
+session_kf_reserve :: proc(r: ^Keyframe_Keys_Range, need: int) {
 	if need <= r.slots {
 		return
 	}
@@ -341,8 +341,8 @@ session_kf_reserve :: proc(r: ^Kf_Keys_Range, need: int) {
 // session_kf_release frees a range's slots. The caller must already have broken
 // sharing — releasing a range another clip still points at would hand its slots
 // to someone else. The store does not track holders, so that is a rule on the
-// caller, and `kf_free_tracks` is the one place that owns whole clips.
-session_kf_release :: proc(r: Kf_Keys_Range) {
+// caller, and `keyframe_free_tracks` is the one place that owns whole clips.
+session_kf_release :: proc(r: Keyframe_Keys_Range) {
 	if r.slots > 0 {
 		session_kf_free(r.first, r.slots)
 	}
@@ -351,7 +351,7 @@ session_kf_release :: proc(r: Kf_Keys_Range) {
 // session_kf_clone copies a range's live keys into a fresh private one. This is
 // what a deep copy (undo snapshot, split half, project load) uses, and what
 // `session_kf_make_unique` does when it resolves sharing.
-session_kf_clone :: proc(r: Kf_Keys_Range) -> Kf_Keys_Range {
+session_kf_clone :: proc(r: Keyframe_Keys_Range) -> Keyframe_Keys_Range {
 	if r.n == 0 && r.slots == 0 {
 		return {}
 	}
@@ -362,7 +362,7 @@ session_kf_clone :: proc(r: Kf_Keys_Range) -> Kf_Keys_Range {
 		raw_data(session_kf_view(r)),
 		r.n * size_of(Keyframe),
 	)
-	return Kf_Keys_Range{first = off, slots = slots, n = r.n}
+	return Keyframe_Keys_Range{first = off, slots = slots, n = r.n}
 }
 
 // session_kf_push appends one key to a range, growing in place when the slack
@@ -373,7 +373,7 @@ session_kf_clone :: proc(r: Kf_Keys_Range) -> Kf_Keys_Range {
 // the key lands at r.n in the (possibly new) slots. Writing first and growing
 // after would put the key in the old range and then move it, which is the one
 // ordering that loses the insert.
-session_kf_push :: proc(r: ^Kf_Keys_Range, k: Keyframe) {
+session_kf_push :: proc(r: ^Keyframe_Keys_Range, k: Keyframe) {
 	assert(!r.shared, "session_kf_push: range is shared; make it unique first")
 	session_kf_reserve(r, r.n + 1)
 	session_kf_window(r^, r.n + 1)[r.n] = k
@@ -383,7 +383,7 @@ session_kf_push :: proc(r: ^Kf_Keys_Range, k: Keyframe) {
 // session_kf_erase removes the key at `i`, shifting the rest down so the range
 // stays sorted ascending. The freed slot becomes tailroom rather than being
 // returned, so an erase/insert cycle on one track does not churn the store.
-session_kf_erase :: proc(r: ^Kf_Keys_Range, i: int) {
+session_kf_erase :: proc(r: ^Keyframe_Keys_Range, i: int) {
 	assert(!r.shared, "session_kf_erase: range is shared; make it unique first")
 	assert(i >= 0 && i < r.n, "session_kf_erase: index out of range")
 	keys := session_kf_window(r^, r.n)
@@ -401,7 +401,7 @@ session_kf_erase :: proc(r: ^Kf_Keys_Range, i: int) {
 // session_kf_set overwrites the key at `i`. Distinct from push/erase because it
 // asserts the index: a set is the "replace the key on this frame" edit, and a
 // bad index there is a search bug, not a user error.
-session_kf_set :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
+session_kf_set :: proc(r: ^Keyframe_Keys_Range, i: int, k: Keyframe) {
 	assert(!r.shared, "session_kf_set: range is shared; make it unique first")
 	assert(i >= 0 && i < r.n, "session_kf_set: index out of range")
 	session_kf_window(r^, i + 1)[i] = k
@@ -410,7 +410,7 @@ session_kf_set :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
 // session_kf_at reads one key by index. Indexing the range through the store
 // rather than through a slice is what keeps the call sites free of borrowed
 // views; the bounds assert is the same one session_kf_view raises.
-session_kf_at :: proc(r: Kf_Keys_Range, i: int) -> Keyframe {
+session_kf_at :: proc(r: Keyframe_Keys_Range, i: int) -> Keyframe {
 	assert(i >= 0 && i < r.n, "session_kf_at: index out of range")
 	return session_kf_keys[r.first + i]
 }
@@ -418,7 +418,7 @@ session_kf_at :: proc(r: Kf_Keys_Range, i: int) -> Keyframe {
 // session_kf_at_ptr borrows one key in place, for the sites that mutate a single
 // field (`k.value = v`) without replacing the whole key. Same lifetime rule as
 // session_kf_view: do not hold this across a mutation of the range.
-session_kf_at_ptr :: proc(r: Kf_Keys_Range, i: int) -> ^Keyframe {
+session_kf_at_ptr :: proc(r: Keyframe_Keys_Range, i: int) -> ^Keyframe {
 	assert(!r.shared, "session_kf_at_ptr: range is shared; make it unique first")
 	assert(i >= 0 && i < r.n, "session_kf_at_ptr: index out of range")
 	return &session_kf_keys[r.first + i]
@@ -429,7 +429,7 @@ session_kf_at_ptr :: proc(r: Kf_Keys_Range, i: int) -> ^Keyframe {
 // ordered insert sites used, which had to grow the array before the slide so
 // there was a slot to land in -- two chances to get the order wrong, and the
 // wrong order silently drops the key.
-session_kf_insert :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
+session_kf_insert :: proc(r: ^Keyframe_Keys_Range, i: int, k: Keyframe) {
 	assert(!r.shared, "session_kf_insert: range is shared; make it unique first")
 	assert(i >= 0 && i <= r.n, "session_kf_insert: insert position out of range")
 	session_kf_reserve(r, r.n + 1)
@@ -447,8 +447,8 @@ session_kf_insert :: proc(r: ^Kf_Keys_Range, i: int, k: Keyframe) {
 // session_kf_make builds a fresh private range holding `n` default keys. Replaces
 // `make([dynamic]Keyframe, 0, cap)` followed by appends at the sites that build a
 // track from a known key list.
-session_kf_make :: proc(keys: []Keyframe) -> Kf_Keys_Range {
-	r := Kf_Keys_Range{}
+session_kf_make :: proc(keys: []Keyframe) -> Keyframe_Keys_Range {
+	r := Keyframe_Keys_Range{}
 	if len(keys) > 0 {
 		session_kf_reserve(&r, len(keys))
 		mem.copy(

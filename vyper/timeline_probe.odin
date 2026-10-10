@@ -48,7 +48,7 @@ when ODIN_DEBUG {
 		playhead.frame = 250
 		timeline_view.start = 0
 		active_interaction = .None
-		kf_clear()
+		keyframe_clear()
 	}
 
 	// test_ripple_dispatch_closes_gap drives the ACTUAL Backspace action, not
@@ -168,14 +168,17 @@ when ODIN_DEBUG {
 		tl_straddle_scene()
 		cl := &timeline.tracks[0].clips[0]
 		cl.source_start_frame = 100
-		cl.keyframe_tracks = Kf_Track_Range{}
-		session_trk_push(&cl.keyframe_tracks, Kf_Track {
-			name = session_str_intern("transform.x"),
-			keys = Kf_Keys_Range{},
+		cl.keyframe_tracks = Keyframe_Track_Range{}
+		// "transform.x" is a LANE name; the store keys it on the section track
+		// "transform" at lane 0.
+		session_trk_push(&cl.keyframe_tracks, Keyframe_Track {
+			name = session_str_intern("transform"),
 		})
 		track := session_trk_view_mut(&cl.keyframe_tracks, 0)
-		session_kf_push(&track.keys, Keyframe{frame_off=50,value=0.0})
-		session_kf_push(&track.keys, Keyframe{frame_off=250,value=1.0})
+		lane := Keyframe_Lane{}
+		session_kf_push(&lane.keys, Keyframe{frame_off=50,value=0.0})
+		session_kf_push(&lane.keys, Keyframe{frame_off=250,value=1.0})
+		append(&track.lanes, lane)
 		// Markers are keyed by SOURCE frame. The clip starts at source 100 and the
 		// cut is 200 frames in, so the halves read source [100,300) and [300,500):
 		// one marker each, which is what makes the label-ownership check possible.
@@ -225,23 +228,41 @@ when ODIN_DEBUG {
 			clip_name(right),
 			orig_name,
 		)
+		// Isolation, not a count. This scene splits MID-INTERPOLATION (keys at 50 and
+		// 250, cut at 200), so the left half legitimately ends up holding its own
+		// pre-cut key AND the boundary key that carries the curve's value at the cut
+		// (keyframe_split_preserve_continuity). What this test is actually about is that
+		// the halves do not SHARE a key range: each writes its own copy. Asserting a
+		// fixed count here would fail the moment the boundary key is correct, which
+		// is why it counts "both lanes present and distinct" instead.
 		tl_probe_check(
 			left.keyframe_tracks.n == 1 &&
 			right.keyframe_tracks.n == 1 &&
-			session_trk_view(left.keyframe_tracks,0)^.keys.n == 1 &&
-			session_trk_view(right.keyframe_tracks,0)^.keys.n == 1,
-			"each half must own one lane with one key (got %d/%d lanes, %d/%d keys)",
+			keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0).n >= 1 &&
+			keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0).n >= 1,
+			"each half must own its own lane with at least one key (got %d/%d lanes, %d/%d keys)",
 			left.keyframe_tracks.n,
 			right.keyframe_tracks.n,
-			session_trk_view(left.keyframe_tracks,0)^.keys.n,
-			session_trk_view(right.keyframe_tracks,0)^.keys.n,
+			keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0).n,
+			keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0).n,
 		)
+		// And the two key ranges must be distinct objects, not one shared range
+		// reached through two clips.
+		if left.keyframe_tracks.n == 1 && right.keyframe_tracks.n == 1 {
+			lk := keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0)
+			rk := keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0)
+			tl_probe_check(
+				lk != rk,
+				"the two halves must not share one key range (both at %v)",
+				lk,
+			)
+		}
 		tl_probe_check(
-			session_kf_at(session_trk_view(left.keyframe_tracks,0)^.keys,0).frame_off == 50 &&
-				session_kf_at(session_trk_view(right.keyframe_tracks,0)^.keys,0).frame_off == 50,
+			session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0),0).frame_off == 50 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0),0).frame_off == 50,
 			"the split's slice-1 rule: keys re-relativized by -left_len (got %d, %d)",
-			session_kf_at(session_trk_view(left.keyframe_tracks,0)^.keys,0).frame_off,
-			session_kf_at(session_trk_view(right.keyframe_tracks,0)^.keys,0).frame_off,
+			session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0),0).frame_off,
+			session_kf_at(keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0),0).frame_off,
 		)
 		// Marker ranges share until a label write triggers marker-list COW.
 		tl_probe_check(
@@ -266,8 +287,11 @@ when ODIN_DEBUG {
 		}
 		// Editing one half must not disturb the other: the shared-backing failure
 		// mode was invisible until teardown.
-		kf_geom_set_value(right, "transform.x", 50, 0.75)
-		vk := session_kf_view(session_trk_view(left.keyframe_tracks,0)^.keys); v,_ := kf_lane_value(vk[0], 0)
+		keyframe_geom_set_value(right, "transform.x", 50, 0.75)
+		// The left half's first key is read straight: it is a scalar lane now, so
+		// there is no mask to consult for "does this knot cover the lane" -- the
+		// lane's own value IS the answer.
+		v := session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0), 0).value
 		tl_probe_check(
 			v != 0.75,
 			"a keyframe edit on the right half wrote through to the left (left lane reads %v)",
@@ -1779,14 +1803,12 @@ when ODIN_DEBUG {
 		project.frame_rate = 12.0
 
 		c := &timeline.tracks[0].clips[0]
-		kf_set_key(c, "transform.x", 109, 5.0)
-		kf_set_key(c, "transform.x", 218, 9.0)
-		tr := session_trk_view(c.keyframe_tracks, 0)
-		before := session_kf_at(tr.keys, 0).frame_off
+		keyframe_set_key(c, "transform.x", 109, 5.0)
+		keyframe_set_key(c, "transform.x", 218, 9.0)
+		before := keyframe_lane_key(c, 0, 0, 0).frame_off
 
 		set_project_fps(60)
-		tr = session_trk_view(c.keyframe_tracks, 0)
-		after := session_kf_at(tr.keys, 0).frame_off
+		after := keyframe_lane_key(c, 0, 0, 0).frame_off
 
 		// 109 of 219 is the clip's midpoint; it must still be the midpoint at 1095.
 		tl_probe_check(
@@ -1799,11 +1821,11 @@ when ODIN_DEBUG {
 		set_project_fps(12)
 		set_project_fps(60)
 		set_project_fps(12)
-		tr = session_trk_view(c.keyframe_tracks, 0)
+		reflow_lane := keyframe_lane_view(session_trk_view(c.keyframe_tracks, 0), 0)
 		asc := true
 		prev := i32(-1)
-		for ki in 0 ..< tr.keys.n {
-			off := session_kf_at(tr.keys, ki).frame_off
+		for ki in 0 ..< reflow_lane.n {
+			off := session_kf_at(reflow_lane, ki).frame_off
 			if off <= prev {
 				asc = false
 				break

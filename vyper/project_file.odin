@@ -82,7 +82,7 @@ Saved_Marker :: struct {
 
 // Saved_Clip is one timeline clip as stored in the file: every authored field
 // (identity, timing, transform, crop, gain, stream) plus its markers and
-// keyframe tracks. Markers use the Saved_Marker DTO above. Kf_Track is still
+// keyframe tracks. Markers use the Saved_Marker DTO above. Keyframe_Track is still
 // reused directly (its name is a plain string until step 2 moves it into the
 // pool, which must introduce its own DTO the same way). path is NOT stored --
 // see the header note.
@@ -140,7 +140,7 @@ Saved_Clip :: struct {
 }
 
 // Saved_Kf_Track is a keyframe track as stored in the file, for the same reason
-// Saved_Marker exists: the live Kf_Track.name is a session-pool HANDLE
+// Saved_Marker exists: the live Keyframe_Track.name is a session-pool HANDLE
 // (TODO.md Active 19), so reusing the live type would write two i32s where the
 // file stores a name. Its `keys` field reuses the live [dynamic]Keyframe, which
 // IS still cbor-safe (scalars plus a fixed-array union variant) -- that stops
@@ -372,7 +372,7 @@ session_teardown :: proc() {
 	selection.asset_id = 0
 	selection.track = -1
 	selection.index = -1
-	kf_selection_free()
+	keyframe_selection_free()
 }
 
 // session_rebuild makes decoded DTO values live: strings/marker/key rows enter
@@ -499,12 +499,36 @@ session_rebuild :: proc(pf: ^Project_File) {
 					})
 				}
 			}
-			// Rebuild session ranges from the plain-string/key-array file DTO.
+			// Rebuild session ranges from the plain-string/key-array file DTO. A
+			// saved entry names a LANE, so a section's entries resolve back into
+			// one track owning one curve per edge; a plain property loads into a
+			// track of its own name.
 			if len(sc.keyframe_tracks) > 0 {
-				c.keyframe_tracks = Kf_Track_Range{}
+				c.keyframe_tracks = Keyframe_Track_Range{}
 				for kt in sc.keyframe_tracks {
-					r := session_kf_make(kt.keys[:])
-					session_trk_push(&c.keyframe_tracks, Kf_Track{name=session_str_intern(kt.name), keys=r})
+					if section_name, lane_index, is_lane := keyframe_file_name_lane(kt.name); is_lane {
+						for key in kt.keys {
+							keyframe_set_lane_key_interp(
+								&c,
+								section_name,
+								lane_index,
+								key.frame_off,
+								key.value,
+								key.interp,
+							)
+						}
+						continue
+					}
+					for key in kt.keys {
+						keyframe_set_lane_key_interp(
+							&c,
+							kt.name,
+							0,
+							key.frame_off,
+							key.value,
+							key.interp,
+						)
+					}
 				}
 			}
 			append(&tr.clips, c)
@@ -693,19 +717,28 @@ saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
 	return out
 }
 
-// saved_kf_tracks renders a clip's keyframe tracks as the file DTO. The lane
-// names are borrowed views of the session pool, valid for the whole save; the
-// key arrays are copies, because the live ones are freed by kf_free_tracks and
-// the encode must not depend on the session staying put. The arrays are freed by
-// project_file_free_containers.
+// saved_kf_tracks renders a clip's keyframe tracks as the file DTO. A track saves
+// as one entry PER LANE, each named after the property that lane is, because the
+// DTO has no group concept; the loader resolves those names back into a section
+// track. The names are borrowed views of the session pool, valid for the whole
+// save; the key arrays are copies, because the live ones are freed by
+// keyframe_free_tracks and the encode must not depend on the session staying put.
+// The arrays are freed by project_file_free_containers.
 saved_kf_tracks :: proc(c: ^Clip) -> [dynamic]Saved_Kf_Track {
-	out := make([dynamic]Saved_Kf_Track, c.keyframe_tracks.n)
-	for i in 0..<c.keyframe_tracks.n {
-		t := session_trk_view(c.keyframe_tracks, i)
-		vv := session_kf_view(t.keys)
-		keys := make([dynamic]Keyframe, len(vv))
-		for j in 0..<len(vv) { keys[j] = vv[j] }
-		out[i] = Saved_Kf_Track {name = kf_track_name(t), keys = keys}
+	out: [dynamic]Saved_Kf_Track
+	for track_index in 0 ..< c.keyframe_tracks.n {
+		for lane in 0 ..< keyframe_file_track_lanes(c.keyframe_tracks, track_index) {
+			_, total := keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane, nil)
+			keys := make([dynamic]Keyframe, total)
+			keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane, keys[:])
+			append(
+				&out,
+				Saved_Kf_Track {
+					name  = keyframe_file_lane_name(c.keyframe_tracks, track_index, lane),
+					keys = keys,
+				},
+			)
+		}
 	}
 	return out
 }

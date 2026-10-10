@@ -581,23 +581,27 @@ render_geom_name :: proc(p: Render_Geom_Prop) -> string {
 	return ""
 }
 
-// Kf_Geom_Section groups the geometry lanes that animate as one multi-lane
-// property: a packed section key (mask != 0) lives on the section's own track
-// ("crop", "transform"), while per-lane scalar keys live on the individual
-// property tracks. Section and lanes are two migration forms of ONE animation
-// and never coexist (kf_unwrap_section / kf_fold_lanes in keyframes.odin).
+// Keyframe_Geom_Section groups the geometry lanes that animate as one multi-lane
+// property: a section's keys live on the SECTION's own track ("crop",
+// "transform"), one scalar lane per grouped property, and a lane name resolves
+// to (track, lane index) through keyframe_geom_section_for_lane.
 //
 // The lanes are the ACTUAL geometry property variables (Render_Geom_Prop), not
 // string literals: the property variable IS the lane's identity and its track
-// name comes from render_geom_name. A lane's packed index is its position
-// within `lanes` (section-relative), so the mask bits and the [KF_PACK_MAX]f32
-// payload stay keyed per section, independent of the global enum ordering.
-Kf_Geom_Section :: struct {
+// name comes from render_geom_name. A lane's index is its position within
+// `lanes` (section-relative), so each section keys its own arity independent of
+// the global enum ordering.
+
+// KF_GEOM_GROUP_MAX bounds the widest group, so a whole-group key can be passed
+// by value as a fixed array. The widest current section is crop at 4; the widest
+// the property enum could ever group is the enum's own count, asserted below.
+KF_GEOM_GROUP_MAX :: 7
+Keyframe_Geom_Section :: struct {
 	name:  string,
 	lanes: []Render_Geom_Prop,
 }
 
-kf_geom_sections :: []Kf_Geom_Section {
+keyframe_geom_sections :: []Keyframe_Geom_Section {
 	{
 		name  = "crop",
 		lanes = []Render_Geom_Prop{.Crop_L, .Crop_R, .Crop_T, .Crop_B},
@@ -608,34 +612,31 @@ kf_geom_sections :: []Kf_Geom_Section {
 	},
 }
 
-// kf_lane_name is a section lane's keyframe TRACK name — the consumer's
+// keyframe_lane_name is a section lane's keyframe TRACK name — the consumer's
 // property label, resolved from the property variable. The generic store
 // consults this (never the property enum directly) so it stays name-agnostic.
-kf_lane_name :: proc(lane: Render_Geom_Prop) -> string {
+keyframe_lane_name :: proc(lane: Render_Geom_Prop) -> string {
 	return render_geom_name(lane)
 }
 
 // ---------------------------------------------------------------------------
-// Geometry keyframe policy: sections, packed groups, lane<->property mapping.
+// Geometry keyframe policy: sections, lane<->property mapping.
 //
-// The store (keyframes.odin) knows only opaque named tracks plus the packed
-// [KF_PACK_MAX]f32 payload. Everything about WHICH geometry properties group
-// into one packed section — and what a lane track name means — lives here with
-// Render_Geom_Prop, the owner of that mapping.
+// The store (keyframes.odin) knows only opaque named tracks of scalar key
+// lanes. Everything about WHICH geometry properties group together — and what a
+// lane name means — lives here with Render_Geom_Prop, the owner of that mapping.
 //
-// A section key (mask != 0) lives on a track named after the SECTION itself
-// ("crop", "transform"); a scalar key lives on one LANE track ("crop.l"). The
-// section and its lanes are two migration forms of ONE animation and never
-// coexist: keying a whole section folds any keyed lanes into packed form
-// (kf_geom_fold_lanes), keying an individual lane unwraps a packed section
-// into per-lane tracks first (kf_geom_unwrap_section). Both migrations are
-// value-exact — same knots, same lane values, same interpolation: a packed
-// knot only ever carries the lanes that have a breakpoint at that frame, so
-// each lane's curve (and the section knot the fold sets) is its own.
+// A SECTION is one track holding one scalar lane per grouped property:
+// track "crop" has 4 lanes (l/r/t/b), track "transform" has 2 (x/y), track
+// "gain" has 1. Consumers speak LANE names ("crop.l"); this layer resolves a
+// lane name to (track, lane index) and hands it to the store. There is no second
+// form to migrate between and no mask to reconcile: a group's arity is the
+// lane count it was built with, so keying a whole section is just a write to
+// every lane and keying one lane is a write to that lane (TODO.md Active 52).
 // ---------------------------------------------------------------------------
 
-kf_geom_section_index :: proc(name: string) -> (index: int, ok: bool) {
-	defs := kf_geom_sections
+keyframe_geom_section_index :: proc(name: string) -> (index: int, ok: bool) {
+	defs := keyframe_geom_sections
 	for i in 0 ..< len(defs) {
 		if defs[i].name == name {
 			return i, true
@@ -644,354 +645,187 @@ kf_geom_section_index :: proc(name: string) -> (index: int, ok: bool) {
 	return 0, false
 }
 
-// kf_geom_full_mask is the mask that keys every lane of section `sec` — the
-// whole-group key shape. Section names come from kf_geom_sections verbatim, so
-// an unknown name is an invariant error.
-kf_geom_full_mask :: proc(sec: string) -> u8 {
-	sec_index, ok := kf_geom_section_index(sec)
-	assert(ok, "kf_geom_full_mask: name is not a section")
-	defs := kf_geom_sections
-	def := defs[sec_index]
-	mask: u8 = 0
-	for li in 0 ..< len(def.lanes) {
-		mask |= 1 << uint(li)
-	}
-	return mask
-}
-
-// kf_geom_section_for_lane maps a scalar LANE name to its (section index, lane
-// index); a plain property (gain, scale) that groups with nothing misses.
-kf_geom_section_for_lane :: proc(name: string) -> (sec_index, lane_index: int, ok: bool) {
-	defs := kf_geom_sections
-	for s in 0 ..< len(defs) {
-		for li in 0 ..< len(defs[s].lanes) {
-			if kf_lane_name(defs[s].lanes[li]) == name {
-				return s, li, true
+// keyframe_geom_section_for_lane maps a consumer's property name to the section that
+// groups it and the lane it occupies in that section, or ok=false for a plain
+// keyed property (gain, scale, opacity) that is its own single-lane track.
+keyframe_geom_section_for_lane :: proc(name: string) -> (sec_index, lane_index: int, ok: bool) {
+	defs := keyframe_geom_sections
+	for section_index in 0 ..< len(defs) {
+		for lane_index in 0 ..< len(defs[section_index].lanes) {
+			if keyframe_lane_name(defs[section_index].lanes[lane_index]) == name {
+				return section_index, lane_index, true
 			}
 		}
 	}
 	return 0, 0, false
 }
 
-// kf_geom_unwrap_section fans a packed section track out to per-lane scalar
-// tracks — "you keyed an individual lane, so the group has to give way." Each
-// packed key becomes one scalar key per lane its mask keys (on that lane's OWN
-// track at the same frame), then the section track is dropped. Value-exact: the
-// per-lane scalar animation reproduces the packed one knot-for-knot. Caller
-// owns the structure bump. Paired invariant: a lane and its packed section
-// never coexist.
-kf_geom_unwrap_section :: proc(clip: ^Clip, sec: string) {
-	sec_index, ok := kf_geom_section_index(sec)
-	assert(ok, "kf_geom_unwrap_section: name is not a section")
-	si := kf_track_index(clip^, sec)
-	if si < 0 {
-		return
+// keyframe_geom_any_lane_tracked reports whether the section's track exists and holds
+// at least one key in any lane — i.e. the group is animated at all.
+keyframe_geom_any_lane_tracked :: proc(clip: ^Clip, def: Keyframe_Geom_Section) -> bool {
+	section_index := keyframe_track_index(clip^, def.name)
+	if section_index < 0 {
+		return false
 	}
-	defs := kf_geom_sections
-	def := defs[sec_index]
-	trk := session_trk_view(clip.keyframe_tracks, si); src_keys := trk.keys
-	li: int = 0
-	for lane_prop in def.lanes {
-		lane_name := kf_lane_name(lane_prop)
-		assert(
-			kf_track_index(clip^, lane_name) < 0,
-			fmt.tprintf("lane %q coexists with its packed section %q", lane_name, sec),
-		)
-		session_trk_push(&clip.keyframe_tracks, Kf_Track {name = session_str_intern(lane_name)})
-		lane := session_trk_view_mut(&clip.keyframe_tracks, clip.keyframe_tracks.n-1)
-		v := session_kf_view(src_keys)
-		session_kf_reserve(&lane.keys, src_keys.n)
-		for i in 0 ..< src_keys.n {
-			k := v[i]
-			if vval, covered := kf_lane_value(k, li); covered {
-				session_kf_push(&lane.keys, Keyframe{frame_off=k.frame_off, value=vval, interp=k.interp})
-			}
-		}
-		li += 1
-	}
-	// Section keys stay live until all scalar lanes have been built. Return
-	// exclusive key slots only; a shared source range remains with its peer.
-	keys := session_trk_view(clip.keyframe_tracks, si)^.keys
-	if !keys.shared {
-		session_kf_release(keys)
-	}
-	session_trk_erase(&clip.keyframe_tracks, si)
-}
-
-// kf_geom_any_lane_tracked reports whether any lane of `def` owns a live track.
-kf_geom_any_lane_tracked :: proc(clip: ^Clip, def: Kf_Geom_Section) -> bool {
-	for lane_prop in def.lanes {
-		if kf_track_index(clip^, kf_lane_name(lane_prop)) >= 0 {
+	track := session_trk_view(clip.keyframe_tracks, section_index)
+	for lane_index in 0 ..< len(track.lanes) {
+		if track.lanes[lane_index].keys.n > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// kf_geom_fold_lanes migrates scalar lane tracks BACK to the packed section form
-// — the reverse of kf_geom_unwrap_section, run when a grouped key lands on top
-// of keyed lanes. The union of every lane's key frames (plus the new set frame)
-// becomes section knots; each knot keys ONLY the lanes that have a breakpoint
-// there (their own key on that frame), and the set knot keys ALL lanes with the
-// new group values. Because a lane never appears in a knot where it lacks its
-// own breakpoint, its packed curve is exactly its scalar curve — the fold is
-// value-exact: adding a whole-crop key over keyed lanes reproduces the per-lane
-// animation everywhere the new key doesn't land, and unwrap (the reverse
-// migration) lands back on the same per-lane tracks.
-kf_geom_fold_lanes :: proc(
+// keyframe_geom_lane_count is how many lanes section `sec` has. It replaces
+// keyframe_geom_full_mask: with per-lane storage there is no bitmask to build, because
+// a group's arity is just how many lanes its track owns (TODO.md Active 52).
+keyframe_geom_lane_count :: proc(sec: string) -> int {
+	sec_index, ok := keyframe_geom_section_index(sec)
+	assert(ok, "keyframe_geom_lane_count: name is not a section")
+	defs := keyframe_geom_sections
+	return len(defs[sec_index].lanes)
+}
+
+
+// keyframe_geom_set_lane_key records a scalar key on geometry property `name` at
+// frame_off. When `name` is a LANE of a section, the write lands on that lane
+// of the section's own track; a plain property (scale, gain) is its own
+// single-lane track. There is no migration step: a lane key and a whole-group
+// key write into the same place, so neither has to convert the other.
+keyframe_geom_set_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		keyframe_set_lane_key(clip, defs[sec_index].name, lane_index, frame_off, value)
+		return
+	}
+	keyframe_set_key(clip, name, frame_off, value)
+}
+
+// keyframe_geom_lane_location resolves a consumer property name to the (track
+// index, lane index) its curve lives at, or found=false when the clip has no
+// such curve yet. Every read and write of a keyed geometry property goes through
+// this or one of the set/sample wrappers, so "which lane is transform.y" is
+// answered in exactly one place.
+keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track, lane: int, found: bool) {
+	track_name := name
+	lane_index := 0
+	if sec_index, lane_of_section, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		track_name = defs[sec_index].name
+		lane_index = lane_of_section
+	}
+	track_index := keyframe_track_index(clip^, track_name)
+	if track_index < 0 {
+		return -1, -1, false
+	}
+	if lane_index >= len(session_trk_view(clip.keyframe_tracks, track_index).lanes) {
+		return -1, -1, false
+	}
+	return track_index, lane_index, true
+}
+
+// keyframe_geom_del_lane_key is the delete twin of keyframe_geom_set_lane_key: it
+// removes the key at frame_off from the lane `name` identifies. A lane name
+// resolves to its section's track and lane index; a plain property deletes from
+// its own track. The geometry layer owns that mapping, so the store keeps
+// accepting track names only.
+keyframe_geom_del_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		keyframe_del_lane_key(clip, defs[sec_index].name, i32(lane_index), frame_off)
+		return
+	}
+	keyframe_del_key(clip, name, frame_off)
+}
+
+// keyframe_geom_set_group_value records a WHOLE-GROUP key: every lane of section `sec`
+// gets a key at frame_off. This is the old keyframe_geom_set_packed with no mask and
+// no union — a group key is N independent scalar writes, so a lane that is not
+// being edited still keeps its own value at that frame instead of relying on a
+// bit to say whether it was covered.
+keyframe_geom_set_group_value :: proc(
 	clip: ^Clip,
-	sec_index: int,
-	set_frame: i32,
-	set_lanes: [KF_PACK_MAX]f32,
-	full_mask: u8,
+	sec: string,
+	frame_off: i32,
+	values: [KF_GEOM_GROUP_MAX]f32,
 ) {
-	defs := kf_geom_sections
-	def := defs[sec_index]
-	frames := make([dynamic]i32, 0, 8)
-	defer delete(frames)
-	for lane_prop in def.lanes {
-		if ti := kf_track_index(clip^, kf_lane_name(lane_prop)); ti >= 0 {
-			track_keys := session_trk_view(clip.keyframe_tracks, ti).keys
-			assert(track_keys.n > 0, "an empty lane track is a store invariant violation")
-			v := session_kf_view(track_keys)
-			for i in 0 ..< track_keys.n {
-				k := v[i]
-				append(&frames, k.frame_off)
-			}
-		}
-	}
-	append(&frames, set_frame)
-	sort.quick_sort(frames[:])
-	packed: [KF_PACK_MAX]f32
-	for i := 0; i < len(frames); i += 1 {
-		if i > 0 && frames[i] == frames[i-1] {
-			continue // dedupe: one knot per unique frame
-		}
-		fk := frames[i]
-		knot_mask: u8 = 0
-		for li in 0 ..< len(def.lanes) {
-			packed[li] = 0
-			if fk == set_frame {
-				packed[li] = set_lanes[li]
-				knot_mask |= 1 << uint(li)
-				continue
-			}
-			if ti := kf_track_index(clip^, kf_lane_name(def.lanes[li])); ti >= 0 {
-				// A lane is in this knot only at its OWN key frames; a knot on
-				// someone else's frame must not break its curve.
-				track_keys := session_trk_view(clip.keyframe_tracks, ti).keys
-				v := session_kf_view(track_keys)
-				for i in 0 ..< track_keys.n {
-					ck := v[i]
-					if ck.frame_off == fk {
-						packed[li] = ck.value.(f32)
-						knot_mask |= 1 << uint(li)
-						break
-					}
-				}
-			}
-		}
-		assert(knot_mask != 0, "a fold knot must key at least one lane")
-		kf_set_packed_key(clip, def.name, fk, packed, knot_mask)
-	}
-	// The section now owns the animation; drop the lane tracks (which must
-	// hold only keys — folding never leaves an authority behind).
-	for lane_prop in def.lanes {
-		if ti := kf_track_index(clip^, kf_lane_name(lane_prop)); ti >= 0 {
-			tr := session_trk_view_mut(&clip.keyframe_tracks, ti)
-			assert(tr.keys.n > 0, "folding dropped a keyed lane")
-			// name is a pool handle; only the keys array is owned.
-			if !tr.keys.shared {
-				session_kf_release(tr.keys)
-			}
-			session_trk_erase(&clip.keyframe_tracks, ti)
-		}
+	defs := keyframe_geom_sections
+	sec_index, ok := keyframe_geom_section_index(sec)
+	assert(ok, "keyframe_geom_set_group_value: name is not a section")
+	lanes := defs[sec_index].lanes
+	assert(
+		len(lanes) <= KF_GEOM_GROUP_MAX,
+		"keyframe_geom_set_group_value: section is wider than the group value array",
+	)
+	for lane_index in 0 ..< len(lanes) {
+		keyframe_set_lane_key(clip, sec, lane_index, frame_off, values[lane_index])
 	}
 }
 
-// kf_geom_set_packed records a section key on `sec` at frame_off — the grouped
-// producer (whole-crop / whole-transform keyframe). `lanes` is [lane]value,
-// `mask` selects which lanes the key carries (a group key uses the section's
-// full mask). Section and lanes are mutually exclusive forms: if any lane track
-// already holds keys they are folded into the packed form first
-// (kf_geom_fold_lanes), then the key lands.
-kf_geom_set_packed :: proc(clip: ^Clip, sec: string, frame_off: i32, lanes: [KF_PACK_MAX]f32, mask: u8) {
-	sec_index, ok := kf_geom_section_index(sec)
-	assert(ok, "kf_geom_set_packed: name is not a section")
-	defs := kf_geom_sections
-	def := defs[sec_index]
-	full_mask := kf_geom_full_mask(sec)
-	assert(mask != 0 && mask & full_mask == mask, "kf_geom_set_packed: mask keys lanes outside the section")
-	kf_bump_structure()
-	if kf_geom_any_lane_tracked(clip, def) {
-		kf_geom_fold_lanes(clip, sec_index, frame_off, lanes, full_mask)
-		return
-	}
-	kf_set_packed_key(clip, sec, frame_off, lanes, mask)
-}
-
-// kf_geom_set_packed_lane_key records ONE lane's value at frame_off on the
-// section's PACKED track, leaving the group packed. Returns false when there is
-// no packed section to write into (a non-lane name, or a section that is already
-// unwrapped), so the caller can fall back to kf_geom_set_lane_key and keep the
-// behavior it had.
-//
-// This exists because "extend the animation that is already there" and "give
-// this property its own track" are two different requests that both arrive as a
-// lane write, and only the second one should rewrite the section's shape.
-// Auto-key is the first: the toggle says "record my edits on the timeline", and
-// a user who keyed their crop as one whole-crop section must not find it split
-// into four per-lane tracks because they dragged one edge. The inspector's
-// per-lane Key button and a typed value are the second, and those still unwrap
-// (kf_geom_set_lane_key).
-//
-// mask carries only this lane's bit, which is the form the sampler is built for:
-// kf_sample_packed_lane skips knots that do not cover a lane, so the other lanes
-// keep their own curves and simply interpolate through this frame instead of
-// gaining a breakpoint they were never given.
-//
-// A key already ON the frame is merged into rather than replaced: the
-// same-frame path in kf_set_packed_key overwrites mask and value wholesale, so
-// calling it here would drop the other lanes' values from a full-mask knot the
-// user placed themselves.
-kf_geom_set_packed_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) -> bool {
-	sec_index, li, is_lane := kf_geom_section_for_lane(name)
-	if !is_lane {
-		return false
-	}
-	defs := kf_geom_sections
-	sec := defs[sec_index].name
-	si := kf_track_index(clip^, sec)
-	if si < 0 {
-		return false
-	}
-	tr := session_trk_view_mut(&clip.keyframe_tracks, si)
-	bit := u8(1) << uint(li)
-	session_kf_make_unique(&tr.keys)
-	v := session_kf_view_mut(tr.keys)
-	for i in 0 ..< tr.keys.n {
-		k := &v[i]
-		if k.frame_off != frame_off {
-			continue
-		}
-		switch &v in k.value {
-		case [KF_PACK_MAX]f32:
-			v[li] = value
-			k.mask |= bit
-			kf_bump_structure()
-			return true
-		case f32:
-			// A scalar key on a section track would mean the two forms
-			// coexist, which kf_geom_sample_lane asserts against. Assert
-			// here rather than rewrite it: a silent conversion would hide
-			// the writer that produced it.
-			assert(false, "kf_geom_set_packed_lane_key: scalar key on a packed section track")
-		}
-	}
-	payload: [KF_PACK_MAX]f32
-	payload[li] = value
-	kf_set_packed_key(clip, sec, frame_off, payload, bit)
-	kf_bump_structure()
-	return true
-}
-
-// kf_geom_set_lane_key records a scalar key on `name` at frame_off for ANY
-// geometry property name. When `name` is a LANE of a section that is currently
-// packed, the group gives way FIRST: fan the section out to per-lane tracks,
-// then write. ("You keyed an individual value, so the array unwraps.") A plain
-// property (scale, or any non-lane name) lands as an ordinary scalar key.
-kf_geom_set_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
-	if sec_index, _, is_lane := kf_geom_section_for_lane(name); is_lane {
-		defs := kf_geom_sections
-		sec := defs[sec_index].name
-		if kf_track_index(clip^, sec) >= 0 {
-			kf_geom_unwrap_section(clip, sec)
-		}
-	}
-	kf_set_key(clip, name, frame_off, value)
-}
-
-// kf_geom_set_value edits ONE scalar's value at frame_off. On a packed section
-// the section unwraps first and the edit lands on lane 0 (the readout's
-// displayed lane) — the rule that any individual-value edit makes the group give
-// way. A non-section name lands as an ordinary scalar edit.
-kf_geom_set_value :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
-	if sec_index, ok := kf_geom_section_index(name); ok {
-		if kf_track_index(clip^, name) < 0 {
+// keyframe_geom_set_value edits ONE scalar's value at frame_off. A SECTION name means
+// the group, and the inspector showed lane 0 of it, so the edit lands on lane 0;
+// a plain name is an ordinary scalar edit.
+keyframe_geom_set_value :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
+	if sec_index, ok := keyframe_geom_section_index(name); ok {
+		if keyframe_track_index(clip^, name) < 0 {
 			return
 		}
-		kf_geom_unwrap_section(clip, name)
-		defs := kf_geom_sections
-		kf_set_key(clip, kf_lane_name(defs[sec_index].lanes[0]), frame_off, value)
+		keyframe_set_lane_key(clip, name, 0, frame_off, value)
 		return
 	}
-	kf_set_key(clip, name, frame_off, value)
+	keyframe_set_key(clip, name, frame_off, value)
 }
 
-// kf_geom_sample_lane evaluates geometry property track `name` at a TIMELINE
-// frame, relative to the clip start. When `name` is a LANE of a section that
-// lives in packed form, the packed section track is sampled for that lane
-// instead of the (absent) lane track; any other name (scale, gain) samples its
-// own track.
-kf_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64, base: f32) -> (f32, bool) {
-	sec_index, li, is_lane := kf_geom_section_for_lane(name)
-	if is_lane {
-		defs := kf_geom_sections
-		if si := kf_track_index(clip^, defs[sec_index].name); si >= 0 {
-			assert(kf_track_index(clip^, name) < 0, "a lane must be absent while its section is packed")
-			return kf_sample_packed_lane(
-				&session_trk_view(clip.keyframe_tracks, si)^,
-				i32(timeline_frame - clip.timeline_start_frame),
-				li,
-				base,
-			)
+// keyframe_geom_sample_lane evaluates geometry property `name` at a TIMELINE frame,
+// relative to the clip start. A LANE name samples that lane of the section's
+// track; a plain property samples its own single-lane track. Both end up at one
+// scalar sampler, so a lane and a group differ only in which track they name.
+keyframe_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64, base: f32) -> (f32, bool) {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		section_index := keyframe_track_index(clip^, defs[sec_index].name)
+		if section_index < 0 {
+			return base, false
 		}
+		return keyframe_sample_lane(
+			&session_trk_view(clip.keyframe_tracks, section_index)^,
+			lane_index,
+			i32(timeline_frame - clip.timeline_start_frame),
+			base,
+		)
 	}
-	return kf_sample_for(clip, name, timeline_frame, base)
+	return keyframe_sample_for(clip, name, timeline_frame, base)
 }
 
-// kf_geom_fill_snapshot copies geometry property `name`'s track into `dst` up
-// to its cap, returning (copied, total). When `name` is a LANE of a section
-// whose track lives in packed form, the section is unpacked here — each section
-// key expands to a scalar key carrying `name`'s lane value (keys whose mask
-// doesn't cover the lane are skipped), so the cross-thread seam stays
-// packed-free.
-kf_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, total: int) {
-	sec_index, li, is_lane := kf_geom_section_for_lane(name)
-	if is_lane {
-		defs := kf_geom_sections
-		sec := defs[sec_index].name
-		si := kf_track_index(clip^, sec)
-		if si >= 0 {
-			assert(kf_track_index(clip^, name) < 0, "a lane must be absent while its section is packed")
-			track_keys := session_trk_view(clip.keyframe_tracks, si).keys
-			v := session_kf_view(track_keys)
-			for i in 0 ..< track_keys.n {
-				k := v[i]
-				if _, covered := kf_lane_value(k, li); covered {
-					total += 1
-				}
-			}
-			n = min(total, len(dst))
-			di := 0
-			for i in 0 ..< track_keys.n {
-				k := v[i]
-				if value, covered := kf_lane_value(k, li); covered {
-					if di < n {
-						dst[di] = Keyframe {frame_off = k.frame_off, value = value, interp = k.interp}
-						di += 1
-					}
-				}
-			}
-			return
+// keyframe_geom_fill_snapshot copies geometry property `name`'s key track into `dst`
+// up to its cap, returning (copied, total). A LANE name copies that lane of the
+// section track, so the cross-thread worker seam receives a plain scalar key
+// array and never has to know sections exist. The copy used to expand packed
+// knots here, skipping any knot whose mask missed the lane; a lane is now its
+// own sorted window, so the store hands the lane over directly.
+keyframe_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, total: int) {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		defs := keyframe_geom_sections
+		section_index := keyframe_track_index(clip^, defs[sec_index].name)
+		if section_index < 0 {
+			return 0, 0
 		}
+		keys := session_kf_view(
+			keyframe_lane_view(session_trk_view(clip.keyframe_tracks, section_index), lane_index),
+		)
+		total = len(keys)
+		n = min(total, len(dst))
+		if n > 0 {
+			mem.copy(raw_data(dst[:n]), raw_data(keys), n * size_of(Keyframe))
+		}
+		return
 	}
-	return kf_fill_snapshot(clip, name, dst)
+	return keyframe_fill_snapshot(clip, name, dst)
 }
 
 // Render_Kf_Flat is one geometry property's key track copied FLAT onto a
 // Render_Geom_Snap. Filled on the UI thread at render_start; the worker owns it
-// for the job and never touches the live timeline (kf_fill_snapshot).
+// for the job and never touches the live timeline (keyframe_fill_snapshot).
 Render_Kf_Flat :: struct {
 	keys: [KF_RENDER_MAX_KEYS]Keyframe,
 	n:    int,
@@ -1003,7 +837,7 @@ Render_Kf_Flat :: struct {
 // below.
 //
 // Why this is a type and not a convention. The snapshot used to be hand-written
-// per clip kind: Render_Video_Src got geom_base + kf_geom + geom_keyed, while
+// per clip kind: Render_Video_Src got geom_base + keyframe_geom + geom_keyed, while
 // Render_Text_Src and Render_Sub_Src got three loose resting `f32`s each. Text
 // therefore exported its RESTING transform for the whole clip — the animation
 // previewed correctly and never crossed the thread hop — and the same three
@@ -1075,7 +909,7 @@ render_geom_snap_fill :: proc(snap: ^Render_Geom_Snap, clip: ^Clip) {
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		p := Render_Geom_Prop(pi)
 		slot := &snap.keys[int(p)]
-		slot.n, _ = kf_geom_fill_snapshot(clip, render_geom_name(p), slot.keys[:])
+		slot.n, _ = keyframe_geom_fill_snapshot(clip, render_geom_name(p), slot.keys[:])
 		if slot.n > 0 {
 			snap.keyed = true
 			switch p {
@@ -1111,12 +945,12 @@ Geom_Sample :: [int(Render_Geom_Prop._COUNT)]f32
 // geom_sample_clip evaluates every animated geometry property of a LIVE clip at
 // a timeline frame. UI-thread only (reads the clip's tracks); this is the one
 // evaluator the preview uses, and the flat export sampler mirrors it key for
-// key via kf_geom_fill_snapshot.
+// key via keyframe_geom_fill_snapshot.
 geom_sample_clip :: proc(clip: ^Clip, timeline_frame: i64) -> Geom_Sample {
 	s: Geom_Sample
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 		p := Render_Geom_Prop(pi)
-		s[pi], _ = kf_geom_sample_lane(clip, render_geom_name(p), timeline_frame, clip_geom_resting(clip, p))
+		s[pi], _ = keyframe_geom_sample_lane(clip, render_geom_name(p), timeline_frame, clip_geom_resting(clip, p))
 	}
 	return s
 }
@@ -1161,7 +995,7 @@ geom_sample_resting :: proc(clip: ^Clip) -> Geom_Sample {
 geom_sample_flat :: proc(base: Geom_Sample, geom: ^[int(Render_Geom_Prop._COUNT)]Render_Kf_Flat, off: i32) -> Geom_Sample {
 	s: Geom_Sample
 	for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
-		s[pi], _ = kf_sample_keys(geom[pi].keys[:geom[pi].n], off, base[pi])
+		s[pi], _ = keyframe_sample_keys(geom[pi].keys[:geom[pi].n], off, base[pi])
 	}
 	return s
 }
@@ -3511,8 +3345,8 @@ render_worker_run :: proc() {
 			// be present every frame) nor the static crop resampler is built.
 			stage_scale := v.geom.base[int(Render_Geom_Prop.Scale)]
 			for k in v.geom.keys[int(Render_Geom_Prop.Scale)].keys[:v.geom.keys[int(Render_Geom_Prop.Scale)].n] {
-				if k.value.(f32) > stage_scale {
-					stage_scale = k.value.(f32)
+				if k.value > stage_scale {
+					stage_scale = k.value
 				}
 			}
 			v.stage_scale = max(stage_scale, 0.0001)
@@ -5292,7 +5126,7 @@ render_test_run :: proc(paths: [2]string) {
 					fo, fo_ok := strconv.parse_f64(kv2[0])
 					val, val_ok := strconv.parse_f64(kv2[1])
 					if fo_ok && val_ok {
-						kf_set_key(vclip, "scale", i32(fo), f32(val))
+						keyframe_set_key(vclip, "scale", i32(fo), f32(val))
 					}
 				}
 			}

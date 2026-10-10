@@ -62,7 +62,7 @@ TRACK_ROW_H :: CLIP_TILE_HEIGHT // One track row is exactly one clip tile tall, 
                                 // the clip lane and its name gutter can never
                                 // disagree on where a row ends. A track carrying
                                 // keyframed clips grows by KF_ROW_H per lane (see
-                                // kf_rows_for). Fixed (not measured) so track-list
+                                // keyframe_rows_for). Fixed (not measured) so track-list
                                 // scroll geometry stays a pure function of the
                                 // track count and their keyframe lane counts,
                                 // never of layout timing.
@@ -101,17 +101,17 @@ KF_BTN_PAD :: f32(3)       // Transparent click padding around the button diamon
 // element ids are hit-tested in interaction.odin and painted as diamonds in
 // gpu_draw.odin, so they live here as the single source of truth.
 KF_ADD_BTN_IDS :: [11]string{
-	"KfAddX", "KfAddY", "KfAddS",
-	"KfAddCropL", "KfAddCropR", "KfAddCropT", "KfAddCropB",
-	"KfAddOpacity",
-	"KfAddGain",
-	"KfAddTrans", "KfAddCrop",
+	"KeyframeAddX", "KeyframeAddY", "KeyframeAddS",
+	"KeyframeAddCropL", "KeyframeAddCropR", "KeyframeAddCropT", "KeyframeAddCropB",
+	"KeyframeAddOpacity",
+	"KeyframeAddGain",
+	"KeyframeAddTrans", "KeyframeAddCrop",
 }
 // The whole-GROUP add-keyframe buttons: key every lane of a property section
 // at once (transform = x+y, crop = l+r+t+b) instead of one lane. Drawn as a
 // 2x2 diamond cluster in gpu_draw.odin to read as "all lanes" against the
 // single per-lane diamond.
-KF_GROUP_BTN_IDS :: []string{"KfAddTrans", "KfAddCrop"}
+KF_GROUP_BTN_IDS :: []string{"KeyframeAddTrans", "KeyframeAddCrop"}
 
 CLIP_GRAB :: f32(7)        // Left/right edge grab band on a clip (duration resize).
 TSCROLLBAR_W :: f32(10)    // Width of the timeline's vertical scrollbar strip.

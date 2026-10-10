@@ -8866,3 +8866,174 @@ resync unconditional.
   trashed by something else, the crash can still occur.
 - [ ] Not reproduced under scrubbing. The recording has one instantaneous jump-scrub
   and no sustained drag, so the rate-change path is not exercised by a real gesture.
+
+### Active 51 — Splitting mid-interpolation severed the curve
+
+**Status: FIXED, uncommitted.** "the left split creates a keyframe that matches the
+last interpolation step before the split and the right split sets its origin
+properties in the coherent logic for the next step".
+
+### The break, reproduced first
+
+`kf_rebuild_tracks` only PARTITIONS keys into [0,cut) and [cut,MAX). Correct for a
+lane HOLDING a value at the cut; wrong for a lane interpolating across it:
+
+- the LEFT half's last key is the last one before the cut, and the sampler HOLDS a
+  key past its own frame (`kf_sample_keys`, "the animation's end state"), so the
+  tail sits at that key's value rather than the value the curve was arriving at;
+- the RIGHT half's first key is the first one after, and the sampler interpolates up
+  to it from `base`, so the head starts from the clip's RESTING value rather than
+  from where the curve left off.
+
+Probe, on a linear 0->100 ramp split at 50: the left half's final frame read **0**
+instead of 50. The right half was masked in the first cut of the probe because it
+passed the expected value in as `base` — passing `want` made the assertion pass no
+matter what the split wrote. The probe now samples against the right half's OWN
+resting field, which is what actually exposed the origin half as untested.
+
+### The fix
+
+- [x] **`kf_split_preserve_continuity`** — for each lane with a key on BOTH sides of
+  the cut, writes the value the curve actually reads at the cut into BOTH
+  boundaries: a key on the left half's final frame, and the right half's resting
+  field. Neither half invents a value. A lane with keys on one side only is left
+  alone — it is holding, not interpolating, and its surviving half already agrees
+  with base.
+- [x] Sampled from the PRE-SPLIT `src` range against the left (original) clip's
+  resting value — the only combination that reads the un-severed curve.
+- [x] Lane name -> resting field resolved ONCE (`kf_split_lane_prop`), read and
+  written through `clip_geom_resting`/`clip_geom_set_resting` and `clip.gain`, so
+  the read and the write cannot disagree about where a lane lives.
+
+### A probe that had to be corrected, not just extended
+
+`timeline_probe`'s `test_split_halves_own_their_payload` splits the same way
+mid-interpolation (keys at 50 and 250, cut at 200) and asserted "each half must own
+one lane with ONE key". That expectation encoded the old partition-only behaviour —
+it fails exactly when the boundary key is correct. The test's actual subject is
+payload ISOLATION (COW), so it now asserts both lanes present, distinct key RANGES,
+and re-relativisation of the surviving keys, rather than a count that the fix is
+supposed to change.
+
+### Verified
+
+- `kf_split_mid_interp`: left ends at the interpolated cut value, right ORIGIN is
+  that value, right still interpolates past the cut.
+- Red proof, both halves independently: dropping the left boundary key fails
+  `left half must END at the interpolated cut value 50, got 0`; dropping the right
+  origin fails three assertions including `right half ORIGIN must be the interpolated
+  cut value 50, got 0` and `must still interpolate past the cut, got 20`.
+
+Gates: `check`, `keyframe_probe`, `geom_key_probe`, `timeline_probe`,
+`transform_probe`, `session_kf_probe`, `session_str_probe`, `render_kf_probe`,
+`render_live_probe`, `probe`, `smoke`, `action_log`, `dnd_probe`, `undo_valgrind`,
+`valgrind`, `audio_scrub_exact`, `keyed_export`, `gpu_probe`, `yuv_exact`,
+`opacity`, `zorder`, `subtitle_probe`.
+
+### Not covered
+
+- [ ] PACKED section tracks (transform/crop groups) are not handled: the seeding
+  path resolves a lane to a scalar resting field and writes a scalar key, so a
+  section track that straddles the cut is still severed. The probe uses a scalar
+  `gain` lane.
+- [ ] Trim (kf_trim_head/kf_trim_tail) has the same severing shape at a head/tail
+  cut and is untouched.
+- [ ] Not exercised in the editor.
+
+### Active 52 — The keyframe store: delete the collapse, per-lane scalar only
+
+**Status: DONE.** The scalar/packed union and the two-way value-exact collapse
+between the forms was the root of the trap fixed in 871c444 and of the
+"packed section is severed by a split" gap. Both are gone: the union is deleted
+and the split gap closed by making continuity per-lane.
+
+#### Why collapse exists at all, and why deleting it is a simplification not a loss
+
+One animation has two storage forms that never coexist:
+- PACKED: one track named for the section ("transform"), knots carry `mask` +
+  `[KF_PACK_MAX]f32`.
+- SCALAR: one track per lane ("transform.x", "transform.y"), scalar knots.
+
+`kf_geom_unwrap_section` (packed->scalar, when you key one lane) and
+`kf_geom_fold_lanes` (scalar->packed, when you key the whole group) migrate
+between them, value-exact and round-tripping. `mask` says which form a knot is;
+`kf_lane_value` reads one lane out of a packed knot.
+
+**Every one of those mechanisms exists only because scalar and packed are
+different TYPES.** With a track as a set of scalar LANES there is one form:
+keying a group writes the value into each lane at that frame; keying one lane
+writes into that lane. So `kf_geom_fold_lanes`, `kf_geom_unwrap_section`,
+`kf_lane_value`, `mask`, `KF_PACK_MAX` and the packed branch of the samplers are
+deleted outright, not redesigned. The trap becomes unrepresentable.
+
+The section table (`kf_geom_sections`) survives as a UI-ONLY grouping (which lanes
+share a diamond and a group-key button), with no storage consequence.
+
+#### Copy-cost measurement (the gating question, resolved)
+
+`Kf_Keys_Range` is a window `(first, slots)` into a global arena
+(`session_kf_keys`), so an arena track copy is two ints. The worry was that
+per-lane owned arrays make every undo snapshot copy N arrays instead.
+
+Measured from the code: `clone_timeline` (undo.odin:94) calls
+`session_trk_share`, which sets `shared = true` and RETURNS THE RANGE -- it does
+NOT deep-copy. Deep copy happens only lazily on the first WRITE to a shared range
+(`session_kf_make_unique`). So per-lane costs one extra loop on the first write
+to a shared lane, not on every clone. **Per-lane is not more expensive per clone
+than the arena.** The blocker is gone.
+
+#### The one real cost, stated plainly
+
+A group key becomes N knots (one per lane) instead of one packed knot. On
+screen it is value-identical -- the group diamond still reads as one -- but crop
+(4 lanes) writes 4 keys per group-key. Accepted: correctness and the elimination
+of the form ambiguity are worth more than key count, and the keys are tiny.
+
+#### Deletion surface (sized)
+
+~59 packed/mask/collapse references outside the store across clip_geom, state, ui,
+interaction, render, event, timeline, edit; ~53 in the store (keyframes.odin).
+The store's arena API (session_kf, ~20 procs) and the track store (session_trk) are
+both well-contained.
+
+#### What landed
+
+`Keyframe` is `{frame_off, interp, value: f32}` — the `mask` field and the
+`union {f32, [KF_PACK_MAX]f32}` payload are deleted, so a key cannot be the wrong
+type and the trap fixed in 871c444 is unrepresentable rather than guarded.
+
+`Keyframe_Track` owns `lanes: [dynamic]Keyframe_Lane`, each lane a
+`Keyframe_Keys_Range` window into the same session arena. Arity is
+`len(track.lanes)` — structural, knowable without inspecting any key. A section
+track ("crop") owns 4 lanes, "transform" 2, a plain property ("gain") 1.
+
+The section table (`kf_geom_sections`) is now a UI-ONLY grouping: it maps a
+property name to (section track, lane index) and owns the gutter label and the
+group-key write. It has no storage consequence — no fold, no unwrap, no mask.
+
+The collapse layer is deleted outright: `kf_geom_unwrap_section`,
+`kf_geom_fold_lanes`, `kf_geom_set_packed`, `kf_geom_full_mask`,
+`kf_lane_value`, `kf_sample_packed_lane`, `kf_set_packed_key`, `is_packed_track`,
+`KF_PACK_MAX`. Every one existed only to reconcile two forms.
+
+**The split gap is closed as a side effect.** `keyframe_split_preserve_continuity`
+iterates (track, lane) pairs instead of tracks, so a section whose lanes straddle
+a cut is seeded per lane. The packed skip it used to carry (`if false { continue }`)
+is gone rather than implemented around.
+
+Two bugs the migration forced, both worth naming:
+
+- `session_trk_clone_range` deep-copies the lane **array** but shares the key
+  **ranges** — the COW shape. It originally copied only the headers, so two rows
+  shared one `[dynamic]Keyframe_Lane` buffer: writing a lane back through one row
+  was visible through the other, which is exactly what the keyframe COW probe
+  caught. Lane headers are per-row; only key ranges are shared.
+- The project loader dropped `interp` on the plain-property path, silently
+  straightening every eased key on load. `keyframe_set_lane_key_interp` now
+  carries it. The file DTO did not change: `Saved_Kf_Track` has no group concept,
+  so a section saves as one entry per lane, each named after the property, and
+  the loader resolves those names back into one track.
+
+The timeline draws one row per LANE, not per track (`keyframe_clip_rows` /
+`keyframe_clip_row`), so a crop's four edges each get their own diamond row and
+their own gutter label instead of four curves stacked on one line.

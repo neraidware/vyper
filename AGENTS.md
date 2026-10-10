@@ -330,7 +330,17 @@ addresses, lifetimes, and shares data. Everything else follows from it.
 - Comment what code can't say: the why, cross-file invariants, a coupling
   to a probe or cached value. Never restate the line — if a comment would
   just repeat it, the line wins.
-- Short identifiers only in tiny scopes. Default to naming clearly.
+- Spell names out. No abbreviations in identifiers — not fields, not locals,
+  not params, not procs, not type names, and not domain prefixes, no matter how
+  consistent they already are or how many call sites they touch. `keyframe_lane`,
+  never `kf_lane`; `Keyframe_Track`, never `Kf_Track`; `track_index`, never
+  `tr`; `value`, never `v`. Two reasons this is absolute rather than a style
+  preference: an identifier only decodable once you know the line it came from
+  costs every reader a lookup, and a shared abbreviation actively hides bugs.
+  A blind find/replace for `k_lane` once corrupted `keyframe_track_lane_name`
+  into `keyframe_trackeyframe_lane_name`, which still compiled because Odin
+  treats an undefined name as a fresh declaration rather than an error.
+  Single letters are for loop counters and nothing else.
 
 ## 9. Spall is the profiler; use it wherever performance matters
 

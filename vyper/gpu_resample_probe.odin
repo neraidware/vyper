@@ -11,7 +11,7 @@ package vyper
 // kernel's own means the hardware path agrees with the path the export already
 // runs, rather than agreeing with a fresh unvalidated expectation.
 //
-// That oracle used to be swsbench's kf_vs_swscale, a separate microbenchmark
+// That oracle used to be swsbench's keyframe_vs_swscale, a separate microbenchmark
 // that held the CPU kernel against libswscale per geometry. It was deleted as an
 // unused system, so the claim above no longer has a second opinion behind it --
 // this probe now stands alone. If that second opinion matters again, it is one

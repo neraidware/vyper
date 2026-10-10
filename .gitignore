@@ -28,3 +28,10 @@
 # gate.sh keyed_export scratch: synthetic source and A/B encodes, regenerated
 # per run and never inputs.
 __pycache__/
+
+# Stale committed binaries from before 44e295c dropped them, re-added by
+# `git add -A` sweeps that caught odin's output at the repo root. `vyper.bin` is
+# the old linked binary (11.7MB) and `build` an equally stale 0.5MB copy; odin
+# deletes and rewrites both per build, so they are outputs, never inputs.
+/vyper.bin
+/build

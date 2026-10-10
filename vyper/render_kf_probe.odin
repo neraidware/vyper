@@ -8,8 +8,8 @@ import "core:sync"
 // Headless probe for render_kf_geom_rect (render.odin:586) — the pure
 // per-frame keyed-geometry math the compositor worker calls in
 // render_eval_keyed_geom (render.odin:2334). The probe fills each
-// Render_Kf_Flat slot through the exact worker path — kf_set_key into a Clip,
-// then kf_fill_snapshot into the fixed keys array via render_geom_name — so a
+// Render_Kf_Flat slot through the exact worker path — keyframe_set_key into a Clip,
+// then keyframe_fill_snapshot into the fixed keys array via render_geom_name — so a
 // mismatch between the worker's fill and the pure rect's expectations trips
 // the build, not a silent wrong composite.
 
@@ -25,14 +25,14 @@ when ODIN_DEBUG {
 	render_kf_probe_check :: proc(cond: bool, msg: string, args: ..any) {
 		if !cond {
 			render_kf_probe_fail = true
-			fmt.println("[render-kf-probe] FAIL:", fmt.tprintf(msg, ..args))
+			fmt.println("[render-keyframe-probe] FAIL:", fmt.tprintf(msg, ..args))
 		}
 	}
 
-	// kf_probe_base is the resting base a fixture snapshots: identity transform,
+	// keyframe_probe_base is the resting base a fixture snapshots: identity transform,
 	// unit scale, no crop, and the given resting opacity. Expressed in named lanes
 	// because that is what a fixture means by it.
-	kf_probe_base :: proc(op: f32) -> Geom_Sample {
+	keyframe_probe_base :: proc(op: f32) -> Geom_Sample {
 		b: Geom_Sample
 		b[int(Render_Geom_Prop.Scale)] = 1.0
 		b[int(Render_Geom_Prop.Opacity)] = op
@@ -52,7 +52,7 @@ when ODIN_DEBUG {
 	}
 
 	render_kf_fill_flat :: proc(clip: ^Clip, p: Render_Geom_Prop) -> (flat: Render_Kf_Flat) {
-		flat.n, _ = kf_geom_fill_snapshot(clip, render_geom_name(p), flat.keys[:])
+		flat.n, _ = keyframe_geom_fill_snapshot(clip, render_geom_name(p), flat.keys[:])
 		return
 	}
 
@@ -140,8 +140,8 @@ when ODIN_DEBUG {
 		// Case A — transform.x keyed 0 @1 -> 100 @30; everything else rests at
 		// its base (tx/ty baseline 0, scale 1, no crops). Box == full stage.
 		clipA := Clip{}
-		kf_geom_set_lane_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
-		kf_geom_set_lane_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 7, 100)
+		keyframe_geom_set_lane_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+		keyframe_geom_set_lane_key(&clipA, render_geom_name(Render_Geom_Prop.Trans_X), 7, 100)
 		geomA: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		geomA[int(Render_Geom_Prop.Trans_X)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Trans_X)
 		geomA[int(Render_Geom_Prop.Trans_Y)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Trans_Y)
@@ -152,14 +152,14 @@ when ODIN_DEBUG {
 		geomA[int(Render_Geom_Prop.Crop_B)] = render_kf_fill_flat(&clipA, Render_Geom_Prop.Crop_B)
 
 		tx_a, _, s_a, _, _, _, _, _, ox_a, _, rw_a, _, _, _, _, _ :=
-			render_kf_geom_rect(&geomA, 1, kf_probe_base(1.0), 100, 100, 100, 100, 100, 100)
+			render_kf_geom_rect(&geomA, 1, keyframe_probe_base(1.0), 100, 100, 100, 100, 100, 100)
 		// off=1 is exactly the frame of the first key (tx=0), scale rests at 1,
 		// so the box is the full stage centered on the resting tx (=0, base tx).
 		render_kf_probe_check(ox_a == -50 && rw_a == 100,
 			"A at first key: got ox=%d rw=%d want -50 100", ox_a, rw_a)
 
 		txA, _, sA, _, _, _, _, _, oxA, _, rwA, _, _, _, _, _ :=
-			render_kf_geom_rect(&geomA, 9, kf_probe_base(1.0), 100, 100, 100, 100, 100, 100)
+			render_kf_geom_rect(&geomA, 9, keyframe_probe_base(1.0), 100, 100, 100, 100, 100, 100)
 
 		// Scale rests at 1 -> cw = 100, and the box is CENTERED on sampled tx, so
 		// ox = tx - cw/2. off 9 is past the last transform.x key (7, value 100), so
@@ -173,29 +173,29 @@ when ODIN_DEBUG {
 		// left, src sub-rect cuts into the stage, ox/rw follow the visible rect.
 		geomB: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		clipB := Clip{}
-		kf_geom_set_lane_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 1, 0.25)
-		kf_geom_set_lane_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 2, 0.25)
+		keyframe_geom_set_lane_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 1, 0.25)
+		keyframe_geom_set_lane_key(&clipB, render_geom_name(Render_Geom_Prop.Crop_L), 2, 0.25)
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
 			geomB[int(p)] = render_kf_fill_flat(&clipB, p)
 		}
 		_, _, _, clB, _, _, _, _, oxB, _, rwB, _, _, _, _, _ :=
-			render_kf_geom_rect(&geomB, 1, kf_probe_base(1.0), 100, 100, 100, 100, 100, 100)
+			render_kf_geom_rect(&geomB, 1, keyframe_probe_base(1.0), 100, 100, 100, 100, 100, 100)
 		render_kf_probe_check_near(clB, 0.25, 0.0001, "B crop-l sampled")
 		render_kf_probe_check(oxB == -25 && rwB == 75,
 			"B src sub-rect + box trim left: got ox=%d rw=%d want -25 75", oxB, rwB)
 
 		// Case C — the eased mode flows through the WORKER seam end to end. The
-		// seam copies the track into the flat worker copy (kf_geom_fill_snapshot)
-		// and the rect's sampler (kf_sample_keys) then eases with it. Keys tx
+		// seam copies the track into the flat worker copy (keyframe_geom_fill_snapshot)
+		// and the rect's sampler (keyframe_sample_keys) then eases with it. Keys tx
 		// 0@1 -> 100@21, arriving key .Ease_In: at off=11 (t=1/2) the t^3 curve
 		// gives 12.5, box 100 wide -> l=-37.5, ox=-38. A linear path would give
 		// 50 / ox 0, so a dropped interp trips this hard.
 		clipC := Clip{}
-		kf_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
-		kf_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-		kf_key_mut(&clipC, 0, 0).interp = .Ease_Out
-		kf_key_mut(&clipC, 0, 1).interp = .Ease_In
+		keyframe_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+		keyframe_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
+		keyframe_key_mut(&clipC, 0, 0, 0).interp = .Ease_Out
+		keyframe_key_mut(&clipC, 0, 0, 1).interp = .Ease_In
 		geomC: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
@@ -210,7 +210,7 @@ when ODIN_DEBUG {
 			"worker seam copy carries each key's interpolation mode",
 		)
 		txC, _, _, _, _, _, _, _, oxC, _, rwC, _, _, _, _, _ :=
-			render_kf_geom_rect(&geomC, 11, kf_probe_base(1.0), 100, 100, 100, 100, 100, 100)
+			render_kf_geom_rect(&geomC, 11, keyframe_probe_base(1.0), 100, 100, 100, 100, 100, 100)
 		render_kf_probe_check_near(txC, 12.5, 0.001, "C eased tx")
 		render_kf_probe_check(oxC == -38 && rwC == 100,
 			"C eased box: got ox=%d rw=%d want -38 100", oxC, rwC)
@@ -219,46 +219,52 @@ when ODIN_DEBUG {
 		// 0@1 100@11 250@21 350@31, all .Cubic: segment 11->21 has symmetric
 		// tangents (12.5 both edges), so its midpoint is exactly 175 -> ox 125.
 		clipD := Clip{}
-		kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
-		kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 11, 100)
-		kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 21, 250)
-		kf_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 31, 350)
+		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 11, 100)
+		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 21, 250)
+		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 31, 350)
 		dtk := session_trk_view_mut(&clipD.keyframe_tracks, 0)
-		kf_key_mut(&clipD, 0, 1).interp = .Cubic
-		kf_key_mut(&clipD, 0, 2).interp = .Cubic
-		kf_key_mut(&clipD, 0, 3).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, 0, 1).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, 0, 2).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, 0, 3).interp = .Cubic
 		geomD: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
 			geomD[int(p)] = render_kf_fill_flat(&clipD, p)
 		}
 		txD, _, _, _, _, _, _, _, oxD, _, rwD, _, _, _, _, _ :=
-			render_kf_geom_rect(&geomD, 16, kf_probe_base(1.0), 100, 100, 100, 100, 100, 100)
+			render_kf_geom_rect(&geomD, 16, keyframe_probe_base(1.0), 100, 100, 100, 100, 100, 100)
 		render_kf_probe_check_near(txD, 175.0, 0.001, "D spline tx")
 		render_kf_probe_check(oxD == 125 && rwD == 100,
 			"D spline box: got ox=%d rw=%d want 125 100", oxD, rwD)
 
-		// Case E — the PREVIEW (GPU) seam, kf_geom_sample_lane, the exact call the
+		// Case E — the PREVIEW (GPU) seam, keyframe_geom_sample_lane, the exact call the
 		// per-frame preview_state sampling makes before handing floats to the GPU.
-		// E1: scalar eased track. E2: a PACKED "transform" section (the grouped
-		// form) whose lane is sampled; both must ride the arriving key's mode.
+		// E1 keys the lane directly; E2 writes it as part of a WHOLE-GROUP key on the
+		// "transform" section. Both must ride the arriving key's mode and agree --
+		// before per-lane storage these were two separate storage forms with their own
+		// samplers, and the risk was the two disagreeing. Now they are the same scalar
+		// curve reached by two writers, so the assertion is that they agree.
 		clipE1 := Clip{}
-		kf_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
-		kf_set_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-		kf_key_mut(&clipE1, 0, 1).interp = .Ease_In
-		pe1, _ := kf_geom_sample_lane(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
+		// "transform.x" is a LANE name: the geometry layer resolves it to the section
+		// track and its lane index. keyframe_set_key would mint a track literally named
+		// "transform.x", which no consumer samples.
+		keyframe_geom_set_lane_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
+		keyframe_geom_set_lane_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
+		keyframe_key_mut(&clipE1, 0, 0, 1).interp = .Ease_In
+		pe1, _ := keyframe_geom_sample_lane(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 		render_kf_probe_check_near(pe1, 12.5, 0.001, "E1 preview scalar eased")
 
 		clipE2 := Clip{}
-		lanesL := [KF_PACK_MAX]f32{}
-		lanesH := [KF_PACK_MAX]f32{}
-		lanesL[0] = 0
-		lanesH[0] = 100
-		kf_geom_set_packed(&clipE2, "transform", 1, lanesL, 1)
-		kf_geom_set_packed(&clipE2, "transform", 21, lanesH, 1)
-		kf_key_mut(&clipE2, 0, 1).interp = .Ease_In
-		pe2, _ := kf_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
-		render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview packed lane eased")
+		low_values: [KF_GEOM_GROUP_MAX]f32
+		high_values: [KF_GEOM_GROUP_MAX]f32
+		low_values[0] = 0
+		high_values[0] = 100
+		keyframe_geom_set_group_value(&clipE2, "transform", 1, low_values)
+		keyframe_geom_set_group_value(&clipE2, "transform", 21, high_values)
+		keyframe_key_mut(&clipE2, 0, 0, 1).interp = .Ease_In
+		pe2, _ := keyframe_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
+		render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview group-written lane eased")
 
 		// Case F — a KEYED opacity lane sampled through the worker's own rect call.
 		// This is the end-to-end shape of the feature: the opacity keyframe has to
@@ -274,8 +280,8 @@ when ODIN_DEBUG {
 		// fully opaque" -- that no md5 or static check would notice.
 		{
 			clipF := Clip{}
-			kf_geom_set_lane_key(&clipF, render_geom_name(Render_Geom_Prop.Opacity), 1, 1.0)
-			kf_geom_set_lane_key(&clipF, render_geom_name(Render_Geom_Prop.Opacity), 21, 0.25)
+			keyframe_geom_set_lane_key(&clipF, render_geom_name(Render_Geom_Prop.Opacity), 1, 1.0)
+			keyframe_geom_set_lane_key(&clipF, render_geom_name(Render_Geom_Prop.Opacity), 21, 0.25)
 			geomF: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 			geomF[int(Render_Geom_Prop.Opacity)] =
 				render_kf_fill_flat(&clipF, Render_Geom_Prop.Opacity)
@@ -285,7 +291,7 @@ when ODIN_DEBUG {
 				geomF[int(Render_Geom_Prop.Opacity)].n,
 			)
 			// off 1 (first key), 11 (midpoint), 21 (last key), 40 (past the end).
-			baseF := kf_probe_base(1.0)
+			baseF := keyframe_probe_base(1.0)
 			_, _, _, _, _, _, _, op1, _, _, _, _, _, _, _, _ :=
 				render_kf_geom_rect(&geomF, 1, baseF, 100, 100, 100, 100, 100, 100)
 			_, _, _, _, _, _, _, op11, _, _, _, _, _, _, _, _ :=
@@ -302,14 +308,14 @@ when ODIN_DEBUG {
 			// the check would read 0.8 and fail, rather than coincidentally matching
 			// the held 0.25.
 			_, _, _, _, _, _, _, op40, _, _, _, _, _, _, _, _ :=
-				render_kf_geom_rect(&geomF, 40, kf_probe_base(0.8), 100, 100, 100, 100, 100, 100)
+				render_kf_geom_rect(&geomF, 40, keyframe_probe_base(0.8), 100, 100, 100, 100, 100, 100)
 			render_kf_probe_check_near(op40, 0.25, 0.001, "F opacity holds past last key")
 			// An UNKEYED lane must fall back to the resting base: the base is
 			// threaded through render_eval_keyed_geom as the job's geom_base
 			// snapshot, and this is what keeps every un-keyed export
 			// byte-identical to before.
 			_, _, _, _, _, _, _, opBase, _, _, _, _, _, _, _, _ :=
-				render_kf_geom_rect(&geomA, 11, kf_probe_base(0.375), 100, 100, 100, 100, 100, 100)
+				render_kf_geom_rect(&geomA, 11, keyframe_probe_base(0.375), 100, 100, 100, 100, 100, 100)
 			render_kf_probe_check_near(opBase, 0.375, 0.001, "F un-keyed opacity falls back to base")
 		}
 
@@ -332,26 +338,26 @@ when ODIN_DEBUG {
 				crop_b      = 0.04,
 				opacity     = 0.9,
 			}
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_X), 0, 3)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_X), 10, 30)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_Y), 0, -4)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_Y), 20, 8)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 0, 1)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 20, 2)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 5, 1)
-			kf_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 15, 0.25)
-			lanes0: [KF_PACK_MAX]f32
-			lanes0[0] = 0.1
-			lanes0[1] = 0.2
-			lanes0[2] = 0.05
-			lanes0[3] = 0.15
-			lanes1: [KF_PACK_MAX]f32
-			lanes1[0] = 0.3
-			lanes1[1] = 0.4
-			lanes1[2] = 0.25
-			lanes1[3] = 0.35
-			kf_geom_set_packed(&clipG, "crop", 0, lanes0, 0xF)
-			kf_geom_set_packed(&clipG, "crop", 20, lanes1, 0xF)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_X), 0, 3)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_X), 10, 30)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_Y), 0, -4)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Trans_Y), 20, 8)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 0, 1)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Scale), 20, 2)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 5, 1)
+			keyframe_geom_set_lane_key(&clipG, render_geom_name(Render_Geom_Prop.Opacity), 15, 0.25)
+			crop_start: [KF_GEOM_GROUP_MAX]f32
+			crop_start[0] = 0.1
+			crop_start[1] = 0.2
+			crop_start[2] = 0.05
+			crop_start[3] = 0.15
+			crop_end: [KF_GEOM_GROUP_MAX]f32
+			crop_end[0] = 0.3
+			crop_end[1] = 0.4
+			crop_end[2] = 0.25
+			crop_end[3] = 0.35
+			keyframe_geom_set_group_value(&clipG, "crop", 0, crop_start)
+			keyframe_geom_set_group_value(&clipG, "crop", 20, crop_end)
 
 			flatG: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 			baseG: Geom_Sample
@@ -396,8 +402,8 @@ when ODIN_DEBUG {
 			render_job.width, render_job.height = probe_w, probe_h
 
 			clipH := Clip {opacity = 1.0}
-			kf_geom_set_lane_key(&clipH, render_geom_name(Render_Geom_Prop.Opacity), 1, 1.0)
-			kf_geom_set_lane_key(&clipH, render_geom_name(Render_Geom_Prop.Opacity), 11, 0.25)
+			keyframe_geom_set_lane_key(&clipH, render_geom_name(Render_Geom_Prop.Opacity), 1, 1.0)
+			keyframe_geom_set_lane_key(&clipH, render_geom_name(Render_Geom_Prop.Opacity), 11, 0.25)
 
 			v: Render_Video_Src
 			v.timeline_start_frame = 0
@@ -455,7 +461,7 @@ when ODIN_DEBUG {
 			src := Render_Video_Src{
 				source_w = tc.src_w,
 				source_h = tc.src_h,
-				geom      = {base = kf_probe_base(1.0)},
+				geom      = {base = keyframe_probe_base(1.0)},
 			}
 			src.geom.base[int(Render_Geom_Prop.Trans_X)] = tc.tx
 			src.geom.base[int(Render_Geom_Prop.Trans_Y)] = tc.ty
@@ -701,10 +707,10 @@ when ODIN_DEBUG {
 		// still checked below, and it is the mechanism an authored fade uses.
 
 		if render_kf_probe_fail {
-			fmt.println("[render-kf-probe] failed")
+			fmt.println("[render-keyframe-probe] failed")
 			return 1
 		}
-		fmt.println("[render-kf-probe] ok")
+		fmt.println("[render-keyframe-probe] ok")
 		return 0
 	}
 

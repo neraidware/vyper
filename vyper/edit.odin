@@ -16,7 +16,7 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 	case .X, .Y, .None:
 	case .Scale:
 		prec = 2
-	case .Kf_Value:
+	case .Keyframe_Value:
 		prec = 2
 	case .Gain:
 		prec = 1
@@ -92,7 +92,7 @@ edit_field_over :: proc() -> bool {
 		return clay.PointerOver(clay.ID("PropFieldPanX"))
 	case .Pan_Y:
 		return clay.PointerOver(clay.ID("PropFieldPanY"))
-	case .Kf_Value:
+	case .Keyframe_Value:
 		return clay.PointerOver(clay.ID("PropFieldKf"))
 	case .None:
 		return false
@@ -110,26 +110,26 @@ edit_commit :: proc() {
 	// selection while active (S3 exclusivity) — so it can't ride the
 	// selected_clip() resolve the clip fields use. A packed (section) key's
 	// readout shows lane 0; editing it unwraps the section via
-	// kf_geom_set_value, then lands the scalar on that lane. Undo snapshots the
+	// keyframe_geom_set_value, then lands the scalar on that lane. Undo snapshots the
 	// whole timeline, so the replace is a plain commit.
-	if edit_state.field == .Kf_Value {
-		kcl, klane, k, kok := kf_selected()
+	if edit_state.field == .Keyframe_Value {
+		kcl, track_index, lane_index, k, kok := keyframe_selected()
 		if !kok {
 			return
 		}
-		lane_name := kf_track_name(session_trk_view(kcl.keyframe_tracks, klane))
+		lane_name := keyframe_track_lane_name(
+			session_trk_view(kcl.keyframe_tracks, track_index),
+			lane_index,
+		)
 		frame := k.frame_off
-		v0: f32
-		if k.mask != 0 {
-			v0, _ = kf_lane_value(k^, 0)
-		} else {
-			v0 = k.value.(f32)
-		}
+		// A key is a scalar on its own lane, so the readout and the edit agree by
+		// construction: both read k.value.
+		v0 := k.value
 		if v0 == val {
 			return
 		}
 		undo_begin()
-		kf_geom_set_value(kcl, lane_name, frame, val)
+		keyframe_geom_set_value(kcl, lane_name, frame, val)
 		undo_push(.Value, "Set keyframe value")
 		return
 	}
@@ -150,7 +150,7 @@ edit_commit :: proc() {
 	// discarded the edit on any keyed property whenever auto-key was off, and
 	// the field was seeded from the sampled value — so the user typed back the
 	// number they could see and got no change. Gain is not a geometry lane and
-	// keeps the direct write plus kf_auto_key.
+	// keeps the direct write plus keyframe_auto_key.
 	geom := Render_Geom_Prop._COUNT
 	gain_field: ^f32
 	// speed_field and pitch_field are direct pointers to the clip's own fields,
@@ -282,7 +282,7 @@ edit_commit :: proc() {
 		geom = .Pan_Y
 		val = clamp_pan_y(cl_geom_all(cl), val / 100)
 		label = "Set clip pan"
-	case .Kf_Value, .None:
+	case .Keyframe_Value, .None:
 		return
 	}
 	// Compare against what the clip READS at the playhead, not the resting
@@ -335,7 +335,7 @@ edit_commit :: proc() {
 		pitch_field^ = val
 	} else {
 		gain_field^ = val
-		kf_auto_key(cl, name, val)
+		keyframe_auto_key(cl, name, val)
 	}
 	undo_push(kind, label)
 	if speed_field != nil || pitch_field != nil {

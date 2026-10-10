@@ -270,7 +270,7 @@ undo_restore :: proc(idx: i32) {
 	// restore has replaced it wholesale, and a keyframe has no stable id to
 	// re-resolve the way clips do — so drop it rather than alias whatever now
 	// sits at the old indices (same rule any delete follows).
-	kf_clear()
+	keyframe_clear()
 	if has_sel {
 		if tr, c, ok := find_clip_by_id(sel_id); ok {
 			selection.track = track_index_of(tr)
