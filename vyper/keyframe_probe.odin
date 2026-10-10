@@ -93,8 +93,8 @@ when ODIN_DEBUG {
 	}
 
 	// crop_edge_props is the crop section's lane order, spelled out so a probe can
-	// iterate it. kf_geom_sections is the authority; this list exists because Odin
-	// cannot offset an enum arithmetically.
+	// iterate it. keyframe_geom_sections is the authority; this list exists because
+	// Odin cannot offset an enum arithmetically.
 	crop_edge_props := [4]Render_Geom_Prop{.Crop_L, .Crop_R, .Crop_T, .Crop_B}
 
 	keyframe_probe_run :: proc() -> int {
@@ -776,9 +776,9 @@ when ODIN_DEBUG {
 		group_ten[2] = 7.0
 		group_ten[3] = 8.0
 		keyframe_geom_set_group_value(&pp, "crop", 10, group_ten)
-		// The four crop edges, in the section's lane order. An enum cannot be
-		// offset arithmetically in Odin, so the order is named here and kept in sync
-		// with kf_geom_sections by the lane-order assertion below.
+		// The four crop edges, in the section's lane order. An enum cannot be offset
+		// arithmetically in Odin, so the order is named here, in sync with the
+		// section table keyframe_geom_sections.
 		for edge in 0 ..< 4 {
 			edge_prop := crop_edge_props[edge]
 			edge_value, edge_ok := keyframe_geom_sample_lane(

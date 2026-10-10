@@ -650,10 +650,10 @@ keyframe_geom_section_index :: proc(name: string) -> (index: int, ok: bool) {
 // keyed property (gain, scale, opacity) that is its own single-lane track.
 keyframe_geom_section_for_lane :: proc(name: string) -> (sec_index, lane_index: int, ok: bool) {
 	defs := keyframe_geom_sections
-	for si in 0 ..< len(defs) {
-		for li in 0 ..< len(defs[si].lanes) {
-			if keyframe_lane_name(defs[si].lanes[li]) == name {
-				return si, li, true
+	for section_index in 0 ..< len(defs) {
+		for lane_index in 0 ..< len(defs[section_index].lanes) {
+			if keyframe_lane_name(defs[section_index].lanes[lane_index]) == name {
+				return section_index, lane_index, true
 			}
 		}
 	}
@@ -663,13 +663,13 @@ keyframe_geom_section_for_lane :: proc(name: string) -> (sec_index, lane_index: 
 // keyframe_geom_any_lane_tracked reports whether the section's track exists and holds
 // at least one key in any lane — i.e. the group is animated at all.
 keyframe_geom_any_lane_tracked :: proc(clip: ^Clip, def: Keyframe_Geom_Section) -> bool {
-	si := keyframe_track_index(clip^, def.name)
-	if si < 0 {
+	section_index := keyframe_track_index(clip^, def.name)
+	if section_index < 0 {
 		return false
 	}
-	track := session_trk_view(clip.keyframe_tracks, si)
-	for li in 0 ..< len(track.lanes) {
-		if track.lanes[li].keys.n > 0 {
+	track := session_trk_view(clip.keyframe_tracks, section_index)
+	for lane_index in 0 ..< len(track.lanes) {
+		if track.lanes[lane_index].keys.n > 0 {
 			return true
 		}
 	}
@@ -693,9 +693,9 @@ keyframe_geom_lane_count :: proc(sec: string) -> int {
 // single-lane track. There is no migration step: a lane key and a whole-group
 // key write into the same place, so neither has to convert the other.
 keyframe_geom_set_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
-	if sec_index, li, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
 		defs := keyframe_geom_sections
-		keyframe_set_lane_key(clip, defs[sec_index].name, li, frame_off, value)
+		keyframe_set_lane_key(clip, defs[sec_index].name, lane_index, frame_off, value)
 		return
 	}
 	keyframe_set_key(clip, name, frame_off, value)
@@ -757,8 +757,8 @@ keyframe_geom_set_group_value :: proc(
 		len(lanes) <= KF_GEOM_GROUP_MAX,
 		"keyframe_geom_set_group_value: section is wider than the group value array",
 	)
-	for li in 0 ..< len(lanes) {
-		keyframe_set_lane_key(clip, sec, li, frame_off, values[li])
+	for lane_index in 0 ..< len(lanes) {
+		keyframe_set_lane_key(clip, sec, lane_index, frame_off, values[lane_index])
 	}
 }
 
@@ -781,15 +781,15 @@ keyframe_geom_set_value :: proc(clip: ^Clip, name: string, frame_off: i32, value
 // track; a plain property samples its own single-lane track. Both end up at one
 // scalar sampler, so a lane and a group differ only in which track they name.
 keyframe_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64, base: f32) -> (f32, bool) {
-	if sec_index, li, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
 		defs := keyframe_geom_sections
-		si := keyframe_track_index(clip^, defs[sec_index].name)
-		if si < 0 {
+		section_index := keyframe_track_index(clip^, defs[sec_index].name)
+		if section_index < 0 {
 			return base, false
 		}
 		return keyframe_sample_lane(
-			&session_trk_view(clip.keyframe_tracks, si)^,
-			li,
+			&session_trk_view(clip.keyframe_tracks, section_index)^,
+			lane_index,
 			i32(timeline_frame - clip.timeline_start_frame),
 			base,
 		)
@@ -804,14 +804,14 @@ keyframe_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64
 // knots here, skipping any knot whose mask missed the lane; a lane is now its
 // own sorted window, so the store hands the lane over directly.
 keyframe_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, total: int) {
-	if sec_index, li, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
 		defs := keyframe_geom_sections
-		si := keyframe_track_index(clip^, defs[sec_index].name)
-		if si < 0 {
+		section_index := keyframe_track_index(clip^, defs[sec_index].name)
+		if section_index < 0 {
 			return 0, 0
 		}
 		keys := session_kf_view(
-			keyframe_lane_view(session_trk_view(clip.keyframe_tracks, si), li),
+			keyframe_lane_view(session_trk_view(clip.keyframe_tracks, section_index), lane_index),
 		)
 		total = len(keys)
 		n = min(total, len(dst))

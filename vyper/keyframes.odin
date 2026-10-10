@@ -183,27 +183,26 @@ keyframe_key_mut :: proc(clip: ^Clip, track_index, lane, key_index: int) -> ^Key
 // (audio producer, render worker) gets an OWN copy of a track it samples per
 // frame without ever touching the live timeline. The consumer that races the
 // UI thread must memset-free nothing: dst is its own storage (a struct field),
-// the copy is plain bytes. A consumer whose track may live in PACKED form
-// snapshots through its own lane-aware entry point (keyframe_geom_fill_snapshot), so
-// the worker seam stays packed-free.
+// the copy is plain bytes. A consumer whose track is a SECTION snapshots one lane
+// through keyframe_geom_fill_snapshot, so the worker seam never sees a group.
 keyframe_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, total: int) {
-	ti := keyframe_track_index(clip^, name)
-	if ti < 0 {
+	track_index := keyframe_track_index(clip^, name)
+	if track_index < 0 {
 		return 0, 0
 	}
-	tk := session_trk_view(clip.keyframe_tracks, ti)
+	track := session_trk_view(clip.keyframe_tracks, track_index)
 	// A plain keyed property is one lane. A GROUP track is several, and a consumer
 	// asking for a group must snapshot one lane through keyframe_geom_fill_snapshot, which
 	// knows the group's lane order -- asking here would silently merge two curves
 	// into one array, so a group on this path is a bug and is caught.
 	assert(
-		len(tk.lanes) <= 1,
+		len(track.lanes) <= 1,
 		"keyframe_fill_snapshot: a group track needs keyframe_geom_fill_snapshot (one lane), not the whole track",
 	)
-	if len(tk.lanes) == 0 {
+	if len(track.lanes) == 0 {
 		return 0, 0
 	}
-	keys := session_kf_view(tk.lanes[0].keys)
+	keys := session_kf_view(track.lanes[0].keys)
 	total = len(keys)
 	n = min(total, len(dst))
 	if n > 0 {
@@ -268,29 +267,31 @@ keyframe_set_lane_key_interp :: proc(
 ) {
 	assert(lane >= 0, "keyframe_set_lane_key_interp: lane must be >= 0")
 	keyframe_bump_structure()
-	ti := keyframe_track_index(clip^, name)
-	if ti < 0 {
+	track_index := keyframe_track_index(clip^, name)
+	if track_index < 0 {
 		session_trk_push(&clip.keyframe_tracks, Keyframe_Track {name = session_str_intern(name)})
-		ti = clip.keyframe_tracks.n - 1
+		track_index = clip.keyframe_tracks.n - 1
 	}
-	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
 	// Sharing first: this clip may be a copy that shares its keys with the clip it
 	// came from, and writing before resolving that would edit both.
 	session_trk_make_unique(&clip.keyframe_tracks)
-	track = session_trk_view_mut(&clip.keyframe_tracks, ti)
+	track = session_trk_view_mut(&clip.keyframe_tracks, track_index)
 	for lane >= len(track.lanes) {
 		append(&track.lanes, Keyframe_Lane{})
 	}
 	session_kf_make_unique(&track.lanes[lane].keys)
 	keys := track.lanes[lane].keys
 	// Insertion point: last key at-or-before frame_off.
-	ip := 0
-	for ip < keys.n && session_kf_at(keys, ip).frame_off <= frame_off {
-		ip += 1
+	insert_position := 0
+	for insert_position < keys.n &&
+	    session_kf_at(keys, insert_position).frame_off <= frame_off {
+		insert_position += 1
 	}
-	if ip > 0 && session_kf_at(keys, ip - 1).frame_off == frame_off {
-		session_kf_at_ptr(keys, ip - 1).value = value
-		session_kf_at_ptr(keys, ip - 1).interp = interp
+	if insert_position > 0 &&
+	   session_kf_at(keys, insert_position - 1).frame_off == frame_off {
+		session_kf_at_ptr(keys, insert_position - 1).value = value
+		session_kf_at_ptr(keys, insert_position - 1).interp = interp
 		track.lanes[lane].keys = keys
 		return
 	}
@@ -299,12 +300,12 @@ keyframe_set_lane_key_interp :: proc(
 	// land in; get the order wrong and the key is silently dropped.
 	session_kf_insert(
 		&keys,
-		ip,
+		insert_position,
 		Keyframe {frame_off = frame_off, value = value, interp = interp},
 	)
 	// keys was re-windowed by the insert (the range can move); write it back so
 	// the lane's own range tracks the new window.
-	track = session_trk_view_mut(&clip.keyframe_tracks, ti)
+	track = session_trk_view_mut(&clip.keyframe_tracks, track_index)
 	track.lanes[lane].keys = keys
 }
 
@@ -347,11 +348,11 @@ keyframe_del_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
 // dragging transform.y does not reach into transform.x's curve.
 keyframe_del_lane_key :: proc(clip: ^Clip, name: string, lane, frame_off: i32) {
 	keyframe_bump_structure()
-	ti := keyframe_track_index(clip^, name)
-	if ti < 0 {
+	track_index := keyframe_track_index(clip^, name)
+	if track_index < 0 {
 		return
 	}
-	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
+	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
 	if lane >= 0 && lane < i32(len(track.lanes)) {
 		keys := track.lanes[lane].keys
 		session_kf_make_unique(&keys)
@@ -376,7 +377,7 @@ keyframe_del_lane_key :: proc(clip: ^Clip, name: string, lane, frame_off: i32) {
 		keyframe_track_release_lanes(track)
 		// name is a pool handle: no delete, and nothing to blank either -- the row
 		// leaves the array on the next line.
-		session_trk_erase(&clip.keyframe_tracks, ti)
+		session_trk_erase(&clip.keyframe_tracks, track_index)
 	}
 }
 
@@ -595,14 +596,18 @@ keyframe_sample :: proc(track: ^Keyframe_Track, frame_off: i32, base: f32) -> (f
 
 // keyframe_sample_for resolves `name` against the clip and samples at a TIMELINE
 // frame, relative to the clip start -- the caller-facing generic entry point.
-// A consumer whose `name` may live inside a PACKED track samples through its
-// own lane-aware entry point (keyframe_geom_sample_lane).
+// A consumer whose `name` is a section lane samples through its own lane-aware
+// entry point (keyframe_geom_sample_lane).
 keyframe_sample_for :: proc(clip: ^Clip, name: string, timeline_frame: i64, base: f32) -> (f32, bool) {
-	ti := keyframe_track_index(clip^, name)
-	if ti < 0 {
+	track_index := keyframe_track_index(clip^, name)
+	if track_index < 0 {
 		return base, false
 	}
-	return keyframe_sample(session_trk_view(clip.keyframe_tracks, ti), i32(timeline_frame - clip.timeline_start_frame), base)
+	return keyframe_sample(
+		session_trk_view(clip.keyframe_tracks, track_index),
+		i32(timeline_frame - clip.timeline_start_frame),
+		base,
+	)
 }
 
 // keyframe_free_tracks releases exclusively held track rows and key ranges. Shared
