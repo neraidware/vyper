@@ -1183,14 +1183,11 @@ keyframe_readout :: proc() {
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
 		v_buf := ui_text.kf_val[:]
-		// A packed (section) key shows lane 0 — the lane an edit would
-		// unwrap-and-target — so the readout and the commit agree.
-		rval: f32
-		if kf.mask != 0 {
-			rval, _ = kf_lane_value(kf^, 0)
-		} else {
-			rval = kf.value.(f32)
-		}
+		// A key is a scalar on the lane that owns it (TODO.md Active 52), so the
+		// readout is just that value. It used to branch on a packed mask and show
+		// lane 0 -- a key now cannot be packed, so the branch is gone rather than
+		// defaulted.
+		rval := kf.value
 		v_str := fmt.bprintf(v_buf[:], "%.2f", rval)
 		if edit_state.field == .Kf_Value {
 			v_str = string(edit_state.chars[:edit_state.len])

@@ -64,23 +64,37 @@ ELASTIC_FREQ_CYCLES :: 3 // complete sine swings per segment.
 // value stays 0 at the key, then bounces forward of the target.
 ELASTIC_PHASE :: 0.75
 
+// Keyframe is ONE scalar key on ONE lane. There is no packed form: a key's
+// value is a plain f32 and the lane it belongs to is carried by WHICH lane's key
+// window holds it, not by a runtime tag inside the key.
+//
+// The scalar/packed union this replaced (TODO.md Active 52) was the source of a
+// whole class of bug: whether a knot was scalar or packed lived in `mask != 0`,
+// decided at the CALL SITE, so a scalar sampler that met a packed knot asserted
+// and aborted the process, and one animation had two storage forms with
+// value-exact migrations keeping them in sync. A group of N lanes is now N scalar
+// key windows; keying the group writes each lane; "which lanes are keyed on this
+// frame" is a derived question, never a stored fact.
 Keyframe :: struct {
 	// frame_off: clip-relative frame this key sits on. Sorted ascending.
 	frame_off: i32,
-	// mask: bit i set => this key packs lane i's value (a partial keyframe can
-	// key any subset of a packed group's lanes — a consumer's migration knot
-	// only carries the lanes with a breakpoint there). mask == 0 means a scalar
-	// key (value carries .f32); mask != 0 means a packed key (value carries a
-	// [KF_PACK_MAX]f32 indexed by LANE, meaningful where the mask bit is set).
-	mask: u8,
-	// interp: easing for the segment arriving at this key from the previous
-	// one. Scalar and packed keys both carry it; a packed knot's mode applies
-	// to every lane it covers.
+	// interp: easing for the segment arriving at this key from the previous one.
 	interp: Kf_Interp,
-	value: union {
-		f32,
-		[KF_PACK_MAX]f32,
-	},
+	value:  f32,
+}
+
+// Kf_Lane is ONE scalar property's key curve inside a track. A group is just
+// several lanes: crop has four (l/r/t/b), transform has two (x/y), gain has one.
+// Each lane is an independent sorted key window into the session key arena, so a
+// track copy is a struct copy and lane sharing/COW keeps working exactly as it
+// did when the whole track shared one window.
+Kf_Lane :: struct {
+	// keys: sorted ascending by frame_off. A window into the session key store
+	// (session_kf.odin), not an owned array: the session owns the slots and
+	// outlives every holder. Read through session_kf_view/session_kf_at, mutate
+	// through session_kf_push/insert/erase/set after session_kf_make_unique has
+	// resolved sharing (TODO.md Active 19, S2b).
+	keys: Kf_Keys_Range,
 }
 
 Kf_Track :: struct {
@@ -89,13 +103,10 @@ Kf_Track :: struct {
 	// owned by the session, so a track copy is a struct copy. Read through
 	// kf_track_name, match through kf_track_index.
 	name: Session_Str_Handle,
-	// keys: sorted ascending by frame_off. A window into the session key store
-	// (session_kf.odin), not an owned array: the session owns the slots and
-	// outlives every holder, so copying a track is a struct copy and there is
-	// nothing per-track to free. Read through session_kf_view/session_kf_at,
-	// mutate through session_kf_push/insert/erase/set after session_kf_make_unique
-	// has resolved sharing (TODO.md Active 19, S2b).
-	keys: Kf_Keys_Range,
+	// lanes: this track's scalar key curves. Empty for a static property (no
+	// keys anywhere), one for a plain keyed property (gain), N for a keyed
+	// group (transform.x/.y, crop.l/.r/.t/.b).
+	lanes: [dynamic]Kf_Lane,
 }
 
 // kf_track_name is the track's name. The result borrows the pool. Note this is
@@ -105,30 +116,32 @@ kf_track_name :: proc(t: ^Kf_Track) -> string {
 	return session_str_view(t.name)
 }
 
-// ---------------------------------------------------------------------------
-// Packed keys: a track whose keys carry a [KF_PACK_MAX]f32 payload instead of
-// a scalar, with a mask saying which lanes each knot keys. A consumer groups
-// named scalar tracks into one packed track and owns every naming decision
-// (which properties group, what a lane is called, when the two forms migrate);
-// the store only reads and writes the packed form. A lane's packed index is its
-// position within the consumer's group, so a packed key fans out to the right
-// consumer field.
-// ---------------------------------------------------------------------------
-// kf_lane_value reads lane `idx` of a packed key: the value when the key's
-// mask covers idx, otherwise the "this knot leaves the lane alone" answer —
-// a lane with no bit here has no breakpoint at this knot, so its curve runs
-// through the knot untouched.
-kf_lane_value :: proc(k: Keyframe, idx: int) -> (value: f32, covered: bool) {
-	if k.mask == 0 || (k.mask >> uint(idx)) & 1 == 0 {
-		return 0, false
+// --- lanes ------------------------------------------------------------------
+//
+// A track is a set of scalar LANES, one per keyed property it owns. The arity is
+// len(track.lanes): a plain keyed property (gain) has one, a group (transform.x
+// / .y, or crop.l/.r/.t/.b) has several. This replaced a [KF_PACK_MAX]f32 payload
+// plus a runtime `mask` tag (TODO.md Active 52); arity is now structural, so the
+// scalar/packed class of bug is gone rather than merely guarded.
+
+// kf_lane_count is how many scalar key curves a track carries.
+kf_lane_count :: proc(t: ^Kf_Track) -> int {
+	return len(t.lanes)
+}
+
+// kf_lane_view is lane `i`'s keys, read-only. Returns an empty range when the
+// track has no such lane, so a caller iterating a group never has to bounds
+// check against a count it derived elsewhere.
+kf_lane_view :: proc(t: ^Kf_Track, i: int) -> Kf_Keys_Range {
+	if i < 0 || i >= len(t.lanes) {
+		return {}
 	}
-	switch v in k.value {
-	case [KF_PACK_MAX]f32:
-		return v[idx], true
-	case f32:
-	}
-	assert(false, "a key with a nonzero mask must carry the [KF_PACK_MAX]f32 union variant")
-	return 0, false
+	return t.lanes[i].keys
+}
+
+// kf_lane_total is how many keys lane `i` holds -- the `total` a snapshot returns.
+kf_lane_total :: proc(t: ^Kf_Track, i: int) -> int {
+	return kf_lane_view(t, i).n
 }
 
 // --- lookups --------------------------------------------------------------
@@ -153,10 +166,12 @@ kf_track_index :: proc(clip: Clip, name: string) -> int {
 
 // Resolve writable key access through both COW layers before returning a
 // pointer. Never retain returned pointer across a track/key store mutation.
-kf_key_mut :: proc(clip: ^Clip, track_index, key_index: int) -> ^Keyframe {
+// `lane` selects which of the track's scalar curves to write.
+kf_key_mut :: proc(clip: ^Clip, track_index, lane, key_index: int) -> ^Keyframe {
 	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
-	session_kf_make_unique(&track.keys)
-	return session_kf_at_ptr(track.keys, key_index)
+	assert(lane >= 0 && lane < len(track.lanes), "kf_key_mut: lane out of range")
+	session_kf_make_unique(&track.lanes[lane].keys)
+	return session_kf_at_ptr(track.lanes[lane].keys, key_index)
 }
 
 // kf_fill_snapshot copies `name`'s track into `dst` (a flat fixed array) up to
@@ -173,10 +188,22 @@ kf_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, tota
 		return 0, 0
 	}
 	tk := session_trk_view(clip.keyframe_tracks, ti)
-	total = tk.keys.n
+	// A plain keyed property is one lane. A GROUP track is several, and a consumer
+	// asking for a group must snapshot one lane through kf_geom_fill_snapshot, which
+	// knows the group's lane order -- asking here would silently merge two curves
+	// into one array, so a group on this path is a bug and is caught.
+	assert(
+		len(tk.lanes) <= 1,
+		"kf_fill_snapshot: a group track needs kf_geom_fill_snapshot (one lane), not the whole track",
+	)
+	if len(tk.lanes) == 0 {
+		return 0, 0
+	}
+	keys := session_kf_view(tk.lanes[0].keys)
+	total = len(keys)
 	n = min(total, len(dst))
 	if n > 0 {
-		mem.copy(raw_data(dst[:n]), raw_data(session_kf_view(tk.keys)), n * size_of(Keyframe))
+		mem.copy(raw_data(dst[:n]), raw_data(keys), n * size_of(Keyframe))
 	}
 	return
 }
@@ -200,6 +227,22 @@ kf_bump_structure :: proc() {
 }
 
 kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
+	kf_set_lane_key(clip, name, 0, frame_off, value)
+}
+
+// kf_set_lane_key is kf_set_key on lane `lane` of `name`'s track, growing the
+// track's lane list to reach it. A named scalar property uses lane 0; a group
+// track (transform.x/.y, crop.l/.r/.t/.b) uses the lane's index in the group.
+// Grow-then-write rather than assuming the lane exists, so a group's first key
+// can arrive on any of its lanes.
+kf_set_lane_key :: proc(
+	clip: ^Clip,
+	name: string,
+	lane: int,
+	frame_off: i32,
+	value: f32,
+) {
+	assert(lane >= 0, "kf_set_lane_key: lane must be >= 0")
 	kf_bump_structure()
 	ti := kf_track_index(clip^, name)
 	if ti < 0 {
@@ -209,20 +252,30 @@ kf_set_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
 	track := session_trk_view_mut(&clip.keyframe_tracks, ti)
 	// Sharing first: this clip may be a copy that shares its keys with the clip it
 	// came from, and writing before resolving that would edit both.
-	session_kf_make_unique(&track.keys)
+	session_trk_make_unique(&clip.keyframe_tracks)
+	track = session_trk_view_mut(&clip.keyframe_tracks, ti)
+	for lane >= len(track.lanes) {
+		append(&track.lanes, Kf_Lane{})
+	}
+	session_kf_make_unique(&track.lanes[lane].keys)
+	keys := track.lanes[lane].keys
 	// Insertion point: last key at-or-before frame_off.
 	ip := 0
-	for ip < track.keys.n && session_kf_at(track.keys, ip).frame_off <= frame_off {
+	for ip < keys.n && session_kf_at(keys, ip).frame_off <= frame_off {
 		ip += 1
 	}
-	if ip > 0 && session_kf_at(track.keys, ip - 1).frame_off == frame_off {
-		session_kf_at_ptr(track.keys, ip - 1).value = value
+	if ip > 0 && session_kf_at(keys, ip - 1).frame_off == frame_off {
+		session_kf_at_ptr(keys, ip - 1).value = value
 		return
 	}
 	// One call, replacing the append-a-sentinel-then-slide-the-tail dance. That
 	// dance had to grow the array before the mem.copy so there would be a slot to
 	// land in; get the order wrong and the key is silently dropped.
-	session_kf_insert(&track.keys, ip, Keyframe {frame_off = frame_off, value = value})
+	session_kf_insert(&keys, ip, Keyframe {frame_off = frame_off, value = value})
+	// keys was re-windowed by the insert (the range can move); write it back so
+	// the lane's own range tracks the new window.
+	track = session_trk_view_mut(&clip.keyframe_tracks, ti)
+	track.lanes[lane].keys = keys
 }
 
 // kf_del_key removes the key at frame_off from `name`'s track; drops the track
