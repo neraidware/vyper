@@ -23,12 +23,12 @@ when ODIN_DEBUG {
 			return
 		}
 		session_kf_failures += 1
-		fmt.eprintf("[session-kf-probe] FAIL: ")
+		fmt.eprintf("[session-keyframe-probe] FAIL: ")
 		fmt.eprintf(msg, ..args)
 		fmt.eprintln()
 	}
 
-	// kf_key builds a scalar key at a frame, so the checks below read as key data
+	// keyframe_key builds a scalar key at a frame, so the checks below read as key data
 	// rather than as struct literals.
 	session_kf_key :: proc(frame: i32, v: f32) -> Keyframe {
 		return Keyframe{frame_off = frame, value = v}
@@ -46,7 +46,7 @@ when ODIN_DEBUG {
 
 		// --- a range round-trips its keys -------------------------------------
 		{
-			r := Kf_Keys_Range{}
+			r := Keyframe_Keys_Range{}
 			session_kf_reserve(&r, 3)
 			for i in 0 ..< 3 {
 				session_kf_push(&r, session_kf_key(i32(i) * 10, f32(i)))
@@ -76,7 +76,7 @@ when ODIN_DEBUG {
 		// because they are different properties.
 		{
 			before := session_kf_moves
-			r := Kf_Keys_Range{}
+			r := Keyframe_Keys_Range{}
 			session_kf_reserve(&r, 1)
 			for i in 0 ..< 40 {
 				session_kf_push(&r, session_kf_key(i32(i), f32(i)))
@@ -105,11 +105,11 @@ when ODIN_DEBUG {
 		// together cover both arms of session_kf_grow.
 		{
 			session_kf_reset()
-			a := Kf_Keys_Range{}
+			a := Keyframe_Keys_Range{}
 			session_kf_reserve(&a, 8) // lands at the tail, slots=8
 			// Allocate a neighbour directly after, then free it: that leaves a free
 			// span starting exactly at a.first + a.slots.
-			blocker := Kf_Keys_Range{}
+			blocker := Keyframe_Keys_Range{}
 			session_kf_reserve(&blocker, 8)
 			session_kf_release(blocker)
 			first_addr := uintptr(raw_data(session_kf_keys[a.first :]))
@@ -142,7 +142,7 @@ when ODIN_DEBUG {
 			session_kf_reset()
 			delete(session_kf_keys)
 			session_kf_keys = nil
-			a := Kf_Keys_Range{}
+			a := Keyframe_Keys_Range{}
 			session_kf_reserve(&a, 2)
 			session_kf_push(&a, session_kf_key(5, 50.0))
 			session_kf_push(&a, session_kf_key(15, 150.0))
@@ -179,7 +179,7 @@ when ODIN_DEBUG {
 		// travel, the second holder would think it owns the range and write through
 		// it; that failure is invisible in the type, so it is pinned here.
 		{
-			shared := Kf_Keys_Range{first = 0, slots = 1, n = 0, shared = true}
+			shared := Keyframe_Keys_Range{first = 0, slots = 1, n = 0, shared = true}
 			copied := shared
 			session_kf_check(copied.shared, "a struct copy dropped the shared bit")
 			// The other half of the guard: session_kf_view_mut refuses a shared
@@ -197,7 +197,7 @@ when ODIN_DEBUG {
 			session_kf_reset()
 			peak_keys := len(session_kf_keys)
 			for round in 0 ..< 500 {
-				r := Kf_Keys_Range{}
+				r := Keyframe_Keys_Range{}
 				session_kf_reserve(&r, 16)
 				for i in 0 ..< 16 {
 					session_kf_push(&r, session_kf_key(i32(round), f32(i)))
@@ -235,13 +235,13 @@ when ODIN_DEBUG {
 		// --- growth past a stranded range relocates, and the copy is intact -----
 		{
 			session_kf_reset()
-			a := Kf_Keys_Range{}
+			a := Keyframe_Keys_Range{}
 			session_kf_reserve(&a, 2)
 			session_kf_push(&a, session_kf_key(1, 10.0))
 			session_kf_push(&a, session_kf_key(2, 20.0))
 			// Strand a range right after `a` so there is no free span to extend
 			// into; the next growth has to move.
-			blocker := Kf_Keys_Range{}
+			blocker := Keyframe_Keys_Range{}
 			session_kf_reserve(&blocker, 2)
 			before_moves := session_kf_moves
 			session_kf_reserve(&a, 64)
@@ -269,9 +269,9 @@ when ODIN_DEBUG {
 		// that puts the new span BETWEEN two live entries in the sorted list.
 		{
 			session_kf_reset()
-			a := Kf_Keys_Range{}
+			a := Keyframe_Keys_Range{}
 			session_kf_reserve(&a, 8)
-			b := Kf_Keys_Range{}
+			b := Keyframe_Keys_Range{}
 			session_kf_reserve(&b, 8)
 			session_kf_check(
 				a.first + a.slots == b.first,
@@ -299,7 +299,7 @@ when ODIN_DEBUG {
 			)
 			// And the merged span must actually serve a request for its full width,
 			// which is the point of merging it.
-			c := Kf_Keys_Range{}
+			c := Keyframe_Keys_Range{}
 			session_kf_reserve(&c, 16)
 			session_kf_check(
 				c.first == a.first,
@@ -317,7 +317,7 @@ when ODIN_DEBUG {
 		// --- a zero-value range is empty and safe (the useful zero value) -------
 		{
 			session_kf_reset()
-			z := Kf_Keys_Range{}
+			z := Keyframe_Keys_Range{}
 			session_kf_check(z.n == 0 && z.slots == 0, "the zero range is not empty")
 			session_kf_check(len(session_kf_view(z)) == 0, "the zero range does not view as empty")
 			session_kf_check(!z.shared, "the zero range claims to be shared")
@@ -330,7 +330,7 @@ when ODIN_DEBUG {
 		// prevent.
 		{
 			session_kf_reset()
-			r := Kf_Keys_Range{}
+			r := Keyframe_Keys_Range{}
 			session_kf_reserve(&r, 4)
 			session_kf_push(&r, session_kf_key(7, 70.0))
 			stale := r
@@ -352,15 +352,15 @@ when ODIN_DEBUG {
 		}
 
 		if session_kf_failures > 0 {
-			fmt.eprintf("[session-kf-probe] %d check(s) FAILED\n", session_kf_failures)
+			fmt.eprintf("[session-keyframe-probe] %d check(s) FAILED\n", session_kf_failures)
 			return 1
 		}
-		fmt.eprintln("[session-kf-probe] PASS")
+		fmt.eprintln("[session-keyframe-probe] PASS")
 		fmt.eprintln(
-			"[session-kf-probe] growth amortized over 40 inserts and in place when a free span follows, COW resolved on write only, 500 alloc/free rounds reused down to one coalesced span, one relocation copying keys intact, and reset leaving every handle out of bounds",
+			"[session-keyframe-probe] growth amortized over 40 inserts and in place when a free span follows, COW resolved on write only, 500 alloc/free rounds reused down to one coalesced span, one relocation copying keys intact, and reset leaving every handle out of bounds",
 		)
 		fmt.eprintln(
-			"[session-kf-probe] bounds named: SESSION_KF_MAX_KEYS, SESSION_KF_MIN_CAP",
+			"[session-keyframe-probe] bounds named: SESSION_KF_MAX_KEYS, SESSION_KF_MIN_CAP",
 		)
 		return 0
 	}

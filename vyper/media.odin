@@ -664,7 +664,7 @@ add_asset_to_timeline :: proc(asset_id: u64, target_track: int, start_frame: i64
 	clear(&selection.extra_set)
 	selection.track = -1
 	selection.index = -1
-	kf_sel = {} // a fresh import replaces the whole tree; no keyframe survives it
+	keyframe_sel = {} // a fresh import replaces the whole tree; no keyframe survives it
 	want_kind := Media_Kind.Video
 	#partial switch asset.kind {
 	case .Audio:

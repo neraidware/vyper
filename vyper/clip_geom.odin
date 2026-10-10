@@ -5,7 +5,7 @@ package vyper
 //
 // Why this module exists. Every geometry property has two homes: a RESTING
 // field on the Clip, and a keyframe track. Which one is authoritative depends
-// on the playhead — kf_sample_keys returns the track's value from the first key
+// on the playhead — keyframe_sample_keys returns the track's value from the first key
 // onward (interpolating between keys, HOLDING past the last) and IGNORES the
 // resting field there. So "write the resting field" is not always a no-op, but
 // it is *silently* a no-op exactly when the property is keyed, which is the
@@ -18,7 +18,7 @@ package vyper
 // not the same question as keyed-HERE.
 //
 // That made the routing a per-call-site responsibility: every geometry write
-// had to remember to funnel through kf_auto_key, and the two preview gestures
+// had to remember to funnel through keyframe_auto_key, and the two preview gestures
 // (clip_zoom_by for Alt+wheel, clip_pan_by for Alt+middle-drag)
 // did not. The result was a drag that changed the inspector's numbers, moved
 // nothing under the pointer, and made the clip jump when the playhead left the
@@ -102,17 +102,17 @@ clip_geom_set_resting :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) {
 // base that is not on screen, so both the arithmetic and the store have to go
 // through the playhead's value.
 clip_geom_get :: proc(clip: ^Clip, prop: Render_Geom_Prop) -> f32 {
-	v, _ := kf_geom_sample_lane(clip, kf_lane_name(prop), playhead.frame, clip_geom_resting(clip, prop))
+	v, _ := keyframe_geom_sample_lane(clip, keyframe_lane_name(prop), playhead.frame, clip_geom_resting(clip, prop))
 	return v
 }
 
 // clip_geom_keyed_at reports whether the sampler is reading a KEY for this
 // lane at the playhead. This is not "is the property keyed" — it is the exact
 // question "would a resting write here be seen?", which is what the write
-// routing needs to know, and which a bare kf_geom_prop_keyed gets wrong for a
+// routing needs to know, and which a bare keyframe_geom_prop_keyed gets wrong for a
 // playhead outside the keyed span.
 clip_geom_keyed_at :: proc(clip: ^Clip, prop: Render_Geom_Prop) -> bool {
-	_, active := kf_geom_sample_lane(clip, kf_lane_name(prop), playhead.frame, clip_geom_resting(clip, prop))
+	_, active := keyframe_geom_sample_lane(clip, keyframe_lane_name(prop), playhead.frame, clip_geom_resting(clip, prop))
 	return active
 }
 
@@ -130,20 +130,20 @@ clip_geom_keyed_at :: proc(clip: ^Clip, prop: Render_Geom_Prop) -> bool {
 //     somewhere is the track.
 //  2. The property is keyed but INACTIVE at the playhead. That is now ONLY the
 	//     region before the track's first key — past the last key the track HOLDS
-	//     (kf_sample_keys), so the sampler is reading a key there and case 1
+	//     (keyframe_sample_keys), so the sampler is reading a key there and case 1
 	//     applies. Auto-key extends the animation here; without it the resting
 	//     write is what the sampler reads, so the edit is visible either way. Both
 	//     are non-lossy, and this keeps the toggle's meaning unchanged.
 //  3. Not keyed. Write resting and mark the lane pending so "keyframe all
 //     modified" can offer it. Auto-key never MINTS a track, matching
-//     kf_auto_key's long-standing rule — a property nobody has keyed stays a
+//     keyframe_auto_key's long-standing rule — a property nobody has keyed stays a
 //     resting edit until the user asks for a key.
 //
 // No undo handling here: the caller opened an undo node when the gesture
 // began, and its release-time push captures the whole drag including any key
 // inserted along the way.
 clip_geom_set :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) -> (keyed: bool) {
-	// A key is only meaningful while the playhead is over the clip. kf_sample_keys
+	// A key is only meaningful while the playhead is over the clip. keyframe_sample_keys
 	// holds from the first key onward, so a playhead past the clip's end still
 	// reads "active" and would otherwise collect keys on frames the clip does not
 	// cover. The resting write below is correct there: it is what the sampler
@@ -153,9 +153,9 @@ clip_geom_set :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) -> (keyed: bo
 		clip.geom_modified |= 1 << uint(prop)
 		return false
 	}
-	name := kf_lane_name(prop)
+	name := keyframe_lane_name(prop)
 	if clip_geom_keyed_at(clip, prop) ||
-	   (editor_flags.auto_keyframe && kf_geom_prop_keyed(clip, name)) {
+	   (editor_flags.auto_keyframe && keyframe_geom_prop_keyed(clip, name)) {
 		off := i32(playhead.frame - clip.timeline_start_frame)
 		// Write into the section's PACKED track when it has one. This branch
 		// overwrites a value the user already keyed — either a key sits on this
@@ -165,8 +165,8 @@ clip_geom_set :: proc(clip: ^Clip, prop: Render_Geom_Prop, v: f32) -> (keyed: bo
 		// asked for). The scalar path remains for the lanes with no packed
 		// section to write into, and for the explicit per-lane Key buttons,
 		// which are the opposite intent and do unwrap.
-		if !kf_geom_set_packed_lane_key(clip, name, off, v) {
-			kf_geom_set_lane_key(clip, name, off, v)
+		if !keyframe_geom_set_packed_lane_key(clip, name, off, v) {
+			keyframe_geom_set_lane_key(clip, name, off, v)
 		}
 		clip.geom_modified &= ~(1 << uint(prop))
 		return true
@@ -215,13 +215,13 @@ clip_geom_mark_keyed :: proc(clip: ^Clip, prop: Render_Geom_Prop) {
 // currently on screen, and clears that lane's pending flag.
 //
 // Every geometry key-add button goes through here rather than calling
-// kf_add_prop directly, because keying a lane and marking it keyed are ONE
+// keyframe_add_prop directly, because keying a lane and marking it keyed are ONE
 // action: a lane that was panned (pending) and then manually keyed is no longer
 // pending, and a button that left the bit set would keep "Key X" lit and
 // re-key the lane on the next press. The gain diamond is not a geometry lane
-// and still calls kf_add_prop.
+// and still calls keyframe_add_prop.
 clip_geom_add_lane_key :: proc(clip: ^Clip, prop: Render_Geom_Prop) {
-	kf_add_prop(clip, kf_lane_name(prop), clip_geom_get(clip, prop))
+	keyframe_add_prop(clip, keyframe_lane_name(prop), clip_geom_get(clip, prop))
 	clip_geom_mark_keyed(clip, prop)
 }
 
@@ -229,22 +229,22 @@ clip_geom_add_lane_key :: proc(clip: ^Clip, prop: Render_Geom_Prop) {
 // clears every lane in it.
 //
 // The caller names the section, not the values: the lane list and its order
-// come from kf_geom_sections, the same table kf_geom_set_packed reads the
+// come from keyframe_geom_sections, the same table keyframe_geom_set_packed reads the
 // payload in. Spelling the seven values out at each call site would be a
 // hand-written parallel copy of that table, and a lane added to a section would
 // silently write the wrong slot.
 clip_geom_add_group_key :: proc(clip: ^Clip, sec: string) {
-	sec_index, ok := kf_geom_section_index(sec)
+	sec_index, ok := keyframe_geom_section_index(sec)
 	assert(ok, "clip_geom_add_group_key: not a section name")
-	// Bind the table to a local before indexing: kf_geom_sections is a
+	// Bind the table to a local before indexing: keyframe_geom_sections is a
 	// constant, and Odin will not index a constant with a variable.
-	defs := kf_geom_sections
+	defs := keyframe_geom_sections
 	sec_lanes := defs[sec_index].lanes
 	lanes: [KF_PACK_MAX]f32
 	for i in 0 ..< len(sec_lanes) {
 		lanes[i] = clip_geom_get(clip, sec_lanes[i])
 	}
-	kf_add_group_prop(clip, sec, lanes)
+	keyframe_add_group_prop(clip, sec, lanes)
 	for i in 0 ..< len(sec_lanes) {
 		clip_geom_mark_keyed(clip, sec_lanes[i])
 	}
@@ -293,7 +293,7 @@ clip_geom_can_key_all_modified :: proc(clip: ^Clip) -> bool {
 //
 // A section that is ALREADY UNWRAPPED is left unwrapped and its pending lanes
 // are keyed one by one. Per-lane storage is a choice someone already made — the
-// user keyed or edited an individual lane, and kf_geom_set_lane_key is what
+// user keyed or edited an individual lane, and keyframe_geom_set_lane_key is what
 // unwrapped it — so re-packing it here would reshape an existing animation as a
 // side effect of asking to key it. Properties that group with nothing (scale,
 // opacity) are always per lane.
@@ -319,9 +319,9 @@ clip_geom_key_all_modified :: proc(clip: ^Clip) -> (n: int) {
 		sampled[i] = clip_geom_get(clip, Render_Geom_Prop(i))
 	}
 	off := i32(playhead.frame - clip.timeline_start_frame)
-	// Bind the table to a local before indexing: kf_geom_sections is a constant,
+	// Bind the table to a local before indexing: keyframe_geom_sections is a constant,
 	// and Odin will not index a constant with a variable.
-	defs := kf_geom_sections
+	defs := keyframe_geom_sections
 	undo_begin()
 	// Sections first, so nothing below sees a section this loop just wrote.
 	for si in 0 ..< len(defs) {
@@ -340,23 +340,23 @@ clip_geom_key_all_modified :: proc(clip: ^Clip) -> (n: int) {
 		if pending_count == 0 {
 			continue
 		}
-		if kf_geom_any_lane_tracked(clip, sec) {
+		if keyframe_geom_any_lane_tracked(clip, sec) {
 			// Already unwrapped: keep the shape, key only what is pending.
 			for li in 0 ..< len(sec.lanes) {
 				if pending_bits & (1 << uint(li)) == 0 {
 					continue
 				}
 				lane := sec.lanes[li]
-				kf_geom_set_lane_key(clip, kf_lane_name(lane), off, sampled[int(lane)])
+				keyframe_geom_set_lane_key(clip, keyframe_lane_name(lane), off, sampled[int(lane)])
 			}
 			n += pending_count
 			continue
 		}
-		if kf_track_index(clip^, sec.name) >= 0 {
+		if keyframe_track_index(clip^, sec.name) >= 0 {
 			// A packed section is already there, so extend its key AT THIS
 			// FRAME through the lane writer, one lane at a time. That writer
 			// MERGES into a knot already on the frame (mask |= bit) where
-			// kf_set_packed_key replaces mask and value wholesale — so a
+			// keyframe_set_packed_key replaces mask and value wholesale — so a
 			// full-mask knot the user placed keeps the lanes this press does
 			// not mention.
 			for li in 0 ..< len(sec.lanes) {
@@ -364,9 +364,9 @@ clip_geom_key_all_modified :: proc(clip: ^Clip) -> (n: int) {
 					continue
 				}
 				lane := sec.lanes[li]
-				written := kf_geom_set_packed_lane_key(
+				written := keyframe_geom_set_packed_lane_key(
 					clip,
-					kf_lane_name(lane),
+					keyframe_lane_name(lane),
 					off,
 					sampled[int(lane)],
 				)
@@ -387,20 +387,20 @@ clip_geom_key_all_modified :: proc(clip: ^Clip) -> (n: int) {
 		for li in 0 ..< len(sec.lanes) {
 			lanes[li] = sampled[int(sec.lanes[li])]
 		}
-		kf_geom_set_packed(clip, sec.name, off, lanes, pending_bits)
+		keyframe_geom_set_packed(clip, sec.name, off, lanes, pending_bits)
 		n += pending_count
 	}
 	// Properties that group with nothing are always scalar, so the section loop
 	// above has left them untouched.
 	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
 		prop := Render_Geom_Prop(i)
-		if _, _, is_lane := kf_geom_section_for_lane(kf_lane_name(prop)); is_lane {
+		if _, _, is_lane := keyframe_geom_section_for_lane(keyframe_lane_name(prop)); is_lane {
 			continue
 		}
 		if !clip_geom_key_modified(clip, prop) {
 			continue
 		}
-		kf_geom_set_lane_key(clip, kf_lane_name(prop), off, sampled[i])
+		keyframe_geom_set_lane_key(clip, keyframe_lane_name(prop), off, sampled[i])
 		n += 1
 	}
 	clip.geom_modified = 0

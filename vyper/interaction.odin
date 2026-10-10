@@ -364,71 +364,71 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		return false
 	},
 	// Clicking an X/Y/Scale/crop property field focuses it for typing; the
-	// diamond button beside it (KfAdd*) adds a keyframe for that property at
+	// diamond button beside it (KeyframeAdd*) adds a keyframe for that property at
 	// the playhead. The track name is minted HERE (the consumer owns the
-	// property→name mapping; the store never interprets it) — see kf_add_prop.
+	// property→name mapping; the store never interprets it) — see keyframe_add_prop.
 	proc(inp: Mouse_Input) -> bool {
 		sel, ok := transformable_selected()
 		if !ok {
 			return false
 		}
-		if clay.PointerOver(clay.ID("KfAddX")) {
+		if clay.PointerOver(clay.ID("KeyframeAddX")) {
 			clip_geom_add_lane_key(sel, .Trans_X)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddTrans")) {
+		if clay.PointerOver(clay.ID("KeyframeAddTrans")) {
 			clip_geom_add_group_key(sel, "transform")
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddCrop")) {
+		if clay.PointerOver(clay.ID("KeyframeAddCrop")) {
 			clip_geom_add_group_key(sel, "crop")
 			return true
 		}
 		// Zoom and Pan get per-lane diamonds only, no group caption diamond:
-		// they group with no section (kf_geom_sections has no "zoom" section),
+		// they group with no section (keyframe_geom_sections has no "zoom" section),
 		// for the same reason Opacity has none -- there is no packed form to
 		// key together, because pan.x and pan.y are genuinely independent
 		// (a horizontal slide is not half of a vertical one).
-		if clay.PointerOver(clay.ID("KfAddZoom")) {
+		if clay.PointerOver(clay.ID("KeyframeAddZoom")) {
 			clip_geom_add_lane_key(sel, .Zoom)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddPanX")) {
+		if clay.PointerOver(clay.ID("KeyframeAddPanX")) {
 			clip_geom_add_lane_key(sel, .Pan_X)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddPanY")) {
+		if clay.PointerOver(clay.ID("KeyframeAddPanY")) {
 			clip_geom_add_lane_key(sel, .Pan_Y)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddY")) {
+		if clay.PointerOver(clay.ID("KeyframeAddY")) {
 			clip_geom_add_lane_key(sel, .Trans_Y)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddS")) {
+		if clay.PointerOver(clay.ID("KeyframeAddS")) {
 			clip_geom_add_lane_key(sel, .Scale)
 			return true
 		}
 		// Opacity has its own key button rather than riding a section caption
-		// like transform/crop: it groups with nothing (kf_geom_sections has no
+		// like transform/crop: it groups with nothing (keyframe_geom_sections has no
 		// "opacity" section), so there is no group key to hang it on.
-		if clay.PointerOver(clay.ID("KfAddOpacity")) {
+		if clay.PointerOver(clay.ID("KeyframeAddOpacity")) {
 			clip_geom_add_lane_key(sel, .Opacity)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddCropL")) {
+		if clay.PointerOver(clay.ID("KeyframeAddCropL")) {
 			clip_geom_add_lane_key(sel, .Crop_L)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddCropR")) {
+		if clay.PointerOver(clay.ID("KeyframeAddCropR")) {
 			clip_geom_add_lane_key(sel, .Crop_R)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddCropT")) {
+		if clay.PointerOver(clay.ID("KeyframeAddCropT")) {
 			clip_geom_add_lane_key(sel, .Crop_T)
 			return true
 		}
-		if clay.PointerOver(clay.ID("KfAddCropB")) {
+		if clay.PointerOver(clay.ID("KeyframeAddCropB")) {
 			clip_geom_add_lane_key(sel, .Crop_B)
 			return true
 		}
@@ -498,15 +498,15 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 	// Gain knob drag + gain value field + gain keyframe diamond: the only
 	// inspector edit that targets audio clips (the X/Y/Scale/crop probe above
 	// rejects .Audio). The knob starts a live drag; the field focuses for
-	// typing like any other field; the KfAddGain diamond keys gain at the
+	// typing like any other field; the KeyframeAddGain diamond keys gain at the
 	// playhead.
 	proc(inp: Mouse_Input) -> bool {
 		_, cl, ok := selected_clip()
 		if !ok || cl.kind != .Audio {
 			return false
 		}
-		if clay.PointerOver(clay.ID("KfAddGain")) {
-			kf_add_prop(cl, "gain", cl.gain)
+		if clay.PointerOver(clay.ID("KeyframeAddGain")) {
+			keyframe_add_prop(cl, "gain", cl.gain)
 			return true
 		}
 		if clay.PointerOver(clay.ID("GainKnob")) {
@@ -544,22 +544,22 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 	// selected_clip(), and the two selections are mutually exclusive.
 	proc(inp: Mouse_Input) -> bool {
 		if clay.PointerOver(clay.ID("PropFieldKf")) {
-			// kf_selected resolves only a selection of EXACTLY one key, so a
+			// keyframe_selected resolves only a selection of EXACTLY one key, so a
 			// multi-selection cannot land its first key in the editor as though
 			// it were the only one. The field is not even offered for a
 			// multi-selection (keyframes_readout), so this is a belt-and-braces
 			// read of the same contract.
-			if _, _, k, ok := kf_selected(); ok {
+			if _, _, k, ok := keyframe_selected(); ok {
 				// A packed (section) key's readout shows lane 0; edit_begin
 				// seeds the field with that lane so the typed value and the
 				// displayed one agree (commit unwraps and edits that lane).
 				v0: f32
 				if k.mask != 0 {
-					v0, _ = kf_lane_value(k^, 0)
+					v0, _ = keyframe_lane_value(k^, 0)
 				} else {
 					v0 = k.value.(f32)
 				}
-				edit_begin(.Kf_Value, v0)
+				edit_begin(.Keyframe_Value, v0)
 				return true
 			}
 		}
@@ -731,12 +731,12 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 	// drag and the narrowing waits for the release (see below). Shift+click is
 	// always a plain selection of the clicked key: it arms no move and no
 	// hover-select (that is entered from empty space). Both drop any clip set
-	// (kf_select owns the S3 exclusivity).
+	// (keyframe_select owns the S3 exclusivity).
 	proc(inp: Mouse_Input) -> bool {
-		clear(&kf_hits)
-		kf_keys_at(inp.x, inp.y, &kf_hits)
-		if len(kf_hits) > 0 {
-			grab := kf_hits[0]
+		clear(&keyframe_hits)
+		keyframe_keys_at(inp.x, inp.y, &keyframe_hits)
+		if len(keyframe_hits) > 0 {
+			grab := keyframe_hits[0]
 			// A press cannot tell a click from a drag, so it may not collapse a
 			// selection that the press might have been the start of DRAGGING. When
 			// the grabbed key is already part of a run, the run is the payload: the
@@ -745,9 +745,9 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			// on a key outside the selection has nothing to preserve — the user is
 			// starting a fresh selection either way — so it narrows immediately, and
 			// a drag from it moves the key it grabbed rather than the old run.
-			narrow_click := kf_sel_contains(grab)
+			narrow_click := keyframe_sel_contains(grab)
 			if !narrow_click {
-				kf_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+				keyframe_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
 			}
 			if inp.shift {
 				// A Shift+click ON a keyframe is just a selection: it narrows to
@@ -760,42 +760,42 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				// It narrows unconditionally, including for a key that was already
 				// selected — the deferred narrow above is for the PLAIN press,
 				// whose drag has to carry the run, and there is no run to carry here.
-				kf_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
-				kf_brush_disarm()
+				keyframe_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+				keyframe_brush_disarm()
 				// The go-to-keyframe double-click is deliberately not reachable
 				// with Shift held: a Shift+click is a selection, and pairing it
 				// with the plain press next to it into a seek the user never asked
 				// for would make that plain press fire instead. Parking the record
 				// keeps a press on either side from pairing across this one.
-				kf_dbl_click.ns = 0
+				keyframe_dbl_click.ns = 0
 				return true
 			}
-			gcl, _, k, kok := kf_resolve_value(grab)
+			gcl, _, k, kok := keyframe_resolve_value(grab)
 			// A stale hit (the key vanished between the hit-test and the resolve)
 			// must read as a plain click, never as a double-click against a
 			// borrowed frame: park the record so no second press can match it.
 			now := i64(time.now()._nsec)
-			kf_frame := kok ? k.frame_off : -1
+			keyframe_frame := kok ? k.frame_off : -1
 			// A second press on the SAME key inside the double-click window is a
 			// "go to keyframe": move the playhead onto that key's frame (anchoring
 			// audio exactly like the scrub) and swallow the press so it never arms
 			// a move. The first press of the pair already selected the key.
 			if kok &&
-			   kf_dbl_click.ns != 0 &&
-			   now - kf_dbl_click.ns <= KF_DBL_CLICK_NS &&
-			   grab.track_idx == kf_dbl_click.track &&
-			   grab.clip_index == kf_dbl_click.clip &&
-			   grab.lane == kf_dbl_click.lane &&
-			   kf_frame == kf_dbl_click.frame {
+			   keyframe_dbl_click.ns != 0 &&
+			   now - keyframe_dbl_click.ns <= KF_DBL_CLICK_NS &&
+			   grab.track_idx == keyframe_dbl_click.track &&
+			   grab.clip_index == keyframe_dbl_click.clip &&
+			   grab.lane == keyframe_dbl_click.lane &&
+			   keyframe_frame == keyframe_dbl_click.frame {
 				// This press is a seek, not a selection, and it arms no move — so
 				// the deferred narrow will never be reached. Settle it here or a
 				// double-click on a key inside a run would leave the whole run
 				// selected, which is the one case the deferral above changed.
 				if narrow_click {
-					kf_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
+					keyframe_select(grab.track_idx, grab.clip_index, grab.lane, grab.key)
 				}
 				f := clamp(
-					gcl.timeline_start_frame + i64(kf_frame),
+					gcl.timeline_start_frame + i64(keyframe_frame),
 					0,
 					max(0, timeline_duration() - 1),
 				)
@@ -803,14 +803,14 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				audio_seek(f)
 				sync.atomic_store(&audio_rpt.ph_src, 1)
 				sync.atomic_store(&audio_rpt.ph_catch, 0)
-				kf_dbl_click.ns = now
+				keyframe_dbl_click.ns = now
 				return true
 			}
-			kf_dbl_click.ns = now
-			kf_dbl_click.track = grab.track_idx
-			kf_dbl_click.clip = grab.clip_index
-			kf_dbl_click.lane = grab.lane
-			kf_dbl_click.frame = kf_frame
+			keyframe_dbl_click.ns = now
+			keyframe_dbl_click.track = grab.track_idx
+			keyframe_dbl_click.clip = grab.clip_index
+			keyframe_dbl_click.lane = grab.lane
+			keyframe_dbl_click.frame = keyframe_frame
 			// The same press that selects ALSO arms the horizontal move gesture
 			// (S4). A drag is only distinguishable from a click at release, so
 			// arming here with a capture at press + a release-time compare is the
@@ -824,7 +824,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			// brush or by a Shift+click pair). The gesture itself only records
 			// how far the cursor travels from press_frame; the keys themselves
 			// are never written until the release (update_keyframe_drag paints
-			// the preview, kf_move holds the only record of where they started).
+			// the preview, keyframe_move holds the only record of where they started).
 			// An off-center grab therefore keeps its pivot for free: every key
 			// translates by the cursor's own travel.
 			//
@@ -832,11 +832,11 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 			// — when the grab was already selected, the run it captured IS the
 			// payload, and narrowing it here is precisely the bug.
 			if kok {
-				kf_capture_sel(&kf_move.snaps)
-				kf_move.delta = 0
-				kf_move.engaged = false
-				kf_move.narrow_click = narrow_click
-				kf_move.press_x = inp.x
+				keyframe_capture_sel(&keyframe_move.snaps)
+				keyframe_move.delta = 0
+				keyframe_move.engaged = false
+				keyframe_move.narrow_click = narrow_click
+				keyframe_move.press_x = inp.x
 				// The anchor is the key the pointer is ON, not the first
 				// captured one: a capture is ordered by the selection, and the
 				// key the cursor grabbed is the one whose pivot the drag
@@ -844,10 +844,10 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				// (the deferral above) or a brush built a set spanning two
 				// clips — in both cases element zero can name a different clip than
 				// the cursor, whose wrap box would then be the wrong zoom and pan.
-				kf_move.anchor = grab
+				keyframe_move.anchor = grab
 				box :=
 					clay.GetElementData(clay.ID("TimelineClipWrap", u32(grab.track_idx * 1000 + grab.clip_index))).boundingBox
-				kf_move.press_frame = (inp.x - box.x) / timeline_view.zoom
+				keyframe_move.press_frame = (inp.x - box.x) / timeline_view.zoom
 			}
 			undo_begin()
 			active_interaction = .Keyframe_Move
@@ -867,7 +867,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				// Pressing a tile replaces any keyframe selection (S3: the
 				// two are mutually exclusive), both for the plain-click
 				// reselect and for a Shift+click multi-toggle.
-				kf_clear()
+				keyframe_clear()
 
 					if inp.shift {
 					// Shift+click toggles the clip and its whole LINK GROUP into/out
@@ -971,7 +971,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 		if !inp.shift || !clay.PointerOver(clay.ID("TrackArea")) {
 			return false
 		}
-		kf_brush_arm()
+		keyframe_brush_arm()
 		return true
 	},
 }
@@ -1108,7 +1108,7 @@ drag_move_in_place :: proc(frame: f32) {
 //
 // It is a PREVIEW, not a write: the whole gesture is the frame delta the cursor
 // has travelled from the press, and draw_keyframes paints each selected key at
-// its captured start plus that delta (kf_sel_frame). Nothing touches the store
+// its captured start plus that delta (keyframe_sel_frame). Nothing touches the store
 // until the release, so the key arrays stay sorted and unique for the duration
 // and the release's del + set is a real normalization instead of a repair of an
 // array the drag had scrambled. That is what lets more than one key move
@@ -1122,28 +1122,28 @@ drag_move_in_place :: proc(frame: f32) {
 // move only engages once the cursor travels KF_DRAG_THRESHOLD_PX from the press,
 // so a click (even one landing off-center) never nudges a key.
 update_keyframe_drag :: proc(mx: f32) {
-	if len(kf_move.snaps) == 0 {
+	if len(keyframe_move.snaps) == 0 {
 		return
 	}
-	if abs(mx - kf_move.press_x) < KF_DRAG_THRESHOLD_PX {
+	if abs(mx - keyframe_move.press_x) < KF_DRAG_THRESHOLD_PX {
 		return
 	}
 	// Latch the moment the gesture becomes a drag. The release needs this to tell
 	// a click (narrow the selection) from a drag (move it), and delta alone can't:
 	// a drag that ends where it started, or one that only pushes keys into a
 	// clamp, leaves delta at or near zero.
-	kf_move.engaged = true
+	keyframe_move.engaged = true
 	// The frame mapping comes from the GRABBED key's clip — the only one whose
 	// box the press measured, and the one whose wrap the cursor is over. Read
-	// kf_move.anchor, not snaps[0]: a Shift-union set spanning two clips is
+	// keyframe_move.anchor, not snaps[0]: a Shift-union set spanning two clips is
 	// ordered by the older selection, so snaps[0] can name a different clip and
 	// would apply that clip's box to a cursor that never touched it.
-	box := clay.GetElementData(clay.ID("TimelineClipWrap", u32(kf_move.anchor.track_idx * 1000 + kf_move.anchor.clip_index))).boundingBox
+	box := clay.GetElementData(clay.ID("TimelineClipWrap", u32(keyframe_move.anchor.track_idx * 1000 + keyframe_move.anchor.clip_index))).boundingBox
 	if box.width <= 0 {
 		return
 	}
 	cursor_frame := (mx - box.x) / timeline_view.zoom
-	kf_move.delta = i32(math.round(cursor_frame - kf_move.press_frame))
+	keyframe_move.delta = i32(math.round(cursor_frame - keyframe_move.press_frame))
 }
 
 // commit_keyframe_drag is the Keyframe_Move release path. Every selected key
@@ -1159,7 +1159,7 @@ update_keyframe_drag :: proc(mx: f32) {
 // every array comes back sorted and unique from wherever the drag landed. ALL
 // the deletes run before ANY of the sets: two keys on one lane can trade
 // frames, and a set landing on a frame another key has not vacated yet is
-// swallowed by kf_set_key's same-frame replace — that key would silently vanish
+// swallowed by keyframe_set_key's same-frame replace — that key would silently vanish
 // instead of moving.
 //
 // Packed (section) keys re-land in the form they came from, not folded: their
@@ -1169,7 +1169,7 @@ update_keyframe_drag :: proc(mx: f32) {
 // of it may exist (the mutual-exclusion invariant, asserted both ends to catch
 // a drifted store).
 commit_keyframe_drag :: proc() {
-	if len(kf_move.snaps) == 0 {
+	if len(keyframe_move.snaps) == 0 {
 		return
 	}
 	// A press that never slid is a CLICK, and the whole point of the deferral at
@@ -1177,20 +1177,20 @@ commit_keyframe_drag :: proc() {
 	// pointer actually grabbed, leaving a run alone until the user commits to
 	// clicking. Resolved through the anchor rather than the capture, so a stale
 	// or empty selection cannot make this a no-op that looks like it worked.
-	if !kf_move.engaged {
-		if kf_move.narrow_click {
-			a := kf_move.anchor
-			kf_select(a.track_idx, a.clip_index, a.lane, a.key)
+	if !keyframe_move.engaged {
+		if keyframe_move.narrow_click {
+			a := keyframe_move.anchor
+			keyframe_select(a.track_idx, a.clip_index, a.lane, a.key)
 		}
 		return
 	}
 	// Resolve every destination BEFORE the first store op, both because the ops
-	// slide the key arrays underneath us and because kf_moved_frame needs the
+	// slide the key arrays underneath us and because keyframe_moved_frame needs the
 	// live clip lengths — and because the per-key compare is what decides
 	// whether this was a move at all.
 	moved := false
-	for &s in kf_move.snaps {
-		s.final = kf_moved_frame(s, kf_move.delta)
+	for &s in keyframe_move.snaps {
+		s.final = keyframe_moved_frame(s, keyframe_move.delta)
 		if s.final != s.start {
 			moved = true
 		}
@@ -1203,32 +1203,32 @@ commit_keyframe_drag :: proc() {
 	}
 	// Phase 1: delete every key at its captured start frame. ALL deletes run
 	// before ANY set (see the header).
-	for s in kf_move.snaps {
-		cl, ok := kf_clip_at(s.ref.track_idx, s.ref.clip_index)
+	for s in keyframe_move.snaps {
+		cl, ok := keyframe_clip_at(s.ref.track_idx, s.ref.clip_index)
 		if !ok {
 			continue
 		}
-		kf_del_key(cl, s.name, s.start)
+		keyframe_del_key(cl, s.name, s.start)
 	}
 	// Phase 2: re-land each key at its destination, form-preserving.
-	for s in kf_move.snaps {
-		cl, ok := kf_clip_at(s.ref.track_idx, s.ref.clip_index)
+	for s in keyframe_move.snaps {
+		cl, ok := keyframe_clip_at(s.ref.track_idx, s.ref.clip_index)
 		if !ok {
 			continue
 		}
 		if s.mask != 0 {
-			sec_idx, is_sec := kf_geom_section_index(s.name)
+			sec_idx, is_sec := keyframe_geom_section_index(s.name)
 			assert(is_sec, "a packed section key drag must source a section track name")
-			sdefs := kf_geom_sections
+			sdefs := keyframe_geom_sections
 			for lane_prop in sdefs[sec_idx].lanes {
 				assert(
-					kf_track_index(cl^, kf_lane_name(lane_prop)) < 0,
+					keyframe_track_index(cl^, keyframe_lane_name(lane_prop)) < 0,
 					"a packed section and its lanes may not coexist during a drag re-land",
 				)
 			}
-			kf_set_packed_key(cl, s.name, s.final, s.value, s.mask)
+			keyframe_set_packed_key(cl, s.name, s.final, s.value, s.mask)
 		} else {
-			kf_geom_set_lane_key(cl, s.name, s.final, s.value[0])
+			keyframe_geom_set_lane_key(cl, s.name, s.final, s.value[0])
 		}
 	}
 	// Phase 3: re-stamp each key's easing and rebuild the selection, both under
@@ -1238,14 +1238,14 @@ commit_keyframe_drag :: proc() {
 	// selection survives the store ops: the lane index can shift if a track
 	// emptied and re-minted, and those ops bumped the gen, which invalidates the
 	// selection as it stood.
-	picked := make([dynamic]Kf_Ref)
+	picked := make([dynamic]Keyframe_Ref)
 	defer delete(picked)
-	for s in kf_move.snaps {
-		cl, ok := kf_clip_at(s.ref.track_idx, s.ref.clip_index)
+	for s in keyframe_move.snaps {
+		cl, ok := keyframe_clip_at(s.ref.track_idx, s.ref.clip_index)
 		if !ok {
 			continue
 		}
-		li := kf_track_index(cl^, s.name)
+		li := keyframe_track_index(cl^, s.name)
 		if li < 0 {
 			continue
 		}
@@ -1256,7 +1256,7 @@ commit_keyframe_drag :: proc() {
 			v := session_kf_view(keys^)
 			if v[ki].frame_off == s.final {
 				vm := session_kf_view_mut(keys^); vm[ki].interp = s.interp
-				append(&picked, Kf_Ref{s.ref.track_idx, s.ref.clip_index, li, ki})
+				append(&picked, Keyframe_Ref{s.ref.track_idx, s.ref.clip_index, li, ki})
 				break
 			}
 		}
@@ -1264,8 +1264,8 @@ commit_keyframe_drag :: proc() {
 	if len(picked) > 0 {
 		// Replacing rather than adding: the ops above bumped the gen, so the old
 		// set is stale and must not be carried forward on top of the new one.
-		kf_clear()
-		kf_select_add(picked[:])
+		keyframe_clear()
+		keyframe_select_add(picked[:])
 	}
 	undo_push(.Value, "Move keyframe")
 }
@@ -1323,7 +1323,7 @@ if inp.left && !prev_mouse_down {
 	// to disarm it, and the one that forgot would leave the timeline silently
 	// painting selections for the rest of the session.
 	if !inp.shift {
-		kf_brush_disarm()
+		keyframe_brush_disarm()
 	}
 	if !dispatch_click_table(inp) {
 		if clay.PointerOver(clay.ID("DividerHandle")) {
@@ -1554,17 +1554,17 @@ interaction_release :: proc(inp: Mouse_Input) {
 	clip_move.clip = nil
 	gain_drag.clip = nil
 	opacity_drag.clip = nil
-	kf_move.press_x = 0
-	kf_move.press_frame = 0
-	kf_move.delta = 0
-	kf_move.anchor = {}
+	keyframe_move.press_x = 0
+	keyframe_move.press_frame = 0
+	keyframe_move.delta = 0
+	keyframe_move.anchor = {}
 	// Drop the captures, but keep the LIST's buffer: the gesture is re-armed on
 	// the next diamond press and a realloc per drag is churn the ownership
-	// rules forbid. The entries are NOT plain values though — each Kf_Snap owns
+	// rules forbid. The entries are NOT plain values though — each Keyframe_Snap owns
 	// a cloned track name — so this is not a bare clear(). A bare clear() would
 	// zero the rows and hand back the memory the names point at, losing one
 	// track-name string per selected key per drag.
-	kf_snaps_drop(&kf_move.snaps)
+	keyframe_snaps_drop(&keyframe_move.snaps)
 	clip_move.source_track = -1
 	clip_move.source_index = -1
 	clip_move.hover_track = -1
@@ -1587,8 +1587,8 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 	// The keyframe brush runs BEFORE the gesture switch, not as one of its
 	// cases: it has no button to hold and no active_interaction to own, and it
 	// keeps working across the presses that would otherwise replace that state.
-	if kf_brush_armed {
-		kf_brush_paint(inp.x, inp.y)
+	if keyframe_brush_armed {
+		keyframe_brush_paint(inp.x, inp.y)
 	}
 	switch active_interaction {
 	case .Media_Bin_Drag:
@@ -2049,33 +2049,33 @@ interaction_interp_click :: proc(was_click: bool) {
 // mode is a property of the key rather than of its lane, so one pick covers a
 // selection spanning any number of tracks, lanes and clips. One undoable edit
 // for the whole set; an unchanged re-click only closes the menu.
-if was_click && kf_sel_active() {
-	if clay.PointerOver(clay.ID("KfInterpButton")) {
-		kf_view.interp_menu_open = !kf_view.interp_menu_open
-	} else if kf_view.interp_menu_open && clay.PointerOver(clay.ID("KfInterpMenu")) {
-		choice: Kf_Interp
+if was_click && keyframe_sel_active() {
+	if clay.PointerOver(clay.ID("KeyframeInterpButton")) {
+		keyframe_view.interp_menu_open = !keyframe_view.interp_menu_open
+	} else if keyframe_view.interp_menu_open && clay.PointerOver(clay.ID("KeyframeInterpMenu")) {
+		choice: Keyframe_Interp
 		hit := true
-		if clay.PointerOver(clay.ID("KfInterpLinear")) {
+		if clay.PointerOver(clay.ID("KeyframeInterpLinear")) {
 			choice = .Linear
-		} else if clay.PointerOver(clay.ID("KfInterpCubic")) {
+		} else if clay.PointerOver(clay.ID("KeyframeInterpCubic")) {
 			choice = .Cubic
-		} else if clay.PointerOver(clay.ID("KfInterpEaseIn")) {
+		} else if clay.PointerOver(clay.ID("KeyframeInterpEaseIn")) {
 			choice = .Ease_In
-		} else if clay.PointerOver(clay.ID("KfInterpEaseOut")) {
+		} else if clay.PointerOver(clay.ID("KeyframeInterpEaseOut")) {
 			choice = .Ease_Out
-		} else if clay.PointerOver(clay.ID("KfInterpEaseInOut")) {
+		} else if clay.PointerOver(clay.ID("KeyframeInterpEaseInOut")) {
 			choice = .Ease_In_Out
-		} else if clay.PointerOver(clay.ID("KfInterpElastic")) {
+		} else if clay.PointerOver(clay.ID("KeyframeInterpElastic")) {
 			choice = .Elastic
 		} else {
 			hit = false
 		}
 		if hit {
-			kf_set_interp_all(choice)
-			kf_view.interp_menu_open = false
+			keyframe_set_interp_all(choice)
+			keyframe_view.interp_menu_open = false
 		}
-	} else if kf_view.interp_menu_open {
-		kf_view.interp_menu_open = false
+	} else if keyframe_view.interp_menu_open {
+		keyframe_view.interp_menu_open = false
 	}
 }
 }

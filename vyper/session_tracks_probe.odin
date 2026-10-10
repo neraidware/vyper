@@ -31,10 +31,10 @@ when ODIN_DEBUG {
 		// A copied Clip starts by sharing its track range. First track mutation
 		// duplicates rows and marks key ranges shared; first key mutation then
 		// duplicates key payload, leaving original untouched.
-		keys := Kf_Keys_Range{}
+		keys := Keyframe_Keys_Range{}
 		session_kf_push(&keys, Keyframe{frame_off=10, value=1.0})
-		source := Kf_Track_Range{}
-		session_trk_push(&source, Kf_Track{name=session_str_intern("probe"), keys=keys})
+		source := Keyframe_Track_Range{}
+		session_trk_push(&source, Keyframe_Track{name=session_str_intern("probe"), keys=keys})
 		copy := session_trk_share(&source)
 		session_trk_check(source.shared && copy.shared && source.first == copy.first,
 			"copy shares initial track span")
@@ -52,13 +52,13 @@ when ODIN_DEBUG {
 
 		// Freed exclusive track blocks are reusable and coalesce; this keeps edits
 		// from turning the session-lifetime arena into a bump-only allocation leak.
-		block := Kf_Track_Range{}
-		session_trk_push(&block, Kf_Track{})
-		session_trk_push(&block, Kf_Track{})
+		block := Keyframe_Track_Range{}
+		session_trk_push(&block, Keyframe_Track{})
+		session_trk_push(&block, Keyframe_Track{})
 		off, slots := block.first, block.slots
 		session_trk_release_range(block)
-		reused := Kf_Track_Range{}
-		session_trk_push(&reused, Kf_Track{})
+		reused := Keyframe_Track_Range{}
+		session_trk_push(&reused, Keyframe_Track{})
 		session_trk_check(reused.first == off && reused.slots <= slots,
 			"freed track block reused at %d (got %d)", off, reused.first)
 		session_trk_release_range(reused)

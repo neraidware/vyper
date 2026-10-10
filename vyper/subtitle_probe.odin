@@ -135,8 +135,8 @@ when ODIN_DEBUG {
 			// Park the resting scale far from the sampled one so a bake taken from
 			// the resting field is unmistakable rather than a rounding difference.
 			kclip.scale = 1.0
-			kf_geom_set_lane_key(kclip, render_geom_name(Render_Geom_Prop.Scale), 0, 4.0)
-			kf_geom_set_lane_key(kclip, render_geom_name(Render_Geom_Prop.Scale), 40, 4.0)
+			keyframe_geom_set_lane_key(kclip, render_geom_name(Render_Geom_Prop.Scale), 0, 4.0)
+			keyframe_geom_set_lane_key(kclip, render_geom_name(Render_Geom_Prop.Scale), 40, 4.0)
 			kslot := new(Preview_Slot)
 			keyed_font := f32(0)
 			keyed_sampled := f32(0)

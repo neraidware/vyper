@@ -229,44 +229,44 @@ when ODIN_DEBUG {
 		// above because it ends with the keyframe selected (the two never coexist).
 		undo_init()
 		clip0 := &timeline.tracks[0].clips[0]
-		kf_geom_set_lane_key(clip0, "transform.x", 5, 100.0)
-		kf_geom_set_lane_key(clip0, "transform.x", 20, 50.0)
+		keyframe_geom_set_lane_key(clip0, "transform.x", 5, 100.0)
+		keyframe_geom_set_lane_key(clip0, "transform.x", 20, 50.0)
 		selection.track = 0
 		selection.index = 0
-		kf_select(0, 0, 0, 0)
+		keyframe_select(0, 0, 0, 0, 0)
 		rcheck(
 			selection.track == -1 && selection.index == -1 && len(selection.extra_set) == 0,
 			"keyframe selection clears the clip selection",
 			fail,
 		)
 		rcheck(
-			kf_sel_count() == 1 && kf_sel_contains(Kf_Ref{0, 0, 0, 0}),
+			keyframe_sel_count() == 1 && keyframe_sel_contains(Keyframe_Ref{0, 0, 0, 0, 0}),
 			"keyframe selection recorded",
 			fail,
 		)
-		if kcl, klane, k, kok := kf_selected(); kok {
+		if kcl, klane, k, kok := keyframe_selected(); kok {
 			rcheck(
 				kcl == clip0 && klane == 0 && k.frame_off == 5 && k.value == 100.0,
-				"kf_selected resolves the picked key",
+				"keyframe_selected resolves the picked key",
 				fail,
 			)
 		} else {
-			rcheck(false, "kf_selected must resolve a live selection", fail)
+			rcheck(false, "keyframe_selected must resolve a live selection", fail)
 		}
 		// Back the other way: selecting a clip drops the keyframe.
 		select_clip(0, 0)
-		rcheck(!kf_sel_active(), "select_clip drops the keyframe selection", fail)
+		rcheck(!keyframe_sel_active(), "select_clip drops the keyframe selection", fail)
 
 		// A keyframe value edit commits through undo like a numeric field.
-		kf_select(0, 0, 0, 0)
-		edit_state.field = .Kf_Value
+		keyframe_select(0, 0, 0, 0, 0)
+		edit_state.field = .Keyframe_Value
 		edit_state.chars[0] = '4'
 		edit_state.chars[1] = '2'
 		edit_state.len = 2
 		edit_commit()
 		rcheck(undo_count() == 1, "keyframe value edit adds one node", fail)
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 42.0,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).value == 42.0,
 			"keyframe value edit applied",
 			fail,
 		)
@@ -275,15 +275,15 @@ when ODIN_DEBUG {
 		// touching it (the captured pointer dangles into the freed tree).
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 100.0,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).value == 100.0,
 			"undo restores pre-edit keyframe value",
 			fail,
 		)
-		rcheck(!kf_sel_active(), "undo restore drops the keyframe selection (indices don't survive)", fail)
+		rcheck(!keyframe_sel_active(), "undo restore drops the keyframe selection (indices don't survive)", fail)
 		undo_redo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 42.0,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).value == 42.0,
 			"redo restores edited keyframe value",
 			fail,
 		)
@@ -294,25 +294,25 @@ when ODIN_DEBUG {
 		// zero value) — editing TO a non-default mode makes the round trip verify
 		// a real transition in both directions.
 		undo_begin()
-		kf_key_mut(clip0, 0, 1).interp = .Ease_In_Out
+		keyframe_key_mut(clip0, 0, 0, 1).interp = .Ease_In_Out
 		undo_push(.Value, "Set keyframe interpolation")
 		rcheck(undo_count() == 2, "interpolation edit adds one undo node", fail)
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Ease_In_Out,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Ease_In_Out,
 			"interpolation edit applied",
 			fail,
 		)
 		undo_undo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Cubic,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Cubic,
 			"undo restores the mode the key had before the edit (default .Cubic)",
 			fail,
 		)
 		undo_redo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Ease_In_Out,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Ease_In_Out,
 			"redo restores edited interpolation mode",
 			fail,
 		)
@@ -320,20 +320,20 @@ when ODIN_DEBUG {
 		// A store edit that slides keys must invalidate the selection: inserting a
 		// key before the picked one moves the picked key's slot, so resolving the
 		// OLD indices would alias the newly inserted key.
-		kf_select(0, 0, 0, 0)
-		kf_geom_set_lane_key(clip0, "transform.x", 1, 60.0)
-		_, _, _, stale_ok := kf_selected()
+		keyframe_select(0, 0, 0, 0, 0)
+		keyframe_geom_set_lane_key(clip0, "transform.x", 1, 60.0)
+		_, _, _, stale_ok := keyframe_selected()
 		rcheck(!stale_ok, "insert before the selected key kills the selection (structure gen)", fail)
 
 		// --- S4: add / move / delete round-trips + the no-op click --------------
-		// Shift+click (kf_add_prop) mints a row at the playhead with the field's
+		// Shift+click (keyframe_add_prop) mints a row at the playhead with the field's
 		// value; a diamond drag commits ONE move node only when the key actually
 		// slid (the no-move click leaves state untouched — the clip-stutter rule);
 		// Delete drops the key and, with it, the now-empty track's row. Fresh base
 		// first; the timeline survives from the sections above (clip 0 at start
 		// frame 10, length 50, one transform.x track from S3).
 		undo_init()
-		kf_clear()
+		keyframe_clear()
 		select_clip(0, 0)
 		// The earlier m2 test left the clip parked at start 99; pin it back to the
 		// canonical 10 for this section so the playhead math below is exact.
@@ -350,12 +350,12 @@ when ODIN_DEBUG {
 		// as a bug in the block under test rather than as a dirty fixture. The one
 		// exception is the interp block, which round-trips through undo_undo on
 		// purpose: that IS what it is testing.
-	// kf_probe_commit_move arms the drag latch and commits a keyframe move of `delta`.
+	// keyframe_probe_commit_move arms the drag latch and commits a keyframe move of `delta`.
 	//
 	// The latch is the whole point of this helper. `commit_keyframe_drag` returns
-	// immediately when `kf_move.engaged` is false, and the only thing that sets it is
+	// immediately when `keyframe_move.engaged` is false, and the only thing that sets it is
 	// `update_keyframe_drag`, once the cursor passes KF_DRAG_THRESHOLD_PX from the press.
-	// A probe that sets `kf_move.delta` and calls the commit directly therefore does
+	// A probe that sets `keyframe_move.delta` and calls the commit directly therefore does
 	// NOTHING -- and reports six failures that all read like engine bugs.
 	//
 	// Measured before this helper existed: undo_count()=0, all four snaps start==final,
@@ -369,9 +369,9 @@ when ODIN_DEBUG {
 	// helper covers the COMMIT (the two-phase delete-then-set re-land, the easing
 	// re-stamp, the selection rebuild, the single undo node); the press/drag half,
 	// including the frame mapping in `update_keyframe_drag`, has no coverage at all.
-	kf_probe_commit_move :: proc(delta: i32) {
-		kf_move.delta = delta
-		kf_move.engaged = true
+	keyframe_probe_commit_move :: proc(delta: i32) {
+		keyframe_move.delta = delta
+		keyframe_move.engaged = true
 		commit_keyframe_drag()
 	}
 
@@ -385,89 +385,89 @@ when ODIN_DEBUG {
 				if !tr.keys.shared { session_kf_release(tr.keys) }
 			}
 			session_trk_release_range(cl.keyframe_tracks)
-			cl.keyframe_tracks = Kf_Track_Range{}
-			session_trk_push(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("transform.x")})
-			session_trk_push(&cl.keyframe_tracks, Kf_Track{name = session_str_intern("scale")})
-			kf_geom_set_lane_key(cl, "transform.x", 10, 1.0)
-			kf_geom_set_lane_key(cl, "transform.x", 20, 2.0)
-			kf_geom_set_lane_key(cl, "scale", 5, 1.0)
+			cl.keyframe_tracks = Keyframe_Track_Range{}
+			session_trk_push(&cl.keyframe_tracks, Keyframe_Track{name = session_str_intern("transform.x")})
+			session_trk_push(&cl.keyframe_tracks, Keyframe_Track{name = session_str_intern("scale")})
+			keyframe_geom_set_lane_key(cl, "transform.x", 10, 1.0)
+			keyframe_geom_set_lane_key(cl, "transform.x", 20, 2.0)
+			keyframe_geom_set_lane_key(cl, "scale", 5, 1.0)
 			session_kf_at_ptr(session_trk_view(cl.keyframe_tracks,0).keys,1).interp = .Elastic
-			kf_geom_set_lane_key(cl, "transform.x", 50, 3.0)
+			keyframe_geom_set_lane_key(cl, "transform.x", 50, 3.0)
 			undo_init()
 		}
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
 
 		// The four refs of the widest selection used below, named so the blocks read
-		// as the user's action rather than as index arithmetic. kf_select_add is the
-		// Shift+click path's body; the HOVERED SET comes from kf_keys_at, which
+		// as the user's action rather than as index arithmetic. keyframe_select_add is the
+		// Shift+click path's body; the HOVERED SET comes from keyframe_keys_at, which
 		// needs a laid-out frame the probe has no run of.
-		all4 := [4]Kf_Ref{{0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 1, 0}}
-		pair := [2]Kf_Ref{{0, 0, 0, 0}, {0, 0, 0, 1}}
-		kf_select_all :: proc(refs: []Kf_Ref) {
+		all4 := [4]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 1}, {0, 0, 0, 2}, {0, 0, 1, 0}}
+		pair := [2]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 1}}
+		keyframe_select_all :: proc(refs: []Keyframe_Ref) {
 			// A press: sole selection on the first, union for the rest, then arm the
 			// move exactly as the press handler does.
-			kf_select(refs[0].track_idx, refs[0].clip_index, refs[0].lane, refs[0].key)
+			keyframe_select(refs[0].track_idx, refs[0].clip_index, refs[0].lane, refs[0].key)
 			if len(refs) > 1 {
-				kf_select_add(refs[1:])
+				keyframe_select_add(refs[1:])
 			}
 			undo_begin()
-			kf_capture_sel(&kf_move.snaps)
-			kf_move.delta = 0
+			keyframe_capture_sel(&keyframe_move.snaps)
+			keyframe_move.delta = 0
 		}
 
 		// --- union / replace / the no-half-resolve contract ----------------------
-		kf_select_all(all4[:])
-		rcheck(kf_sel_count() == 4, "shift+click builds a four-key set", fail)
+		keyframe_select_all(all4[:])
+		rcheck(keyframe_sel_count() == 4, "shift+click builds a four-key set", fail)
 		rcheck(
-			kf_sel_contains(Kf_Ref{0, 0, 0, 2}) && kf_sel_contains(Kf_Ref{0, 0, 1, 0}),
+			keyframe_sel_contains(Keyframe_Ref{0, 0, 0, 0, 2}) && keyframe_sel_contains(Keyframe_Ref{0, 0, 1, 0, 0}),
 			"every added key is in the set, across both lanes",
 			fail,
 		)
-		kf_select_add(all4[1:2])
-		rcheck(kf_sel_count() == 4, "adding an already-selected key is a no-op (no duplicate)", fail)
-		_, _, _, multi_one := kf_selected()
-		rcheck(!multi_one, "kf_selected refuses a multi-selection (no half-resolve to key[0])", fail)
+		keyframe_select_add(all4[1:2])
+		rcheck(keyframe_sel_count() == 4, "adding an already-selected key is a no-op (no duplicate)", fail)
+		_, _, _, multi_one := keyframe_selected()
+		rcheck(!multi_one, "keyframe_selected refuses a multi-selection (no half-resolve to key[0])", fail)
 		rcheck(
 			selection.track == -1 && selection.index == -1,
 			"the keyframe set still owns S3 exclusivity from the clip selection",
 			fail,
 		)
-		kf_select(0, 0, 0, 1)
-		rcheck(kf_sel_count() == 1, "a plain press replaces the whole set", fail)
-		rcheck(kf_sel_contains(Kf_Ref{0, 0, 0, 1}), "and the pressed key is the one it left selected", fail)
-		kf_snaps_drop(&kf_move.snaps)
+		keyframe_select(0, 0, 0, 0, 1)
+		rcheck(keyframe_sel_count() == 1, "a plain press replaces the whole set", fail)
+		rcheck(keyframe_sel_contains(Keyframe_Ref{0, 0, 0, 0, 1}), "and the pressed key is the one it left selected", fail)
+		keyframe_snaps_drop(&keyframe_move.snaps)
 
 		// --- the shared-property editor ------------------------------------------
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
-		kf_select_all(all4[:])
-		interp, mixed, seen := kf_sel_interp()
+		keyframe_select_all(all4[:])
+		interp, mixed, seen := keyframe_sel_interp()
 		rcheck(seen, "the aggregate saw the selection", fail)
 		rcheck(mixed, "keys that disagree aggregate as mixed", fail)
 		rcheck(interp == .Cubic, "the mixed aggregate reports the first key's mode (meaningless)", fail)
 		// One lane -> the name is a shared header. Two lanes -> it is not, because a
 		// track name is a var identity and not a property.
-		_, same := kf_sel_same_lane()
+		_, same := keyframe_sel_same_lane()
 		rcheck(!same, "a set spanning two lanes has no shared name", fail)
-		lo, hi := kf_sel_frame_span()
+		lo, hi := keyframe_sel_frame_span()
 		rcheck(lo == 15 && hi == 60, "the absolute frame span covers the whole set", fail)
 
-		changed := kf_set_interp_all(.Ease_Out)
+		changed := keyframe_set_interp_all(.Ease_Out)
 		rcheck(changed, "the pick reported a change", fail)
 		rcheck(undo_count() == 1, "one interp pick on four keys is ONE undo node", fail)
 		all_ease := true
-		for item in kf_sel.items {
-			_, _, k, kok := kf_resolve_value(item)
+		for item in keyframe_sel.items {
+			_, _, k, kok := keyframe_resolve_value(item)
 			all_ease = all_ease && kok && k.interp == .Ease_Out
 		}
 		rcheck(all_ease, "the pick wrote every selected key", fail)
-		interp2, mixed2, _ := kf_sel_interp()
+		interp2, mixed2, _ := keyframe_sel_interp()
 		rcheck(!mixed2 && interp2 == .Ease_Out, "a set that now agrees aggregates as shared", fail)
 		// Re-picking the mode already in use changes nothing and adds no node.
 		undo_count_before := undo_count()
 		rcheck(
-			!kf_set_interp_all(.Ease_Out),
+			!keyframe_set_interp_all(.Ease_Out),
 			"re-picking the current mode reports no change",
 			fail,
 		)
@@ -476,15 +476,15 @@ when ODIN_DEBUG {
 		undo_undo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Elastic &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).interp == .Cubic,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Elastic &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).interp == .Cubic,
 			"undo restores the per-key modes the set had before the pick",
 			fail,
 		)
 		undo_redo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).interp == .Ease_Out,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).interp == .Ease_Out,
 			"redo re-applies the mode to the whole set",
 			fail,
 		)
@@ -499,24 +499,24 @@ when ODIN_DEBUG {
 		// is per key.
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
-		kf_select_all(all4[:])
-		kf_probe_commit_move(3)
+		keyframe_select_all(all4[:])
+		keyframe_probe_commit_move(3)
 		rcheck(undo_count() == 1, "moving four keys is ONE undo node", fail)
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 13 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 23 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,2).frame_off == 50 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,1)^.keys,0).frame_off == 8,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).frame_off == 13 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).frame_off == 23 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),2).frame_off == 50 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,1), 0),0).frame_off == 8,
 			"every key slid by the same delta, each clamped into its own clip",
 			fail,
 		)
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).interp == .Elastic,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Elastic,
 			"a move preserves the key's interpolation (the insert path would zero it)",
 			fail,
 		)
-		rcheck(kf_sel_count() == 4, "the whole set is re-selected after the move", fail)
+		rcheck(keyframe_sel_count() == 4, "the whole set is re-selected after the move", fail)
 		sorted_ok := true
 		for lane in 0 ..< clip0.keyframe_tracks.n {
 			keys := session_trk_view(clip0.keyframe_tracks,lane).keys
@@ -526,13 +526,13 @@ when ODIN_DEBUG {
 			}
 		}
 		rcheck(sorted_ok, "every lane comes back sorted and frame-unique", fail)
-		kf_snaps_drop(&kf_move.snaps)
+		keyframe_snaps_drop(&keyframe_move.snaps)
 		undo_undo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 10 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 20 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,1)^.keys,0).frame_off == 5,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).frame_off == 10 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).frame_off == 20 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,1), 0),0).frame_off == 5,
 			"undo restores all four frames",
 			fail,
 		)
@@ -546,28 +546,28 @@ when ODIN_DEBUG {
 		// would then remove it — the key at 10 would vanish, value and all.
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
-		kf_select_all(pair[:])
-		kf_probe_commit_move(10)
+		keyframe_select_all(pair[:])
+		keyframe_probe_commit_move(10)
 		clip0 = &timeline.tracks[0].clips[0]
 		// The unselected key at 50 is untouched, so the lane is [20, 30, 50].
 		rcheck(
-			session_trk_view(clip0.keyframe_tracks,0)^.keys.n == 3,
+			keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0).n == 3,
 			"a key sliding onto a vacated frame moves both keys, not one",
 			fail,
 		)
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 20 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 1.0,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).frame_off == 20 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).value == 1.0,
 			"the slid key re-landed on the vacated frame WITH ITS OWN VALUE",
 			fail,
 		)
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 30 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).value == 2.0,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).frame_off == 30 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).value == 2.0,
 			"and the key it displaced moved on carrying its own value",
 			fail,
 		)
-		kf_snaps_drop(&kf_move.snaps)
+		keyframe_snaps_drop(&keyframe_move.snaps)
 		undo_init()
 		clip0 = &timeline.tracks[0].clips[0]
 
@@ -578,54 +578,54 @@ when ODIN_DEBUG {
 		// selection moves the others and does commit.
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
-		kf_select(0, 0, 0, 2)
+		keyframe_select(0, 0, 0, 0, 2)
 		undo_begin()
-		kf_capture_sel(&kf_move.snaps)
-		kf_probe_commit_move(10)
+		keyframe_capture_sel(&keyframe_move.snaps)
+		keyframe_probe_commit_move(10)
 		rcheck(undo_count() == 0, "a drag whose every key clamps back commits no undo node", fail)
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,2).frame_off == 50,
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),2).frame_off == 50,
 			"the clamped key stayed where it was",
 			fail,
 		)
-		kf_snaps_drop(&kf_move.snaps)
-		wide_clamp := [2]Kf_Ref{{0, 0, 0, 0}, {0, 0, 0, 2}}
-		kf_select_all(wide_clamp[:])
-		kf_probe_commit_move(10)
+		keyframe_snaps_drop(&keyframe_move.snaps)
+		wide_clamp := [2]Keyframe_Ref{{0, 0, 0, 0, 0}, {0, 0, 0, 2}}
+		keyframe_select_all(wide_clamp[:])
+		keyframe_probe_commit_move(10)
 		rcheck(undo_count() == 1, "the same delta over a wider selection DOES commit", fail)
 		clip0 = &timeline.tracks[0].clips[0]
 		// The clamped key held 50; the sliding key went 10 -> 20, where an UNSELECTED
-		// key already sat. That one is absorbed: kf_set_key replaces a key already on
+		// key already sat. That one is absorbed: keyframe_set_key replaces a key already on
 		// the frame, so the mover's value wins. This is the mirror of the trade case
 		// above (landing on a VACATED frame is a clean move, landing on an OCCUPIED
 		// one is a replace) and it is pre-existing store semantics, but a multi-move
 		// makes it reachable by dragging over keys the user did not pick, so it is
 		// pinned here rather than left to be discovered as silent key loss.
 		rcheck(
-			session_trk_view(clip0.keyframe_tracks,0)^.keys.n == 2 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).frame_off == 20 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,0).value == 1.0 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).frame_off == 50 &&
-				session_kf_at(session_trk_view(clip0.keyframe_tracks,0)^.keys,1).value == 3.0,
+			keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0).n == 2 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).frame_off == 20 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).value == 1.0 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).frame_off == 50 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).value == 3.0,
 			"the clamped key held its frame, the other slid, and the unselected key it landed on was absorbed",
 			fail,
 		)
-		kf_snaps_drop(&kf_move.snaps)
+		keyframe_snaps_drop(&keyframe_move.snaps)
 
 		// --- one store op invalidates the WHOLE set -----------------------------
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
-		kf_select_all(all4[:])
-		rcheck(kf_sel_count() == 4, "four keys selected before the sliding insert", fail)
-		kf_geom_set_lane_key(clip0, "transform.x", 1, 60.0)
+		keyframe_select_all(all4[:])
+		rcheck(keyframe_sel_count() == 4, "four keys selected before the sliding insert", fail)
+		keyframe_geom_set_lane_key(clip0, "transform.x", 1, 60.0)
 		rcheck(
-			kf_sel_count() == 0,
+			keyframe_sel_count() == 0,
 			"an insert invalidates every selected key, not just the slid one",
 			fail,
 		)
 		rcheck(
-			!kf_sel_contains(Kf_Ref{0, 0, 0, 0}),
+			!keyframe_sel_contains(Keyframe_Ref{0, 0, 0, 0, 0}),
 			"a stale ref is not 'contained', so the paint cannot light it",
 			fail,
 		)
@@ -633,13 +633,13 @@ when ODIN_DEBUG {
 		// --- delete the whole set ------------------------------------------------
 		base_fixture()
 		clip0 = &timeline.tracks[0].clips[0]
-		kf_select_all(all4[:])
-		rcheck(kf_sel_count() == 4, "four keys selected for the delete", fail)
+		keyframe_select_all(all4[:])
+		rcheck(keyframe_sel_count() == 4, "four keys selected for the delete", fail)
 		undo_init()
 		del_multi := delete_selected_keyframe()
 		rcheck(del_multi, "delete_selected_keyframe fires on a multi-selection", fail)
 		rcheck(undo_count() == 1, "deleting four keys is ONE undo node", fail)
-		rcheck(!kf_sel_active(), "delete drops the whole selection", fail)
+		rcheck(!keyframe_sel_active(), "delete drops the whole selection", fail)
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
 			clip0.keyframe_tracks.n == 0,
@@ -650,17 +650,17 @@ when ODIN_DEBUG {
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
 			clip0.keyframe_tracks.n == 2 &&
-				session_trk_view(clip0.keyframe_tracks,0)^.keys.n == 3 &&
-				session_trk_view(clip0.keyframe_tracks,1)^.keys.n == 1,
+				keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0).n == 3 &&
+				keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,1), 0).n == 1,
 			"undo restores every deleted key and both dropped tracks",
 			fail,
 		)
 		undo_redo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(clip0.keyframe_tracks.n == 0, "redo deletes the whole set again", fail)
-		// A stale set must never come back as live: kf_clear keeps the buffer, so the
+		// A stale set must never come back as live: keyframe_clear keeps the buffer, so the
 		// next selection re-stamps the gen rather than inheriting the old one.
-		rcheck(!kf_sel_active(), "the selection is still clear after the redo's tree swap", fail)
+		rcheck(!keyframe_sel_active(), "the selection is still clear after the redo's tree swap", fail)
 	}
 
 	// handle_undo_probe runs the probe when VYPER_UNDO_PROBE is set (headless; runs

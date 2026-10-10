@@ -425,9 +425,9 @@ box_intersect :: proc(a, b: clay.BoundingBox) -> clay.BoundingBox {
 	return clay.BoundingBox{x = x, y = y, width = x2 - x, height = y2 - y}
 }
 
-// kf_lane_rect is the region draw_keyframes paints one track into: its clip lane,
+// keyframe_lane_rect is the region draw_keyframes paints one track into: its clip lane,
 // clipped to the track-list viewport. Empty when the track is scrolled out of view.
-kf_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
+keyframe_lane_rect :: proc(track_idx: int) -> clay.BoundingBox {
 	lane := clay.GetElementData(clay.ID("ClipsSection", u32(track_idx))).boundingBox
 	if lane.width <= 0 || lane.height <= 0 {
 		return {}
@@ -844,14 +844,14 @@ draw_clip_markers :: proc(
 	}
 }
 
-// kf_key_center maps a key to its diamond's center on screen from the clip wrap
+// keyframe_key_center maps a key to its diamond's center on screen from the clip wrap
 // box. Single source of truth for the diamond geometry, shared by draw_keyframes
 // and the click hit-test (interaction.odin) so the pickable spot always lines up
 // with the painted diamond. Lane tr hugs the tile's bottom edge (ui.odin keys
 // KeyframeLane by tr below the fixed-height tile), so y derives from the box and
 // the LANE ELEMENT's layout; cx clamps to the wrap so a key that drifted past a
 // trimmed edge paints at the edge rather than outside the row.
-kf_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32, f32) {
+keyframe_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32, f32) {
 	cy := box.y + CLIP_TILE_HEIGHT + (f32(lane) + 0.5) * KF_ROW_H
 	cx := clamp(
 		box.x + f32(frame_off) * timeline_view.zoom,
@@ -915,7 +915,7 @@ draw_keyframes :: proc(
 		// so scissoring to it alone let a row scrolled up or down paint its
 		// diamonds over the ruler strip and the panels above the timeline. Empty
 		// rect -> the track is off screen and costs no draw calls.
-		lane := kf_lane_rect(track_idx)
+		lane := keyframe_lane_rect(track_idx)
 		if lane.width <= 0 || lane.height <= 0 {
 			continue
 		}
@@ -940,15 +940,15 @@ draw_keyframes :: proc(
 				v := session_kf_view(session_trk_view(clip.keyframe_tracks,tr).keys)
 				for k_idx in 0 ..< session_trk_view(clip.keyframe_tracks,tr).keys.n {
 					k := v[k_idx]
-					// kf_sel_frame answers both questions the paint asks of
+					// keyframe_sel_frame answers both questions the paint asks of
 					// every diamond — is this key selected, and where should it
 					// be — in one scan. During a drag the frame it returns is the
 					// previewed destination, not k.frame_off: the gesture writes
 					// nothing until its release, so the store still holds where
-					// the key will be normalized FROM (see Kf_Move).
+					// the key will be normalized FROM (see Keyframe_Move).
 					frame, selected :=
-						kf_sel_frame(Kf_Ref{track_idx, index, tr, k_idx}, k.frame_off)
-					cx, cy := kf_key_center(box, tr, frame)
+						keyframe_sel_frame(Keyframe_Ref{track_idx, index, tr, k_idx}, k.frame_off)
+					cx, cy := keyframe_key_center(box, tr, frame)
 					// Cull keys scrolled out of the lane's visible range. The
 					// scissor rejects these quads anyway, but each still costs two
 					// uniform uploads and two draws, and at TIMELINE_MIN_ZOOM a
@@ -1408,7 +1408,7 @@ draw_gain_knob :: proc(
 // diamonds (same KF_DIAMOND_* look as the timeline, scaled via KF_BTN_R),
 // centered on each button's clay box. Hover lifts the fill like a selected key
 // would, a button affordance on top of the exact keyframe glyph. Empty boxes
-// (a video clip has no KfAddGain element) paint nothing. Scissored to the
+// (a video clip has no KeyframeAddGain element) paint nothing. Scissored to the
 // whole inspector column so a glyph sitting flush at a row edge can never
 // overpaint the scrollbar gutter or the column's rounded corner.
 draw_kf_add_buttons :: proc(

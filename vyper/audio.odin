@@ -1273,15 +1273,15 @@ Audio_Gain_Snapshot :: struct {
 // clip); the snapshot is what crosses to the worker threads.
 audio_gain_snapshot_from_clip :: proc(clip: ^Clip) -> (g: Audio_Gain_Snapshot, total: int) {
 	g.db = clip.gain
-	g.n, total = kf_fill_snapshot(clip, "gain", g.keys[:])
+	g.n, total = keyframe_fill_snapshot(clip, "gain", g.keys[:])
 	return
 }
 
 // audio_gain_linear evaluates a committed gain snapshot to a LINEAR amplitude
-// multiplier at clip-relative frame `rel`. Thin wrapper over kf_gain_linear so
+// multiplier at clip-relative frame `rel`. Thin wrapper over keyframe_gain_linear so
 // both mixers evaluate the same shape the same way.
 audio_gain_linear :: proc(g: ^Audio_Gain_Snapshot, rel: i32) -> f32 {
-	return kf_gain_linear(g.keys[:g.n], rel, g.db)
+	return keyframe_gain_linear(g.keys[:g.n], rel, g.db)
 }
 
 // Audio_Pitch_Snapshot is a clip's pitch, committed: a static semitone offset plus
@@ -1303,7 +1303,7 @@ Audio_Pitch_Snapshot :: struct {
 // track's REAL key count so the caller can log truncation.
 audio_pitch_snapshot_from_clip :: proc(clip: ^Clip) -> (p: Audio_Pitch_Snapshot, total: int) {
 	p.semitones = clip.pitch
-	p.n, total = kf_fill_snapshot(clip, "pitch", p.keys[:])
+	p.n, total = keyframe_fill_snapshot(clip, "pitch", p.keys[:])
 	return
 }
 
@@ -1315,12 +1315,12 @@ audio_pitch_snapshot_from_clip :: proc(clip: ^Clip) -> (p: Audio_Pitch_Snapshot,
 // it is a frequency ratio -- so it is returned in SEMITONES and converted to a ratio
 // once, where the ratio is actually needed (the shifter's resample factor). Converting
 // here would bake a unit into the snapshot and make the key values unreadable, which
-// is the mistake the dB comment on kf_gain_linear warns about in the other direction.
+// is the mistake the dB comment on keyframe_gain_linear warns about in the other direction.
 audio_pitch_semitones :: proc(p: ^Audio_Pitch_Snapshot, rel: i32) -> f32 {
 	if p.n == 0 {
 		return p.semitones
 	}
-	v, _ := kf_sample_keys(p.keys[:p.n], rel, p.semitones)
+	v, _ := keyframe_sample_keys(p.keys[:p.n], rel, p.semitones)
 	return v
 }
 
@@ -1433,8 +1433,8 @@ Audio_Geom :: struct {
 	// overflow logs once when the timeline holds more audio clips (or more
 	// path bytes) than a fixed slab can carry, so the dropped tail is visible.
 	overflow:   bool,
-	// kf_trunc_logged logs once when a gain keyframe track is capped.
-	kf_trunc_logged: bool,
+	// keyframe_trunc_logged logs once when a gain keyframe track is capped.
+	keyframe_trunc_logged: bool,
 	// pitch_kf_trunc_logged is the same for pitch. Separate flag rather than a shared
 	// one, because sharing them would mean a long gain track silences the pitch
 	// warning forever -- the second cap would look already-reported.
@@ -1556,7 +1556,7 @@ audio_geometry_commit :: proc() {
 			// speed touched snapshots as 1.0 rather than 0.
 			chip.speed = clip_speed(clip)
 			// Snapshot the clip's gain (static dB + its keyframe track) into the
-			// shared committed shape. kf_fill_snapshot renders the name; the
+			// shared committed shape. keyframe_fill_snapshot renders the name; the
 			// geometry commit is UI-thread so reading the live clip is safe.
 			g, total := audio_gain_snapshot_from_clip(clip)
 			pitch_snap, pitch_total := audio_pitch_snapshot_from_clip(clip)
@@ -1566,9 +1566,9 @@ audio_geometry_commit :: proc() {
 				fmt.printf("[audio] pitch keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, pitch_total)
 				audio_geom_state.pitch_kf_trunc_logged = true
 			}
-			if g.n > 0 && total > GAIN_KF_MAX_KEYS && !audio_geom_state.kf_trunc_logged {
+			if g.n > 0 && total > GAIN_KF_MAX_KEYS && !audio_geom_state.keyframe_trunc_logged {
 				fmt.printf("[audio] gain keyframe track exceeds GAIN_KF_MAX_KEYS=%d; keeping the first %d keys\n", GAIN_KF_MAX_KEYS, g.n)
-				audio_geom_state.kf_trunc_logged = true
+				audio_geom_state.keyframe_trunc_logged = true
 			}
 			chip.path_off = slot.path_used
 			chip.path_len = len(path)
@@ -2399,7 +2399,7 @@ db_to_linear :: proc(db: f32) -> f32 {
 	return math.pow(10, db / 20)
 }
 
-// kf_gain_linear evaluates a gain keyframe track — authored in dB, the unit the
+// keyframe_gain_linear evaluates a gain keyframe track — authored in dB, the unit the
 // inspector shows — to a LINEAR amplitude multiplier at clip-relative frame
 // `rel`. `base_dB` is the clip's static level (also dB) and rules where the
 // track has no key yet (empty, or before the first key); past the last key the
@@ -2407,11 +2407,11 @@ db_to_linear :: proc(db: f32) -> f32 {
 // of snapping back to the clip's static gain. Both the playback mixer and the
 // export mixer go through here, so a key's dB value can never again be mistaken
 // for the multiplier itself (a -40 dB key is 0.01, not -40).
-kf_gain_linear :: proc(keys: []Keyframe, rel: i32, base_dB: f32) -> f32 {
+keyframe_gain_linear :: proc(keys: []Keyframe, rel: i32, base_dB: f32) -> f32 {
 	if len(keys) == 0 {
 		return db_to_linear(base_dB)
 	}
-	db, _ := kf_sample_keys(keys, rel, base_dB)
+	db, _ := keyframe_sample_keys(keys, rel, base_dB)
 	return db_to_linear(db)
 }
 
@@ -2430,7 +2430,7 @@ play_seg_gain_linear :: proc(seg: ^Play_Seg, rel: i32) -> f32 {
 // keyed curve (clip_geom_get) rather than showing the resting field — the gain
 // row was the one holdout and so disagreed with what playback was doing.
 clip_gain_db_at_playhead :: proc(clip: ^Clip) -> f32 {
-	if v, active := kf_sample_for(clip, "gain", playhead.frame, clip.gain); active {
+	if v, active := keyframe_sample_for(clip, "gain", playhead.frame, clip.gain); active {
 		return v
 	}
 	return clip.gain

@@ -48,7 +48,7 @@ when ODIN_DEBUG {
 		playhead.frame = 250
 		timeline_view.start = 0
 		active_interaction = .None
-		kf_clear()
+		keyframe_clear()
 	}
 
 	// test_ripple_dispatch_closes_gap drives the ACTUAL Backspace action, not
@@ -168,10 +168,10 @@ when ODIN_DEBUG {
 		tl_straddle_scene()
 		cl := &timeline.tracks[0].clips[0]
 		cl.source_start_frame = 100
-		cl.keyframe_tracks = Kf_Track_Range{}
-		session_trk_push(&cl.keyframe_tracks, Kf_Track {
+		cl.keyframe_tracks = Keyframe_Track_Range{}
+		session_trk_push(&cl.keyframe_tracks, Keyframe_Track {
 			name = session_str_intern("transform.x"),
-			keys = Kf_Keys_Range{},
+			keys = Keyframe_Keys_Range{},
 		})
 		track := session_trk_view_mut(&cl.keyframe_tracks, 0)
 		session_kf_push(&track.keys, Keyframe{frame_off=50,value=0.0})
@@ -228,7 +228,7 @@ when ODIN_DEBUG {
 		// Isolation, not a count. This scene splits MID-INTERPOLATION (keys at 50 and
 		// 250, cut at 200), so the left half legitimately ends up holding its own
 		// pre-cut key AND the boundary key that carries the curve's value at the cut
-		// (kf_split_preserve_continuity). What this test is actually about is that
+		// (keyframe_split_preserve_continuity). What this test is actually about is that
 		// the halves do not SHARE a key range: each writes its own copy. Asserting a
 		// fixed count here would fail the moment the boundary key is correct, which
 		// is why it counts "both lanes present and distinct" instead.
@@ -284,8 +284,8 @@ when ODIN_DEBUG {
 		}
 		// Editing one half must not disturb the other: the shared-backing failure
 		// mode was invisible until teardown.
-		kf_geom_set_value(right, "transform.x", 50, 0.75)
-		vk := session_kf_view(session_trk_view(left.keyframe_tracks,0)^.keys); v,_ := kf_lane_value(vk[0], 0)
+		keyframe_geom_set_value(right, "transform.x", 50, 0.75)
+		vk := session_kf_view(session_trk_view(left.keyframe_tracks,0)^.keys); v,_ := keyframe_lane_value(vk[0], 0)
 		tl_probe_check(
 			v != 0.75,
 			"a keyframe edit on the right half wrote through to the left (left lane reads %v)",
@@ -1797,8 +1797,8 @@ when ODIN_DEBUG {
 		project.frame_rate = 12.0
 
 		c := &timeline.tracks[0].clips[0]
-		kf_set_key(c, "transform.x", 109, 5.0)
-		kf_set_key(c, "transform.x", 218, 9.0)
+		keyframe_set_key(c, "transform.x", 109, 5.0)
+		keyframe_set_key(c, "transform.x", 218, 9.0)
 		tr := session_trk_view(c.keyframe_tracks, 0)
 		before := session_kf_at(tr.keys, 0).frame_off
 

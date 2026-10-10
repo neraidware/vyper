@@ -1346,7 +1346,7 @@ update_handle_drag :: proc(clip: ^Clip, canvas: clay.BoundingBox, mx, my: f32, f
 // if the real call site stopped routing one of them).
 //
 // update_handle_drag writes the RESTING fields, because it runs every frame and
-// the drag is not yet committed. That is exactly the write kf_sample_keys
+// the drag is not yet committed. That is exactly the write keyframe_sample_keys
 // discards between the first and last key, so without this the handles appear to
 // work on an unkeyed clip and silently do nothing on a keyed one. clip_geom_drag
 // keys the playhead when the property is keyed there, so a keyed clip follows

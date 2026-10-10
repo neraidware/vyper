@@ -15,7 +15,7 @@ when ODIN_DEBUG {
 	//
 	// The defect this gates: clip_zoom_by / clip_pan_by (Alt+wheel and
 	// Alt+middle-drag) wrote the clip's seven RESTING fields directly and never
-	// called kf_auto_key, while every OTHER geometry write path funnels through it.
+	// called keyframe_auto_key, while every OTHER geometry write path funnels through it.
 	// So on a clip whose crop/transform is already keyed, the edit landed in a
 	// field the sampler never reads between the first and last key: the box did not
 	// move under the pointer, the inspector value changed, and the clip jumped the
@@ -54,7 +54,7 @@ when ODIN_DEBUG {
 	// geom_key_fixture builds a selected, fully keyframed clip on track 0 and puts
 	// the playhead in its middle. Every geometry lane carries a key at the clip's
 	// start and end, so the playhead sits strictly BETWEEN two keys — the exact
-	// window where kf_sample_keys takes the interpolated value and the caller's
+	// window where keyframe_sample_keys takes the interpolated value and the caller's
 	// `base` (the resting field) is ignored. That is what made the old edit
 	// invisible, so the fixture must be inside the span or it proves nothing.
 	geom_key_fixture :: proc() -> (cl: ^Clip) {
@@ -92,9 +92,9 @@ when ODIN_DEBUG {
 		START_OFF :: 0
 		END_OFF :: 300
 		for entry in geom_key_lanes {
-			name := kf_lane_name(entry.lane)
-			kf_geom_set_lane_key(cl, name, START_OFF, entry.base)
-			kf_geom_set_lane_key(cl, name, END_OFF, entry.base)
+			name := keyframe_lane_name(entry.lane)
+			keyframe_geom_set_lane_key(cl, name, START_OFF, entry.base)
+			keyframe_geom_set_lane_key(cl, name, END_OFF, entry.base)
 		}
 		selection.track = 0
 		selection.index = 0
@@ -109,7 +109,7 @@ when ODIN_DEBUG {
 	// geom_key_drop_track removes a keyframe track by name and returns its exclusive
 	// key range. The probe builds fixtures by hand, so it honors session ownership.
 	geom_key_drop_track :: proc(cl: ^Clip, name: string) {
-		ti := kf_track_index(cl^, name)
+		ti := keyframe_track_index(cl^, name)
 		if ti < 0 {
 			return
 		}
@@ -129,7 +129,7 @@ when ODIN_DEBUG {
 	geom_key_unkeyed_fixture :: proc() -> (cl: ^Clip) {
 		cl = geom_key_fixture()
 		for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
-			name := kf_track_name(&session_trk_view(cl.keyframe_tracks, ti)^)
+			name := keyframe_track_name(&session_trk_view(cl.keyframe_tracks, ti)^)
 			if name == "" {
 				continue
 			}
@@ -169,7 +169,7 @@ when ODIN_DEBUG {
 	// what an un-keyed property falls back to, and a probe that passed a different
 	// base would be measuring a read path nobody ships.
 	geom_key_sample :: proc(cl: ^Clip, lane: Render_Geom_Prop) -> (v: f32, active: bool) {
-		return kf_geom_sample_lane(cl, kf_lane_name(lane), playhead.frame, geom_key_resting(cl, lane))
+		return keyframe_geom_sample_lane(cl, keyframe_lane_name(lane), playhead.frame, geom_key_resting(cl, lane))
 	}
 
 	// geom_key_resting is the clip's resting value for a lane — the `base`
@@ -226,14 +226,14 @@ when ODIN_DEBUG {
 		// coupling from creeping back.
 		{
 			cl := geom_key_fixture()
-			kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Zoom), 0, 1.0)
-			kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Zoom), 300, 1.0)
+			keyframe_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Zoom), 0, 1.0)
+			keyframe_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Zoom), 300, 1.0)
 			before_z, _ := geom_key_sample(cl, .Zoom)
 			before_l, _ := geom_key_sample(cl, .Crop_L)
 			before_s, _ := geom_key_sample(cl, .Scale)
 			before_x, _ := geom_key_sample(cl, .Trans_X)
 			geom_key_check(
-				kf_approx(before_z, 1.0),
+				keyframe_approx(before_z, 1.0),
 				"fixture: zoom must sample active inside the keyed span, got %v",
 				before_z,
 			)
@@ -243,7 +243,7 @@ when ODIN_DEBUG {
 			)
 			after_z, _ := geom_key_sample(cl, .Zoom)
 			geom_key_check(
-				kf_approx(after_z, 2.0),
+				keyframe_approx(after_z, 2.0),
 				"Alt+wheel: zoom must change WHERE IT IS SAMPLED (was %v, now %v) — an edit that only moves the resting field is invisible between keys",
 				before_z,
 				after_z,
@@ -255,17 +255,17 @@ when ODIN_DEBUG {
 			after_s, _ := geom_key_sample(cl, .Scale)
 			after_x, _ := geom_key_sample(cl, .Trans_X)
 			geom_key_check(
-				kf_approx(after_l, before_l),
+				keyframe_approx(after_l, before_l),
 				"Alt+wheel must not write crop.l (was %v, now %v)",
 				before_l, after_l,
 			)
 			geom_key_check(
-				kf_approx(after_s, before_s),
+				keyframe_approx(after_s, before_s),
 				"Alt+wheel must not write scale (was %v, now %v)",
 				before_s, after_s,
 			)
 			geom_key_check(
-				kf_approx(after_x, before_x),
+				keyframe_approx(after_x, before_x),
 				"Alt+wheel must not write transform.x (was %v, now %v)",
 				before_x, after_x,
 			)
@@ -282,7 +282,7 @@ when ODIN_DEBUG {
 			playhead.frame = 0
 			at_start, _ := geom_key_sample(cl, .Zoom)
 			geom_key_check(
-				kf_approx(at_start, 1.0),
+				keyframe_approx(at_start, 1.0),
 				"Alt+wheel: the clip's FIRST key must still hold its original value, got %v — a gesture rewrote keys the user never touched",
 				at_start,
 			)
@@ -293,10 +293,10 @@ when ODIN_DEBUG {
 		// on both axes, and must not write crop or the transform.
 		{
 			cl := geom_key_fixture()
-			kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_X), 0, 0.0)
-			kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_X), 300, 0.0)
-			kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_Y), 0, 0.0)
-			kf_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_Y), 300, 0.0)
+			keyframe_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_X), 0, 0.0)
+			keyframe_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_X), 300, 0.0)
+			keyframe_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_Y), 0, 0.0)
+			keyframe_geom_set_lane_key(cl, render_geom_name(Render_Geom_Prop.Pan_Y), 300, 0.0)
 			before_x, _ := geom_key_sample(cl, .Pan_X)
 			before_l, _ := geom_key_sample(cl, .Crop_L)
 			clip_pan_by(cl, 60, 40)
@@ -314,13 +314,13 @@ when ODIN_DEBUG {
 			)
 			after_l, _ := geom_key_sample(cl, .Crop_L)
 			geom_key_check(
-				kf_approx(after_l, before_l),
+				keyframe_approx(after_l, before_l),
 				"Alt+drag must not write crop.l (was %v, now %v)",
 				before_l, after_l,
 			)
 			after_tx, _ := geom_key_sample(cl, .Trans_X)
 			geom_key_check(
-				kf_approx(after_tx, 960),
+				keyframe_approx(after_tx, 960),
 				"Alt+drag must not write transform.x (got %v)",
 				after_tx,
 			)
@@ -397,7 +397,7 @@ when ODIN_DEBUG {
 		// --- the TYPED edit path. The inspector field is seeded from the sampled
 		// value, so a user who clicks a field on an animated clip, sees 0.05, and
 		// types 0.3 must get 0.3 ON SCREEN. This wrote the resting field and then
-		// called kf_auto_key, which declines unless the toggle is on -- so with
+		// called keyframe_auto_key, which declines unless the toggle is on -- so with
 		// auto-key off the field showed the new number while the preview ignored it.
 		{
 			cl := geom_key_fixture()
@@ -423,13 +423,13 @@ when ODIN_DEBUG {
 			}
 			edit_commit()
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_L), 0.3),
+				keyframe_approx(clip_geom_get(cl, .Crop_L), 0.3),
 				"a typed edit on a keyed clip must change what the preview shows (got %v)",
 				clip_geom_get(cl, .Crop_L),
 			)
 			// A no-op commit must not stamp a key: the field was seeded from the
 			// sampled value, so re-committing it unchanged changes nothing visible.
-			ti := kf_track_index(cl^, "crop.l")
+			ti := keyframe_track_index(cl^, "crop.l")
 			keys_before := session_trk_view(cl.keyframe_tracks,ti).keys.n
 			edit_begin(.Crop_L, clip_geom_get(cl, .Crop_L))
 			for i in 0 ..< len(edit_state.chars) {
@@ -460,7 +460,7 @@ when ODIN_DEBUG {
 			// Replace the per-lane tracks with one packed crop section.
 			for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
 				tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
-				if kf_track_name(tr) == "crop" {
+				if keyframe_track_name(tr) == "crop" {
 					if tr.keys.slots > 0 && !tr.keys.shared {
 						session_kf_release(tr.keys)
 					}
@@ -472,7 +472,7 @@ when ODIN_DEBUG {
 			geom_key_drop_track(cl, "crop.t")
 			geom_key_drop_track(cl, "crop.b")
 			geom_key_check(
-				kf_track_index(cl^, "crop") < 0,
+				keyframe_track_index(cl^, "crop") < 0,
 				"fixture: the packed case must start with no crop section",
 			)
 			// Keys span [100, 200] and the playhead sits at 50 — BEFORE the first
@@ -486,16 +486,16 @@ when ODIN_DEBUG {
 			// key.
 			playhead.frame = 50
 			for off in ([]i32{100, 200}) {
-				kf_geom_set_packed(
+				keyframe_geom_set_packed(
 					cl,
 					"crop",
 					off,
 					[KF_PACK_MAX]f32{0.05, 0.05, 0.05, 0.05, 0, 0, 0},
-					kf_geom_full_mask("crop"),
+					keyframe_geom_full_mask("crop"),
 				)
 			}
 			geom_key_check(
-				kf_track_index(cl^, "crop") >= 0,
+				keyframe_track_index(cl^, "crop") >= 0,
 				"fixture: the packed crop section must exist",
 			)
 			// Ahead of the animation the lane is on its run-up: the resting base is
@@ -526,13 +526,13 @@ when ODIN_DEBUG {
 			// key, and it is the number the knot must then carry.
 			on_screen_l := clip_geom_get(cl, .Crop_L)
 			geom_key_check(
-				on_screen_l > 0.05 && on_screen_l < 0.4 && !kf_approx(on_screen_l, pre_edit_l),
+				on_screen_l > 0.05 && on_screen_l < 0.4 && !keyframe_approx(on_screen_l, pre_edit_l),
 				"a resting edit ahead of the first key must move the run-up (got %v, was %v)",
 				on_screen_l,
 				pre_edit_l,
 			)
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_R), before_r),
+				keyframe_approx(clip_geom_get(cl, .Crop_R), before_r),
 				"an untouched lane must keep its value after the shortcut (got %v)",
 				clip_geom_get(cl, .Crop_R),
 			)
@@ -542,25 +542,25 @@ when ODIN_DEBUG {
 			// out to four per-lane tracks, a storage they did not ask for, as a
 			// side effect of asking to key one edge.
 			geom_key_check(
-				kf_track_index(cl^, "crop") >= 0,
+				keyframe_track_index(cl^, "crop") >= 0,
 				"keying one lane of a packed section must leave the section packed",
 			)
 			geom_key_check(
-				kf_track_index(cl^, "crop.l") < 0,
+				keyframe_track_index(cl^, "crop.l") < 0,
 				"the section must not have been unwrapped into a 'crop.l' track",
 			)
 			// The section and its lanes must never both exist: that coexistence is
-			// what kf_geom_sample_lane asserts against, so a shortcut press that
+			// what keyframe_geom_sample_lane asserts against, so a shortcut press that
 			// left both would crash the next preview frame rather than this probe.
 			geom_key_check(
-				!(kf_track_index(cl^, "crop") >= 0 && kf_track_index(cl^, "crop.l") >= 0),
+				!(keyframe_track_index(cl^, "crop") >= 0 && keyframe_track_index(cl^, "crop.l") >= 0),
 				"the packed section and its lane must not coexist after the shortcut",
 			)
 			// The new knot carries ONLY the lane that was pending. A full-mask knot
 			// here would key breakpoints on three edges the user never panned, and
 			// would pin them to whatever the sampler happened to read — the exact
 			// "stamps keys nobody asked for" failure clip_geom_drag exists to avoid.
-			crop_ti := kf_track_index(cl^, "crop")
+			crop_ti := keyframe_track_index(cl^, "crop")
 			if crop_ti >= 0 {
 				keys := session_trk_view(cl.keyframe_tracks,crop_ti).keys
 				off_new := i32(playhead.frame - cl.timeline_start_frame)
@@ -579,7 +579,7 @@ when ODIN_DEBUG {
 							k.mask,
 						)
 						geom_key_check(
-							kf_approx(v[0], on_screen_l),
+							keyframe_approx(v[0], on_screen_l),
 							"the knot must carry the pending lane's on-screen value (got %v want %v)",
 							v[0],
 							on_screen_l,
@@ -601,7 +601,7 @@ when ODIN_DEBUG {
 			geom_key_check(true, "sampling every lane after the grouped key did not assert")
 		}
 
-		// --- the playhead guard. kf_sample_keys holds from the first key onward, so
+		// --- the playhead guard. keyframe_sample_keys holds from the first key onward, so
 		// a playhead past the clip's end still reads "active" and would collect keys
 		// on frames the clip does not cover. Keys are only meaningful over the clip;
 		// off-clip, the resting write is what the sampler reads.
@@ -611,7 +611,7 @@ when ODIN_DEBUG {
 			// 40 frames past the end of a 300-frame clip.
 			playhead.frame = 340
 			clip_geom_set(cl, .Crop_L, 0.4)
-			ti := kf_track_index(cl^, "crop.l")
+			ti := keyframe_track_index(cl^, "crop.l")
 			geom_key_check(ti >= 0, "fixture: the guard case still has a crop.l track")
 			if ti >= 0 {
 				keys := session_trk_view(cl.keyframe_tracks,ti).keys
@@ -622,7 +622,7 @@ when ODIN_DEBUG {
 				)
 			}
 			geom_key_check(
-				kf_approx(cl.crop_l, 0.4),
+				keyframe_approx(cl.crop_l, 0.4),
 				"an off-clip edit must still be VISIBLE, as the resting write (got %v)",
 				cl.pan_x,
 			)
@@ -693,8 +693,8 @@ when ODIN_DEBUG {
 			// order -- which is what the positional payload used to depend on a
 			// hand-written list at each call site to get right.
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_L), 0.4) &&
-					kf_approx(clip_geom_get(cl, .Crop_R), 0.4),
+				keyframe_approx(clip_geom_get(cl, .Crop_L), 0.4) &&
+					keyframe_approx(clip_geom_get(cl, .Crop_R), 0.4),
 				"a group key must carry the on-screen values, not zeroed slots (l=%v r=%v)",
 				clip_geom_get(cl, .Crop_L),
 				clip_geom_get(cl, .Crop_R),
@@ -747,14 +747,14 @@ when ODIN_DEBUG {
 				n,
 			)
 			geom_key_check(
-				kf_track_index(cl^, "pan.x") >= 0,
+				keyframe_track_index(cl^, "pan.x") >= 0,
 				"the panned lane must be keyed",
 			)
 			for name in ([]string{
 				"crop.l", "crop.r", "crop.t", "crop.b", "transform.x", "transform.y", "pan.y",
 			}) {
 				geom_key_check(
-					kf_track_index(cl^, name) < 0,
+					keyframe_track_index(cl^, name) < 0,
 					"a pan must not mint a track for a lane it did not touch (%q exists)",
 					name,
 				)
@@ -766,7 +766,7 @@ when ODIN_DEBUG {
 			// there is nothing to group.
 			for name in ([]string{"crop", "transform"}) {
 				geom_key_check(
-					kf_track_index(cl^, name) < 0,
+					keyframe_track_index(cl^, name) < 0,
 					"a pan must not create the %q section (it writes no crop or transform)",
 					name,
 				)
@@ -775,11 +775,11 @@ when ODIN_DEBUG {
 			// not have keyed them — keying either would start animating a property
 			// the user left alone.
 			geom_key_check(
-				kf_track_index(cl^, "scale") < 0,
+				keyframe_track_index(cl^, "scale") < 0,
 				"the shortcut must key only the pending lanes — 'scale' was never panned",
 			)
 			geom_key_check(
-				kf_track_index(cl^, "opacity") < 0,
+				keyframe_track_index(cl^, "opacity") < 0,
 				"the shortcut must key only the pending lanes — 'opacity' was never panned",
 			)
 			// Pressing it again with nothing pending must be a no-op, not a second
@@ -790,7 +790,7 @@ when ODIN_DEBUG {
 		// --- an ALREADY UNWRAPPED section stays unwrapped. Grouping is for a section
 		// the user never split up. Once a lane carries its own track, that shape is
 		// already on the clip — the user keyed or edited that lane individually, and
-		// kf_geom_set_lane_key is what unwrapped it — so re-packing on the next
+		// keyframe_geom_set_lane_key is what unwrapped it — so re-packing on the next
 		// grouped press would delete a real track and rewrite an animation the user
 		// built, as a side effect of asking to key a DIFFERENT edge.
 		{
@@ -799,11 +799,11 @@ when ODIN_DEBUG {
 			// Key one crop edge on its own. This is the unwrap.
 			clip_geom_add_lane_key(cl, .Crop_L)
 			geom_key_check(
-				kf_track_index(cl^, "crop") < 0,
+				keyframe_track_index(cl^, "crop") < 0,
 				"fixture: keying one crop lane on its own must not make a section track",
 			)
 			geom_key_check(
-				kf_track_index(cl^, "crop.l") >= 0,
+				keyframe_track_index(cl^, "crop.l") >= 0,
 				"fixture: the individual lane key must own a 'crop.l' track",
 			)
 			// A different edge is panned, so it is pending.
@@ -811,20 +811,20 @@ when ODIN_DEBUG {
 			n := clip_geom_key_all_modified(cl)
 			geom_key_check(n == 1, "one pending lane must key exactly one lane, got %d", n)
 			geom_key_check(
-				kf_track_index(cl^, "crop") < 0,
+				keyframe_track_index(cl^, "crop") < 0,
 				"an already-unwrapped section must NOT be re-packed into a section track",
 			)
 			geom_key_check(
-				kf_track_index(cl^, "crop.t") >= 0,
+				keyframe_track_index(cl^, "crop.t") >= 0,
 				"the pending lane of an unwrapped section must be keyed on its own track",
 			)
 			geom_key_check(
-				kf_track_index(cl^, "crop.l") >= 0,
+				keyframe_track_index(cl^, "crop.l") >= 0,
 				"the per-lane key already on the clip must survive a write to a sibling lane",
 			)
 			for name in ([]string{"crop.r", "crop.b"}) {
 				geom_key_check(
-					kf_track_index(cl^, name) < 0,
+					keyframe_track_index(cl^, name) < 0,
 					"keying one lane of an unwrapped section must not mint %q",
 					name,
 				)
@@ -839,7 +839,7 @@ when ODIN_DEBUG {
 		// --- keyed handle drag. This is the one gesture that looked correct and
 		// animated nothing. update_handle_drag writes the RESTING fields every
 		// frame, because the drag is not committed until the pointer is released,
-		// and that is exactly the write kf_sample_keys discards between the first
+		// and that is exactly the write keyframe_sample_keys discards between the first
 		// and last key of a span. So the inspector numbers moved and the timeline
 		// did not, with auto-key off. Driven through the same handle_drag_commit
 		// the shipped pointer path calls, not a copy of its lane list -- a copied
@@ -864,14 +864,14 @@ when ODIN_DEBUG {
 			update_handle_drag(cl, canvas, cx, vt0 - 300, false)
 			handle_drag_commit(cl)
 			geom_key_check(
-				!kf_approx(clip_geom_get(cl, .Scale), scale0),
+				!keyframe_approx(clip_geom_get(cl, .Scale), scale0),
 				"a handle drag on a KEYED clip must move what the clip reads (scale %v, was %v)",
 				clip_geom_get(cl, .Scale), scale0,
 			)
 			// The point of the commit: the drag must land ON the playhead key, not
 			// only on the resting field the preview is already drawing.
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Scale), cl.scale),
+				keyframe_approx(clip_geom_get(cl, .Scale), cl.scale),
 				"the drag must land on the playhead key (sampled %v, resting %v)",
 				clip_geom_get(cl, .Scale), cl.scale,
 			)
@@ -879,12 +879,12 @@ when ODIN_DEBUG {
 			// alone; routing it unconditionally would key translate.x the user
 			// never moved, and that key would show up in the graph.
 			geom_key_check(
-				!kf_approx(clip_geom_get(cl, .Trans_Y), ty0),
+				!keyframe_approx(clip_geom_get(cl, .Trans_Y), ty0),
 				"a top-edge drag must move the vertical transform (%v, was %v)",
 				clip_geom_get(cl, .Trans_Y), ty0,
 			)
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Trans_X), tx0) && kf_approx(cl.transform_x, tx0),
+				keyframe_approx(clip_geom_get(cl, .Trans_X), tx0) && keyframe_approx(cl.transform_x, tx0),
 				"a top-edge drag must not touch translate.x (sampled %v, resting %v, was %v)",
 				clip_geom_get(cl, .Trans_X), cl.transform_x, tx0,
 			)
@@ -900,7 +900,7 @@ when ODIN_DEBUG {
 
 		// --- auto-key must not unwrap a packed section. The toggle means "record my
 		// edits on the timeline"; it is not a request to change how the animation is
-		// STORED. But auto-key's write went through kf_geom_set_lane_key, which
+		// STORED. But auto-key's write went through keyframe_geom_set_lane_key, which
 		// unwraps a packed section on any lane write ("you keyed an individual
 		// value, so the array unwraps"). So one auto-keyed crop drag deleted the
 		// user's whole-crop section track and replaced it with four per-lane tracks
@@ -909,72 +909,72 @@ when ODIN_DEBUG {
 			cl := geom_key_fixture()
 			playhead.frame = 150
 			for off in ([]i32{0, 300}) {
-				kf_geom_set_packed(
+				keyframe_geom_set_packed(
 					cl,
 					"crop",
 					off,
 					[KF_PACK_MAX]f32{0.05, 0.05, 0.05, 0.05, 0, 0, 0},
-					kf_geom_full_mask("crop"),
+					keyframe_geom_full_mask("crop"),
 				)
 			}
 			geom_key_check(
-				kf_track_index(cl^, "crop") >= 0 && kf_track_index(cl^, "crop.l") < 0,
+				keyframe_track_index(cl^, "crop") >= 0 && keyframe_track_index(cl^, "crop.l") < 0,
 				"fixture: crop must start packed, with no per-lane track",
 			)
 			// Pre-place a FULL-mask knot exactly on the playhead, as a section the
 			// user keyed wholesale would have, so the auto-key has to merge into it.
-			kf_geom_set_packed(
+			keyframe_geom_set_packed(
 				cl,
 				"crop",
 				150,
 				[KF_PACK_MAX]f32{0.05, 0.07, 0.05, 0.05, 0, 0, 0},
-				kf_geom_full_mask("crop"),
+				keyframe_geom_full_mask("crop"),
 			)
 			editor_flags.auto_keyframe = true
 			// One lane moves, toggle on, playhead inside the packed span. Both
-			// auto-key entry points are exercised: kf_auto_key (the gain path and
+			// auto-key entry points are exercised: keyframe_auto_key (the gain path and
 			// anything still calling it) and clip_geom_set, which is where every
 			// shipped geometry write -- drag, Alt+wheel, typed field -- lands.
 			geom_key_check(
-				kf_auto_key(cl, kf_lane_name(.Crop_L), 0.4),
+				keyframe_auto_key(cl, keyframe_lane_name(.Crop_L), 0.4),
 				"auto-key must write a key for a lane that is already keyed",
 			)
 			geom_key_check(
-				kf_geom_set_packed_lane_key(cl, kf_lane_name(.Crop_T), 150, 0.2),
+				keyframe_geom_set_packed_lane_key(cl, keyframe_lane_name(.Crop_T), 150, 0.2),
 				"a lane write on a packed section must land in the section",
 			)
 			cl.crop_b = 0.33
 			keyed := clip_geom_set(cl, .Crop_B, 0.33)
 			geom_key_check(keyed, "an auto-keyed drag lane must report as keyed")
 			geom_key_check(
-				kf_track_index(cl^, "crop") >= 0,
+				keyframe_track_index(cl^, "crop") >= 0,
 				"auto-key must NOT unwrap a packed section — the 'crop' section track is gone",
 			)
 			geom_key_check(
-				kf_track_index(cl^, "crop.l") < 0,
+				keyframe_track_index(cl^, "crop.l") < 0,
 				"auto-key must NOT mint per-lane tracks on a packed section",
 			)
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_L), 0.4),
+				keyframe_approx(clip_geom_get(cl, .Crop_L), 0.4),
 				"the auto-keyed lane must read back its new value (got %v)",
 				clip_geom_get(cl, .Crop_L),
 			)
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_T), 0.2),
+				keyframe_approx(clip_geom_get(cl, .Crop_T), 0.2),
 				"the second auto-keyed lane must read back its new value (got %v)",
 				clip_geom_get(cl, .Crop_T),
 			)
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_B), 0.33),
+				keyframe_approx(clip_geom_get(cl, .Crop_B), 0.33),
 				"a drag-routed lane must read back its new value (got %v)",
 				clip_geom_get(cl, .Crop_B),
 			)
 			// The lane nobody wrote must keep the value the same-frame knot
 			// carried -- crop.r is 0.07 there, deliberately different from the
 			// 0.05 everywhere else, so a wholesale replace of that knot (which is
-			// what kf_set_packed_key's same-frame path does) is visible here.
+			// what keyframe_set_packed_key's same-frame path does) is visible here.
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Crop_R), 0.07),
+				keyframe_approx(clip_geom_get(cl, .Crop_R), 0.07),
 				"an untouched lane must keep its value through an auto-key (got %v)",
 				clip_geom_get(cl, .Crop_R),
 			)
@@ -1063,10 +1063,10 @@ when ODIN_DEBUG {
 			cl.crop_b = 0.4
 			scrambled := clip_image_bounds(canvas, cl)
 			geom_key_check(
-				kf_approx(at_rest_key.x, scrambled.x) &&
-				kf_approx(at_rest_key.y, scrambled.y) &&
-				kf_approx(at_rest_key.width, scrambled.width) &&
-				kf_approx(at_rest_key.height, scrambled.height),
+				keyframe_approx(at_rest_key.x, scrambled.x) &&
+				keyframe_approx(at_rest_key.y, scrambled.y) &&
+				keyframe_approx(at_rest_key.width, scrambled.width) &&
+				keyframe_approx(at_rest_key.height, scrambled.height),
 				"clip_image_bounds must read the playhead, not the resting fields — scrambling them moved the box from (%v,%v %vx%v) to (%v,%v %vx%v)",
 				at_rest_key.x, at_rest_key.y, at_rest_key.width, at_rest_key.height,
 				scrambled.x, scrambled.y, scrambled.width, scrambled.height,
@@ -1082,10 +1082,10 @@ when ODIN_DEBUG {
 			cl.crop_r = 0.1
 			cl.crop_t = 0.1
 			cl.crop_b = 0.1
-			kf_geom_set_lane_key(cl, "scale", i32(playhead.frame), 0.25)
+			keyframe_geom_set_lane_key(cl, "scale", i32(playhead.frame), 0.25)
 			moved := clip_image_bounds(canvas, cl)
 			geom_key_check(
-				!kf_approx(at_rest_key.width, moved.width),
+				!keyframe_approx(at_rest_key.width, moved.width),
 				"a new scale key under the playhead must resize the box (was %v, now %v)",
 				at_rest_key.width, moved.width,
 			)
@@ -1182,19 +1182,19 @@ when ODIN_DEBUG {
 			geom[int(Render_Geom_Prop.Zoom)] = 2.0
 			half := geom_source_window(geom)
 			geom_key_check(
-				kf_approx(win_w(half), win_w(full) / 2),
+				keyframe_approx(win_w(half), win_w(full) / 2),
 				"zoom 2 must halve the window width (%v -> %v)",
 				win_w(full), win_w(half),
 			)
 			// Uniform: both axes share the factor, or the box's aspect would change.
 			geom_key_check(
-				kf_approx(win_h(half), win_h(full) / 2),
+				keyframe_approx(win_h(half), win_h(full) / 2),
 				"zoom must be uniform across axes (%v -> %v)",
 				win_h(full), win_h(half),
 			)
 			// Centered: a centered window stays centered under zoom.
 			geom_key_check(
-				kf_approx((1 + half.l - half.r) / 2, (1 + full.l - full.r) / 2),
+				keyframe_approx((1 + half.l - half.r) / 2, (1 + full.l - full.r) / 2),
 				"zoom must not move the window's center",
 			)
 			// Pan slides the WINDOW by a fraction of its OWN width, toward the source's
@@ -1206,7 +1206,7 @@ when ODIN_DEBUG {
 			geom[int(Render_Geom_Prop.Pan_X)] = 0.25
 			after := geom_source_window(geom)
 			geom_key_check(
-				kf_approx(before.l - after.l, 0.25 * win_w(before)),
+				keyframe_approx(before.l - after.l, 0.25 * win_w(before)),
 				"pan 0.25 must slide the window left by a quarter of its width (%v of %v)",
 				before.l - after.l, win_w(before),
 			)
@@ -1221,7 +1221,7 @@ when ODIN_DEBUG {
 				far.l, far.r,
 			)
 			geom_key_check(
-				kf_approx(win_w(far), win_w(before)),
+				keyframe_approx(win_w(far), win_w(before)),
 				"a far pan pins to an edge rather than resizing the window (%v vs %v)",
 				win_w(far), win_w(before),
 			)
@@ -1272,7 +1272,7 @@ when ODIN_DEBUG {
 			sx0 := (u - before.l) / win_w(before) * cw
 			sx1 := (u - after.l) / win_w(after) * cw
 			geom_key_check(
-				kf_approx_px(sx1 - sx0, 120),
+				keyframe_approx_px(sx1 - sx0, 120),
 				"a 120px drag at zoom %.2f must move the content 120px on screen (got %.2f)",
 				clip_geom_get(cl, .Zoom), sx1 - sx0,
 			)
@@ -1312,7 +1312,7 @@ when ODIN_DEBUG {
 			sx0 := (u - before.l) / win_w(before) * cw
 			sx1 := (u - after.l) / win_w(after) * cw
 			geom_key_check(
-				kf_approx_px(sx1 - sx0, 120),
+				keyframe_approx_px(sx1 - sx0, 120),
 				"the SAME 120px drag at zoom 4 must move the content 120px (got %.2f) — pan speed must not scale with zoom",
 				sx1 - sx0,
 			)
@@ -1346,7 +1346,7 @@ when ODIN_DEBUG {
 			}
 			stored := clip_geom_get(cl, .Pan_X)
 			geom_key_check(
-				kf_approx(stored, r.x_hi),
+				keyframe_approx(stored, r.x_hi),
 				"a drag into the border must stop the lane at the achievable limit (%v, limit %v)",
 				stored, r.x_hi,
 			)
@@ -1362,7 +1362,7 @@ when ODIN_DEBUG {
 				unclamped, 1 - p.nw,
 			)
 			geom_key_check(
-				kf_approx(unclamped, 0),
+				keyframe_approx(unclamped, 0),
 				"the x_hi bound must put the window at the source's left edge (got %v)",
 				unclamped,
 			)
@@ -1388,7 +1388,7 @@ when ODIN_DEBUG {
 				geom[pi] = clip_geom_get(cl, Render_Geom_Prop(pi))
 			}
 			geom_key_check(
-				kf_approx(clip_geom_get(cl, .Pan_Y), geom_pan_range(geom).y_hi),
+				keyframe_approx(clip_geom_get(cl, .Pan_Y), geom_pan_range(geom).y_hi),
 				"the y lane must stop at its own limit (got %v)",
 				clip_geom_get(cl, .Pan_Y),
 			)
@@ -1428,10 +1428,10 @@ when ODIN_DEBUG {
 			// And it must fit the fixed buffer with room to spare, since a silent
 			// truncation here would look like a correct short list.
 			geom_key_check(
-				len(labels) < len(ui_text.kf_pending_list),
-				"pending-lane summary (%d bytes) must fit kf_pending_list (%d)",
+				len(labels) < len(ui_text.keyframe_pending_list),
+				"pending-lane summary (%d bytes) must fit keyframe_pending_list (%d)",
 				len(labels),
-				len(ui_text.kf_pending_list),
+				len(ui_text.keyframe_pending_list),
 			)
 		}
 
@@ -1445,7 +1445,7 @@ when ODIN_DEBUG {
 			geom[int(Render_Geom_Prop.Crop_R)] = 0.1
 			w := geom_source_window(geom)
 			geom_key_check(
-				kf_approx(1 - w.l - w.r, 0.8),
+				keyframe_approx(1 - w.l - w.r, 0.8),
 				"a zero zoom must leave the crop window alone (width %v)",
 				1 - w.l - w.r,
 			)

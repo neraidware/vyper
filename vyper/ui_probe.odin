@@ -444,7 +444,7 @@ when ODIN_DEBUG {
 				// use. The marker one adds the insert gap above the lane, so its top
 				// edge is the part that used to escape.
 				passes := [2]struct{name: string, rect: clay.BoundingBox} {
-					{name = "keyframes", rect = kf_lane_rect(t)},
+					{name = "keyframes", rect = keyframe_lane_rect(t)},
 					{name = "markers", rect = marker_lane_rect(t)},
 				}
 				for pass in passes {
@@ -483,7 +483,7 @@ when ODIN_DEBUG {
 		timeline_view.top = max_top * 4
 		build_page(1920, 1600)
 		for t in 0 ..< len(timeline.tracks) {
-			if r := kf_lane_rect(t); r.width > 0 && r.height > 0 {
+			if r := keyframe_lane_rect(t); r.width > 0 && r.height > 0 {
 				fmt.eprintf(
 					"[ui-probe] marker cull: track %d keyframe lane still %.1fx%.1f with every row scrolled away\n",
 					t,
@@ -503,7 +503,7 @@ when ODIN_DEBUG {
 		timeline_view.start = f32(timeline_duration())
 		build_page(1920, 1600)
 		for t in 0 ..< len(timeline.tracks) {
-			r := kf_lane_rect(t)
+			r := keyframe_lane_rect(t)
 			if r.width > 0 && r.height > 0 && r.x < view.x - 0.5 {
 				fmt.eprintf(
 					"[ui-probe] marker cull: track %d paints from x %.1f, left of the lane edge %.1f\n",
@@ -1770,12 +1770,12 @@ when ODIN_DEBUG {
 			crop_b               = 0.4,
 		}
 		session_marker_push(&vclip.markers, Clip_Marker {source_frame = 12, label = session_str_intern("chapter")})
-		vclip.keyframe_tracks = Kf_Track_Range{}
-		session_trk_push(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("scale"), keys = Kf_Keys_Range{}})
+		vclip.keyframe_tracks = Keyframe_Track_Range{}
+		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("scale"), keys = Keyframe_Keys_Range{}})
 		track0 := session_trk_view_mut(&vclip.keyframe_tracks, 0)
 		session_kf_push(&track0.keys, Keyframe{frame_off=0,value=1.0})
 		session_kf_push(&track0.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
-		session_trk_push(&vclip.keyframe_tracks, Kf_Track {name = session_str_intern("crop"), keys = Kf_Keys_Range{}})
+		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("crop"), keys = Keyframe_Keys_Range{}})
 		// A packed key: mask != 0, value carries the [KF_PACK_MAX]f32 payload.
 		track1 := session_trk_view_mut(&vclip.keyframe_tracks, 1)
 		session_kf_push(&track1.keys, Keyframe{frame_off=10,mask=0b101,value=[KF_PACK_MAX]f32{1,2,3,4,5,6,7}})
@@ -1853,8 +1853,8 @@ when ODIN_DEBUG {
 				fmt.eprintf("[ui-probe] marker label is not a cbor string in the saved file\n")
 				ok = false
 			}
-			// Same trap for lane names: Kf_Track.name became a pool handle too, and
-			// Saved_Clip.keyframe_tracks was typed [dynamic]Kf_Track for the same
+			// Same trap for lane names: Keyframe_Track.name became a pool handle too, and
+			// Saved_Clip.keyframe_tracks was typed [dynamic]Keyframe_Track for the same
 			// reason the marker DTO had to change. A handle encodes as two i32s and
 			// cannot contain the text.
 			if !strings.contains(text, "scale") {
@@ -1984,12 +1984,12 @@ when ODIN_DEBUG {
 			ok = false
 		}
 		if c.keyframe_tracks.n != 2 {
-			fmt.eprintf("[ui-probe] %d kf tracks want 2\n", c.keyframe_tracks.n)
+			fmt.eprintf("[ui-probe] %d keyframe tracks want 2\n", c.keyframe_tracks.n)
 			ok = false
 		} else {
 			sk := session_trk_view(c.keyframe_tracks, 0)
-			if kf_track_name(sk) != "scale" || sk.keys.n != 2 {
-				fmt.eprintf("[ui-probe] scalar kf track mismatch\n")
+			if keyframe_track_name(sk) != "scale" || sk.keys.n != 2 {
+				fmt.eprintf("[ui-probe] scalar keyframe track mismatch\n")
 				ok = false
 			} else if session_kf_at(sk.keys,1).value != 2.0 || session_kf_at(sk.keys,1).interp != .Elastic {
 				fmt.eprintf("[ui-probe] scalar key value/interp mismatch\n")
@@ -2164,10 +2164,10 @@ when ODIN_DEBUG {
 			fmt.eprintf("[ui-probe] TimelineClip height %.1f want %.1f\n", tile.height, CLIP_TILE_HEIGHT)
 			ok = false
 		}
-		gutter := clay.GetElementData(clay.ID("KfGutterNames", 0)).boundingBox
+		gutter := clay.GetElementData(clay.ID("KeyframeGutterNames", 0)).boundingBox
 		want_gutter := 2 * KF_ROW_H
 		if abs(gutter.height - want_gutter) > 0.5 {
-			fmt.eprintf("[ui-probe] KfGutterNames height %.1f want %.1f\n", gutter.height, want_gutter)
+			fmt.eprintf("[ui-probe] KeyframeGutterNames height %.1f want %.1f\n", gutter.height, want_gutter)
 			ok = false
 		}
 		// The "keyframe all modified" row must actually LAY OUT for a video clip.
@@ -2178,9 +2178,9 @@ when ODIN_DEBUG {
 		// box exists and is inside the inspector.
 		sel_v, ok_v := transformable_selected()
 		if ok_v {
-			row_bb := clay.GetElementData(clay.ID("KfAllModifiedRow")).boundingBox
+			row_bb := clay.GetElementData(clay.ID("KeyframeAllModifiedRow")).boundingBox
 			if row_bb.width <= 0 || row_bb.height <= 0 {
-				fmt.eprintf("[ui-probe] KfAllModifiedRow never laid out (%.0fx%.0f)\n", row_bb.width, row_bb.height)
+				fmt.eprintf("[ui-probe] KeyframeAllModifiedRow never laid out (%.0fx%.0f)\n", row_bb.width, row_bb.height)
 				ok = false
 			}
 
@@ -2334,14 +2334,14 @@ when ODIN_DEBUG {
 	// This drives the real interaction entry points (interaction_click_dispatch /
 	// interaction_move / interaction_release), because the arming is a property of
 	// WHICH press handler claims the click, not of the paint call — a probe that
-	// called kf_brush_paint directly would pass against code where nothing arms it.
+	// called keyframe_brush_paint directly would pass against code where nothing arms it.
 	ui_probe_kf_brush_asserts :: proc() -> bool {
 		ok := true
 		// The go-to-keyframe double-click record is a global on a wall-clock timer.
 		// Two probes that press the same diamond in the same process run inside that
 		// window, so without this the second press is read as a double-click seek and
 		// never reaches the gesture under test.
-		kf_dbl_click = {}
+		keyframe_dbl_click = {}
 		build_page(1920, 1600)
 		cl := &timeline.tracks[0].clips[0]
 		// The lane is FOUND, not assumed at index 0: the geometry layer owns lane
@@ -2350,7 +2350,7 @@ when ODIN_DEBUG {
 		lane, k_first, k_second := -1, -1, -1
 		for li in 0 ..< cl.keyframe_tracks.n {
 			n := session_trk_view(cl.keyframe_tracks,li).keys.n
-			if n >= 2 && (lane < 0 || n > session_trk_view(cl.keyframe_tracks,lane)^.keys.n) {
+			if n >= 2 && (lane < 0 || n > keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0).n) {
 				lane, k_first, k_second = li, 0, 1
 			}
 		}
@@ -2359,10 +2359,10 @@ when ODIN_DEBUG {
 			return false
 		}
 		box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-		f_a := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, k_first).frame_off
-		f_b := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, k_second).frame_off
-		x_a, y_a := kf_key_center(box, lane, f_a)
-		x_b, y_b := kf_key_center(box, lane, f_b)
+		f_a := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), k_first).frame_off
+		f_b := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), k_second).frame_off
+		x_a, y_a := keyframe_key_center(box, lane, f_a)
+		x_b, y_b := keyframe_key_center(box, lane, f_b)
 		// An empty spot to arm the brush on. It has to be past the clip's RIGHT EDGE,
 		// not merely past its last key: the clip press handler runs before the brush
 		// fallback and claims any press on a clip body, so a point still over the clip
@@ -2371,8 +2371,8 @@ when ODIN_DEBUG {
 		y_empty := y_a
 
 		defer {
-			kf_brush_disarm()
-			kf_clear()
+			keyframe_brush_disarm()
+			keyframe_clear()
 			selection = {}
 			build_page(1920, 1600)
 		}
@@ -2395,25 +2395,25 @@ when ODIN_DEBUG {
 		// The premise, asserted rather than assumed: a Shift+click on a keyframe must
 		// NOT arm the brush. If this passes trivially because the click armed nothing,
 		// the rest of the probe would still look right while testing the wrong thing.
-		kf_clear()
+		keyframe_clear()
 		press(x_a, y_a, true)
-		if kf_brush_armed {
+		if keyframe_brush_armed {
 			fmt.eprintf("[ui-probe] a shift+click on a keyframe must not arm the brush\n")
 			ok = false
 		}
-		if kf_sel_count() != 1 {
+		if keyframe_sel_count() != 1 {
 			fmt.eprintf(
 				"[ui-probe] shift+click on a keyframe selected %d keys, want just that one\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
 		// And nothing may be painted while it is unarmed.
 		hover(x_b, y_b)
-		if kf_sel_count() != 1 {
+		if keyframe_sel_count() != 1 {
 			fmt.eprintf(
 				"[ui-probe] hovering painted %d keys with the brush unarmed, want the selection untouched\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2422,14 +2422,14 @@ when ODIN_DEBUG {
 		// the selection: A is still selected, because a brush session accumulates and
 		// the arming click is not a reselect.
 		press(x_empty, y_empty, true)
-		if !kf_brush_armed {
+		if !keyframe_brush_armed {
 			fmt.eprintf("[ui-probe] shift+click on empty timeline space must arm the brush\n")
 			return false
 		}
-		if kf_sel_count() != 1 || !kf_sel_contains(Kf_Ref{0, 0, lane, k_first}) {
+		if keyframe_sel_count() != 1 || !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_first}) {
 			fmt.eprintf(
 				"[ui-probe] arming the brush left %d keys selected, want the previous selection kept\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2437,12 +2437,12 @@ when ODIN_DEBUG {
 		// 2. Hovering the OTHER key adds it to what was already there — the mode does
 		// not start fresh, which is the whole difference from a reselect.
 		hover(x_b, y_b)
-		if kf_sel_count() != 2 ||
-		   !kf_sel_contains(Kf_Ref{0, 0, lane, k_first}) ||
-		   !kf_sel_contains(Kf_Ref{0, 0, lane, k_second}) {
+		if keyframe_sel_count() != 2 ||
+		   !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_first}) ||
+		   !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_second}) {
 			fmt.eprintf(
 				"[ui-probe] hovering a key in brush mode left %d selected, want both accumulated\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2450,10 +2450,10 @@ when ODIN_DEBUG {
 		// 3. Resting on it changes nothing (the edge trigger), so the mode survives a
 		// stationary pointer instead of oscillating.
 		hover(x_b, y_b)
-		if kf_sel_count() != 2 {
+		if keyframe_sel_count() != 2 {
 			fmt.eprintf(
 				"[ui-probe] resting on a painted key changed the count to %d, want 2\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2461,38 +2461,38 @@ when ODIN_DEBUG {
 		// 4. The mode outlives the button AND the release: painting continues with no
 		// button, which is the behaviour a held-drag implementation cannot express.
 		interaction_release(Mouse_Input{x_b, y_b, false, false, false, false, false, false})
-		if !kf_brush_armed {
+		if !keyframe_brush_armed {
 			fmt.eprintf("[ui-probe] releasing the button must not disarm the brush\n")
 			ok = false
 		}
-		kf_clear()
+		keyframe_clear()
 		hover(x_a, y_a)
-		if kf_sel_count() != 1 || !kf_sel_contains(Kf_Ref{0, 0, lane, k_first}) {
-			fmt.eprintf("[ui-probe] the brush stopped painting after release (count %d)\n", kf_sel_count())
+		if keyframe_sel_count() != 1 || !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_first}) {
+			fmt.eprintf("[ui-probe] the brush stopped painting after release (count %d)\n", keyframe_sel_count())
 			ok = false
 		}
 
 		// 6. Esc cancels the mode without touching the selection.
-		kf_clear()
+		keyframe_clear()
 		escape_dismiss()
-		if kf_brush_armed {
+		if keyframe_brush_armed {
 			fmt.eprintf("[ui-probe] Esc must cancel the brush\n")
 			ok = false
 		}
-		if kf_sel_count() != 0 {
-			fmt.eprintf("[ui-probe] Esc changed the selection to %d keys\n", kf_sel_count())
+		if keyframe_sel_count() != 0 {
+			fmt.eprintf("[ui-probe] Esc changed the selection to %d keys\n", keyframe_sel_count())
 			ok = false
 		}
 
 		// 7. A plain press cancels the mode too — central in the click dispatch, so it
 		// cannot be forgotten by an individual handler.
 		press(x_empty, y_empty, true)
-		if !kf_brush_armed {
+		if !keyframe_brush_armed {
 			fmt.eprintf("[ui-probe] fixture failed to re-arm the brush\n")
 			return false
 		}
 		press(x_b, y_b, false)
-		if kf_brush_armed {
+		if keyframe_brush_armed {
 			fmt.eprintf("[ui-probe] a plain press must cancel the brush\n")
 			ok = false
 		}
@@ -2514,7 +2514,7 @@ when ODIN_DEBUG {
 		ok := true
 		// See the brush probe: a leaked double-click record would turn this probe's
 		// press into a seek before it can test the click/drag split.
-		kf_dbl_click = {}
+		keyframe_dbl_click = {}
 		build_page(1920, 1600)
 		cl := &timeline.tracks[0].clips[0]
 		// Find the lane, do not assume index 0: the geometry layer renames and
@@ -2536,7 +2536,7 @@ when ODIN_DEBUG {
 		}
 		defer {
 			undo_cancel()
-			kf_clear()
+			keyframe_clear()
 			selection = {}
 			build_page(1920, 1600)
 		}
@@ -2547,12 +2547,12 @@ when ODIN_DEBUG {
 		// tracks, which invalidates the INDEX but not the view -- the pool block is
 		// fixed, so published bytes never move. This is the property the clone used
 		// to be protecting against, now gone at the source.
-		lane_name := kf_track_name(session_trk_view(cl.keyframe_tracks,lane))
-		f_a := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, 0).frame_off
-		f_b := session_kf_at(session_trk_view(cl.keyframe_tracks,lane)^.keys, 1).frame_off
+		lane_name := keyframe_track_name(session_trk_view(cl.keyframe_tracks,lane))
+		f_a := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), 0).frame_off
+		f_b := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), 1).frame_off
 		box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-		x_a, y := kf_key_center(box, lane, f_a)
-		x_b, _ := kf_key_center(box, lane, f_b)
+		x_a, y := keyframe_key_center(box, lane, f_a)
+		x_b, _ := keyframe_key_center(box, lane, f_b)
 		if x_b - x_a < KF_DRAG_THRESHOLD_PX * 2 {
 			fmt.eprintf(
 				"[ui-probe] click/drag fixture keys are %v px apart, too close to grab one\n",
@@ -2567,14 +2567,14 @@ when ODIN_DEBUG {
 		drag :: proc(x, y: f32) {
 			interaction_move(Mouse_Input{x, y, true, false, false, false, false, false}, true, 1600)
 		}
-		ref_a, ref_b := Kf_Ref{0, 0, lane, 0}, Kf_Ref{0, 0, lane, 1}
-		run := [?]Kf_Ref{ref_a, ref_b}
+		ref_a, ref_b := Keyframe_Ref{0, 0, lane, 0, 0}, Keyframe_Ref{0, 0, lane, 0, 1}
+		run := [?]Keyframe_Ref{ref_a, ref_b}
 
 		// The run under test: both keys selected, the state a brush leaves behind.
-		kf_clear()
-		kf_select_add(run[:])
-		if kf_sel_count() != 2 {
-			fmt.eprintf("[ui-probe] click/drag fixture wants a 2-key run, got %d\n", kf_sel_count())
+		keyframe_clear()
+		keyframe_select_add(run[:])
+		if keyframe_sel_count() != 2 {
+			fmt.eprintf("[ui-probe] click/drag fixture wants a 2-key run, got %d\n", keyframe_sel_count())
 			return false
 		}
 
@@ -2582,10 +2582,10 @@ when ODIN_DEBUG {
 		// run intact. It used to narrow on mouse-down, so grabbing one key of a run to
 		// retime it silently deselected the rest before the drag even started.
 		press(x_b, y)
-		if kf_sel_count() != 2 {
+		if keyframe_sel_count() != 2 {
 			fmt.eprintf(
 				"[ui-probe] pressing a selected key collapsed the run to %d keys on mouse-down\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2600,7 +2600,7 @@ when ODIN_DEBUG {
 		want_a, want_b := f_a + drag_frames, f_b + drag_frames
 		drag(x_b + f32(drag_frames) * timeline_view.zoom, y)
 		interaction_release(Mouse_Input{x_b, y, false, false, false, false, false, false})
-		got := kf_frames_by_name(cl^, lane_name)
+		got := keyframe_frames_by_name(cl^, lane_name)
 		want := [2]i32{want_a, want_b}
 		if got != want {
 			fmt.eprintf(
@@ -2610,10 +2610,10 @@ when ODIN_DEBUG {
 			)
 			ok = false
 		}
-		if kf_sel_count() != 2 {
+		if keyframe_sel_count() != 2 {
 			fmt.eprintf(
 				"[ui-probe] the drag left %d keys selected, want the whole run\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2621,38 +2621,38 @@ when ODIN_DEBUG {
 		// 3. The other half: a press with NO drag narrows on mouse-up, and moves
 		// nothing. This is the click that replaces the run, now decided at release.
 		box = clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-		moved_lane, found := kf_lane_by_name(cl^, lane_name)
+		moved_lane, found := keyframe_lane_by_name(cl^, lane_name)
 		if !found {
 			fmt.eprintf("[ui-probe] the dragged lane vanished from the store\n")
 			return false
 		}
-		ref_a_moved := Kf_Ref{0, 0, moved_lane, 0}
-		cx, cy := kf_key_center(box, moved_lane, want_a)
+		ref_a_moved := Keyframe_Ref{0, 0, moved_lane, 0, 0}
+		cx, cy := keyframe_key_center(box, moved_lane, want_a)
 		press(cx, cy)
 		interaction_release(Mouse_Input{cx, cy, false, false, false, false, false, false})
-		if kf_sel_count() != 1 || !kf_sel_contains(ref_a_moved) {
+		if keyframe_sel_count() != 1 || !keyframe_sel_contains(ref_a_moved) {
 			fmt.eprintf(
 				"[ui-probe] clicking a selected key without dragging left %d keys selected, want 1\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
-		if got := kf_frames_by_name(cl^, lane_name); got != want {
+		if got := keyframe_frames_by_name(cl^, lane_name); got != want {
 			fmt.eprintf("[ui-probe] the click-without-drag moved the frames to %v\n", got)
 			ok = false
 		}
 
 		// 4. A press on a key OUTSIDE the selection narrows immediately, so dragging
 		// it moves the key that was grabbed rather than the run that was selected.
-		bx, by := kf_key_center(box, moved_lane, want_b)
-		one := [?]Kf_Ref{ref_a_moved}
-		kf_clear()
-		kf_select_add(one[:])
+		bx, by := keyframe_key_center(box, moved_lane, want_b)
+		one := [?]Keyframe_Ref{ref_a_moved}
+		keyframe_clear()
+		keyframe_select_add(one[:])
 		press(bx, by)
-		if kf_sel_count() != 1 || kf_sel_contains(ref_a_moved) {
+		if keyframe_sel_count() != 1 || keyframe_sel_contains(ref_a_moved) {
 			fmt.eprintf(
 				"[ui-probe] pressing an UNselected key left %d selected, want just the grabbed one\n",
-				kf_sel_count(),
+				keyframe_sel_count(),
 			)
 			ok = false
 		}
@@ -2664,26 +2664,26 @@ when ODIN_DEBUG {
 		return ok
 	}
 
-	// kf_lane_by_name finds a lane by its track name, at an index that is only valid
+	// keyframe_lane_by_name finds a lane by its track name, at an index that is only valid
 	// for the current build. A probe must not cache a lane INDEX across a store op:
 	// the geometry layer can mint or retire lanes while re-landing keys, which slides
 	// every index after it.
-	kf_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
+	keyframe_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
 		for i in 0 ..< cl.keyframe_tracks.n {
-			if kf_track_name(session_trk_view(cl.keyframe_tracks,i)) == name {
+			if keyframe_track_name(session_trk_view(cl.keyframe_tracks,i)) == name {
 				return i, true
 			}
 		}
 		return -1, false
 	}
 
-	// kf_frames_by_name is the frame list of the named lane, as a fixed pair so a
+	// keyframe_frames_by_name is the frame list of the named lane, as a fixed pair so a
 	// probe can compare it with == and get one readable failure instead of two.
-	kf_frames_by_name :: proc(cl: Clip, name: string) -> [2]i32 {
-		li, ok := kf_lane_by_name(cl, name)
-		assert(ok, "kf_frames_by_name: the probe's lane vanished from the store")
+	keyframe_frames_by_name :: proc(cl: Clip, name: string) -> [2]i32 {
+		li, ok := keyframe_lane_by_name(cl, name)
+		assert(ok, "keyframe_frames_by_name: the probe's lane vanished from the store")
 		keys := session_trk_view(cl.keyframe_tracks,li).keys
-		assert(keys.n == 2, "kf_frames_by_name wants exactly the 2 keys its fixture selected")
+		assert(keys.n == 2, "keyframe_frames_by_name wants exactly the 2 keys its fixture selected")
 		return [2]i32{session_kf_at(keys,0).frame_off, session_kf_at(keys,1).frame_off}
 	}
 	// ui_probe_clip_tile_width_asserts holds the tile to the model's width. A tile
@@ -2740,9 +2740,9 @@ when ODIN_DEBUG {
 	// a delete that merely removed the clip (or silently did nothing) is the bug.
 	ui_probe_backspace_ripple_asserts :: proc() -> bool {
 		ok := true
-		kf_dbl_click = {}
-		kf_clear()
-		kf_brush_disarm()
+		keyframe_dbl_click = {}
+		keyframe_clear()
+		keyframe_brush_disarm()
 		build_page(1920, 1600)
 		if len(timeline.tracks) == 0 || len(timeline.tracks[0].clips) < 3 {
 			fmt.eprintf("[ui-probe] backspace ripple fixture wants 3+ clips on track 0\n")
@@ -2778,8 +2778,8 @@ when ODIN_DEBUG {
 			return false
 		}
 		defer {
-			kf_clear()
-			kf_brush_disarm()
+			keyframe_clear()
+			keyframe_brush_disarm()
 			// Release session ranges held by rebuilt clips before restoring backup.
 			for &c in track.clips {
 				clip_ranges_release(&c)
@@ -3102,14 +3102,14 @@ when ODIN_DEBUG {
 		// Track names are heap clones (not literals): the project-file round-trip
 		// later tears this session down, and free_timeline frees keyframe-track
 		// names, exactly as a real session's are freed.
-		kf0 := &timeline.tracks[0].clips[0]
-		kf0.keyframe_tracks = Kf_Track_Range{}
-		session_trk_push(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("transform.x"), keys = Kf_Keys_Range{}})
-		track0 := session_trk_view_mut(&kf0.keyframe_tracks, 0)
+		fixture_clip := &timeline.tracks[0].clips[0]
+		fixture_clip.keyframe_tracks = Keyframe_Track_Range{}
+		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("transform.x"), keys = Keyframe_Keys_Range{}})
+		track0 := session_trk_view_mut(&fixture_clip.keyframe_tracks, 0)
 		session_kf_push(&track0.keys, Keyframe{frame_off=0,value=0})
 		session_kf_push(&track0.keys, Keyframe{frame_off=120,value=1})
-		session_trk_push(&kf0.keyframe_tracks, Kf_Track {name = session_str_intern("zoom"), keys = Kf_Keys_Range{}})
-		track1 := session_trk_view_mut(&kf0.keyframe_tracks, 1)
+		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("zoom"), keys = Keyframe_Keys_Range{}})
+		track1 := session_trk_view_mut(&fixture_clip.keyframe_tracks, 1)
 		session_kf_push(&track1.keys, Keyframe{frame_off=30,value=1})
 
 		sync_track_order()

@@ -25,7 +25,7 @@ package vyper
 //     two evaluators must agree on scale, transform, crop, opacity and the
 //     rounded destination box. This is the check that FALSIFIED a suspected
 //     keyframe-offset bug: both samplers convert a timeline frame to the
-//     clip-relative offset internally (kf_geom_sample_lane -> kf_sample_for),
+//     clip-relative offset internally (keyframe_geom_sample_lane -> keyframe_sample_for),
 //     so they agree, and the probe reporting agreement is what said so.
 //
 // The fixture mode exists because a gate needs a project that reliably breaks
@@ -794,7 +794,7 @@ when ODIN_DEBUG {
 					clip.transform_y,
 					"opacity",
 					clip.opacity,
-					"kf_tracks",
+					"keyframe_tracks",
 					clip.keyframe_tracks.n,
 				)
 			}
@@ -972,7 +972,7 @@ when ODIN_DEBUG {
 				v.geom.opacity_keyed,
 				"stage_scale",
 				v.stage_scale,
-				"kf_keys",
+				"keyframe_keys",
 				keys,
 				"base_scale",
 				v.geom.base[int(Render_Geom_Prop.Scale)],
@@ -1002,7 +1002,7 @@ when ODIN_DEBUG {
 				t.geom.scale_keyed,
 				"opacity_keyed",
 				t.geom.opacity_keyed,
-				"kf_keys",
+				"keyframe_keys",
 				keys,
 				"base_scale",
 				t.geom.base[int(Render_Geom_Prop.Scale)],
@@ -1028,7 +1028,7 @@ when ODIN_DEBUG {
 				s.geom.scale_keyed,
 				"opacity_keyed",
 				s.geom.opacity_keyed,
-				"kf_keys",
+				"keyframe_keys",
 				keys,
 				"base_scale",
 				s.geom.base[int(Render_Geom_Prop.Scale)],
@@ -1127,8 +1127,8 @@ when ODIN_DEBUG {
 					continue
 				}
 				clip.timeline_start_frame = 5
-				kf_set_key(&clip, "scale", 0, 1.0)
-				kf_set_key(&clip, "scale", 10, 0.5)
+				keyframe_set_key(&clip, "scale", 0, 1.0)
+				keyframe_set_key(&clip, "scale", 10, 0.5)
 			}
 		}
 		// A KEYED TEXT CLIP on its own track, spanning frames the video does not, so
@@ -1160,7 +1160,7 @@ when ODIN_DEBUG {
 	//
 	// The keys use a whole-transform section plus a per-lane opacity, so both
 	// storage forms are in the snapshot: a packed section (mask != 0, which
-	// kf_geom_fill_snapshot has to unpack per lane) and a scalar lane.
+	// keyframe_geom_fill_snapshot has to unpack per lane) and a scalar lane.
 	parity_probe_add_keyed_text :: proc() {
 		// sync_track_order FIRST: it is what turns track_order into a permutation of
 		// the existing tracks, and injecting into a not-yet-synced order duplicates an
@@ -1196,13 +1196,13 @@ when ODIN_DEBUG {
 		packed: [KF_PACK_MAX]f32
 		packed[0] = 40
 		packed[1] = 60
-		kf_geom_set_packed(clip, "transform", 0, packed, 0b11)
+		keyframe_geom_set_packed(clip, "transform", 0, packed, 0b11)
 		packed[0] = 200
 		packed[1] = 140
-		kf_geom_set_packed(clip, "transform", 19, packed, 0b11)
+		keyframe_geom_set_packed(clip, "transform", 19, packed, 0b11)
 		// opacity as its own scalar lane, so both storage forms are in the snapshot.
-		kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 0, 1.0)
-		kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 19, 0.25)
+		keyframe_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 0, 1.0)
+		keyframe_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Opacity), 19, 0.25)
 		// scale keyed as well, because scale is the one lane that is BAKED into the
 		// text raster rather than applied per frame: it drives text_job_rescale, which
 		// allocates a new raster and frees the stale one every frame the scale moves.
@@ -1210,8 +1210,8 @@ when ODIN_DEBUG {
 		// that most needs a gate -- and parity_valgrind only sees it if the fixture
 		// animates scale. A fixture keying only transform would leave the re-bake
 		// path entirely unexercised while still reporting a clean memcheck.
-		kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Scale), 0, 1.0)
-		kf_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Scale), 19, 1.8)
+		keyframe_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Scale), 0, 1.0)
+		keyframe_geom_set_lane_key(clip, render_geom_name(Render_Geom_Prop.Scale), 19, 1.8)
 		sync_track_order()
 	}
 

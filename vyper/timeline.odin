@@ -504,14 +504,14 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 		return
 	}
 	ratio := f64(new_len) / f64(old_len)
-	// Rebuilt rather than edited in place, the same shape kf_trim_head uses: the
+	// Rebuilt rather than edited in place, the same shape keyframe_trim_head uses: the
 	// key store is a session window, so replacing the range wholesale is what keeps
 	// a shared range (two clips aliasing one set of keys) from having its offsets
 	// rewritten under the other clip.
-	out := Kf_Track_Range{}
+	out := Keyframe_Track_Range{}
 	for si in 0 ..< clip.keyframe_tracks.n {
 		st := session_trk_view(clip.keyframe_tracks, si)
-		r := Kf_Keys_Range{}
+		r := Keyframe_Keys_Range{}
 		prev := i32(-1)
 		for ki in 0 ..< st.keys.n {
 			k := session_kf_at(st.keys, ki)
@@ -533,14 +533,14 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 			session_kf_push(&r, Keyframe{frame_off = off, mask = k.mask, value = k.value, interp = k.interp})
 		}
 		if r.n > 0 {
-			session_trk_push(&out, Kf_Track{name = st.name, keys = r})
+			session_trk_push(&out, Keyframe_Track{name = st.name, keys = r})
 		} else {
 			session_kf_release(r)
 		}
 	}
 	old := clip.keyframe_tracks
 	clip.keyframe_tracks = out
-	kf_free_tracks(old)
+	keyframe_free_tracks(old)
 }
 
 // add_text_generator_clip inserts a 1-second Text generator clip on `track`,
@@ -1149,16 +1149,16 @@ split_clip_at_playhead :: proc() {
 		// Split remap (slice-1 rule): left keeps keys < left_len, right gets
 		// keys >= left_len re-relativized by -left_len; both read source before
 		// either candidate replaces it.
-		kf_bump_structure()
-		c.keyframe_tracks = kf_rebuild_tracks(source_tracks, 0, i32(left_len))
-		right.keyframe_tracks = kf_rebuild_tracks(source_tracks, i32(left_len), KF_MAX_OFFSET)
+		keyframe_bump_structure()
+		c.keyframe_tracks = keyframe_rebuild_tracks(source_tracks, 0, i32(left_len))
+		right.keyframe_tracks = keyframe_rebuild_tracks(source_tracks, i32(left_len), KF_MAX_OFFSET)
 		// A lane interpolating ACROSS the cut is severed by the partition above:
 		// the left tail would hold its last pre-cut key and the right head would
 		// ramp from the pre-split resting value. Rejoin them with the value the
 		// curve actually reads at the cut, read from the pre-split range.
-		kf_split_preserve_continuity(source_tracks, c, &right, i32(left_len))
+		keyframe_split_preserve_continuity(source_tracks, c, &right, i32(left_len))
 		session_marker_release(source_markers)
-		kf_free_tracks(source_tracks)
+		keyframe_free_tracks(source_tracks)
 		inject_at_elem(&tt.clips, target.index + 1, right)
 	}
 	when ODIN_DEBUG {
@@ -1316,9 +1316,9 @@ clip_marker_mut :: proc(c: ^Clip, i: int) -> ^Clip_Marker {
 // arenas. Shared ranges remain reserved for the other Clip/undo snapshot.
 clip_ranges_release :: proc(c: ^Clip) {
 	session_marker_release(c.markers)
-	kf_free_tracks(c.keyframe_tracks)
+	keyframe_free_tracks(c.keyframe_tracks)
 	c.markers = Clip_Markers_Range{}
-	c.keyframe_tracks = Kf_Track_Range{}
+	c.keyframe_tracks = Keyframe_Track_Range{}
 }
 
 // delete_selected_clip_raw removes the selected clip (and, when it belongs to a
@@ -1460,11 +1460,11 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			)
 			// Left keeps keys < cut; right keeps keys >= cut and re-relativizes.
 			cut := i32(start - cs)
-			kf_bump_structure()
-			left.keyframe_tracks = kf_rebuild_tracks(source_tracks, 0, cut)
-			right.keyframe_tracks = kf_rebuild_tracks(source_tracks, cut, KF_MAX_OFFSET)
+			keyframe_bump_structure()
+			left.keyframe_tracks = keyframe_rebuild_tracks(source_tracks, 0, cut)
+			right.keyframe_tracks = keyframe_rebuild_tracks(source_tracks, cut, KF_MAX_OFFSET)
 			session_marker_release(source_markers)
-			kf_free_tracks(source_tracks)
+			keyframe_free_tracks(source_tracks)
 			append(&new_clips, left)
 			append(&new_clips, right)
 		case cs < start:
@@ -1476,7 +1476,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 				c.source_start_frame,
 				c.source_length_frames,
 			)
-			kf_trim_tail(&c, i32(start - cs))
+			keyframe_trim_tail(&c, i32(start - cs))
 			append(&new_clips, c)
 			session_marker_release(old_markers)
 		case ce > end:
@@ -1500,7 +1500,7 @@ ripple_delete_track_region :: proc(ti: int, start, length: i64) {
 			// Keyframes are clip-relative: head trimmed off means keys <
 			// (start-cs) go with the removed head, survivors re-relativize by
 			// - (start-cs).
-			kf_trim_head(&c, i32(start - cs))
+			keyframe_trim_head(&c, i32(start - cs))
 			append(&new_clips, c)
 			session_marker_release(old_markers)
 		case cs >= start && ce <= end:
