@@ -1315,7 +1315,63 @@ when ODIN_DEBUG {
 		)
 	}
 
+	// A split must not trap on a PACKED section track. A section track's key.value
+	// union holds a [KF_PACK_MAX]f32 payload, so every SCALAR sampler -- including
+	// the one the continuity fix uses to read the value at the cut -- asserts .(f32)
+	// and traps at runtime. The probe that proved the scalar case used a scalar
+	// `gain` lane, so nothing in the suite ever split a clip that ALSO carried a
+	// packed transform/crop group; the trap only appeared against a real project.
+	kf_split_packed_section_does_not_trap :: proc() {
+		timeline = Timeline{tracks = make([dynamic]Track, 0, 1, context.temp_allocator)}
+		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+		append(
+			&timeline.tracks[0].clips,
+			Clip{
+				clip_id              = 9201,
+				source_start_frame   = 0,
+				source_length_frames = 100,
+				timeline_start_frame = 0,
+				kind                 = .Video,
+			},
+		)
+		c := &timeline.tracks[0].clips[0]
+		// A packed transform group straddling the cut: keys before AND after, so the
+		// partition severs it -- exactly the case the fix must survive.
+		packed := [KF_PACK_MAX]f32{0, 0, 0, 0, 0, 0, 0}
+		packed[0], packed[1] = 0.0, 0.0
+		kf_geom_set_packed(c, "transform", 0, packed, 0b11)
+		moved := [KF_PACK_MAX]f32{0, 0, 0, 0, 0, 0, 0}
+		moved[0], moved[1] = 50.0, 50.0
+		kf_geom_set_packed(c, "transform", 100, moved, 0b11)
+		selection.track = 0
+		selection.index = 0
+		clear(&selection.extra_set)
+		playhead.frame = 50
+		timeline_view.start = 0
+		// If the fix sampled this track it would trap here, aborting the probe.
+		split_clip_at_playhead()
+		kf_probe_check(
+			len(timeline.tracks[0].clips) == 2,
+			"packed-section split must still produce 2 clips (got %d)",
+			len(timeline.tracks[0].clips),
+		)
+		if len(timeline.tracks[0].clips) == 2 {
+			// The scalar lane still gets its boundary treatment: this clip has one
+			// packed track and no scalar one, so both halves keep the packed track
+			// partitioned without being seeded. Nothing to assert beyond survival --
+			// the packed SEEDING is the known open item.
+			kf_probe_check(
+				timeline.tracks[0].clips[0].keyframe_tracks.n >= 1 &&
+					timeline.tracks[0].clips[1].keyframe_tracks.n >= 1,
+				"each half must keep the packed lane (got %d/%d)",
+				timeline.tracks[0].clips[0].keyframe_tracks.n,
+				timeline.tracks[0].clips[1].keyframe_tracks.n,
+			)
+		}
+	}
+
 		kf_split_mid_interp()
+		kf_split_packed_section_does_not_trap()
 		if kf_probe_fail {
 			fmt.println("[kf-probe] summary: FAIL")
 			return 1

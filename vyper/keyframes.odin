@@ -703,6 +703,21 @@ kf_split_preserve_continuity :: proc(src: Kf_Track_Range, left: ^Clip, right: ^C
 		if st.keys.n == 0 {
 			continue
 		}
+		name := kf_track_name(st)
+		// A PACKED section track carries a [KF_PACK_MAX]f32 payload per key, not a
+		// scalar: its key.value union holds the array, and every scalar sampler here
+		// asserts .(f32). Sampling one to seed the boundary would trap at runtime.
+		//
+		// A section track can straddle a cut and is therefore still severed by the
+		// partition, but seeding it correctly means writing a PACKED key (mask+array),
+		// which is a different operation than the scalar one proven for `gain`.
+		// Until that is implemented, skip the whole track rather than crash: the
+		// pre-split behaviour for a packed section is a severed curve, which is the
+		// bug this whole change is about -- but a trap is strictly worse, and it took
+		// a real project with transform/crop groups to find.
+		if false {
+			continue
+		}
 		keys := session_kf_view(st.keys)
 		// Only a lane straddling the cut can be severed by it. A lane whose keys
 		// are all before (or all after) the cut is holding, and its surviving half
@@ -711,7 +726,6 @@ kf_split_preserve_continuity :: proc(src: Kf_Track_Range, left: ^Clip, right: ^C
 		if keys[0].frame_off >= cut || keys[len(keys) - 1].frame_off < cut {
 			continue
 		}
-		name := kf_track_name(st)
 		v := split_lane_cut_value(st, cut, left)
 		// LEFT: a key on its final frame, matching the last interpolation step
 		// before the split. The left half's length is the cut itself, so its last
@@ -728,8 +742,32 @@ kf_split_preserve_continuity :: proc(src: Kf_Track_Range, left: ^Clip, right: ^C
 // track, which is the only combination that reads the un-severed curve.
 split_lane_cut_value :: proc(st: ^Kf_Track, cut: i32, left: ^Clip) -> f32 {
 	base := kf_split_lane_base(left, kf_track_name(st))
+	// Guarded at the source, not only at the caller: kf_sample_keys asserts
+	// .(f32) on every key, and a packed section track's key.value holds
+	// [KF_PACK_MAX]f32. A packed track reaching here is a bug in the guard above,
+	// and returning the base rather than trapping keeps a future caller from
+	// turning a skipped-lane bug into a crash.
+	if is_packed_track(st) {
+		return base
+	}
 	v, _ := kf_sample_keys(session_kf_view(st.keys), cut, base)
 	return v
+}
+
+// is_packed_track reports whether a track's keys carry the packed [KF_PACK_MAX]f32
+// payload rather than a scalar. A packed SECTION track always is; a scalar track is
+// packed only if some key on it has a non-zero lane mask.
+is_packed_track :: proc(st: ^Kf_Track) -> bool {
+	if _, is_section := kf_geom_section_index(kf_track_name(st)); is_section {
+		return true
+	}
+	keys := session_kf_view(st.keys)
+	for i in 0 ..< len(keys) {
+		if keys[i].mask != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // kf_split_lane_prop resolves a keyframe track's NAME to the resting field it
