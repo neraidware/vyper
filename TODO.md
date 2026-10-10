@@ -8939,3 +8939,59 @@ Gates: `check`, `keyframe_probe`, `geom_key_probe`, `timeline_probe`,
 - [ ] Trim (kf_trim_head/kf_trim_tail) has the same severing shape at a head/tail
   cut and is untouched.
 - [ ] Not exercised in the editor.
+
+### Active 52 — The keyframe store: delete the collapse, per-lane scalar only
+
+**Status: DESIGNED, work starting.** The scalar/packed union and the two-way
+value-exact collapse between the forms is the root of the trap fixed in 871c444
+and of the still-open "packed section is severed by a split" gap. The user
+directed: scalars only, delete collapse.
+
+#### Why collapse exists at all, and why deleting it is a simplification not a loss
+
+One animation has two storage forms that never coexist:
+- PACKED: one track named for the section ("transform"), knots carry `mask` +
+  `[KF_PACK_MAX]f32`.
+- SCALAR: one track per lane ("transform.x", "transform.y"), scalar knots.
+
+`kf_geom_unwrap_section` (packed->scalar, when you key one lane) and
+`kf_geom_fold_lanes` (scalar->packed, when you key the whole group) migrate
+between them, value-exact and round-tripping. `mask` says which form a knot is;
+`kf_lane_value` reads one lane out of a packed knot.
+
+**Every one of those mechanisms exists only because scalar and packed are
+different TYPES.** With a track as a set of scalar LANES there is one form:
+keying a group writes the value into each lane at that frame; keying one lane
+writes into that lane. So `kf_geom_fold_lanes`, `kf_geom_unwrap_section`,
+`kf_lane_value`, `mask`, `KF_PACK_MAX` and the packed branch of the samplers are
+deleted outright, not redesigned. The trap becomes unrepresentable.
+
+The section table (`kf_geom_sections`) survives as a UI-ONLY grouping (which lanes
+share a diamond and a group-key button), with no storage consequence.
+
+#### Copy-cost measurement (the gating question, resolved)
+
+`Kf_Keys_Range` is a window `(first, slots)` into a global arena
+(`session_kf_keys`), so an arena track copy is two ints. The worry was that
+per-lane owned arrays make every undo snapshot copy N arrays instead.
+
+Measured from the code: `clone_timeline` (undo.odin:94) calls
+`session_trk_share`, which sets `shared = true` and RETURNS THE RANGE -- it does
+NOT deep-copy. Deep copy happens only lazily on the first WRITE to a shared range
+(`session_kf_make_unique`). So per-lane costs one extra loop on the first write
+to a shared lane, not on every clone. **Per-lane is not more expensive per clone
+than the arena.** The blocker is gone.
+
+#### The one real cost, stated plainly
+
+A group key becomes N knots (one per lane) instead of one packed knot. On
+screen it is value-identical -- the group diamond still reads as one -- but crop
+(4 lanes) writes 4 keys per group-key. Accepted: correctness and the elimination
+of the form ambiguity are worth more than key count, and the keys are tiny.
+
+#### Deletion surface (sized)
+
+~59 packed/mask/collapse references outside the store across clip_geom, state, ui,
+interaction, render, event, timeline, edit; ~53 in the store (keyframes.odin).
+The store's arena API (session_kf, ~20 procs) and the track store (session_trk) are
+both well-contained.
