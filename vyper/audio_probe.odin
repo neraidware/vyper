@@ -4656,4 +4656,56 @@ when ODIN_DEBUG {
 		return true
 	}
 
+	// The scrub path retunes the atempo graph IN PLACE: a velocity change writes
+	// each stage's tempo and leaves the graph OBJECT standing. This is the whole
+	// point -- the old path destroyed and rebuilt the chain on every change, and
+	// the replay measured ~800 rebuilds across a single drag.
+	//
+	// What is asserted is observable, not self-reported: the graph pointer is
+	// IDENTICAL across the whole sweep (a rebuild cannot be distinguished by
+	// pointer here -- the old path proved that, since a freed graph reallocated at
+	// the same address), so identity is only half the proof; the other half is
+	// that every tempo write is ACCEPTED, which is the write whose rejection
+	// aborts libavfilter's pull loop.
+	audio_probe_retune :: proc() -> bool {
+		atempo_graph_destroy(&audio_atempo)
+		atempo_graph_build_fixed(&audio_atempo, ATEMPO_SCRUB_STAGES)
+		if audio_atempo.graph == nil {
+			fmt.println("[ap] retune: FAIL: fixed graph did not build")
+			return false
+		}
+		graph := audio_atempo.graph
+		fmt.printf("[ap] retune: fixed graph %d stage(s)\n", audio_atempo.n_stages)
+		swing := []f64{0.4, 3.5, 0.3, 2.0, 4.0, 0.25, 1.0}
+		for r in swing {
+			if !atempo_rate_set_inplace(&audio_atempo, r) {
+				fmt.printf("[ap] retune: FAIL: setter refused %.2fx\n", r)
+				return false
+			}
+			if audio_atempo.graph != graph {
+				fmt.printf("[ap] retune: FAIL: retune to %.2fx replaced the graph\n", r)
+				return false
+			}
+			factor :=
+				clamp(
+					math.pow(r, 1.0 / f64(audio_atempo.n_stages)),
+					ATEMPO_CHAIN_MIN_TEMPO,
+					ATEMPO_CHAIN_MAX_TEMPO,
+				)
+			for i in 0 ..< audio_atempo.n_stages {
+				if avutil.opt_set_double(
+					transmute(rawptr)audio_atempo.stages[i].priv,
+					cstring("tempo"),
+					factor,
+					0,
+				) < 0 {
+					fmt.printf("[ap] retune: FAIL: stage %d rejected tempo %.4f at %.2fx\n", i, factor, r)
+					return false
+				}
+			}
+		}
+		fmt.println("[ap] retune: ok (every rate retunes in place; graph never rebuilt)")
+		atempo_graph_destroy(&audio_atempo)
+		return true
+	}
 }

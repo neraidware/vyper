@@ -40,6 +40,12 @@ ATEMPO_MAX_STAGES :: 8
 ATEMPO_CHAIN_MIN_TEMPO :: 0.5
 ATEMPO_CHAIN_MAX_TEMPO :: 2.0
 
+// ATEMPO_SCRUB_STAGES is how many atempo stages the SCRUB graph is built with.
+// Two stages span 0.25x..4.0x with each stage inside [0.5, 2.0] at the extremes:
+// 0.25x = 0.5 x 0.5, 4.0x = 2.0 x 2.0. Fixed, so a velocity change only rewrites
+// the per-stage tempo instead of changing the chain's LENGTH.
+ATEMPO_SCRUB_STAGES :: 2
+
 // ATEMPO_IN_POOL is the number of refcounted staging frames for input. We
 // round-robin them so we never clobber a frame the graph still holds; atempo
 // consumes each pushed frame when it reads it, and its window is a couple of
@@ -351,6 +357,109 @@ atempo_graph_build :: proc(g: ^Atempo_Graph, rate: f64, pitch_ratio: f64 = 1.0) 
 	}
 
 	atempo_finish(graph, g, prev)
+}
+
+// atempo_graph_build_fixed constructs the SAME abuffer->atempo*->aformat->abuffersink
+// chain as atempo_graph_build, but with a FIXED number of atempo stages each
+// configured at the MAXIMUM tempo, ready to be retuned in place.
+//
+// The stages are built at tempo=ATEMPO_CHAIN_MAX_TEMPO rather than at the
+// requested rate because atempo sizes its internal ring from the tempo present
+// when the filter is CONFIGURED, and asserts `read_size <= ring` on every pull.
+// A ring sized for the rate it was built at cannot absorb a later retune upward:
+// the first fast scrub aborts the process inside libavfilter
+// (af_atempo.c:445). A ring sized for the maximum makes every later retune read
+// LESS than the ring holds, so the invariant holds across the whole range.
+//
+// stage_count stages each carrying rate^(1/stage_count) spans
+// [MIN^(1/n), MAX^(1/n)] per stage, so every stage stays inside atempo's own
+// [ATEMPO_CHAIN_MIN_TEMPO, ATEMPO_CHAIN_MAX_TEMPO] window.
+atempo_graph_build_fixed :: proc(g: ^Atempo_Graph, stage_count: int) {
+	atempo_graph_destroy(g)
+	g.rate = 1.0
+	g.pitch_ratio = 1.0
+	// clamp into [1, ATEMPO_MAX_STAGES]; proc parameters are immutable in Odin.
+	n := clamp(stage_count, 1, ATEMPO_MAX_STAGES)
+
+	graph := avfilter.graph_alloc()
+	if graph == nil {
+		fmt.println("[atempo] graph_alloc failed")
+		return
+	}
+	g.graph = graph
+
+	ret := avfilter.graph_create_filter(
+		&g.src,
+		avfilter.get_by_name("abuffer"),
+		cstring("in"),
+		cstring("sample_rate=48000:sample_fmt=flt:channel_layout=stereo"),
+		nil,
+		graph,
+	)
+	if ret < 0 || g.src == nil {
+		fmt.printf("[atempo] abuffer create: %s\n", ff_err_str(ret))
+		atempo_graph_destroy(g)
+		return
+	}
+
+	prev := g.src
+	for s in 0 ..< n {
+		name_buf: [32]u8
+		fmt.bprintf(name_buf[:], "atempo%d", s)
+		// MAXIMUM tempo, not the requested one -- see the header.
+		ctx := atempo_link_stage(
+			graph,
+			prev,
+			"atempo",
+			cstring(raw_data(name_buf[:])),
+			cstring("tempo=2.000000"),
+		)
+		if ctx == nil {
+			atempo_graph_destroy(g)
+			return
+		}
+		g.stages[g.n_stages] = ctx
+		g.n_stages += 1
+		prev = ctx
+	}
+	atempo_finish(graph, g, prev)
+}
+
+// atempo_rate_set_inplace retunes an ALREADY-BUILT fixed graph by writing each
+// stage's tempo, instead of destroying and rebuilding the whole filter chain.
+//
+// This is the difference between a scrub that stays smooth and one that tears
+// the engine down on every velocity change. The rebuild path frees and
+// reallocates the entire graph, forces audio_device_clear (dropping everything
+// the device had not yet played) and re-anchors every decoder (discarding its
+// fifo); at drag speed that is hundreds of rebuilds per gesture, and the heap
+// churn underneath it is not safe to assume benign.
+//
+// Each stage takes the SAME factor, so a stage's tempo stays inside atempo's
+// own window for every rate this supports.
+atempo_rate_set_inplace :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
+	if g.graph == nil || g.n_stages <= 0 {
+		return false
+	}
+	r := rate
+	if r <= 0.0 {
+		r = 1.0
+	}
+	// n stages each at r^(1/n) multiplies out to exactly r.
+	factor := math.pow(r, 1.0 / f64(g.n_stages))
+	if factor < ATEMPO_CHAIN_MIN_TEMPO {
+		factor = ATEMPO_CHAIN_MIN_TEMPO
+	}
+	if factor > ATEMPO_CHAIN_MAX_TEMPO {
+		factor = ATEMPO_CHAIN_MAX_TEMPO
+	}
+	for i in 0 ..< g.n_stages {
+		// opt_set on the FilterContext reaches the atempo private context, which
+		// is where the "tempo" option lives.
+		avutil.opt_set_double(transmute(rawptr)g.stages[i].priv, cstring("tempo"), factor, 0)
+	}
+	g.rate = r
+	return true
 }
 
 // atempo_finish wires the tail of the graph -- aformat, abuffersink, configure -- and

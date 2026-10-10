@@ -8797,3 +8797,72 @@ lines, 5 shift-clicks, 1 scrub), so the replay cannot exercise this path; the
 probe is the coverage. Gates: `check`, `timeline_probe`, `action_log`,
 `dnd_probe`, `transform_probe`, `session_trk_probe`, `still_switch`,
 `keyframe_probe`, `smoke`, `probe`, `undo_valgrind`.
+
+### Active 50e — The scrub rate change tore down the filter graph on every velocity change
+
+**Status: FIXED, uncommitted.** The user rejected an assert-only answer ("an assert
+doesn't prevent the issue from happening again") — correctly. An assert converts a
+silent heap smash into a loud crash; it does not stop it. This removes the cause.
+
+### What the core said
+
+SIGSEGV in the producer thread:
+
+    #2  mem::copy (dst=0x7f5313dd3938, src=0x7f5313ddbd38, len=1536)
+    #3  decode_audio_chunk          audio.odin:448
+    #7  audio_reconcile             audio.odin:2172
+    #8  audio_producer_feed         audio.odin:3028
+
+`dec.s16` is 18432 bytes; `src` sits at offset **33792**, past the end. From the
+pointer args: `produced=0`, `dropped=8448`, `n=8832` — **8832 samples written into a
+4608-sample buffer**. The write at audio.odin:401 overflowed; the tail-slide at :448
+is where the corrupted heap finally faulted. (gdb's `dropped`/`n` read exactly half
+their true values for the same reason.)
+
+`audio_decoder_reserve` is correct — it grows `dec.s16` to `(produced + need) * ch`
+before the write, and `swres.convert` is bounded by the room it returns. So the
+reserve trusted a `len(dec.s16)` that was **too large**, skipped growing, and let
+`swres_convert` write past the real allocation. That is heap corruption, not a decode
+bug. lldb 23.1.1 cannot parse this core at all (`CachedFileStream was not committed`);
+gdb reads it fine.
+
+### The fix
+
+- [x] **`atempo_graph_build_fixed`** builds a fixed-length atempo chain, each stage
+  configured at the MAXIMUM tempo. atempo sizes its internal ring from the tempo
+  present at CONFIGURE time and asserts `read_size <= ring` on every pull, so a ring
+  sized for the rate it was built at cannot absorb a later retune upward — that is
+  the `af_atempo.c:445` abort. Sized for the maximum, every later retune reads LESS
+  than the ring holds, so the invariant holds across the whole range.
+- [x] **`atempo_rate_set_inplace`** retunes by writing each stage's `tempo` through
+  `av_opt_set_double` on the filter's `priv` (the ctx itself rejects the write —
+  caught by the probe, not guessed). `ATEMPO_SCRUB_STAGES = 2` spans 0.25x..4.0x with
+  each stage inside atempo's own [0.5, 2.0] window at both extremes.
+- [x] The rate-change path (audio.odin:3023) retunes in place when a graph exists.
+  The device clear + decoder re-anchor still happen on every rate change, because PCM
+  already queued was stretched at the OLD rate and is wrong the moment the rate
+  moves — what the retune removes is the teardown, not the resync.
+
+### Verified
+
+New `audio_probe_retune` (via `audio_scrub_exact`): builds the fixed graph, sweeps
+0.4 / 3.5 / 0.3 / 2.0 / 4.0 / 0.25 / 1.0 asserting the graph pointer never changes
+and every per-stage tempo write is accepted. **Red proof**: restoring
+destroy-and-rebuild inside the setter fails the probe (rc=1).
+
+Gates: all 19 audio gates plus `check`, `smoke`, `probe`, `timeline_probe`,
+`transform_probe`, `session_trk_probe`, `action_log`, `dnd_probe`, `undo_valgrind`,
+and `valgrind`.
+
+`audio_bus_rate_transition` initially FAILED on this change ("device frame moved
+backwards 17 -> 3") — a real bug: the first nil->graph build still needs the clear and
+re-anchor, because queued PCM was mixed through the bypass path. Fixed by keeping the
+resync unconditional.
+
+### Still open
+
+- [ ] The corruption SOURCE is inferred from call ordering, not demonstrated. The
+  retune removes the destructive teardown from this path; if the heap is being
+  trashed by something else, the crash can still occur.
+- [ ] Not reproduced under scrubbing. The recording has one instantaneous jump-scrub
+  and no sustained drag, so the rate-change path is not exercised by a real gesture.

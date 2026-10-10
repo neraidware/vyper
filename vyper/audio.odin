@@ -3020,7 +3020,22 @@ audio_producer_feed :: proc() {
 		)
 		fps_num, fps_den := fps_rational(fps)
 		anchor := frame_at_sample(audible_before_change, i64(fps_num), i64(fps_den))
-		atempo_rate_set(&audio_atempo, want_ratio)
+		// A graph that already exists is RETUNED, not rebuilt. Rebuilding frees and
+		// reallocates the whole filter chain underneath the producer -- at drag speed
+		// that is hundreds of graph rebuilds per gesture, and the heap churn is not
+		// something to leave in the path a scrub runs through.
+		//
+		// The graph is built at the maximum stage tempo, so a retune upward cannot
+		// overflow atempo's internal ring (see atempo_graph_build_fixed).
+		//
+		// The clear + re-anchor below still happens on every rate change: the PCM
+		// already queued was stretched at the OLD rate, so it is wrong the moment the
+		// rate moves. What the retune removes is the teardown, not the resync.
+		if audio_atempo.graph != nil && want_ratio != 1.0 {
+			atempo_rate_set_inplace(&audio_atempo, want_ratio)
+		} else {
+			atempo_rate_set(&audio_atempo, want_ratio)
+		}
 		audio_device_clear()
 		// A rate rebuild re-anchors at the audible frame it captured, which is a
 		// playhead move by definition -- the position the device had reached is

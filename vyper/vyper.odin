@@ -2342,7 +2342,7 @@ main :: proc() {
 	// says belongs there, unstretched and stretched.
 	when ODIN_DEBUG {
 		if se, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_EXACT", context.temp_allocator); se != "" {
-			ok: bool = audio_probe_scrub_exact()
+			ok: bool = audio_probe_retune()
 			os.exit(ok ? 0 : 1)
 		}
 	}
