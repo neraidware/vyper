@@ -144,6 +144,111 @@ when ODIN_DEBUG {
 		timeline_view.start = saved_start
 	}
 
+
+	// ui_probe_zoom_skew (VYPER_ZOOM_SKEW_PROBE=<project.vyproj>) proves the
+	// ORDERING defect between the two timeline renderers.
+	//
+	// Clay lays the timeline out ONCE per frame in build_page and BAKES the tiles
+	// and their per-track scissor commands into a command array. The GPU overlay
+	// passes (ruler, render range, markers, keyframes, drag ghosts) instead
+	// RECOMPUTE x live as `lane.x + (frame - view.start) * zoom`, reading
+	// timeline_view at draw time.
+	//
+	// A zoom click fires from the click dispatch table inside
+	// interaction_post_build, which runs AFTER build_page. So the frame that
+	// processes a zoom click bakes Clay with the OLD zoom, then mutates the view,
+	// then draws the overlay with the NEW zoom against a lane box from the OLD
+	// stream. That is a one-frame skew between the two renderers -- and the baked
+	// scissor no longer matches the overlay geometry, which is the
+	// SDL_SetGPUScissor overshoot.
+	//
+	// This probe does not need a window: it just calls the two read paths around a
+	// single simulated zoom and compares them.
+	ui_probe_zoom_skew :: proc(project_path: string) {
+		CLAY_ARENA_BYTES :: 64 * 1024 * 1024
+		memory := make([^]u8, CLAY_ARENA_BYTES)
+		clay.Initialize(
+			clay.CreateArenaWithCapacityAndMemory(c.size_t(CLAY_ARENA_BYTES), memory),
+			{WINDOW_WIDTH, WINDOW_HEIGHT},
+			{handler = clay_probe_error},
+		)
+		clay.SetMeasureTextFunction(measure_probe, nil)
+		if err := project_file_open(project_path); len(err) > 0 {
+			fmt.eprintf("[skew-probe] open %s failed: %s\n", project_path, err)
+			delete(err)
+			return
+		}
+
+		saved_zoom := timeline_view.zoom
+		saved_start := timeline_view.start
+		defer timeline_view.zoom = saved_zoom
+		defer timeline_view.start = saved_start
+
+		// The two reads, sampled the way each renderer takes them.
+		//
+		// clay_tile_x is what the baked command stream would draw: Clay laid it with
+		// whatever view state existed at build_page time.
+		// overlay_x is what draw_clip_markers/draw_keyframes compute: they read the
+		// LIVE timeline_view at draw time against a lane box.
+		//
+		// We model a frame that (a) bakes Clay at zoom Z0, then (b) applies a zoom
+		// click the way interaction_post_build does -- AFTER the bake. If the two
+		// disagree for any frame of a track, the two renderers are out of sync.
+		timeline_view.zoom = saved_zoom
+		timeline_view.start = saved_start
+		_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
+
+		// Capture the baked lane geometry at Z0, exactly as the draw reads it.
+		lane_at_zoom0 := make([]f32, len(timeline.tracks), context.temp_allocator)
+		for t in 0 ..< len(timeline.tracks) {
+			lane_at_zoom0[t] =
+				clay.GetElementData(clay.ID("ClipsSection", u32(t))).boundingBox.x
+		}
+
+		// The zoom click: same mutation timeline_zoom_about_playhead performs,
+		// applied AFTER the bake (which is what interaction_post_build does).
+		zoom_before := timeline_view.zoom
+		anchor := f32(playhead.frame - i64(timeline_view.start)) * timeline_view.zoom
+		anchor_frame := timeline_view.start + anchor / timeline_view.zoom
+		new_zoom := clamp(timeline_view.zoom * 1.5, TIMELINE_MIN_ZOOM, TIMELINE_MAX_ZOOM)
+		timeline_view.start = anchor_frame - anchor / new_zoom
+		timeline_view.start = clamp(timeline_view.start, 0, f32(timeline_duration()))
+		timeline_view.zoom = new_zoom
+
+		// Now the overlay's read on the SAME frame: live view, but the lane box
+		// from the Z0 bake (it has not been re-laid-out yet).
+		bad := 0
+		for t in 0 ..< len(timeline.tracks) {
+			lane := clay.GetElementData(clay.ID("ClipsSection", u32(t))).boundingBox.x
+			// A tile at frame F: Clay drew it at Z0, so its x is lane_at_zoom0 +
+			// the Z0 offset. The overlay computes lane(at Z0) + F*new_zoom - new_start.
+			// If those disagree, THIS FRAME draws tile and overlay in different
+			// places.
+			// Use the same F both sides so only the view/zoom differs.
+			F := f32(60)
+			clay_x := lane_at_zoom0[t] + F * zoom_before - saved_start * zoom_before
+			overlay_x := lane + F * timeline_view.zoom - timeline_view.start * timeline_view.zoom
+			if math.abs(clay_x - overlay_x) > 1.0 {
+				fmt.eprintf(
+					"[skew-probe] track %d: clay drew tile at %.1f, overlay at %.1f (skew %.1f)\n",
+					t,
+					clay_x,
+					overlay_x,
+					clay_x - overlay_x,
+				)
+				bad += 1
+			}
+		}
+		if bad > 0 {
+			fmt.eprintf(
+				"[skew-probe] FAIL: %d track(s) skewed between the baked Clay stream and the live GPU overlay on the zoom-click frame\n",
+				bad,
+			)
+			return
+		}
+		fmt.println("[skew-probe] ok: baked Clay and live overlay agreed on the zoom-click frame")
+	}
+
 	// ui_probe_clip_widths (VYPER_CLIPW_PROBE=<project.vyproj>) measures the laid-out
 	// width of every clip tile at a spread of timeline zooms, and prints the tile's
 	// own width next to the width the model implies (frames * zoom). A tile wider

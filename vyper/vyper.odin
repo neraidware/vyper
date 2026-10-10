@@ -2551,6 +2551,9 @@ main :: proc() {
 		if v, _ := os.lookup_env_alloc("VYPER_PAN_PROBE", context.temp_allocator); v != "" {
 			ui_probe_pan_shift(v)
 		}
+		if v, _ := os.lookup_env_alloc("VYPER_ZOOM_SKEW_PROBE", context.temp_allocator); v != "" {
+			ui_probe_zoom_skew(v)
+		}
 		if v, _ := os.lookup_env_alloc("VYPER_CLIPW_PROBE", context.temp_allocator); v != "" {
 			ui_probe_clip_widths(v)
 			return
