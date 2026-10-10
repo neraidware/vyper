@@ -22,6 +22,7 @@ import clay "clay-odin"
 import sdl "vendor:sdl3"
 import "core:c"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -44,6 +45,103 @@ when ODIN_DEBUG {
 	}
 
 	clay_probe_error :: proc "c" (data: clay.ErrorData) {
+	}
+
+
+	// ui_probe_pan_shift (VYPER_PAN_PROBE=<project.vyproj>) measures whether every
+	// track's clip tiles shift by the SAME delta when the timeline is panned.
+	//
+	// A pan is one childOffset on the whole ClipsSection per track, so the honest
+	// invariant is: for a given pan, track A's tiles and track B's tiles move by the
+	// same amount. Two tracks moving differently means one of them is not following
+	// the offset -- a per-track branch, a stale cached rect, or a second draw path
+	// that recomputes x from view.start while the tiles are offset by Clay.
+	ui_probe_pan_shift :: proc(project_path: string) {
+		CLAY_ARENA_BYTES :: 64 * 1024 * 1024
+		memory := make([^]u8, CLAY_ARENA_BYTES)
+		clay.Initialize(
+			clay.CreateArenaWithCapacityAndMemory(c.size_t(CLAY_ARENA_BYTES), memory),
+			{WINDOW_WIDTH, WINDOW_HEIGHT},
+			{handler = clay_probe_error},
+		)
+		clay.SetMeasureTextFunction(measure_probe, nil)
+		if err := project_file_open(project_path); len(err) > 0 {
+			fmt.eprintf("[pan-probe] open %s failed: %s\n", project_path, err)
+			delete(err)
+			return
+		}
+		fmt.printf("[pan-probe] %s: tracks=%d\n", project_path, len(timeline.tracks))
+
+		// Tile x for a clip, as laid out. The tile id is keyed by
+		// (track_idx * 1000 + index), matching ui.odin.
+		tile_x := proc(track_idx, index: int) -> f32 {
+			return clay.GetElementData(
+				clay.ID("TimelineClip", u32(track_idx * 1000 + index)),
+			).boundingBox.x
+		}
+
+		// Capture every tile's x at start=0, pan by a known amount, capture again.
+		// Read the boxes immediately after build_page, exactly as the clipw probe
+		// does -- GetElementData reflects the layout build_page just produced.
+		n_tiles := 0
+		for t in 0 ..< len(timeline.tracks) {
+			n_tiles += len(timeline.tracks[t].clips)
+		}
+		x0 := make([]f32, n_tiles, context.temp_allocator)
+		x1 := make([]f32, n_tiles, context.temp_allocator)
+		// Tile order must match between passes: (track, index) row-major.
+		saved_start := timeline_view.start
+		timeline_view.start = 0
+		_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
+		idx := 0
+		for t in 0 ..< len(timeline.tracks) {
+			for i in 0 ..< len(timeline.tracks[t].clips) {
+				x0[idx] =
+					clay.GetElementData(clay.ID("TimelineClip", u32(t * 1000 + i))).boundingBox.x
+				idx += 1
+			}
+		}
+		timeline_view.start = 250 / timeline_view.zoom
+		_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
+		idx = 0
+		for t in 0 ..< len(timeline.tracks) {
+			for i in 0 ..< len(timeline.tracks[t].clips) {
+				x1[idx] =
+					clay.GetElementData(clay.ID("TimelineClip", u32(t * 1000 + i))).boundingBox.x
+				idx += 1
+			}
+		}
+
+		// Every tile must shift by the SAME delta: -250 view px (content slides
+		// left as view.start grows).
+		want_delta := f32(-250.0)
+		bad := 0
+		idx = 0
+		for t in 0 ..< len(timeline.tracks) {
+			for i in 0 ..< len(timeline.tracks[t].clips) {
+				delta := x1[idx] - x0[idx]
+				if math.abs(delta - want_delta) > 1.0 {
+					fmt.eprintf(
+						"[pan-probe] track %d clip %d shifted %.1f, want %.1f (x %.1f -> %.1f)\n",
+						t,
+						i,
+						delta,
+						want_delta,
+						x0[idx],
+						x1[idx],
+					)
+					bad += 1
+				}
+				idx += 1
+			}
+		}
+		if bad > 0 {
+			fmt.eprintf("[pan-probe] FAIL: %d tile(s) did not follow the pan\n", bad)
+			timeline_view.start = saved_start
+			return
+		}
+		fmt.printf("[pan-probe] ok: every tile shifted by %.1f across the pan\n", want_delta)
+		timeline_view.start = saved_start
 	}
 
 	// ui_probe_clip_widths (VYPER_CLIPW_PROBE=<project.vyproj>) measures the laid-out

@@ -2548,6 +2548,9 @@ main :: proc() {
 		}
 	}
 	when ODIN_DEBUG {
+		if v, _ := os.lookup_env_alloc("VYPER_PAN_PROBE", context.temp_allocator); v != "" {
+			ui_probe_pan_shift(v)
+		}
 		if v, _ := os.lookup_env_alloc("VYPER_CLIPW_PROBE", context.temp_allocator); v != "" {
 			ui_probe_clip_widths(v)
 			return
