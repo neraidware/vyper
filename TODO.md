@@ -8431,7 +8431,7 @@ All three of these were live in the sense that something still called them.
 
 ## Active 48 — Scrubbing the timeline made no sound at all
 
-**Status: FIXED, uncommitted.** Found by replaying the user's own action recording
+**Status: FIXED, committed** (`8eea882`..`0f652d9`, restored; `875fb12`). Found by replaying the user's own action recording
 after being told "I literally don't hear any audio while scrubbing".
 
 ### The actual cause was not the one the feature was built on
@@ -8554,7 +8554,7 @@ not for scrubbing.
 
 ## Active 49 — `./build.odin run` produced no output at all, and skipped its prerequisites
 
-**Status: FIXED, uncommitted.** Reported as "i dont see any logging at all".
+**Status: FIXED, committed** (`0832b56`). Reported as "i dont see any logging at all".
 
 ### Two separate defects, both in the same proc
 
@@ -8590,7 +8590,7 @@ window close (exit 0, not a crash). `./scripts/gate.sh check` clean.
 
 ## Active 50 — Clip actions acted on one clip and silently ignored the rest of the selection
 
-**Status: FIXED, uncommitted.** "Ripple delete should apply to all selected clips."
+**Status: FIXED, committed** (`c44648b`). "Ripple delete should apply to all selected clips."
 The selection already held a SET (anchor + every Shift-clicked clip, in
 `selection.extra_set`) — but only the link/toggle actions read it. Delete, ripple
 and split all read the single anchor, so Shift-clicking four clips and pressing
@@ -8669,7 +8669,7 @@ Gates: `check`, `timeline_probe`, `transform_probe`, `geom_key_probe`,
 
 ### Active 50b — Shift+click could select half a linked pair
 
-**Status: FIXED, uncommitted.** "Shift click to select a clip should select all
+**Status: FIXED, committed** (`30340bc`). "Shift click to select a clip should select all
 linked clips as well."
 
 `selection.extra_set` is the whole of multi-selection, and shift+click added
@@ -8706,7 +8706,7 @@ Gates: `check`, `timeline_probe`, `action_log`, `dnd_probe`, `transform_probe`,
 
 ### Active 50c — Shift+click toggled clips it had never been shown
 
-**Status: FIXED, uncommitted.** "not all clicked clips were actually selected."
+**Status: FIXED, committed** (`30340bc`). "not all clicked clips were actually selected."
 
 Two defects, found by replaying the user's own recording and reading the
 `shift-select` trace:
@@ -8758,7 +8758,7 @@ without a reproduction would be a workaround, which AGENTS.md §3b forbids.
 
 ### Active 50d — A multi-selection could not be dragged
 
-**Status: FIXED, uncommitted.** "clicking + drag should not single select clip.
+**Status: FIXED, committed** (`44e295c`). "clicking + drag should not single select clip.
 currently you cant drag multiple selected clips."
 
 The clip press called `select_clip(track_idx, index)` unconditionally, which
@@ -8800,7 +8800,7 @@ probe is the coverage. Gates: `check`, `timeline_probe`, `action_log`,
 
 ### Active 50e — The scrub rate change tore down the filter graph on every velocity change
 
-**Status: FIXED, uncommitted.** The user rejected an assert-only answer ("an assert
+**Status: FIXED, committed** (`906e44c`). The user rejected an assert-only answer ("an assert
 doesn't prevent the issue from happening again") — correctly. An assert converts a
 silent heap smash into a loud crash; it does not stop it. This removes the cause.
 
@@ -8869,7 +8869,7 @@ resync unconditional.
 
 ### Active 51 — Splitting mid-interpolation severed the curve
 
-**Status: FIXED, uncommitted.** "the left split creates a keyframe that matches the
+**Status: FIXED, committed** (`67f927c`, `871c444`). "the left split creates a keyframe that matches the
 last interpolation step before the split and the right split sets its origin
 properties in the coherent logic for the next step".
 
@@ -9037,3 +9037,52 @@ Two bugs the migration forced, both worth naming:
 The timeline draws one row per LANE, not per track (`keyframe_clip_rows` /
 `keyframe_clip_row`), so a crop's four edges each get their own diamond row and
 their own gutter label instead of four curves stacked on one line.
+
+### Active 53 — The timeline has two renderers, and a zoom click makes them disagree
+
+**Status: DIAGNOSED, probes committed, fix NOT implemented.** Reported as
+"panning the timeline leaves the clips on tracks 5 and 6 visually behind the
+rest" — later found to be one symptom of a mechanism that affects every track.
+
+`2aa144d` measures the pan: every tile must shift by the same delta, and
+`VYPER_PAN_PROBE` (red-proven — panning each track at `1/(1+ti)` the rate fails
+with "track 1 clip 0 shifted -125.0, want -250.0") requires exactly that.
+Red proof passed, so pan itself is honest.
+
+`771dea5` is the real finding. There are **two renderers reading `timeline_view`
+at two different points in the frame**:
+
+- `build_page` (vyper.odin) lays the timeline out ONCE and BAKES the tiles plus
+  their per-track scissor commands into a Clay command array.
+- The GPU overlay passes (ruler, render range, markers, keyframes, ghosts)
+  RECOMPUTE x live as `lane.x + (frame - view.start) * zoom`.
+
+A zoom click fires from the click table inside `interaction_post_build`, which
+runs AFTER `build_page`. So on that frame Clay bakes at the old zoom, the
+handler mutates the view, and the overlay then draws at the new zoom against a
+lane box from the stale stream. `VYPER_ZOOM_SKEW_PROBE` measures it: Clay at
+`x=244.0` while the overlay draws the same frame at `x=259.5` — a **15.5px
+desync on all 7 tracks, every zoom click, not intermittent**. Only tracks with an
+overlay (markers/keyframes) had something visibly drawn in the wrong place,
+which is why the symptom looked per-track.
+
+This is also the mechanism behind the `SDL_SetGPUScissor_REAL` assert in Active
+50e: the baked scissor no longer matches the overlay geometry on that same
+frame. Same frame, not an unrelated flake.
+
+#### Chosen fix, not yet written
+
+**Option A: one geometry table.** The overlay passes read the baked command
+array instead of `timeline_view` live, so there is exactly one source of truth
+for the frame. Requires an explicit "freeze the view state at `build_page` time"
+step, because `interaction_post_build` mutating the view after the bake is the
+whole bug.
+
+#### Still open
+
+- [ ] Option A not implemented; the overlay passes still read the live view.
+- [ ] The zoom-skew probe needs a project that the current build can open —
+      pre-format-change `.vyproj` files are rejected, so it has not been re-run
+      since `771dea5`.
+- [ ] `SDL_SetGPUScissor_REAL` overshoot follows from the same frame; diagnosing
+      it independently is redundant until Option A lands.

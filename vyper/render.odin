@@ -668,7 +668,7 @@ keyframe_geom_any_lane_tracked :: proc(clip: ^Clip, def: Keyframe_Geom_Section) 
 		return false
 	}
 	track := session_trk_view(clip.keyframe_tracks, section_index)
-	for lane_index in 0 ..< len(track.lanes) {
+	for lane_index in 0 ..< track.lane_count {
 		if track.lanes[lane_index].keys.n > 0 {
 			return true
 		}
@@ -718,7 +718,7 @@ keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track, lane: 
 	if track_index < 0 {
 		return -1, -1, false
 	}
-	if lane_index >= len(session_trk_view(clip.keyframe_tracks, track_index).lanes) {
+	if lane_index >= session_trk_view(clip.keyframe_tracks, track_index).lane_count {
 		return -1, -1, false
 	}
 	return track_index, lane_index, true
@@ -766,11 +766,14 @@ keyframe_geom_set_group_value :: proc(
 // the group, and the inspector showed lane 0 of it, so the edit lands on lane 0;
 // a plain name is an ordinary scalar edit.
 keyframe_geom_set_value :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
-	if sec_index, ok := keyframe_geom_section_index(name); ok {
-		if keyframe_track_index(clip^, name) < 0 {
-			return
-		}
-		keyframe_set_lane_key(clip, name, 0, frame_off, value)
+	// A LANE name ("transform.x") resolves to its section's track and that lane; a
+	// SECTION name ("transform") means the group, and the inspector showed lane 0;
+	// a plain property ("gain") is its own track. All three land through
+	// keyframe_set_lane_key, which takes a TRACK name -- a lane name passed to
+	// keyframe_set_key instead mints a track literally called "transform.x", which
+	// no consumer samples, so an inspector edit would write into a black hole.
+	if track_index, lane_index, found := keyframe_geom_lane_location(clip, name); found {
+		keyframe_set_lane_key(clip, keyframe_track_name(session_trk_view(clip.keyframe_tracks, track_index)), lane_index, frame_off, value)
 		return
 	}
 	keyframe_set_key(clip, name, frame_off, value)

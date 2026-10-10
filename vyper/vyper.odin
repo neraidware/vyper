@@ -1019,11 +1019,16 @@ keyframe_resolve :: proc(r: Keyframe_Ref) -> (cl: ^Clip, keyframe_track: int, k:
 		return nil, -1, nil, false
 	}
 	track := session_trk_view_mut(&clip.keyframe_tracks, r.keyframe_track)
-	if r.keyframe_lane < 0 || r.keyframe_lane >= len(track.lanes) {
+	if r.keyframe_lane < 0 || r.keyframe_lane >= track.lane_count {
 		return nil, -1, nil, false
 	}
 	keys := track.lanes[r.keyframe_lane].keys
+	// A shared range COWs into a NEW window; without writing it back the track
+	// still addresses the old one and the pointer returned below is the only thing
+	// holding the copy -- every write through it is lost, which is what the
+	// shared-property interp pick measured.
 	session_kf_make_unique(&keys)
+	track.lanes[r.keyframe_lane].keys = keys
 	return clip, r.keyframe_track, session_kf_at_ptr(keys, r.key), true
 }
 
@@ -1388,7 +1393,10 @@ delete_selected_keyframe :: proc() -> bool {
 		if !ok {
 			continue
 		}
-		keyframe_del_key(cl, s.name, s.start)
+		// s.name is the key's LANE name, so the delete has to go through the layer
+		// that resolves it: keyframe_del_key takes a TRACK name, and "transform.x"
+		// addresses no track, so the delete would silently do nothing.
+		keyframe_geom_del_lane_key(cl, s.name, s.start)
 	}
 	keyframe_clear()
 	undo_push(.Value, "Delete keyframe")

@@ -135,7 +135,7 @@ when ODIN_DEBUG {
 		keyframe_set_lane_interp :: proc(clip: ^Clip, name: string, interp: Keyframe_Interp) {
 			if ti := keyframe_track_index(clip^, name); ti >= 0 {
 				track := session_trk_view_mut(&clip.keyframe_tracks, ti)
-				for lane in 0 ..< len(track.lanes) {
+				for lane in 0 ..< track.lane_count {
 					keys := track.lanes[lane].keys
 					session_kf_make_unique(&keys)
 					for k in 0 ..< keys.n {
@@ -249,8 +249,14 @@ when ODIN_DEBUG {
 			keyframe_gain_linear(db_keys[:kn], 5, 0),
 			db_to_linear(-20.0),
 		)
-		v, _ = keyframe_sample(gain, 100, 7.0)
-		keyframe_probe_check(v == 8.0, "far past the last key: still holds (got %v)", v)
+		// Re-resolve before this one: a ^Keyframe_Track is invalidated by any later
+		// track push, and the leading-segment cases above minted tracks of their own,
+		// which reallocated the row array out from under the pointer captured at the
+		// top of this block. Sampling through it here reads freed memory.
+		if far_ti := keyframe_track_index(smp, "gain"); far_ti >= 0 {
+			v, _ = keyframe_sample(session_trk_view(smp.keyframe_tracks, far_ti), 100, 7.0)
+			keyframe_probe_check(v == 8.0, "far past the last key: still holds (got %v)", v)
+		}
 
 		// --- lone key / no later target -----------------------------------------
 		// A single key pins its frame and then HOLDS: before it the resting base
@@ -986,8 +992,20 @@ when ODIN_DEBUG {
 		}
 		keyframe_probe_check(del_ok, "del on a section drops only the frame, the lane survives")
 		th := Clip {}
-		keyframe_geom_set_group_value(&th, "crop", 5, crop_first)
-		keyframe_geom_set_group_value(&th, "crop", 40, crop_second)
+		// Explicit literals, not the shared crop_first/crop_second: the assertion
+		// below pins lane 0's post-trim value, so the fixture has to say what it is.
+		trim_start: [KF_GEOM_GROUP_MAX]f32
+		trim_start[0] = 1.0
+		trim_start[1] = 2.0
+		trim_start[2] = 3.0
+		trim_start[3] = 4.0
+		trim_end: [KF_GEOM_GROUP_MAX]f32
+		trim_end[0] = 2.0
+		trim_end[1] = 4.0
+		trim_end[2] = 6.0
+		trim_end[3] = 8.0
+		keyframe_geom_set_group_value(&th, "crop", 5, trim_start)
+		keyframe_geom_set_group_value(&th, "crop", 40, trim_end)
 		keyframe_trim_head(&th, 40)
 		th_ok := false
 		if ti := keyframe_track_index(th, "crop"); ti >= 0 {
@@ -1148,8 +1166,8 @@ when ODIN_DEBUG {
 			)
 			// Empty track: the static base, converted. This is the unkeyed clip.
 			keyframe_probe_check(
-				keyframe_approx(keyframe_gain_linear(db_keys[:0], 3, 0), db_to_linear(-20)),
-				"unkeyed gain returns the static dB base, converted",
+				keyframe_approx(keyframe_gain_linear(db_keys[:0], 3, -20), db_to_linear(-20)),
+				"unkeyed gain returns the static dB base, converted (base_dB=-20)",
 			)
 
 			// Both mixers read the SAME committed snapshot shape and evaluate it
@@ -1466,21 +1484,40 @@ when ODIN_DEBUG {
 					right_keys.n,
 				)
 				if left_keys.n >= 1 && right_keys.n >= 1 {
-					// The left half's final key sits on its last frame and carries the
-					// value the curve read at the cut; the right half's first key is the
-					// same value, so the joined timeline reads what it read before.
+					// The two halves meet in TWO places, and it matters which is which:
+					// the LEFT half gets a key on its final frame carrying the value the
+					// curve read at the cut, while the RIGHT half gets that same value in
+					// its RESTING field -- because the right half's first key is still the
+					// user's original key (re-relativized to the cut), not a new boundary
+					// knot. Comparing key-to-key here would compare the seeded value
+					// against the original key's value and fail on correct code.
 					left_last := session_kf_at(left_keys, left_keys.n - 1)
-					right_first := session_kf_at(right_keys, 0)
-					keyframe_probe_check(
-						keyframe_approx(left_last.value, right_first.value),
-						"the two halves must agree on the value at the cut (%v vs %v)",
-						left_last.value,
-						right_first.value,
-					)
 					keyframe_probe_check(
 						left_last.frame_off == 49,
 						"the left half's boundary key sits on its last frame (got %d)",
 						left_last.frame_off,
+					)
+					// The cubic 0 -> 100 over 100 frames lands on 25 at the midpoint.
+					keyframe_probe_check(
+						keyframe_approx(left_last.value, 25.0),
+						"the left half's boundary key carries the curve's value at the cut (got %v want 25)",
+						left_last.value,
+					)
+					right_resting := clip_geom_resting(&right, .Trans_X)
+					keyframe_probe_check(
+						keyframe_approx(right_resting, left_last.value),
+						"the right half's resting origin must carry the same value at the cut (%v vs %v)",
+						right_resting,
+						left_last.value,
+					)
+					// ...and the right half's own key is the user's, untouched and
+					// re-relativized, not a boundary knot rewritten by the seeding.
+					keyframe_probe_check(
+						right_keys.n == 1 &&
+							session_kf_at(right_keys, 0).frame_off == 50 &&
+							keyframe_approx(session_kf_at(right_keys, 0).value, 50.0),
+						"the right half keeps the user's key re-relativized to the cut (got %d keys)",
+						right_keys.n,
 					)
 				}
 			}

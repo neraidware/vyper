@@ -495,6 +495,13 @@ when ODIN_DEBUG {
 		if !ui_probe_marker_copy_asserts() {
 			os.exit(1)
 		}
+		// Tear the session down before exiting. The round-trip above already tore
+		// down once and re-seeded, so the LIVE timeline is a SECOND session whose
+		// clips still own keyframe-track rows -- and a track's lane array is a heap
+		// allocation, not a pool window, so only a real free releases it. Without
+		// this the probe exits with one lane array per track still held, which the
+		// memory gate reports as definitely lost.
+		session_teardown()
 		os.exit(0)
 	}
 
@@ -1979,7 +1986,8 @@ when ODIN_DEBUG {
 		scale_lane := Keyframe_Lane{}
 		session_kf_push(&scale_lane.keys, Keyframe{frame_off=0,value=1.0})
 		session_kf_push(&scale_lane.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
-		append(&scale_track.lanes, scale_lane)
+		scale_track.lanes[0] = scale_lane
+		scale_track.lane_count = 1
 		// A section track: "crop" owns one scalar lane per edge, four curves side by
 		// side. This is what the packed [KF_PACK_MAX]f32 knot used to be, except the
 		// edges are separate keys with separate frames instead of four slots in one.
@@ -1993,8 +2001,9 @@ when ODIN_DEBUG {
 			if edge % 2 == 0 {
 				session_kf_push(&crop_lane.keys, Keyframe{frame_off=40,value=f32(edge)+1.5})
 			}
-			append(&crop_track.lanes, crop_lane)
+			crop_track.lanes[edge] = crop_lane
 		}
+		crop_track.lane_count = 4
 
 		tr0 := Track {name = strings.clone("V1"), clips = make([dynamic]Clip, 0, 1)}
 		append(&tr0.clips, vclip)
@@ -2216,7 +2225,7 @@ when ODIN_DEBUG {
 			// The section track round-trips as four independent curves: arity from
 			// len(lanes), each lane holding its own scalar value.
 			crop_track := session_trk_view(c.keyframe_tracks, 1)
-			if keyframe_track_name(crop_track) != "crop" || len(crop_track.lanes) != 4 {
+			if keyframe_track_name(crop_track) != "crop" || crop_track.lane_count != 4 {
 				fmt.eprintf("[ui-probe] section track lane count mismatch\n")
 				ok = false
 			} else {
@@ -3334,16 +3343,14 @@ when ODIN_DEBUG {
 		// names, exactly as a real session's are freed.
 		fixture_clip := &timeline.tracks[0].clips[0]
 		fixture_clip.keyframe_tracks = Keyframe_Track_Range{}
-		// "transform" is the section track; lane 0 is transform.x.
-		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("transform")})
-		transform_lane := Keyframe_Lane{}
-		session_kf_push(&transform_lane.keys, Keyframe{frame_off=0,value=0})
-		session_kf_push(&transform_lane.keys, Keyframe{frame_off=120,value=1})
-		append(&session_trk_view_mut(&fixture_clip.keyframe_tracks, 0).lanes, transform_lane)
-		session_trk_push(&fixture_clip.keyframe_tracks, Keyframe_Track {name = session_str_intern("zoom")})
-		zoom_lane := Keyframe_Lane{}
-		session_kf_push(&zoom_lane.keys, Keyframe{frame_off=30,value=1})
-		append(&session_trk_view_mut(&fixture_clip.keyframe_tracks, 1).lanes, zoom_lane)
+		// "transform.x" is a LANE name: the geometry layer resolves it to the section
+		// track "transform" at lane 0. Written through the shipped entry point rather
+		// than by hand-building lane arrays, so this fixture is exactly what a real
+		// keyframe edit produces -- and the lane slots are filled by the store, which
+		// is the code path under test.
+		keyframe_geom_set_lane_key(fixture_clip, "transform.x", 0, 0)
+		keyframe_geom_set_lane_key(fixture_clip, "transform.x", 120, 1)
+		keyframe_geom_set_lane_key(fixture_clip, "zoom", 30, 1)
 
 		sync_track_order()
 

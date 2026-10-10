@@ -117,7 +117,7 @@ when ODIN_DEBUG {
 		// Name is interned; shared key ranges remain with their other holder. Every
 		// lane's array is released: a section track owns one per lane, and freeing
 		// only lane 0 would leak the rest.
-		for lane in 0 ..< len(tr.lanes) {
+		for lane in 0 ..< tr.lane_count {
 			keys := keyframe_lane_view(tr, lane)
 			if keys.slots > 0 && !keys.shared {
 				session_kf_release(keys)
@@ -829,11 +829,13 @@ when ODIN_DEBUG {
 			// section, so keying crop.t (lane 2) after crop.l (lane 0) must leave an
 			// empty lane 1 behind rather than compacting -- otherwise crop.t's key
 			// would land on crop.r's index.
-			crop_lanes := session_trk_view(cl.keyframe_tracks, crop_track).lanes
+			crop_track_row := session_trk_view(cl.keyframe_tracks, crop_track)
+			crop_lane_count := crop_track_row.lane_count
+			crop_lanes := crop_track_row.lanes
 			geom_key_check(
-				len(crop_lanes) == 3,
+				crop_lane_count == 3,
 				"the sibling key must grow the lane list densely (got %d)",
-				len(crop_lanes),
+				crop_lane_count,
 			)
 			geom_key_check(
 				crop_lanes[1].keys.n == 0 && crop_lanes[2].keys.n == 1,

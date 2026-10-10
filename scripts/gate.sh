@@ -2186,10 +2186,39 @@ target_all() {
 	# jump case, which fails if a jump decodes the audio it skipped instead of
 	# seeking. Both degrade to SKIP rather than fail when no audio device is
 	# present, so they cost a synthetic fixture on a headless box.
+	local failed=()
+	local t
 	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_scrub_follow audio_decode_integrity still_switch audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
 		echo "=== $t ==="
-		"$SELF" "$t" || return 1
+		# NOT `|| return 1`. An early bail made the FIRST failure hide every
+		# target after it, so `all` could print "everything green" while two dozen
+		# targets never ran -- which is exactly how a broken keyframe_probe stayed
+		# invisible through a green `all`. Run every target, collect the failures,
+		# and report them all at the end.
+		if ! "$SELF" "$t"; then
+			failed+=("$t")
+			echo "=== $t FAILED ==="
+		fi
+		# The *_valgrind targets build their own binary with ./build.odin, and
+		# build.odin always compiles the SPIR-V first. That leaves the .spv newer
+		# than ./target/vyper, so every LATER target refuses to run as stale --
+		# which is how 17 targets silently stopped running. Refresh the primary
+		# binary after any target that rebuilds, so the next one measures this tree.
+		if [[ "$t" == *_valgrind ]]; then
+			target_build >/dev/null 2>&1 || true
+		fi
 	done
+	if [[ ${#failed[@]} -ne 0 ]]; then
+		echo
+		echo "all: ${#failed[@]} target(s) FAILED:"
+		local f
+		for f in "${failed[@]}"; do
+			echo "  - $f"
+		done
+		return 1
+	fi
+	echo
+	echo "all: every target passed"
 }
 
 main() {

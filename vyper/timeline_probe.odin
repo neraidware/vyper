@@ -178,7 +178,8 @@ when ODIN_DEBUG {
 		lane := Keyframe_Lane{}
 		session_kf_push(&lane.keys, Keyframe{frame_off=50,value=0.0})
 		session_kf_push(&lane.keys, Keyframe{frame_off=250,value=1.0})
-		append(&track.lanes, lane)
+		track.lanes[0] = lane
+		track.lane_count = 1
 		// Markers are keyed by SOURCE frame. The clip starts at source 100 and the
 		// cut is 200 frames in, so the halves read source [100,300) and [300,500):
 		// one marker each, which is what makes the label-ownership check possible.
