@@ -1152,6 +1152,11 @@ split_clip_at_playhead :: proc() {
 		kf_bump_structure()
 		c.keyframe_tracks = kf_rebuild_tracks(source_tracks, 0, i32(left_len))
 		right.keyframe_tracks = kf_rebuild_tracks(source_tracks, i32(left_len), KF_MAX_OFFSET)
+		// A lane interpolating ACROSS the cut is severed by the partition above:
+		// the left tail would hold its last pre-cut key and the right head would
+		// ramp from the pre-split resting value. Rejoin them with the value the
+		// curve actually reads at the cut, read from the pre-split range.
+		kf_split_preserve_continuity(source_tracks, c, &right, i32(left_len))
 		session_marker_release(source_markers)
 		kf_free_tracks(source_tracks)
 		inject_at_elem(&tt.clips, target.index + 1, right)

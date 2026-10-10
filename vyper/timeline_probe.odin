@@ -225,17 +225,35 @@ when ODIN_DEBUG {
 			clip_name(right),
 			orig_name,
 		)
+		// Isolation, not a count. This scene splits MID-INTERPOLATION (keys at 50 and
+		// 250, cut at 200), so the left half legitimately ends up holding its own
+		// pre-cut key AND the boundary key that carries the curve's value at the cut
+		// (kf_split_preserve_continuity). What this test is actually about is that
+		// the halves do not SHARE a key range: each writes its own copy. Asserting a
+		// fixed count here would fail the moment the boundary key is correct, which
+		// is why it counts "both lanes present and distinct" instead.
 		tl_probe_check(
 			left.keyframe_tracks.n == 1 &&
 			right.keyframe_tracks.n == 1 &&
-			session_trk_view(left.keyframe_tracks,0)^.keys.n == 1 &&
-			session_trk_view(right.keyframe_tracks,0)^.keys.n == 1,
-			"each half must own one lane with one key (got %d/%d lanes, %d/%d keys)",
+			session_trk_view(left.keyframe_tracks,0)^.keys.n >= 1 &&
+			session_trk_view(right.keyframe_tracks,0)^.keys.n >= 1,
+			"each half must own its own lane with at least one key (got %d/%d lanes, %d/%d keys)",
 			left.keyframe_tracks.n,
 			right.keyframe_tracks.n,
 			session_trk_view(left.keyframe_tracks,0)^.keys.n,
 			session_trk_view(right.keyframe_tracks,0)^.keys.n,
 		)
+		// And the two key ranges must be distinct objects, not one shared range
+		// reached through two clips.
+		if left.keyframe_tracks.n == 1 && right.keyframe_tracks.n == 1 {
+			lk := session_trk_view(left.keyframe_tracks,0)^.keys
+			rk := session_trk_view(right.keyframe_tracks,0)^.keys
+			tl_probe_check(
+				lk != rk,
+				"the two halves must not share one key range (both at %v)",
+				lk,
+			)
+		}
 		tl_probe_check(
 			session_kf_at(session_trk_view(left.keyframe_tracks,0)^.keys,0).frame_off == 50 &&
 				session_kf_at(session_trk_view(right.keyframe_tracks,0)^.keys,0).frame_off == 50,

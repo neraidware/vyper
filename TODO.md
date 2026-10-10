@@ -8866,3 +8866,76 @@ resync unconditional.
   trashed by something else, the crash can still occur.
 - [ ] Not reproduced under scrubbing. The recording has one instantaneous jump-scrub
   and no sustained drag, so the rate-change path is not exercised by a real gesture.
+
+### Active 51 — Splitting mid-interpolation severed the curve
+
+**Status: FIXED, uncommitted.** "the left split creates a keyframe that matches the
+last interpolation step before the split and the right split sets its origin
+properties in the coherent logic for the next step".
+
+### The break, reproduced first
+
+`kf_rebuild_tracks` only PARTITIONS keys into [0,cut) and [cut,MAX). Correct for a
+lane HOLDING a value at the cut; wrong for a lane interpolating across it:
+
+- the LEFT half's last key is the last one before the cut, and the sampler HOLDS a
+  key past its own frame (`kf_sample_keys`, "the animation's end state"), so the
+  tail sits at that key's value rather than the value the curve was arriving at;
+- the RIGHT half's first key is the first one after, and the sampler interpolates up
+  to it from `base`, so the head starts from the clip's RESTING value rather than
+  from where the curve left off.
+
+Probe, on a linear 0->100 ramp split at 50: the left half's final frame read **0**
+instead of 50. The right half was masked in the first cut of the probe because it
+passed the expected value in as `base` — passing `want` made the assertion pass no
+matter what the split wrote. The probe now samples against the right half's OWN
+resting field, which is what actually exposed the origin half as untested.
+
+### The fix
+
+- [x] **`kf_split_preserve_continuity`** — for each lane with a key on BOTH sides of
+  the cut, writes the value the curve actually reads at the cut into BOTH
+  boundaries: a key on the left half's final frame, and the right half's resting
+  field. Neither half invents a value. A lane with keys on one side only is left
+  alone — it is holding, not interpolating, and its surviving half already agrees
+  with base.
+- [x] Sampled from the PRE-SPLIT `src` range against the left (original) clip's
+  resting value — the only combination that reads the un-severed curve.
+- [x] Lane name -> resting field resolved ONCE (`kf_split_lane_prop`), read and
+  written through `clip_geom_resting`/`clip_geom_set_resting` and `clip.gain`, so
+  the read and the write cannot disagree about where a lane lives.
+
+### A probe that had to be corrected, not just extended
+
+`timeline_probe`'s `test_split_halves_own_their_payload` splits the same way
+mid-interpolation (keys at 50 and 250, cut at 200) and asserted "each half must own
+one lane with ONE key". That expectation encoded the old partition-only behaviour —
+it fails exactly when the boundary key is correct. The test's actual subject is
+payload ISOLATION (COW), so it now asserts both lanes present, distinct key RANGES,
+and re-relativisation of the surviving keys, rather than a count that the fix is
+supposed to change.
+
+### Verified
+
+- `kf_split_mid_interp`: left ends at the interpolated cut value, right ORIGIN is
+  that value, right still interpolates past the cut.
+- Red proof, both halves independently: dropping the left boundary key fails
+  `left half must END at the interpolated cut value 50, got 0`; dropping the right
+  origin fails three assertions including `right half ORIGIN must be the interpolated
+  cut value 50, got 0` and `must still interpolate past the cut, got 20`.
+
+Gates: `check`, `keyframe_probe`, `geom_key_probe`, `timeline_probe`,
+`transform_probe`, `session_kf_probe`, `session_str_probe`, `render_kf_probe`,
+`render_live_probe`, `probe`, `smoke`, `action_log`, `dnd_probe`, `undo_valgrind`,
+`valgrind`, `audio_scrub_exact`, `keyed_export`, `gpu_probe`, `yuv_exact`,
+`opacity`, `zorder`, `subtitle_probe`.
+
+### Not covered
+
+- [ ] PACKED section tracks (transform/crop groups) are not handled: the seeding
+  path resolves a lane to a scalar resting field and writes a scalar key, so a
+  section track that straddles the cut is still severed. The probe uses a scalar
+  `gain` lane.
+- [ ] Trim (kf_trim_head/kf_trim_tail) has the same severing shape at a head/tail
+  cut and is untouched.
+- [ ] Not exercised in the editor.

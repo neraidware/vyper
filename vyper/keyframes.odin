@@ -667,6 +667,120 @@ kf_rebuild_tracks :: proc(src: Kf_Track_Range, lo, hi: i32) -> Kf_Track_Range {
 	return out
 }
 
+// kf_split_preserve_continuity makes a split that lands MID-INTERPOLATION join the
+// two halves back into one curve.
+//
+// kf_rebuild_tracks only PARTITIONS keys -- [0,cut) and [cut,MAX) -- which is
+// correct for a lane that is HOLDING a value at the cut but severs a lane that is
+// interpolating across it:
+//
+//   * the left half's last key is the last one before the cut, and the sampler
+//     HOLDS that key past its own frame, so the tail sits at the key's value
+//     instead of the value the curve was arriving at;
+//   * the right half's first key is the first one after the cut, and the sampler
+//     interpolates up to it from the resting value, so the head starts from the
+//     clip's origin instead of from where the curve left off.
+//
+// So for each lane whose value AT the cut is interpolated -- a key on each side of
+// it -- this writes the value the curve actually reads at the cut into BOTH
+// boundaries: a key on the left half's final frame, and the right half's resting
+// field. Neither half invents a value; both carry the curve's own, so the joined
+// timeline reads exactly what it read before the split.
+//
+// A lane with keys on only ONE side of the cut is left alone: it is holding, not
+// interpolating, and that half already agrees with the resting value.
+//
+// `src` is the PRE-SPLIT track range, which is the only thing that still holds
+// the whole curve; `left` and `right` are the halves as the caller has just
+// rebuilt them. Left is the ORIGINAL clip (its source range has been trimmed to
+// the left span by now), so its resting fields are still the pre-split ones.
+kf_split_preserve_continuity :: proc(src: Kf_Track_Range, left: ^Clip, right: ^Clip, cut: i32) {
+	if cut <= 0 {
+		return
+	}
+	for si in 0 ..< src.n {
+		st := session_trk_view(src, si)
+		if st.keys.n == 0 {
+			continue
+		}
+		keys := session_kf_view(st.keys)
+		// Only a lane straddling the cut can be severed by it. A lane whose keys
+		// are all before (or all after) the cut is holding, and its surviving half
+		// already agrees with the resting value -- seeding it would pin a constant
+		// the curve never had.
+		if keys[0].frame_off >= cut || keys[len(keys) - 1].frame_off < cut {
+			continue
+		}
+		name := kf_track_name(st)
+		v := split_lane_cut_value(st, cut, left)
+		// LEFT: a key on its final frame, matching the last interpolation step
+		// before the split. The left half's length is the cut itself, so its last
+		// frame is cut-1.
+		kf_set_key(left, name, cut - 1, v)
+		// RIGHT: its ORIGIN property, so the next step interpolates from where
+		// the curve arrived rather than from the pre-split resting value.
+		kf_split_seed_origin(right, name, v)
+	}
+}
+
+// split_lane_cut_value is the value the curve reads AT the cut for one lane. The
+// base is the left (original) clip's resting value, sampled against the PRE-SPLIT
+// track, which is the only combination that reads the un-severed curve.
+split_lane_cut_value :: proc(st: ^Kf_Track, cut: i32, left: ^Clip) -> f32 {
+	base := kf_split_lane_base(left, kf_track_name(st))
+	v, _ := kf_sample_keys(session_kf_view(st.keys), cut, base)
+	return v
+}
+
+// kf_split_lane_prop resolves a keyframe track's NAME to the resting field it
+// samples against. A section track (packed) has several lanes, so this is only
+// meaningful for a lane that rides its OWN scalar track; a packed section is
+// handled by its lanes, not by the section name.
+//
+// gain is the one non-geometry lane with a resting field, and it has no
+// Render_Geom_Prop, so it is answered first and returns _COUNT to mean "not a
+// geometry prop".
+kf_split_lane_prop :: proc(name: string) -> Render_Geom_Prop {
+	if name == "gain" {
+		return ._COUNT
+	}
+	si, li, ok := kf_geom_section_for_lane(name)
+	if !ok {
+		return ._COUNT
+	}
+	defs := kf_geom_sections
+	if si >= len(defs) || li >= len(defs[si].lanes) {
+		return ._COUNT
+	}
+	return defs[si].lanes[li]
+}
+
+// kf_split_lane_base reads a lane name's resting value off a clip: geometry
+// through clip_geom_resting, gain through its own field. A name with no resting
+// field (or one this does not know) reads 0, which is the neutral the geometry
+// samplers already assume for an un-keyed lane.
+kf_split_lane_base :: proc(clip: ^Clip, name: string) -> f32 {
+	p := kf_split_lane_prop(name)
+	if p == ._COUNT {
+		return name == "gain" ? clip.gain : 0.0
+	}
+	return clip_geom_resting(clip, p)
+}
+
+// kf_split_seed_origin writes a lane's RESTING value on the right half. Mirrors
+// kf_split_lane_base so the two can never disagree about where a lane lives: a
+// lane that is not read there is not written here.
+kf_split_seed_origin :: proc(clip: ^Clip, name: string, v: f32) {
+	p := kf_split_lane_prop(name)
+	if p == ._COUNT {
+		if name == "gain" {
+			clip.gain = v
+		}
+		return
+	}
+	clip_geom_set_resting(clip, p, v)
+}
+
 // kf_trim_head drops keys on the trimmed head and re-relativizes the rest
 // (a clip whose head was cut off and which shifted left by `cut`).
 kf_trim_head :: proc(clip: ^Clip, cut: i32) {

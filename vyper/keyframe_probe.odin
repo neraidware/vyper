@@ -1215,6 +1215,107 @@ when ODIN_DEBUG {
 			kf_probe_fail = true
 		}
 
+
+	// --- split while interpolating ------------------------------------------
+	//
+	// Splitting a clip mid-interpolation must not break the curve. Today the
+	// split only PARTITIONS keys into [0,cut) and [cut,MAX) and re-relativises,
+	// so a lane interpolating across the cut is severed:
+	//
+	//   * the LEFT half keeps only the keys before the cut, and its sampler HOLDS
+	//     the last of those past their frame -- so the tail sits at that key's
+	//     value, not the value the curve was actually heading toward;
+	//   * the RIGHT half keeps only the keys after, and its sampler interpolates
+	//     from `base` up to its first key -- so the head starts from the resting
+	//     value, not from where the curve left off.
+	//
+	// Either half alone looks plausible; together they are a discontinuity at the
+	// cut. The fix belongs in the split remap, not in the sampler.
+	//
+	// Drives the REAL split_clip_at_playhead, because the remap is the behaviour
+	// under test and a helper would only prove the helper agrees with itself.
+	kf_split_scene :: proc(len_frames, cut: i64) {
+		timeline = Timeline{tracks = make([dynamic]Track, 0, 1, context.temp_allocator)}
+		append(&timeline.tracks, Track{clips = make([dynamic]Clip, 0, 2, context.temp_allocator)})
+		append(
+			&timeline.tracks[0].clips,
+			Clip{
+				clip_id              = 9101,
+				source_start_frame   = 0,
+				source_length_frames = len_frames,
+				timeline_start_frame = 0,
+				kind                 = .Video,
+			},
+		)
+		c := &timeline.tracks[0].clips[0]
+		// Two keys spanning the clip, linear: the curve is strictly interpolating
+		// across the whole clip, so the cut is unambiguously mid-segment.
+		kf_set_key(c, "gain", 0, 0.0)
+		kf_set_key(c, "gain", i32(len_frames), f32(len_frames))
+		selection.track = 0
+		selection.index = 0
+		clear(&selection.extra_set)
+		playhead.frame = cut
+		timeline_view.start = 0
+	}
+
+	kf_split_mid_interp :: proc() {
+		kf_split_scene(100, 50)
+		// What the unsplit curve reads AT the cut. This is the value both halves
+		// have to agree on, so it is sampled BEFORE the split mutates the track.
+		want, _ := kf_sample_for(&timeline.tracks[0].clips[0], "gain", 50, 0.0)
+		kf_probe_check(kf_approx(want, 50.0), "linear 0..100 must read 50 at the cut, got %v", want)
+
+		split_clip_at_playhead()
+		clips := timeline.tracks[0].clips
+		kf_probe_check(len(clips) == 2, "split must leave 2 clips (got %d)", len(clips))
+		if len(clips) != 2 {
+			return
+		}
+		left, right := &clips[0], &clips[1]
+
+		// LEFT half: its FINAL frame must read the value the curve was arriving
+		// at, not the last pre-cut key's value held forever.
+		left_end, _ := kf_sample_for(left, "gain", left.source_length_frames - 1, 0.0)
+		kf_probe_check(
+			kf_approx(left_end, want),
+			"split: left half must END at the interpolated cut value %v, got %v",
+			want,
+			left_end,
+		)
+
+		// RIGHT half: offset 0 IS the cut. It must start from the same value, so
+		// the two halves meet exactly and the joined curve is continuous.
+		// Sampled against the right half's OWN resting field, not against `want`:
+		// passing the expected value in as the base would make this assertion pass
+		// no matter what the split wrote, which is exactly the bug it exists to catch.
+		kf_probe_check(
+			kf_approx(right.gain, want),
+			"split: right half ORIGIN must be the interpolated cut value %v, got %v",
+			want,
+			right.gain,
+		)
+		right_start, _ := kf_sample_for(right, "gain", right.timeline_start_frame, right.gain)
+		kf_probe_check(
+			kf_approx(right_start, want),
+			"split: right half must START at the interpolated cut value %v, got %v",
+			want,
+			right_start,
+		)
+
+		// And the curve must still be MOVING after the cut. A right half that
+		// starts at the right value but then holds it is a second, quieter bug:
+		// the animation stops dead where it used to continue.
+		right_later, _ := kf_sample_for(right, "gain", right.timeline_start_frame + 10, right.gain)
+		kf_probe_check(
+			right_later > want + 0.5,
+			"split: right half must still interpolate past the cut (want > %v), got %v",
+			want,
+			right_later,
+		)
+	}
+
+		kf_split_mid_interp()
 		if kf_probe_fail {
 			fmt.println("[kf-probe] summary: FAIL")
 			return 1
