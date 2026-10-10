@@ -28,8 +28,6 @@ import "core:fmt"
 import "core:strings"
 import "core:time"
 import sdl "vendor:sdl3"
-import yuvconv "vendor/yuv"
-
 
 // The NV12 shaders, embedded at compile time. These were declared in
 // gpu_nv12_probe.odin, which was the only reason the probe file could not be
