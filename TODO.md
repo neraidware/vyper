@@ -9038,6 +9038,37 @@ The timeline draws one row per LANE, not per track (`keyframe_clip_rows` /
 `keyframe_clip_row`), so a crop's four edges each get their own diamond row and
 their own gutter label instead of four curves stacked on one line.
 
+### Active 54 — Keyframes had no "hold" (no-interpolation) mode
+
+**Status: FIXED, committed.** The interpolation menu offered Cubic, Linear,
+Ease in/out/in-out and Elastic, but no way to say "do not interpolate": a value
+could only ever move between two keys by easing. Every animation tool's default
+answer for "this property is stepped" is a hold, and its absence meant a stepped
+transform had to be faked with a near-zero-length ease or dozens of duplicate
+keys.
+
+Added `Keyframe_Interp.Hold`. The segment ARRIVING at a key stays at the
+previous key's value until that key's own frame, then steps to it — the mode
+belongs to the key it arrives at, exactly like every other mode, so one pick
+covers a selection spanning any number of tracks, lanes and clips
+(`keyframe_set_interp_all`).
+
+Wired at every layer that names or offers a mode: the enum, `keyframe_ease`,
+`keyframe_apply_interp`, the inspector label, the dropdown (now leading the list,
+since Hold is the safe answer for a stepped curve), and the click handler.
+
+The enum member is deliberately LAST. `.Cubic` is the zero value and a fresh key
+must keep defaulting to it; inserting Hold anywhere else would renumber every
+mode already written to a project file and silently re-type it on load.
+
+The curve is 0 across the segment and 1 at its end. The sampler only ever calls
+it with 0 < t < 1 (a key's own frame is answered earlier, by returning the key's
+value), so the `t >= 1` arm is not what makes the step exact — it completes the
+contract for `keyframe_ease` as a callable curve. Pinned by a red-proofable probe:
+the curve at t = 0 / 0.5 / 0.99 / 1, plus the real sampler holding the previous
+key's value at 1/25/50/75/99, stepping to the arriving key's value on its own
+frame, and holding past the last key.
+
 ### Active 53 — The timeline has two renderers, and a zoom click makes them disagree
 
 **Status: DIAGNOSED, probes committed, fix NOT implemented.** Reported as

@@ -2077,7 +2077,9 @@ if was_click && keyframe_sel_active() {
 	} else if keyframe_view.interp_menu_open && clay.PointerOver(clay.ID("KeyframeInterpMenu")) {
 		choice: Keyframe_Interp
 		hit := true
-		if clay.PointerOver(clay.ID("KeyframeInterpLinear")) {
+		if clay.PointerOver(clay.ID("KeyframeInterpHold")) {
+			choice = .Hold
+		} else if clay.PointerOver(clay.ID("KeyframeInterpLinear")) {
 			choice = .Linear
 		} else if clay.PointerOver(clay.ID("KeyframeInterpCubic")) {
 			choice = .Cubic
