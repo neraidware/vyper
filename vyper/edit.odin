@@ -3,6 +3,7 @@ package vyper
 import "core:fmt"
 import "core:strconv"
 import clay "clay-odin"
+import sdl "vendor:sdl3"
 
 // ---------------------------------------------------------------------------
 // Inline editing of a clip property text field. Scale and the crop fields are
@@ -53,9 +54,52 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 	// buffer and every format would overflow.
 	text := fmt.bprintf(edit_state.chars[:], "%.*f", prec, scaled)
 	edit_state.len = len(text)
+
+	// SDL delivers TEXT_INPUT only while text input is ON, and nothing in the number
+	// field's path ever turned it on -- only the modal string field (clip rename)
+	// did, from text_input_begin. So every keystroke a user made in a number field
+	// was delivered to event.odin's TEXT_INPUT case and dropped, because `edit_state
+	// .field` was set but SDL had nothing to deliver. That is the whole of "I can't
+	// type in the number fields": the field was live and the keyboard was not.
+	//
+	// Deferred, never immediate, for the reason text_input_begin gives: activating an
+	// IME mid-keypress makes SDL route the very keypress that opened the field
+	// through the new IME context, so the character that opened it lands in the field
+	// a second time. edit_field_text_input_flush runs from the same between-drains
+	// point as the string field's.
+	if !edit_state.text_on && !edit_state.text_pending {
+		edit_state.text_pending = true
+	}
+}
+
+// edit_field_text_input_flush enables SDL text input for a number field that opened
+// during a drain, at the same between-drains point text_input_flush_pending uses.
+// Mirrors that proc exactly, including honouring a field that opened and closed
+// inside one drain.
+edit_field_text_input_flush :: proc() {
+	if !edit_state.text_pending {
+		return
+	}
+	edit_state.text_pending = false
+	if edit_state.field == .None || app_window == nil {
+		return
+	}
+	_ = sdl.StartTextInput(app_window)
+	edit_state.text_on = true
+}
+
+// edit_field_text_input_stop turns SDL text input off when the number field closes,
+// for the same reason the string field's does: no focused field means no IME work.
+edit_field_text_input_stop :: proc() {
+	edit_state.text_pending = false
+	if edit_state.text_on {
+		_ = sdl.StopTextInput(app_window)
+		edit_state.text_on = false
+	}
 }
 
 edit_cancel :: proc() {
+	edit_field_text_input_stop()
 	edit_state.field = .None
 	edit_state.len = 0
 }

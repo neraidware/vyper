@@ -9038,6 +9038,50 @@ The timeline draws one row per LANE, not per track (`keyframe_clip_rows` /
 `keyframe_clip_row`), so a crop's four edges each get their own diamond row and
 their own gutter label instead of four curves stacked on one line.
 
+### Active 55 — You could not type in any number field
+
+**Status: FIXED, committed. Visual polish of the fields NOT done.**
+
+Clicking a number field set `edit_state.field`, the UI rendered the field as
+live, and every keystroke went nowhere. There was no error, no wrong value, no
+visible state — the field looked focused and simply did not respond.
+
+**Cause:** SDL delivers `TEXT_INPUT` only while SDL text input is ON. The only
+caller of `sdl.StartTextInput` was `text_input_begin`, the MODAL STRING field's
+(clip rename). The number-field path called `edit_begin` and never asked SDL for
+text input at all, so `dispatch_sdl_event`'s `.TEXT_INPUT` case — which routes
+to `edit_append` correctly — was simply never reached.
+
+The routing was right; the keyboard was never connected. That is why it read as
+"input fields don't work" with no other symptom.
+
+Fix: `edit_begin` requests text input, deferred to a new
+`edit_field_text_input_flush` called from the same between-drains point as
+`text_input_flush_pending` (never inside a drain: activating an IME mid-keypress
+makes SDL route the opening keypress through the new IME context and the field
+swallows a duplicate character). `edit_cancel`/`edit_commit` stop it via
+`edit_field_text_input_stop`, mirroring the string field's bookkeeping so a
+field that opens and closes inside one drain cannot stop input that was never
+started. `Edit_State` gained `text_pending`/`text_on` for the same reason
+`Text_Input` carries them.
+
+Probed: opening a number field must leave a text-input request recorded, and
+cancelling must leave none. The request is recorded even with no window (headless)
+so the invariant is testable; the actual SDL call still no-ops without a window.
+
+#### Still open — the polish half of the report
+
+- [ ] No visual feedback at all: no focus ring, no caret, no selected state, no
+      hover affordance on the number fields.
+- [ ] No way to select-all and retype a field: Backspace deletes one character at
+      a time from the end and there is no cursor to move, so correcting a typo
+      means retyping the whole value by hand.
+- [ ] The accept filter is a hand-written `0-9 - .` list (event.odin). No digits
+      grouping, no `%`/unit suffix, no leading-plus, and no rejection feedback —
+      typing a stray letter is silently dropped with no indication.
+- [ ] `edit_field_claims_key` has a stray bare `case:` left from an earlier
+      switch conversion. Harmless (it falls to the default) but confusing to read.
+
 ### Active 54 — Keyframes had no "hold" (no-interpolation) mode
 
 **Status: FIXED, committed.** The interpolation menu offered Cubic, Linear,

@@ -48,7 +48,11 @@ handle_sdl_events :: proc(running: ^bool) {
 	// "can prevent some key press events from being passed through", so a field
 	// that opened during this drain gets its text input here — with the opening
 	// keypress already consumed, and with no text input on to echo it.
+	//
+	// Both editors flush here. The number fields used to have no flush at all and no
+	// enable either (edit.odin), which is why they could not be typed into.
 	text_input_flush_pending()
+	edit_field_text_input_flush()
 }
 
 // dispatch_sdl_event routes one event to its owner. Split out of the poll loop

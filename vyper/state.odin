@@ -1298,6 +1298,15 @@ Edit_State :: struct {
 	field: Edit_Field,
 	chars: [64]u8,
 	len:   int,
+	// text_on / text_pending mirror Text_Input's, for the same reason: a number
+	// field needs SDL text input turned on or SDL emits no TEXT_INPUT at all and
+	// the field cannot be typed into. They are separate because the two systems can
+	// not both be open -- a number field commits into the modal string field's
+	// absence, never over it -- but each owns its own record of what SDL was
+	// actually told, so a field that opens and closes inside one drain cannot stop
+	// text input that was never started.
+	text_pending: bool,
+	text_on:      bool,
 }
 edit_state: Edit_State
 

@@ -3124,6 +3124,30 @@ when ODIN_DEBUG {
 			fmt.eprintf("[ui-probe] the number field must be closed after cancel\n")
 			ok = false
 		}
+
+		// The bug this pins: opening a number field must REQUEST SDL text input.
+		// SDL emits TEXT_INPUT only while text input is on, and the number field's
+		// path never turned it on — only the modal string field did. So every
+		// keystroke reached dispatch_sdl_event's TEXT_INPUT case with nothing to
+		// deliver and was dropped: the field was live and the keyboard was not, and
+		// it read as "I can't type in the number fields" with no other symptom.
+		//
+		// Headless the window is nil, so the request is recorded rather than sent to
+		// SDL; that is the whole observable contract here.
+		edit_begin(.X, 0)
+		if !edit_state.text_pending && !edit_state.text_on {
+			fmt.eprintf(
+				"[ui-probe] opening a number field must request SDL text input, or SDL delivers no TEXT_INPUT and nothing can be typed\n",
+			)
+			ok = false
+		}
+		// ...and the request must be dropped when the field closed inside the same
+		// drain, so it never enables an IME for a field that is already gone.
+		edit_cancel()
+		if edit_state.text_pending || edit_state.text_on {
+			fmt.eprintf("[ui-probe] a closed number field must not leave text input requested\n")
+			ok = false
+		}
 		if ok {
 			fmt.printf("[ui-probe] backspace ripple-deletes and closes the gap ok\n")
 		}
