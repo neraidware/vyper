@@ -439,59 +439,6 @@ when ODIN_DEBUG {
 			ease_mid,
 		)
 
-		// Hold: 0 across the segment, 1 at its end. The end value is what makes a
-		// step rather than a flat track -- a bare `return 0` would hold the PREVIOUS
-		// key forever and never show this one.
-		keyframe_probe_check(
-			keyframe_ease(.Hold, 0) == 0 &&
-			keyframe_ease(.Hold, 0.5) == 0 &&
-			keyframe_ease(.Hold, 0.99) == 0 &&
-			keyframe_ease(.Hold, 1) == 1,
-			"Hold is flat across the segment and 1 at its end",
-		)
-
-		// Hold through the real sampler, not just the curve: two keys, the SECOND
-		// holding. Everything strictly between the keys must read the FIRST key's
-		// value, the second key's own frame must read its own value, and past it the
-		// track holds there. The mode belongs to the key it ARRIVES at, so setting it
-		// on the second key is what makes the segment hold -- setting it on the first
-		// would shape the run-up instead, and this pins which.
-		{
-			hold_track := Clip{}
-			keyframe_set_key(&hold_track, "gain", 0, 10.0)
-			keyframe_set_key(&hold_track, "gain", 100, 90.0)
-			hold_ti := keyframe_track_index(hold_track, "gain")
-			keyframe_key_mut(&hold_track, hold_ti, 0, 1).interp = .Hold
-			hold_track_ptr := session_trk_view(hold_track.keyframe_tracks, hold_ti)
-			hold_values := [5]f32{}
-			hold_ok := true
-			for frame in ([]i32{1, 25, 50, 75, 99}) {
-				value, _ := keyframe_sample_lane(hold_track_ptr, 0, frame, 0.0)
-				hold_values[0] = value
-				hold_ok = hold_ok && value == 10.0
-			}
-			keyframe_probe_check(
-				hold_ok,
-				"Hold keeps the previous key's value across the whole segment (sampled %v)",
-				hold_values,
-			)
-			// The step itself: the arriving key's own frame reads ITS value, not the
-			// held one. This is the half a `return 0`-only implementation gets wrong.
-			on_key, on_key_ok := keyframe_sample_lane(hold_track_ptr, 0, 100, 0.0)
-			keyframe_probe_check(
-				on_key_ok && on_key == 90.0,
-				"Hold steps to the arriving key's value on its own frame (got %v ok=%v)",
-				on_key,
-				on_key_ok,
-			)
-			past, _ := keyframe_sample_lane(hold_track_ptr, 0, 140, 0.0)
-			keyframe_probe_check(
-				past == 90.0,
-				"Hold still holds past the last key (got %v)",
-				past,
-			)
-		}
-
 		// A TWO-key track with .Cubic is exactly Linear: both spline tangents
 		// default to the chord slope (no outside neighbor on either end — the
 		// natural edge condition), and a Hermite whose endpoint tangents equal the

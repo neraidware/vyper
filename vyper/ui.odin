@@ -1405,8 +1405,6 @@ keyframe_interp_label :: proc(interp: Keyframe_Interp) -> string {
 		return "Ease in/out"
 	case .Elastic:
 		return "Elastic"
-	case .Hold:
-		return "Hold"
 	}
 	return "Linear"
 }
@@ -1476,12 +1474,6 @@ keyframe_interp_dropdown :: proc(interp: Keyframe_Interp, mixed: bool) {
 		) {
 			// No entry is marked current when the selection is mixed: the whole
 			// list is offered, and a pick writes every selected key.
-			settings_button(
-				"KeyframeInterpHold",
-				keyframe_interp_label(.Hold),
-				!mixed && interp == .Hold,
-				fill_width = true,
-			)
 			settings_button(
 				"KeyframeInterpLinear",
 				keyframe_interp_label(.Linear),

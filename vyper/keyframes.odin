@@ -44,15 +44,6 @@ Keyframe_Interp :: enum u8 {
 	Ease_Out,
 	Ease_In_Out,
 	Elastic,
-	// Hold: the segment ARRIVING at this key stays at the previous key's value
-	// until this key's own frame, then steps. The mode belongs to the key it
-	// arrives at (we ease INTO a breakpoint), so this reads the previous value for
-	// the whole span and this key's value only on its frame.
-	//
-	// Deliberately LAST: .Cubic is the zero value and a fresh key must keep
-	// defaulting to it. Inserting this member anywhere else would renumber every
-	// mode already written to a project file.
-	Hold,
 }
 
 // Elastic is the Penner easeOutElastic over one segment: an amplitude envelope
@@ -430,19 +421,6 @@ keyframe_ease :: proc(interp: Keyframe_Interp, t: f32) -> f32 {
 		return t
 	case .Linear:
 		return t
-	case .Hold:
-		// 0 for the whole segment, 1 at its end. keyframe_apply_interp computes
-		// l + (r-l)*ease, so 0 holds the previous key's value across the span and 1
-		// lands on the next key's value: the step.
-		//
-		// The sampler only reaches this with 0 < t < 1 (a key's own frame is answered
-		// earlier, by returning the key's value), so the t >= 1 arm is not what makes
-		// the step exact -- it completes the CONTRACT for keyframe_ease as a callable
-		// curve, which a probe and any future caller reach directly with t == 1.
-		if t >= 1 {
-			return 1
-		}
-		return 0
 	case .Ease_In:
 		return t * t * t
 	case .Ease_Out:
@@ -497,7 +475,7 @@ keyframe_apply_interp :: proc(l, r: f32, t: f32, interp: Keyframe_Interp, m0, m1
 		h01 := -(2 * t3) + 3 * t2
 		h11 := t3 - t2
 		return h00 * l + h10 * (m0 * span) + h01 * r + h11 * (m1 * span)
-	case .Linear, .Ease_In, .Ease_Out, .Ease_In_Out, .Elastic, .Hold:
+	case .Linear, .Ease_In, .Ease_Out, .Ease_In_Out, .Elastic:
 		return l + (r - l) * keyframe_ease(interp, t)
 	}
 	return l

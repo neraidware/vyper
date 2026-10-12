@@ -9119,38 +9119,23 @@ selects the whole field and one Backspace empties it; keys on an empty field do
 not move the caret below zero; Delete is claimed when focused and not when not;
 opening a field requests SDL text input and cancelling leaves no request.
 
-### Active 54 — Keyframes had no "hold" (no-interpolation) mode
+### Active 54 — Hold interpolation: ADDED, THEN REMOVED (misread request)
 
-**Status: FIXED, committed.** The interpolation menu offered Cubic, Linear,
-Ease in/out/in-out and Elastic, but no way to say "do not interpolate": a value
-could only ever move between two keys by easing. Every animation tool's default
-answer for "this property is stepped" is a hold, and its absence meant a stepped
-transform had to be faked with a near-zero-length ease or dozens of duplicate
-keys.
+Added as `Keyframe_Interp.Hold` in `6d612e9`: the segment arriving at a key stays
+at the previous key's value and steps on the key's own frame. Wired to the UI
+menu, the click handler, and the keyframe probe.
 
-Added `Keyframe_Interp.Hold`. The segment ARRIVING at a key stays at the
-previous key's value until that key's own frame, then steps to it — the mode
-belongs to the key it arrives at, exactly like every other mode, so one pick
-covers a selection spanning any number of tracks, lanes and clips
-(`keyframe_set_interp_all`).
+**Removed again.** The request was never "hold" — it was **move toward the value,
+without smooth interpolation**. Hold is the opposite of that: it is the one mode
+where the value does not move at all and jumps. `.Linear` was already exactly
+what was asked for — `keyframe_ease(.Linear, t) == t`, a constant-rate move from
+the previous key's value to this one with no easing.
 
-Wired at every layer that names or offers a mode: the enum, `keyframe_ease`,
-`keyframe_apply_interp`, the inspector label, the dropdown (now leading the list,
-since Hold is the safe answer for a stepped curve), and the click handler.
+Removing the last enum member renumbers nothing, so no existing project file's
+stored mode changes: `.Cubic` keeps its zero value and stays the default for a
+fresh key.
 
-The enum member is deliberately LAST. `.Cubic` is the zero value and a fresh key
-must keep defaulting to it; inserting Hold anywhere else would renumber every
-mode already written to a project file and silently re-type it on load.
-
-The curve is 0 across the segment and 1 at its end. The sampler only ever calls
-it with 0 < t < 1 (a key's own frame is answered earlier, by returning the key's
-value), so the `t >= 1` arm is not what makes the step exact — it completes the
-contract for `keyframe_ease` as a callable curve. Pinned by a red-proofable probe:
-the curve at t = 0 / 0.5 / 0.99 / 1, plus the real sampler holding the previous
-key's value at 1/25/50/75/99, stepping to the arriving key's value on its own
-frame, and holding past the last key.
-
-### Active 56 — Windows crash log not findable next to the exe
+## Active 56 — Windows crash log not findable next to the exe
 
 Reported as "the crash log isn't being recorded; I can't find it in the executable
 directory". It *was* being recorded — just not there. `crash_handler_install`
