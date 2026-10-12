@@ -105,20 +105,25 @@ jobs:
           # aborts the link with a fatal exception. The output would be wrong even
           # if it survived, so suppressing the warning is not a fix.
           #
-          # llvm-dlltool writes a fresh import lib from the DLL with sections lld
-          # can merge. The DLLs are already staged and are what actually ships, so
+          # dlltool writes a fresh import lib from the DLL with sections lld can
+          # merge. The DLLs are already staged and are what actually ships, so
           # the import lib is derived from the same bytes rather than trusted from
           # a second source that can disagree with them.
-          $dlltool = Get-Command llvm-dlltool.exe -ErrorAction SilentlyContinue
-          if (-not $dlltool) { throw "llvm-dlltool not found on PATH; the ffmpeg import libs cannot be regenerated and lld cannot link them" }
+          # GNU dlltool reads a DLL's exports directly. llvm-dlltool does not --
+          # it parses .def text, and handed a DLL it reports "error parsing
+          # definition" -- so the tool has to be one that takes the binary.
+          $dlltool = Get-Command dlltool.exe -ErrorAction SilentlyContinue
+          if (-not $dlltool) { throw "dlltool not found on PATH; the ffmpeg import libs cannot be regenerated and lld cannot link them" }
           foreach ($l in @("avcodec","avfilter","avformat","avutil","swresample","swscale")) {
             # BtbN ships VERSIONED DLL names (avcodec-61.dll), and the import lib
             # must record the DLL name that actually ships -- so the real file is
             # globbed and its own name is what goes in, not the bare library name.
+            # dlltool names the import library's DLL field from -D, which must be
+            # the file that actually ships or the loader looks for the wrong name.
             $dll = Get-ChildItem "deps\$l*.dll" | Select-Object -First 1
             if (-not $dll) { throw "no DLL matching $l*.dll in deps\" }
-            & llvm-dlltool -d $dll.FullName -D $dll.Name -l "vyper\vendor\ffmpeg\$l\$l.lib"
-            if ($LASTEXITCODE -ne 0) { throw "llvm-dlltool failed for $($dll.Name) (exit $LASTEXITCODE)" }
+            & dlltool -d $dll.FullName -D $dll.Name -l "vyper\vendor\ffmpeg\$l\$l.lib"
+            if ($LASTEXITCODE -ne 0) { throw "dlltool failed for $($dll.Name) (exit $LASTEXITCODE)" }
             Write-Host "import lib: $l <- $($dll.Name)"
           }
 
