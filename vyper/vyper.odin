@@ -605,10 +605,10 @@ apply_command :: proc() {
 
 	switch verb {
 	case "save":
-		// Bare ":save" opens the in-app file finder in Save mode (same picker
-		// bare ":open" uses) instead of demanding a typed path.
+		// Bare ":save" opens the save dialog (the same picker bare ":open" uses)
+		// instead of demanding a typed path.
 		if len(arg) == 0 {
-			finder_open(.Save)
+			file_picker_request(.Save)
 			return
 		}
 		if err := project_file_save(arg); len(err) > 0 {
@@ -619,11 +619,11 @@ apply_command :: proc() {
 		}
 		show_ui_noticef(3000, "Saved '%s'", arg)
 	case "open":
-		// Bare ":open" (no argument) launches the in-app fuzzy file finder
-		// instead of the OS dialog that the Open File button uses; a typed
-		// path after "open" still goes down the direct-open path below.
+		// Bare ":open" (no argument) launches the open dialog, same picker the
+		// Open File button uses; a typed path after "open" still goes down the
+		// direct-open path below.
 		if len(arg) == 0 {
-			finder_open(.Open)
+			file_picker_request(.Open)
 			return
 		}
 		if project_path_is_project(arg) {

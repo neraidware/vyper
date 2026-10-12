@@ -9316,3 +9316,30 @@ render_kf_probe, session_kf_probe, geom_key_probe, timeline_probe, smoke green.
 Note: `VYPER_AUDIO_RATE_PROBE` still runs long on a 4GB AV1 source, but that is
 the probe transcoding, not a window -- its `return` makes reaching CreateWindow
 impossible either way.
+
+## Active 60 — File dialogs route to the OS picker; the in-app finder is bypassed, not removed
+
+Every file dialog went to the **in-app finder** (`file_finder.odin`). The portal
+and Win32 pickers were already written — `portal.odin` + `portal_windows.odin`
+— but `open_file_picker` had **zero callers**: interaction.odin:194 said so
+outright ("The in-app finder replaces the OS import dialog"). Only
+`save_file_picker` was live, and only for the render output path.
+
+All four entry points now go through `file_picker_request`:
+`BinImportButton`, `OpenFileButton`, bare `:save`, bare `:open`. One dispatcher
+rather than four edits, so they cannot drift apart.
+
+**The finder is NOT removed.** `FINDER_USE_OS_PICKER` is the one-line switch;
+`finder_open`, its listing, filter field and all three commit modes are untouched,
+and the finder's own probes still call `finder_open` directly, so it keeps
+compiling and stays covered while bypassed. Both flag values were built to prove
+that, rather than assuming it.
+
+What a picked path MEANS is deliberately not restated in the new proc: `.Open`
+goes through `open_file_at` and `.ImportBin` through `import_path_to_bin`,
+which are the finder's own commit decisions. The dialog differs; the decodability
+rule and the project-vs-media split do not get a second copy.
+
+Ownership: the picker's path is a per-call session buffer owned for the life of
+the program. Nothing frees it, and the bin clones it onto the asset — freeing it
+would double-free against that copy.

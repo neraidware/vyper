@@ -481,6 +481,74 @@ finder_save_typed_name :: proc() {
 // finder_open starts the finder from the process cwd in the given commit mode.
 // The field always starts empty: Open/ImportBin use it as a filter, and Save
 // uses it as a name it must not pre-fill (see finder_enter).
+// FINDER_USE_OS_PICKER routes every file dialog to the platform picker -- the
+// XDG portal on Linux, the Win32 common dialog on Windows -- instead of the
+// in-app finder below.
+//
+// TEMPORARY, and one line to flip back. The finder is NOT removed and NOT
+// deleted: `finder_open`, its listing, its filter field and its commit modes all
+// stay exactly as they were, and the finder's own probes still call
+// `finder_open` directly, so it keeps compiling and stays covered while it is
+// bypassed. Flipping this to false restores it for every entry point at once,
+// because they all go through file_picker_request.
+//
+// Why the OS picker is preferred: the finder is a good fuzzy browser, but the
+// platform dialog is what the user's own file manager hands off from (and what
+// the portal makes available to a sandboxed app at all). The finder cannot pick
+// a path outside what its own listing walks.
+FINDER_USE_OS_PICKER :: true
+
+// file_picker_request is THE entry point for "the user asked for a file
+// dialog". Four sites used to call finder_open directly -- the bin Import
+// button, the Open File button, and bare ":save"/":open" -- and each picked the
+// dialog, so routing them meant four edits that could drift apart. They all come
+// here now.
+file_picker_request :: proc(mode: Finder_Commit_Mode) {
+	if FINDER_USE_OS_PICKER {
+		file_picker_os(mode)
+		return
+	}
+	// The in-app finder, intact. This is the branch the flag above turns back on.
+	finder_open(mode)
+}
+
+// file_picker_os runs the platform picker and applies the choice exactly as the
+// finder's commit did, so only the DIALOG differs -- what a picked path means
+// (a project, media for the bin, a destination to save into) is the finder's
+// decision and must not be restated here in a second copy.
+//
+// The returned path is the picker's own per-call session buffer, owned for the
+// life of the program: nothing here frees it, and the bin clones it onto the
+// asset. Freeing it would be a double free against the asset's copy.
+file_picker_os :: proc(mode: Finder_Commit_Mode) {
+	path: cstring
+	switch mode {
+	case .Open, .ImportBin:
+		path = open_file_picker()
+	case .Save:
+		path = save_file_picker()
+	}
+	if path == nil {
+		return // cancelled, or the picker could not produce a path
+	}
+	switch mode {
+	case .Open:
+		// open_file_at routes a .vyproj to the project loader and everything else
+		// to the bin plus the timeline -- the same split the finder's .Open
+		// commit made, including refusing a project in .ImportBin.
+		open_file_at(path)
+	case .ImportBin:
+		// import_path_to_bin is the finder's own "can the bin hold this" gate, so
+		// the decodability rule stays in ONE place rather than being restated.
+		import_path_to_bin(path)
+	case .Save:
+		if err := project_file_save(string(path)); len(err) > 0 {
+			defer delete(err)
+			show_ui_notice(err, 4000)
+		}
+	}
+}
+
 finder_open :: proc(mode: Finder_Commit_Mode) {
 	if file_finder.active {
 		finder_close()

@@ -191,9 +191,10 @@ click_cases := []Click_Case{
 		return import_bg_active() && box_contains(import_ui.cancel_box, inp.x, inp.y)
 	}, action = proc(_: Mouse_Input) { import_bg_cancel() } },
 	{ id = "BinImportButton", action = proc(_: Mouse_Input) {
-		// The in-app finder replaces the OS import dialog; ImportBin mode drops
-		// the picked file into the media bin without touching the timeline.
-		finder_open(.ImportBin)
+		// ImportBin mode drops the picked file into the media bin without touching
+		// the timeline. file_picker_request owns which dialog that is (the OS
+		// picker today, the in-app finder behind FINDER_USE_OS_PICKER).
+		file_picker_request(.ImportBin)
 	} },
 	// Pressing a bin cell selects the media and starts the drag-to-timeline
 	// gesture (ghost while down, committed on release over a lane).
@@ -203,7 +204,7 @@ click_cases := []Click_Case{
 		begin_media_drag(media_bin_item_at(inp.x, inp.y), inp.x, inp.y)
 	} },
 	{ id = "OpenFileButton", action = proc(_: Mouse_Input) {
-		finder_open(.Open)
+		file_picker_request(.Open)
 	} },
 	{ id = "Res720", action = proc(_: Mouse_Input) { set_project_resolution_preset(1280, 720) } },
 	{ id = "Res1080", action = proc(_: Mouse_Input) { set_project_resolution_preset(1920, 1080) } },
