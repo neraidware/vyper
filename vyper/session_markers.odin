@@ -148,7 +148,17 @@ session_marker_push :: proc(r: ^Clip_Markers_Range, m: Clip_Marker) {
 session_marker_erase :: proc(r: ^Clip_Markers_Range, i: int) {
 	session_marker_make_unique(r)
 	assert(i >= 0 && i < r.n, "session_marker_erase: index out of range")
-	mem.copy(&session_marker_rows[r.first+i], &session_marker_rows[r.first+i+1], (r.n-i-1)*size_of(Clip_Marker))
+	// Only when there is something to move. The length is 0 when erasing the last
+	// marker, but `&session_marker_rows[r.first+i+1]` is evaluated anyway and
+	// points past the row -- the same trap session_kf_erase documents, which is
+	// what a pattern repeated across four stores buys you.
+	if i + 1 < r.n {
+		mem.copy(
+			&session_marker_rows[r.first+i],
+			&session_marker_rows[r.first+i+1],
+			(r.n-i-1)*size_of(Clip_Marker),
+		)
+	}
 	r.n -= 1
 }
 

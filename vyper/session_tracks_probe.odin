@@ -73,6 +73,73 @@ when ODIN_DEBUG {
 			"freed track block reused at %d (got %d)", off, reused.first)
 		session_trk_release_range(reused)
 
+		// Erasing or inserting at the END of a range that sits flush against the
+		// end of the store. This is the crash: the slide has nothing to move, so its
+		// length is 0 -- but `&rows[r.first+idx+1]` is evaluated regardless, and when
+		// first+n == len(rows) that index is one past the array. Bounds-checked
+		// builds abort on the pointer, not on the copy.
+		//
+		// Reachable from the editor: keyframe_drop_track calls session_trk_erase
+		// whenever a track loses its last key, and the newest clip's range is
+		// exactly the one occupying the tail of the store.
+		//
+		// The shape is a range that is FULL (n == slots) and ends at the array end.
+		// A freshly reset store hands out SESSION_TRK_MIN_CAP slots at offset 0, so
+		// filling it puts first+n == len(rows) without touching any field by hand.
+		{
+			session_trk_reset()
+			session_kf_reset()
+
+			tail := Keyframe_Track_Range{}
+			for i in 0 ..< SESSION_TRK_MIN_CAP {
+				session_trk_push(&tail, Keyframe_Track{name=session_str_intern("track")})
+			}
+			session_trk_check(
+				tail.first + tail.n == len(session_trk_rows) && tail.n == tail.slots,
+				"range must be full and flush at the array end (first=%d n=%d slots=%d rows=%d)",
+				tail.first, tail.n, tail.slots, len(session_trk_rows))
+
+			// Erase the LAST track: nothing to slide, and first+n is already len.
+			session_trk_erase(&tail, tail.n - 1)
+			session_trk_check(tail.n == SESSION_TRK_MIN_CAP-1,
+				"erasing the last track of a flush range leaves n=%d (got %d)",
+				SESSION_TRK_MIN_CAP-1, tail.n)
+			// The survivors must be untouched: the guard skips a copy that has
+			// nothing to move, not one that has.
+			session_trk_check(session_trk_view(tail, 0).name == session_str_intern("track"),
+				"the surviving first track is unchanged")
+			session_trk_release_range(tail)
+
+			// Insert at the END of a flush range: also nothing to slide.
+			tail2 := Keyframe_Track_Range{}
+			for i in 0 ..< SESSION_TRK_MIN_CAP {
+				session_trk_push(&tail2, Keyframe_Track{name=session_str_intern("old")})
+			}
+			session_trk_insert(&tail2, tail2.n, Keyframe_Track{name=session_str_intern("new")})
+			session_trk_check(
+				tail2.n == SESSION_TRK_MIN_CAP+1 &&
+				session_trk_view(tail2, tail2.n-1).name == session_str_intern("new"),
+				"insert at the end appends (n=%d)", tail2.n)
+			session_trk_release_range(tail2)
+
+			// Erase from the MIDDLE: the case that actually shifts, so the guard
+			// above is not hiding a broken slide.
+			session_trk_reset()
+			mid := Keyframe_Track_Range{}
+			session_trk_push(&mid, Keyframe_Track{name=session_str_intern("p")})
+			session_trk_push(&mid, Keyframe_Track{name=session_str_intern("q")})
+			session_trk_push(&mid, Keyframe_Track{name=session_str_intern("r")})
+			session_trk_erase(&mid, 1)
+			session_trk_check(
+				mid.n == 2 &&
+				session_trk_view(mid, 0).name == session_str_intern("p") &&
+				session_trk_view(mid, 1).name == session_str_intern("r"),
+				"erasing the middle slides the tail (n=%d)", mid.n)
+			session_trk_release_range(mid)
+			session_trk_reset()
+			session_kf_reset()
+		}
+
 		// Probe-created pool state dies here; production teardown owns normal reset.
 		session_trk_reset()
 		session_kf_reset()

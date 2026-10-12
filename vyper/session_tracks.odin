@@ -149,7 +149,22 @@ session_trk_push :: proc(r: ^Keyframe_Track_Range, t: Keyframe_Track) {
 session_trk_erase :: proc(r: ^Keyframe_Track_Range, idx: int) {
 	session_trk_make_unique(r)
 	assert(idx >= 0 && idx < r.n, "session_trk_erase: index out of range")
-	mem.copy(&session_trk_rows[r.first+idx], &session_trk_rows[r.first+idx+1], (r.n-idx-1)*size_of(Keyframe_Track))
+	// Only when there is something to move, and for the same reason
+	// session_kf_erase guards its copy: `&session_trk_rows[r.first+idx+1]` is
+	// evaluated whatever the length argument says, so erasing the LAST track of a
+	// range sitting at the end of the store formed a pointer past the end of the
+	// global array and handed it to mem.copy with a length of 0. The bounds check
+	// stopped it; -no-bounds-check would have made it a pointer nobody looked at.
+	//
+	// This was fixed in session_kf and missed here -- the same pattern in two
+	// stores, which is the shape that lets one keep the bug.
+	if idx + 1 < r.n {
+		mem.copy(
+			&session_trk_rows[r.first+idx],
+			&session_trk_rows[r.first+idx+1],
+			(r.n-idx-1)*size_of(Keyframe_Track),
+		)
+	}
 	r.n -= 1
 }
 
@@ -170,8 +185,15 @@ session_trk_insert :: proc(r: ^Keyframe_Track_Range, idx: int, t: Keyframe_Track
 		if r.slots > 0 { session_trk_free(r.first, r.slots) }
 		r.first = new_off
 		r.slots = new_slots
-	} else {
-		mem.copy(&session_trk_rows[r.first+idx+1], &session_trk_rows[r.first+idx], (r.n-idx)*size_of(Keyframe_Track))
+	} else if idx < r.n {
+		// Same one-past-the-end guard as the erases: inserting AT THE END has
+		// nothing to shift, and `&...rows[r.first+idx+1]` is evaluated regardless
+		// of the length, so it formed a pointer past the row the range owns.
+		mem.copy(
+			&session_trk_rows[r.first+idx+1],
+			&session_trk_rows[r.first+idx],
+			(r.n-idx)*size_of(Keyframe_Track),
+		)
 	}
 	session_trk_rows[r.first+idx] = t
 	r.n += 1
