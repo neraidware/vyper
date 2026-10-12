@@ -37,37 +37,34 @@ KF_MAX_OFFSET :: 268435456
 // closed-form curves evaluated in keyframe_ease. Samplers use keyframe_apply_interp so
 // scalar and packed lanes share one curve. The very first key has nothing
 // arriving at it, so its mode is inert.
-// KEYFRAME_DEFAULT_INTERP is the mode a freshly created key carries.
+// KEYFRAME_DEFAULT_INTERP is the mode a freshly created key carries: .Linear, so
+// a new key moves toward its value at a constant rate with no easing. It was
+// .Cubic, a spline that eased in and out of every breakpoint. "No interpolation"
+// asked for a keyframe that travels to its value without smoothing itself on the
+// way, and easing is the thing being removed, not the travel.
 //
-// .Linear, so a new key MOVES toward its value at a constant rate with no
-// easing. It was .Cubic -- the zero value, and a spline that eases in and out of
-// every breakpoint. "No interpolation" asked for a keyframe that travels to its
-// value without smoothing itself on the way, and easing is the thing being
-// removed, not the travel.
-//
-// NOT expressed as the enum's zero value. It was tempting to reorder the enum so
-// .Linear is zero and `Keyframe{}` just means "the default", but
-// `Saved_Kf_Track.keys` is `[dynamic]Keyframe` -- the mode is persisted as its
-// raw enum number -- so reordering would silently reinterpret the easing of
-// every key already in every project file. A named constant in the one proc that
-// stamps a default changes what NEW keys get and leaves stored ones meaning
-// exactly what they meant. keyframe_set_lane_key_interp is the only other entry,
-// and the project loader uses it deliberately, to preserve what the user saved.
+// .Linear is ALSO the enum's zero value now, so `Keyframe{}` means "the default"
+// with no further saying -- the zero value is useful rather than a trap that
+// needs a compensating constant. That renumbers the modes, so a project file
+// written before the reorder reads the wrong easing; the format is knowingly
+// incompatible across it.
 KEYFRAME_DEFAULT_INTERP :: Keyframe_Interp.Linear
 
 // Keyframe_Interp is the easing a key applies to the segment ARRIVING at it from
 // the previous key — we ease INTO a breakpoint, so the key you're heading to owns
-// the curve. .Cubic is the zero value — a cubic Hermite spline over
-// neighbor-estimated tangents; .Linear and the rest are closed-form curves
-// evaluated in keyframe_ease. Samplers use keyframe_apply_interp so scalar and
-// packed lanes share one curve. The very first key has nothing arriving at it, so
-// its mode is inert.
+// the curve. .Linear is the zero value and a fresh key's mode: a constant-rate
+// move to that key's value, no easing. .Cubic is a cubic Hermite spline over
+// neighbor-estimated tangents; the rest are closed-form curves evaluated in
+// keyframe_ease. Samplers use keyframe_apply_interp so scalar and packed lanes
+// share one curve. The very first key has nothing arriving at it, so its mode is
+// inert.
 //
-// The mode a NEW key carries is KEYFRAME_DEFAULT_INTERP (.Linear), NOT this
-// enum's zero value. See that constant for why the numbering is left alone.
+// Reordered so the default is zero. The mode is persisted as this enum's raw
+// number (Saved_Kf_Track.keys is [dynamic]Keyframe), so a project file written
+// before the reorder reads the wrong easing — knowingly incompatible.
 Keyframe_Interp :: enum u8 {
-	Cubic,
 	Linear,
+	Cubic,
 	Ease_In,
 	Ease_Out,
 	Ease_In_Out,

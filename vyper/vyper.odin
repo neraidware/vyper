@@ -2093,6 +2093,7 @@ main :: proc() {
 	when ODIN_DEBUG {
 		if dr, _ := os.lookup_env_alloc("VYPER_DECODE_REPEAT_PROBE", context.temp_allocator); dr != "" {
 			decode_repeat_probe_run(dr)
+			return
 		}
 	}
 	when ODIN_DEBUG {
@@ -2467,6 +2468,7 @@ main :: proc() {
 	when ODIN_DEBUG {
 		if ar, _ := os.lookup_env_alloc("VYPER_AUDIO_RATE_PROBE", context.temp_allocator); ar != "" {
 			audio_rate_probe_run(ar)
+			return
 		}
 	}
 	when ODIN_DEBUG {
@@ -2557,12 +2559,20 @@ main :: proc() {
 			os.exit(yuv_exact_probe_run())
 		}
 	}
+	// Headless UI probes. Each returns: the probe IS the run, and falling through
+	// opens the window and enters the main loop, so a headless gate hangs until
+	// something kills it instead of reporting. Split into one `when` block per
+	// probe because a `return` in the first would make the rest unreachable.
 	when ODIN_DEBUG {
 		if v, _ := os.lookup_env_alloc("VYPER_PAN_PROBE", context.temp_allocator); v != "" {
 			ui_probe_pan_shift(v)
+			return
 		}
+	}
+	when ODIN_DEBUG {
 		if v, _ := os.lookup_env_alloc("VYPER_ZOOM_SKEW_PROBE", context.temp_allocator); v != "" {
 			ui_probe_zoom_skew(v)
+			return
 		}
 		if v, _ := os.lookup_env_alloc("VYPER_GUTTER_PROBE", context.temp_allocator); v != "" {
 			ui_probe_gutter(v)

@@ -9289,3 +9289,30 @@ whole bug.
       since `771dea5`.
 - [ ] `SDL_SetGPUScissor_REAL` overshoot follows from the same frame; diagnosing
       it independently is redundant until Option A lands.
+
+## Active 59 — Three "headless" probes opened the window and hung
+
+`VYPER_PAN_PROBE`, `VYPER_ZOOM_SKEW_PROBE` and `VYPER_AUDIO_RATE_PROBE` ran
+their probe and then **fell through** into `sdl.CreateWindow` and the main loop.
+A probe env var meant "run this headless", and instead it opened a real window
+and sat there — a gate had to be killed by `timeout` rather than reporting, and
+the run looked like a pass when it had proved nothing.
+
+Audited every `VYPER_*_PROBE` dispatch in `main` (40 of them) for a terminating
+`return` / `os.exit`. Seven lacked both; three were genuinely affected, three
+called `os.exit` inside the probe and were fine, one (decode-repeat) exits non-zero
+on its own paths.
+
+- The two UI probes shared a single `when ODIN_DEBUG` block, so the `return` in
+  the first would have made the rest unreachable. Split into one block per probe.
+- The rule is now stated in a comment at the dispatch site, because the failure is
+  invisible: the probe's output is correct, and only the fact that the process
+  never exits says anything is wrong.
+
+Verified: `VYPER_PAN_PROBE` and `VYPER_ZOOM_SKEW_PROBE` against ~/hello.vyproj
+now exit 0 instead of hanging to the timeout. check, probe, keyframe_probe,
+render_kf_probe, session_kf_probe, geom_key_probe, timeline_probe, smoke green.
+
+Note: `VYPER_AUDIO_RATE_PROBE` still runs long on a 4GB AV1 source, but that is
+the probe transcoding, not a window -- its `return` makes reaching CreateWindow
+impossible either way.
