@@ -79,11 +79,6 @@ session_lane_reset :: proc() {
 	session_lane_live = 0
 	session_lane_live_peak = 0
 }
-
-session_lane_live_lanes :: proc() -> int {
-	return session_lane_live
-}
-
 // session_lane_alloc reserves `slots` contiguous slots, first fit over the free
 // list, else the tail. Callers pass a capacity and never a length: a zero-length
 // range still needs a slot to append into.
@@ -316,13 +311,6 @@ session_lane_erase :: proc(r: ^Keyframe_Lanes_Range, i: int) {
 	}
 	r.n -= 1
 }
-
-session_lane_set :: proc(r: ^Keyframe_Lanes_Range, i: int, lane: Keyframe_Lane) {
-	session_lane_make_unique(r)
-	assert(i >= 0 && i < r.n, "session_lane_set: index out of range")
-	session_lane_rows[r.first+i] = lane
-}
-
 session_lane_at :: proc(r: Keyframe_Lanes_Range, i: int) -> Keyframe_Lane {
 	assert(i >= 0 && i < r.n, "session_lane_at: index out of range")
 	return session_lane_view(r)[i]
@@ -365,18 +353,4 @@ session_lane_insert :: proc(r: ^Keyframe_Lanes_Range, i: int, lane: Keyframe_Lan
 	}
 	session_lane_rows[r.first+i] = lane
 	r.n += 1
-}
-
-session_lane_make :: proc(lanes: []Keyframe_Lane) -> Keyframe_Lanes_Range {
-	r := Keyframe_Lanes_Range{}
-	if len(lanes) > 0 {
-		session_lane_reserve(&r, len(lanes))
-		mem.copy(
-			raw_data(session_lane_rows[r.first :]),
-			raw_data(lanes),
-			len(lanes) * size_of(Keyframe_Lane),
-		)
-		r.n = len(lanes)
-	}
-	return r
 }
