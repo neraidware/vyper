@@ -122,7 +122,11 @@ jobs:
             # the file that actually ships or the loader looks for the wrong name.
             $dll = Get-ChildItem "deps\$l*.dll" | Select-Object -First 1
             if (-not $dll) { throw "no DLL matching $l*.dll in deps\" }
-            & dlltool -d $dll.FullName -D $dll.Name -l "vyper\vendor\ffmpeg\$l\$l.lib"
+            # -k drops dlltool's "@<dll>" suffix from the generated import names.
+            # Without it every av*/sws*/swr* symbol comes out decorated and the
+            # link fails with "unresolved symbol 'av_read_frame'" -- the libs are
+            # right, the names are not.
+            & dlltool -k -d $dll.FullName -D $dll.Name -l "vyper\vendor\ffmpeg\$l\$l.lib"
             if ($LASTEXITCODE -ne 0) { throw "dlltool failed for $($dll.Name) (exit $LASTEXITCODE)" }
             Write-Host "import lib: $l <- $($dll.Name)"
           }
