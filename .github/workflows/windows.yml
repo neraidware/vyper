@@ -21,22 +21,39 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The compiler line is READ from .mise.toml rather than pinned here. It was
-      # pinned, and drifted: this said dev-2026-07a while the dev machine tracked
-      # dev-2026-09, so CI was validating a build two months behind the one the
-      # gates actually run. A compiler bump changes codegen, which is exactly what
-      # a build gate is supposed to catch -- so a second copy of the version can
-      # only ever make the gate check a compiler nobody uses. One home for it.
+      # The compiler line is READ from .mise.toml rather than duplicated here, so
+      # the two cannot drift silently again -- a second copy of the version can
+      # only ever make the gate check a compiler nobody uses.
+      #
+      # WINDOWS_HOLD is an override, not a second pin: it is the version minus
+      # dev-2026-10, and it exists for one measured reason.
+      #
+      # dev-2026-10 changed the default Windows linker to radlink (lld-link),
+      # which does not link this project. The binary is /SUBSYSTEM:WINDOWS with a
+      # custom /ENTRY; radlink rejects the entry-point override, then reports
+      # .idata section-flag conflicts against the ffmpeg import libraries and
+      # dies on a rasdll.dll load. The documented workaround -- naming the linker
+      # with -linker: -- crashes the driver itself with an access violation before
+      # the package is compiled, with and without -linker:msvc, so there is no
+      # usable configuration on dev-2026-10 today.
+      #
+      # This costs only Windows, and only until Odin fixes it. Remove the
+      # override and CI tracks .mise.toml again the moment dev-2026-11 links.
+      # Meanwhile a real compile break DOES get caught here: dev-2026-10 changed
+      # wstring from ^u16 to cstring16 and broke three call sites in
+      # portal_windows.odin, which is how the hold was found rather than assumed.
       - name: Read pinned Odin version
         id: odin_version
         shell: pwsh
         run: |
-          # .mise.toml is `odin = "dev-2026-10"`. Fail loudly if that shape
-          # changes, so the gate cannot silently fall back to an unpinned Odin.
           $line = Select-String -Path .mise.toml -Pattern '^odin\s*=\s*"([^"]+)"\s*$'
           if (-not $line) { throw "no pinned odin in .mise.toml -- a build gate must not pick its own compiler" }
           $v = $line.Matches[0].Groups[1].Value
-          Write-Host "odin=$v (from .mise.toml)"
+          $hold = "dev-2026-09"
+          if ($v -ne $hold) {
+            Write-Host "odin=$v from .mise.toml; Windows holds at $hold (radlink default does not link this project -- see step comment)"
+            $v = $hold
+          }
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Setup Odin
