@@ -9122,18 +9122,48 @@ opening a field requests SDL text input and cancelling leaves no request.
 ### Active 54 — Hold interpolation: ADDED, THEN REMOVED (misread request)
 
 Added as `Keyframe_Interp.Hold` in `6d612e9`: the segment arriving at a key stays
-at the previous key's value and steps on the key's own frame. Wired to the UI
-menu, the click handler, and the keyframe probe.
+at the previous key's value and steps on the key's own frame.
 
-**Removed again.** The request was never "hold" — it was **move toward the value,
-without smooth interpolation**. Hold is the opposite of that: it is the one mode
-where the value does not move at all and jumps. `.Linear` was already exactly
-what was asked for — `keyframe_ease(.Linear, t) == t`, a constant-rate move from
-the previous key's value to this one with no easing.
+**Removed** (`ae448af`). The request was never "hold" — it was **move toward the
+value, without smooth interpolation**. Hold is the one mode where the value does
+not move at all and jumps; `.Linear` was already exactly what was asked for
+(`keyframe_ease(.Linear, t) == t`). Removing the last enum member renumbered
+nothing, so no stored file changed meaning.
 
-Removing the last enum member renumbers nothing, so no existing project file's
-stored mode changes: `.Cubic` keeps its zero value and stays the default for a
-fresh key.
+## Active 58 — .Linear is the default interpolation for a new key
+
+The default was `.Cubic`, a Hermite spline that eases in and out of every
+breakpoint. "No interpolation" asked for a keyframe that travels to its value
+without smoothing itself on the way — easing is what comes out, not the travel.
+So a new key now carries `.Linear`.
+
+`KEYFRAME_DEFAULT_INTERP :: Keyframe_Interp.Linear` (keyframes.odin), stamped in
+the one proc that creates a key (`keyframe_set_lane_key`).
+
+**Deliberately NOT the enum's zero value.** Reordering the enum so `.Linear` is
+zero would have been tidier — `Keyframe{}` would just mean "the default" — but
+`Saved_Kf_Track.keys` is `[dynamic]Keyframe`, so the mode is persisted as its raw
+enum number. Reordering silently reinterprets the easing of every key already in
+every project file. A named constant changes what NEW keys get and leaves every
+stored one meaning what it meant. This is the same trade the `Hold` member's own
+comment used to make ("inserting this member anywhere else would renumber every
+mode already written to a project file") — the numbering rule is unchanged, only
+the thing that fills it in.
+
+Two probe corrections fell out of it, both the same mistake:
+
+- Several keyframe_probe fixtures compared against bare `Keyframe{frame_off, value}`
+  literals, which zero-init `interp` to `.Cubic`. They were asserting the old
+  default without saying so. They now name `KEYFRAME_DEFAULT_INTERP` explicitly.
+- The "cubic collapses to the chord" run-up fixture built its clip with
+  `keyframe_set_key` and relied on inheriting `.Cubic`. It means cubic, so it now
+  says `.Cubic`.
+
+And a new assertion pins the default itself: a test that means "linear" must say
+linear, and nothing else would have caught the default changing quietly.
+
+Verified: check, probe, keyframe_probe, render_kf_probe, session_kf_probe,
+geom_key_probe, timeline_probe, render_live_probe, transform_probe, smoke.
 
 ## Active 56 — Windows crash log not findable next to the exe
 
