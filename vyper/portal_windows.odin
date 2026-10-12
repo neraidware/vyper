@@ -34,17 +34,18 @@ win32_open_file_picker :: proc() -> cstring {
 		"\x00\x00",
 	}, context.temp_allocator)
 
-	// &file_buf[0] is the LPWSTR lpstrFile wants. It used to be wrapped in
-	// win32.wstring, which changed return type in Odin dev-2026-10: wstring is
-	// now cstring16, and lpstrFile is LPWSTR (^WCHAR). The cast was never load
-	// bearing -- the buffer is already u16 -- so dropping it is the fix rather
-	// than a cast to paper over the new type.
+	// wstring(&file_buf[0]) is the form dev-2026-09 wants: OPENFILENAMEW.lpstrFile
+	// is cstring16 there. dev-2026-10 CHANGED THE FIELD to LPWSTR (^WCHAR), so
+	// that version wants a bare &file_buf[0] instead -- the two are mutually
+	// exclusive and there is no single source that compiles on both. CI holds
+	// Windows at dev-2026-09 until Odin fixes its linker default, so this file
+	// is the dev-2026-09 form. See the "Read pinned Odin version" step.
 	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
 	defer delete(file_buf)
 
 	ofn := win32.OPENFILENAMEW{
 		lStructSize  = size_of(win32.OPENFILENAMEW),
-		lpstrFile    = &file_buf[0],
+		lpstrFile    = win32.wstring(&file_buf[0]),
 		nMaxFile     = win32.MAX_PATH_WIDE,
 		lpstrTitle   = win32.utf8_to_wstring("Open media file", context.temp_allocator),
 		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
@@ -81,7 +82,7 @@ win32_open_srt_picker :: proc() -> cstring {
 
 	ofn := win32.OPENFILENAMEW{
 		lStructSize  = size_of(win32.OPENFILENAMEW),
-		lpstrFile    = &file_buf[0],
+		lpstrFile    = win32.wstring(&file_buf[0]),
 		nMaxFile     = win32.MAX_PATH_WIDE,
 		lpstrTitle   = win32.utf8_to_wstring("Select subtitle file", context.temp_allocator),
 		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
@@ -145,7 +146,7 @@ win32_save_file_picker :: proc(target: Save_Target) -> cstring {
 
 	ofn := win32.OPENFILENAMEW{
 		lStructSize  = size_of(win32.OPENFILENAMEW),
-		lpstrFile    = &file_buf[0],
+		lpstrFile    = win32.wstring(&file_buf[0]),
 		nMaxFile     = win32.MAX_PATH_WIDE,
 		lpstrTitle   = win32.utf8_to_wstring(save_target_title(target), context.temp_allocator),
 		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
