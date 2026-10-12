@@ -408,9 +408,20 @@ linker_flags :: proc() -> string {
 
 // odin_extra_flags are defines the build needs on this platform. Windows links
 // the ffmpeg import libraries by name, which is what FFMPEG_LINK=system selects.
+//
+// It also NAMES the Windows linker, rather than taking the compiler default.
+//
+// Odin dev-2026-10 changed that default to radlink (lld-link), and this project
+// does not link with it: the binary is a GUI subsystem app with a custom
+// /ENTRY, and radlink warns "unable to redefine entry point" on it, then fails
+// with .idata section-flag conflicts against the ffmpeg import libraries and a
+// fatal "debug information file was not found or was not valid". MSVC's link.exe
+// links it. Every other platform already names its linker from this file, so
+// leaving Windows to the compiler default was the one gap -- and the compiler
+// changing its mind is how that becomes a red build with no code change.
 odin_extra_flags :: proc() -> []string {
 	when ODIN_OS == .Windows {
-		WINDOWS_FLAGS := []string{"-define:FFMPEG_LINK=system"}
+		WINDOWS_FLAGS := []string{"-define:FFMPEG_LINK=system", "-linker:msvc"}
 		return WINDOWS_FLAGS[:]
 	}
 	return {}
