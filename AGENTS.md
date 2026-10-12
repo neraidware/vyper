@@ -246,28 +246,37 @@ and change how it behaves — without an AI, and without refactoring unrelated
 functions first to make the path make sense. That is the bar, not "it passes
 and the comment explains it."
 
+- **Needing an essay is the evidence, not the problem to solve in words.** The
+  moment a system takes paragraphs to explain, the architecture is what failed —
+  the name, the shape, the boundary, or the missing seam. Shortening the prose
+  is the one response that is always available and never right: it hides the
+  evidence and leaves the structure exactly as unfindable. Fix the structure,
+  then see how much prose survives, which is usually very little.
+- **Discipline means refusing to let that stand, not writing more about it.** A
+  rule about comment length is not a fix. Noticing you wrote an essay and
+  carrying on is the failure. The discipline is stopping, finding the shape that
+  forced the explanation, and changing it — even when the explanation already
+  exists and is accurate, because accurate prose over a bad structure still
+  leaves the next reader lost in the same place.
 - **One home per fact, and every consumer reaches it by name.** A second
-  derivation of something is not a convenience, it is a scheduled
-  disagreement. Two names for one value (`FOO_DEFAULT` beside the zero value it
-  equals) is the smallest version of this defect and still a defect: the reader
-  has to work out which one is real, and the wrong answer is silent.
-- **Structure carries the explanation.** If a reader needs a paragraph to work
-  out what something does, the thing is wrong — the name, the shape, or the
-  boundary. Fix that instead. Prose laid over a bad structure is worse than no
-  prose, because it makes the structure look deliberate and stops anyone
-  finding the real fault.
+  derivation is not a convenience, it is a scheduled disagreement. Two names for
+  one value (`FOO_DEFAULT` beside the zero value it equals) is the smallest
+  version and still a defect: the reader has to work out which is real, and the
+  wrong answer is silent.
+- **Structure carries the explanation.** Name the thing for what it is, give it
+  one job, and let the call graph show the connections. If a reader needs prose
+  to know what a function does, the function is wrong.
 - **A seam you cannot find is a seam that is wrong.** Changing behaviour means
   starting from code you can see and following it to its other end — producer,
-  consumer, caller — without a global search. If following the path requires
+  consumer, caller — without a global search. When following the path requires
   knowing where to look, the path is the thing to fix.
 - **Prose is for what the code cannot say:** why this approach over the obvious
   one, a measured number, a platform fact, an invariant another module depends
-  on. Not for narrating what the next line does.
-- **The tell:** if a change needed prose to justify it, the change is probably
-  in the wrong shape. Ask what would have to be true for the obvious version to
-  work.
-- Two homes introduced in one sitting is not "mostly fine". The cost is not that
-  line; it is every reader afterwards who trusts the wrong one.
+  on. Never for narrating the next line, and never to reconcile two callers that
+  disagree.
+- **The tell, stated once:** a comment that explains *why two call sites had to
+  be made to agree* is describing a missing shared decision. Move the decision
+  into one place and delete the comment.
 
 ## 4. Low level is home turf
 

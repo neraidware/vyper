@@ -382,32 +382,18 @@ finder_commit :: proc(entry: Finder_Entry) {
 		open_file_at(cpath)
 		delete(cpath)
 	case .ImportBin:
-		// A project file is not media; importing it into the bin is a mistake.
-		if project_path_is_project(entry.fullpath) {
-			show_ui_notice("Project files can't be imported into the media bin", 4000)
-			return
-		}
-		// import_media_to_bin/import_srt_to_bin store the path directly on the
-		// asset, so the clone becomes bin-owned when a new asset is appended;
-		// on a dedup no-op (path already in the bin) nothing stores it, so we
-		// must free it. Cheap pre-check avoids guessing from the return id.
-		already_in_bin := false
-		for &a in media_bin.assets {
-			if strings.compare(string(a.path), entry.fullpath) == 0 {
-				already_in_bin = true
-				break
-			}
-		}
-		if already_in_bin {
+		// The clone below becomes bin-owned when an asset is appended and must be
+		// freed when it is not, so the finder needs to know up front whether the
+		// path is already in the bin. That is an ownership question about THIS
+		// proc's cstring; whether a file may be imported at all is
+		// import_path_to_bin's decision, and all four import routes go through it.
+		if media_bin_holds(entry.fullpath) {
 			finder_close()
 			return
 		}
 		cpath := strings.clone_to_cstring(entry.fullpath)
-		if is_srt_pick(cpath) {
-			import_srt_to_bin(cpath)
-		} else {
-			import_media_to_bin(cpath)
-		}
+		defer delete(cpath)
+		import_path_to_bin(cpath)
 	case .Save:
 		// Reached only when Enter landed on a file row with an empty field
 		// (a typed name is handled earlier, in finder_enter), so there is
@@ -481,45 +467,24 @@ finder_save_typed_name :: proc() {
 // finder_open starts the finder from the process cwd in the given commit mode.
 // The field always starts empty: Open/ImportBin use it as a filter, and Save
 // uses it as a name it must not pre-fill (see finder_enter).
-// FINDER_USE_OS_PICKER routes every file dialog to the platform picker -- the
-// XDG portal on Linux, the Win32 common dialog on Windows -- instead of the
-// in-app finder below.
-//
-// TEMPORARY, and one line to flip back. The finder is NOT removed and NOT
-// deleted: `finder_open`, its listing, its filter field and its commit modes all
-// stay exactly as they were, and the finder's own probes still call
-// `finder_open` directly, so it keeps compiling and stays covered while it is
-// bypassed. Flipping this to false restores it for every entry point at once,
-// because they all go through file_picker_request.
-//
-// Why the OS picker is preferred: the finder is a good fuzzy browser, but the
-// platform dialog is what the user's own file manager hands off from (and what
-// the portal makes available to a sandboxed app at all). The finder cannot pick
-// a path outside what its own listing walks.
+// FINDER_USE_OS_PICKER routes every dialog to the platform picker (XDG portal on
+// Linux, Win32 common dialog on Windows). Temporary: set false to restore the
+// in-app finder below, which is intact and still covered by its own probes.
 FINDER_USE_OS_PICKER :: true
 
-// file_picker_request is THE entry point for "the user asked for a file
-// dialog". Four sites used to call finder_open directly -- the bin Import
-// button, the Open File button, and bare ":save"/":open" -- and each picked the
-// dialog, so routing them meant four edits that could drift apart. They all come
-// here now.
+// Every entry point asks here, so the four of them cannot disagree about which
+// dialog opens.
 file_picker_request :: proc(mode: Finder_Commit_Mode) {
 	if FINDER_USE_OS_PICKER {
 		file_picker_os(mode)
 		return
 	}
-	// The in-app finder, intact. This is the branch the flag above turns back on.
 	finder_open(mode)
 }
 
-// file_picker_os runs the platform picker and applies the choice exactly as the
-// finder's commit did, so only the DIALOG differs -- what a picked path means
-// (a project, media for the bin, a destination to save into) is the finder's
-// decision and must not be restated here in a second copy.
-//
-// The returned path is the picker's own per-call session buffer, owned for the
-// life of the program: nothing here frees it, and the bin clones it onto the
-// asset. Freeing it would be a double free against the asset's copy.
+// The picker's path is its own per-call session buffer, owned for the life of the
+// program: the bin clones it onto the asset, so freeing it here would double
+// free against that copy.
 file_picker_os :: proc(mode: Finder_Commit_Mode) {
 	path: cstring
 	switch mode {
@@ -538,8 +503,6 @@ file_picker_os :: proc(mode: Finder_Commit_Mode) {
 		// commit made, including refusing a project in .ImportBin.
 		open_file_at(path)
 	case .ImportBin:
-		// import_path_to_bin is the finder's own "can the bin hold this" gate, so
-		// the decodability rule stays in ONE place rather than being restated.
 		import_path_to_bin(path)
 	case .Save:
 		if err := project_file_save(string(path)); len(err) > 0 {

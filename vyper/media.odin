@@ -698,6 +698,16 @@ import_media :: proc(path: cstring) {
 	}
 }
 
+// media_bin_holds reports whether a path is already an asset in the bin.
+media_bin_holds :: proc(path: string) -> bool {
+	for &a in media_bin.assets {
+		if strings.compare(string(a.path), path) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // import_path_to_bin routes one path into the media bin and nothing else: a
 // subtitle file loads as a subtitle asset, anything ffprobe reports a stream
 // for (video, audio, or an image) imports as media, and anything else -- a
@@ -709,6 +719,16 @@ import_media :: proc(path: cstring) {
 // a second caller needed the same answer; two copies of a decodability rule
 // are two places for it to be wrong.
 import_path_to_bin :: proc(path: cstring) -> u64 {
+	// A .vyproj is CBOR metadata, not media, and every route into the bin has to
+	// refuse it with the same message. It lives here rather than at the call
+	// sites because "the user chose a file to add to the bin" is one decision with
+	// four callers -- an open dialog, a drag-and-drop, the finder's import mode,
+	// and a typed path -- and a caller that forgets the check just reports
+	// "not decodable media" for a file that is perfectly decodable.
+	if project_path_is_project(string(path)) {
+		show_ui_notice("Project files can't be imported into the media bin", 4000)
+		return 0
+	}
 	if is_srt_pick(path) {
 		return import_srt_to_bin(path)
 	}
