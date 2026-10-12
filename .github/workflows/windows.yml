@@ -94,10 +94,27 @@ jobs:
           Copy-Item "$src\bin\*.dll" deps\ -Force
           Copy-Item "$src\bin\ffmpeg.exe" deps\ -Force
           Copy-Item "$src\bin\ffprobe.exe" deps\ -Force
-          # Drop import libs into vyper/vendor/ffmpeg/<lib>/<lib>.lib for the libs the
-          # app actually binds (relative foreign-import resolution).
+          # Import libs are GENERATED from the staged DLLs rather than copied from
+          # the BtbN zip, and that is not tidiness -- it is the only way this links.
+          #
+          # Odin dev-2026-10 made radlink (lld-link) the default Windows linker.
+          # MSVC's link.exe tolerates the odd section flags in the BtbN import
+          # libs; lld does not. It reports "detected section flags conflict in
+          # .idata" against avcodec and friends, then "unable to merge
+          # .idata=.data because of conflicting section flags", and the CRT then
+          # aborts the link with a fatal exception. The output would be wrong even
+          # if it survived, so suppressing the warning is not a fix.
+          #
+          # llvm-dlltool writes a fresh import lib from the DLL with sections lld
+          # can merge. The DLLs are already staged and are what actually ships, so
+          # the import lib is derived from the same bytes rather than trusted from
+          # a second source that can disagree with them.
+          $dlltool = Get-Command llvm-dlltool.exe -ErrorAction SilentlyContinue
+          if (-not $dlltool) { throw "llvm-dlltool not found on PATH; the ffmpeg import libs cannot be regenerated and lld cannot link them" }
           foreach ($l in @("avcodec","avfilter","avformat","avutil","swresample","swscale")) {
-            Copy-Item "deps\lib\$l.lib" "vyper\vendor\ffmpeg\$l\$l.lib" -Force
+            & llvm-dlltool -d "deps\$l.dll" -D $l -l "vyper\vendor\ffmpeg\$l\$l.lib"
+            if ($LASTEXITCODE -ne 0) { throw "llvm-dlltool failed for $l (exit $LASTEXITCODE)" }
+            Write-Host "import lib: $l"
           }
 
       # build.odin compiles every shader on every build and refuses to fall back to the
