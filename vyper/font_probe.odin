@@ -48,11 +48,11 @@ when ODIN_DEBUG {
 		append(&graph.nodes, Compositor_Node{kind = .Style_Process, input_len = 2})
 		append(&graph.nodes, Compositor_Node{kind = .Text_Renderer})
 		graph.sink = 3
-		graph_connect(graph, 0, 1, 0)
-		graph_connect(graph, 0, 2, 0)
-		graph_connect(graph, 1, 3, 1)
-		graph_connect(graph, 2, 3, 2)
-		graph_connect(graph, 0, 3, 0)
+		graph_connect(graph, 0, 1)
+		graph_connect(graph, 0, 2)
+		graph_connect(graph, 1, 3)
+		graph_connect(graph, 2, 3)
+		graph_connect(graph, 0, 3)
 	}
 
 	// tint_probe_ink_edges returns the RGB of the leftmost and rightmost inked
@@ -338,7 +338,7 @@ pieces: Text_Pieces_Range,
 				// renderer <- style <- input already. Wiring input back from the
 				// renderer closes a loop, so it must be refused.
 				font_probe_check(
-					!graph_connect(&graph, graph.sink, 0, 0),
+					!graph_connect(&graph, graph.sink, 0),
 					"graph: a connection that would close a cycle must be refused",
 				)
 				// A renderer emits an IMAGE, so nothing may feed it from a node
@@ -354,6 +354,44 @@ pieces: Text_Pieces_Range,
 						node_pin_emits(.Text_Input) == .Text,
 					"graph: only the renderer may emit an image",
 				)
+				// A branch that fans out and reconverges. Nothing in a node's shape
+				// says how many things feed it, so a source driving three processes
+				// that all reach one renderer is the SAME construction as a chain --
+				// the difference is two more edges. A per-node input array would have
+				// needed a struct change and a slot-index convention to get here.
+				{
+					branch := Node_Graph{}
+					branch.nodes = make([dynamic]Compositor_Node, 0, 5)
+					append(&branch.nodes, Compositor_Node{kind = .Text_Input})
+					append(&branch.nodes, Compositor_Node{kind = .Style_Process, input_len = 1})
+					append(&branch.nodes, Compositor_Node{kind = .Style_Process, input_len = 2})
+					append(&branch.nodes, Compositor_Node{kind = .Style_Process, input_start = 2, input_len = 3})
+					append(&branch.nodes, Compositor_Node{kind = .Text_Renderer})
+					branch.sink = 4
+					font_probe_check(graph_connect(&branch, 0, 1), "branch: source feeds first process")
+					font_probe_check(graph_connect(&branch, 0, 2), "branch: source feeds second process")
+					font_probe_check(graph_connect(&branch, 0, 3), "branch: source feeds third process")
+					font_probe_check(graph_connect(&branch, 1, 4), "branch: first process reconverges")
+					font_probe_check(graph_connect(&branch, 2, 4), "branch: second process reconverges")
+					font_probe_check(graph_connect(&branch, 3, 4), "branch: third process reconverges")
+					font_probe_check(len(branch.edges) == 6, "branch: six edges, not a slot count")
+					// ...and it evaluates: the last style to annotate a character wins,
+					// which is the only ordering rule a reconvergence needs.
+					branch_inks := make([dynamic]Text_Ink, 5)
+					defer delete(branch_inks)
+					branch_order := make([dynamic]int, 0, 16)
+					defer delete(branch_order)
+					graph_eval_text(&branch, 5, branch_inks[:], &branch_order)
+					// The declared ranges are [0,1), [0,2), [2,5) -- so chars 0..4
+					// are all claimed by at least one process, and the reconvergence is
+					// what lets the LAST process win for char 0.
+					font_probe_check(
+						branch_inks[0].drawn && branch_inks[1].drawn && branch_inks[2].drawn,
+						"branch: a branching graph must still resolve ink",
+					)
+					text_graph_free(&branch)
+				}
+
 				// And the built topology really is the design's: input, one style per
 				// piece, renderer.
 				font_probe_check(

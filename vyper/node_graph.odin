@@ -69,7 +69,17 @@ GRAPH_SEEN_MAX :: 64
 NODE_NO_INPUT :: -1
 
 Node_Input :: struct {
-	node: int,
+	// from and to are node indices; pin is the type the FROM node emits, which is
+	// the type this edge carries. A node has no slots and no input count: the
+	// graph owns its edges, so nothing in a node's shape says how many things
+	// feed it.
+	//
+	// That is not a detail. A per-node input ARRAY caps the shape at that many
+	// inputs and makes a slot index mean "the k-th thing", which is a linear
+	// chain wearing a graph's types: adding a fan-in is a struct change, and the
+	// evaluator ends up walking positions rather than edges.
+	from: int,
+	to:   int,
 	pin:  Node_Pin,
 }
 
@@ -79,10 +89,6 @@ Node_Input :: struct {
 // lives in a session arena.
 Compositor_Node :: struct {
 	kind: Node_Kind,
-	// inputs are the node's incoming edges, one per slot. NODE_NO_INPUT is an
-	// empty slot: a graph under construction is a legal graph, and demanding both
-	// ends of an edge at once would make every edit a two-sided transaction.
-	inputs: [NODE_INPUT_SLOTS]Node_Input,
 	// input_start/input_len is the CHARACTER RANGE a Style_Process applies to, in
 	// the text's own coordinates. A process that worked on ranges is what lets
 	// several of them compose over one string: each annotates the characters it
@@ -121,10 +127,15 @@ TEXT_INK_DEFAULT_RGB :: [3]u8{255, 255, 255}
 // Node_Graph is a set of nodes plus the node that emits. The sink is the node the
 // timeline asks for; everything else exists to feed it.
 Node_Graph :: struct {
-	// nodes are dynamic because a graph is BUILT per bake: the node count is the
-	// clip's piece count plus the input and the renderer, which is known only once
-	// the pieces are. The allocator is the bake's, not the graph's.
+	// nodes are dynamic because a graph is BUILT per evaluation: what a composited
+	// clip contains is known only once its chain is resolved. The allocator is the
+	// bake's, not the graph's.
 	nodes: [dynamic]Compositor_Node,
+	// edges are the graph's connectivity, flat and unordered. A node may take any
+	// number of inputs and may feed any number of outputs, which is what lets a
+	// clip be a LINE today and a DAG the moment the user restructures it, with
+	// neither shape special-cased anywhere.
+	edges: [dynamic]Node_Input,
 	sink:  int,
 }
 
@@ -156,80 +167,74 @@ node_pin_accepts :: proc(kind: Node_Kind, pin: Node_Pin) -> bool {
 	return false
 }
 
-// node_pin_of_slot is which pin a given input SLOT expects, which is not the same
-// as every pin the kind accepts: a renderer takes text in several ways (a source
-// and a set of styles) and text in exactly one way.
-node_pin_of_slot :: proc(kind: Node_Kind, slot: int) -> Node_Pin {
-	switch kind {
-	case .Text_Renderer:
-		// Slot 0 is the text itself; later slots are style processes feeding it.
-		return .Text
-	case .Style_Process:
-		return .Text
-	case .Text_Input:
-		return .Text
-	}
-	return .Text
-}
-
-// graph_connect wires `from`'s output into `to`'s `slot`, refusing a connection
-// whose pin types differ and a connection that would close a cycle. Returns
-// false and changes nothing on refusal, so a caller wiring a graph cannot end up
-// half-connected.
+// graph_connect wires `from`'s output into `to`, refusing a connection whose pin
+// types differ and one that would close a cycle. Returns false and changes
+// nothing on refusal, so a caller wiring a graph cannot end up half-connected.
+//
+// There is no slot argument, because there are no slots: a node takes whatever
+// the graph gives it, and the edge says what type it carries. That is what lets a
+// clip be a chain and later become a branching DAG without the graph noticing --
+// the difference is in how many edges exist, not in what a node is shaped like.
 //
 // The cycle check walks backwards from `from` through existing edges: if it can
 // reach `to`, then adding this edge gives `to` a path to itself. That is the
-// only question, and asking it on connect is what keeps the evaluator's
-// assumption — that walking the graph terminates — true by construction instead
-// of by a second pass that hopes the first one was correct.
-graph_connect :: proc(graph: ^Node_Graph, from, to, slot: int) -> bool {
-	if from < 0 || from >= len(graph.nodes) || to < 0 || to >= len(graph.nodes) {
-		return false
-	}
-	if slot < 0 || slot >= NODE_INPUT_SLOTS {
+// only question, and asking it at connect time is what keeps the evaluator's
+// assumption -- that walking the graph terminates -- true by construction rather
+// than by a second pass that hopes the first was correct.
+graph_connect :: proc(graph: ^Node_Graph, from, to: int) -> bool {
+	if from < 0 || from >= len(graph.nodes) || to < 0 || to >= len(graph.nodes) || from == to {
 		return false
 	}
 	emits := node_pin_emits(graph.nodes[from].kind)
-	wants := node_pin_of_slot(graph.nodes[to].kind, slot)
-	if emits != wants || !node_pin_accepts(graph.nodes[to].kind, wants) {
+	if !node_pin_accepts(graph.nodes[to].kind, emits) {
 		return false
 	}
 	seen_buffer: [GRAPH_SEEN_MAX]bool
 	seen := seen_buffer[:min(len(graph.nodes), GRAPH_SEEN_MAX)]
-	if graph_reaches(graph, from, to, seen) {
+	// from->to closes a cycle iff `to` can ALREADY reach `from`. The walk starts
+	// at the target for exactly that reason.
+	if graph_reaches(graph, to, from, seen) {
 		return false
 	}
-	graph.nodes[to].inputs[slot] = Node_Input{node = from, pin = emits}
+	append(&graph.edges, Node_Input{from = from, to = to, pin = emits})
 	return true
 }
 
+// graph_inputs_into collects the edges feeding `node`, in edge order. It is a
+// scan because a composited clip is a handful of nodes and the alternative --
+// per-node adjacency lists -- is the slot array again under another name.
+graph_inputs_into :: proc(graph: ^Node_Graph, node: int) -> [dynamic]Node_Input {
+	found := make([dynamic]Node_Input, 0, len(graph.edges))
+	defer delete(found)
+	for edge in graph.edges {
+		if edge.to == node {
+			append(&found, edge)
+		}
+	}
+	return found
+}
+
 // graph_reaches reports whether `target` is reachable from `start` by following
-// input edges backwards.
+// edges backwards.
 //
 // `seen` is the caller's, so a rejected connection allocates nothing: connect runs
-// on every edge the user drags, and a walk that allocated a visited set per
-// attempt would allocate per drag.
+// on every edge a user drags, and a walk that allocated a visited set per attempt
+// would allocate per drag.
 //
-// Recursive because a graph's depth is its longest chain -- a handful of nodes
-// for a text clip -- and an explicit stack would be machinery for a depth that
-// does not exist. `seen` is what makes it terminate on a malformed graph rather
-// than on trust.
+// Recursive because a graph's depth is its longest chain -- a handful of nodes for
+// a clip -- and an explicit stack would be machinery for a depth that does not
+// exist. `seen` is what makes it terminate on a malformed graph rather than on
+// trust.
 graph_reaches :: proc(graph: ^Node_Graph, start, target: int, seen: []bool) -> bool {
 	if start == target {
 		return true
 	}
-	if start < 0 || start >= len(graph.nodes) || start >= len(seen) {
-		return false
-	}
-	if seen[start] {
+	if start < 0 || start >= len(graph.nodes) || start >= len(seen) || seen[start] {
 		return false
 	}
 	seen[start] = true
-	for &input in graph.nodes[start].inputs {
-		if input.node == NODE_NO_INPUT {
-			continue
-		}
-		if graph_reaches(graph, input.node, target, seen) {
+	for edge in graph.edges {
+		if edge.from == start && graph_reaches(graph, edge.to, target, seen) {
 			return true
 		}
 	}
@@ -291,7 +296,13 @@ graph_eval_text :: proc(
 					// the whole of what this layer has to decide.
 					continue
 				}
-				if !text_reveal_contains(style.reveal, local) {
+				// An unset reveal on a node means ALL of the node's own characters,
+				// the same rule session_piece_push normalises on the way in. Both
+				// exist because a zero reveal cannot mean both "everything" and
+				// "nothing": the store settles it at construction, and a node built
+				// directly (by a future structural edit) settles it here.
+				if style.reveal != (Text_Reveal{}) &&
+				   !text_reveal_contains(style.reveal, local) {
 					out[index].drawn = false
 					continue
 				}
@@ -315,11 +326,10 @@ graph_eval_order :: proc(
 		return
 	}
 	seen[node] = true
-	for &input in graph.nodes[node].inputs {
-		if input.node == NODE_NO_INPUT {
-			continue
+	for edge in graph.edges {
+		if edge.to == node {
+			graph_eval_order(graph, edge.from, out, seen)
 		}
-		graph_eval_order(graph, input.node, out, seen)
 	}
 	append(out, node)
 }
@@ -356,6 +366,7 @@ text_graph_build :: proc(graph: ^Node_Graph, character_count: int, pieces: Text_
 	// allocation freed twice.
 	nodes := make([dynamic]Compositor_Node, 0, pieces.n+2)
 	append(&nodes, Compositor_Node{kind = .Text_Input})
+	clear(&graph.edges)
 	for piece in session_piece_view(pieces) {
 		if piece.len < 0 || piece.start < 0 || piece.start > character_count {
 			delete(nodes)
@@ -377,20 +388,21 @@ text_graph_build :: proc(graph: ^Node_Graph, character_count: int, pieces: Text_
 	graph.nodes = nodes
 	graph.sink = renderer
 	for style in 1 ..< renderer {
-		if !graph_connect(graph, 0, style, 0) {
+		if !graph_connect(graph, 0, style) {
 			return false
 		}
-		if !graph_connect(graph, style, renderer, style) {
+		if !graph_connect(graph, style, renderer) {
 			return false
 		}
 	}
 	// The renderer also takes the text itself, so a chain with no styles still
 	// evaluates rather than being a sink fed by nothing.
-	return graph_connect(graph, 0, renderer, 0)
+	return graph_connect(graph, 0, renderer)
 }
 
 // text_graph_free releases the nodes a build allocated.
 text_graph_free :: proc(graph: ^Node_Graph) {
 	delete(graph.nodes)
+	delete(graph.edges)
 	graph.sink = -1
 }
