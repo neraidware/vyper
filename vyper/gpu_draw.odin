@@ -852,7 +852,7 @@ draw_clip_markers :: proc(
 // the LANE ELEMENT's layout; cx clamps to the wrap so a key that drifted past a
 // trimmed edge paints at the edge rather than outside the row.
 keyframe_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32, f32) {
-	cy := box.y + CLIP_TILE_HEIGHT + (f32(lane) + 0.5) * KF_ROW_H
+	cy := box.y + keyframe_lane_offset(lane) + KF_ROW_H / 2
 	cx := clamp(
 		box.x + f32(frame_off) * timeline_view.zoom,
 		box.x + KF_DIAMOND_R,

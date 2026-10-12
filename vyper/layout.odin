@@ -72,6 +72,28 @@ TRACK_GAP_H :: 8           // Height of the insert gap above each track row.
 // clip in it carries. A diamond is the 45°-rotated square SDF (KF_DIAMOND_ROT),
 // corners rounded just enough to stay crisp.
 KF_ROW_H :: f32(18)        // One keyframe lane height.
+
+// keyframe_lane_offset is where keyframe lane `lane` begins, measured down from
+// the top of the clip tile it belongs to: the tile's own height, then one
+// KF_ROW_H per lane above it.
+//
+// ONE definition on purpose. This offset used to be derived in three places --
+// the GPU diamond pass added CLIP_TILE_HEIGHT to the tile box, the gutter let
+// Clay's text flow decide where the lane labels began, and the Clay lane
+// elements simply flowed -- and the three disagreed by 14px, so every lane name
+// in the gutter pointed at the lane above it. Nothing about the disagreement was
+// visible from any one of them: each was locally correct and there was no way to
+// ask "is this the same lane the diamond uses?".
+//
+// Everything that has to agree about where a lane is calls this: the Clay lane
+// elements and the gutter that name them size themselves from it, the GPU
+// diamond pass positions from it, and the hit-test goes through
+// keyframe_key_center so a pick and a paint cannot drift either. TRACK_ROW_H is
+// CLIP_TILE_HEIGHT by definition, so a track row sized by this is also the size
+// that makes a row's lanes and its tiles line up.
+keyframe_lane_offset :: proc(lane: int) -> f32 {
+	return CLIP_TILE_HEIGHT + f32(lane) * KF_ROW_H
+}
 KF_DIAMOND_R :: f32(4)     // Half of the diamond's bounding square (8px across).
 KF_DIAMOND_ROT :: [2]f32{0.70710678, 0.70710678} // cos/sin of 45°: squares up at the screen.
 KF_DIAMOND_CORNER :: 2     // Diamond corner rounding, keeps a point on each axis.

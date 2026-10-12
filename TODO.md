@@ -9176,6 +9176,51 @@ algorithm was validated standalone against stubbed calls (spaces in the path, a
 root-level exe, forward slashes, and the truncation fallback). What is NOT
 machine-verified here is the Windows compile itself.
 
+## Active 57 — The keyframe gutter labels pointed 14px above the lanes they named
+
+Reported as "the keyframe track gutter doesn't align with the keyframe timeline".
+
+Every keyframe lane name sat **14px above** the lane it labelled, on every track
+and every lane — a lane named "crop.b" pointed at the diamonds of the lane above
+it. Probed red before the fix: `KeyframeGutterName lane 0 centre 725.0, diamond
+lane 0 is at 739.0 (off by -14.0)`.
+
+The cause is the class this file keeps running into: **"where is lane N" was
+derived in three places, each locally correct and none able to see the others.**
+
+- the GPU diamond pass computed `tile.y + CLIP_TILE_HEIGHT + (lane+0.5)*KF_ROW_H`
+- the gutter let Clay's text flow decide where the labels began — the measured
+  line height of the track name plus the `TrackName` childGap
+- the Clay `KeyframeLane` elements just flowed
+
+The gutter's origin was a *measured* text height (18px) plus a 4px gap = 22px,
+while the lanes began at the fixed `CLIP_TILE_HEIGHT` = 36px. 22 ≠ 36 is the 14px.
+
+#### Fix: one derivation, called by every side
+
+`keyframe_lane_offset(lane)` in layout.odin is now the only expression of where a
+lane begins, and it lives next to the constants it derives from. Everything that
+has to agree calls it:
+
+- the Clay `KeyframeLane` elements and the gutter's fixed name box size themselves
+  from it (the name box is `keyframe_lane_offset(0)` — "past the tile")
+- `keyframe_key_center` positions the diamonds and the hit-test from it, so a
+  pick and a paint cannot drift either
+- a track row and a clip wrap are sized by it
+- `timeline_tracks_content_height` uses it, so scroll geometry stays a pure
+  function of the model, never of layout timing
+
+`TRACK_ROW_H` is already `CLIP_TILE_HEIGHT` by definition, so a row sized by
+`keyframe_lane_offset` is also the size that keeps a row's lanes and tiles aligned.
+
+#### The class is now detectable
+
+`ui_probe_layout_asserts` compares each gutter label's centre against
+`keyframe_lane_offset(lane)` for **every track with lanes**, not a sample track.
+The expected value is computed by the same function both renderers call, so the
+probe cannot drift from the implementation — it can only catch a side that stops
+calling it. A one-track check would have passed while the class was still live.
+
 ## Active 53 — The timeline has two renderers, and a zoom click makes them disagree
 
 **Status: DIAGNOSED, probes committed, fix NOT implemented.** Reported as

@@ -2411,6 +2411,43 @@ when ODIN_DEBUG {
 			fmt.eprintf("[ui-probe] KeyframeGutterNames height %.1f want %.1f\n", gutter.height, want_gutter)
 			ok = false
 		}
+		// Height is not alignment. A gutter label that is the right SIZE but sits
+		// at the wrong y points at the wrong lane, and the user cannot tell a
+		// label that names lane 1 while sitting on lane 0 from one that is simply
+		// misaligned -- so the label's centre is compared against the centre the
+		// diamond for that lane is actually drawn at.
+		//
+		// Checked across EVERY track that has lanes, not a sample: the gutter and
+		// the diamond pass disagreed because each derived "where lane N is" on its
+		// own, and a one-track check would have passed on every other track while
+		// the class was still live. The expected value comes from
+		// keyframe_lane_offset, the same function both renderers call -- so this
+		// cannot drift from the implementation, only catch it if one side stops
+		// calling it.
+		for ti in 0 ..< len(timeline.tracks) {
+			rows := keyframe_rows_for(&timeline.tracks[ti])
+			if rows == 0 {continue}
+			tile := clay.GetElementData(clay.ID("TimelineClip", u32(ti * 1000))).boundingBox
+			if tile.height <= 0 {continue}
+			for lane in 0 ..< rows {
+				label := clay.GetElementData(
+					clay.ID("KeyframeGutterName", u32(ti * 1000 + lane)),
+				).boundingBox
+				want_centre := tile.y + keyframe_lane_offset(lane) + KF_ROW_H / 2
+				got_centre := label.y + label.height / 2
+				if abs(got_centre - want_centre) > 0.5 {
+					fmt.eprintf(
+						"[ui-probe] track %d lane %d: gutter label centre %.1f, diamond lane centre %.1f (off by %.1f)\n",
+						ti,
+						lane,
+						got_centre,
+						want_centre,
+						got_centre - want_centre,
+					)
+					ok = false
+				}
+			}
+		}
 		// The "keyframe all modified" row must actually LAY OUT for a video clip.
 		// It carries the A shortcut's pending set and nothing else — there is no
 		// button, so the row is the only place the inspector says what A will key.

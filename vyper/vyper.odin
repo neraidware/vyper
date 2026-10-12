@@ -263,7 +263,7 @@ timeline_resize_hover :: proc(mx, my: f32) -> bool {
 timeline_tracks_content_height :: proc() -> f32 {
 	total := f32(len(timeline.tracks) + 1) * TRACK_GAP_H
 	for &t in timeline.tracks {
-		total += TRACK_ROW_H + f32(keyframe_rows_for(&t)) * KF_ROW_H
+		total += keyframe_lane_offset(keyframe_rows_for(&t))
 	}
 	return total
 }

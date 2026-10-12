@@ -3226,7 +3226,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 						layout = {
 							sizing = {
 								width = clay.SizingGrow({}),
-								height = clay.SizingFixed(TRACK_ROW_H + f32(keyframe_rows) * KF_ROW_H),
+								height = clay.SizingFixed(keyframe_lane_offset(keyframe_rows)),
 							},
 							layoutDirection = .LeftToRight,
 							childGap = SECTION_GAP,
@@ -3240,20 +3240,47 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 									width = clay.SizingFixed(GUTTER_WIDTH),
 									height = clay.SizingGrow({}),
 								},
-								layoutDirection = .TopToBottom,
-								childGap = 4,
-								childAlignment = {x = .Left, y = .Top},
-							},
-							backgroundColor = TRACK_GUTTER_BG,
+layoutDirection = .TopToBottom,
+							childGap = 0,
+							childAlignment = {x = .Left, y = .Top},
 						},
-						) {
-							clay.Text(
-								track.name,
-								clay.TextElementConfig {
-									textColor = TEXT,
-									fontSize = FONT_HEADING,
-								},
-							)
+						backgroundColor = TRACK_GUTTER_BG,
+					},
+				) {
+					// The track name gets a FIXED TRACK_ROW_H box, and the gap above
+					// the keyframe labels is zero, because that box is what puts the
+					// labels on the lanes' origin. The labels used to start wherever
+					// Clay happened to finish the name text -- a measured line height
+					// plus childGap -- while the diamonds they name are placed from
+					// CLIP_TILE_HEIGHT. The two are different origins, so every label
+					// sat 14px above the lane it labelled, and a lane name is exactly
+					// the thing a user cannot sanity-check against anything else.
+					//
+					// Still top-aligned inside the box, so the name itself does not
+					// move: only where the labels start changes.
+					if clay.UI(clay.ID("TrackNameLabel", u32(ti)))(
+					{
+						layout = {
+							sizing = {
+								width = clay.SizingGrow({}),
+								// Sized so the labels below begin exactly where lane
+								// 0 begins: keyframe_lane_offset(0) is "past the tile",
+								// which is the only thing standing between a lane name
+								// and the lane it names.
+								height = clay.SizingFixed(keyframe_lane_offset(0)),
+							},
+							childAlignment = {x = .Left, y = .Top},
+						},
+					},
+					) {
+						clay.Text(
+							track.name,
+							clay.TextElementConfig {
+								textColor = TEXT,
+								fontSize = FONT_HEADING,
+							},
+						)
+					}
 							// No per-track buttons here: duplicate/delete moved
 							// to the track menu (right-click the gutter), which
 							// keeps the row short enough to fit more tracks.
@@ -3399,7 +3426,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 											sizing = {
 												width = clay.SizingFixed(clip_width),
 												height = clay.SizingFixed(
-													CLIP_TILE_HEIGHT + f32(keyframe_n) * KF_ROW_H,
+													keyframe_lane_offset(keyframe_n),
 												),
 											},
 											layoutDirection = .TopToBottom,
