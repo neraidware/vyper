@@ -112,12 +112,12 @@ when ODIN_DEBUG {
 			vk := session_kf_view(keys); v := vk
 			keyframe_probe_check(keys.n == 3, "3 distinct frames => 3 keys, got %d", keys.n)
 			keyframe_probe_check(
-				v[0] == Keyframe {frame_off = 10, value = 5.0, interp = KEYFRAME_DEFAULT_INTERP},
+				v[0] == Keyframe {frame_off = 10, value = 5.0},
 				"inserts must stay sorted and the repeated frame replaced: v[0]=%v",
 				v[0],
 			)
-	keyframe_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0, interp = KEYFRAME_DEFAULT_INTERP}, "v[1]=%v", v[1])
-		keyframe_probe_check(v[2] == Keyframe {frame_off = 30, value = 3.0, interp = KEYFRAME_DEFAULT_INTERP}, "v[2]=%v", v[2])
+	keyframe_probe_check(v[1] == Keyframe {frame_off = 20, value = 2.0}, "v[1]=%v", v[1])
+		keyframe_probe_check(v[2] == Keyframe {frame_off = 30, value = 3.0}, "v[2]=%v", v[2])
 		}
 
 		// --- lookup: missing name ---------------------------------------------
@@ -127,10 +127,8 @@ when ODIN_DEBUG {
 		// value interpolates and reaches the NEXT key's value exactly on its
 		// frame. Before the first key the caller's base rules (direct edits apply
 		// there); past the last key the track holds the final key's value.
-		// What a NEW key carries. Pinned because it is a decision, not a zero
-		// value: KEYFRAME_DEFAULT_INTERP is deliberately NOT the enum's zero, so
-		// "whatever the enum starts at" is no longer the answer and nothing else
-		// would catch it quietly changing.
+		// What a NEW key carries. Pinned because "whatever the enum starts at"
+		// is not the answer, and nothing else would catch it changing quietly.
 		{
 			d := Clip {}
 			keyframe_set_key(&d, "gain", 10, 5.0)
@@ -341,7 +339,7 @@ when ODIN_DEBUG {
 		if sp.keyframe_tracks.n == 1 {
 			lk := keyframe_lane_view(session_trk_view(sp.keyframe_tracks, 0), 0)
 			lv := session_kf_view(lk)
-			left_ok = lk.n == 1 && lv[0] == Keyframe {frame_off = 10, value = 1.0, interp = KEYFRAME_DEFAULT_INTERP}
+			left_ok = lk.n == 1 && lv[0] == Keyframe {frame_off = 10, value = 1.0}
 		}
 		keyframe_probe_check(left_ok, "left keeps only keys < cut, values preserved")
 		right_ok := false
@@ -349,9 +347,9 @@ when ODIN_DEBUG {
 			rk := keyframe_lane_view(session_trk_view(sp_right.keyframe_tracks,0), 0)
 			rv := session_kf_view(rk)
 			right_ok = rk.n == 3 &&
-			rv[0] == Keyframe {frame_off = 0, value = 2.0, interp = KEYFRAME_DEFAULT_INTERP} &&
-			rv[1] == Keyframe {frame_off = 5, value = 3.0, interp = KEYFRAME_DEFAULT_INTERP} &&
-			rv[2] == Keyframe {frame_off = 59, value = 4.0, interp = KEYFRAME_DEFAULT_INTERP}
+			rv[0] == Keyframe {frame_off = 0, value = 2.0} &&
+			rv[1] == Keyframe {frame_off = 5, value = 3.0} &&
+			rv[2] == Keyframe {frame_off = 59, value = 4.0}
 		}
 		keyframe_probe_check(right_ok, "right re-relatives keys >= cut by -cut")
 		if right_ok {
@@ -371,7 +369,7 @@ when ODIN_DEBUG {
 		if tr.keyframe_tracks.n == 1 {
 			tk := keyframe_lane_view(session_trk_view(tr.keyframe_tracks,0), 0)
 			tv := session_kf_view(tk)
-			trim_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 0, value = 2.0, interp = KEYFRAME_DEFAULT_INTERP} && tv[1] == Keyframe {frame_off = 5, value = 3.0, interp = KEYFRAME_DEFAULT_INTERP}
+			trim_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 0, value = 2.0} && tv[1] == Keyframe {frame_off = 5, value = 3.0}
 		}
 		keyframe_probe_check(trim_ok, "trim_head drops head keys and re-relatives survivors")
 		tr2 := Clip {}
@@ -383,7 +381,7 @@ when ODIN_DEBUG {
 		if tr2.keyframe_tracks.n == 1 {
 			tk := keyframe_lane_view(session_trk_view(tr2.keyframe_tracks,0), 0)
 			tv := session_kf_view(tk)
-			trim2_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 5, value = 1.0, interp = KEYFRAME_DEFAULT_INTERP} && tv[1] == Keyframe {frame_off = 40, value = 2.0, interp = KEYFRAME_DEFAULT_INTERP}
+			trim2_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 5, value = 1.0} && tv[1] == Keyframe {frame_off = 40, value = 2.0}
 		}
 		keyframe_probe_check(trim2_ok, "trim_tail drops keys beyond the new length")
 
@@ -838,8 +836,8 @@ when ODIN_DEBUG {
 		snap_ok := sn == 2
 		if snap_ok {
 			snap_ok =
-				snap_dst[0] == Keyframe {frame_off = 10, value = 4.0, interp = KEYFRAME_DEFAULT_INTERP} &&
-				snap_dst[1] == Keyframe {frame_off = 24, value = 9.0, interp = KEYFRAME_DEFAULT_INTERP}
+				snap_dst[0] == Keyframe {frame_off = 10, value = 4.0} &&
+				snap_dst[1] == Keyframe {frame_off = 24, value = 9.0}
 		}
 		keyframe_probe_check(
 			snap_ok,
@@ -861,7 +859,7 @@ when ODIN_DEBUG {
 		keyframe_set_key(&gain_clip, "gain", 5, 7.0)
 		gn, gtotal := keyframe_geom_fill_snapshot(&gain_clip, "gain", snap_dst[:])
 		keyframe_probe_check(
-			gn == 1 && gtotal == 1 && snap_dst[0] == Keyframe {frame_off = 5, value = 7.0, interp = KEYFRAME_DEFAULT_INTERP},
+			gn == 1 && gtotal == 1 && snap_dst[0] == Keyframe {frame_off = 5, value = 7.0},
 			"snapshot: scalar track copies unchanged",
 		)
 

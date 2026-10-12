@@ -252,24 +252,15 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	return clay.EndLayout(0)
 }
 
-// keyframe_gutter_names collects the lane names the track-name gutter
-// (KeyframeGutterNames) labels one visible row each: every clip's rows in clip
-// order, deduplicated. Capped at `rows` (the row only has room for that many
-// lines); clips keyframing lanes others omit still read because each label row
-// is aligned to the same KF_ROW_H lanes above the tiles.
+// keyframe_gutter_names fills `out` with the distinct lane names a track's
+// gutter shows, in row order, and returns how many. A track row is sized by
+// keyframe_rows_for, and a name is emitted per flattened LANE row, so the count
+// matches the rows the row was sized for -- which is the invariant that had
+// drifted when this emitted one name per TRACK instead.
 //
-// It walks FLATTENED ROWS (keyframe_clip_row_name), not tracks, and that is the
-// whole correctness of this proc. A section track owns several lanes -- the
-// "transform" track holds transform.x AND transform.y -- and the painter draws
-// one diamond per lane, so a clip with tracks {transform, zoom, pan.x, pan.y}
-// draws FIVE rows while one name per track produced FOUR labels. Every label
-// from row 1 down was then naming the row above it: "zoom" sat on transform.y's
-// diamonds, "pan.x" on zoom's, and the last lane had no label at all, because
-// the row was sized for five and only four names were ever emitted. keyframes.odin
-// says the flattened row index is what the painter, the hit-test and the gutter
-// all speak (TODO.md Active 52); this proc was the last one still speaking track
-// index, which is what made the gutter disagree with the lanes beside it.
-keyframe_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
+// `out` bounds the result. It is the only bound: the caller sizes the buffer,
+// and there is no second limit to keep in step with it.
+keyframe_gutter_names :: proc(track: ^Track, out: []string) -> int {
 	n := 0
 	for &c in track.clips {
 		for row in 0 ..< keyframe_clip_rows(c.keyframe_tracks) {
@@ -285,7 +276,7 @@ keyframe_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 			if dup {
 				continue
 			}
-			if n >= rows || n >= len(out) {
+			if n >= len(out) {
 				return n
 			}
 			out[n] = lane
@@ -3293,7 +3284,7 @@ layoutDirection = .TopToBottom,
 								// visible lane, stacked under the buttons so they
 								// line up with the diamond lanes beside them.
 								keyframe_names: [32]string
-								keyframe_count := keyframe_gutter_names(track, keyframe_rows, keyframe_names[:])
+								keyframe_count := keyframe_gutter_names(track, keyframe_names[:])
 								if clay.UI(clay.ID("KeyframeGutterNames", u32(ti)))(
 								{
 									layout = {

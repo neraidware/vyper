@@ -279,7 +279,7 @@ when ODIN_DEBUG {
 			// "transform" owns x AND y, so one name per track left the fifth row
 			// nameless while every label below it named the row above.
 			names: [32]string
-			emitted := keyframe_gutter_names(&timeline.tracks[ti], rows, names[:])
+			emitted := keyframe_gutter_names(&timeline.tracks[ti], names[:])
 			if emitted != rows {
 				fmt.eprintf(
 					"[ui-probe] track %d is sized for %d lane(s) but only %d lane name(s) exist:",
@@ -342,7 +342,7 @@ when ODIN_DEBUG {
 				clay.GetElementData(clay.ID("TrackNameLabel", u32(ti))).boundingBox.height,
 			)
 			names: [32]string
-			emitted := keyframe_gutter_names(&timeline.tracks[ti], rows, names[:])
+			emitted := keyframe_gutter_names(&timeline.tracks[ti], names[:])
 			fmt.eprintf("[gutter-probe]   rows=%d emitted=%d names:", rows, emitted)
 			for i in 0 ..< emitted {fmt.eprintf(" %q", names[i])}
 			fmt.eprintln()

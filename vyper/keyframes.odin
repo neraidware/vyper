@@ -30,34 +30,11 @@ import "core:mem"
 KF_MAX_OFFSET :: 268435456
 
 
-// Keyframe_Interp is the easing a key applies to the segment ARRIVING at it from the
-// previous key — we ease INTO a breakpoint, so the key you're heading to owns
-// the curve. .Cubic is the zero value — a fresh key defaults to the spline
-// (cubic Hermite over neighbor-estimated tangents); .Linear and the rest are
-// closed-form curves evaluated in keyframe_ease. Samplers use keyframe_apply_interp so
-// scalar and packed lanes share one curve. The very first key has nothing
-// arriving at it, so its mode is inert.
-// KEYFRAME_DEFAULT_INTERP is the mode a freshly created key carries: .Linear, so
-// a new key moves toward its value at a constant rate with no easing. It was
-// .Cubic, a spline that eased in and out of every breakpoint. "No interpolation"
-// asked for a keyframe that travels to its value without smoothing itself on the
-// way, and easing is the thing being removed, not the travel.
-//
-// .Linear is ALSO the enum's zero value now, so `Keyframe{}` means "the default"
-// with no further saying -- the zero value is useful rather than a trap that
-// needs a compensating constant. That renumbers the modes, so a project file
-// written before the reorder reads the wrong easing; the format is knowingly
-// incompatible across it.
-KEYFRAME_DEFAULT_INTERP :: Keyframe_Interp.Linear
-
-// Keyframe_Interp is the easing a key applies to the segment ARRIVING at it from
-// the previous key — we ease INTO a breakpoint, so the key you're heading to owns
-// the curve. .Linear is the zero value and a fresh key's mode: a constant-rate
-// move to that key's value, no easing. .Cubic is a cubic Hermite spline over
-// neighbor-estimated tangents; the rest are closed-form curves evaluated in
-// keyframe_ease. Samplers use keyframe_apply_interp so scalar and packed lanes
-// share one curve. The very first key has nothing arriving at it, so its mode is
-// inert.
+// Keyframe_Interp is the easing on the segment ARRIVING at a key, not the one
+// leaving it: you ease INTO a breakpoint, so the key being headed toward owns the
+// curve. .Linear is the zero value and the default; .Cubic is a Hermite spline
+// over neighbor-estimated tangents; the rest are closed-form in keyframe_ease.
+// The first key has nothing arriving at it, so its mode is inert.
 //
 // Reordered so the default is zero. The mode is persisted as this enum's raw
 // number (Saved_Kf_Track.keys is [dynamic]Keyframe), so a project file written
@@ -281,7 +258,7 @@ keyframe_set_lane_key :: proc(
 	frame_off: i32,
 	value: f32,
 ) {
-	keyframe_set_lane_key_interp(clip, name, lane, frame_off, value, KEYFRAME_DEFAULT_INTERP)
+	keyframe_set_lane_key_interp(clip, name, lane, frame_off, value, .Linear)
 }
 
 // keyframe_set_lane_key_interp records a scalar key on lane `lane` of `name`'s

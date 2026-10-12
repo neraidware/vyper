@@ -238,6 +238,37 @@ addresses, lifetimes, and shares data. Everything else follows from it.
 - Treat persisted formats and other cross-subsystem contracts as APIs. Change
   them deliberately because every dependent caller pays the migration cost.
 
+## 3d. Legible as a whole, and modifiable by hand
+
+The code is the documentation. A person who has never met this project must be
+able to read a system, see what it is for, trace how it connects to the rest,
+and change how it behaves — without an AI, and without refactoring unrelated
+functions first to make the path make sense. That is the bar, not "it passes
+and the comment explains it."
+
+- **One home per fact, and every consumer reaches it by name.** A second
+  derivation of something is not a convenience, it is a scheduled
+  disagreement. Two names for one value (`FOO_DEFAULT` beside the zero value it
+  equals) is the smallest version of this defect and still a defect: the reader
+  has to work out which one is real, and the wrong answer is silent.
+- **Structure carries the explanation.** If a reader needs a paragraph to work
+  out what something does, the thing is wrong — the name, the shape, or the
+  boundary. Fix that instead. Prose laid over a bad structure is worse than no
+  prose, because it makes the structure look deliberate and stops anyone
+  finding the real fault.
+- **A seam you cannot find is a seam that is wrong.** Changing behaviour means
+  starting from code you can see and following it to its other end — producer,
+  consumer, caller — without a global search. If following the path requires
+  knowing where to look, the path is the thing to fix.
+- **Prose is for what the code cannot say:** why this approach over the obvious
+  one, a measured number, a platform fact, an invariant another module depends
+  on. Not for narrating what the next line does.
+- **The tell:** if a change needed prose to justify it, the change is probably
+  in the wrong shape. Ask what would have to be true for the obvious version to
+  work.
+- Two homes introduced in one sitting is not "mostly fine". The cost is not that
+  line; it is every reader afterwards who trusts the wrong one.
+
 ## 4. Low level is home turf
 
 - Raw bytes, pointer math, bit twiddling, `transmute`, `offset_of`,
