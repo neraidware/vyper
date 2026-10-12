@@ -424,7 +424,7 @@ linker_flags :: proc() -> string {
 // a flag we are using wrong, so it is not the option to ship.
 odin_extra_flags :: proc() -> []string {
 	when ODIN_OS == .Windows {
-		WINDOWS_FLAGS := []string{"-define:FFMPEG_LINK=system", "-linker:msvc-rad-link"}
+		WINDOWS_FLAGS := []string{"-define:FFMPEG_LINK=system"}
 		return WINDOWS_FLAGS[:]
 	}
 	return {}
