@@ -122,15 +122,24 @@ Portal_Filter :: struct {
 	patterns: []string,
 }
 
+// portal_filter_media covers everything open_file_at knows how to route: media,
+// subtitles, AND projects. A .vyproj is not media, but it is what "Open" is for
+// half the time, and omitting it made a project unreachable through the dialog
+// — the Win32 picker listed an "All Files" escape hatch and this one had none,
+// so on Linux there was simply no way to pick one.
 portal_filter_media := Portal_Filter{
-	name = "Media files",
+	name = "Media and projects",
 	patterns = {
 		"*.mp4", "*.m4v", "*.mov", "*.mkv", "*.webm", "*.avi", "*.mpeg", "*.mpg",
 		"*.ts", "*.m2ts", "*.flv", "*.wmv", "*.3gp", "*.mp3", "*.wav", "*.flac",
 		"*.ogg", "*.opus", "*.m4a", "*.aac", "*.png", "*.jpg", "*.jpeg", "*.webp",
-		"*.gif", "*.bmp", "*.tiff", "*.srt",
+		"*.gif", "*.bmp", "*.tiff", "*.srt", "*.vyproj",
 	},
 }
+
+portal_filter_project := Portal_Filter{name = "vyper projects", patterns = {"*.vyproj"}}
+
+portal_filter_render := Portal_Filter{name = "MP4 video", patterns = {"*.mp4"}}
 
 portal_filter_srt := Portal_Filter{name = "Subtitle files", patterns = {"*.srt"}}
 
@@ -362,7 +371,7 @@ portal_wait_response_path :: proc(connection: ^GDBusConnection, request_path: cs
 // portal_save_file_picker opens the portal SaveFile dialog for the render output
 // path. Same request/Response plumbing as open, but through the SaveFile method
 // and seeded with the current default output name so the dialog opens on it.
-portal_save_file_picker :: proc() -> cstring {
+portal_save_file_picker :: proc(target: Save_Target) -> cstring {
 	portal_state.response_data = nil
 	connection := g_bus_get_sync(2, nil, nil) // G_BUS_TYPE_SESSION
 	if connection == nil {
@@ -370,10 +379,7 @@ portal_save_file_picker :: proc() -> cstring {
 		return nil
 	}
 
-	default_name := "out.mp4"
-	if render_output.path_len > 0 {
-		default_name = path_basename(cstring(&render_output.path_buf[0]))
-	}
+	default_name := save_target_name(target)
 	dict_type := g_variant_type_new("a{sv}")
 	dict := g_variant_builder_new(dict_type)
 
@@ -383,10 +389,18 @@ portal_save_file_picker :: proc() -> cstring {
 	}
 
 	add_option(dict, "handle_token", "vyper_save")
-	add_option(dict, "current_name", cstring(raw_data(default_name)))
+	name_buf: [1024]u8
+	name_written := len(fmt.bprintf(name_buf[:], "%s", default_name))
+	if name_written > 0 && name_written < len(name_buf) {
+		name_buf[name_written] = 0
+		add_option(dict, "current_name", cstring(raw_data(name_buf[:name_written])))
+	}
 	// Open the dialog on the folder that holds the current output path (for
 	// the startup default, ~/Videos) instead of wherever the portal last was.
-	{
+	// Only for the render output: no project path is tracked, so seeding a
+	// project save with the render's folder would be a guess, and the portal's
+	// own default is a better answer than a wrong folder.
+	if target == .Render_Output {
 		out := string(render_output.path_buf[:render_output.path_len])
 		dir_end := 0
 		for i := len(out) - 1; i >= 0; i -= 1 {
@@ -402,9 +416,13 @@ portal_save_file_picker :: proc() -> cstring {
 			add_option(dict, "current_folder", cstring(raw_data(uri)))
 		}
 	}
-	{ // filters (a(sa(us)) value, not a plain string)
-		filter := Portal_Filter{name = "MP4 video", patterns = {"*.mp4"}}
-		entry := g_variant_new_dict_entry(g_variant_new_string("filters"), g_variant_new_variant(portal_build_filters(filter)))
+	// filters: a(sa(us)) value, not a plain string.
+	{
+		filter := target == .Project ? portal_filter_project : portal_filter_render
+		entry := g_variant_new_dict_entry(
+			g_variant_new_string("filters"),
+			g_variant_new_variant(portal_build_filters(filter)),
+		)
 		g_variant_builder_add_value(dict, entry)
 	}
 	options := g_variant_builder_end(dict)
@@ -413,7 +431,10 @@ portal_save_file_picker :: proc() -> cstring {
 
 	// Same (parent_window, title, options) `(ssa{sv})` shape as OpenFile.
 	parent := g_variant_new_string("")
-	title_v := g_variant_new_string("Save render output")
+	title_buf: [128]u8
+	title_written := len(fmt.bprintf(title_buf[:], "%s", save_target_title(target)))
+	title_buf[min(title_written, len(title_buf) - 1)] = 0
+	title_v := g_variant_new_string(cstring(raw_data(title_buf[:])))
 	parameters := g_variant_new_tuple(raw_data([]^GVariant{parent, title_v, options}), 3)
 
 	error: ^GError

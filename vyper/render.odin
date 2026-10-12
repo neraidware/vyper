@@ -4521,7 +4521,7 @@ render_out_path :: proc() -> string {
 // zenity (kills the dialog), so we use the portal path the open-file picker
 // already uses.
 render_pick_output_path :: proc() {
-	path := save_file_picker()
+	path := save_file_picker(.Render_Output)
 	if path == nil {
 		return
 	}

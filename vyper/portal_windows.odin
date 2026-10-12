@@ -3,6 +3,7 @@
 package vyper
 
 import win32 "core:sys/windows"
+import "core:fmt"
 import "core:strings"
 
 // ---------------------------------------------------------------------------
@@ -23,9 +24,9 @@ import "core:strings"
 
 win32_open_file_picker :: proc() -> cstring {
 	filters := strings.concatenate({
-		"Media files",
+		"Media and projects",
 		"\x00",
-		"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.mpeg;*.mpg;*.ts;*.m2ts;*.flv;*.wmv;*.3gp;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac;*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp;*.tiff;*.srt",
+		"*.mp4;*.m4v;*.mov;*.mkv;*.webm;*.avi;*.mpeg;*.mpg;*.ts;*.m2ts;*.flv;*.wmv;*.3gp;*.mp3;*.wav;*.flac;*.ogg;*.opus;*.m4a;*.aac;*.png;*.jpg;*.jpeg;*.webp;*.gif;*.bmp;*.tiff;*.srt;*.vyproj",
 		"\x00",
 		"All Files",
 		"\x00",
@@ -96,11 +97,25 @@ win32_open_srt_picker :: proc() -> cstring {
 // win32_save_file_picker opens the Win32 common Save-As dialog for the render
 // output path, pre-filtered to .mp4 with an overwrite prompt. Mirror of
 // win32_open_file_picker using GetSaveFileNameW.
-win32_save_file_picker :: proc() -> cstring {
+win32_save_file_picker :: proc(target: Save_Target) -> cstring {
+	def_ext := "mp4"
+	primary := "MP4 video"
+	if target == .Project {
+		def_ext = "vyproj"
+		primary = "vyper projects"
+	}
+	// Odin concatenates only constant strings, so the pattern is formatted into a
+	// fixed buffer rather than built with "+".
+	pattern_buf: [64]u8
+	pattern_len := len(fmt.bprintf(pattern_buf[:], "*.%s", def_ext))
+	if pattern_len <= 0 || pattern_len >= len(pattern_buf) {
+		return nil
+	}
+	pattern_buf[pattern_len] = 0
 	filters := strings.concatenate({
-		"MP4 video",
+		primary,
 		"\x00",
-		"*.mp4",
+		string(pattern_buf[:pattern_len]),
 		"\x00",
 		"All Files",
 		"\x00",
@@ -110,21 +125,26 @@ win32_save_file_picker :: proc() -> cstring {
 
 	file_buf := make([]u16, win32.MAX_PATH_WIDE, context.temp_allocator)
 	defer delete(file_buf)
-	if render_output.path_len > 0 {
-		// Pre-fill the dialog filename with the last render path. The render
-		// path is UTF-8 and the dialog wants UTF-16; a byte-for-byte copy would
-		// print every non-ASCII name wrong. A too-long/invalid name just opens
-		// the dialog empty -- cosmetic, so a failed conversion is dropped.
-		_ = win32.utf8_to_utf16_buf(file_buf[:], string(render_output.path_buf[:render_output.path_len]))
+	{
+		// Pre-fill with what is being saved. The name is UTF-8 and the dialog
+		// wants UTF-16; a byte-for-byte copy would print every non-ASCII name
+		// wrong. A too-long/invalid name just opens the dialog empty --
+		// cosmetic, so a failed conversion is dropped.
+		name_buf: [512]u8
+		written := len(fmt.bprintf(name_buf[:], "%s", save_target_name(target)))
+		if written > 0 {
+			name_buf[written] = 0
+			_ = win32.utf8_to_utf16_buf(file_buf[:], string(name_buf[:written]))
+		}
 	}
 
 	ofn := win32.OPENFILENAMEW{
 		lStructSize  = size_of(win32.OPENFILENAMEW),
 		lpstrFile    = win32.wstring(&file_buf[0]),
 		nMaxFile     = win32.MAX_PATH_WIDE,
-		lpstrTitle   = win32.utf8_to_wstring("Save render output", context.temp_allocator),
+		lpstrTitle   = win32.utf8_to_wstring(save_target_title(target), context.temp_allocator),
 		lpstrFilter  = win32.utf8_to_wstring(filters, context.temp_allocator),
-		lpstrDefExt  = win32.utf8_to_wstring("mp4", context.temp_allocator),
+		lpstrDefExt  = win32.utf8_to_wstring(def_ext, context.temp_allocator),
 		Flags        = win32.SAVE_FLAGS,
 	}
 

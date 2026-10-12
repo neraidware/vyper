@@ -491,7 +491,7 @@ file_picker_os :: proc(mode: Finder_Commit_Mode) {
 	case .Open, .ImportBin:
 		path = open_file_picker()
 	case .Save:
-		path = save_file_picker()
+		path = save_file_picker(.Project)
 	}
 	if path == nil {
 		return // cancelled, or the picker could not produce a path

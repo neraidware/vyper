@@ -790,10 +790,53 @@ open_srt_picker :: proc() -> cstring {
 // save_file_picker opens a save-as dialog (render output) and returns the chosen
 // path (or nil on cancel). Linux uses the XDG portal SaveFile; Windows uses the
 // Win32 common save dialog.
-save_file_picker :: proc() -> cstring {
+RENDER_OUTPUT_EXTENSION :: ".mp4"
+
+// Save_Target is what a save dialog is saving. The render output and the project
+// want the same dialog with a different default name, filter and title, so that
+// difference is a parameter rather than a second picker drifting from the first
+// — which is how bare `:save` came to offer "out.mp4" as the project filename.
+Save_Target :: enum { Render_Output, Project }
+
+save_target_title :: proc(target: Save_Target) -> string {
+	switch target {
+	case .Render_Output:
+		return "Save render output"
+	case .Project:
+		return "Save project"
+	}
+	return "Save"
+}
+
+// save_target_name is the filename the dialog opens on: the current one for the
+// render output, and the project under its own name for a project. An unnamed
+// project still gets a usable name rather than a bare extension, which a file
+// chooser would treat as a hidden file.
+save_target_name :: proc(target: Save_Target) -> string {
+	switch target {
+	case .Render_Output:
+		if render_output.path_len > 0 {
+			return path_basename(cstring(&render_output.path_buf[0]))
+		}
+		return "out.mp4"
+	case .Project:
+		if len(project.name) > 0 {
+			buf: [1024]u8
+			written := len(fmt.bprintf(buf[:], "%s%s", project.name, PROJECT_FILE_EXTENSION))
+			if written > 0 && written < len(buf) {
+				buf[written] = 0
+				return string(buf[:written])
+			}
+		}
+		return "project" + PROJECT_FILE_EXTENSION
+	}
+	return ""
+}
+
+save_file_picker :: proc(target: Save_Target) -> cstring {
 	when ODIN_OS == .Windows {
-		return win32_save_file_picker()
+		return win32_save_file_picker(target)
 	} else {
-		return portal_save_file_picker()
+		return portal_save_file_picker(target)
 	}
 }
