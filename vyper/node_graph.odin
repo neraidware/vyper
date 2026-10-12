@@ -578,7 +578,12 @@ graph_eval_text :: proc(graph: ^Node_Graph, character_count: int, out: []Text_In
 }
 
 text_graph_build :: proc(graph: ^Node_Graph, character_count: int, pieces: Text_Pieces_Range) -> bool {
-	graph_init(graph)
+	// Reusing a graph is one free-all + rebuild, not a delete for every buffer.
+	if graph.initialized {
+		node_graph_free_all(graph)
+	} else {
+		graph_init(graph)
+	}
 	text_input := graph_node_add(graph, .Text_Input)
 	style_start := len(graph.nodes)
 	for piece in session_piece_view(pieces) {
