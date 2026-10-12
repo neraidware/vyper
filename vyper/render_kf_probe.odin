@@ -537,7 +537,7 @@ when ODIN_DEBUG {
 		// already paid for seven times. It is listed for S3, where the mix moves to
 		// its own thread and the position should live in one place. Until then, that
 		// the right pixels come out is pinned where it cannot drift: end to end on a
-		// real project (TODO.md Active 22, S2).
+		// real project (~/Notes/Vyper/TODO.md, S2).
 		//
 		// Two things, because the S3 split made a value test possible where before it
 		// was not: publishing and consuming are now separate steps on separate

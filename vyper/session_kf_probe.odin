@@ -1,5 +1,5 @@
 // session_kf_probe: the session key store's allocator and COW invariants
-// (TODO.md Active 19, S2b). Registered as `scripts/gate.sh session_kf_probe`.
+// (~/Notes/Vyper/TODO.md, S2b). Registered as `scripts/gate.sh session_kf_probe`.
 //
 // The store is the one place in the clip POD work that MOVES memory, so this
 // probe is about the properties that movement can break: a range survives being
@@ -185,7 +185,7 @@ when ODIN_DEBUG {
 			// The other half of the guard: session_kf_view_mut refuses a shared
 			// range, which is what stops a future write site from corrupting a copy.
 			// Exercising the assert needs a subprocess, so the mutation that proves
-			// it fires is recorded in TODO.md Active 19 S2b rather than run here.
+			// it fires is recorded in ~/Notes/Vyper/TODO.md rather than run here.
 		}
 
 		// --- freed space is REUSED, not leaked past the bound -------------------

@@ -538,7 +538,7 @@ CROP_MIN_VISIBLE_FRAC :: 0.05
 // box center each time to keep the visible box exactly where it was. That
 // compensation WAS the hack: seven coupled values had to stay in step by hand,
 // any one of them drifting moved the box a pixel, and it is why the gesture
-// needed a probe of its own (TODO.md Active 3, geom_key_probe's keyed-drag case).
+// needed a probe of its own (~/Notes/Vyper/TODO.md, geom_key_probe's keyed-drag case).
 // Now the box is untouched by construction, because Zoom is resolved INSIDE the
 // window and the box is derived from the window's center.
 //

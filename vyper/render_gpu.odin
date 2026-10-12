@@ -22,7 +22,7 @@ package vyper
 // texel, matching the CPU kernel's footprint walk. It is in the shader rather
 // than the sampler because this driver clamps every lookup to mip level 0: a
 // generated mip chain plus a hardcoded textureLod(3.0) still returns level-0
-// data, and 16x anisotropy was bit-identical to 1x. See TODO.md Active 4.
+// data, and 16x anisotropy was bit-identical to 1x. See ~/Notes/Vyper/TODO.md.
 
 import "core:fmt"
 import "core:strings"

@@ -247,7 +247,7 @@ when ODIN_DEBUG {
 	// It deliberately does not go through update_preview_slots, because the async decode
 	// worker keeps its own one-slot result per path and never re-checks the file, so
 	// through the whole pipeline a stale picture could come from either layer and the
-	// check could not say which one it was blaming (see TODO.md Active 44).
+	// check could not say which one it was blaming (see ~/Notes/Vyper/TODO.md).
 	//
 	// Stores a still for a scratch file, requires a hit, rewrites the file, and requires
 	// a miss.

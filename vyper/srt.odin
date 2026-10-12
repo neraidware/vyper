@@ -10,7 +10,7 @@ import "core:strings"
 // An Srt_Source is a parsed subtitle file: each cue keeps the authored time
 // span (start/end ms) and authored text verbatim.
 //
-// Geometry/timing model (see TODO.md "Subtitle generator clip"):
+// Geometry/timing model ():
 //   - cues are relative to the clip start (sequence semantics), not absolute.
 //   - a cue's span is [start_ms, end_ms) as authored; end is EXCLUSIVE.
 //   - cue ms convert to frames at the project frame rate on every hit-test and

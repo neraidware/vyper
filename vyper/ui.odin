@@ -1266,7 +1266,7 @@ keyframe_readout :: proc() {
 			clay.TextElementConfig{textColor = TEXT, fontSize = FONT_SMALL},
 		)
 		v_buf := ui_text.keyframe_val[:]
-		// A key is a scalar on the lane that owns it (TODO.md Active 52), so the
+		// A key is a scalar on the lane that owns it (~/Notes/Vyper/TODO.md), so the
 		// readout is just that value. It used to branch on a packed mask and show
 		// lane 0 -- a key now cannot be packed, so the branch is gone rather than
 		// defaulted.

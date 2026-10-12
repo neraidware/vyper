@@ -5,7 +5,7 @@ package vyper
 //
 // Before this, each was a heap `string` owned by its struct. Interned handles
 // make names and labels immutable session data, so Clip value copies never
-// allocate or free those bytes (TODO.md Active 19).
+// allocate or free those bytes (~/Notes/Vyper/TODO.md).
 //
 // The pool removes string ownership, not marker/key range ownership. Clip name
 // handles copy by value; when two live Clips retain one pooled range, copy sites
@@ -25,7 +25,7 @@ package vyper
 // So the pool is a fixed block carved from one end. That is the whole trick: a
 // bump allocator whose storage never moves makes every alias valid for the
 // session, which is exactly the lifetime a clip name needs. Growth is an assert
-// at a named bound, not a reallocation -- and per TODO.md §6 a loud stop at the
+// at a named bound, not a reallocation -- and per AGENTS.md §6 a loud stop at the
 // real limit beats a silent corruption three subsystems later.
 //
 // SESSION_STR_POOL_BYTES is sized from the real thing: a name is a filename
@@ -38,7 +38,7 @@ package vyper
 // session_teardown. Every handle issued before that is dead, so nothing
 // surviving a reset may hold one -- which holds because no Clip value outlives
 // the timeline: undo snapshots are freed before the reset and never touch disk
-// (TODO.md Active 19, step 0). A stale handle is caught by session_str_view's
+// (~/Notes/Vyper/TODO.md, step 0). A stale handle is caught by session_str_view's
 // bound assert, not by returning empty: reset sets used to 0, so the bytes a
 // stale handle names are no longer part of the pool at all.
 
@@ -46,7 +46,7 @@ package vyper
 // practice is a clip's display name -- a filename component (NAME_MAX is 255) or
 // a title a person typed -- so nothing real comes near this. It exists to turn
 // "something interned a buffer" into an assert at the intern site instead of a
-// silently truncated name (TODO.md §6: truncating into a fixed buffer is silent
+// silently truncated name (AGENTS.md §6: truncating into a fixed buffer is silent
 // data loss unless something says so happened).
 SESSION_STR_MAX_LEN :: 64 * 1024
 

@@ -3669,7 +3669,7 @@ when ODIN_DEBUG {
 
 	// clip_probe_name formats a probe clip's label into a fixed buffer. Interning
 	// copies the bytes, so heap-formatting with aprintf here would leak the
-	// intermediate for nothing (TODO.md §1).
+	// intermediate for nothing (AGENTS.md §1).
 	clip_probe_name :: proc(t, c: int) -> string {
 		buf: [48]u8
 		return fmt.bprintf(buf[:], "clip %d-%d", t, c)

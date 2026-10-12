@@ -17,7 +17,7 @@ import "core:mem"
 // frame_off is clip-relative (timeline frame - clip.timeline_start_frame), so
 // a track travels with its clip: drag and undo snapshots need zero remapping.
 //
-// Ownership: lane NAMES are session-pool handles (TODO.md Active 19) -- interned
+// Ownership: lane NAMES are session-pool handles (~/Notes/Vyper/TODO.md) -- interned
 // once, owned by the session, copied by a struct copy, never freed per track.
 // Key ARRAYS are still owned per track at this step: deep-copied at every copy
 // site (clone_timeline, duplicate_track/clip) and freed by split/trim remaps and
@@ -62,7 +62,7 @@ ELASTIC_PHASE :: 0.75
 // value is a plain f32 and the lane it belongs to is carried by WHICH lane's key
 // window holds it, not by a runtime tag inside the key.
 //
-// The scalar/packed union this replaced (TODO.md Active 52) was the source of a
+// The scalar/packed union this replaced (~/Notes/Vyper/TODO.md) was the source of a
 // whole class of bug: whether a knot was scalar or packed lived in `mask != 0`,
 // decided at the CALL SITE, so a scalar sampler that met a packed knot asserted
 // and aborted the process, and one animation had two storage forms with
@@ -87,13 +87,13 @@ Keyframe_Lane :: struct {
 	// (session_kf.odin), not an owned array: the session owns the slots and
 	// outlives every holder. Read through session_kf_view/session_kf_at, mutate
 	// through session_kf_push/insert/erase/set after session_kf_make_unique has
-	// resolved sharing (TODO.md Active 19, S2b).
+	// resolved sharing (~/Notes/Vyper/TODO.md, S2b).
 	keys: Keyframe_Keys_Range,
 }
 
 Keyframe_Track :: struct {
 	// name: opaque id + gutter label. Consumer-defined; the store only matches.
-	// A session-pool handle (TODO.md Active 19): the bytes are immutable and
+	// A session-pool handle (~/Notes/Vyper/TODO.md): the bytes are immutable and
 	// owned by the session, so a track copy is a struct copy. Read through
 	// keyframe_track_name, match through keyframe_track_index.
 	name: Session_Str_Handle,
@@ -129,7 +129,7 @@ keyframe_track_name :: proc(t: ^Keyframe_Track) -> string {
 // A track is a set of scalar LANES, one per keyed property it owns. The arity is
 // track.lane_count: a plain keyed property (gain) has one, a group (transform.x
 // / .y, or crop.l/.r/.t/.b) has several. This replaced a [KF_PACK_MAX]f32 payload
-// plus a runtime `mask` tag (TODO.md Active 52); arity is now structural, so the
+// plus a runtime `mask` tag (~/Notes/Vyper/TODO.md); arity is now structural, so the
 // scalar/packed class of bug is gone rather than merely guarded.
 
 // keyframe_lane_count is how many scalar key curves a track carries.
@@ -403,7 +403,7 @@ keyframe_del_lane_key :: proc(clip: ^Clip, name: string, lane, frame_off: i32) {
 		// memory gate reports from the undo probe (it is the only gate that runs
 		// a path deleting keys down to empty). So the keys array is deleted here;
 		// the name used to be deleted alongside it and no longer needs to be,
-		// because it is a pool handle (TODO.md Active 19).
+		// because it is a pool handle (~/Notes/Vyper/TODO.md).
 		keyframe_track_release_lanes(track)
 		// name is a pool handle: no delete, and nothing to blank either -- the row
 		// leaves the array on the next line.
@@ -594,8 +594,7 @@ keyframe_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f3
 // key. This replaces keyframe_sample_packed_lane, which existed only to extract one
 // lane out of a [KF_PACK_MAX]f32 knot: with a track holding one scalar curve per
 // lane, "sample lane idx" is just keyframe_sample_keys over that lane's own keys, so
-// the two samplers collapse into one and the packed path is gone (TODO.md
-// Active 52).
+// the two samplers collapse into one and the packed path is gone (see ~/Notes/Vyper/TODO.md).
 keyframe_sample_lane :: proc(track: ^Keyframe_Track, lane: int, frame_off: i32, base: f32) -> (f32, bool) {
 	if track == nil {
 		return base, false
@@ -743,7 +742,7 @@ keyframe_split_preserve_continuity :: proc(src: Keyframe_Track_Range, left: ^Cli
 		// severed and moves the bug one level down. Iterating lanes is also what makes
 		// the old packed-section skip unnecessary -- a section is no longer a knot with
 		// two arms, it is N independent curves, and each is handled by the scalar path
-		// already proven for `gain` (TODO.md Active 52).
+		// already proven for `gain` (~/Notes/Vyper/TODO.md).
 		for li in 0 ..< st.lane_count {
 			keys := session_kf_view(st.lanes[li].keys)
 			// Only a lane straddling the cut can be severed by it. A lane whose keys
@@ -863,7 +862,7 @@ keyframe_trim_tail :: proc(clip: ^Clip, keep: i32) {
 // keyframe tracks' LANES flattened in order. Rows used to be one per track, which
 // worked only because a track held a single curve; a group track's lanes each
 // need their own diamond and their own gutter label, so the flattened row index
-// is what the painter, the hit-test and the gutter all speak (TODO.md Active 52).
+// is what the painter, the hit-test and the gutter all speak (~/Notes/Vyper/TODO.md).
 
 // The three helpers take the clip's keyframe track RANGE, not the clip: rows are
 // a property of the tracks alone, and a range is a plain value that a `for ... in`

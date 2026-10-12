@@ -213,7 +213,7 @@ when ODIN_DEBUG {
 		)
 		// Both halves SHARE the one name handle now: the pool is immutable and
 		// session-owned, so the split's struct copy copied the handle and nothing owns
-		// a second string (TODO.md Active 19). Pointer inequality no longer describes
+		// a second string (~/Notes/Vyper/TODO.md). Pointer inequality no longer describes
 		// the invariant -- isolation does. Renaming one half must not reach the other,
 		// which is the property separate heap ownership used to have to buy.
 		orig_name := clip_name(right)

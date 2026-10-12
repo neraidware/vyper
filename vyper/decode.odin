@@ -42,7 +42,7 @@ import sws "vendor/ffmpeg/swscale"
 //     * If you add a new write to last_frame/have_last, prove the physical
 //       decoder is consistent with it, or reuse the guard below.
 //
-// TODO(per TODO.md): promote this to a per-asset decoder cache with a bounded
+// TODO( promote this to a per-asset decoder cache with a bounded
 // rolling frame pool once real-time multi-track composition lands.
 Clip_Decoder :: struct {
 	opened:      bool,

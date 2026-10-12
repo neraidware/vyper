@@ -1,5 +1,4 @@
-// Session keyframe store: the key ranges that make `Clip` POD (TODO.md
-// Active 19, S2b).
+// Session keyframe store: the key ranges that make `Clip` POD (see ~/Notes/Vyper/TODO.md).
 //
 // A `Keyframe_Track` no longer owns its keys. It holds a `Keyframe_Keys_Range` — a window
 // into one flat `[dynamic]Keyframe` owned by the session — so copying a clip is
@@ -96,7 +95,7 @@ session_kf_live_peak: int
 session_kf_moves: int
 
 // session_kf_reset drops every range. Called from session teardown alongside
-// session_str_reset. Blind rewind, for the reason recorded in TODO.md Active 19
+// session_str_reset. Blind rewind, for the reason recorded in ~/Notes/Vyper/TODO.md
 // S0: no Clip, undo snapshot or timeline survives a session reset, so there is
 // nothing to invalidate beyond asserting on the read side.
 session_kf_reset :: proc() {

@@ -668,7 +668,7 @@ target_timeline_probe() {
 
 # The session string pool check (session_str_probe.odin). Clip names and marker
 # labels moved from heap strings to offset+length handles into one session block
-# (TODO.md Active 19), which trades a compiler-checked ownership chain for a
+# (~/Notes/Vyper/TODO.md), which trades a compiler-checked ownership chain for a
 # handle the compiler cannot check. The probe stands in for it: intern/view
 # round-trip, rename isolation across a copy, dedupe, the zero handle, offset
 # stability under growth, and reset. Exits 0/1.
@@ -680,7 +680,7 @@ target_session_str_probe() {
 # The session keyframe store check (session_kf_probe.odin). Clip keyframe keys
 # move out of per-track owned arrays into one session-owned store addressed by
 # range, with a copy-on-write bit so a Clip copy can be a struct copy
-# (TODO.md Active 19). Unlike the string pool this store RELOCATES a range when
+# (~/Notes/Vyper/TODO.md). Unlike the string pool this store RELOCATES a range when
 # it cannot grow in place, so the probe is about what movement breaks: in-place
 # growth across many inserts, sharing resolved on write and only on write,
 # freeing actually reusing space (the reason it is an allocator and not a bump
@@ -1626,7 +1626,7 @@ target_parity_valgrind() {
 	echo "parity-valgrind: ok (no invalid access; SDL control clean; definitely-lost within the worker-thread residue; full log: $log)"
 }
 
-# The audio engine's own acceptance measurement (TODO.md Active 22).
+# The audio engine's own acceptance measurement (~/Notes/Vyper/TODO.md).
 #
 # Every other audio gate builds its OWN fixture — audio_probe, audio_rate_probe
 # and atempo_probe all synthesize a WAV and construct a timeline. That is right
@@ -1688,7 +1688,7 @@ target_atempo_probe() {
 #   wav  -- uncompressed, no encoder delay. Both mixers must be BIT-IDENTICAL.
 #           This is the regression guard for the mixing arithmetic itself.
 #   aac  -- encoder-delayed. This one CURRENTLY FAILS, and it fails because
-#           neither sink can supply content 0 (see TODO.md Active 30 S4).
+#           neither sink can supply content 0 (see ~/Notes/Vyper/TODO.md).
 #
 # It is a gate target rather than a case inside audio_probe precisely because of
 # that: a red line inside `all` gets disabled, and a check nobody runs proves
@@ -1716,7 +1716,7 @@ target_audio_mix_parity() {
 	VYPER_AUDIO_MIX_PARITY="$PWD/$aac" timeout 600 ./target/vyper 2>&1 | tail -2
 	[ ${PIPESTATUS[0]} -ne 0 ] && rc=1
 	if [ $rc -ne 0 ]; then
-		echo "audio-mix-parity: FAILED (known; TODO.md Active 30 S4)" >&2
+		echo "audio-mix-parity: FAILED (known: the AAC case cannot supply content 0 to either sink)" >&2
 		return 1
 	fi
 	echo "audio-mix-parity: ok"

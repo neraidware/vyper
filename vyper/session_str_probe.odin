@@ -12,7 +12,7 @@ when ODIN_DEBUG {
 	// Session string pool probe (VYPER_SESSION_STR_PROBE=1).
 	//
 	// The pool replaced per-Clip heap strings for clip names and marker labels
-	// (TODO.md Active 19), so what used to be a compiler-checked ownership chain is
+	// (~/Notes/Vyper/TODO.md), so what used to be a compiler-checked ownership chain is
 	// now an offset+length handle into one session block. The compiler can no longer
 	// see a name leak or a stale handle; these assertions are what stands in for it.
 	//

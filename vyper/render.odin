@@ -632,7 +632,7 @@ keyframe_lane_name :: proc(lane: Render_Geom_Prop) -> string {
 // lane name to (track, lane index) and hands it to the store. There is no second
 // form to migrate between and no mask to reconcile: a group's arity is the
 // lane count it was built with, so keying a whole section is just a write to
-// every lane and keying one lane is a write to that lane (TODO.md Active 52).
+// every lane and keying one lane is a write to that lane (~/Notes/Vyper/TODO.md).
 // ---------------------------------------------------------------------------
 
 keyframe_geom_section_index :: proc(name: string) -> (index: int, ok: bool) {
@@ -678,7 +678,7 @@ keyframe_geom_any_lane_tracked :: proc(clip: ^Clip, def: Keyframe_Geom_Section) 
 
 // keyframe_geom_lane_count is how many lanes section `sec` has. It replaces
 // keyframe_geom_full_mask: with per-lane storage there is no bitmask to build, because
-// a group's arity is just how many lanes its track owns (TODO.md Active 52).
+// a group's arity is just how many lanes its track owns (~/Notes/Vyper/TODO.md).
 keyframe_geom_lane_count :: proc(sec: string) -> int {
 	sec_index, ok := keyframe_geom_section_index(sec)
 	assert(ok, "keyframe_geom_lane_count: name is not a section")
@@ -1946,7 +1946,7 @@ render_kf_geom_rect :: proc(
 	// reusing cl..cb because those are the box insets -- feeding them to
 	// crop_src_rect would select the crop window's pixels and silently drop a
 	// zoom or a pan on the keyed path only, which is the keyed/static split that
-	// has bitten twice (TODO.md Active 24).
+	// has bitten twice (~/Notes/Vyper/TODO.md).
 	wl, wr2, wt, wb := geom_content_insets(sampled)
 	csr := crop_src_rect(int(stage_w), int(stage_h), wl, wr2, wt, wb)
 	srcx = c.int(csr.x)

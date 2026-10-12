@@ -71,7 +71,7 @@ Saved_Asset :: struct {
 
 // Saved_Marker is a marker as stored in the file. It exists only because the
 // live Clip_Marker.label became a session-pool HANDLE rather than a string
-// (TODO.md Active 19), which makes the live type no longer cbor-safe -- the
+// (~/Notes/Vyper/TODO.md), which makes the live type no longer cbor-safe -- the
 // decoder would read a CBOR string into two i32s. Field names and types match
 // what Clip_Marker used to encode, so the on-disk format is unchanged; only the
 // in-memory DTO type is explicit now.
@@ -141,7 +141,7 @@ Saved_Clip :: struct {
 
 // Saved_Kf_Track is a keyframe track as stored in the file, for the same reason
 // Saved_Marker exists: the live Keyframe_Track.name is a session-pool HANDLE
-// (TODO.md Active 19), so reusing the live type would write two i32s where the
+// (~/Notes/Vyper/TODO.md), so reusing the live type would write two i32s where the
 // file stores a name. Its `keys` field reuses the live [dynamic]Keyframe, which
 // IS still cbor-safe (scalars plus a fixed-array union variant) -- that stops
 // being true when the keys move into a session store.
@@ -359,7 +359,7 @@ session_teardown :: proc() {
 	undo_free_all()
 	// Every Clip, marker and keyframe-track range dies with these session pools.
 	// Nothing above survives: live timeline and undo snapshots are released first.
-	// Pool resets are blind rewinds for the reason recorded in TODO.md Active 19
+	// Pool resets are blind rewinds for the reason recorded in ~/Notes/Vyper/TODO.md
 	// S0 -- no Clip, snapshot or timeline outlives teardown, so there is nothing
 	// to invalidate beyond the bounds assert on the read side.
 	session_str_reset()

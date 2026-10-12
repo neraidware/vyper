@@ -8,7 +8,7 @@ import "core:c"
 // This file exists because both subsystems need the same two answers -- "how
 // big is this clip's uncropped box" and "where is its cropped box" -- and were
 // keeping separate copies. The copies had already drifted into claiming
-// agreement they did not have (see TODO.md Active 10), and a preview that
+// agreement they did not have (see ~/Notes/Vyper/TODO.md), and a preview that
 // disagrees with the export about where a clip lands is a WYSIWYG bug, not a
 // style issue.
 //
@@ -160,7 +160,7 @@ text_box_dims :: proc(base_w, base_h: c.int, scale, pw: f32) -> (f32, f32) {
 // the export needs it for crop_src_rect, and they used to be derived by
 // different code from different inputs -- the preview from sampled lanes, the
 // export from `geom_base` -- which is exactly the shape of bug that made keyed
-// text export at its resting pose (TODO.md Active 24). Resolving here, from a
+// text export at its resting pose (~/Notes/Vyper/TODO.md). Resolving here, from a
 // Geom_Sample, means a caller cannot pick the wrong one.
 // ---------------------------------------------------------------------------
 
