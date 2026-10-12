@@ -13,17 +13,50 @@ package vyper
 import "core:c"
 import "core:fmt"
 import "core:os"
+import stb "vendor:stb/truetype"
 
 // Debug-only. A probe is test scaffolding: it exists to prove something to
 // `scripts/gate.sh`, never to run in a shipped binary, so a release build
 // does not contain it. The entry point is gated the same way in main.odin.
 when ODIN_DEBUG {
+	// The reveal cases below lay text out and paint it, which needs a font and a
+	// scratch. They keep their OWN rather than using the app's shared text state,
+	// for the same reason the render worker keeps its own: the globals belong to
+	// the live frame loop and a probe must not touch them.
+	font_probe_font: stb.fontinfo
+	font_probe_font_init: bool
+	font_probe_scratch: []u8
+	font_probe_glyphs: [dynamic]Text_Glyph
+
+	// font_probe_ink_of paints `title` into a throwaway buffer at the probe's own
+	// font state and returns the inked rect. A proc rather than a closure because
+	// Odin closures cannot capture a block-scoped [dynamic] that the callee mutates,
+	// and because the reveal cases want to call it four times with different
+	// windows.
+	font_probe_ink_of :: proc(title: string, bw, bh: int, reveal: Text_Reveal) -> (ox, oy, ow, oh: int) {
+		buf := make([]u8, bw*bh*4)
+		defer delete(buf)
+		return rasterize_title_into_buffer(
+			title,
+			buf,
+			bw,
+			bh,
+			&font_probe_font,
+			&font_probe_font_init,
+			font_probe_scratch,
+			&font_probe_glyphs,
+			reveal,
+			48,
+		)
+	}
+
 
 	font_probe_failed: bool
 
-	font_probe_check :: proc(cond: bool, msg: string) {
+	font_probe_check :: proc(cond: bool, msg: string, args: ..any) {
 		if !cond {
-			fmt.println("[font-probe] FAIL:", msg)
+			fmt.print("[font-probe] FAIL: ")
+			fmt.eprintfln(msg, ..args)
 			font_probe_failed = true
 		}
 	}
@@ -119,6 +152,81 @@ when ODIN_DEBUG {
 		font_probe_check(atlas.generation == 2, "second grow bumps the generation")
 		cx, cy := glyph_atlas_cell_xy(&atlas, atlas.slots[c0].cell)
 		font_probe_check(cx == 0 && cy == 16, "cell 1024 maps to (0,16) on a 64-wide grid")
+
+		// --- per-character reveal ---------------------------------------------
+		// The typing window. What matters is not that fewer pixels appear but WHERE
+		// the text's geometry comes from: the whole string is still laid out, and
+		// only the glyphs outside the window are skipped at paint time. So typing
+		// does not reflow -- a character revealed later lands in the position it
+		// would have had all along, with its neighbours' kerning applied.
+		//
+		// A per-character feature built on the opposite shape -- painting a revealed
+		// PREFIX as its own string -- would re-measure and shift on every reveal,
+		// and this is the assertion that keeps that from creeping back in.
+		{
+			title := "AV Wa"
+			bw, bh := text_buf_size_for(title, &font_probe_font, &font_probe_font_init, 48)
+			font_probe_check(bw > 0 && bh > 0, "reveal: the buffer must size")
+			font_probe_scratch = make([]u8, text_scratch_size_for(48))
+			defer delete(font_probe_scratch)
+
+			layout := text_layout_into(title, &font_probe_font, &font_probe_font_init, 48, &font_probe_glyphs)
+			font_probe_check(
+				len(layout.glyphs) == 5,
+				"reveal: a 5-character text must lay out 5 glyphs (got %d)",
+				len(layout.glyphs),
+			)
+			// Monotonic char_index is what makes the range test meaningful: the
+			// painter's only decision is `first <= char_index < last`.
+			monotonic := true
+			for glyph, index in layout.glyphs {
+				if glyph.char_index != index {
+					monotonic = false
+					break
+				}
+			}
+			font_probe_check(monotonic, "reveal: char_index must run 0..n-1 in layout order")
+
+			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, text_reveal_all(5))
+			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 0, last = 1})
+			// Narrower, and no taller. Not "the same height": a round letter overshoots
+			// the baseline by a pixel, so "AV Wa" is legitimately 1px taller than the
+			// "A" alone -- the first assertion I wrote here failed on exactly that, and
+			// the height was right all along.
+			font_probe_check(
+				all_w > one_w && all_h >= one_h && one_h > 0,
+				"reveal: one character must be narrower than five and no taller (%dx%d vs %dx%d)",
+				one_w,
+				one_h,
+				all_w,
+				all_h,
+			)
+			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 0, last = 0})
+			font_probe_check(
+				zero_w == 0 && zero_h == 0,
+				"reveal: an empty window must paint no ink (got %dx%d)",
+				zero_w,
+				zero_h,
+			)
+			// A window open from either end, not just the front.
+			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 1, last = 5})
+			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 0, last = 4})
+			font_probe_check(
+				tail_w < all_w && head_w < all_w,
+				"reveal: a window open from either end must be narrower than the whole (%d/%d/%d)",
+				head_w,
+				tail_w,
+				all_w,
+			)
+			// Revealing nothing must not change the MEASUREMENT. The reflow property,
+			// stated as an assertion rather than left as a comment.
+			after := text_layout_into(title, &font_probe_font, &font_probe_font_init, 48, &font_probe_glyphs)
+			font_probe_check(
+				len(after.glyphs) == 5 && after.width == layout.width,
+				"reveal: laying out again after an empty paint must still measure the whole text (%d glyphs)",
+				len(after.glyphs),
+			)
+		}
 
 		if font_probe_failed {
 			os.exit(1)

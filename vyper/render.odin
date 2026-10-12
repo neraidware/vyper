@@ -1126,6 +1126,11 @@ Render_Text_Src :: struct {
 	timeline_start_frame: i64,
 	source_length_frames: i64,
 	geom:                 Render_Geom_Snap,
+	// reveal: which characters of the title get drawn. Carried like the geometry
+	// rather than re-read from the clip on the worker: it must not address the UI
+	// thread's clip, and a value that can change between the snapshot and the bake
+	// is exactly what a snapshot is for.
+	reveal:               Text_Reveal,
 	source_w:             c.int, // text_w (tight ink width, text px)
 	source_h:             c.int, // text_h (tight ink height, text px)
 
@@ -1234,6 +1239,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, r
 		&render_text_font.init,
 		scratch,
 		&over.layout,
+		t.reveal,
 		font_px,
 	)
 	if ow <= 0 || oh <= 0 {
@@ -1292,6 +1298,7 @@ snapshot_text_src :: proc(clip: ^Clip, job_idx: int) -> Render_Text_Src {
 		source_w = clip.source_w,
 		source_h = clip.source_h,
 		job_idx = job_idx,
+		reveal = text_clip_reveal(clip),
 	}
 	render_geom_snap_fill(&src.geom, clip)
 	return src

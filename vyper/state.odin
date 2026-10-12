@@ -689,6 +689,17 @@ Clip :: struct {
 	// .None for ordinary file-backed clips; .Text for the text generator;
 	// .Subtitles for the subtitle (.srt) generator.
 	generator:            Generator_Kind,
+	// text_reveal is which characters of a Text clip's title get drawn: the typing
+	// window, as a half-open range over character indices. Not keyframable yet --
+	// this is the range, plumbed end to end, so that per-character painting is a
+	// property of the clip rather than of the rasterizer.
+	//
+	// It is plain POD with no heap behind it, which is deliberate: the alternative
+	// is a per-piece range list, and Clip is copied by value in a dozen places that
+	// would each have to share it. A two-int range needs no ownership story, and
+	// when pieces arrive this stays the default that every piece without an
+	// override inherits.
+	text_reveal:          Text_Reveal,
 	// srt_id is the index into srt_cache for a .Subtitles generator clip (the
 	// parsed .srt backing this clip); -1/ignored for other clip kinds. The
 	// cache is session-scoped and append-only, so this index stays valid for

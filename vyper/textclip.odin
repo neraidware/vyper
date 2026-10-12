@@ -213,6 +213,52 @@ text_buf_size_for :: proc(
 // combining-mark case it implies flagged rather than hidden: a reveal range
 // stored in codepoints can split a cluster.
 
+// Text_Reveal is which characters of a laid-out text get DRAWN, as a half-open
+// range over Text_Glyph.char_index. It is the typing animation: first=0 with a
+// rising last walks the string out; first rising with last pinned eats it from
+// the end; both together are a window.
+//
+// It lives on the TEXT, not on a piece, because "how much of this string is
+// visible" is one question about one string. When pieces arrive they may
+// override it per piece -- a word typed on its own -- but a piece that does not
+// override inherits this, so "type the whole text" is one range and no
+// per-piece data at all. Giving every piece its own copy instead would mean N
+// copies of one animated value that can drift apart.
+//
+// A range rather than a character COUNT on purpose: a count reads the same
+// whether a character is one codepoint or one grapheme cluster, so this survives
+// the segmenter changing under it. See TEXT_CHAR_UNIT.
+Text_Reveal :: struct {
+	first: int,
+	last:  int,
+}
+
+// text_clip_reveal is a Text clip's reveal window, with an unset one meaning
+// "all of it". A zeroed Text_Reveal would otherwise reveal nothing at all, which
+// is the opposite of the intent: the default has to BE the full range, so that a
+// clip nobody has animated reads as fully drawn and no sink has to special-case
+// it.
+text_clip_reveal :: proc(clip: ^Clip) -> Text_Reveal {
+	length := len(clip_name(clip))
+	if clip.text_reveal.last <= 0 && clip.text_reveal.first <= 0 {
+		return text_reveal_all(length)
+	}
+	return clip.text_reveal
+}
+
+// text_reveal_all is the "draw everything" range. It is deliberately not a
+// sentinel the painter compares against: the painter clamps, so an unset reveal
+// has to BE the full range, not a magic negative that means the same thing.
+text_reveal_all :: proc(character_count: int) -> Text_Reveal {
+	return Text_Reveal{first = 0, last = character_count}
+}
+
+// text_reveal_contains is the whole test a painter needs: is this character
+// inside the revealed window? Written once so the clamping rule lives once.
+text_reveal_contains :: proc(reveal: Text_Reveal, char_index: int) -> bool {
+	return char_index >= reveal.first && char_index < reveal.last
+}
+
 // Text_Glyph is one character's placement, as measured rather than painted.
 //
 // It is the data the old loop computed and threw away on every iteration. With
@@ -246,9 +292,14 @@ Text_Layout :: struct {
 	// the real number here instead, which is the one thing this split buys that
 	// is free today.
 	width: f32,
-	// ink: the tight bounds of what was laid out, in raster pixels, with the same
+	// ink: the tight bounds of the WHOLE laid text, in raster pixels, with the same
 	// arithmetic the painter used inline — a glyph with no ink (a space) still
 	// advances the right edge, exactly as before.
+	//
+	// This is the full extent, which is NOT what the painter returns: that one is
+	// the revealed ink. Both are wanted, and they are different questions — a clip's
+	// box stays the full text's (so a line being typed does not shift its centering),
+	// while the blit only samples what is visible. Centering a text clip reads this.
 	ink_x, ink_y, ink_w, ink_h: int,
 }
 
@@ -359,6 +410,12 @@ text_layout_into :: proc(
 // `layout_glyphs` is the caller-owned buffer text_layout_into writes into, for the
 // same reason the per-glyph `scratch` is passed in: the UI thread and the render
 // worker each keep their own, so neither races the other.
+//
+// `reveal` says which characters get drawn. The text is still LAID OUT whole —
+// kerning and advance of a hidden character affect the ones after it, so a
+// partially typed line does not reflow as it types — and only the glyphs outside
+// the window are skipped at paint time. The returned ink rect is therefore the
+// INKED rect, not the text's full extent, which is what a caller blits.
 rasterize_title_into_buffer :: proc(
 	title: string,
 	buf: []u8,
@@ -367,6 +424,7 @@ rasterize_title_into_buffer :: proc(
 	font_init: ^bool,
 	scratch: []u8,
 	layout_glyphs: ^[dynamic]Text_Glyph,
+	reveal: Text_Reveal,
 	font_px: f32,
 ) -> (
 	ox: int,
@@ -377,11 +435,38 @@ rasterize_title_into_buffer :: proc(
 	mem.zero(raw_data(buf), len(buf))
 	layout := text_layout_into(title, font, font_init, font_px, layout_glyphs)
 	baseline_i := cast(int)layout.baseline
+	// The ink rect starts as EMPTY and is measured from the glyphs actually drawn,
+	// so a half-revealed text reports the width of what is visible. Measuring it in
+	// text_layout_into instead would report the full string and blit dead space.
+	top := max(int)
+	bottom := -max(int)
+	left := max(int)
+	right := -max(int)
 	for glyph in layout.glyphs {
+		if !text_reveal_contains(reveal, glyph.char_index) {
+			continue
+		}
 		start_x := cast(int)glyph.x + int(glyph.box[0])
 		start_y := baseline_i + int(glyph.box[1])
 		gw := int(glyph.box[2]) - int(glyph.box[0])
 		gh := int(glyph.box[3]) - int(glyph.box[1])
+		// Tracked BEFORE the no-ink skip, and for the same reason the layout did:
+		// a glyph with no ink (a space) still advances the right edge, so the inked
+		// rect of a revealed trailing space is the pen position, not the last ink.
+		ink_right := start_x + gw
+		ink_bottom := start_y + gh
+		if start_y < top {
+			top = start_y
+		}
+		if ink_bottom > bottom {
+			bottom = ink_bottom
+		}
+		if start_x < left {
+			left = start_x
+		}
+		if ink_right > right {
+			right = ink_right
+		}
 		if gw <= 0 || gh <= 0 {
 			continue
 		}
@@ -419,7 +504,12 @@ rasterize_title_into_buffer :: proc(
 			}
 		}
 	}
-	return layout.ink_x, layout.ink_y, layout.ink_w, layout.ink_h
+	if left > right || top > bottom {
+		// Nothing revealed: the caller gets an empty rect rather than the layout's,
+		// and treats it as "this clip has no ink this frame".
+		return 0, 0, 0, 0
+	}
+	return left, top, right - left, bottom - top
 }
 
 // text_buf_size_for_lines estimates a single-call RGBA buffer (bw x bh) large
@@ -518,6 +608,7 @@ rasterize_lines_into_buffer :: proc(
 			font_init,
 			scratch,
 			&line_layout,
+			text_reveal_all(len(lines[i])),
 			px,
 		)
 		slots[i] = {
