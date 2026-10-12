@@ -3,33 +3,6 @@
 Engineering philosophy for this codebase. Every change should satisfy these,
 in order, or deviate with a comment saying why.
 
-## 0. The project tracker lives outside the repo
-
-The work queue, the speculative-idea bank, and the Windows build notes are in
-`~/Notes/Vyper/` — `TODO.md`, `IDEAs.md`, `WINDOWS.md`. They are deliberately
-NOT in this repository.
-
-- Why: they had become 9,345 lines of mostly-completed work that git already
-  records. Keeping a second, worse copy of the history in the working tree
-  buried the few genuinely open items and made stale notes — sections whose
-  "open" checkboxes described code that no longer existed — indistinguishable
-  from live work.
-- What still goes in the **commit message**: every change that affects the final
-  result of the project. A new feature, a behavioural change, a fix that changes
-  output. The commit is the durable record, and unlike the notes it cannot drift
-  out of date with the code.
-- What goes in `~/Notes/Vyper/TODO.md`: **open** work only, investigated against
-  the current tree before it is written down. If you cannot verify a claim
-  against the tree, it is not a TODO item yet — measure it, or drop it. A
-  description of code that has since been rewritten is worse than no entry,
-  because it reads as authority.
-- Not tracked anywhere: scratch, probe-only churn that changes nothing shipped,
-  and experiments reverted before landing.
-- Never cite a TODO section number from a code comment. Those references go
-  stale silently — a renumbered section leaves the pointer pointing at a
-  different bug — and the reasoning belongs in the comment anyway, not in a
-  pointer to a file that may have moved.
-
 ## 1. Memory model: arenas, generational handles, single-writer ownership
 
 The memory model is the architecture — it decides how every subsystem
