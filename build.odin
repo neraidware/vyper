@@ -387,7 +387,7 @@ linker_flags :: proc() -> string {
 		// the binary is a GUI app that returns from WinMain directly.
 		lib := join_or_empty({current_dir(), "deps", "lib"})
 		return strings.concatenate(
-			{"/LIBPATH:", lib, " /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"},
+			{"/LIBPATH:", lib, " /SUBSYSTEM:WINDOWS"},
 			context.temp_allocator,
 		)
 	}

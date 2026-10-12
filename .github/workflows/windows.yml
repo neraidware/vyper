@@ -49,11 +49,6 @@ jobs:
           $line = Select-String -Path .mise.toml -Pattern '^odin\s*=\s*"([^"]+)"\s*$'
           if (-not $line) { throw "no pinned odin in .mise.toml -- a build gate must not pick its own compiler" }
           $v = $line.Matches[0].Groups[1].Value
-          $hold = "dev-2026-09"
-          if ($v -ne $hold) {
-            Write-Host "odin=$v from .mise.toml; Windows holds at $hold (radlink default does not link this project -- see step comment)"
-            $v = $hold
-          }
           "version=$v" >> $env:GITHUB_OUTPUT
 
       - name: Setup Odin
