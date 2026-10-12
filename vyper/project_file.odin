@@ -510,24 +510,14 @@ session_rebuild :: proc(pf: ^Project_File) {
 			if len(sc.keyframe_tracks) > 0 {
 				c.keyframe_tracks = Keyframe_Track_Range{}
 				for kt in sc.keyframe_tracks {
-					if section_name, lane_index, is_lane := keyframe_file_name_lane(kt.name); is_lane {
-						for key in kt.keys {
-							keyframe_set_lane_key_interp(
-								&c,
-								section_name,
-								lane_index,
-								key.frame_off,
-								key.value,
-								key.interp,
-							)
-						}
-						continue
-					}
+					// The entry names a curve. A section lane resolves to its
+					// section's track; a plain property resolves to its own.
+					track_name, lane_name := keyframe_geom_lane_of_track(kt.name)
 					for key in kt.keys {
 						keyframe_set_lane_key_interp(
 							&c,
-							kt.name,
-							0,
+							track_name,
+							lane_name,
 							key.frame_off,
 							key.value,
 							key.interp,
@@ -731,14 +721,16 @@ saved_markers :: proc(c: ^Clip) -> [dynamic]Saved_Marker {
 saved_kf_tracks :: proc(c: ^Clip) -> [dynamic]Saved_Kf_Track {
 	out: [dynamic]Saved_Kf_Track
 	for track_index in 0 ..< c.keyframe_tracks.n {
-		for lane in 0 ..< keyframe_file_track_lanes(c.keyframe_tracks, track_index) {
-			_, total := keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane, nil)
+		track := session_trk_view(c.keyframe_tracks, track_index)
+		for lane in 0 ..< keyframe_lane_count(track) {
+			lane_name := keyframe_lane_pos(track, lane)
+			_, total := keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane_name, nil)
 			keys := make([dynamic]Keyframe, total)
-			keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane, keys[:])
+			keyframe_file_lane_keys(c.keyframe_tracks, track_index, lane_name, keys[:])
 			append(
 				&out,
 				Saved_Kf_Track {
-					name  = keyframe_file_lane_name(c.keyframe_tracks, track_index, lane),
+					name  = lane_name,
 					keys = keys,
 				},
 			)

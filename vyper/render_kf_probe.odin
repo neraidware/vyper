@@ -194,8 +194,8 @@ when ODIN_DEBUG {
 		clipC := Clip{}
 		keyframe_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
 		keyframe_geom_set_lane_key(&clipC, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-		keyframe_key_mut(&clipC, 0, 0, 0).interp = .Ease_Out
-		keyframe_key_mut(&clipC, 0, 0, 1).interp = .Ease_In
+		keyframe_key_mut(&clipC, 0, "transform.x", 0).interp = .Ease_Out
+		keyframe_key_mut(&clipC, 0, "transform.x", 1).interp = .Ease_In
 		geomC: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
@@ -224,9 +224,9 @@ when ODIN_DEBUG {
 		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 21, 250)
 		keyframe_geom_set_lane_key(&clipD, render_geom_name(Render_Geom_Prop.Trans_X), 31, 350)
 		dtk := session_trk_view_mut(&clipD.keyframe_tracks, 0)
-		keyframe_key_mut(&clipD, 0, 0, 1).interp = .Cubic
-		keyframe_key_mut(&clipD, 0, 0, 2).interp = .Cubic
-		keyframe_key_mut(&clipD, 0, 0, 3).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, "transform.x", 1).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, "transform.x", 2).interp = .Cubic
+		keyframe_key_mut(&clipD, 0, "transform.x", 3).interp = .Cubic
 		geomD: [int(Render_Geom_Prop._COUNT)]Render_Kf_Flat
 		for pi in 0 ..< int(Render_Geom_Prop._COUNT) {
 			p := Render_Geom_Prop(pi)
@@ -251,7 +251,7 @@ when ODIN_DEBUG {
 		// "transform.x", which no consumer samples.
 		keyframe_geom_set_lane_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 1, 0)
 		keyframe_geom_set_lane_key(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 21, 100)
-		keyframe_key_mut(&clipE1, 0, 0, 1).interp = .Ease_In
+		keyframe_key_mut(&clipE1, 0, "transform.x", 1).interp = .Ease_In
 		pe1, _ := keyframe_geom_sample_lane(&clipE1, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 		render_kf_probe_check_near(pe1, 12.5, 0.001, "E1 preview scalar eased")
 
@@ -262,7 +262,7 @@ when ODIN_DEBUG {
 		high_values[0] = 100
 		keyframe_geom_set_group_value(&clipE2, "transform", 1, low_values)
 		keyframe_geom_set_group_value(&clipE2, "transform", 21, high_values)
-		keyframe_key_mut(&clipE2, 0, 0, 1).interp = .Ease_In
+		keyframe_key_mut(&clipE2, 0, "transform.x", 1).interp = .Ease_In
 		pe2, _ := keyframe_geom_sample_lane(&clipE2, render_geom_name(Render_Geom_Prop.Trans_X), 11, 0)
 		render_kf_probe_check_near(pe2, 12.5, 0.001, "E2 preview group-written lane eased")
 

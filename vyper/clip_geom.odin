@@ -352,7 +352,7 @@ clip_geom_key_all_modified :: proc(clip: ^Clip) -> (n: int) {
 	// above has left them untouched.
 	for i in 0 ..< int(Render_Geom_Prop._COUNT) {
 		prop := Render_Geom_Prop(i)
-		if _, _, is_lane := keyframe_geom_section_for_lane(keyframe_lane_name(prop)); is_lane {
+		if _, is_lane := keyframe_geom_section_for_lane(keyframe_lane_name(prop)); is_lane {
 			continue
 		}
 		if !clip_geom_key_modified(clip, prop) {

@@ -516,7 +516,8 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 		rebuilt: Keyframe_Track
 		rebuilt.name = source.name // pool handle
 		for lane in 0 ..< keyframe_lane_count(source) {
-			source_keys := keyframe_lane_view(source, lane)
+			source_lane := keyframe_lane_at(source, lane)
+			source_keys := source_lane.keys
 			rescaled := Keyframe_Keys_Range{}
 			prev := i32(-1)
 			for ki in 0 ..< source_keys.n {
@@ -542,7 +543,14 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 				)
 			}
 			if rescaled.n > 0 {
-				session_lane_push(&rebuilt.lanes, Keyframe_Lane{keys = rescaled})
+				// The name rides along. A lane without one is not the same curve, so
+				// dropping it here silently turned every keyed clip's lanes into
+				// nameless ones on a reflow -- which reads as "the keys vanished"
+				// somewhere downstream, with nothing in this function to point at.
+				session_lane_push(
+					&rebuilt.lanes,
+					Keyframe_Lane{name = source_lane.name, keys = rescaled},
+				)
 			} else {
 				session_kf_release(rescaled)
 			}

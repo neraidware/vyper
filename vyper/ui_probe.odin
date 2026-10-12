@@ -2126,17 +2126,20 @@ when ODIN_DEBUG {
 		vclip.keyframe_tracks = Keyframe_Track_Range{}
 		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("scale")})
 		scale_track := session_trk_view_mut(&vclip.keyframe_tracks, 0)
-		scale_lane := Keyframe_Lane{}
+		scale_lane := Keyframe_Lane{name = session_str_intern("scale")}
 		session_kf_push(&scale_lane.keys, Keyframe{frame_off=0,value=1.0})
 		session_kf_push(&scale_lane.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
 		session_lane_push(&scale_track.lanes, scale_lane)
-		// A section track: "crop" owns one scalar lane per edge, four curves side by
-		// side. This is what the packed [KF_PACK_MAX]f32 knot used to be, except the
-		// edges are separate keys with separate frames instead of four slots in one.
+		// A section track: "crop" owns one scalar curve per edge, four side by side.
+		// This is what the packed [KF_PACK_MAX]f32 knot used to be, except the edges
+		// are separate keys with separate frames instead of four slots in one.
 		session_trk_push(&vclip.keyframe_tracks, Keyframe_Track {name = session_str_intern("crop")})
 		crop_track := session_trk_view_mut(&vclip.keyframe_tracks, 1)
+		crop_lane_name := [4]string{"crop.l", "crop.r", "crop.t", "crop.b"}
 		for edge in 0 ..< 4 {
-			crop_lane := Keyframe_Lane{}
+			crop_lane := Keyframe_Lane{
+				name = session_str_intern(crop_lane_name[edge]),
+			}
 			// Lanes 0 and 2 also carry a second key, so the fixture distinguishes a
 			// lane with a curve from a lane holding a single constant.
 			session_kf_push(&crop_lane.keys, Keyframe{frame_off=10,value=f32(edge)+1.0})
@@ -2354,7 +2357,7 @@ when ODIN_DEBUG {
 			ok = false
 		} else {
 			scale_track := session_trk_view(c.keyframe_tracks, 0)
-			scale_lane := keyframe_lane_view(scale_track, 0)
+			scale_lane := keyframe_own_lane_keys(scale_track)
 			if keyframe_track_name(scale_track) != "scale" || scale_lane.n != 2 {
 				fmt.eprintf("[ui-probe] scalar keyframe track mismatch\n")
 				ok = false
@@ -2371,8 +2374,9 @@ when ODIN_DEBUG {
 				fmt.eprintf("[ui-probe] section track lane count mismatch\n")
 				ok = false
 			} else {
+				crop_lane_name := [4]string{"crop.l", "crop.r", "crop.t", "crop.b"}
 				for edge in 0 ..< 4 {
-					edge_keys := keyframe_lane_view(crop_track, edge)
+					edge_keys := keyframe_lane_view(crop_track, crop_lane_name[edge])
 					want_keys := edge % 2 == 0 ? 2 : 1
 					if edge_keys.n != want_keys ||
 					   session_kf_at(edge_keys, 0).frame_off != 10 ||
@@ -2737,27 +2741,25 @@ when ODIN_DEBUG {
 		keyframe_dbl_click = {}
 		build_page(1920, 1600)
 		cl := &timeline.tracks[0].clips[0]
-		// The lane is FOUND, not assumed at index 0: the geometry layer owns lane
-		// naming and order (a seeded "scale" track comes back normalized), so an
-		// index-based fixture would be testing the normalization, not the brush.
-		lane, k_first, k_second := -1, -1, -1
-		for li in 0 ..< cl.keyframe_tracks.n {
-			n := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, li), 0).n
-			if n >= 2 &&
-			   (lane < 0 ||
-					   n > keyframe_lane_view(session_trk_view(cl.keyframe_tracks, lane), 0).n) {
-				lane, k_first, k_second = li, 0, 1
-			}
-		}
-		if lane < 0 {
+		// The lane is FOUND by name, not assumed: a lane is a named curve now, and
+		// "the first lane of the first track" is a thing the store no longer promises
+		// anything about.
+		lane_track, lane_name := ui_probe_lane_with_keys(cl, 2)
+		k_first, k_second := 0, 1
+		// The ROW the curve draws on, from the same walk the painter uses -- a track
+		// index is a row index only when the clip has one track, and this fixture
+		// does not.
+		lane_row := keyframe_clip_row_of(cl.keyframe_tracks, lane_track, lane_name)
+		if lane_track < 0 {
 			fmt.eprintf("[ui-probe] brush fixture wants a lane with 2+ keys\n")
 			return false
 		}
 		box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-		f_a := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), k_first).frame_off
-		f_b := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), k_second).frame_off
-		x_a, y_a := keyframe_key_center(box, lane, f_a)
-		x_b, y_b := keyframe_key_center(box, lane, f_b)
+		keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, lane_track), lane_name)
+		f_a := session_kf_at(keys, k_first).frame_off
+		f_b := session_kf_at(keys, k_second).frame_off
+		x_a, y_a := keyframe_key_center(box, lane_track, f_a)
+		x_b, y_b := keyframe_key_center(box, lane_track, f_b)
 		// An empty spot to arm the brush on. It has to be past the clip's RIGHT EDGE,
 		// not merely past its last key: the clip press handler runs before the brush
 		// fallback and claims any press on a clip body, so a point still over the clip
@@ -2821,7 +2823,7 @@ when ODIN_DEBUG {
 			fmt.eprintf("[ui-probe] shift+click on empty timeline space must arm the brush\n")
 			return false
 		}
-		if keyframe_sel_count() != 1 || !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_first}) {
+		if keyframe_sel_count() != 1 || !keyframe_sel_contains(Keyframe_Ref{0, 0, lane_track, lane_name, k_first}) {
 			fmt.eprintf(
 				"[ui-probe] arming the brush left %d keys selected, want the previous selection kept\n",
 				keyframe_sel_count(),
@@ -2833,8 +2835,8 @@ when ODIN_DEBUG {
 		// not start fresh, which is the whole difference from a reselect.
 		hover(x_b, y_b)
 		if keyframe_sel_count() != 2 ||
-		   !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_first}) ||
-		   !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_second}) {
+		   !keyframe_sel_contains(Keyframe_Ref{0, 0, lane_track, lane_name, k_first}) ||
+		   !keyframe_sel_contains(Keyframe_Ref{0, 0, lane_track, lane_name, k_second}) {
 			fmt.eprintf(
 				"[ui-probe] hovering a key in brush mode left %d selected, want both accumulated\n",
 				keyframe_sel_count(),
@@ -2862,7 +2864,7 @@ when ODIN_DEBUG {
 		}
 		keyframe_clear()
 		hover(x_a, y_a)
-		if keyframe_sel_count() != 1 || !keyframe_sel_contains(Keyframe_Ref{0, 0, lane, 0, k_first}) {
+		if keyframe_sel_count() != 1 || !keyframe_sel_contains(Keyframe_Ref{0, 0, lane_track, lane_name, k_first}) {
 			fmt.eprintf("[ui-probe] the brush stopped painting after release (count %d)\n", keyframe_sel_count())
 			ok = false
 		}
@@ -2912,17 +2914,14 @@ when ODIN_DEBUG {
 		keyframe_dbl_click = {}
 		build_page(1920, 1600)
 		cl := &timeline.tracks[0].clips[0]
-		// Find the lane, do not assume index 0: the geometry layer renames and
-		// reorders lanes during build, so a fixture pinned to (lane 0, key 0/1)
-		// tests that normalization instead of the gesture.
-		lane := -1
-		for li in 0 ..< cl.keyframe_tracks.n {
-			if keyframe_lane_view(session_trk_view(cl.keyframe_tracks, li), 0).n >= 2 {
-				lane = li
-				break
-			}
-		}
-		if lane < 0 {
+		// The lane is FOUND by name: a fixture pinned to "lane 0" was pinning the
+		// store's layout, not the gesture.
+		lane_track, lane_name := ui_probe_lane_with_keys(cl, 2)
+		// The TRACK's name is read now, while the index still points at it: the
+		// drag below rebuilds the rows, and a name read from a stale index names
+		// whichever curve landed there instead.
+		track_name := keyframe_track_name(session_trk_view(cl.keyframe_tracks, lane_track))
+		if lane_track < 0 {
 			fmt.eprintf(
 				"[ui-probe] click/drag fixture wants a lane with 2+ keys, got %d lanes\n",
 				cl.keyframe_tracks.n,
@@ -2942,12 +2941,13 @@ when ODIN_DEBUG {
 		// tracks, which invalidates the INDEX but not the view -- the pool block is
 		// fixed, so published bytes never move. This is the property the clone used
 		// to be protecting against, now gone at the source.
-		lane_name := keyframe_track_name(session_trk_view(cl.keyframe_tracks,lane))
-		f_a := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), 0).frame_off
-		f_b := session_kf_at(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,lane), 0), 1).frame_off
+		keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, lane_track), lane_name)
+		f_a := session_kf_at(keys, 0).frame_off
+		f_b := session_kf_at(keys, 1).frame_off
 		box := clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-		x_a, y := keyframe_key_center(box, lane, f_a)
-		x_b, _ := keyframe_key_center(box, lane, f_b)
+		lane_row := keyframe_clip_row_of(cl.keyframe_tracks, lane_track, lane_name)
+		x_a, y := keyframe_key_center(box, lane_row, f_a)
+		x_b, _ := keyframe_key_center(box, lane_row, f_b)
 		if x_b - x_a < KF_DRAG_THRESHOLD_PX * 2 {
 			fmt.eprintf(
 				"[ui-probe] click/drag fixture keys are %v px apart, too close to grab one\n",
@@ -2962,7 +2962,7 @@ when ODIN_DEBUG {
 		drag :: proc(x, y: f32) {
 			interaction_move(Mouse_Input{x, y, true, false, false, false, false, false}, true, 1600)
 		}
-		ref_a, ref_b := Keyframe_Ref{0, 0, lane, 0, 0}, Keyframe_Ref{0, 0, lane, 0, 1}
+		ref_a, ref_b := Keyframe_Ref{0, 0, lane_track, lane_name, 0}, Keyframe_Ref{0, 0, lane_track, lane_name, 1}
 		run := [?]Keyframe_Ref{ref_a, ref_b}
 
 		// The run under test: both keys selected, the state a brush leaves behind.
@@ -2995,7 +2995,7 @@ when ODIN_DEBUG {
 		want_a, want_b := f_a + drag_frames, f_b + drag_frames
 		drag(x_b + f32(drag_frames) * timeline_view.zoom, y)
 		interaction_release(Mouse_Input{x_b, y, false, false, false, false, false, false})
-		got := keyframe_frames_by_name(cl^, lane_name)
+		got := keyframe_frames_by_name(cl, lane_name)
 		want := [2]i32{want_a, want_b}
 		if got != want {
 			fmt.eprintf(
@@ -3016,13 +3016,19 @@ when ODIN_DEBUG {
 		// 3. The other half: a press with NO drag narrows on mouse-up, and moves
 		// nothing. This is the click that replaces the run, now decided at release.
 		box = clay.GetElementData(clay.ID("TimelineClipWrap", 0)).boundingBox
-		moved_lane, found := keyframe_lane_by_name(cl^, lane_name)
-		if !found {
+		// Still the same curve, at a NEW index: the drag rebuilt the track rows, so
+		// the index captured before it points at a row that moved. The lane's name is
+		// unchanged and its track's name is unchanged, so both are re-resolved here
+		// rather than carried across the drag.
+		lane_track = keyframe_track_index(cl^, track_name)
+		lane_row = keyframe_clip_row_of(cl.keyframe_tracks, lane_track, lane_name)
+		if _, lane_seen, found := keyframe_geom_lane_location(cl, lane_name); !found ||
+			lane_seen != lane_name {
 			fmt.eprintf("[ui-probe] the dragged lane vanished from the store\n")
 			return false
 		}
-		ref_a_moved := Keyframe_Ref{0, 0, moved_lane, 0, 0}
-		cx, cy := keyframe_key_center(box, moved_lane, want_a)
+		ref_a_moved := Keyframe_Ref{0, 0, lane_track, lane_name, 0}
+		cx, cy := keyframe_key_center(box, lane_row, want_a)
 		press(cx, cy)
 		interaction_release(Mouse_Input{cx, cy, false, false, false, false, false, false})
 		if keyframe_sel_count() != 1 || !keyframe_sel_contains(ref_a_moved) {
@@ -3032,14 +3038,14 @@ when ODIN_DEBUG {
 			)
 			ok = false
 		}
-		if got := keyframe_frames_by_name(cl^, lane_name); got != want {
+		if got := keyframe_frames_by_name(cl, lane_name); got != want {
 			fmt.eprintf("[ui-probe] the click-without-drag moved the frames to %v\n", got)
 			ok = false
 		}
 
 		// 4. A press on a key OUTSIDE the selection narrows immediately, so dragging
 		// it moves the key that was grabbed rather than the run that was selected.
-		bx, by := keyframe_key_center(box, moved_lane, want_b)
+		bx, by := keyframe_key_center(box, lane_row, want_b)
 		one := [?]Keyframe_Ref{ref_a_moved}
 		keyframe_clear()
 		keyframe_select_add(one[:])
@@ -3059,25 +3065,31 @@ when ODIN_DEBUG {
 		return ok
 	}
 
-	// keyframe_lane_by_name finds a lane by its track name, at an index that is only valid
-	// for the current build. A probe must not cache a lane INDEX across a store op:
-	// the geometry layer can mint or retire lanes while re-landing keys, which slides
-	// every index after it.
-	keyframe_lane_by_name :: proc(cl: Clip, name: string) -> (int, bool) {
-		for i in 0 ..< cl.keyframe_tracks.n {
-			if keyframe_track_name(session_trk_view(cl.keyframe_tracks,i)) == name {
-				return i, true
+	// ui_probe_lane_with_keys is the fixtures' lane search: the (track index, lane
+	// NAME) of the first lane holding at least `min_keys`. It walks lanes by name
+	// because that is what a lane is now -- and the old version's warnings about
+	// "the geometry layer renames and reorders lanes" and "do not assume index 0"
+	// were describing the positional model, not a property of these fixtures.
+	ui_probe_lane_with_keys :: proc(cl: ^Clip, min_keys: int) -> (track: int, lane: string) {
+		for track_index in 0 ..< cl.keyframe_tracks.n {
+			view := session_trk_view(cl.keyframe_tracks, track_index)
+			for position in 0 ..< keyframe_lane_count(view) {
+				if keyframe_lane_at(view, position).keys.n >= min_keys {
+					return track_index, keyframe_lane_pos(view, position)
+				}
 			}
 		}
-		return -1, false
+		return -1, ""
 	}
 
 	// keyframe_frames_by_name is the frame list of the named lane, as a fixed pair so a
-	// probe can compare it with == and get one readable failure instead of two.
-	keyframe_frames_by_name :: proc(cl: Clip, name: string) -> [2]i32 {
-		li, ok := keyframe_lane_by_name(cl, name)
+	// probe can compare it with == and get one readable failure instead of two. The
+	// name resolves through the shipped mapping, so a section lane ("crop.l") and a
+	// plain property ("scale") both address the track that holds them.
+	keyframe_frames_by_name :: proc(cl: ^Clip, name: string) -> [2]i32 {
+		track_index, lane, ok := keyframe_geom_lane_location(cl, name)
 		assert(ok, "keyframe_frames_by_name: the probe's lane vanished from the store")
-		keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, li), 0)
+		keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, track_index), lane)
 		assert(keys.n == 2, "keyframe_frames_by_name wants exactly the 2 keys its fixture selected")
 		return [2]i32{session_kf_at(keys, 0).frame_off, session_kf_at(keys, 1).frame_off}
 	}

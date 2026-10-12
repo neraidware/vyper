@@ -118,7 +118,7 @@ when ODIN_DEBUG {
 		// lane's array is released: a section track owns one per lane, and freeing
 		// only lane 0 would leak the rest.
 		for lane in 0 ..< keyframe_lane_count(tr) {
-			keys := keyframe_lane_view(tr, lane)
+			keys := keyframe_lane_at(tr, lane).keys
 			if keys.slots > 0 && !keys.shared {
 				session_kf_release(keys)
 			}
@@ -350,9 +350,14 @@ when ODIN_DEBUG {
 			for ti := cl.keyframe_tracks.n - 1; ti >= 0; ti -= 1 {
 				tr := session_trk_view_mut(&cl.keyframe_tracks, ti)
 				// name is a pool handle: nothing to free here.
-				if keyframe_lane_view(tr, 0).slots > 0 && !keyframe_lane_view(tr, 0).shared {
-					session_kf_release(keyframe_lane_view(tr, 0))
+				for lane in 0 ..< keyframe_lane_count(tr) {
+					keys := keyframe_lane_at(tr, lane).keys
+					if keys.slots > 0 && !keys.shared {
+						session_kf_release(keys)
+					}
 				}
+				session_lane_release(tr.lanes)
+				tr.lanes = {}
 				session_trk_erase(&cl.keyframe_tracks, ti)
 			}
 			geom_key_check(cl.keyframe_tracks.n == 0, "fixture: the un-keyed case must start with no tracks")
@@ -436,9 +441,9 @@ when ODIN_DEBUG {
 			)
 			// A no-op commit must not stamp a key: the field was seeded from the
 			// sampled value, so re-committing it unchanged changes nothing visible.
-			// "crop" is the section track; crop.l is its lane 0.
+			// "crop" is the section track; crop.l is the lane being edited.
 			ti := keyframe_track_index(cl^, "crop")
-			keys_before := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n
+			keys_before := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), "crop.l").n
 			edit_begin(.Crop_L, clip_geom_get(cl, .Crop_L))
 			edit_select_all()
 			edit_remove_selection()
@@ -447,10 +452,10 @@ when ODIN_DEBUG {
 			}
 			edit_commit()
 			geom_key_check(
-				keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n == keys_before,
+				keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), "crop.l").n == keys_before,
 				"committing the value already on screen must not add a key (%d -> %d)",
 				keys_before,
-				keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n,
+				keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), "crop.l").n,
 			)
 			_ = keys_before
 		}
@@ -556,11 +561,9 @@ when ODIN_DEBUG {
 			if crop_ti >= 0 {
 				off_new := i32(playhead.frame - cl.timeline_start_frame)
 				found := false
-				for lane_index in 0 ..< 4 {
-					keys := keyframe_lane_view(
-						session_trk_view(cl.keyframe_tracks, crop_ti),
-						lane_index,
-					)
+				crop_row := session_trk_view(cl.keyframe_tracks, crop_ti)
+				for lane_index in 0 ..< keyframe_lane_count(crop_row) {
+					keys := keyframe_lane_at(crop_row, lane_index).keys
 					kv := session_kf_view(keys)
 					has_key_here := false
 					for i in 0 ..< keys.n {
@@ -620,11 +623,11 @@ when ODIN_DEBUG {
 			// 40 frames past the end of a 300-frame clip.
 			playhead.frame = 340
 			clip_geom_set(cl, .Crop_L, 0.4)
-			// "crop" is the section track; crop.l is its lane 0.
+			// "crop" is the section track; crop.l is the lane being edited.
 			ti := keyframe_track_index(cl^, "crop")
 			geom_key_check(ti >= 0, "fixture: the guard case still has a crop track")
 			if ti >= 0 {
-				keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0)
+				keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), "crop.l")
 				geom_key_check(
 					keys.n == 2,
 					"an off-clip edit must not mint a key (2 fixture keys expected, got %d)",
@@ -815,7 +818,7 @@ when ODIN_DEBUG {
 				keyframe_track_index(cl^, "crop.l") < 0,
 				"no separate per-lane track may exist",
 			)
-			lane_l := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), 0)
+			lane_l := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), "crop.l")
 			geom_key_check(lane_l.n == 1, "the first edge holds its own key (got %d)", lane_l.n)
 			// A different edge is panned, so it is pending.
 			clip_geom_mark_modified(cl, .Crop_T)
@@ -825,26 +828,38 @@ when ODIN_DEBUG {
 				keyframe_track_index(cl^, "crop") >= 0,
 				"keying a sibling lane must keep the one section track",
 			)
-			// The lane list stays DENSE: a lane's index is its position in the
-			// section, so keying crop.t (lane 2) after crop.l (lane 0) must leave an
-			// empty lane 1 behind rather than compacting -- otherwise crop.t's key
-			// would land on crop.r's index.
+			// The section holds EXACTLY the two curves that were keyed: crop.l and
+			// crop.t, and nothing for crop.r or crop.b.
+			//
+			// This is the assertion that used to be the opposite. A lane's identity
+			// was its position in the section, so keying crop.t after crop.l had to
+			// leave an empty lane behind to keep crop.t at index 2 -- three lanes for
+			// two curves, and a probe to pin the gap. Lanes are named now, so the
+			// store holds two, and the phantom lane that represented crop.r is not
+			// something it can even express.
 			crop_track_row := session_trk_view(cl.keyframe_tracks, crop_track)
 			crop_lane_count := keyframe_lane_count(crop_track_row)
 			geom_key_check(
-				crop_lane_count == 3,
-				"the sibling key must grow the lane list densely (got %d)",
+				crop_lane_count == 2,
+				"two keyed edges must mean two lanes, with no phantom for the edges between (got %d)",
 				crop_lane_count,
 			)
 			geom_key_check(
-				keyframe_lane_view(crop_track_row, 1).n == 0 &&
-					keyframe_lane_view(crop_track_row, 2).n == 1,
-				"the gap lane stays empty and the keyed lane holds its key (%d/%d)",
-				keyframe_lane_view(crop_track_row, 1).n,
-				keyframe_lane_view(crop_track_row, 2).n,
+				keyframe_lane_pos(crop_track_row, 0) == "crop.l" &&
+					keyframe_lane_pos(crop_track_row, 1) == "crop.t",
+				"the lanes read in section order regardless of which was keyed first (%q/%q)",
+				keyframe_lane_pos(crop_track_row, 0),
+				keyframe_lane_pos(crop_track_row, 1),
+			)
+			geom_key_check(
+				keyframe_lane_view(crop_track_row, "crop.r").n == 0 &&
+					keyframe_lane_view(crop_track_row, "crop.b").n == 0,
+				"an edge that was never keyed must not exist as a lane (%d/%d)",
+				keyframe_lane_view(crop_track_row, "crop.r").n,
+				keyframe_lane_view(crop_track_row, "crop.b").n,
 			)
 			// The first edge's curve is untouched by the sibling's key.
-			lane_l_after := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), 0)
+			lane_l_after := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), "crop.l")
 			geom_key_check(
 				lane_l_after.n == lane_l.n &&
 				session_kf_at(lane_l_after, 0).value == session_kf_at(lane_l, 0).value,

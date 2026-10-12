@@ -84,12 +84,16 @@ when ODIN_DEBUG {
 		return true
 	}
 
-	kp_set_interp :: proc(clip: ^Clip, ti, ki: int, interp: Keyframe_Interp) {
-		keyframe_key_mut(clip, ti, 0, ki).interp = interp
+	// The lane is named, not numbered: these fixtures cover both a plain property
+	// ("gain", whose lane is named after the track) and a section lane
+	// ("transform.x"), and "key index 1 on whichever lane" is the only thing they
+	// share.
+	kp_set_interp :: proc(clip: ^Clip, ti: int, lane: string, ki: int, interp: Keyframe_Interp) {
+		keyframe_key_mut(clip, ti, lane, ki).interp = interp
 	}
 
-	kp_set_value :: proc(clip: ^Clip, ti, ki: int, value: f32) {
-		keyframe_key_mut(clip, ti, 0, ki).value = value
+	kp_set_value :: proc(clip: ^Clip, ti: int, lane: string, ki: int, value: f32) {
+		keyframe_key_mut(clip, ti, lane, ki).value = value
 	}
 
 	// crop_edge_props is the crop section's lane order, spelled out so a probe can
@@ -108,7 +112,7 @@ when ODIN_DEBUG {
 		keyframe_probe_check(ti >= 0, "track 'gain' must exist after 3 inserts")
 		keyframe_probe_check(c.keyframe_tracks.n == 1, "one property => one track, got %d", c.keyframe_tracks.n)
 		if ti >= 0 {
-			keys := keyframe_lane_view(session_trk_view(c.keyframe_tracks, ti), 0)
+			keys := keyframe_own_lane_keys(session_trk_view(c.keyframe_tracks, ti))
 			vk := session_kf_view(keys); v := vk
 			keyframe_probe_check(keys.n == 3, "3 distinct frames => 3 keys, got %d", keys.n)
 			keyframe_probe_check(
@@ -133,7 +137,7 @@ when ODIN_DEBUG {
 			d := Clip {}
 			keyframe_set_key(&d, "gain", 10, 5.0)
 			dv := session_kf_view(
-				keyframe_lane_view(session_trk_view(d.keyframe_tracks, 0), 0),
+				keyframe_own_lane_keys(session_trk_view(d.keyframe_tracks, 0)),
 			)
 			keyframe_probe_check(
 				len(dv) == 1 && dv[0].interp == .Linear,
@@ -342,14 +346,14 @@ when ODIN_DEBUG {
 		keyframe_trim_head(&sp_right, 40)
 		left_ok := false
 		if sp.keyframe_tracks.n == 1 {
-			lk := keyframe_lane_view(session_trk_view(sp.keyframe_tracks, 0), 0)
+			lk := keyframe_own_lane_keys(session_trk_view(sp.keyframe_tracks, 0))
 			lv := session_kf_view(lk)
 			left_ok = lk.n == 1 && lv[0] == Keyframe {frame_off = 10, value = 1.0}
 		}
 		keyframe_probe_check(left_ok, "left keeps only keys < cut, values preserved")
 		right_ok := false
 		if sp_right.keyframe_tracks.n == 1 {
-			rk := keyframe_lane_view(session_trk_view(sp_right.keyframe_tracks,0), 0)
+			rk := keyframe_own_lane_keys(session_trk_view(sp_right.keyframe_tracks,0))
 			rv := session_kf_view(rk)
 			right_ok = rk.n == 3 &&
 			rv[0] == Keyframe {frame_off = 0, value = 2.0} &&
@@ -372,7 +376,7 @@ when ODIN_DEBUG {
 		keyframe_trim_head(&tr, 40)
 		trim_ok := false
 		if tr.keyframe_tracks.n == 1 {
-			tk := keyframe_lane_view(session_trk_view(tr.keyframe_tracks,0), 0)
+			tk := keyframe_own_lane_keys(session_trk_view(tr.keyframe_tracks,0))
 			tv := session_kf_view(tk)
 			trim_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 0, value = 2.0} && tv[1] == Keyframe {frame_off = 5, value = 3.0}
 		}
@@ -384,7 +388,7 @@ when ODIN_DEBUG {
 		keyframe_trim_tail(&tr2, 42)
 		trim2_ok := false
 		if tr2.keyframe_tracks.n == 1 {
-			tk := keyframe_lane_view(session_trk_view(tr2.keyframe_tracks,0), 0)
+			tk := keyframe_own_lane_keys(session_trk_view(tr2.keyframe_tracks,0))
 			tv := session_kf_view(tk)
 			trim2_ok = tk.n == 2 && tv[0] == Keyframe {frame_off = 5, value = 1.0} && tv[1] == Keyframe {frame_off = 40, value = 2.0}
 		}
@@ -395,12 +399,12 @@ when ODIN_DEBUG {
 		tmt := Clip {}
 		keyframe_set_key(&tmt, "gain", 5, 1.0)
 		keyframe_set_key(&tmt, "gain", 40, 2.0)
-		kp_set_interp(&tmt, 0, 1, .Ease_In_Out)
+		kp_set_interp(&tmt, 0, "gain", 1, .Ease_In_Out)
 		keyframe_trim_head(&tmt, 20)
 		trim_mode_ok :=
 			tmt.keyframe_tracks.n == 1 &&
-			keyframe_lane_view(session_trk_view(tmt.keyframe_tracks,0), 0).n == 1 &&
-			session_kf_view(keyframe_lane_view(session_trk_view(tmt.keyframe_tracks,0), 0))[0] == Keyframe {frame_off = 20, value = 2.0, interp = .Ease_In_Out}
+			keyframe_own_lane_keys(session_trk_view(tmt.keyframe_tracks,0)).n == 1 &&
+			session_kf_view(keyframe_own_lane_keys(session_trk_view(tmt.keyframe_tracks,0)))[0] == Keyframe {frame_off = 20, value = 2.0, interp = .Ease_In_Out}
 		keyframe_probe_check(trim_mode_ok, "trim rebuild preserves the key's interpolation mode")
 
 		// --- flat-copy evaluator (the audio producer's sampler) mirrors keyframe_sample --
@@ -417,7 +421,7 @@ when ODIN_DEBUG {
 			fc_same = true
 			for off := i32(0); off <= 40; off += 1 {
 				tv, tok := keyframe_sample(tk, off, 4.0)
-				fv, fok := keyframe_sample_keys(session_kf_view(keyframe_lane_view(tk, 0)), off, 4.0)
+				fv, fok := keyframe_sample_keys(session_kf_view(keyframe_own_lane_keys(tk)), off, 4.0)
 				if tv != fv || tok != fok {
 					fc_same = false
 					break
@@ -429,10 +433,10 @@ when ODIN_DEBUG {
 			// key (225) the track holds that key's 2. The audio producer samples
 			// gain through this same proc, so a keyed fade that ends now sustains
 			// its final dB for the rest of the segment.
-			f10, _ := keyframe_sample_keys(session_kf_view(keyframe_lane_view(tk, 0)), i32(210 - 200), 4.0)
-			f11, _ := keyframe_sample_keys(session_kf_view(keyframe_lane_view(tk, 0)), i32(211 - 200), 4.0)
-			f19, _ := keyframe_sample_keys(session_kf_view(keyframe_lane_view(tk, 0)), i32(219 - 200), 4.0)
-			f25, fok := keyframe_sample_keys(session_kf_view(keyframe_lane_view(tk, 0)), i32(225 - 200), 4.0)
+			f10, _ := keyframe_sample_keys(session_kf_view(keyframe_own_lane_keys(tk)), i32(210 - 200), 4.0)
+			f11, _ := keyframe_sample_keys(session_kf_view(keyframe_own_lane_keys(tk)), i32(211 - 200), 4.0)
+			f19, _ := keyframe_sample_keys(session_kf_view(keyframe_own_lane_keys(tk)), i32(219 - 200), 4.0)
+			f25, fok := keyframe_sample_keys(session_kf_view(keyframe_own_lane_keys(tk)), i32(225 - 200), 4.0)
 			keyframe_probe_check(
 				f10 == 8.0 && keyframe_approx(f11, 7.4) && keyframe_approx(f19, 2.6) && fok && f25 == 2.0,
 				"flat sampler is clip-relative on timeline addresses (210->%v 211->%v 219->%v 225->%v ok=%v)",
@@ -471,7 +475,7 @@ when ODIN_DEBUG {
 		cubic_ok := true
 		if sti := keyframe_track_index(twok, "gain"); sti >= 0 {
 			sk2 := session_trk_view(twok.keyframe_tracks,sti)
-			kp_set_interp(&twok, sti, 1, .Cubic)
+			kp_set_interp(&twok, sti, "gain", 1, .Cubic)
 			for off in i32(0) ..= 10 {
 				vc, _ := keyframe_sample(sk2, off, 0.0)
 				if !keyframe_approx(vc, f32(off) * 10.0) {
@@ -490,21 +494,21 @@ when ODIN_DEBUG {
 		keyframe_set_key(&sc, "gain", 10, 100.0)
 		if sti := keyframe_track_index(sc, "gain"); sti >= 0 {
 			sk := session_trk_view(sc.keyframe_tracks,sti)
-			kp_set_interp(&sc, sti, 1, .Ease_In)
+			kp_set_interp(&sc, sti, "gain", 1, .Ease_In)
 			ki0, _ := keyframe_sample(sk, 0, 0.0)
 			kim, _ := keyframe_sample(sk, 5, 0.0)
 			ki1, _ := keyframe_sample(sk, 10, 0.0)
-			kp_set_interp(&sc, sti, 1, .Ease_Out)
+			kp_set_interp(&sc, sti, "gain", 1, .Ease_Out)
 			kom, _ := keyframe_sample(sk, 5, 0.0)
-			kp_set_interp(&sc, sti, 1, .Ease_In_Out)
+			kp_set_interp(&sc, sti, "gain", 1, .Ease_In_Out)
 			kio_m, _ := keyframe_sample(sk, 5, 0.0)
-			kp_set_interp(&sc, sti, 1, .Elastic)
+			kp_set_interp(&sc, sti, "gain", 1, .Elastic)
 			kel_m, _ := keyframe_sample(sk, 5, 0.0)
 			// Ownership pin: setting the FIRST (departing) key's mode must not
 			// reshape the segment — nothing arrives at the first key, its mode is
 			// inert. Rearm the arriving key to Linear and bounce the first one.
-			kp_set_interp(&sc, sti, 1, .Linear)
-			kp_set_interp(&sc, sti, 0, .Elastic)
+			kp_set_interp(&sc, sti, "gain", 1, .Linear)
+			kp_set_interp(&sc, sti, "gain", 0, .Elastic)
 			first_key, _ := keyframe_sample(sk, 5, 0.0)
 			keyframe_probe_check(
 				ki0 == 0.0 && keyframe_approx(kim, 12.5) && ki1 == 100.0 &&
@@ -525,9 +529,9 @@ when ODIN_DEBUG {
 		keyframe_set_key(&spc, "gain", 30, 350.0)
 		if sti := keyframe_track_index(spc, "gain"); sti >= 0 {
 			spk := session_trk_view(spc.keyframe_tracks, sti)
-			kp_set_interp(&spc, sti, 0, .Cubic)
-			kp_set_interp(&spc, sti, 1, .Cubic)
-			kp_set_interp(&spc, sti, 2, .Cubic)
+			kp_set_interp(&spc, sti, "gain", 0, .Cubic)
+			kp_set_interp(&spc, sti, "gain", 1, .Cubic)
+			kp_set_interp(&spc, sti, "gain", 2, .Cubic)
 			// segment 10->20: tangents (250-0)/20 == (350-100)/20 == 12.5 each =>
 			// Hermite midpoint == (100+250)/2 == 175.
 			sm_mid, _ := keyframe_sample(spk, 15, 0.0)
@@ -552,13 +556,13 @@ when ODIN_DEBUG {
 		keyframe_geom_set_group_value(&peck, "transform", 0, group_low)
 		keyframe_geom_set_group_value(&peck, "transform", 10, group_high)
 		peck_track := keyframe_track_index(peck, "transform")
-		kp_set_interp(&peck, peck_track, 1, .Ease_Out)
+		kp_set_interp(&peck, peck_track, "transform.x", 1, .Ease_Out)
 		pv_m, pok := keyframe_geom_sample_lane(&peck, "transform.x", 5, 0.0)
 		pek := Clip {}
 		keyframe_geom_set_lane_key(&pek, "transform.x", 0, 0.0)
 		keyframe_geom_set_lane_key(&pek, "transform.x", 10, 100.0)
 		peks_ti := keyframe_track_index(pek, "transform")
-		kp_set_interp(&pek, peks_ti, 1, .Ease_Out)
+		kp_set_interp(&pek, peks_ti, "transform.x", 1, .Ease_Out)
 		sv_m, _ := keyframe_geom_sample_lane(&pek, "transform.x", 5, 0.0)
 		keyframe_probe_check(
 			pok && keyframe_approx(pv_m, 87.5) && pv_m == sv_m,
@@ -576,7 +580,7 @@ when ODIN_DEBUG {
 		}
 		seck_ti := keyframe_track_index(pecs, "transform")
 		for i in 0 ..= 2 {
-			kp_set_interp(&pecs, seck_ti, i, .Cubic)
+			kp_set_interp(&pecs, seck_ti, "transform.x", i, .Cubic)
 		}
 		sc2 := Clip {}
 		for i in 0 ..< 4 {
@@ -584,7 +588,7 @@ when ODIN_DEBUG {
 		}
 		sc2_ti := keyframe_track_index(sc2, "transform")
 		for i in 0 ..= 2 {
-			kp_set_interp(&sc2, sc2_ti, i, .Cubic)
+			kp_set_interp(&sc2, sc2_ti, "transform.x", i, .Cubic)
 		}
 		spline_parity := true
 		for off := i32(0); off <= 30; off += 1 {
@@ -612,14 +616,14 @@ when ODIN_DEBUG {
 		keyframe_probe_check(keyframe_track_index(cl^, "gain") >= 0, "clone carried the gain track")
 		keyframe_probe_check(keyframe_track_index(cl^, "scale") >= 0, "clone carried the scale track")
 		if cgt := keyframe_track_index(cl^, "gain"); cgt >= 0 {
-			cl_gain := session_kf_view(keyframe_lane_view(session_trk_view(cl.keyframe_tracks,cgt), 0))[0].value
+			cl_gain := session_kf_view(keyframe_own_lane_keys(session_trk_view(cl.keyframe_tracks,cgt)))[0].value
 			keyframe_probe_check(cl_gain == 1.5, "clone carried the base key's value (got %v)", cl_gain)
 		}
 		// Poke the clone: delete its key at 20, smash its scale key value.
 		keyframe_del_key(cl, "gain", 20)
 		bsi := keyframe_track_index(cl^, "scale")
 		if bsi >= 0 {
-			kp_set_value(cl, bsi, 0, -1.0)
+			kp_set_value(cl, bsi, "scale", 0, -1.0)
 		}
 		// The original must not feel either poke, and vice versa: give the
 		// ORIGINAL a new key at 30 and the clone must not see it.
@@ -627,7 +631,7 @@ when ODIN_DEBUG {
 		base_ti := keyframe_track_index(base, "gain")
 		orig_ok := false
 		if base_ti >= 0 {
-			keys := keyframe_lane_view(session_trk_view(base.keyframe_tracks,base_ti), 0)
+			keys := keyframe_own_lane_keys(session_trk_view(base.keyframe_tracks,base_ti))
 			has20 := false
 			has30 := false
 			vk := session_kf_view(keys); v := vk
@@ -645,7 +649,7 @@ when ODIN_DEBUG {
 		keyframe_probe_check(orig_ok, "original keeps its key 20 AND gains key 30 (clone's delete is invisible)")
 		clone_ok := false
 		if clone_ti := keyframe_track_index(cl^, "gain"); clone_ti >= 0 {
-			keys := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,clone_ti), 0)
+			keys := keyframe_own_lane_keys(session_trk_view(cl.keyframe_tracks,clone_ti))
 			no30 := true
 			vk := session_kf_view(keys)
 			for i in 0 ..< keys.n {
@@ -755,7 +759,7 @@ when ODIN_DEBUG {
 			"group key: no separate lane track exists",
 		)
 		if cti >= 0 {
-			ck := keyframe_lane_view(session_trk_view(crop.keyframe_tracks, cti), 0)
+			ck := keyframe_lane_view(session_trk_view(crop.keyframe_tracks, cti), "crop.l")
 			keyframe_probe_check(ck.n == 2, "group key: same-frame replace keeps 2 keys, got %d", ck.n)
 			if ck.n == 2 {
 				keyframe_probe_check(
@@ -1004,11 +1008,11 @@ when ODIN_DEBUG {
 		pc := Clip {}
 		keyframe_geom_set_group_value(&pc, "crop", 5, crop_first)
 		keyframe_geom_set_group_value(&pc, "crop", 40, crop_second)
-		keyframe_del_key(&pc, "crop", 5)
+		keyframe_geom_del_lane_key(&pc, "crop.l", 5)
 		pk := keyframe_track_index(pc, "crop")
 		del_ok := false
 		if pk >= 0 {
-			keys := keyframe_lane_view(session_trk_view(pc.keyframe_tracks, pk), 0)
+			keys := keyframe_lane_view(session_trk_view(pc.keyframe_tracks, pk), "crop.l")
 			del_ok = keys.n == 1 && session_kf_at(keys, 0).frame_off == 40
 		}
 		keyframe_probe_check(del_ok, "del on a section drops only the frame, the lane survives")
@@ -1030,7 +1034,7 @@ when ODIN_DEBUG {
 		keyframe_trim_head(&th, 40)
 		th_ok := false
 		if ti := keyframe_track_index(th, "crop"); ti >= 0 {
-			keys := keyframe_lane_view(session_trk_view(th.keyframe_tracks, ti), 0)
+			keys := keyframe_lane_view(session_trk_view(th.keyframe_tracks, ti), "crop.l")
 			th_ok = keys.n == 1 && session_kf_at(keys, 0).frame_off == 0
 			if th_ok {
 				th_value, _ := keyframe_geom_sample_lane(&th, "crop.l", 0, 0.0)
@@ -1049,12 +1053,12 @@ when ODIN_DEBUG {
 		keyframe_trim_head(&sp2r, 30)
 		sp_ok := false
 		if lti := keyframe_track_index(sp2, "crop"); lti >= 0 {
-			lk := keyframe_lane_view(session_trk_view(sp2.keyframe_tracks, lti), 0)
+			lk := keyframe_lane_view(session_trk_view(sp2.keyframe_tracks, lti), "crop.l")
 			sp_ok = lk.n == 1 && session_kf_at(lk, 0).frame_off == 10
 		}
 		if sp_ok {
 			if rti := keyframe_track_index(sp2r, "crop"); rti >= 0 {
-				rk := keyframe_lane_view(session_trk_view(sp2r.keyframe_tracks, rti), 0)
+				rk := keyframe_lane_view(session_trk_view(sp2r.keyframe_tracks, rti), "crop.l")
 				sp_ok =
 					rk.n == 2 &&
 					session_kf_at(rk, 0).frame_off == 0 &&
@@ -1077,7 +1081,7 @@ when ODIN_DEBUG {
 		cpcl := &cp_cloned.tracks[0].clips[0]
 		cp_ok := false
 		if ti := keyframe_track_index(cpcl^, "crop"); ti >= 0 {
-			keys := keyframe_lane_view(session_trk_view(cpcl.keyframe_tracks, ti), 0)
+			keys := keyframe_lane_view(session_trk_view(cpcl.keyframe_tracks, ti), "crop.l")
 			cp_ok = keys.n == 1
 			if cp_ok {
 				cp_crop_value, _ := keyframe_geom_sample_lane(cpcl, "crop.l", 10, 0.0)
@@ -1102,17 +1106,17 @@ when ODIN_DEBUG {
 		ak := Clip {timeline_start_frame = 10, source_length_frames = 40}
 		keyframe_set_key(&ak, "gain", 5, 1.0)
 		keyframe_set_key(&ak, "gain", 30, 2.0)
-		kp_set_interp(&ak, 0, 1, .Ease_In_Out)
+		kp_set_interp(&ak, 0, "gain", 1, .Ease_In_Out)
 		ak_ti := &session_trk_view(ak.keyframe_tracks,0)^
 
 		// Playhead INSIDE the clip, mid-segment, no key on the frame: insert.
 		// (playhead 20 -> clip-relative off 10, between the keys at 5 and 30.)
 		playhead.frame = 20
-		got_track_before := keyframe_lane_view(session_trk_view(ak.keyframe_tracks,0), 0).n
+		got_track_before := keyframe_own_lane_keys(session_trk_view(ak.keyframe_tracks,0)).n
 		created := keyframe_auto_key(&ak, "gain", 3.0)
-		ak_ok := created && keyframe_lane_view(ak_ti, 0).n == got_track_before + 1
+		ak_ok := created && keyframe_own_lane_keys(ak_ti).n == got_track_before + 1
 		if ak_ok {
-			akv, _ := keyframe_sample_lane(ak_ti, 0, 10, 0.0)
+			akv, _ := keyframe_sample_lane(ak_ti, "gain", 10, 0.0)
 			ak_ok = akv == 3.0
 		}
 		keyframe_probe_check(ak_ok, "auto-key inserts a new key at the playhead mid-segment")
@@ -1121,13 +1125,13 @@ when ODIN_DEBUG {
 		// unchanged, and the key keeps its interpolation mode. The original key
 		// sits at clip-relative off 30 (timeline frame 40).
 		playhead.frame = 40
-		ak_lane := keyframe_lane_view(ak_ti, 0)
+		ak_lane := keyframe_own_lane_keys(ak_ti)
 		akv_view := session_kf_view(ak_lane)
 		mode_before := akv_view[2].interp
 		updated := keyframe_auto_key(&ak, "gain", 9.0)
-		ak_ok = updated && keyframe_lane_view(ak_ti, 0).n == got_track_before + 1
+		ak_ok = updated && keyframe_own_lane_keys(ak_ti).n == got_track_before + 1
 		if ak_ok {
-			akv, _ := keyframe_sample_lane(ak_ti, 0, 30, 0.0)
+			akv, _ := keyframe_sample_lane(ak_ti, "gain", 30, 0.0)
 			ak_ok = akv == 9.0 && akv_view[2].interp == mode_before
 		}
 		keyframe_probe_check(ak_ok, "auto-key on an existing key updates it in place, preserving its mode")
@@ -1496,8 +1500,13 @@ when ODIN_DEBUG {
 			left_track := keyframe_track_index(left, "transform")
 			right_track := keyframe_track_index(right, "transform")
 			if left_track >= 0 && right_track >= 0 {
-				left_keys := keyframe_lane_view(session_trk_view(left.keyframe_tracks, left_track), 0)
-				right_keys := keyframe_lane_view(session_trk_view(right.keyframe_tracks, right_track), 0)
+				// The straddling curve is transform.x, on the "transform" section
+				// track -- its lane is named, so the halves are read by that name
+				// rather than by whatever position it landed in.
+				left_view := session_trk_view(left.keyframe_tracks, left_track)
+				right_view := session_trk_view(right.keyframe_tracks, right_track)
+				left_keys := keyframe_lane_view(left_view, "transform.x")
+				right_keys := keyframe_lane_view(right_view, "transform.x")
 				keyframe_probe_check(
 					left_keys.n >= 1 && right_keys.n >= 1,
 					"each half must keep a key on the straddling lane (got %d/%d)",

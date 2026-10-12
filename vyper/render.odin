@@ -584,7 +584,7 @@ render_geom_name :: proc(p: Render_Geom_Prop) -> string {
 // Keyframe_Geom_Section groups the geometry lanes that animate as one multi-lane
 // property: a section's keys live on the SECTION's own track ("crop",
 // "transform"), one scalar lane per grouped property, and a lane name resolves
-// to (track, lane index) through keyframe_geom_section_for_lane.
+// to a (track, lane) pair through keyframe_geom_lane_of_track.
 //
 // The lanes are the ACTUAL geometry property variables (Render_Geom_Prop), not
 // string literals: the property variable IS the lane's identity and its track
@@ -645,19 +645,60 @@ keyframe_geom_section_index :: proc(name: string) -> (index: int, ok: bool) {
 	return 0, false
 }
 
-// keyframe_geom_section_for_lane maps a consumer's property name to the section that
-// groups it and the lane it occupies in that section, or ok=false for a plain
-// keyed property (gain, scale, opacity) that is its own single-lane track.
-keyframe_geom_section_for_lane :: proc(name: string) -> (sec_index, lane_index: int, ok: bool) {
+// keyframe_geom_lane_of_section is the one place that answers "is this a lane of
+// this section, and which": the named counterpart of indexing
+// keyframe_geom_sections[si].lanes[i]. Callers that had a position and wanted a
+// property went through here; callers that had a name and wanted a position used
+// to as well, which is why it returns ._COUNT rather than an index -- there is no
+// position any more.
+keyframe_geom_lane_of_section :: proc(section: string, lane_name: string) -> Render_Geom_Prop {
+	section_index, ok := keyframe_geom_section_index(section)
+	if !ok {
+		return ._COUNT
+	}
+	defs := keyframe_geom_sections
+	for prop in defs[section_index].lanes {
+		if keyframe_lane_name(prop) == lane_name {
+			return prop
+		}
+	}
+	return ._COUNT
+}
+
+// keyframe_geom_lane_order is where a lane name sits in its section's order, or
+// the section's own length when the name is not one of its lanes. The store uses
+// it to insert a new curve in its section's place, so crop's edges read
+// left/right/top/bottom no matter which one the user keyed first or what order
+// the file listed them in.
+keyframe_geom_lane_order :: proc(section: string, lane_name: string) -> int {
+	section_index, ok := keyframe_geom_section_index(section)
+	if !ok {
+		return 0
+	}
+	defs := keyframe_geom_sections
+	for position in 0 ..< len(defs[section_index].lanes) {
+		if keyframe_lane_name(defs[section_index].lanes[position]) == lane_name {
+			return position
+		}
+	}
+	return len(defs[section_index].lanes)
+}
+
+// keyframe_geom_section_for_lane maps a consumer's property name to the section
+// that groups it, or ok=false for a plain keyed property (gain, scale, opacity)
+// that is its own track. It answers "which SECTION", and nothing else: the lane's
+// position in that section is not an identity any more, so the position it used to
+// return has no caller left to justify it.
+keyframe_geom_section_for_lane :: proc(name: string) -> (sec_index: int, ok: bool) {
 	defs := keyframe_geom_sections
 	for section_index in 0 ..< len(defs) {
 		for lane_index in 0 ..< len(defs[section_index].lanes) {
 			if keyframe_lane_name(defs[section_index].lanes[lane_index]) == name {
-				return section_index, lane_index, true
+				return section_index, true
 			}
 		}
 	}
-	return 0, 0, false
+	return 0, false
 }
 
 // keyframe_geom_any_lane_tracked reports whether the section's track exists and holds
@@ -668,8 +709,8 @@ keyframe_geom_any_lane_tracked :: proc(clip: ^Clip, def: Keyframe_Geom_Section) 
 		return false
 	}
 	track := session_trk_view(clip.keyframe_tracks, section_index)
-	for lane_index in 0 ..< keyframe_lane_count(track) {
-		if keyframe_lane_view(track, lane_index).n > 0 {
+	for lane in 0 ..< keyframe_lane_count(track) {
+		if keyframe_lane_at(track, lane).keys.n > 0 {
 			return true
 		}
 	}
@@ -693,35 +734,47 @@ keyframe_geom_lane_count :: proc(sec: string) -> int {
 // single-lane track. There is no migration step: a lane key and a whole-group
 // key write into the same place, so neither has to convert the other.
 keyframe_geom_set_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32, value: f32) {
-	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
-		defs := keyframe_geom_sections
-		keyframe_set_lane_key(clip, defs[sec_index].name, lane_index, frame_off, value)
-		return
+	track_name, lane_name := keyframe_geom_lane_of_track(name)
+	keyframe_set_lane_key(clip, track_name, lane_name, frame_off, value)
+}
+
+// keyframe_geom_lane_of_track is "where does this name address a curve", and it
+// has three answers because callers say three different things:
+//
+//   - a LANE name ("transform.x") is that curve, on its section's track;
+//   - a SECTION name ("transform") is the group, and the inspector edits the
+//     section's FIRST lane -- which used to be written "lane 0" and is named here
+//     so the code does not pretend a position is an identity;
+//   - a plain property ("gain") is its own track and its own lane.
+//
+// One function because every set, delete, sample and locate below used to carry
+// the same branch, and a lane that is named needs no index to hand on.
+keyframe_geom_lane_of_track :: proc(name: string) -> (track, lane: string) {
+	defs := keyframe_geom_sections
+	if section_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+		return defs[section_index].name, name
 	}
-	keyframe_set_key(clip, name, frame_off, value)
+	if section_index, is_section := keyframe_geom_section_index(name); is_section {
+		return name, keyframe_lane_name(defs[section_index].lanes[0])
+	}
+	return name, name
 }
 
 // keyframe_geom_lane_location resolves a consumer property name to the (track
-// index, lane index) its curve lives at, or found=false when the clip has no
-// such curve yet. Every read and write of a keyed geometry property goes through
-// this or one of the set/sample wrappers, so "which lane is transform.y" is
-// answered in exactly one place.
-keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track, lane: int, found: bool) {
-	track_name := name
-	lane_index := 0
-	if sec_index, lane_of_section, is_lane := keyframe_geom_section_for_lane(name); is_lane {
-		defs := keyframe_geom_sections
-		track_name = defs[sec_index].name
-		lane_index = lane_of_section
-	}
+// index, lane NAME) its curve lives at, or found=false when the clip has no such
+// curve yet. Every read and write of a keyed geometry property goes through this
+// or one of the set/sample wrappers, so "where is transform.y" is answered in
+// exactly one place.
+keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track: int, lane: string, found: bool) {
+	track_name, lane_name := keyframe_geom_lane_of_track(name)
 	track_index := keyframe_track_index(clip^, track_name)
 	if track_index < 0 {
-		return -1, -1, false
+		return -1, "", false
 	}
-	if lane_index >= keyframe_lane_count(session_trk_view(clip.keyframe_tracks, track_index)) {
-		return -1, -1, false
+	if keyframe_track_lane_index(session_trk_view(clip.keyframe_tracks, track_index), lane_name) < 0 {
+		return -1, "", false
 	}
-	return track_index, lane_index, true
+	return track_index, lane_name, true
 }
 
 // keyframe_geom_del_lane_key is the delete twin of keyframe_geom_set_lane_key: it
@@ -730,12 +783,8 @@ keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track, lane: 
 // its own track. The geometry layer owns that mapping, so the store keeps
 // accepting track names only.
 keyframe_geom_del_lane_key :: proc(clip: ^Clip, name: string, frame_off: i32) {
-	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
-		defs := keyframe_geom_sections
-		keyframe_del_lane_key(clip, defs[sec_index].name, i32(lane_index), frame_off)
-		return
-	}
-	keyframe_del_key(clip, name, frame_off)
+	track_name, lane_name := keyframe_geom_lane_of_track(name)
+	keyframe_del_lane_key(clip, track_name, lane_name, frame_off)
 }
 
 // keyframe_geom_set_group_value records a WHOLE-GROUP key: every lane of section `sec`
@@ -758,7 +807,15 @@ keyframe_geom_set_group_value :: proc(
 		"keyframe_geom_set_group_value: section is wider than the group value array",
 	)
 	for lane_index in 0 ..< len(lanes) {
-		keyframe_set_lane_key(clip, sec, lane_index, frame_off, values[lane_index])
+		// By the lane's own name: a group write names each curve it writes, and
+		// there is no position to count to.
+		keyframe_set_lane_key(
+			clip,
+			sec,
+			keyframe_lane_name(lanes[lane_index]),
+			frame_off,
+			values[lane_index],
+		)
 	}
 }
 
@@ -772,11 +829,8 @@ keyframe_geom_set_value :: proc(clip: ^Clip, name: string, frame_off: i32, value
 	// keyframe_set_lane_key, which takes a TRACK name -- a lane name passed to
 	// keyframe_set_key instead mints a track literally called "transform.x", which
 	// no consumer samples, so an inspector edit would write into a black hole.
-	if track_index, lane_index, found := keyframe_geom_lane_location(clip, name); found {
-		keyframe_set_lane_key(clip, keyframe_track_name(session_trk_view(clip.keyframe_tracks, track_index)), lane_index, frame_off, value)
-		return
-	}
-	keyframe_set_key(clip, name, frame_off, value)
+	track_name, lane_name := keyframe_geom_lane_of_track(name)
+	keyframe_set_lane_key(clip, track_name, lane_name, frame_off, value)
 }
 
 // keyframe_geom_sample_lane evaluates geometry property `name` at a TIMELINE frame,
@@ -784,7 +838,7 @@ keyframe_geom_set_value :: proc(clip: ^Clip, name: string, frame_off: i32, value
 // track; a plain property samples its own single-lane track. Both end up at one
 // scalar sampler, so a lane and a group differ only in which track they name.
 keyframe_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64, base: f32) -> (f32, bool) {
-	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+	if sec_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
 		defs := keyframe_geom_sections
 		section_index := keyframe_track_index(clip^, defs[sec_index].name)
 		if section_index < 0 {
@@ -792,7 +846,7 @@ keyframe_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64
 		}
 		return keyframe_sample_lane(
 			&session_trk_view(clip.keyframe_tracks, section_index)^,
-			lane_index,
+			name,
 			i32(timeline_frame - clip.timeline_start_frame),
 			base,
 		)
@@ -807,14 +861,14 @@ keyframe_geom_sample_lane :: proc(clip: ^Clip, name: string, timeline_frame: i64
 // knots here, skipping any knot whose mask missed the lane; a lane is now its
 // own sorted window, so the store hands the lane over directly.
 keyframe_geom_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n, total: int) {
-	if sec_index, lane_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+	if sec_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
 		defs := keyframe_geom_sections
 		section_index := keyframe_track_index(clip^, defs[sec_index].name)
 		if section_index < 0 {
 			return 0, 0
 		}
 		keys := session_kf_view(
-			keyframe_lane_view(session_trk_view(clip.keyframe_tracks, section_index), lane_index),
+			keyframe_lane_view(session_trk_view(clip.keyframe_tracks, section_index), name),
 		)
 		total = len(keys)
 		n = min(total, len(dst))

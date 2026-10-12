@@ -1229,12 +1229,18 @@ selection: Selection
 Keyframe_Ref :: struct {
 	track_idx:  int,
 	clip_index: int,
-	// keyframe_track indexes the clip's keyframe tracks; keyframe_lane indexes
-	// that track's scalar lanes. Both are needed because a key lives in a LANE,
-	// not directly in a track: a section track ("crop") owns four curves and one
-	// ref has to say which of them.
+	// keyframe_track indexes the clip's keyframe tracks; keyframe_lane NAMES the
+	// curve within it. A key lives in a lane, not in a track -- a section track
+	// ("crop") owns several -- so a ref has to say which curve, and it says it by
+	// name.
+	//
+	// The name rather than an index, and that is not cosmetic: an index is only
+	// valid until the first store op (see Keyframe_Snap), which is why the undo
+	// machinery has to clone a track name to keep addressing the key afterwards.
+	// An interned lane name is a stable borrowed view of session pool bytes, so
+	// the same staleness rule stops applying to it.
 	keyframe_track: int,
-	keyframe_lane:  int,
+	keyframe_lane:  string,
 	key:            int,
 }
 
@@ -1719,16 +1725,16 @@ opacity_drag: Opacity_Drag
 // selected key and the caller releases every cloned name and the buffer itself
 // (keyframe_snap_free) — the callee never frees.
 Keyframe_Snap :: struct {
-	// ref identifies the key in the LIVE tree. All four fields are valid for
-	// the whole gesture, and ref.track_idx / ref.clip_index stay valid past it
-	// too — a keyframe edit never reorders tracks or clips. ref.keyframe_track /
-	// ref.keyframe_lane / ref.key do NOT survive the first store op, which is why the
-	// release addresses the key by name + frame instead.
+	// ref identifies the key in the LIVE tree. ref.track_idx / ref.clip_index /
+	// ref.keyframe_lane stay valid past the gesture too — a keyframe edit never
+	// reorders tracks or clips, and a lane's name does not change when its keys
+	// do. ref.keyframe_track / ref.key do NOT survive the first store op, which
+	// is why the release addresses the key by name + frame instead.
 	ref: Keyframe_Ref,
-	// name is the CLONED track name and start the frame_off the key sat on at
-	// capture: the pair that still addresses the key once the indices went
-	// stale. The name is cloned for the reason above — a delete that empties a
-	// track frees the live string.
+	// name is the lane's name and start the frame_off the key sat on at capture:
+	// the pair that still addresses the key once the key index went stale. It is
+	// a BORROWED interned view — the reason a snap had to clone one is in the
+	// ownership note above, and it is gone.
 	name:  string,
 	start: i32,
 	// final is where a move lands the key (== start until the release computes
@@ -1803,7 +1809,7 @@ Keyframe_Dbl_Click :: struct {
 	track:         int,
 	clip:          int,
 	keyframe_track: int,
-	keyframe_lane:  int,
+	keyframe_lane:  string,
 	frame:         i32,
 }
 keyframe_dbl_click: Keyframe_Dbl_Click

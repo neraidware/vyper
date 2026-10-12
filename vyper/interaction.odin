@@ -1258,11 +1258,11 @@ commit_keyframe_drag :: proc() {
 		if !ok {
 			continue
 		}
-		track_index, lane_index, found := keyframe_geom_lane_location(cl, s.name)
+		track_index, lane_name, found := keyframe_geom_lane_location(cl, s.name)
 		if !found {
 			continue
 		}
-		mutable_lane := keyframe_lane_at_mut(cl, track_index, lane_index)
+		mutable_lane := keyframe_lane_named_mut(cl, track_index, lane_name)
 		session_kf_make_unique(&mutable_lane.keys)
 		keys := mutable_lane.keys
 		keys_view := session_kf_view(keys)
@@ -1276,7 +1276,7 @@ commit_keyframe_drag :: proc() {
 						s.ref.track_idx,
 						s.ref.clip_index,
 						track_index,
-						lane_index,
+						lane_name,
 						key_index,
 					},
 				)

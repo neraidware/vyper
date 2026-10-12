@@ -871,7 +871,11 @@ keyframe_selection_free :: proc() {
 // keyframe_select makes (track_idx,clip_index,keyframe_track,keyframe_lane,key) the
 // SOLE keyframe selection, which deselects the clip selection (the two never
 // coexist, S3).
-keyframe_select :: proc(track_idx, clip_index, keyframe_track, keyframe_lane, key: int) {
+keyframe_select :: proc(
+	track_idx, clip_index, keyframe_track: int,
+	keyframe_lane: string,
+	key: int,
+) {
 	clear(&keyframe_sel.items)
 	append(&keyframe_sel.items, Keyframe_Ref{track_idx, clip_index, keyframe_track, keyframe_lane, key})
 	keyframe_sel.gen = keyframe_view.structure_gen
@@ -1021,7 +1025,7 @@ keyframe_resolve :: proc(r: Keyframe_Ref) -> (cl: ^Clip, keyframe_track: int, k:
 	// One door for both COW steps: the picked key is addressed by (track, lane),
 	// and a lane pointer is only reachable once both the row and the window
 	// behind it are this clip's alone.
-	mutable_lane := keyframe_lane_at_mut(clip, r.keyframe_track, r.keyframe_lane)
+	mutable_lane := keyframe_lane_named_mut(clip, r.keyframe_track, r.keyframe_lane)
 	if mutable_lane == nil {
 		return nil, -1, nil, false
 	}
@@ -1043,12 +1047,12 @@ keyframe_resolve :: proc(r: Keyframe_Ref) -> (cl: ^Clip, keyframe_track: int, k:
 keyframe_selected :: proc() -> (
 	cl: ^Clip,
 	keyframe_track: int,
-	keyframe_lane: int,
+	keyframe_lane: string,
 	k: ^Keyframe,
 	ok: bool,
 ) {
 	if keyframe_sel_count() != 1 {
-		return nil, -1, -1, nil, false
+		return nil, -1, "", nil, false
 	}
 	clip, track_index, key, found := keyframe_resolve(keyframe_sel.items[0])
 	return clip, track_index, keyframe_sel.items[0].keyframe_lane, key, found
@@ -1246,18 +1250,12 @@ keyframe_capture_sel :: proc(dst: ^[dynamic]Keyframe_Snap) -> int {
 		}
 		s: Keyframe_Snap
 		s.ref = item
-		// Keyframe_Snap.name is still an owned heap string (it is a UI-side selection
-		// snapshot, freed by the caller), so it keeps its clone -- reading the
-		// lane name through the accessor is the only borrow here. The name is the
-		// LANE's, not the track's: a release re-addresses the key by this name, so
-		// the track name would point at a group whose lanes are separate curves.
-		s.name = strings.clone(
-			keyframe_track_lane_name(
-				session_trk_view(cl.keyframe_tracks, keyframe_track),
-				item.keyframe_lane,
-			),
-		)
-		s.start = k.frame_off
+		// The LANE's name, borrowed: a release re-addresses the key by this name
+		// plus a frame, so the track name would point at a group whose lanes are
+		// separate curves, and a clone would be a per-key heap string to free on a
+		// path that only needs to name a curve.
+		s.name = item.keyframe_lane
+s.start = k.frame_off
 		s.final = k.frame_off
 		s.interp = k.interp
 		s.value = k.value
@@ -1273,10 +1271,12 @@ keyframe_capture_sel :: proc(dst: ^[dynamic]Keyframe_Snap) -> int {
 // so keeping the buffer saves a realloc per drag while a bare clear() would hand
 // back one track-name string per selected key. keyframe_snap_free is the counterpart
 // for a caller that owns the list outright and wants the buffer back too.
+// keyframe_snaps_drop releases the snap BUFFER and nothing else. Each snap's
+// name is a borrowed view of an interned curve name, so there is nothing to free
+// per snap -- which is the whole of what changed when lanes became named, and it
+// is why deleting here is now a free of pool bytes: the probe caught it as
+// "free(): invalid pointer" the first time a brush drag captured a selection.
 keyframe_snaps_drop :: proc(snaps: ^[dynamic]Keyframe_Snap) {
-	for s in snaps^ {
-		delete(s.name)
-	}
 	// clear takes the pointer to the dynamic array directly, not a deref.
 	clear(snaps)
 }
@@ -1284,10 +1284,9 @@ keyframe_snaps_drop :: proc(snaps: ^[dynamic]Keyframe_Snap) {
 // keyframe_snap_free releases a keyframe_capture_sel result: every cloned name, then the
 // buffer. A result that captured nothing still owns its (empty) buffer, so this
 // is safe on it.
+// keyframe_snap_free is the owning counterpart: the BUFFER is caller heap, the
+// borrowed names are not freed here. See keyframe_snaps_drop.
 keyframe_snap_free :: proc(snaps: ^[dynamic]Keyframe_Snap) {
-	for s in snaps^ {
-		delete(s.name)
-	}
 	delete(snaps^)
 }
 
@@ -1322,7 +1321,7 @@ keyframe_add_group_prop :: proc(clip: ^Clip, sec: string, values: [KF_GEOM_GROUP
 // name is keyed when its section's track exists at all (lanes live there), and a
 // plain property when its own track does.
 keyframe_geom_prop_keyed :: proc(clip: ^Clip, name: string) -> bool {
-	if sec_index, _, is_lane := keyframe_geom_section_for_lane(name); is_lane {
+	if sec_index, is_lane := keyframe_geom_section_for_lane(name); is_lane {
 		defs := keyframe_geom_sections
 		return keyframe_track_index(clip^, defs[sec_index].name) >= 0
 	}

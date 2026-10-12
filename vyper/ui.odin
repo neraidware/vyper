@@ -1230,20 +1230,18 @@ keyframe_readout :: proc() {
 	// count: keyframe_selected already carries that contract, and a sole selection
 	// whose ref no longer resolves has no clip to name a lane from, so it reads
 	// as the set readout too.
-	cl, track_index, lane_index, keyframe, one := keyframe_selected()
+	cl, track_index, lane_name, keyframe, one := keyframe_selected()
 	if !one {
 		keyframes_readout()
 		return
 	}
 	// The header names the key's LANE, not its track: a section track holds several
 	// curves, so the track name alone does not say which property is being shown.
+	// The picked key already carries the lane's name, so nothing has to be looked
+	// back up from a position.
 	name_buf := ui_text.keyframe_name[:]
 	clay.Text(
-		fmt.bprintf(
-			name_buf[:],
-			"%s",
-			keyframe_track_lane_name(session_trk_view(cl.keyframe_tracks, track_index), lane_index),
-		),
+		fmt.bprintf(name_buf[:], "%s", lane_name),
 		clay.TextElementConfig{textColor = TEXT, fontSize = FONT_NORMAL},
 	)
 	frame_buf := ui_text.keyframe_frame[:]

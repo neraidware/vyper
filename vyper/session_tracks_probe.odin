@@ -35,6 +35,7 @@ when ODIN_DEBUG {
 		session_kf_push(&lane.keys, Keyframe{frame_off=10, value=1.0})
 		source := Keyframe_Track_Range{}
 		session_trk_push(&source, Keyframe_Track{name=session_str_intern("probe")})
+		lane.name = session_str_intern("probe")
 		session_lane_push(&session_trk_view_mut(&source, 0).lanes, lane)
 		copy := session_trk_share(&source)
 		session_trk_check(source.shared && copy.shared && source.first == copy.first,
@@ -47,8 +48,8 @@ when ODIN_DEBUG {
 		// them writes. Lane-window COW is the step above key COW, so the probe writes
 		// through keyframe_lane_at_mut to exercise both.
 		session_trk_check(
-			keyframe_lane_view(session_trk_view(source, 0), 0).shared &&
-			keyframe_lane_view(copy_track, 0).shared,
+			keyframe_own_lane_keys(session_trk_view(source, 0)).shared &&
+			keyframe_own_lane_keys(copy_track).shared,
 			"track clone marks key ranges shared")
 		// The clip stands in for whatever holds the range, so the probe drives the
 		// production door rather than a private path: it resolves the TRACK row and
@@ -62,10 +63,10 @@ when ODIN_DEBUG {
 		keyframe_lane_at_mut(&holder, 0, 0).keys = copy_lane
 		copy = holder.keyframe_tracks
 		session_trk_check(
-			session_kf_at(keyframe_lane_view(session_trk_view(source, 0), 0), 0).value == 1.0,
+			session_kf_at(keyframe_own_lane_keys(session_trk_view(source, 0)), 0).value == 1.0,
 			"key COW preserves source value")
 		session_trk_check(
-			session_kf_at(keyframe_lane_view(copy_track, 0), 0).value == 9.0,
+			session_kf_at(keyframe_own_lane_keys(copy_track), 0).value == 9.0,
 			"mutated copy gets independent key value")
 
 		// Freed exclusive track blocks are reusable and coalesce; this keeps edits

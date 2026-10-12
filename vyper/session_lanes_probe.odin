@@ -69,22 +69,30 @@ session_lane_probe_main :: proc() -> int {
 			)
 		}
 		// The win is the reason this store exists, so it is pinned rather than
-		// remembered: a track row was 272 bytes (an inline [Keyframe_Lane_Max] of
-		// 32-byte lanes) and is now 40. Re-inlining the lanes would pass every
-		// behavioural check below and quietly give the 232 bytes back, which is
-		// exactly the regression nothing else here would catch.
+		// remembered: a track row was 272 bytes with the lanes inline and is 40
+		// with a window. Re-inlining them would pass every behavioural check below
+		// and quietly give the 232 bytes back -- exactly the regression nothing
+		// else here would catch.
+		//
+		// The ROW is what this measures. A track's lanes moved out of the row into
+		// this store, so the honest per-track comparison is 80 bytes for a
+		// single-lane property (was 272) and 200 for crop's four (was 272).
 		session_lane_check(
 			size_of(Keyframe_Track) <= 48,
 			"a track row is %d bytes; the inline lane array is back",
 			size_of(Keyframe_Track),
 		)
-		// The bound is an assert, not storage: pushing past it must fail loudly
-		// rather than truncate a curve.
-		session_lane_check(
-			Keyframe_Lane_Max == 4,
-			"lane bound is %d; keyframe_geom_sections' widest section (crop) is 4",
-			Keyframe_Lane_Max,
-		)
+		// There is no lane bound to pin any more, and that is the point of naming
+		// lanes: arity is a count of curves that exist, not a capacity the store
+		// has to be told about. A section gaining a fifth lane now needs a table
+		// edit and nothing else.
+		for lane in 0 ..< 32 {
+			keys := Keyframe_Keys_Range{}
+			session_kf_push(&keys, Keyframe{frame_off = i32(lane), value = 1.0})
+			session_lane_push(&r, Keyframe_Lane{name = session_str_intern("probe.lane"), keys = keys})
+			session_kf_release(keys)
+		}
+		session_lane_check(r.n >= 32, "a track grew to %d lanes; nothing should bound it", r.n)
 		session_lane_release(r)
 	}
 

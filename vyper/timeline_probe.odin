@@ -175,7 +175,7 @@ when ODIN_DEBUG {
 			name = session_str_intern("transform"),
 		})
 		track := session_trk_view_mut(&cl.keyframe_tracks, 0)
-		lane := Keyframe_Lane{}
+		lane := Keyframe_Lane{name = session_str_intern("transform.x")}
 		session_kf_push(&lane.keys, Keyframe{frame_off=50,value=0.0})
 		session_kf_push(&lane.keys, Keyframe{frame_off=250,value=1.0})
 		session_lane_push(&track.lanes, lane)
@@ -238,19 +238,19 @@ when ODIN_DEBUG {
 		tl_probe_check(
 			left.keyframe_tracks.n == 1 &&
 			right.keyframe_tracks.n == 1 &&
-			keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0).n >= 1 &&
-			keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0).n >= 1,
+			keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), "transform.x").n >= 1 &&
+			keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), "transform.x").n >= 1,
 			"each half must own its own lane with at least one key (got %d/%d lanes, %d/%d keys)",
 			left.keyframe_tracks.n,
 			right.keyframe_tracks.n,
-			keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0).n,
-			keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0).n,
+			keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), "transform.x").n,
+			keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), "transform.x").n,
 		)
 		// And the two key ranges must be distinct objects, not one shared range
 		// reached through two clips.
 		if left.keyframe_tracks.n == 1 && right.keyframe_tracks.n == 1 {
-			lk := keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0)
-			rk := keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0)
+			lk := keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), "transform.x")
+			rk := keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), "transform.x")
 			tl_probe_check(
 				lk != rk,
 				"the two halves must not share one key range (both at %v)",
@@ -258,11 +258,11 @@ when ODIN_DEBUG {
 			)
 		}
 		tl_probe_check(
-			session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0),0).frame_off == 50 &&
-				session_kf_at(keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0),0).frame_off == 50,
+			session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), "transform.x"),0).frame_off == 50 &&
+				session_kf_at(keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), "transform.x"),0).frame_off == 50,
 			"the split's slice-1 rule: keys re-relativized by -left_len (got %d, %d)",
-			session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0),0).frame_off,
-			session_kf_at(keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), 0),0).frame_off,
+			session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), "transform.x"),0).frame_off,
+			session_kf_at(keyframe_lane_view(session_trk_view(right.keyframe_tracks, 0), "transform.x"),0).frame_off,
 		)
 		// Marker ranges share until a label write triggers marker-list COW.
 		tl_probe_check(
@@ -291,7 +291,7 @@ when ODIN_DEBUG {
 		// The left half's first key is read straight: it is a scalar lane now, so
 		// there is no mask to consult for "does this knot cover the lane" -- the
 		// lane's own value IS the answer.
-		v := session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), 0), 0).value
+		v := session_kf_at(keyframe_lane_view(session_trk_view(left.keyframe_tracks, 0), "transform.x"), 0).value
 		tl_probe_check(
 			v != 0.75,
 			"a keyframe edit on the right half wrote through to the left (left lane reads %v)",
@@ -1803,12 +1803,20 @@ when ODIN_DEBUG {
 		project.frame_rate = 12.0
 
 		c := &timeline.tracks[0].clips[0]
-		keyframe_set_key(c, "transform.x", 109, 5.0)
-		keyframe_set_key(c, "transform.x", 218, 9.0)
-		before := keyframe_lane_key(c, 0, 0, 0).frame_off
+		// Through the geometry entry point, so the curve lands on the "transform"
+		// track under its own name. keying a LANE name through the plain store API
+		// mints a private track called "transform.x" that nothing samples -- a black
+		// hole this fixture used to sit in without noticing.
+		keyframe_geom_set_lane_key(c, "transform.x", 109, 5.0)
+		keyframe_geom_set_lane_key(c, "transform.x", 218, 9.0)
+		transform_track := keyframe_track_index(c^, "transform")
+		before := keyframe_lane_key(c, transform_track, "transform.x", 0).frame_off
 
 		set_project_fps(60)
-		after := keyframe_lane_key(c, 0, 0, 0).frame_off
+		// Re-resolved BY NAME: the reflow rebuilds the track rows, so the index
+		// captured before it points at a row that has moved. The lane's name does
+		// not care, which is the reason a lane is named.
+		after := keyframe_lane_key(c, keyframe_track_index(c^, "transform"), "transform.x", 0).frame_off
 
 		// 109 of 219 is the clip's midpoint; it must still be the midpoint at 1095.
 		tl_probe_check(
@@ -1821,7 +1829,10 @@ when ODIN_DEBUG {
 		set_project_fps(12)
 		set_project_fps(60)
 		set_project_fps(12)
-		reflow_lane := keyframe_lane_view(session_trk_view(c.keyframe_tracks, 0), 0)
+		reflow_lane := keyframe_lane_view(
+			session_trk_view(c.keyframe_tracks, keyframe_track_index(c^, "transform")),
+			"transform.x",
+		)
 		asc := true
 		prev := i32(-1)
 		for ki in 0 ..< reflow_lane.n {
