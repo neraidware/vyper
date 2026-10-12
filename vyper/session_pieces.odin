@@ -44,6 +44,14 @@ Text_Piece :: struct {
 	// rather than one. That is a authoring-time cost and not a data-model one, and
 	// for the common case there is no N: text with one style is one piece.
 	reveal: Text_Reveal,
+	// color: the ink for this piece's characters, RGB. Alpha is NOT here: the
+	// raster's alpha channel is the glyph's antialiased COVERAGE, which the
+	// renderer supplies. A piece opacity is a separate multiplication, not a
+	// fourth channel here.
+	//
+	// White, because that is what every text clip painted before pieces existed,
+	// and a piece with no style must look identical to a clip with no pieces.
+	color: [3]u8,
 }
 
 // Text_Pieces_Range is a window into the session piece store. `shared` means a
@@ -197,6 +205,23 @@ session_piece_release :: proc(r: Text_Pieces_Range) {
 }
 
 session_piece_push :: proc(r: ^Text_Pieces_Range, piece: Text_Piece) {
+	// A piece built without saying what it reveals shows ALL of its own
+	// characters, and that is resolved HERE rather than tested at every read.
+	//
+	// The alternative is a zero reveal meaning "everything", which is a sentinel:
+	// a reader would have to know the convention to tell "unset" from "a piece
+	// that reveals no characters", and those are opposites. Normalising on the way
+	// in means every stored reveal is a real range and no reader knows a
+	// convention exists.
+	//
+	// Colour is deliberately NOT normalised here: [0,0,0] is black, which is a
+	// real choice, so it cannot also mean "unset". A piece states its ink
+	// outright; only the no-pieces fast path supplies the default, and it builds
+	// that piece itself with the colour spelled out.
+	stored := piece
+	if stored.reveal == (Text_Reveal{}) {
+		stored.reveal = text_reveal_all(stored.len)
+	}
 	session_piece_make_unique(r)
 	if r.n == r.slots {
 		new_slots := max(r.slots*2, SESSION_PIECE_MIN_CAP)
@@ -210,7 +235,7 @@ session_piece_push :: proc(r: ^Text_Pieces_Range, piece: Text_Piece) {
 		r.first = new_off
 		r.slots = new_slots
 	}
-	session_piece_rows[r.first+r.n] = piece
+	session_piece_rows[r.first+r.n] = stored
 	r.n += 1
 }
 

@@ -27,15 +27,87 @@ when ODIN_DEBUG {
 	font_probe_font_init: bool
 	font_probe_scratch: []u8
 	font_probe_glyphs: [dynamic]Text_Glyph
+	font_probe_inks: [dynamic]Text_Ink
+	font_probe_order: [dynamic]int
 
 	// font_probe_ink_of paints `title` into a throwaway buffer at the probe's own
 	// font state and returns the inked rect. A proc rather than a closure because
 	// Odin closures cannot capture a block-scoped [dynamic] that the callee mutates,
 	// and because the reveal cases want to call it four times with different
 	// windows.
-	font_probe_ink_of :: proc(title: string, bw, bh: int, pieces: Text_Pieces_Range) -> (ox, oy, ow, oh: int) {
+	// font_probe_ink_of is the production path end to end: pieces go in, the
+	// compositor resolves them into per-character ink, and the rasterizer paints
+	// what it is told. Nothing here reaches past the graph to read a piece field,
+	// because production does not either.
+	// text_probe_build_chain is the two-piece topology, built directly so the
+	// refusals above can rewire edges production never touches.
+	text_probe_build_chain :: proc(graph: ^Node_Graph) {
+		graph.nodes = make([dynamic]Compositor_Node, 0, 4)
+		append(&graph.nodes, Compositor_Node{kind = .Text_Input})
+		append(&graph.nodes, Compositor_Node{kind = .Style_Process, input_len = 3})
+		append(&graph.nodes, Compositor_Node{kind = .Style_Process, input_len = 2})
+		append(&graph.nodes, Compositor_Node{kind = .Text_Renderer})
+		graph.sink = 3
+		graph_connect(graph, 0, 1, 0)
+		graph_connect(graph, 0, 2, 0)
+		graph_connect(graph, 1, 3, 1)
+		graph_connect(graph, 2, 3, 2)
+		graph_connect(graph, 0, 3, 0)
+	}
+
+	// tint_probe_ink_edges returns the RGB of the leftmost and rightmost inked
+	// pixels of a paint, so a two-colour paint can be checked for putting each
+	// colour on the right SIDE of the text rather than merely somewhere.
+	tint_probe_ink_edges :: proc(
+		title: string,
+		bw, bh: int,
+		pieces: Text_Pieces_Range,
+		ink_x, ink_w, ink_h: int,
+	) -> (first, last: [3]u8, found: bool) {
 		buf := make([]u8, bw*bh*4)
 		defer delete(buf)
+		text_pieces_ink(pieces, len(title), &font_probe_inks, &font_probe_order)
+		ox, oy, ow, oh := rasterize_title_into_buffer(
+			title,
+			buf,
+			bw,
+			bh,
+			&font_probe_font,
+			&font_probe_font_init,
+			font_probe_scratch,
+			&font_probe_glyphs,
+			font_probe_inks[:],
+			48,
+		)
+		for y in oy ..< oy + oh {
+			for x in ox ..< ox + ow {
+				o := (y * bw + x) * 4
+				if buf[o + 3] == 0 {
+					continue
+				}
+				pixel := [3]u8{buf[o + 0], buf[o + 1], buf[o + 2]}
+				if !found {
+					first = pixel
+					found = true
+				}
+				last = pixel
+			}
+		}
+		return first, last, found
+	}
+
+	font_probe_ink_of :: proc(
+		title: string,
+		bw, bh: int,
+pieces: Text_Pieces_Range,
+	inks: ^[dynamic]Text_Ink,
+	order: ^[dynamic]int,
+) -> (ox, oy, ow, oh: int) {
+		buf := make([]u8, bw*bh*4)
+		defer delete(buf)
+		// The same entry production uses, implicit piece and all -- a probe that
+		// built its own graph would be testing a path nothing runs.
+		text_pieces_ink(pieces, len(title), inks, order)
 		return rasterize_title_into_buffer(
 			title,
 			buf,
@@ -45,7 +117,7 @@ when ODIN_DEBUG {
 			&font_probe_font_init,
 			font_probe_scratch,
 			&font_probe_glyphs,
-			pieces,
+			inks[:],
 			48,
 		)
 	}
@@ -169,6 +241,12 @@ when ODIN_DEBUG {
 			font_probe_check(bw > 0 && bh > 0, "reveal: the buffer must size")
 			font_probe_scratch = make([]u8, text_scratch_size_for(48))
 			defer delete(font_probe_scratch)
+			// Sized up front: the evaluator writes into a caller-owned table rather
+			// than growing one, because it runs once per bake and must not allocate.
+			resize(&font_probe_inks, 256)
+			resize(&font_probe_order, 64)
+			defer delete(font_probe_inks)
+			defer delete(font_probe_order)
 
 			layout := text_layout_into(title, &font_probe_font, &font_probe_font_init, 48, &font_probe_glyphs)
 			font_probe_check(
@@ -188,14 +266,14 @@ when ODIN_DEBUG {
 			font_probe_check(monotonic, "reveal: char_index must run 0..n-1 in layout order")
 
 			// No pieces at all draws everything: the implicit single piece.
-			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, {})
+			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, {}, &font_probe_inks, &font_probe_order)
 			// One piece over the whole text, revealing only its first character.
 			first_only := Text_Pieces_Range{}
 			session_piece_push(
 				&first_only,
 				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 1}},
 			)
-			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, first_only)
+			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, first_only, &font_probe_inks, &font_probe_order)
 			// Narrower, and no taller. Not "the same height": a round letter overshoots
 			// the baseline by a pixel, so "AV Wa" is legitimately 1px taller than the
 			// "A" alone -- the first assertion I wrote here failed on exactly that, and
@@ -209,11 +287,8 @@ when ODIN_DEBUG {
 				all_h,
 			)
 			none_shown := Text_Pieces_Range{}
-			session_piece_push(
-				&none_shown,
-				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 0}},
-			)
-			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, none_shown)
+			session_piece_push(&none_shown, Text_Piece{start = 0, len = 0})
+			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, none_shown, &font_probe_inks, &font_probe_order)
 			font_probe_check(
 				zero_w == 0 && zero_h == 0,
 				"reveal: an empty window must paint no ink (got %dx%d)",
@@ -231,8 +306,8 @@ when ODIN_DEBUG {
 				&short_head,
 				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 4}},
 			)
-			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, from_back)
-			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, short_head)
+			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, from_back, &font_probe_inks, &font_probe_order)
+			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, short_head, &font_probe_inks, &font_probe_order)
 			font_probe_check(
 				tail_w < all_w && head_w < all_w,
 				"reveal: a window open from either end must be narrower than the whole (%d/%d/%d)",
@@ -253,6 +328,44 @@ when ODIN_DEBUG {
 			session_piece_release(from_back)
 			session_piece_release(short_head)
 
+			// --- the graph refuses what a graph cannot be ----------------------
+			// A cycle check on a hardcoded topology guards nothing, because a
+			// hardcoded topology cannot cycle. These are the refusals that make
+			// "it is a graph" true rather than asserted.
+			{
+				graph := Node_Graph{}
+				text_probe_build_chain(&graph)
+				// renderer <- style <- input already. Wiring input back from the
+				// renderer closes a loop, so it must be refused.
+				font_probe_check(
+					!graph_connect(&graph, graph.sink, 0, 0),
+					"graph: a connection that would close a cycle must be refused",
+				)
+				// A renderer emits an IMAGE, so nothing may feed it from a node
+				// that emits text where an image is expected -- and no node kind
+				// takes an image yet, which is what makes "input -> track" impossible
+				// rather than merely discouraged.
+				font_probe_check(
+					!node_pin_accepts(.Style_Process, .Image),
+					"graph: a process must not accept an image; only the renderer promotes",
+				)
+				font_probe_check(
+					node_pin_emits(.Text_Renderer) == .Image &&
+						node_pin_emits(.Text_Input) == .Text,
+					"graph: only the renderer may emit an image",
+				)
+				// And the built topology really is the design's: input, one style per
+				// piece, renderer.
+				font_probe_check(
+					len(graph.nodes) == 4 && graph.nodes[0].kind == .Text_Input &&
+						graph.nodes[1].kind == .Style_Process &&
+						graph.nodes[2].kind == .Style_Process &&
+						graph.nodes[3].kind == .Text_Renderer,
+					"graph: a two-piece clip must build input, two styles and a renderer",
+				)
+				text_graph_free(&graph)
+			}
+
 			// --- two pieces, each revealing itself -----------------------------
 			// This is the case a clip-level reveal cannot express: one window over
 			// the whole text, and another over one word inside it. Both are the same
@@ -266,7 +379,7 @@ when ODIN_DEBUG {
 				&split,
 				Text_Piece{start = 3, len = 2, reveal = Text_Reveal{first = 0, last = 1}},
 			)
-			_, _, split_w, _ := font_probe_ink_of(title, bw, bh, split)
+			_, _, split_w, _ := font_probe_ink_of(title, bw, bh, split, &font_probe_inks, &font_probe_order)
 			font_probe_check(
 				split_w > one_w && split_w < all_w,
 				"pieces: two independently revealed runs must land between one character and the whole (%d)",
@@ -276,9 +389,22 @@ when ODIN_DEBUG {
 			// and piece two starts at character 3. A clip-level range would have had
 			// to be rewritten to 3..4 here, which is the translation the piece's
 			// coordinates remove.
+			split_inks := make([dynamic]Text_Ink, 5)
+			defer delete(split_inks)
+			{
+				graph := Node_Graph{}
+				font_probe_check(
+					text_graph_build(&graph, 5, split),
+					"graph: a two-piece text must build",
+				)
+				graph_eval_text(&graph, 5, split_inks[:], &font_probe_order)
+				text_graph_free(&graph)
+			}
 			font_probe_check(
-				text_clip_reveals(split, 3) && !text_clip_reveals(split, 4),
-				"pieces: a piece-local reveal must index from the piece's own start",
+				split_inks[3].drawn && !split_inks[4].drawn,
+				"pieces: a piece-local reveal must index from the piece's own start (%v/%v)",
+				split_inks[3],
+				split_inks[4],
 			)
 			// A character no piece claims draws nothing.
 			gap := Text_Pieces_Range{}
@@ -286,12 +412,80 @@ when ODIN_DEBUG {
 				&gap,
 				Text_Piece{start = 0, len = 2, reveal = Text_Reveal{first = 0, last = 2}},
 			)
+			gap_inks := make([dynamic]Text_Ink, 5)
+			defer delete(gap_inks)
+			{
+				graph := Node_Graph{}
+				font_probe_check(text_graph_build(&graph, 5, gap), "graph: a gap text must build")
+				graph_eval_text(&graph, 5, gap_inks[:], &font_probe_order)
+				text_graph_free(&graph)
+			}
 			font_probe_check(
-				!text_clip_reveals(gap, 4),
+				!gap_inks[4].drawn,
 				"pieces: a character past the last piece must not be drawn",
 			)
 			session_piece_release(split)
 			session_piece_release(gap)
+
+			// --- colour, through the compositor --------------------------------
+			// The first property to live on a piece, and the reason the piece list is
+			// a graph: a per-character colour is not a special case of the text model,
+			// it is a ONE-CHARACTER style node. Two runs in two inks is the same
+			// structure with a different length, and the rasterizer learned nothing
+			// new to paint them -- it was handed two different answers.
+			red := [3]u8{255, 0, 0}
+			blue := [3]u8{0, 0, 255}
+			tinted := Text_Pieces_Range{}
+			session_piece_push(&tinted, Text_Piece{start = 0, len = 3, color = red})
+			session_piece_push(&tinted, Text_Piece{start = 3, len = 2, color = blue})
+			inks := make([dynamic]Text_Ink, 5)
+			defer delete(inks)
+			order2 := make([dynamic]int, 0, 16)
+			defer delete(order2)
+			text_pieces_ink(tinted, 5, &inks, &order2)
+			font_probe_check(
+				inks[0].drawn && inks[2].drawn && inks[0].color == red && inks[3].color == blue,
+				"colour: two style nodes must resolve their own ranges (%v/%v)",
+				inks[0],
+				inks[3],
+			)
+			// Asserted on WHERE the ink lands, not merely that both colours appear:
+			// a raster holding both colours somewhere would also pass if the node
+			// order or the character mapping were wrong.
+			tint_x, _, tint_w, tint_h := font_probe_ink_of(
+				title, bw, bh, tinted, &font_probe_inks, &font_probe_order,
+			)
+			font_probe_check(tint_w > 0 && tint_h > 0, "colour: two inked pieces must produce ink")
+			first_ink, last_ink, found_any := tint_probe_ink_edges(title, bw, bh, tinted, tint_x, tint_w, tint_h)
+			font_probe_check(
+				found_any && first_ink == red,
+				"colour: the leftmost inked pixel must be the FIRST piece's (%v, want %v)",
+				first_ink, red,
+			)
+			font_probe_check(
+				last_ink == blue,
+				"colour: the rightmost inked pixel must be the LAST piece's (%v, want %v)",
+				last_ink, blue,
+			)
+			// A piece with no colour is white, so nothing that existed before pieces
+			// changes appearance.
+			unstyled := Text_Pieces_Range{}
+			session_piece_push(&unstyled, Text_Piece{start = 0, len = 5, color = TEXT_INK_DEFAULT_RGB})
+			_, _, styled_w, styled_h := font_probe_ink_of(
+				title, bw, bh, unstyled, &font_probe_inks, &font_probe_order,
+			)
+			blank_first, _, found_blank := tint_probe_ink_edges(title, bw, bh, unstyled, tint_x, tint_w, tint_h)
+			font_probe_check(
+				found_blank && blank_first == TEXT_INK_DEFAULT_RGB,
+				"colour: a piece with no colour must paint default ink (%v)",
+				blank_first,
+			)
+			font_probe_check(
+				styled_w == all_w && styled_h == all_h,
+				"colour: an unstyled piece must have the same extents as the fast path",
+			)
+			session_piece_release(tinted)
+			session_piece_release(unstyled)
 		}
 
 		if font_probe_failed {

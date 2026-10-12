@@ -520,6 +520,10 @@ update_preview_slots :: proc() -> bool {
 				}
 				delete(slot.text_layout)
 				slot.text_layout = nil
+				delete(slot.text_inks)
+				slot.text_inks = nil
+				delete(slot.text_order)
+				slot.text_order = nil
 				flash_rec_note_kill(slot_idx, "reassign-to-other-clip")
 				slot^ = {}
 				if same_asset {
@@ -705,7 +709,7 @@ slot.is_text = true
 						&text_clip_state.font_init,
 						scratch,
 						&slot.text_layout,
-						clip.pieces,
+						clip_pieces_ink(clip, &slot.text_inks, &slot.text_order),
 						TEXT_CLIP_FONT_PIXELS,
 					)
 					// Legacy clips (pre-metric model) carry a galley-height
@@ -746,7 +750,7 @@ slot.is_text = true
 						&text_clip_state.font_init,
 						scratch,
 						&slot.text_layout,
-						clip.pieces,
+						clip_pieces_ink(clip, &slot.text_inks, &slot.text_order),
 						font_px,
 					)
 					// Sample the tight ink horizontally (the width estimate is
@@ -1053,6 +1057,10 @@ slot.is_text = true
 			}
 			delete(slot.text_layout)
 			slot.text_layout = nil
+			delete(slot.text_inks)
+			slot.text_inks = nil
+			delete(slot.text_order)
+			slot.text_order = nil
 			slot^ = {}
 		}
 	}

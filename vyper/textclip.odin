@@ -233,38 +233,86 @@ Text_Reveal :: struct {
 	last:  int,
 }
 
-// text_clip_reveals is THE question the painter asks per character: does this
-// character get drawn?
+// clip_pieces_ink is the whole compositor pass for a text clip: build the graph
+// from the clip's pieces, evaluate it into `inks`, and hand the painter its
+// answer. One call, because the two halves are a unit -- a graph nobody evaluates
+// is a graph that silently paints nothing.
 //
-// It is one function, not a lookup the caller assembles, because the rules it
-// encodes are exactly the ones that must not be re-derived per call site:
-//
-//   - a clip with NO pieces draws all of its text. That is the degenerate case
-//     of the same rule rather than a special one -- one piece covering
-//     everything -- which is what lets a text clip exist without anyone having
-//     authored pieces for it;
-//   - a character in a GAP between pieces draws nothing. Pieces are ordered and
-//     non-overlapping, so a gap is a run of text no piece claims, and inventing
-//     one would make "which piece owns this letter" answerable two ways;
-//   - otherwise the piece's OWN reveal decides, in piece-local coordinates.
-//
-// The walk is linear over a handful of pieces, not a map: pieces are ordered and
-// the painter visits characters in order.
-text_clip_reveals :: proc(pieces: Text_Pieces_Range, char_index: int) -> bool {
-	view := session_piece_view(pieces)
-	if len(view) == 0 {
-		return true
+// Returns `inks` unchanged when the pieces are malformed, which is a caller bug
+// and not a user error: the text then paints with whatever the table already
+// holds, which is the same thing it did before the pieces were consulted.
+// The ink table is sized HERE rather than by the caller. Every caller held an
+// empty dynamic array on its first bake, so a caller-sized table silently
+// evaluated zero characters and the clip painted nothing -- which is how the
+// zorder gate caught it: it is the only gate that composites real text over real
+// video and measures that the difference exists.
+text_pieces_ink :: proc(
+	pieces: Text_Pieces_Range,
+	character_count: int,
+	inks: ^[dynamic]Text_Ink,
+	order: ^[dynamic]int,
+) -> []Text_Ink {
+	// A clip with no pieces is the design note's fast path -- a plain text clip is
+	// not a graph -- but it still goes through one, a single whole-text style
+	// process. That keeps "who draws this character" answerable by exactly one
+	// thing for every clip: the graph. A separate default here would be a second
+	// answer for the same question, which is how a gap starts being drawn by one
+	// path and not the other.
+	whole_text := pieces
+	// len(), NOT `== nil`: a zero range views as rows[0:0], which is a valid
+	// non-nil slice, so the nil test said "this clip HAS pieces" and skipped the
+	// implicit one. Every plain text clip then painted nothing -- which is exactly
+	// what the zorder probe caught, since it is the one gate that composites real
+	// text over real video and measures the difference.
+	if len(session_piece_view(pieces)) == 0 {
+		whole_text = Text_Pieces_Range{}
+		session_piece_push(
+			&whole_text,
+			Text_Piece {
+				start = 0,
+				len = character_count,
+				reveal = text_reveal_all(character_count),
+				color = TEXT_INK_DEFAULT_RGB,
+			},
+		)
+		defer session_piece_release(whole_text)
 	}
-	for piece in view {
-		if char_index < piece.start {
-			return false
-		}
-		if char_index < piece.start + piece.len {
-			local := char_index - piece.start
-			return text_reveal_contains(piece.reveal, local)
-		}
+	if len(inks^) < character_count {
+		resize(inks, character_count)
 	}
-	return false
+	graph := Node_Graph{}
+	if !text_graph_build(&graph, character_count, whole_text) {
+		text_graph_free(&graph)
+		return inks[:]
+	}
+	graph_eval_text(&graph, character_count, inks[:], order)
+	text_graph_free(&graph)
+	return inks[:]
+}
+
+// clip_pieces_ink is the UI-thread entry: the clip knows its own title length, so
+// callers holding a clip do not have to work it out to ask the same question.
+clip_pieces_ink :: proc(clip: ^Clip, inks: ^[dynamic]Text_Ink, order: ^[dynamic]int) -> []Text_Ink {
+	return text_pieces_ink(clip.pieces, len(clip_name(clip)), inks, order)
+}
+
+// text_clip_ink is the painter's question, and the compositor answers it.
+//
+// The rasterizer does not know that a piece, a node or a colour exists: it asks
+// what ink a character has and writes what it is told. That is what keeps this
+// loop from growing a case per property -- colour, stroke, font and everything
+// after them are nodes in text_graph_build, not branches here.
+//
+// The answer is resolved for the WHOLE text once per bake, by graph_eval_text,
+// rather than walked per character: processes annotate, the renderer emits, and
+// the paint loop only draws. A clip with no pieces is the design note's fast
+// path -- it is not a graph at all, and its answer is the default ink for every
+// character.
+text_clip_ink :: proc(inks: []Text_Ink, char_index: int) -> Text_Ink {
+	if char_index < 0 || char_index >= len(inks) {
+		return {}
+	}
+	return inks[char_index]
 }
 
 // text_reveal_all is the "draw everything" range. It is deliberately not a
@@ -432,7 +480,7 @@ text_layout_into :: proc(
 // same reason the per-glyph `scratch` is passed in: the UI thread and the render
 // worker each keep their own, so neither races the other.
 //
-// `pieces` says which characters get drawn, per piece (text_clip_reveals). The
+// `inks` is the per-character ink the compositor resolved before this call. The
 // text is still LAID OUT whole — the kerning and advance of a hidden character
 // affect the ones after it, so a partially typed line does not reflow as it
 // types — and only the glyphs no piece claims are skipped at paint time. The
@@ -446,7 +494,7 @@ rasterize_title_into_buffer :: proc(
 	font_init: ^bool,
 	scratch: []u8,
 	layout_glyphs: ^[dynamic]Text_Glyph,
-	pieces: Text_Pieces_Range,
+	inks: []Text_Ink,
 	font_px: f32,
 ) -> (
 	ox: int,
@@ -465,7 +513,8 @@ rasterize_title_into_buffer :: proc(
 	left := max(int)
 	right := -max(int)
 	for glyph in layout.glyphs {
-		if !text_clip_reveals(pieces, glyph.char_index) {
+		ink := text_clip_ink(inks, glyph.char_index)
+		if !ink.drawn {
 			continue
 		}
 		start_x := cast(int)glyph.x + int(glyph.box[0])
@@ -519,9 +568,9 @@ rasterize_title_into_buffer :: proc(
 					continue
 				}
 				o := (py * bw + px) * 4
-				buf[o + 0] = 255
-				buf[o + 1] = 255
-				buf[o + 2] = 255
+				buf[o + 0] = ink.color[0]
+				buf[o + 1] = ink.color[1]
+				buf[o + 2] = ink.color[2]
 				buf[o + 3] = u8(a)
 			}
 		}
