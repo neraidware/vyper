@@ -234,7 +234,13 @@ keyframe_lane_ensure_mut :: proc(clip: ^Clip, track_index, lane: int) -> ^Keyfra
 // track has no such lane, so a caller iterating a group never has to bounds
 // check against a count it derived elsewhere.
 keyframe_lane_view :: proc(t: ^Keyframe_Track, i: int) -> Keyframe_Keys_Range {
-	return keyframe_lane_at(t, i).keys
+	// Straight to the keys rather than through keyframe_lane_at: this is the
+	// per-frame sampling path, and a lane is 32 bytes while its key range is 16,
+	// so going through the value accessor copied twice what the caller wanted.
+	if i < 0 || i >= t.lanes.n {
+		return {}
+	}
+	return session_lane_view(t.lanes)[i].keys
 }
 
 // keyframe_lane_key reads one key by (track, lane, key index). It is the read side of
