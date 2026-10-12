@@ -249,6 +249,131 @@ when ODIN_DEBUG {
 		fmt.println("[skew-probe] ok: baked Clay and live overlay agreed on the zoom-click frame")
 	}
 
+	// ui_probe_gutter_alignment checks that every keyframe lane name in the
+	// track-name gutter sits on the lane it names, for EVERY track with lanes.
+	//
+	// Height is not alignment. A label that is the right SIZE but at the wrong y
+	// points at the wrong lane, and a user cannot tell a label naming lane 1
+	// while sitting on lane 0 from one that is merely misaligned -- so each
+	// label's centre is compared against the centre its lane's diamond is
+	// actually painted at.
+	//
+	// The expected value comes from keyframe_lane_offset, the same function the
+	// diamond pass calls, so this cannot drift from the implementation; it can
+	// only catch a renderer that stops calling it. That is the point of routing
+	// the offset through one function: the check and the drawing would otherwise
+	// be two derivations free to disagree the way they used to.
+	ui_probe_gutter_alignment :: proc() -> bool {
+		ok := true
+		for ti in 0 ..< len(timeline.tracks) {
+			rows := keyframe_rows_for(&timeline.tracks[ti])
+			if rows == 0 {continue}
+			tile := clay.GetElementData(clay.ID("TimelineClip", u32(ti * 1000))).boundingBox
+			if tile.height <= 0 {continue}
+
+			// A lane with NO label is a lane the row reserved space for and nobody
+			// named: an invisible row that looks like missing data. The row is
+			// sized by the tallest clip's lane count, and that clip's lanes are
+			// distinct by construction, so the label count must equal it exactly.
+			// This is the check that would have caught the section-track bug --
+			// "transform" owns x AND y, so one name per track left the fifth row
+			// nameless while every label below it named the row above.
+			names: [32]string
+			emitted := keyframe_gutter_names(&timeline.tracks[ti], rows, names[:])
+			if emitted != rows {
+				fmt.eprintf(
+					"[ui-probe] track %d is sized for %d lane(s) but only %d lane name(s) exist:",
+					ti, rows, emitted,
+				)
+				for i in 0 ..< emitted {fmt.eprintf(" %q", names[i])}
+				fmt.eprintln(" -- a lane has no label")
+				ok = false
+			}
+
+			for lane in 0 ..< rows {
+				label := clay.GetElementData(
+					clay.ID("KeyframeGutterName", u32(ti * 1000 + lane)),
+				).boundingBox
+				want_centre := tile.y + keyframe_lane_offset(lane) + KF_ROW_H / 2
+				got_centre := label.y + label.height / 2
+				if abs(got_centre - want_centre) > 0.5 {
+					fmt.eprintf(
+						"[ui-probe] track %d lane %d: gutter label centre %.1f, lane centre %.1f (off by %.1f)\n",
+						ti, lane, got_centre, want_centre, got_centre - want_centre,
+					)
+					ok = false
+				}
+			}
+		}
+		return ok
+	}
+
+	// ui_probe_gutter (VYPER_GUTTER_PROBE=<project.vyproj>) runs the same check
+	// against a REAL project, not the synthetic fixture. A fixture with two
+	// lanes on track 0 cannot speak for a clip carrying five lanes in the middle
+	// of a long timeline -- and "the probe passed" would have said nothing about
+	// the shape the bug was actually reported from. This is the check that had to
+	// pass on that project, so it prints the numbers as well as the verdict: an
+	// offset is a fact, and whether it is constant across lanes or grows says
+	// whether the gutter's origin is wrong or the lane count itself is.
+	ui_probe_gutter :: proc(project_path: string) {
+		CLAY_ARENA_BYTES :: 64 * 1024 * 1024
+		memory := make([^]u8, CLAY_ARENA_BYTES)
+		clay.Initialize(
+			clay.CreateArenaWithCapacityAndMemory(c.size_t(CLAY_ARENA_BYTES), memory),
+			{WINDOW_WIDTH, WINDOW_HEIGHT},
+			{handler = clay_probe_error},
+		)
+		clay.SetMeasureTextFunction(measure_probe, nil)
+		if err := project_file_open(project_path); len(err) > 0 {
+			fmt.eprintf("[gutter-probe] open %s failed: %s\n", project_path, err)
+			delete(err)
+			return
+		}
+		_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
+		for ti in 0 ..< len(timeline.tracks) {
+			rows := keyframe_rows_for(&timeline.tracks[ti])
+			if rows == 0 {continue}
+			tile := clay.GetElementData(clay.ID("TimelineClip", u32(ti * 1000))).boundingBox
+			fmt.eprintf(
+				"[gutter-probe] track %d: %d lane(s) tile y=%.1f h=%.1f namebox y=%.1f h=%.1f\n",
+				ti, rows, tile.y, tile.height,
+				clay.GetElementData(clay.ID("TrackNameLabel", u32(ti))).boundingBox.y,
+				clay.GetElementData(clay.ID("TrackNameLabel", u32(ti))).boundingBox.height,
+			)
+			names: [32]string
+			emitted := keyframe_gutter_names(&timeline.tracks[ti], rows, names[:])
+			fmt.eprintf("[gutter-probe]   rows=%d emitted=%d names:", rows, emitted)
+			for i in 0 ..< emitted {fmt.eprintf(" %q", names[i])}
+			fmt.eprintln()
+			for ci in 0 ..< len(timeline.tracks[ti].clips) {
+				clip := &timeline.tracks[ti].clips[ci]
+				fmt.eprintf("[gutter-probe]   clip %d has %d keyframe track(s):", ci, clip.keyframe_tracks.n)
+				for i in 0 ..< clip.keyframe_tracks.n {
+					kt := session_trk_view(clip.keyframe_tracks, i)
+					fmt.eprintf(" %q", keyframe_track_name(kt))
+				}
+				fmt.eprintln()
+			}
+			for lane in 0 ..< rows {
+				label := clay.GetElementData(
+					clay.ID("KeyframeGutterName", u32(ti * 1000 + lane)),
+				).boundingBox
+				_, diamond_centre := keyframe_key_center(tile, lane, 0)
+				fmt.eprintf(
+					"[gutter-probe]   lane %d label %.1f..%.1f centre %.1f vs diamond centre %.1f\n",
+					lane, label.y, label.y + label.height,
+					label.y + label.height / 2, diamond_centre,
+				)
+			}
+		}
+		if ui_probe_gutter_alignment() {
+			fmt.println("[gutter-probe] ok: every lane name sits on its lane")
+		} else {
+			fmt.eprintln("[gutter-probe] FAIL: a lane name does not sit on its lane")
+		}
+	}
+
 	// ui_probe_clip_widths (VYPER_CLIPW_PROBE=<project.vyproj>) measures the laid-out
 	// width of every clip tile at a spread of timeline zooms, and prints the tile's
 	// own width next to the width the model implies (frames * zoom). A tile wider
@@ -2424,30 +2549,7 @@ when ODIN_DEBUG {
 		// keyframe_lane_offset, the same function both renderers call -- so this
 		// cannot drift from the implementation, only catch it if one side stops
 		// calling it.
-		for ti in 0 ..< len(timeline.tracks) {
-			rows := keyframe_rows_for(&timeline.tracks[ti])
-			if rows == 0 {continue}
-			tile := clay.GetElementData(clay.ID("TimelineClip", u32(ti * 1000))).boundingBox
-			if tile.height <= 0 {continue}
-			for lane in 0 ..< rows {
-				label := clay.GetElementData(
-					clay.ID("KeyframeGutterName", u32(ti * 1000 + lane)),
-				).boundingBox
-				want_centre := tile.y + keyframe_lane_offset(lane) + KF_ROW_H / 2
-				got_centre := label.y + label.height / 2
-				if abs(got_centre - want_centre) > 0.5 {
-					fmt.eprintf(
-						"[ui-probe] track %d lane %d: gutter label centre %.1f, diamond lane centre %.1f (off by %.1f)\n",
-						ti,
-						lane,
-						got_centre,
-						want_centre,
-						got_centre - want_centre,
-					)
-					ok = false
-				}
-			}
-		}
+		if !ui_probe_gutter_alignment() {ok = false}
 		// The "keyframe all modified" row must actually LAY OUT for a video clip.
 		// It carries the A shortcut's pending set and nothing else — there is no
 		// button, so the row is the only place the inspector says what A will key.

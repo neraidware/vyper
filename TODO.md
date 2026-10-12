@@ -9176,50 +9176,55 @@ algorithm was validated standalone against stubbed calls (spaces in the path, a
 root-level exe, forward slashes, and the truncation fallback). What is NOT
 machine-verified here is the Windows compile itself.
 
-## Active 57 — The keyframe gutter labels pointed 14px above the lanes they named
+## Active 57 — The keyframe gutter named the wrong lane (two bugs, one report)
 
 Reported as "the keyframe track gutter doesn't align with the keyframe timeline".
+**Two independent defects**, found by measuring the real project
+(`~/hello.vyproj`, a clip on Track 1 with four keyframe tracks) rather than the
+synthetic fixture.
 
-Every keyframe lane name sat **14px above** the lane it labelled, on every track
-and every lane — a lane named "crop.b" pointed at the diamonds of the lane above
-it. Probed red before the fix: `KeyframeGutterName lane 0 centre 725.0, diamond
-lane 0 is at 739.0 (off by -14.0)`.
+### 1. The gutter's origin was a measured text height (FIXED, `1d78ac7`)
 
-The cause is the class this file keeps running into: **"where is lane N" was
-derived in three places, each locally correct and none able to see the others.**
+Every lane name sat **14px above** the lane it named. "Where is lane N" was
+derived in three places: the GPU diamond pass added `CLIP_TILE_HEIGHT` to the
+tile box, the gutter let Clay's text flow decide where labels began (measured
+name height + `childGap`), and the Clay lane elements just flowed. The gutter's
+origin was 18 + 4 = 22px; the lanes began at the fixed 36px.
 
-- the GPU diamond pass computed `tile.y + CLIP_TILE_HEIGHT + (lane+0.5)*KF_ROW_H`
-- the gutter let Clay's text flow decide where the labels began — the measured
-  line height of the track name plus the `TrackName` childGap
-- the Clay `KeyframeLane` elements just flowed
+`keyframe_lane_offset(lane)` in layout.odin is now the only expression of a
+lane's position, and the diamond pass, the hit-test, the Clay lane elements, the
+gutter's name box, the row/wrap sizing and the scroll height all call it.
 
-The gutter's origin was a *measured* text height (18px) plus a 4px gap = 22px,
-while the lanes began at the fixed `CLIP_TILE_HEIGHT` = 36px. 22 ≠ 36 is the 14px.
+### 2. The gutter spoke TRACK index while the painter spoke ROW index (FIXED, here)
 
-#### Fix: one derivation, called by every side
+The fixture had two lanes on track 0 and passed. The real project has a
+**section track**: `transform` owns both `transform.x` and `transform.y`, so the
+clip's four tracks are **five** lane rows.
 
-`keyframe_lane_offset(lane)` in layout.odin is now the only expression of where a
-lane begins, and it lives next to the constants it derives from. Everything that
-has to agree calls it:
+- `keyframe_clip_rows` (the painter) sums `lane_count` -> **5 rows**
+- `keyframe_gutter_names` emitted one name per TRACK -> **4 labels**
 
-- the Clay `KeyframeLane` elements and the gutter's fixed name box size themselves
-  from it (the name box is `keyframe_lane_offset(0)` — "past the tile")
-- `keyframe_key_center` positions the diamonds and the hit-test from it, so a
-  pick and a paint cannot drift either
-- a track row and a clip wrap are sized by it
-- `timeline_tracks_content_height` uses it, so scroll geometry stays a pure
-  function of the model, never of layout timing
+So `transform`, `zoom`, `pan.x`, `pan.y` were laid out on five rows: every label
+from row 1 down named the row above it (`zoom` sat on `transform.y`'s diamonds),
+and the fifth lane had **no label at all** — an invisible row that reads as
+missing data.
 
-`TRACK_ROW_H` is already `CLIP_TILE_HEIGHT` by definition, so a row sized by
-`keyframe_lane_offset` is also the size that keeps a row's lanes and tiles aligned.
+keyframes.odin has said since Active 52 that "the flattened row index is what the
+painter, the hit-test and the gutter all speak". The gutter was the last one still
+speaking track index. It now walks `keyframe_clip_rows` /
+`keyframe_clip_row_name` — the same flattened-row walk the painter uses.
 
-#### The class is now detectable
+#### The class is now asserted, on a real project
 
-`ui_probe_layout_asserts` compares each gutter label's centre against
-`keyframe_lane_offset(lane)` for **every track with lanes**, not a sample track.
-The expected value is computed by the same function both renderers call, so the
-probe cannot drift from the implementation — it can only catch a side that stops
-calling it. A one-track check would have passed while the class was still live.
+- `ui_probe_gutter_alignment` (runs in the fixture probe too) checks, per track,
+  that the label COUNT equals the lane count the row was sized for. A lane with
+  no label is a lane the row reserved space for and nobody named — that
+  invariant is what defect 2 violated, and it is now impossible to reintroduce
+  silently.
+- `VYPER_GUTTER_PROBE=<project.vyproj>` runs the same check against a real
+  project and PRINTS the numbers, because "the fixture passed" said nothing about
+  a shape the fixture does not have. Run it against the project a bug was
+  reported from before calling it fixed.
 
 ## Active 53 — The timeline has two renderers, and a zoom click makes them disagree
 

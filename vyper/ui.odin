@@ -252,18 +252,30 @@ build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
 	return clay.EndLayout(0)
 }
 
-// keyframe_gutter_names collects the distinct keyframe-track names the track-name
-// gutter (KeyframeGutterNames) labels one visible lane each: every clip's tracks in
-// clip order, deduplicated. Capped at `rows` (the row only has room for that
-// many lines); clips keyframing paths others omit still read because each
-// label row is aligned to the same KF_ROW_H lanes above the tiles.
+// keyframe_gutter_names collects the lane names the track-name gutter
+// (KeyframeGutterNames) labels one visible row each: every clip's rows in clip
+// order, deduplicated. Capped at `rows` (the row only has room for that many
+// lines); clips keyframing lanes others omit still read because each label row
+// is aligned to the same KF_ROW_H lanes above the tiles.
+//
+// It walks FLATTENED ROWS (keyframe_clip_row_name), not tracks, and that is the
+// whole correctness of this proc. A section track owns several lanes -- the
+// "transform" track holds transform.x AND transform.y -- and the painter draws
+// one diamond per lane, so a clip with tracks {transform, zoom, pan.x, pan.y}
+// draws FIVE rows while one name per track produced FOUR labels. Every label
+// from row 1 down was then naming the row above it: "zoom" sat on transform.y's
+// diamonds, "pan.x" on zoom's, and the last lane had no label at all, because
+// the row was sized for five and only four names were ever emitted. keyframes.odin
+// says the flattened row index is what the painter, the hit-test and the gutter
+// all speak (TODO.md Active 52); this proc was the last one still speaking track
+// index, which is what made the gutter disagree with the lanes beside it.
 keyframe_gutter_names :: proc(track: ^Track, rows: int, out: []string) -> int {
 	n := 0
 	for &c in track.clips {
-		for i in 0..<c.keyframe_tracks.n {
-			t := session_trk_view(c.keyframe_tracks,i)
+		for row in 0 ..< keyframe_clip_rows(c.keyframe_tracks) {
+			lane := keyframe_clip_row_name(c.keyframe_tracks, row)
+			if lane == "" {continue}
 			dup := false
-			lane := keyframe_track_name(t)
 			for i in 0 ..< n {
 				if out[i] == lane {
 					dup = true
