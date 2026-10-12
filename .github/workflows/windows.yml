@@ -10,7 +10,6 @@ permissions:
   contents: read
 
 env:
-  ODIN_VERSION: dev-2026-09
   SDL3_VER: 3.4.14
   GLSLANG_VER: 16.6.0
 
@@ -22,15 +21,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Same compiler line as .mise.toml. This was dev-2026-07a while the dev
-      # machine tracked dev-2026-09, so CI was validating a build two months
-      # behind the one the gates actually run -- a compiler bump changes codegen,
-      # which is exactly what a build gate is supposed to catch.
+      # The compiler line is READ from .mise.toml rather than pinned here. It was
+      # pinned, and drifted: this said dev-2026-07a while the dev machine tracked
+      # dev-2026-09, so CI was validating a build two months behind the one the
+      # gates actually run. A compiler bump changes codegen, which is exactly what
+      # a build gate is supposed to catch -- so a second copy of the version can
+      # only ever make the gate check a compiler nobody uses. One home for it.
+      - name: Read pinned Odin version
+        id: odin_version
+        shell: pwsh
+        run: |
+          # .mise.toml is `odin = "dev-2026-10"`. Fail loudly if that shape
+          # changes, so the gate cannot silently fall back to an unpinned Odin.
+          $line = Select-String -Path .mise.toml -Pattern '^odin\s*=\s*"([^"]+)"\s*$'
+          if (-not $line) { throw "no pinned odin in .mise.toml -- a build gate must not pick its own compiler" }
+          $v = $line.Matches[0].Groups[1].Value
+          Write-Host "odin=$v (from .mise.toml)"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
       - name: Setup Odin
         uses: laytan/setup-odin@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          release: ${{ env.ODIN_VERSION }}
+          release: ${{ steps.odin_version.outputs.version }}
 
       # Prebuilt dependency binaries (no vcpkg-from-source: ffmpeg cold builds
       # take 20+ min). SDL3 MSVC dev package provides the SDL3.lib import lib
