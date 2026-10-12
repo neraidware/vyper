@@ -186,32 +186,91 @@ text_buf_size_for :: proc(
 	return bw, bh
 }
 
-// rasterize_title_into_buffer is the shared core: rasterize `title` as white
-// glyphs at the top of an RGBA buffer bw x bh on a fully transparent background.
-// font_px is the glyph pixel height (TEXT_CLIP_FONT_PIXELS at scale 1) — callers
-// pass 48*clip.scale so baking the clip's scale into the raster keeps glyphs
-// crisp instead of upscaling a fixed-size render. Returns the tight ink rect
-// (ox, oy, w, h) in buffer pixels. Font state and the per-glyph scratch are
-// passed in so each caller owns them — the UI thread and the render worker each
-// keep their own, avoiding a data race on the shared preview font/scratch
-// globals.
-rasterize_title_into_buffer :: proc(
+// --- layout -----------------------------------------------------------------
+//
+// TEXT_CHAR_UNIT is what Text_Glyph.char_index counts. It is a codepoint index
+// today, and it is named so that changing it is a change to ONE definition
+// rather than to the layout, the painter and every piece that addresses a
+// character.
+//
+// The unit that will eventually replace it is a Unicode grapheme cluster, and
+// kb_text_shape already vendors both the segmentation and the OpenType shaping
+// for it (in the Odin distribution's vendor tree). Two things about that are
+// worth knowing before adopting it, because both bear on this axis:
+//
+//   - Segmentation is SEPARABLE from shaping. `kbts_BreakEntireStringUtf8`
+//     returns grapheme boundaries over a UTF-8 string with no font and no
+//     shaping context, so the cluster axis does not require adopting OpenType
+//     shaping to exist.
+//   - The shaper's glyph cluster is OUR choice: ShapeCodepointWithUserId with
+//     user_id_generation_mode.SOURCE_INDEX carries whichever index we hand in,
+//     so a codepoint axis today becomes a grapheme axis later by changing what
+//     we pass, not by reworking the layout.
+//
+// It does not link yet: the bindings want a prebuilt `lib/kb_text_shape.a` from
+// `src/build_unix.sh`, which is a build-system change (and the Windows CI has no
+// such script). Until then a codepoint index is the honest unit, with the
+// combining-mark case it implies flagged rather than hidden: a reveal range
+// stored in codepoints can split a cluster.
+
+// Text_Glyph is one character's placement, as measured rather than painted.
+//
+// It is the data the old loop computed and threw away on every iteration. With
+// it kept, everything a per-character feature needs — a stroke pass, a colour
+// per character, a reveal range over "characters 3..7 of this piece" — is a read
+// of this array instead of a rewrite of the rasterizer.
+Text_Glyph :: struct {
+	codepoint:  rune,
+	// char_index: this character's position in the text, per TEXT_CHAR_UNIT.
+	// Carried so a glyph can be traced back to the piece that owns it and to
+	// its offset inside that piece.
+	char_index: int,
+	// x: the pen position when this glyph starts, in raster pixels. advance: how
+	// far the pen moves after it, kerning already applied to x. box: stb's
+	// integer bitmap box at the baked scale, which is what MakeCodepointBitmap
+	// and the ink rect are derived from.
+	x:       f32,
+	advance: f32,
+	box:     [4]c.int,
+}
+
+// Text_Layout is one line's worth of measurement. glyphs BORROWS the caller's
+// buffer: the layout writes into storage the caller owns and reuses, so laying
+// text out allocates nothing after the first line of a given length.
+Text_Layout :: struct {
+	glyphs:   []Text_Glyph,
+	scale:    f32,
+	baseline: f32,
+	// width: the exact advance width of the laid text, kerning included. The
+	// buffer sizer used to GUESS this at 1.2 pixels per codepoint; it can read
+	// the real number here instead, which is the one thing this split buys that
+	// is free today.
+	width: f32,
+	// ink: the tight bounds of what was laid out, in raster pixels, with the same
+	// arithmetic the painter used inline — a glyph with no ink (a space) still
+	// advances the right edge, exactly as before.
+	ink_x, ink_y, ink_w, ink_h: int,
+}
+
+// text_layout_into measures `title` into `glyphs`, which the caller owns and
+// reuses: it is cleared (keeping its capacity) and refilled. Font state is passed
+// in so each caller keeps its own, the same reason the rasterizer takes it.
+//
+// Nothing here paints. That is the whole point of the split: measurement is
+// cheap, has no output buffer, and every per-character feature is a consumer of
+// it, so the expensive half runs only when something asks for pixels.
+text_layout_into :: proc(
 	title: string,
-	buf: []u8,
-	bw, bh: int,
 	font: ^stb.fontinfo,
 	font_init: ^bool,
-	scratch: []u8,
 	font_px: f32,
+	glyphs: ^[dynamic]Text_Glyph,
 ) -> (
-	ox: int,
-	oy: int,
-	ow: int,
-	oh: int,
+	layout: Text_Layout,
 ) {
-	mem.zero(raw_data(buf), len(buf))
+	clear(glyphs)
 	if len(title) == 0 {
-		return 0, 0, 0, 0
+		return {}
 	}
 	px := font_px
 	if px <= 0 {
@@ -228,6 +287,7 @@ rasterize_title_into_buffer :: proc(
 	right := -max(int)
 	x_pen: f32 = 4.0
 	prev: rune = 0
+	char_index := 0
 	for ch in title {
 		if prev > 0 {
 			x_pen += f32(stb.GetCodepointKernAdvance(font, prev, ch)) * scale
@@ -245,71 +305,121 @@ rasterize_title_into_buffer :: proc(
 			&box_val[2],
 			&box_val[3],
 		)
-		ix0 := int(box_val[0])
-		iy0 := int(box_val[1])
-		ix1 := int(box_val[2])
-		iy1 := int(box_val[3])
-		gw := int(ix1 - ix0)
-		gh := int(iy1 - iy0)
-		start_x := cast(int)x_pen + ix0
-		start_y := cast(int)baseline + iy0
-		// Track the drawn ink so the returned rect is the tight text bounds.
-		x0 := start_x
-		x1 := start_x + gw
-		y0 := start_y
-		y1 := start_y + gh
-		if y0 < top {
-			top = y0
+		append(
+			glyphs,
+			Text_Glyph {
+				codepoint = ch,
+				char_index = char_index,
+				x = x_pen,
+				advance = f32(adv) * scale,
+				box = box_val,
+			},
+		)
+		char_index += 1
+		// The ink rect is measured HERE rather than while painting, and with the
+		// same arithmetic: a glyph with no ink still advances the right edge, so
+		// the rect is identical to what the fused loop produced.
+		start_x := cast(int)x_pen + int(box_val[0])
+		start_y := cast(int)baseline + int(box_val[1])
+		ink_right := start_x + int(box_val[2]) - int(box_val[0])
+		ink_bottom := start_y + int(box_val[3]) - int(box_val[1])
+		if start_y < top {
+			top = start_y
 		}
-		if y1 > bottom {
-			bottom = y1
+		if ink_bottom > bottom {
+			bottom = ink_bottom
 		}
-		if x0 < left {
-			left = x0
+		if start_x < left {
+			left = start_x
 		}
-		if x1 > right {
-			right = x1
-		}
-		if gw > 0 && gh > 0 {
-			n := gw * gh
-			if n <= len(scratch) {
-				mem.zero(raw_data(scratch[:n]), n)
-				stb.MakeCodepointBitmap(
-					font,
-					raw_data(scratch[:]),
-					c.int(gw),
-					c.int(gh),
-					c.int(gw),
-					scale,
-					scale,
-					ch,
-				)
-				for gy in 0 ..< gh {
-					for gx in 0 ..< gw {
-						a := int(scratch[gy * gw + gx])
-						if a == 0 {
-							continue
-						}
-						px := start_x + gx
-						py := start_y + gy
-						if px < 0 || py < 0 || px >= bw || py >= bh {
-							continue
-						}
-						o := (py * bw + px) * 4
-						buf[o + 0] = 255
-						buf[o + 1] = 255
-						buf[o + 2] = 255
-						buf[o + 3] = u8(a)
-					}
-				}
-			}
+		if ink_right > right {
+			right = ink_right
 		}
 		x_pen += f32(adv) * scale
 		prev = ch
 	}
-	ow = max(0, right - left)
-	oh = max(0, bottom - top)
-	return left, top, ow, oh
+	layout = Text_Layout {
+		glyphs = glyphs[:],
+		scale = scale,
+		baseline = baseline,
+		width = x_pen,
+		ink_x = left,
+		ink_y = top,
+		ink_w = max(0, right - left),
+		ink_h = max(0, bottom - top),
+	}
+	return
+}
+
+// rasterize_title_into_buffer paints a measured layout as white glyphs at the top
+// of an RGBA buffer bw x bh on a fully transparent background. It is the
+// measurement's other half: the loop it used to fuse is now text_layout_into, and
+// what is left here is one glyph bitmap per entry.
+//
+// `layout_glyphs` is the caller-owned buffer text_layout_into writes into, for the
+// same reason the per-glyph `scratch` is passed in: the UI thread and the render
+// worker each keep their own, so neither races the other.
+rasterize_title_into_buffer :: proc(
+	title: string,
+	buf: []u8,
+	bw, bh: int,
+	font: ^stb.fontinfo,
+	font_init: ^bool,
+	scratch: []u8,
+	layout_glyphs: ^[dynamic]Text_Glyph,
+	font_px: f32,
+) -> (
+	ox: int,
+	oy: int,
+	ow: int,
+	oh: int,
+) {
+	mem.zero(raw_data(buf), len(buf))
+	layout := text_layout_into(title, font, font_init, font_px, layout_glyphs)
+	baseline_i := cast(int)layout.baseline
+	for glyph in layout.glyphs {
+		start_x := cast(int)glyph.x + int(glyph.box[0])
+		start_y := baseline_i + int(glyph.box[1])
+		gw := int(glyph.box[2]) - int(glyph.box[0])
+		gh := int(glyph.box[3]) - int(glyph.box[1])
+		if gw <= 0 || gh <= 0 {
+			continue
+		}
+		n := gw * gh
+		if n > len(scratch) {
+			continue
+		}
+		mem.zero(raw_data(scratch[:n]), n)
+		stb.MakeCodepointBitmap(
+			font,
+			raw_data(scratch[:]),
+			c.int(gw),
+			c.int(gh),
+			c.int(gw),
+			layout.scale,
+			layout.scale,
+			glyph.codepoint,
+		)
+		for gy in 0 ..< gh {
+			for gx in 0 ..< gw {
+				a := int(scratch[gy * gw + gx])
+				if a == 0 {
+					continue
+				}
+				px := start_x + gx
+				py := start_y + gy
+				if px < 0 || py < 0 || px >= bw || py >= bh {
+					continue
+				}
+				o := (py * bw + px) * 4
+				buf[o + 0] = 255
+				buf[o + 1] = 255
+				buf[o + 2] = 255
+				buf[o + 3] = u8(a)
+			}
+		}
+	}
+	return layout.ink_x, layout.ink_y, layout.ink_w, layout.ink_h
 }
 
 // text_buf_size_for_lines estimates a single-call RGBA buffer (bw x bh) large
@@ -382,6 +492,11 @@ rasterize_lines_into_buffer :: proc(
 		loh: int,
 	}
 	slots := make([]Type_Line_Slot, len(lines), context.temp_allocator)
+	// One measurement buffer for every line, grown to the longest and reused:
+	// subtitles are baked once per clip, not per frame, and this path already
+	// allocates a line buffer per line from the same arena, so one more growing
+	// buffer over the whole loop is the same trade with none of the per-line cost.
+	line_layout: [dynamic]Text_Glyph
 
 	// Line pitch = the font's typographic line box, so stacked lines sit at
 	// exactly their standard character height (no overlap, no dead gap).
@@ -402,6 +517,7 @@ rasterize_lines_into_buffer :: proc(
 			font,
 			font_init,
 			scratch,
+			&line_layout,
 			px,
 		)
 		slots[i] = {

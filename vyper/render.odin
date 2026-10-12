@@ -1182,6 +1182,13 @@ render_text_font: Render_Text_Font
 // text_box_dims with the sampled scale (render_text_blit), so the ink carrying
 // the scale and the box applying it cannot drift into a double-scaling.
 Render_Text_Job :: struct {
+	// layout is the measurement the raster was painted from: one entry per
+	// character, carrying that character's index into the text and its placement.
+	// It is kept beside the ink rather than discarded, because every per-character
+	// property — a stroke pass, a colour, a reveal range over "characters 3..7 of
+	// this piece" — is a read of it, and re-measuring to find that out would be
+	// work the job already did. Grow-only, owned by the job, freed with it.
+	layout:          [dynamic]Text_Glyph,
 	raster:         []u8,
 	bw:             int, // raster row stride
 	ox, oy, ow, oh: int, // tight ink rect in raster
@@ -1226,6 +1233,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, r
 		&render_text_font.font,
 		&render_text_font.init,
 		scratch,
+		&over.layout,
 		font_px,
 	)
 	if ow <= 0 || oh <= 0 {
@@ -3627,6 +3635,18 @@ render_worker_run :: proc() {
 		t := &render_job.texts[i]
 		base := t.geom.base[int(Render_Geom_Prop.Scale)]
 		setup_text_job(&text_jobs[i], t^, base, true)
+	}
+	// Every job's ink and its measurement are this run's to release. They are
+	// general-heap allocations with no arena behind them, and the jobs live until
+	// the frame loop ends, so without this each render run leaks one RGBA raster
+	// plus its layout per text clip -- and the jobs array itself. Nothing else in
+	// this proc frees them: text_job_rescale frees only a raster it SUPERSEDED.
+	defer {
+		for &job in text_jobs {
+			delete(job.raster)
+			delete(job.layout)
+		}
+		delete(text_jobs)
 	}
 
 	// Subtitle compositing: a one-slot active-cue raster cache per clip. Cues

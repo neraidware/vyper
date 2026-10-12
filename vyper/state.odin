@@ -1498,6 +1498,12 @@ Preview_Slot :: struct {
 	// sized for the current baked font (the fixed shared buffers are too
 	// small once clip.scale is baked into a larger font).
 	text_scratch:         []u8,
+	// text_layout is the per-glyph MEASUREMENT the rasterizer fills before it
+	// paints: one entry per character, each carrying its index into the text and
+	// its placement. It is the slot's own, grow-only and reused across rebakes,
+	// for the same reason text_scratch is — a slot is rasterized on the UI
+	// thread and nothing else may hand it storage.
+	text_layout:          [dynamic]Text_Glyph,
 	// text_recreate tells the render loop a text slot's texture must be
 	// reallocated at text_tex_w x text_tex_h (buffer size changed or the slot
 	// just became text). Only the render loop has the GPU device, so it does the
