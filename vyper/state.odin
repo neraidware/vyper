@@ -137,6 +137,31 @@ Timeline_View :: struct {
 	top:   f32,
 }
 timeline_view: Timeline_View = {start = 0, zoom = 1, top = 0}
+
+// frame_view is timeline_view frozen for the frame being drawn.
+//
+// The frame loop lays the timeline out ONCE (build_page) and then, before it
+// draws, dispatches the clicks that can pan and zoom it (interaction_post_build).
+// Drawing then had two renderers reading the same mutable struct at two different
+// moments: Clay replayed commands baked at the old view, while the GPU overlay
+// passes recomputed x from the new one. Every pan or zoom click drew the frame
+// desynced — measured at 30px across all six tracks of a real project — and the
+// baked per-track scissors no longer matched the overlay geometry either.
+//
+// One snapshot removes the class rather than the instance: everything that
+// computes screen geometry reads THIS, so within a frame there is a single
+// number to disagree with. input keeps editing timeline_view, which the next
+// frame then freezes again.
+//
+// Three consumers, and the snapshot belongs to two of them:
+//   DRAW from frame_view, and HIT-TEST against frame_view -- both describe
+//   pixels, and the pointer is answering the question "which pixel".
+//   EDIT timeline_view -- panning, zooming, and scrolling are model changes,
+//   and they take effect on the next frame, never mid-draw.
+// Putting the hit-tests on the live view instead would be the same defect one
+// step removed: the pointer would be resolved through a transform the user has
+// not been shown yet.
+frame_view: Timeline_View = {start = 0, zoom = 1, top = 0}
 SNAP_PIXELS :: 8 // Snap margin (in screen px) while either toggle is on.
 TIMELINE_MIN_ZOOM :: f32(0.001)
 TIMELINE_MAX_ZOOM :: f32(16)

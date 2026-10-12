@@ -196,6 +196,7 @@ when ODIN_DEBUG {
 		// disagree for any frame of a track, the two renderers are out of sync.
 		timeline_view.zoom = saved_zoom
 		timeline_view.start = saved_start
+		frame_view = timeline_view
 		_ = build_page(WINDOW_WIDTH, WINDOW_HEIGHT)
 
 		// Capture the baked lane geometry at Z0, exactly as the draw reads it.
@@ -215,19 +216,19 @@ when ODIN_DEBUG {
 		timeline_view.start = clamp(timeline_view.start, 0, f32(timeline_duration()))
 		timeline_view.zoom = new_zoom
 
-		// Now the overlay's read on the SAME frame: live view, but the lane box
-		// from the Z0 bake (it has not been re-laid-out yet).
+		// The overlay's read on the SAME frame. draw_keyframes and draw_clip_markers
+		// compute `lane.x + (frame - frame_view.start) * frame_view.zoom`, and
+		// frame_view was frozen before build_page, so it still holds Z0. Read it
+		// here rather than re-deriving "what the overlay would have read": a probe
+		// that models the second renderer can disagree with a correct fix, and a
+		// probe that cannot fail is worse than none.
 		bad := 0
 		for t in 0 ..< len(timeline.tracks) {
 			lane := clay.GetElementData(clay.ID("ClipsSection", u32(t))).boundingBox.x
-			// A tile at frame F: Clay drew it at Z0, so its x is lane_at_zoom0 +
-			// the Z0 offset. The overlay computes lane(at Z0) + F*new_zoom - new_start.
-			// If those disagree, THIS FRAME draws tile and overlay in different
-			// places.
-			// Use the same F both sides so only the view/zoom differs.
+			// Same F both sides, so only the view differs.
 			F := f32(60)
 			clay_x := lane_at_zoom0[t] + F * zoom_before - saved_start * zoom_before
-			overlay_x := lane + F * timeline_view.zoom - timeline_view.start * timeline_view.zoom
+			overlay_x := lane + F * frame_view.zoom - frame_view.start * frame_view.zoom
 			if math.abs(clay_x - overlay_x) > 1.0 {
 				fmt.eprintf(
 					"[skew-probe] track %d: clay drew tile at %.1f, overlay at %.1f (skew %.1f)\n",
@@ -239,9 +240,22 @@ when ODIN_DEBUG {
 				bad += 1
 			}
 		}
+		// The freeze itself, stated first because it is the thing that makes the
+		// comparison above hold: mutating the live view after the bake must not move
+		// the snapshot every renderer reads from.
+		if frame_view.zoom != zoom_before || frame_view.start != saved_start {
+			fmt.eprintf(
+				"[skew-probe] FAIL: frame_view moved with the live view (zoom %v->%v, start %v->%v); the frame snapshot is not frozen\n",
+				zoom_before,
+				frame_view.zoom,
+				saved_start,
+				frame_view.start,
+			)
+			bad += 1
+		}
 		if bad > 0 {
 			fmt.eprintf(
-				"[skew-probe] FAIL: %d track(s) skewed between the baked Clay stream and the live GPU overlay on the zoom-click frame\n",
+				"[skew-probe] FAIL: %d track(s) skewed between the baked Clay stream and the GPU overlay on the zoom-click frame\n",
 				bad,
 			)
 			return

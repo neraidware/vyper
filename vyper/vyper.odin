@@ -2884,6 +2884,8 @@ main :: proc() {
 		refresh_file_drag()
 		interaction_pre_build(inp)
 
+		// build_page freezes timeline_view into frame_view, so the commands it
+		// bakes and the overlay passes drawn from them describe the same view.
 		commands := build_page(width, height)
 		clamp_view_scrolls()
 		was_mouse_down, was_right_down = interaction_post_build(

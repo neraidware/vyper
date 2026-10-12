@@ -173,7 +173,7 @@ timeline_frame_from_x :: proc(mx: f32) -> i64 {
 	if len(timeline.tracks) > 0 {
 		start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
 		if start > 0 {
-			return max(0, i64((mx - start) / timeline_view.zoom + timeline_view.start))
+			return max(0, i64((mx - start) / frame_view.zoom + frame_view.start))
 		}
 	}
 	empty := clay.GetElementData(clay.ID("EmptyTimeline")).boundingBox
@@ -184,7 +184,7 @@ timeline_frame_from_x :: proc(mx: f32) -> i64 {
 		// unshifted origin puts both the ghost tile and the committed clip
 		// ~GUTTER_WIDTH + SECTION_GAP pixels right of the cursor.
 		origin := empty.x + f32(TIMELINE_PADDING) + GUTTER_WIDTH + SECTION_GAP
-		return max(0, i64((mx - origin) / timeline_view.zoom + timeline_view.start))
+		return max(0, i64((mx - origin) / frame_view.zoom + frame_view.start))
 	}
 	return 0
 }
@@ -417,9 +417,9 @@ render_sdf_rect(renderer, command_buffer, pass, header, clay.Color{127, 187, 179
 				}
 			}
 			b := clay.BoundingBox{
-				x = lane_box.x + (f32(lane.placed) - timeline_view.start) * timeline_view.zoom,
+				x = lane_box.x + (f32(lane.placed) - frame_view.start) * frame_view.zoom,
 				y = lane_box.y,
-				width = f32(lane.clip_len) * timeline_view.zoom,
+				width = f32(lane.clip_len) * frame_view.zoom,
 				height = lane_box.height,
 			}
 			sdl.SetGPUScissor(

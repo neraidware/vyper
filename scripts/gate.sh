@@ -1191,6 +1191,22 @@ target_silent_playback() {
 #     audio_init: no device, so audio_producer_proc returned on its first line. It now
 #     calls audio_init itself, and FAILS if the project has audio clips and the producer
 #     never held a source.
+# Two-renderer skew check against a REAL project. Needs one, so it is not part of
+# `all` -- pass the project: ./scripts/gate.sh zoom_skew ~/some.vyproj
+#
+# This is the check that found the 30px desync: the frame loop lays the timeline
+# out, then dispatches the click that pans/zooms it, then draws -- so Clay drew
+# from the bake and the GPU overlay from the mutated view. Run it against any
+# project after touching timeline geometry.
+target_zoom_skew() {
+	require_fresh_binary zoom_skew || return 1
+	local proj=${1:?}
+	if ! VYPER_ZOOM_SKEW_PROBE="$proj" timeout 600 ./target/vyper 2>&1 | grep -E '^\[skew-probe\]'; then
+		return 1
+	fi
+	return 0
+}
+
 target_fuzz() {
 	require_fresh_binary fuzz || return 1
 	local proj=${1:?}
@@ -2282,6 +2298,7 @@ main() {
 	image_decode_probe) target_image_decode_probe ;;
 	proxy_bg) target_proxy_bg ;;
 	audio_group_isolation) target_audio_group_isolation ;;
+	zoom_skew) shift; target_zoom_skew "$@" ;;
 	fuzz) shift; target_fuzz "$@" ;;
 	silent_playback) target_silent_playback ;;
 	smoke) target_smoke ;;
@@ -2290,7 +2307,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|zoom_skew <project.vyproj>|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

@@ -102,6 +102,11 @@ UI_Text_Buffers :: struct {
 ui_text: UI_Text_Buffers
 
 build_page :: proc(width, height: c.int) -> clay.ClayArray(clay.RenderCommand) {
+	// Freeze the view for the frame being laid out. Doing it HERE rather than in
+	// the frame loop means every caller gets it by construction: a probe that
+	// moves the view and builds a page describes the same frame the overlay
+	// will draw, with no chance of one doing it and the other not.
+	frame_view = timeline_view
 	clay.SetLayoutDimensions({f32(width), f32(height)})
 	clay.BeginLayout()
 	DEFAULT_BORDER := clay.BorderOutside(1)
@@ -3159,7 +3164,7 @@ build_timeline :: proc(default_border: clay.BorderWidth) {
 						layoutDirection = .TopToBottom,
 						childGap = 0,
 					},
-					clip = {vertical = true, childOffset = {0, -timeline_view.top}},
+					clip = {vertical = true, childOffset = {0, -frame_view.top}},
 				},
 				) {
 					sync_track_order()
@@ -3334,7 +3339,7 @@ layoutDirection = .TopToBottom,
 								horizontal = true,
 								vertical = true,
 								childOffset = {
-									-timeline_view.start * timeline_view.zoom,
+									-frame_view.start * frame_view.zoom,
 									0,
 								},
 							},
@@ -3344,7 +3349,7 @@ layoutDirection = .TopToBottom,
 							for &timeline_clip, index in track.clips {
 								target_x :=
 									f32(timeline_clip.timeline_start_frame) *
-									timeline_view.zoom
+									frame_view.zoom
 								if target_x > clips_content_x {
 									spacer_w := target_x - clips_content_x
 									clips_content_x = target_x
@@ -3366,7 +3371,7 @@ layoutDirection = .TopToBottom,
 								}
 								clip_width :=
 									f32(max(timeline_clip.source_length_frames, 1)) *
-									timeline_view.zoom
+									frame_view.zoom
 								clip_color := BUTTON
 								clip_border := BUTTON_BORDER
 								clip_border_w: u16 = 2

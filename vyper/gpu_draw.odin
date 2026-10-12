@@ -42,19 +42,19 @@ draw_timeline_ruler :: proc(
 	)
 	dur := timeline_duration()
 	// Adapt the tick spacing to the current zoom so labels stay ~70px apart.
-	major := nice_frame_step(timeline_view.zoom)
+	major := nice_frame_step(frame_view.zoom)
 	minor := max(major / 5, 1)
 
 	// Tick marks along the bottom edge of the ruler strip.
 	minor_h := ruler.height * 0.35
 	major_h := ruler.height * 0.6
-	start_f := i64(f32(i64(timeline_view.start / f32(minor))) * f32(minor))
+	start_f := i64(f32(i64(frame_view.start / f32(minor))) * f32(minor))
 	// Ticks span [0, dur): dur is the exclusive end and holds no frame (the
 	// last content frame is dur-1), so a tick/label there reads as a phantom
 	// "one frame above the clip's frame count" -- the playhead's max is
 	// already dur-1, which draws the boundary instead.
 	for f := start_f; f < dur; f += minor {
-		x := ruler.x + (f32(f) - timeline_view.start) * timeline_view.zoom
+		x := ruler.x + (f32(f) - frame_view.start) * frame_view.zoom
 		if x < ruler.x {
 			continue
 		}
@@ -100,7 +100,7 @@ draw_timeline_ruler :: proc(
 
 	// Vertical playhead line spanning the ruler and all track rows, plus a grab
 	// handle sitting on top of the ruler strip.
-	line_x := ruler.x + (f32(playhead.frame) - timeline_view.start) * timeline_view.zoom
+	line_x := ruler.x + (f32(playhead.frame) - frame_view.start) * frame_view.zoom
 	tracks := clay.GetElementData(clay.ID("TracksSection")).boundingBox
 	line_bottom := ruler.y + RULER_HEIGHT + tracks.height
 	render_sdf_rect(
@@ -152,8 +152,8 @@ draw_render_range :: proc(
 	if project.start_frame >= 0 &&
 	   project.end_frame >= 0 &&
 	   project.start_frame < project.end_frame {
-		x1 := ruler.x + (f32(project.start_frame) - timeline_view.start) * timeline_view.zoom
-		x2 := ruler.x + (f32(project.end_frame) - timeline_view.start) * timeline_view.zoom
+		x1 := ruler.x + (f32(project.start_frame) - frame_view.start) * frame_view.zoom
+		x2 := ruler.x + (f32(project.end_frame) - frame_view.start) * frame_view.zoom
 		if x2 > ruler.x && x1 < isect {
 			band_x := max(x1, ruler.x)
 			band_w := min(x2, isect) - band_x
@@ -173,13 +173,13 @@ draw_render_range :: proc(
 	// Edge caps make the range boundaries readable even when the band is thin;
 	// a lone start/end marker is drawn the same way so its placement is visible.
 	if project.start_frame >= 0 {
-		x1 := ruler.x + (f32(project.start_frame) - timeline_view.start) * timeline_view.zoom
+		x1 := ruler.x + (f32(project.start_frame) - frame_view.start) * frame_view.zoom
 		if x1 >= ruler.x && x1 <= isect {
 			render_sdf_rect(renderer, command_buffer, pass, {x1, y, 2, 8}, RANGE_COLOR, 0, 0)
 		}
 	}
 	if project.end_frame >= 0 {
-		x2 := ruler.x + (f32(project.end_frame) - timeline_view.start) * timeline_view.zoom
+		x2 := ruler.x + (f32(project.end_frame) - frame_view.start) * frame_view.zoom
 		if x2 >= ruler.x && x2 <= isect {
 			render_sdf_rect(renderer, command_buffer, pass, {x2 - 2, y, 2, 8}, RANGE_COLOR, 0, 0)
 		}
@@ -380,7 +380,7 @@ render_clay :: proc(
 
 // tracks_scroll_box is the track list's own viewport: the TracksSection box, which
 // is the rect Clay clips the rows to (clip.vertical) and slides them by
-// (childOffset = -timeline_view.top).
+// (childOffset = -frame_view.top).
 //
 // It is the ONE rect every track-lane overlay must intersect. draw_clip_markers
 // and draw_keyframes run after render_clay, so they do not inherit Clay's scissor
@@ -777,7 +777,7 @@ draw_clip_markers :: proc(
 			for marker_idx in 0..<clip.markers.n {
 				m := session_marker_at(clip.markers, marker_idx)
 				line_x := clamp(
-					box.x + f32(m.source_frame - clip.source_start_frame) * timeline_view.zoom,
+					box.x + f32(m.source_frame - clip.source_start_frame) * frame_view.zoom,
 					box.x,
 					box.x + box.width,
 				)
@@ -854,7 +854,7 @@ draw_clip_markers :: proc(
 keyframe_key_center :: proc(box: clay.BoundingBox, lane: int, frame_off: i32) -> (f32, f32) {
 	cy := box.y + keyframe_lane_offset(lane) + KF_ROW_H / 2
 	cx := clamp(
-		box.x + f32(frame_off) * timeline_view.zoom,
+		box.x + f32(frame_off) * frame_view.zoom,
 		box.x + KF_DIAMOND_R,
 		box.x + box.width - KF_DIAMOND_R,
 	)
@@ -1024,8 +1024,8 @@ draw_drag_ghost :: proc(
 				continue
 			}
 			start := max(m.start + clip_move.group_delta, 0)
-			x0 := lane.x + (f32(start) - timeline_view.start) * timeline_view.zoom
-			w := f32(m.length) * timeline_view.zoom
+			x0 := lane.x + (f32(start) - frame_view.start) * frame_view.zoom
+			w := f32(m.length) * frame_view.zoom
 			bounds := clay.BoundingBox {
 				x      = x0,
 				y      = lane.y,
@@ -1072,8 +1072,8 @@ draw_drag_ghost :: proc(
 		return
 	}
 	// Lane origin is at frame 0 = ruler.x; tiles slide with the view offset.
-	x0 := lane.x + (f32(placed) - timeline_view.start) * timeline_view.zoom
-	w := f32(clip_len) * timeline_view.zoom
+	x0 := lane.x + (f32(placed) - frame_view.start) * frame_view.zoom
+	w := f32(clip_len) * frame_view.zoom
 	// Ghost tile height matches real clips (CLIP_TILE_HEIGHT, same as the layout).
 	h := CLIP_TILE_HEIGHT
 	bounds := clay.BoundingBox {

@@ -863,7 +863,7 @@ click_fallbacks := []proc(inp: Mouse_Input) -> bool{
 				keyframe_move.anchor = grab
 				box :=
 					clay.GetElementData(clay.ID("TimelineClipWrap", u32(grab.track_idx * 1000 + grab.clip_index))).boundingBox
-				keyframe_move.press_frame = (inp.x - box.x) / timeline_view.zoom
+				keyframe_move.press_frame = (inp.x - box.x) / frame_view.zoom
 			}
 			undo_begin()
 			active_interaction = .Keyframe_Move
@@ -1158,7 +1158,7 @@ update_keyframe_drag :: proc(mx: f32) {
 	if box.width <= 0 {
 		return
 	}
-	cursor_frame := (mx - box.x) / timeline_view.zoom
+	cursor_frame := (mx - box.x) / frame_view.zoom
 	keyframe_move.delta = i32(math.round(cursor_frame - keyframe_move.press_frame))
 }
 
@@ -1697,7 +1697,7 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		   selection.track < len(timeline.tracks) &&
 		   selection.index < len(timeline.tracks[selection.track].clips) {
 			track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-			frame := max(f32(0), (inp.x - track_start) / timeline_view.zoom + timeline_view.start)
+			frame := max(f32(0), (inp.x - track_start) / frame_view.zoom + frame_view.start)
 			// Clip→playhead toggle applies to trim and roll drags too.
 			if editor_flags.snap_clips_to_playhead {
 				frame = f32(snap_to_playhead(i64(frame)))
@@ -1775,7 +1775,7 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 		if clip_move.clip != nil {
 			clip_x := inp.x - clip_move.offset
 			track_start := clay.GetElementData(clay.ID("ClipsSection", 0)).boundingBox.x
-			frame := (clip_x - track_start) / timeline_view.zoom + timeline_view.start
+			frame := (clip_x - track_start) / frame_view.zoom + frame_view.start
 			frame = max(frame, 0)
 			// Clip→playhead toggle: latch the drag target onto the playhead
 			// once it comes within the pixel snap margin. Applied to the
@@ -1872,7 +1872,7 @@ interaction_move :: proc(inp: Mouse_Input, prev_mouse_down: bool, height: c.int)
 	case .Playhead_Scrub:
 		// Scrub the playhead to the pointer's frame along the ruler bar.
 		ruler := clay.GetElementData(clay.ID("Ruler")).boundingBox
-		frame := i64((inp.x - ruler.x) / timeline_view.zoom + timeline_view.start)
+		frame := i64((inp.x - ruler.x) / frame_view.zoom + frame_view.start)
 		frame = max(frame, 0)
 		// Clamp to the last REAL frame of the timeline. timeline_duration()
 		// is the exclusive content end, so frame == timeline_duration() is a
