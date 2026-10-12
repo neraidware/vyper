@@ -118,19 +118,31 @@ jobs:
 
       # The probes (VYPER_FRAME_PROBE, VYPER_PROXY_PROBE) are debug-only: a release
       # binary does not contain them, which is the point of the release build. So the
-      # smoke test below runs a separate debug build of the same source against the
-      # same ffmpeg DLLs the dist ships, and the dist's vyper.exe stays the release
-      # build. What the smoke test proves is the DLL set and the decode path, which the
-      # two builds share; it does not run the shipped exe.
-      - name: Build probe binary (debug)
+      # smoke test below runs the debug build against the same ffmpeg DLLs the dist
+      # ships, and the dist's vyper.exe stays the release build. What the smoke test
+      # proves is the DLL set and the decode path, which the two builds share; it does
+      # not run the shipped exe.
+      #
+      # The debug binary is now a published artifact too, so it is named vyper-debug
+      # rather than vyper-probe: it is the whole application with probes compiled in,
+      # and a name that says "probe" would ship a binary that looks like a
+      # diagnostic-only tool and is not one.
+      - name: Build debug binary (with probes)
         shell: pwsh
         run: |
           $env:VYPER_LINK_FLAGS = "/LIBPATH:$PWD\deps\lib /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup"
-          $env:VYPER_OUT = "vyper-probe.exe"
+          $env:VYPER_OUT = "vyper-debug.exe"
           odin run build.odin -file -- debug
           if ($LASTEXITCODE -ne 0) { throw "build.odin debug failed (exit $LASTEXITCODE)" }
 
-      - name: Stage dist
+      # Two artifacts, deliberately SEPARATE folders: the release dist must stay
+      # exactly the release build, because shipping a debug binary next to it in
+      # one folder is how somebody ends up handing a user a probe-carrying
+      # -o:none build and calling it the release. They duplicate the runtime DLLs
+      # (ffmpeg's shared set is most of that size, and GitHub only recalculates
+      # artifact usage every 6-12h, so it costs quota) -- correctness of what a
+      # user downloads is worth more than the duplicate.
+      - name: Stage dist (release)
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -139,6 +151,16 @@ jobs:
           # CLIs stay behind in deps\ (smoke-only, not shipped).
           Get-ChildItem deps\*.dll | Copy-Item -Destination dist -Force
           Get-ChildItem dist | Select-Object Name,Length
+
+      - name: Stage dist-debug (debug)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist-debug | Out-Null
+          Copy-Item vyper-debug.exe dist-debug\vyper-debug.exe -Force
+          # Same runtime DLLs as the release dist: the debug binary is the same
+          # program with probes compiled in, not a different dependency set.
+          Get-ChildItem deps\*.dll | Copy-Item -Destination dist-debug -Force
+          Get-ChildItem dist-debug | Select-Object Name,Length
 
       # Smoke test the shipped DLL set headlessly: generate a sample, decode a
       # frame range through the vendored ffmpeg DLLs (VYPER_FRAME_PROBE), then
@@ -152,7 +174,7 @@ jobs:
       - name: Smoke test (decode + proxy)
         shell: pwsh
         run: |
-          # vyper-probe.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
+          # vyper-debug.exe is /SUBSYSTEM:WINDOWS; its stdout only exists when
           # redirected, so every run writes a log that we dump on failure/success.
           $env:PATH = "$PWD\dist;$env:PATH"
           & .\deps\ffmpeg.exe -y -loglevel error -f lavfi -i testsrc2=duration=8:size=320x180:rate=30 -frames:v 240 -pix_fmt yuv420p sample.mp4
@@ -163,7 +185,7 @@ jobs:
           # Start-Process -Wait, not `&`: a /SUBSYSTEM:WINDOWS process launched with
           # the call operator does not have its redirect honoured reliably, and the
           # log came out EMPTY while the probe itself had run and passed.
-          $p = Start-Process -FilePath .\vyper-probe.exe -NoNewWindow -Wait -PassThru `
+          $p = Start-Process -FilePath .\vyper-debug.exe -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput .\smoke_frame.log -RedirectStandardError .\smoke_frame.err
           Write-Host "frame-probe exit=$($p.ExitCode) log_bytes=$((Get-Item .\smoke_frame.log).Length)"
           # The probe's OWN result, not just its exit code. The binary is
@@ -184,7 +206,7 @@ jobs:
 
           Remove-Item -ErrorAction SilentlyContinue .\smoke_proxy.log
           $env:VYPER_PROXY_PROBE = "sample.mp4"
-          $q = Start-Process -FilePath .\vyper-probe.exe -NoNewWindow -Wait -PassThru `
+          $q = Start-Process -FilePath .\vyper-debug.exe -NoNewWindow -Wait -PassThru `
             -RedirectStandardOutput .\smoke_proxy.log -RedirectStandardError .\smoke_proxy.err
           Write-Host "proxy-probe exit=$($q.ExitCode) log_bytes=$((Get-Item .\smoke_proxy.log).Length)"
           if (-not (Select-String -Quiet -Path .\smoke_proxy.log -Pattern 'proxy-probe\] OK')) {
@@ -204,7 +226,7 @@ jobs:
           Get-Content .\smoke_frame.log
           Get-Content .\smoke_proxy.log
 
-      - name: Upload artifact
+      - name: Upload release artifact
         # Best-effort: a quota hiccup on the account must not red a build whose
         # compile and smoke both passed. Artifact storage is account-wide and
         # GitHub only recalculates usage every 6-12h after deletions, so this
@@ -214,5 +236,16 @@ jobs:
         with:
           name: vyper-windows
           path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Same rationale for continue-on-error: a debug artifact is the one you can
+      # most afford to lose, since the release one is already uploaded by then.
+      - name: Upload debug artifact
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: vyper-windows-debug
+          path: dist-debug/
           if-no-files-found: error
           retention-days: 7
