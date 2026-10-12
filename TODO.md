@@ -9150,7 +9150,33 @@ the curve at t = 0 / 0.5 / 0.99 / 1, plus the real sampler holding the previous
 key's value at 1/25/50/75/99, stepping to the arriving key's value on its own
 frame, and holding past the last key.
 
-### Active 53 — The timeline has two renderers, and a zoom click makes them disagree
+### Active 56 — Windows crash log not findable next to the exe
+
+Reported as "the crash log isn't being recorded; I can't find it in the executable
+directory". It *was* being recorded — just not there. `crash_handler_install`
+passed the bare name `vyper_crash.log` to `CreateFileW`, and Windows resolves a
+relative path against the **process working directory**, not the exe directory. So
+the file landed wherever the process happened to be launched from (a desktop, a
+shortcut's "Start in", a project folder) while the header comment promised it was
+next to the exe.
+
+- [x] Resolve the exe path with `GetModuleFileNameW(nil, ...)` and append the file
+      name to it, so the log lands where the header says it is.
+- [x] Accept `\` and `/` in the split — the loader echoes back whatever form the
+      binary was launched with.
+- [x] Treat a result that exactly fills `MAX_PATH` as truncated (its tail is not the
+      real path) and fall back to the bare name, which still beats no crash record.
+- [x] Fix the struct comment, which claimed a `.mdpp`/`.txt` pair; only a `.log` is
+      ever written.
+
+Verification note: this file is `#+build windows` and there is no Windows SDK on
+this machine, so a real Windows-target `odin check` was not possible. The Win32
+signatures were read from the Odin core rather than recalled, and the path
+algorithm was validated standalone against stubbed calls (spaces in the path, a
+root-level exe, forward slashes, and the truncation fallback). What is NOT
+machine-verified here is the Windows compile itself.
+
+## Active 53 — The timeline has two renderers, and a zoom click makes them disagree
 
 **Status: DIAGNOSED, probes committed, fix NOT implemented.** Reported as
 "panning the timeline leaves the clips on tracks 5 and 6 visually behind the

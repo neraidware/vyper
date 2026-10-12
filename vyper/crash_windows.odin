@@ -27,8 +27,8 @@ import sws "vendor/ffmpeg/swscale"
 // ---------------------------------------------------------------------------
 
 // Crash_State is the crash-handler's once-only setup state: whether the
-// handler is installed and the fixed .mdmp/.txt log path, both written during
-// startup guard, never torn down.
+// handler is installed and the absolute log path next to the exe, both written
+// during startup guard, never torn down.
 Crash_State :: struct {
 	handler_installed: bool,
 	log_name:          [win32.MAX_PATH]u16,
@@ -113,10 +113,62 @@ crash_filter :: proc "system" (ep: ^win32.EXCEPTION_POINTERS) -> win32.LONG {
 }
 
 crash_handler_install :: proc() {
-	if !crash_state.handler_installed {
-		w := win32.utf8_to_utf16_buf(crash_state.log_name[:], "vyper_crash.log")
-		if w != nil {crash_state.log_name[len(w)] = 0}
-		win32.SetUnhandledExceptionFilter(crash_filter)
-		crash_state.handler_installed = true
+	if crash_state.handler_installed {return}
+
+	// Win32 path separators as they appear in the UTF-16 module path. Both are
+	// accepted: GetModuleFileNameW echoes whatever the loader was given, and a
+	// binary launched through a forward-slash path gets forward slashes back.
+	SEPARATOR      :: u16(0x5C) // '\'
+	SEPARATOR_ALT  :: u16(0x2F) // '/'
+
+	// The log goes NEXT TO THE EXE, and a bare filename does NOT mean that:
+	// Windows resolves a relative path against the process working directory,
+	// so "vyper_crash.log" was written wherever the user happened to launch
+	// from -- a desktop, a shortcut's "Start in", a project folder -- and the
+	// documented location stayed empty after a crash. Resolve the module path
+	// and build the name from it, so the file is where the header says it is.
+	//
+	// The file name is converted into its OWN buffer first: the conversion
+	// writes from index 0, so running it over the module path would overwrite
+	// the very directory prefix the name has to be appended to.
+	CRASH_LOG_FILE_NAME :: "vyper_crash.log"
+	file_name: [32]u16
+	name_w := win32.utf8_to_utf16_buf(file_name[:], CRASH_LOG_FILE_NAME)
+
+	module_path: [win32.MAX_PATH]u16
+	copied := int(
+		win32.GetModuleFileNameW(nil, &module_path[0], win32.DWORD(len(module_path))),
+	)
+	// A result that exactly fills the buffer was truncated, so its tail -- and
+	// therefore the directory split below -- would not be the real path.
+	if name_w != nil && copied > 0 && copied < len(module_path) {
+		// Drop the trailing NUL so the split sees only real characters.
+		path_len := copied
+		if module_path[path_len - 1] == 0 {path_len -= 1}
+
+		// Scan back to the last separator: the file name starts just past it,
+		// which is where the log name has to be appended.
+		name_start := path_len
+		for i := path_len - 1; i >= 0; i -= 1 {
+			if module_path[i] == SEPARATOR || module_path[i] == SEPARATOR_ALT {
+				name_start = i + 1
+				break
+			}
+		}
+
+		if name_start + len(name_w) < len(crash_state.log_name) {
+			for i in 0 ..< name_start {crash_state.log_name[i] = module_path[i]}
+			for i in 0 ..< len(name_w) {crash_state.log_name[name_start + i] = name_w[i]}
+			crash_state.log_name[name_start + len(name_w)] = 0
+		}
 	}
+
+	// Fall back to the bare name if the module path could not be resolved: a log
+	// in an unknown directory still beats no crash record at all.
+	if crash_state.log_name[0] == 0 {
+		_ = win32.utf8_to_utf16_buf(crash_state.log_name[:], CRASH_LOG_FILE_NAME)
+	}
+
+	win32.SetUnhandledExceptionFilter(crash_filter)
+	crash_state.handler_installed = true
 }
