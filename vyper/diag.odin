@@ -75,33 +75,26 @@ diag_flag :: proc(name: string) -> bool {
 	return false
 }
 
-// diag_path resolves a diagnostic that records to a file.
+// diag_path resolves a diagnostic that records to a file: the path named by
+// `name`, or "" when it is unset — which means the diagnostic is OFF.
 //
-// Set explicitly -> that path. Unset in a debug build -> the named file under
-// the temp dir. Unset in a release build -> "" (off), because a release binary
-// does not carry the code that would open it anyway.
+// It used to fall back to a default file under the temp dir in a debug build,
+// so "profiling is available without inventing a filename". That convenience is
+// what a published debug binary pays for: opening vyper wrote spall.json,
+// session.vya and flash-rec.log on every launch, whether or not anyone wanted
+// them, and the user has no way to turn it off. One env var is one thing to
+// remember; three files nobody asked for is not a good trade.
+//
+// A release build carries none of this code, so the fallback was never load
+// bearing there -- it only ever affected the build people download.
 //
 // `buf` is caller-owned fixed storage: the returned string points into it, so
 // it is frame-scoped and must not outlive the frame. Callers that keep the path
 // (a dump header, an error message after the arena moved) copy it out first --
 // the same rule as every other fixed buffer here.
 diag_path :: proc(name: string, file: string, buf: []u8) -> string {
-	if v, ok := os.lookup_env_alloc(name, context.temp_allocator); ok && v != "" {
-		return v
-	}
-	when ODIN_DEBUG {
-		at := diag_dir(buf)
-		if at == 0 {
-			return ""
-		}
-		written := len(fmt.bprintf(buf[at:len(buf) - 1], "%s", file))
-		if written <= 0 {
-			return ""
-		}
-		buf[at + written] = 0
-		return transmute(string)buf[:at + written]
-	}
-	return ""
+	v, _ := os.lookup_env_alloc(name, context.temp_allocator)
+	return v
 }
 
 // diag_interval resolves a numeric diagnostic that takes a value rather than a
