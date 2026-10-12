@@ -81,12 +81,10 @@ dispatch_sdl_event :: proc(event: ^sdl.Event, running: ^bool) {
 		if ti.active {
 			text_input_insert(string(event.text.text))
 		} else if edit_state.field != .None {
-			for ch in string(event.text.text) {
-				// Only accept printable ASCII that makes sense in a number.
-				if ch >= '0' && ch <= '9' || ch == '-' || ch == '.' {
-					edit_append(u8(ch))
-				}
-			}
+			// edit_insert owns the grammar (edit_char_allowed) and flashes the
+			// field on a character it refuses, so the filter and its feedback
+			// cannot drift apart the way an inlined list did.
+			edit_insert(string(event.text.text))
 		}
 	case .MOUSE_WHEEL:
 		handle_mouse_wheel(event.wheel)
@@ -116,7 +114,14 @@ route_key_down :: proc(key: sdl.Keycode, mods: sdl.Keymod, repeat: bool) -> bool
 	if field_claims_key(key, mods) {
 		return true
 	}
-	if edit_field_claims_key(key) {
+	// Modifiers come off the event, never sdl.GetModState(): the event
+	// snapshots what was held at key-down, the global state is sampled at
+	// handling time. They diverge whenever the main thread stalls long enough
+	// for events to queue and the user releases or changes a modifier before
+	// the queue drains. Same reasoning as field_claims_key above.
+	shift := sdl.KeymodFlag.LSHIFT in mods || sdl.KeymodFlag.RSHIFT in mods
+	ctrl := sdl.KeymodFlag.LCTRL in mods || sdl.KeymodFlag.RCTRL in mods
+	if edit_field_claims_key(key, shift, ctrl) {
 		return true
 	}
 	return app_claims_key(key, mods, repeat)
@@ -221,21 +226,54 @@ field_claims_key :: proc(key: sdl.Keycode, mods: sdl.Keymod) -> bool {
 // keyboard. The old `case:` comment claimed the router checked first;
 // route_key_down checks the TEXT field (ti.active) and nothing else, because the
 // number field was never expected to be reachable while closed.
-edit_field_claims_key :: proc(key: sdl.Keycode) -> bool {
+edit_field_claims_key :: proc(key: sdl.Keycode, shift: bool = false, ctrl: bool = false) -> bool {
 	if edit_state.field == .None {
 		return false
 	}
+	// The editing arms fall out of the switch and return true at the end, so
+	// there is one place that says "this key was the field's". The ctrl arms
+	// return from inside their case because the SAME letter without the modifier
+	// must fall through to the app layer (Ctrl+C is copy here, C is not).
 	switch key {
 	case sdl.K_BACKSPACE:
 		edit_backspace()
+	case sdl.K_DELETE:
+		edit_delete()
+	case sdl.K_LEFT:
+		edit_move(edit_state.cursor - 1, shift)
+	case sdl.K_RIGHT:
+		edit_move(edit_state.cursor + 1, shift)
+	case sdl.K_HOME:
+		edit_move(0, shift)
+	case sdl.K_END:
+		edit_move(edit_state.len, shift)
 	case sdl.K_RETURN, sdl.K_RETURN2:
 		edit_commit()
 	case sdl.K_ESCAPE:
 		edit_cancel()
+	case sdl.K_A:
+		if ctrl {
+			edit_select_all()
+		} else {
+			return false
+		}
+	case sdl.K_C:
+		if !ctrl {
+			return false
+		}
+		return edit_copy()
+	case sdl.K_X:
+		if !ctrl {
+			return false
+		}
+		return edit_cut()
+	case sdl.K_V:
+		if !ctrl {
+			return false
+		}
+		return edit_paste()
 	case:
-		// A bare `case:` is Odin's default clause in a value switch. Reached
-		// when a field IS open and the key is not one of its three, so the
-		// fallback is live: it lets the key travel on to the app layer.
+		// Not one of the field's own keys, so it travels on to the app layer.
 		return false
 	}
 	return true

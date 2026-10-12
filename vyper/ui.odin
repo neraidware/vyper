@@ -3,6 +3,7 @@ package vyper
 import clay "clay-odin"
 import "core:c"
 import "core:fmt"
+import "core:time"
 import "core:math"
 import "core:unicode/utf8"
 
@@ -440,7 +441,67 @@ panel_caption :: proc(label: string) {
 
 // prop_field renders one editable labelled value box (X/Y/Scale/crop). focused
 // highlights the border while that field is being edited.
+// edit_field_with_caret draws the focused value followed by a blinking caret, and
+// highlights the selected range behind it. The caret is a 2px child element
+// rather than a drawn rectangle because the field's own layout already stacks
+// text left-to-right: a fixed-width child after the text lands the caret exactly
+// one cell past the last glyph with no measuring.
+// edit_field_caret emits the caret as a fixed-width child of the focused field.
+// The `if` PREFIX is load-bearing: clay.UI is a deferred-close element opener, so
+// called as a bare statement Odin parses it as a declaration and reports
+// "...is not a type". Every clay element in this file is written `if clay.UI(..)
+// {}` for that reason.
+edit_field_caret :: proc(dim: bool) {
+	if clay.UI(clay.ID("PropFieldCaret"))(
+		{
+			layout = {
+				sizing = {
+					width = clay.SizingFixed(f32(EDIT_CARET_W)),
+					height = clay.SizingFixed(f32(FONT_DATA)),
+				},
+			},
+			backgroundColor = dim ? TEXT_COLOR_UNLIT : TEXT,
+		},
+	) {}
+}
+
+// EDIT_CARET_W is the caret's width in pixels: wide enough to see, narrow enough
+// not to read as a character.
+EDIT_CARET_W :: 2
+
+edit_field_with_caret :: proc(value: string) {
+	if clay.UI(clay.ID("PropFieldEdit"))(
+		{
+			layout = {
+				sizing = {width = clay.SizingGrow({}), height = clay.SizingFit({})},
+				layoutDirection = .LeftToRight,
+				childGap = 0,
+			},
+		},
+	) {
+		clay.Text(value, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		// The caret is a 2px bar: wide enough to see, narrow enough not to read as
+		// a character. It is emitted EVERY frame and blinked by alpha rather than
+		// conditionally, because a caret that appears and disappears would re-run
+		// layout on each blink and shove the field's text sideways. Paint is the
+		// only thing that changes.
+		caret_dim := !edit_caret_lit(time.now()._nsec)
+		edit_field_caret(caret_dim)
+	}
+}
+
+// prop_field paints one number field. The three pieces of FEEDBACK a text field
+// needs and this had none of -- a caret, a selection, and a rejected-keystroke
+// flash -- are drawn here rather than at the thirteen call sites, because they
+// are properties of "a field is focused", not of which field it is.
 prop_field :: proc(id_name: string, label, value: string, focused: bool) {
+	now := time.now()._nsec
+	// Rejected-keystroke flash: a keystroke outside the number grammar was dropped
+	// by edit_append, and without this the user cannot tell a refused key from a
+	// lost one. It rides the FOCUS colour so it is one more state on a border
+	// rather than a new widget.
+	rejected := focused && now < edit_state.rejected_until
+	border_colour := rejected ? BUTTON_BORDER_BAD : (focused ? BUTTON_BORDER_HOVER : BUTTON_BORDER)
 	if clay.UI(clay.ID(id_name))(
 	{
 		layout = {
@@ -452,8 +513,8 @@ prop_field :: proc(id_name: string, label, value: string, focused: bool) {
 		},
 		backgroundColor = BUTTON,
 		border = {
-			color = focused ? BUTTON_BORDER_HOVER : BUTTON_BORDER,
-			width = clay.BorderOutside(focused ? 2 : 1),
+			color = border_colour,
+			width = clay.BorderOutside((focused || rejected) ? 2 : 1),
 		},
 		cornerRadius = clay.CornerRadiusAll(RADIUS_BUTTON),
 	},
@@ -465,9 +526,17 @@ prop_field :: proc(id_name: string, label, value: string, focused: bool) {
 				fontSize = FONT_SMALL,
 			},
 		)
-		clay.Text(value, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		if focused {
+			// The value plus a caret, laid out as one row so the caret sits after the
+			// glyphs it belongs to instead of being positioned by hand against a
+			// second text element.
+			edit_field_with_caret(value)
+		} else {
+			clay.Text(value, clay.TextElementConfig{textColor = TEXT, fontSize = FONT_DATA})
+		}
 	}
 }
+
 
 // keyframe_add_button is the inspector's "key this property at the playhead"
 // control: a transparent click pad sized to the diamond glyph (KF_BTN_R*2

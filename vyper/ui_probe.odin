@@ -993,7 +993,7 @@ when ODIN_DEBUG {
 			{ sdl.K_RETURN, false, "Enter reaches the app" },
 			{ sdl.K_RETURN2, false, "the keypad Enter reaches the app" },
 			{ sdl.K_BACKSPACE, false, "Backspace reaches the ripple delete" },
-			{ sdl.K_DELETE, false, "Delete is not the number field's: it deletes a clip" },
+			{ sdl.K_DELETE, false, "Delete is not the field's when none is focused: it deletes a clip" },
 			{ sdl.K_F1, false, "F1 stays a global shortcut" },
 		}
 		for c in closed {
@@ -1012,7 +1012,11 @@ when ODIN_DEBUG {
 			{ sdl.K_RETURN, true, "Enter commits the field" },
 			{ sdl.K_RETURN2, true, "the keypad Enter commits too" },
 			{ sdl.K_BACKSPACE, true, "Backspace edits the field" },
-			{ sdl.K_DELETE, false, "Delete is not the number field's: it deletes a clip" },
+			// Delete DOES belong to a FOCUSED field now: without it there is no
+			// forward-delete, and a field that can only be edited backwards is half
+			// a text field. The closed table above is the other side of this --
+			// clip-delete still reaches the app layer when no field has focus.
+			{ sdl.K_DELETE, true, "Delete edits a focused field" },
 			{ sdl.K_F1, false, "F1 stays a global shortcut" },
 		}
 		defer edit_cancel()
@@ -3148,6 +3152,118 @@ when ODIN_DEBUG {
 			fmt.eprintf("[ui-probe] a closed number field must not leave text input requested\n")
 			ok = false
 		}
+
+		// --- the rest of the field: caret, selection, and refused-keystroke flash ---
+		// A field used to have no caret and no cursor at all, so a typo meant
+		// retyping the whole value: Backspace only removed from the end.
+		edit_begin(.Scale, 12.5) // Scale formats at 2 decimals, so this seeds "12.50"
+		caret_ok :=
+			edit_state.len == 5 &&
+			string(edit_state.chars[:edit_state.len]) == "12.50" &&
+			edit_state.cursor == 5 &&
+			edit_state.anchor == 5
+		if !caret_ok {
+			fmt.eprintf("[ui-probe] a field must open with its caret at the end of the seeded value\n")
+			ok = false
+		}
+		// The caret moves and the selection spans.
+		edit_move(2, false)
+		edit_move(4, true) // shift-extend to 4
+		sel_start, sel_end := edit_sel()
+		if sel_start != 2 || sel_end != 4 {
+			fmt.eprintf(
+				"[ui-probe] shift+Right must extend the selection (got %d..%d, want 2..4)\n",
+				sel_start,
+				sel_end,
+			)
+			ok = false
+		}
+		// Typing replaces the selection.
+		edit_append('9')
+		replaced := edit_state.len == 4 && string(edit_state.chars[:edit_state.len]) == "1290"
+		if !replaced {
+			fmt.eprintf(
+				"[ui-probe] typing must replace the selection (got %q)\n",
+				string(edit_state.chars[:edit_state.len]),
+			)
+			ok = false
+		}
+		// A character outside the grammar is REFUSED, and the refusal is visible.
+		edit_state.rejected_until = 0
+		if edit_append('z') {
+			fmt.eprintf("[ui-probe] a letter must not be accepted by a number field\n")
+			ok = false
+		}
+		if edit_state.rejected_until == 0 {
+			fmt.eprintf(
+				"[ui-probe] a refused keystroke must flash the field, or a dropped key is indistinguishable from a lost one\n",
+			)
+			ok = false
+		}
+		// Select-all then type replaces the whole value.
+		edit_state.rejected_until = 0
+		edit_select_all()
+		edit_insert("7")
+		all_ok := string(edit_state.chars[:edit_state.len]) == "7" && edit_state.cursor == 1
+		if !all_ok {
+			fmt.eprintf("[ui-probe] select-all then type must replace the whole value\n")
+			ok = false
+		}
+		// Backspace at the start of the field does nothing rather than underflowing.
+		edit_move(0, false)
+		edit_backspace()
+		underflow_ok := string(edit_state.chars[:edit_state.len]) == "7" && edit_state.cursor == 0
+		if !underflow_ok {
+			fmt.eprintf("[ui-probe] Backspace at offset 0 must be a no-op\n")
+			ok = false
+		}
+		edit_cancel()
+		// The full field must also be reachable by KEY, not only by calling the
+		// buffer procs directly -- the routing is the part that was never wired.
+		edit_begin(.Scale, 0) // "0.00"
+		for ch in "42" {
+			edit_append(u8(ch))
+		}
+		typed_ok := string(edit_state.chars[:edit_state.len]) == "0.0042"
+		if !typed_ok {
+			fmt.eprintf(
+				"[ui-probe] typed digits must land in the field (got %q)\n",
+				string(edit_state.chars[:edit_state.len]),
+			)
+			ok = false
+		}
+		// Ctrl+A selects everything, so ONE Backspace empties the field -- which is
+		// the whole point of a selection: without it a five-digit value needed
+		// five backspaces.
+		route_key_down(sdl.K_A, {sdl.KeymodFlag.LCTRL}, false)
+		sel_start_all, sel_end_all := edit_sel()
+		sel_all_ok := sel_start_all == 0 && sel_end_all == edit_state.len && edit_state.len > 0
+		if !sel_all_ok || sel_start_all != 0 || sel_end_all != 6 {
+			fmt.eprintf("[ui-probe] ctrl+A must select the whole field (got %d..%d of %d)\n", sel_start_all, sel_end_all, edit_state.len)
+			ok = false
+		}
+		route_key_down(sdl.K_BACKSPACE, {}, false)
+		emptied := edit_state.len == 0 && edit_state.cursor == 0
+		if !emptied {
+			fmt.eprintf(
+				"[ui-probe] Backspace over a full selection must empty the field in one press (got %q)\n",
+				string(edit_state.chars[:edit_state.len]),
+			)
+			ok = false
+		}
+		// And with it empty, Delete and Left must be no-ops rather than underflow.
+		route_key_down(sdl.K_DELETE, {}, false)
+		route_key_down(sdl.K_LEFT, {}, false)
+		route_key_down(sdl.K_HOME, {}, false)
+		stable := edit_state.len == 0 && edit_state.cursor == 0
+		if !stable {
+			fmt.eprintf("[ui-probe] keys on an empty field must not move the caret below zero (at %d)\n", edit_state.cursor)
+			ok = false
+		}
+		// A key that is NOT the field's must still reach the app layer, or the field
+		// would swallow shortcuts.
+		route_key_down(sdl.K_DELETE, {}, false) // consumed
+		edit_cancel()
 		if ok {
 			fmt.printf("[ui-probe] backspace ripple-deletes and closes the gap ok\n")
 		}

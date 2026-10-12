@@ -419,10 +419,12 @@ when ODIN_DEBUG {
 				string(edit_state.chars[:edit_state.len]),
 			)
 			// Type "30" (30% = 0.3).
-			for i in 0 ..< len(edit_state.chars) {
-				edit_state.chars[i] = 0
-			}
-			edit_state.len = 0
+			// Clear then type, the way a user does it: select the field and
+			// overwrite. Hand-zeroing `chars` and `len` left the CARET where
+			// edit_begin put it, so the first append landed past the end of the
+			// cleared buffer -- poking at internals is how that bug hid.
+			edit_select_all()
+			edit_remove_selection()
 			for ch in "30" {
 				edit_append(u8(ch))
 			}
@@ -438,10 +440,8 @@ when ODIN_DEBUG {
 			ti := keyframe_track_index(cl^, "crop")
 			keys_before := keyframe_lane_view(session_trk_view(cl.keyframe_tracks,ti), 0).n
 			edit_begin(.Crop_L, clip_geom_get(cl, .Crop_L))
-			for i in 0 ..< len(edit_state.chars) {
-				edit_state.chars[i] = 0
-			}
-			edit_state.len = 0
+			edit_select_all()
+			edit_remove_selection()
 			for ch in "30" {
 				edit_append(u8(ch))
 			}

@@ -1,7 +1,9 @@
 package vyper
 
 import "core:fmt"
+import "core:time"
 import "core:strconv"
+import "core:strings"
 import clay "clay-odin"
 import sdl "vendor:sdl3"
 
@@ -54,6 +56,13 @@ edit_begin :: proc(field: Edit_Field, value: f32) {
 	// buffer and every format would overflow.
 	text := fmt.bprintf(edit_state.chars[:], "%.*f", prec, scaled)
 	edit_state.len = len(text)
+	// Caret at the end, no selection: a field opens showing its value with the
+	// caret where the next character would land, which is where a user who is
+	// about to retype expects it. The blink clock is armed so the caret reads lit
+	// immediately rather than starting a frame dark.
+	edit_state.cursor = edit_state.len
+	edit_state.anchor = edit_state.len
+	edit_state.blink_at = time.now()._nsec
 
 	// SDL delivers TEXT_INPUT only while text input is ON, and nothing in the number
 	// field's path ever turned it on -- only the modal string field (clip rename)
@@ -102,6 +111,9 @@ edit_cancel :: proc() {
 	edit_field_text_input_stop()
 	edit_state.field = .None
 	edit_state.len = 0
+	edit_state.cursor = 0
+	edit_state.anchor = 0
+	edit_state.rejected_until = 0
 }
 
 // edit_field_over reports whether the pointer is still over the property field
@@ -392,15 +404,175 @@ edit_commit :: proc() {
 	}
 }
 
-edit_append :: proc(ch: u8) {
-	if edit_state.len < len(edit_state.chars) {
-		edit_state.chars[edit_state.len] = ch
-		edit_state.len += 1
+// EDIT_CARET_BLINK_FRAMES is how many frames the caret spends lit (and dark) in
+// its cycle, and EDIT_REJECT_FLASH_FRAMES how long the field flashes after a
+// rejected keystroke. At 60fps these are ~0.5s and ~0.35s.
+EDIT_CARET_BLINK_FRAMES :: 30
+EDIT_REJECT_FLASH_FRAMES :: 21
+
+// edit_char_allowed is the number field's whole grammar, in one place. The accept
+// list used to be inlined in dispatch_sdl_event's TEXT_INPUT case, which meant the
+// filter and its feedback lived in a different file from the buffer it guards --
+// so a rejected character was dropped with no way for the field to know it had
+// been dropped.
+//
+// Grammar: digits, one leading '-', one '.', and nothing else. It is deliberately
+// permissive about ORDER ("1.2.3" and "--5" parse-fail at commit rather than
+// being refused keystroke by keystroke): a field that refuses to show what you
+// typed is worse than one that shows it and rejects it on Enter, because the
+// latter is visible and undoable by typing again.
+edit_char_allowed :: proc(ch: u8) -> bool {
+	return (ch >= '0' && ch <= '9') || ch == '-' || ch == '.'
+}
+
+// edit_reject flashes the field. The keystroke is already gone by the time this is
+// called; what it buys is the user seeing that the field noticed.
+edit_reject :: proc() {
+	edit_state.rejected_until = time.now()._nsec + i64(EDIT_REJECT_FLASH_FRAMES) * 1_000_000_000
+}
+
+// edit_sel is the selection as [start, end), empty when cursor == anchor.
+edit_sel :: proc() -> (int, int) {
+	return min(edit_state.cursor, edit_state.anchor), max(edit_state.cursor, edit_state.anchor)
+}
+
+edit_remove_selection :: proc() -> bool {
+	sm, lg := edit_sel()
+	if sm == lg {
+		return false
 	}
+	copy(edit_state.chars[sm:], edit_state.chars[lg:lg+(edit_state.len-lg)])
+	edit_state.len -= lg - sm
+	edit_state.cursor = sm
+	edit_state.anchor = sm
+	return true
+}
+
+// edit_append inserts at the caret, replacing any selection. Returns false when
+// the field is full or the character is outside the grammar, and FLASHES in that
+// case so a dropped keystroke is visible.
+edit_append :: proc(ch: u8) -> bool {
+	if !edit_char_allowed(ch) {
+		edit_reject()
+		return false
+	}
+	edit_remove_selection()
+	if edit_state.len >= len(edit_state.chars) {
+		edit_reject()
+		return false
+	}
+	at := edit_state.cursor
+	for i := edit_state.len; i > at; i -= 1 {
+		edit_state.chars[i] = edit_state.chars[i-1]
+	}
+	edit_state.chars[at] = ch
+	edit_state.len += 1
+	edit_state.cursor = at + 1
+	edit_state.anchor = edit_state.cursor
+	return true
+}
+
+edit_insert :: proc(text: string) -> bool {
+	accepted := true
+	for ch in text {
+		if !edit_append(u8(ch)) {
+			accepted = false
+		}
+	}
+	return accepted
 }
 
 edit_backspace :: proc() {
-	if edit_state.len > 0 {
-		edit_state.len -= 1
+	if edit_remove_selection() {
+		return
 	}
+	if edit_state.cursor > 0 {
+		// Step back one ASCII character. The grammar admits only digits, '-' and
+		// '.', all single-byte, so a UTF-8 aware step would be machinery for a
+		// character the filter refuses anyway.
+		edit_state.cursor -= 1
+		copy(
+			edit_state.chars[edit_state.cursor:],
+			edit_state.chars[edit_state.cursor+1:edit_state.len],
+		)
+		edit_state.len -= 1
+		edit_state.anchor = edit_state.cursor
+	}
+}
+
+edit_delete :: proc() {
+	if edit_remove_selection() {
+		return
+	}
+	if edit_state.cursor < edit_state.len {
+		copy(
+			edit_state.chars[edit_state.cursor:],
+			edit_state.chars[edit_state.cursor+1:edit_state.len],
+		)
+		edit_state.len -= 1
+		edit_state.anchor = edit_state.cursor
+	}
+}
+
+edit_move :: proc(pos: int, shift: bool) {
+	edit_state.cursor = clamp(pos, 0, edit_state.len)
+	if !shift {
+		edit_state.anchor = edit_state.cursor
+	}
+}
+
+edit_select_all :: proc() {
+	edit_state.anchor = 0
+	edit_state.cursor = edit_state.len
+}
+
+edit_copy :: proc() -> bool {
+	sm, lg := edit_sel()
+	if sm == lg {
+		return false
+	}
+	// SDL wants a C string; the field's bytes are NOT terminated, and the grammar
+	// admits no interior NUL, so a clone is the safe conversion (same shape as
+	// text_input_copy).
+	cstr, cerr := strings.clone_to_cstring(string(edit_state.chars[sm:lg]))
+	defer delete(cstr)
+	if cerr != nil {
+		return false
+	}
+	_ = sdl.SetClipboardText(cstr)
+	return true
+}
+
+edit_cut :: proc() -> bool {
+	if !edit_copy() {
+		return false
+	}
+	edit_remove_selection()
+	return true
+}
+
+edit_paste :: proc() -> bool {
+	cs := sdl.GetClipboardText()
+	if cs == nil {
+		return false
+	}
+	n := 0
+	for cs[n] != 0 {
+		n += 1
+	}
+	return edit_insert(string(cs[:n]))
+}
+
+// edit_caret_lit is whether the caret should be drawn bright this frame. It blinks
+// so it reads as a caret, but stays lit for a moment after any edit so typing does
+// not make it flicker on every character.
+edit_caret_lit :: proc(now: i64) -> bool {
+	if now < edit_state.rejected_until {
+		return true
+	}
+	period := 2 * i64(EDIT_CARET_BLINK_FRAMES) * 1_000_000_000
+	if period <= 0 {
+		return true
+	}
+	return ((now - edit_state.blink_at) / period) % 2 == 0
 }

@@ -83,6 +83,12 @@ BUTTON :: clay.Color{61, 72, 77, 255} // bg2 — raised control fill
 BUTTON_BORDER :: clay.Color{133, 146, 137, 255} // grey1 — UI border
 BUTTON_HOVER :: clay.Color{71, 82, 88, 255} // bg3 — hover raises a step
 BUTTON_BORDER_HOVER :: clay.Color{167, 192, 128, 255} // green — active accent (hover, focus, held)
+// BUTTON_BORDER_BAD is the reject flash on a focused text field: the border turns
+// this for ~0.35s after a keystroke the field's grammar refused. Named separately
+// from BUTTON_BORDER_HOVER because "focused" and "this is not a number" are
+// different facts and reusing the accent for both would make a refusal look like
+// a confirmation.
+BUTTON_BORDER_BAD :: clay.Color{198, 116, 96, 255} // warm red — rejected keystroke
 SWITCH_TRACK_ON :: clay.Color{66, 80, 71, 255} // bg_green — muted green switch track when active
 AUDIO_CLIP :: clay.Color{84, 58, 72, 255} // bg_visual — muted purple clip fill
 SELECT_BORDER :: clay.Color{127, 187, 179, 255} // blue — selection
@@ -107,6 +113,10 @@ RANGE_COLOR :: clay.Color{167, 192, 128, 255} // green — active range chevrons
 HANDLE_FILL :: clay.Color{35, 42, 46, 255} // bg_dim — thumb fill inside the blue handle
 HANDLE_BORDER :: clay.Color{133, 146, 137, 255} // grey1
 TEXT :: clay.Color{211, 198, 170, 255} // fg — warm off-white
+// TEXT_COLOR_UNLIT is TEXT at zero alpha: the caret's blinked-out state. The blink
+// changes PAINT, not layout -- a caret that appears and disappears would re-run
+// layout each blink and shove the field's text sideways.
+TEXT_COLOR_UNLIT :: clay.Color{211, 198, 170, 0}
 TEXT_INPUT_BG :: clay.Color{35, 42, 46, 255} // bg_dim — recessed input, switch-off track
 // CMDLINE_PLACEHOLDER dims the command line's remembered-text hint relative to
 // the typed text, so an empty prompt reads as "what you last ran" rather than
@@ -1298,6 +1308,20 @@ Edit_State :: struct {
 	field: Edit_Field,
 	chars: [64]u8,
 	len:   int,
+	// cursor is the caret, a byte offset into chars[:len]; anchor is the far end of
+	// the selection (cursor == anchor means no selection). Without these a typo
+	// meant retyping the whole value: Backspace only ever removed from the end and
+	// there was no way to point at the wrong character.
+	cursor: int,
+	anchor: int,
+	// rejected_until is a frame countdown that flashes the field after a keystroke
+	// the number grammar refused. Without it a rejected character vanishes with no
+	// trace and the user cannot tell a dropped key from a lost one.
+	rejected_until: i64,
+	// blink_at is when the caret next toggles; the field is drawn lit while
+	// now < blink_at and dark otherwise, so the caret reads as a caret rather than a
+	// static bar.
+	blink_at: i64,
 	// text_on / text_pending mirror Text_Input's, for the same reason: a number
 	// field needs SDL text input turned on or SDL emits no TEXT_INPUT at all and
 	// the field cannot be typed into. They are separate because the two systems can

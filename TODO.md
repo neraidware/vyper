@@ -9069,18 +9069,55 @@ Probed: opening a number field must leave a text-input request recorded, and
 cancelling must leave none. The request is recorded even with no window (headless)
 so the invariant is testable; the actual SDL call still no-ops without a window.
 
-#### Still open — the polish half of the report
+#### The rest of it, now done
 
-- [ ] No visual feedback at all: no focus ring, no caret, no selected state, no
-      hover affordance on the number fields.
-- [ ] No way to select-all and retype a field: Backspace deletes one character at
-      a time from the end and there is no cursor to move, so correcting a typo
-      means retyping the whole value by hand.
-- [ ] The accept filter is a hand-written `0-9 - .` list (event.odin). No digits
-      grouping, no `%`/unit suffix, no leading-plus, and no rejection feedback —
-      typing a stray letter is silently dropped with no indication.
-- [ ] `edit_field_claims_key` has a stray bare `case:` left from an earlier
-      switch conversion. Harmless (it falls to the default) but confusing to read.
+The field had no caret, no selection, and no way to tell a refused key from a
+lost one. All three are now real, and they are properties of "a field is
+focused", so they live in `prop_field` (one site) rather than at the thirteen
+call sites.
+
+- **Caret.** `Edit_State` gained `cursor`/`anchor`; `edit_begin` seats the caret
+  at the end of the seeded value and arms the blink clock. `prop_field` draws a
+  2px bar after the text. It is emitted EVERY frame and blinked by ALPHA
+  (`TEXT_COLOR_UNLIT`), never conditionally: a caret that appears and disappears
+  re-runs layout on each blink and shoves the field's text sideways. Paint is the
+  only thing that changes.
+
+- **Selection and the rest of the keyboard.** `edit_remove_selection`,
+  `edit_delete`, `edit_move`, `edit_select_all`, `edit_copy/cut/paste`, and
+  Delete / Left / Right / Home / End / Ctrl+A / Ctrl+C / Ctrl+X / Ctrl+V are
+  wired through `edit_field_claims_key`, which now takes `shift` and `ctrl` off
+  the event (never `sdl.GetModState`, matching `field_claims_key`).
+  **Delete changed meaning on purpose**: it used to be asserted NOT to belong to
+  a number field ("it deletes a clip"). It does now, because without it there is
+  no forward-delete at all and a field you can only edit backwards is half a text
+  field. Clip-delete still reaches the app layer whenever no field is focused —
+  both sides of that are pinned in the two key-routing tables.
+
+- **Refused keystrokes are visible.** The accept grammar moved out of
+  `dispatch_sdl_event` and into `edit_char_allowed` next to the buffer it guards,
+  so the filter and its feedback cannot drift apart again. A refused character
+  sets `rejected_until` and the field's border flashes `BUTTON_BORDER_BAD` for
+  ~0.35s. A named token rather than reusing the focus accent: "focused" and
+  "this is not a number" are different facts, and sharing a colour would make a
+  refusal look like a confirmation.
+
+- **Stray `case:` removed** from `edit_field_claims_key` (a leftover from an
+  earlier switch conversion that fell through to the default anyway).
+
+Two notes for whoever reads this next. First, `clay.UI` is a deferred-close
+element opener, so it must be written as an `if` PREFIX — `clay.UI(..){}` as a
+bare statement is parsed as a declaration and reports "...is not a type". The
+caret helper is written that way and says why. Second, `geom_key_probe` used to
+clear the field by hand-zeroing `chars` and `len`; with a caret that left the
+cursor past the end of the cleared buffer, so both sites now select-all and
+delete, which is what a user does anyway.
+
+Probed: caret seats at the end of the seeded value; shift+Right extends the
+selection; typing replaces the selection; a letter is refused AND flashes; ctrl+A
+selects the whole field and one Backspace empties it; keys on an empty field do
+not move the caret below zero; Delete is claimed when focused and not when not;
+opening a field requests SDL text input and cancelling leaves no request.
 
 ### Active 54 — Keyframes had no "hold" (no-interpolation) mode
 
