@@ -211,23 +211,6 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   to generalize is when repeated structure is visible, not when it is merely
   predicted.
 
-## 3b. No workarounds
-
-- A workaround targets the symptom, not the defect. Not "avoid when
-  possible" — not allowed.
-- Buggy, confusing, or wrong code: fix it, refactor it, clean it up. No
-  special case, guard clause, retry, or reordering that hides the symptom
-  while the cause stays live for the next person or code path to hit blind.
-- Worse than doing nothing — the symptom stopping removes the pressure to
-  fix the real thing.
-- Signs you're about to write one: you don't fully understand why the bug
-  happens but found an input that avoids it; the change lives far from the
-  actual defect; you're about to write a comment explaining why this weird
-  thing is here instead of fixing what made it necessary.
-- Genuinely can't fix it now? Say so at the actual defect site, not just
-  the call site papering over it — so the next person finds the real
-  problem, not another layer on top.
-
 ## 3a. Wrong architecture is the defect. Rethink it; never shrink around it.
 
 **When the architecture is wrong, that is the thing to fix.** Not the constant,
@@ -262,6 +245,23 @@ not the call site, not the guard that makes the symptom go away.
   no heap memory" while a neighbouring field already owns a session window,
   the rule is stale and it is actively costing you the right design. Check
   the rule against the code before obeying it.
+
+## 3b. No workarounds
+
+- A workaround targets the symptom, not the defect. Not "avoid when
+  possible" — not allowed.
+- Buggy, confusing, or wrong code: fix it, refactor it, clean it up. No
+  special case, guard clause, retry, or reordering that hides the symptom
+  while the cause stays live for the next person or code path to hit blind.
+- Worse than doing nothing — the symptom stopping removes the pressure to
+  fix the real thing.
+- Signs you're about to write one: you don't fully understand why the bug
+  happens but found an input that avoids it; the change lives far from the
+  actual defect; you're about to write a comment explaining why this weird
+  thing is here instead of fixing what made it necessary.
+- Genuinely can't fix it now? Say so at the actual defect site, not just
+  the call site papering over it — so the next person finds the real
+  problem, not another layer on top.
 
 ## 3c. Boundaries should stay cheap to change
 

@@ -1,7 +1,20 @@
+// session_lane_probe: the lane-window arena's allocator and COW invariants.
+// Registered as `scripts/gate.sh session_lane_probe`.
+//
+// Lanes used to be an inline fixed array inside a track row, so nothing about
+// them needed a probe. As a session window (session_lanes.odin) they acquired
+// every way a store can leak or alias -- reuse, relocation, sharing -- and this
+// is where those are pinned, plus the row size, which is the reason the change
+// was made and the one regression nothing else here would catch.
 package vyper
 
 import "core:fmt"
 import "core:os"
+
+// Debug-only. A probe is test scaffolding: it exists to prove something to
+// `scripts/gate.sh`, never to run in a shipped binary, so a release build does
+// not contain it. The entry point is gated the same way in vyper.odin.
+when ODIN_DEBUG {
 
 session_lane_failures: int
 
@@ -309,4 +322,6 @@ session_lane_probe_main :: proc() -> int {
 	}
 
 	return session_lane_failures
+}
+
 }
