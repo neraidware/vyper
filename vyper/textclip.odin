@@ -250,7 +250,6 @@ text_pieces_ink :: proc(
 	pieces: Text_Pieces_Range,
 	character_count: int,
 	inks: ^[dynamic]Text_Ink,
-	order: ^[dynamic]int,
 ) -> []Text_Ink {
 	// A clip with no pieces is the design note's fast path -- a plain text clip is
 	// not a graph -- but it still goes through one, a single whole-text style
@@ -282,18 +281,18 @@ text_pieces_ink :: proc(
 	}
 	graph := Node_Graph{}
 	if !text_graph_build(&graph, character_count, whole_text) {
-		text_graph_free(&graph)
+		node_graph_free_all(&graph)
 		return inks[:]
 	}
-	graph_eval_text(&graph, character_count, inks[:], order)
-	text_graph_free(&graph)
+	graph_eval_text(&graph, character_count, inks[:])
+	node_graph_free_all(&graph)
 	return inks[:]
 }
 
 // clip_pieces_ink is the UI-thread entry: the clip knows its own title length, so
 // callers holding a clip do not have to work it out to ask the same question.
-clip_pieces_ink :: proc(clip: ^Clip, inks: ^[dynamic]Text_Ink, order: ^[dynamic]int) -> []Text_Ink {
-	return text_pieces_ink(clip.pieces, len(clip_name(clip)), inks, order)
+clip_pieces_ink :: proc(clip: ^Clip, inks: ^[dynamic]Text_Ink) -> []Text_Ink {
+	return text_pieces_ink(clip.pieces, len(clip_name(clip)), inks)
 }
 
 // text_clip_ink is the painter's question, and the compositor answers it.

@@ -1195,10 +1195,8 @@ Render_Text_Job :: struct {
 	// this piece" — is a read of it, and re-measuring to find that out would be
 	// work the job already did. Grow-only, owned by the job, freed with it.
 	layout:          [dynamic]Text_Glyph,
-	// inks is the per-character ink the compositor resolved for this bake, and
-	// order is the node walk it used. Both are freed with the job.
+	// inks is the per-character ink the compositor resolved for this bake.
 	inks:           [dynamic]Text_Ink,
-	order:          [dynamic]int,
 	raster:         []u8,
 	bw:             int, // raster row stride
 	ox, oy, ow, oh: int, // tight ink rect in raster
@@ -1244,7 +1242,7 @@ setup_text_job :: proc(over: ^Render_Text_Job, t: Render_Text_Src, scale: f32, r
 		&render_text_font.init,
 		scratch,
 		&over.layout,
-		text_pieces_ink(t.pieces, len(t.name), &over.inks, &over.order),
+		text_pieces_ink(t.pieces, len(t.name), &over.inks),
 		font_px,
 	)
 	if ow <= 0 || oh <= 0 {
@@ -3658,7 +3656,6 @@ render_worker_run :: proc() {
 			delete(job.raster)
 			delete(job.layout)
 			delete(job.inks)
-			delete(job.order)
 		}
 		delete(text_jobs)
 	}

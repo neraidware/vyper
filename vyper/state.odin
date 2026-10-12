@@ -1513,12 +1513,10 @@ Preview_Slot :: struct {
 	// thread and nothing else may hand it storage.
 	text_layout:          [dynamic]Text_Glyph,
 	// text_inks is the per-character ink the compositor resolved for this slot's
-	// current bake, and text_order is the node evaluation order it walked. Both
-	// are the slot's own and grow-only, for the reason text_layout is: the
-	// compositor runs per bake on the UI thread and nothing else may hand it
-	// storage.
+	// current bake. It is the slot's own and grow-only, for the same reason
+	// text_layout is: the compositor runs per bake on the UI thread and nothing
+	// else may hand it storage.
 	text_inks:            [dynamic]Text_Ink,
-	text_order:           [dynamic]int,
 	// text_recreate tells the render loop a text slot's texture must be
 	// reallocated at text_tex_w x text_tex_h (buffer size changed or the slot
 	// just became text). Only the render loop has the GPU device, so it does the

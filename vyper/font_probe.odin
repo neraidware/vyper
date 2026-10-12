@@ -28,7 +28,6 @@ when ODIN_DEBUG {
 	font_probe_scratch: []u8
 	font_probe_glyphs: [dynamic]Text_Glyph
 	font_probe_inks: [dynamic]Text_Ink
-	font_probe_order: [dynamic]int
 
 	// font_probe_ink_of paints `title` into a throwaway buffer at the probe's own
 	// font state and returns the inked rect. A proc rather than a closure because
@@ -41,19 +40,53 @@ when ODIN_DEBUG {
 	// because production does not either.
 	// text_probe_build_chain is the two-piece topology, built directly so the
 	// refusals above can rewire edges production never touches.
+	text_probe_add_style :: proc(
+		graph: ^Node_Graph,
+		start, length: int,
+		reveal: Text_Reveal,
+		color: [3]u8,
+	) -> Node_Handle {
+	style := graph_node_add(graph, .Text_Style)
+	_, start_ok := graph_property_add(graph, style, .Character_Start, Node_Value{kind = .Integer, integer = i64(start)})
+	_, length_ok := graph_property_add(graph, style, .Character_Length, Node_Value{kind = .Integer, integer = i64(length)})
+	_, reveal_ok := graph_property_add(graph, style, .Reveal, Node_Value{kind = .Reveal, reveal = reveal})
+	_, color_ok := graph_property_add(
+		graph,
+		style,
+		.Ink_Color,
+		Node_Value{kind = .Color, color = [4]u8{color[0], color[1], color[2], 255}},
+	)
+	assert(start_ok && length_ok && reveal_ok && color_ok, "font probe built invalid Text_Style property")
+	return style
+}
+
 	text_probe_build_chain :: proc(graph: ^Node_Graph) {
-		graph.nodes = make([dynamic]Compositor_Node, 0, 4)
-		append(&graph.nodes, Compositor_Node{kind = .Text_Input})
-		append(&graph.nodes, Compositor_Node{kind = .Style_Process, input_len = 3})
-		append(&graph.nodes, Compositor_Node{kind = .Style_Process, input_len = 2})
-		append(&graph.nodes, Compositor_Node{kind = .Text_Renderer})
-		graph.sink = 3
-		graph_connect(graph, 0, 1)
-		graph_connect(graph, 0, 2)
-		graph_connect(graph, 1, 3)
-		graph_connect(graph, 2, 3)
-		graph_connect(graph, 0, 3)
-	}
+	text_input := graph_node_add(graph, .Text_Input)
+	first_style := text_probe_add_style(
+		graph,
+		0,
+		3,
+		Text_Reveal{first = 0, last = 3},
+		TEXT_INK_DEFAULT_RGB,
+	)
+	second_style := text_probe_add_style(
+		graph,
+		3,
+		2,
+		Text_Reveal{first = 0, last = 2},
+		TEXT_INK_DEFAULT_RGB,
+	)
+	renderer := graph_node_add(graph, .Text_Renderer)
+	output := graph_node_add(graph, .Image_Output)
+	graph.sink = output
+	assert(graph_connect(graph, text_input, .Text, first_style, .Text))
+	assert(graph_connect(graph, text_input, .Text, second_style, .Text))
+	assert(graph_connect(graph, first_style, .Style, renderer, .Style))
+	assert(graph_connect(graph, second_style, .Style, renderer, .Style))
+	assert(graph_connect(graph, text_input, .Text, renderer, .Text))
+	assert(graph_connect(graph, renderer, .Image, output, .Image))
+	assert(graph_compile(graph), "font probe graph must compile")
+}
 
 	// tint_probe_ink_edges returns the RGB of the leftmost and rightmost inked
 	// pixels of a paint, so a two-colour paint can be checked for putting each
@@ -66,7 +99,7 @@ when ODIN_DEBUG {
 	) -> (first, last: [3]u8, found: bool) {
 		buf := make([]u8, bw*bh*4)
 		defer delete(buf)
-		text_pieces_ink(pieces, len(title), &font_probe_inks, &font_probe_order)
+		text_pieces_ink(pieces, len(title), &font_probe_inks)
 		ox, oy, ow, oh := rasterize_title_into_buffer(
 			title,
 			buf,
@@ -99,15 +132,14 @@ when ODIN_DEBUG {
 	font_probe_ink_of :: proc(
 		title: string,
 		bw, bh: int,
-pieces: Text_Pieces_Range,
-	inks: ^[dynamic]Text_Ink,
-	order: ^[dynamic]int,
-) -> (ox, oy, ow, oh: int) {
+		pieces: Text_Pieces_Range,
+		inks: ^[dynamic]Text_Ink,
+	) -> (ox, oy, ow, oh: int) {
 		buf := make([]u8, bw*bh*4)
 		defer delete(buf)
 		// The same entry production uses, implicit piece and all -- a probe that
 		// built its own graph would be testing a path nothing runs.
-		text_pieces_ink(pieces, len(title), inks, order)
+		text_pieces_ink(pieces, len(title), inks)
 		return rasterize_title_into_buffer(
 			title,
 			buf,
@@ -244,9 +276,7 @@ pieces: Text_Pieces_Range,
 			// Sized up front: the evaluator writes into a caller-owned table rather
 			// than growing one, because it runs once per bake and must not allocate.
 			resize(&font_probe_inks, 256)
-			resize(&font_probe_order, 64)
 			defer delete(font_probe_inks)
-			defer delete(font_probe_order)
 
 			layout := text_layout_into(title, &font_probe_font, &font_probe_font_init, 48, &font_probe_glyphs)
 			font_probe_check(
@@ -266,14 +296,14 @@ pieces: Text_Pieces_Range,
 			font_probe_check(monotonic, "reveal: char_index must run 0..n-1 in layout order")
 
 			// No pieces at all draws everything: the implicit single piece.
-			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, {}, &font_probe_inks, &font_probe_order)
+			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, {}, &font_probe_inks)
 			// One piece over the whole text, revealing only its first character.
 			first_only := Text_Pieces_Range{}
 			session_piece_push(
 				&first_only,
 				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 1}},
 			)
-			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, first_only, &font_probe_inks, &font_probe_order)
+			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, first_only, &font_probe_inks)
 			// Narrower, and no taller. Not "the same height": a round letter overshoots
 			// the baseline by a pixel, so "AV Wa" is legitimately 1px taller than the
 			// "A" alone -- the first assertion I wrote here failed on exactly that, and
@@ -288,7 +318,7 @@ pieces: Text_Pieces_Range,
 			)
 			none_shown := Text_Pieces_Range{}
 			session_piece_push(&none_shown, Text_Piece{start = 0, len = 0})
-			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, none_shown, &font_probe_inks, &font_probe_order)
+			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, none_shown, &font_probe_inks)
 			font_probe_check(
 				zero_w == 0 && zero_h == 0,
 				"reveal: an empty window must paint no ink (got %dx%d)",
@@ -306,8 +336,8 @@ pieces: Text_Pieces_Range,
 				&short_head,
 				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 4}},
 			)
-			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, from_back, &font_probe_inks, &font_probe_order)
-			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, short_head, &font_probe_inks, &font_probe_order)
+			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, from_back, &font_probe_inks)
+			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, short_head, &font_probe_inks)
 			font_probe_check(
 				tail_w < all_w && head_w < all_w,
 				"reveal: a window open from either end must be narrower than the whole (%d/%d/%d)",
@@ -335,73 +365,63 @@ pieces: Text_Pieces_Range,
 			{
 				graph := Node_Graph{}
 				text_probe_build_chain(&graph)
-				// renderer <- style <- input already. Wiring input back from the
-				// renderer closes a loop, so it must be refused.
-				font_probe_check(
-					!graph_connect(&graph, graph.sink, 0),
-					"graph: a connection that would close a cycle must be refused",
-				)
-				// A renderer emits an IMAGE, so nothing may feed it from a node
-				// that emits text where an image is expected -- and no node kind
-				// takes an image yet, which is what makes "input -> track" impossible
-				// rather than merely discouraged.
-				font_probe_check(
-					!node_pin_accepts(.Style_Process, .Image),
-					"graph: a process must not accept an image; only the renderer promotes",
-				)
-				font_probe_check(
-					node_pin_emits(.Text_Renderer) == .Image &&
-						node_pin_emits(.Text_Input) == .Text,
-					"graph: only the renderer may emit an image",
-				)
-				// A branch that fans out and reconverges. Nothing in a node's shape
-				// says how many things feed it, so a source driving three processes
-				// that all reach one renderer is the SAME construction as a chain --
-				// the difference is two more edges. A per-node input array would have
-				// needed a struct change and a slot-index convention to get here.
-				{
-					branch := Node_Graph{}
-					branch.nodes = make([dynamic]Compositor_Node, 0, 5)
-					append(&branch.nodes, Compositor_Node{kind = .Text_Input})
-					append(&branch.nodes, Compositor_Node{kind = .Style_Process, input_len = 1})
-					append(&branch.nodes, Compositor_Node{kind = .Style_Process, input_len = 2})
-					append(&branch.nodes, Compositor_Node{kind = .Style_Process, input_start = 2, input_len = 3})
-					append(&branch.nodes, Compositor_Node{kind = .Text_Renderer})
-					branch.sink = 4
-					font_probe_check(graph_connect(&branch, 0, 1), "branch: source feeds first process")
-					font_probe_check(graph_connect(&branch, 0, 2), "branch: source feeds second process")
-					font_probe_check(graph_connect(&branch, 0, 3), "branch: source feeds third process")
-					font_probe_check(graph_connect(&branch, 1, 4), "branch: first process reconverges")
-					font_probe_check(graph_connect(&branch, 2, 4), "branch: second process reconverges")
-					font_probe_check(graph_connect(&branch, 3, 4), "branch: third process reconverges")
-					font_probe_check(len(branch.edges) == 6, "branch: six edges, not a slot count")
-					// ...and it evaluates: the last style to annotate a character wins,
-					// which is the only ordering rule a reconvergence needs.
-					branch_inks := make([dynamic]Text_Ink, 5)
-					defer delete(branch_inks)
-					branch_order := make([dynamic]int, 0, 16)
-					defer delete(branch_order)
-					graph_eval_text(&branch, 5, branch_inks[:], &branch_order)
-					// The declared ranges are [0,1), [0,2), [2,5) -- so chars 0..4
-					// are all claimed by at least one process, and the reconvergence is
-					// what lets the LAST process win for char 0.
-					font_probe_check(
-						branch_inks[0].drawn && branch_inks[1].drawn && branch_inks[2].drawn,
-						"branch: a branching graph must still resolve ink",
-					)
-					text_graph_free(&branch)
+				// Pin typing is checked at connection time: Text_Style takes text,
+				// Text_Renderer is the only text-to-image promotion.
+				bad_type, bad_ok := node_input_type(.Text_Style, .Image)
+				font_probe_check(!bad_ok,
+					"graph: Text_Style rejects Image input")
+				_ = bad_type
+				text_type, text_ok := node_output_type(.Text_Input, .Text)
+				image_type, image_ok := node_output_type(.Text_Renderer, .Image)
+				font_probe_check(text_ok && image_ok && text_type == .Text && image_type == .Image,
+					"graph: Text_Renderer promotes text to image")
+				cycle_graph := Node_Graph{}
+				scale_node := graph_node_add(&cycle_graph, .Scale)
+				crop_node := graph_node_add(&cycle_graph, .Crop)
+				font_probe_check(graph_connect(&cycle_graph, scale_node, .Image, crop_node, .Image),
+					"graph: first compatible geometry edge connects")
+				font_probe_check(!graph_connect(&cycle_graph, crop_node, .Image, scale_node, .Image),
+					"graph: reverse edge that closes a cycle is rejected")
+				node_graph_free_all(&cycle_graph)
+				// A fan-out/fan-in with eight style processes demonstrates that the
+				// renderer owns a variable-length input range, not a fixed slot array.
+				many_pieces := Text_Pieces_Range{}
+				for index in 0 ..< 8 {
+					session_piece_push(&many_pieces, Text_Piece{
+						start = index,
+						len = 1,
+						reveal = Text_Reveal{first = 0, last = 1},
+						color = TEXT_INK_DEFAULT_RGB,
+					})
 				}
+				many_graph := Node_Graph{}
+				font_probe_check(text_graph_build(&many_graph, 8, many_pieces),
+					"graph: eight style inputs compile without a slot limit")
+				renderer := Node_Handle{
+					index = many_graph.sink.index-1,
+					gen = many_graph.nodes[many_graph.sink.index-1].generation,
+				}
+			font_probe_check(len(graph_node_inputs(many_graph, renderer)) == 9,
+				"graph: renderer owns text plus eight style inputs (got %d)",
+				len(graph_node_inputs(many_graph, renderer)))
+			many_inks := make([]Text_Ink, 8)
+			font_probe_check(graph_eval_text(&many_graph, 8, many_inks) == 8,
+				"graph: branching graph evaluates all eight characters")
+			font_probe_check(len(many_graph.topological_order) == len(many_graph.nodes)-1,
+				"graph: compiled topological order includes every node")
+				node_graph_free_all(&many_graph)
+			session_piece_release(many_pieces)
 
-				// And the built topology really is the design's: input, one style per
-				// piece, renderer.
-				font_probe_check(
-					len(graph.nodes) == 4 && graph.nodes[0].kind == .Text_Input &&
-						graph.nodes[1].kind == .Style_Process &&
-						graph.nodes[2].kind == .Style_Process &&
-						graph.nodes[3].kind == .Text_Renderer,
-					"graph: a two-piece clip must build input, two styles and a renderer",
-				)
-				text_graph_free(&graph)
+			// The built text topology is input, styles, renderer, output.
+			font_probe_check(
+				len(graph.nodes)-1 == 5 && graph.nodes[1].operation == .Text_Input &&
+					graph.nodes[2].operation == .Text_Style &&
+					graph.nodes[3].operation == .Text_Style &&
+					graph.nodes[4].operation == .Text_Renderer &&
+					graph.nodes[5].operation == .Image_Output,
+				"graph: two-piece topology materializes input, style nodes, renderer, output",
+			)
+				node_graph_free_all(&graph)
 			}
 
 			// --- two pieces, each revealing itself -----------------------------
@@ -417,7 +437,7 @@ pieces: Text_Pieces_Range,
 				&split,
 				Text_Piece{start = 3, len = 2, reveal = Text_Reveal{first = 0, last = 1}},
 			)
-			_, _, split_w, _ := font_probe_ink_of(title, bw, bh, split, &font_probe_inks, &font_probe_order)
+			_, _, split_w, _ := font_probe_ink_of(title, bw, bh, split, &font_probe_inks)
 			font_probe_check(
 				split_w > one_w && split_w < all_w,
 				"pieces: two independently revealed runs must land between one character and the whole (%d)",
@@ -435,8 +455,8 @@ pieces: Text_Pieces_Range,
 					text_graph_build(&graph, 5, split),
 					"graph: a two-piece text must build",
 				)
-				graph_eval_text(&graph, 5, split_inks[:], &font_probe_order)
-				text_graph_free(&graph)
+				graph_eval_text(&graph, 5, split_inks[:])
+				node_graph_free_all(&graph)
 			}
 			font_probe_check(
 				split_inks[3].drawn && !split_inks[4].drawn,
@@ -455,8 +475,8 @@ pieces: Text_Pieces_Range,
 			{
 				graph := Node_Graph{}
 				font_probe_check(text_graph_build(&graph, 5, gap), "graph: a gap text must build")
-				graph_eval_text(&graph, 5, gap_inks[:], &font_probe_order)
-				text_graph_free(&graph)
+				graph_eval_text(&graph, 5, gap_inks[:])
+			node_graph_free_all(&graph)
 			}
 			font_probe_check(
 				!gap_inks[4].drawn,
@@ -478,9 +498,7 @@ pieces: Text_Pieces_Range,
 			session_piece_push(&tinted, Text_Piece{start = 3, len = 2, color = blue})
 			inks := make([dynamic]Text_Ink, 5)
 			defer delete(inks)
-			order2 := make([dynamic]int, 0, 16)
-			defer delete(order2)
-			text_pieces_ink(tinted, 5, &inks, &order2)
+			text_pieces_ink(tinted, 5, &inks)
 			font_probe_check(
 				inks[0].drawn && inks[2].drawn && inks[0].color == red && inks[3].color == blue,
 				"colour: two style nodes must resolve their own ranges (%v/%v)",
@@ -491,7 +509,7 @@ pieces: Text_Pieces_Range,
 			// a raster holding both colours somewhere would also pass if the node
 			// order or the character mapping were wrong.
 			tint_x, _, tint_w, tint_h := font_probe_ink_of(
-				title, bw, bh, tinted, &font_probe_inks, &font_probe_order,
+				title, bw, bh, tinted, &font_probe_inks,
 			)
 			font_probe_check(tint_w > 0 && tint_h > 0, "colour: two inked pieces must produce ink")
 			first_ink, last_ink, found_any := tint_probe_ink_edges(title, bw, bh, tinted, tint_x, tint_w, tint_h)
@@ -510,7 +528,7 @@ pieces: Text_Pieces_Range,
 			unstyled := Text_Pieces_Range{}
 			session_piece_push(&unstyled, Text_Piece{start = 0, len = 5, color = TEXT_INK_DEFAULT_RGB})
 			_, _, styled_w, styled_h := font_probe_ink_of(
-				title, bw, bh, unstyled, &font_probe_inks, &font_probe_order,
+				title, bw, bh, unstyled, &font_probe_inks,
 			)
 			blank_first, _, found_blank := tint_probe_ink_edges(title, bw, bh, unstyled, tint_x, tint_w, tint_h)
 			font_probe_check(
