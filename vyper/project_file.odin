@@ -369,6 +369,7 @@ session_teardown :: proc() {
 	session_kf_reset()
 	session_lane_reset()
 	session_trk_reset()
+	session_piece_reset()
 	session_marker_reset()
 	srt_cache_free_all()
 	media_bin_free()

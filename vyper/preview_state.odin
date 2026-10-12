@@ -705,7 +705,7 @@ slot.is_text = true
 						&text_clip_state.font_init,
 						scratch,
 						&slot.text_layout,
-						text_clip_reveal(clip),
+						clip.pieces,
 						TEXT_CLIP_FONT_PIXELS,
 					)
 					// Legacy clips (pre-metric model) carry a galley-height
@@ -746,7 +746,7 @@ slot.is_text = true
 						&text_clip_state.font_init,
 						scratch,
 						&slot.text_layout,
-						text_clip_reveal(clip),
+						clip.pieces,
 						font_px,
 					)
 					// Sample the tight ink horizontally (the width estimate is

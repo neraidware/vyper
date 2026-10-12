@@ -1338,8 +1338,10 @@ clip_marker_mut :: proc(c: ^Clip, i: int) -> ^Clip_Marker {
 clip_ranges_release :: proc(c: ^Clip) {
 	session_marker_release(c.markers)
 	keyframe_free_tracks(c.keyframe_tracks)
+	session_piece_release(c.pieces)
 	c.markers = Clip_Markers_Range{}
 	c.keyframe_tracks = Keyframe_Track_Range{}
+	c.pieces = Text_Pieces_Range{}
 }
 
 // delete_selected_clip_raw removes the selected clip (and, when it belongs to a
@@ -2706,6 +2708,7 @@ duplicate_track :: proc(index: int) {
 		c := src.clips[i]
 		c.markers = session_marker_share(&src.clips[i].markers)
 		c.keyframe_tracks = session_trk_share(&src.clips[i].keyframe_tracks)
+		c.pieces = session_piece_share(&src.clips[i].pieces)
 		c.clip_id = new_clip_id()
 		c.link_id = 0
 		append(&new_track.clips, c)
@@ -2731,6 +2734,7 @@ duplicate_clip :: proc(track_idx, index: int) -> int {
 	c := src^
 	c.markers = session_marker_share(&src.markers)
 	c.keyframe_tracks = session_trk_share(&src.keyframe_tracks)
+	c.pieces = session_piece_share(&src.pieces)
 	c.clip_id = new_clip_id()
 	c.link_id = 0
 	place := clip_timeline_end(src^)

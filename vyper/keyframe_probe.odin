@@ -342,6 +342,7 @@ when ODIN_DEBUG {
 		sp_right := sp
 		sp_right.markers = session_marker_share(&sp.markers)
 		sp_right.keyframe_tracks = session_trk_share(&sp.keyframe_tracks)
+		sp_right.pieces = session_piece_share(&sp.pieces)
 		keyframe_trim_tail(&sp, 40)
 		keyframe_trim_head(&sp_right, 40)
 		left_ok := false
@@ -1049,6 +1050,7 @@ when ODIN_DEBUG {
 		sp2r := sp2
 		sp2r.markers = session_marker_share(&sp2.markers)
 		sp2r.keyframe_tracks = session_trk_share(&sp2.keyframe_tracks)
+		sp2r.pieces = session_piece_share(&sp2.pieces)
 		keyframe_trim_tail(&sp2, 30)
 		keyframe_trim_head(&sp2r, 30)
 		sp_ok := false

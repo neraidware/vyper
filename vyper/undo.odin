@@ -92,6 +92,7 @@ clone_timeline :: proc(src: Timeline) -> Timeline {
 			nt.clips[j] = st.clips[j]
 			nt.clips[j].markers = session_marker_share(&st.clips[j].markers)
 			nt.clips[j].keyframe_tracks = session_trk_share(&st.clips[j].keyframe_tracks)
+			nt.clips[j].pieces = session_piece_share(&st.clips[j].pieces)
 		}
 		out.tracks[i] = nt
 	}

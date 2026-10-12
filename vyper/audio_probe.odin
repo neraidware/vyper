@@ -82,6 +82,7 @@ when ODIN_DEBUG {
 		for k in 1 ..< lanes {
 			clone := audio_clip^
 			clone.keyframe_tracks = session_trk_share(&audio_clip.keyframe_tracks)
+			clone.pieces = session_piece_share(&audio_clip.pieces)
 			clone.clip_id = new_clip_id()
 			clone.link_id = video_link
 			clone.markers = Clip_Markers_Range{}

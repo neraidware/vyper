@@ -233,17 +233,38 @@ Text_Reveal :: struct {
 	last:  int,
 }
 
-// text_clip_reveal is a Text clip's reveal window, with an unset one meaning
-// "all of it". A zeroed Text_Reveal would otherwise reveal nothing at all, which
-// is the opposite of the intent: the default has to BE the full range, so that a
-// clip nobody has animated reads as fully drawn and no sink has to special-case
-// it.
-text_clip_reveal :: proc(clip: ^Clip) -> Text_Reveal {
-	length := len(clip_name(clip))
-	if clip.text_reveal.last <= 0 && clip.text_reveal.first <= 0 {
-		return text_reveal_all(length)
+// text_clip_reveals is THE question the painter asks per character: does this
+// character get drawn?
+//
+// It is one function, not a lookup the caller assembles, because the rules it
+// encodes are exactly the ones that must not be re-derived per call site:
+//
+//   - a clip with NO pieces draws all of its text. That is the degenerate case
+//     of the same rule rather than a special one -- one piece covering
+//     everything -- which is what lets a text clip exist without anyone having
+//     authored pieces for it;
+//   - a character in a GAP between pieces draws nothing. Pieces are ordered and
+//     non-overlapping, so a gap is a run of text no piece claims, and inventing
+//     one would make "which piece owns this letter" answerable two ways;
+//   - otherwise the piece's OWN reveal decides, in piece-local coordinates.
+//
+// The walk is linear over a handful of pieces, not a map: pieces are ordered and
+// the painter visits characters in order.
+text_clip_reveals :: proc(pieces: Text_Pieces_Range, char_index: int) -> bool {
+	view := session_piece_view(pieces)
+	if len(view) == 0 {
+		return true
 	}
-	return clip.text_reveal
+	for piece in view {
+		if char_index < piece.start {
+			return false
+		}
+		if char_index < piece.start + piece.len {
+			local := char_index - piece.start
+			return text_reveal_contains(piece.reveal, local)
+		}
+	}
+	return false
 }
 
 // text_reveal_all is the "draw everything" range. It is deliberately not a
@@ -411,11 +432,12 @@ text_layout_into :: proc(
 // same reason the per-glyph `scratch` is passed in: the UI thread and the render
 // worker each keep their own, so neither races the other.
 //
-// `reveal` says which characters get drawn. The text is still LAID OUT whole —
-// kerning and advance of a hidden character affect the ones after it, so a
-// partially typed line does not reflow as it types — and only the glyphs outside
-// the window are skipped at paint time. The returned ink rect is therefore the
-// INKED rect, not the text's full extent, which is what a caller blits.
+// `pieces` says which characters get drawn, per piece (text_clip_reveals). The
+// text is still LAID OUT whole — the kerning and advance of a hidden character
+// affect the ones after it, so a partially typed line does not reflow as it
+// types — and only the glyphs no piece claims are skipped at paint time. The
+// returned ink rect is therefore the INKED rect, not the text's full extent,
+// which is what a caller blits.
 rasterize_title_into_buffer :: proc(
 	title: string,
 	buf: []u8,
@@ -424,7 +446,7 @@ rasterize_title_into_buffer :: proc(
 	font_init: ^bool,
 	scratch: []u8,
 	layout_glyphs: ^[dynamic]Text_Glyph,
-	reveal: Text_Reveal,
+	pieces: Text_Pieces_Range,
 	font_px: f32,
 ) -> (
 	ox: int,
@@ -443,7 +465,7 @@ rasterize_title_into_buffer :: proc(
 	left := max(int)
 	right := -max(int)
 	for glyph in layout.glyphs {
-		if !text_reveal_contains(reveal, glyph.char_index) {
+		if !text_clip_reveals(pieces, glyph.char_index) {
 			continue
 		}
 		start_x := cast(int)glyph.x + int(glyph.box[0])
@@ -608,7 +630,7 @@ rasterize_lines_into_buffer :: proc(
 			font_init,
 			scratch,
 			&line_layout,
-			text_reveal_all(len(lines[i])),
+			{},
 			px,
 		)
 		slots[i] = {

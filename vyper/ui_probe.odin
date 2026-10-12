@@ -3166,6 +3166,7 @@ when ODIN_DEBUG {
 			c := track.clips[i]
 			c.markers = session_marker_share(&track.clips[i].markers)
 			c.keyframe_tracks = session_trk_share(&track.clips[i].keyframe_tracks)
+			c.pieces = session_piece_share(&track.clips[i].pieces)
 			append(&saved_clips, c)
 		}
 		target := track.clips[1]

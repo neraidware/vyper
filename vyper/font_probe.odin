@@ -33,7 +33,7 @@ when ODIN_DEBUG {
 	// Odin closures cannot capture a block-scoped [dynamic] that the callee mutates,
 	// and because the reveal cases want to call it four times with different
 	// windows.
-	font_probe_ink_of :: proc(title: string, bw, bh: int, reveal: Text_Reveal) -> (ox, oy, ow, oh: int) {
+	font_probe_ink_of :: proc(title: string, bw, bh: int, pieces: Text_Pieces_Range) -> (ox, oy, ow, oh: int) {
 		buf := make([]u8, bw*bh*4)
 		defer delete(buf)
 		return rasterize_title_into_buffer(
@@ -45,7 +45,7 @@ when ODIN_DEBUG {
 			&font_probe_font_init,
 			font_probe_scratch,
 			&font_probe_glyphs,
-			reveal,
+			pieces,
 			48,
 		)
 	}
@@ -187,8 +187,15 @@ when ODIN_DEBUG {
 			}
 			font_probe_check(monotonic, "reveal: char_index must run 0..n-1 in layout order")
 
-			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, text_reveal_all(5))
-			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 0, last = 1})
+			// No pieces at all draws everything: the implicit single piece.
+			_, _, all_w, all_h := font_probe_ink_of(title, bw, bh, {})
+			// One piece over the whole text, revealing only its first character.
+			first_only := Text_Pieces_Range{}
+			session_piece_push(
+				&first_only,
+				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 1}},
+			)
+			_, _, one_w, one_h := font_probe_ink_of(title, bw, bh, first_only)
 			// Narrower, and no taller. Not "the same height": a round letter overshoots
 			// the baseline by a pixel, so "AV Wa" is legitimately 1px taller than the
 			// "A" alone -- the first assertion I wrote here failed on exactly that, and
@@ -201,7 +208,12 @@ when ODIN_DEBUG {
 				all_w,
 				all_h,
 			)
-			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 0, last = 0})
+			none_shown := Text_Pieces_Range{}
+			session_piece_push(
+				&none_shown,
+				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 0}},
+			)
+			_, _, zero_w, zero_h := font_probe_ink_of(title, bw, bh, none_shown)
 			font_probe_check(
 				zero_w == 0 && zero_h == 0,
 				"reveal: an empty window must paint no ink (got %dx%d)",
@@ -209,8 +221,18 @@ when ODIN_DEBUG {
 				zero_h,
 			)
 			// A window open from either end, not just the front.
-			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 1, last = 5})
-			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, Text_Reveal{first = 0, last = 4})
+			from_back := Text_Pieces_Range{}
+			session_piece_push(
+				&from_back,
+				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 1, last = 5}},
+			)
+			short_head := Text_Pieces_Range{}
+			session_piece_push(
+				&short_head,
+				Text_Piece{start = 0, len = 5, reveal = Text_Reveal{first = 0, last = 4}},
+			)
+			_, _, tail_w, _ := font_probe_ink_of(title, bw, bh, from_back)
+			_, _, head_w, _ := font_probe_ink_of(title, bw, bh, short_head)
 			font_probe_check(
 				tail_w < all_w && head_w < all_w,
 				"reveal: a window open from either end must be narrower than the whole (%d/%d/%d)",
@@ -226,6 +248,50 @@ when ODIN_DEBUG {
 				"reveal: laying out again after an empty paint must still measure the whole text (%d glyphs)",
 				len(after.glyphs),
 			)
+			session_piece_release(first_only)
+			session_piece_release(none_shown)
+			session_piece_release(from_back)
+			session_piece_release(short_head)
+
+			// --- two pieces, each revealing itself -----------------------------
+			// This is the case a clip-level reveal cannot express: one window over
+			// the whole text, and another over one word inside it. Both are the same
+			// kind of thing, which is the point -- a property lives on a piece.
+			split := Text_Pieces_Range{}
+			session_piece_push(
+				&split,
+				Text_Piece{start = 0, len = 3, reveal = Text_Reveal{first = 0, last = 3}},
+			)
+			session_piece_push(
+				&split,
+				Text_Piece{start = 3, len = 2, reveal = Text_Reveal{first = 0, last = 1}},
+			)
+			_, _, split_w, _ := font_probe_ink_of(title, bw, bh, split)
+			font_probe_check(
+				split_w > one_w && split_w < all_w,
+				"pieces: two independently revealed runs must land between one character and the whole (%d)",
+				split_w,
+			)
+			// The second piece's reveal is PIECE-LOCAL: it says "1 of this piece",
+			// and piece two starts at character 3. A clip-level range would have had
+			// to be rewritten to 3..4 here, which is the translation the piece's
+			// coordinates remove.
+			font_probe_check(
+				text_clip_reveals(split, 3) && !text_clip_reveals(split, 4),
+				"pieces: a piece-local reveal must index from the piece's own start",
+			)
+			// A character no piece claims draws nothing.
+			gap := Text_Pieces_Range{}
+			session_piece_push(
+				&gap,
+				Text_Piece{start = 0, len = 2, reveal = Text_Reveal{first = 0, last = 2}},
+			)
+			font_probe_check(
+				!text_clip_reveals(gap, 4),
+				"pieces: a character past the last piece must not be drawn",
+			)
+			session_piece_release(split)
+			session_piece_release(gap)
 		}
 
 		if font_probe_failed {
