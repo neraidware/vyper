@@ -83,6 +83,13 @@ jobs:
       # file dir* (vyper/vendor/ffmpeg/<lib>/<lib>.lib), then passes as an absolute file
       # to link.exe so /LIBPATH does NOT apply. So we must drop each import lib in
       # the exact vendor slot Odin expects, in addition to deps\lib (for SDL3).
+      # MSVC has to be on PATH before any step that shells out to a Microsoft
+      # tool, not just before the final build. The import libs below are written
+      # by dumpbin and lib, so this sits ahead of the downloads rather than
+      # immediately before the build.
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Download ffmpeg (prebuilt shared)
         shell: pwsh
         run: |
@@ -157,11 +164,6 @@ jobs:
           Expand-Archive -Path glslang.zip -DestinationPath deps\glslang
           "$PWD\deps\glslang\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           & "$PWD\deps\glslang\bin\glslang.exe" --version
-
-      # build.odin drives cl and lib on Windows, so MSVC has to be on PATH
-      # before it runs.
-      - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
 
       # The build is build.odin, the same program the dev machine and the nix
       # package use. It picks cl/lib and the MSVC link line by itself; the only
