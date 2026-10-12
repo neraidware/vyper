@@ -691,8 +691,20 @@ target_session_kf_probe() {
 	VYPER_SESSION_KF_PROBE=1 timeout 120 ./target/vyper
 }
 
+# The session lane-window arena check (session_lanes_probe.odin). Keyframe lanes
+# are a session window rather than an inline fixed array (session_lanes.odin), so
+# the probe pins what a window store owns that an inline array could not: freed
+# windows are reused, growth past a stranded span relocates intact, copy-on-write
+# separates a cloned window before a write, and releasing a shared window does not
+# free one its holder still addresses. Exits 0/1.
+target_session_lane_probe() {
+	require_fresh_binary session-lane-probe || return 1
+	VYPER_SESSION_LANE_PROBE=1 timeout 120 ./target/vyper
+}
+
 # The session track-row arena check (session_tracks_probe.odin). It pins bounded
-# reuse and both COW layers: track rows first, then their key ranges.
+# reuse and both COW layers: track rows first, then lane windows, then their key
+# ranges.
 target_session_trk_probe() {
 	require_fresh_binary session-trk-probe || return 1
 	VYPER_SESSION_TRK_PROBE=1 timeout 120 ./target/vyper
@@ -2204,7 +2216,7 @@ target_all() {
 	# present, so they cost a synthetic fixture on a headless box.
 	local failed=()
 	local t
-	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_scrub_follow audio_decode_integrity still_switch audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
+	for t in check build probe transform_probe geom_key_probe render_kf_probe render_live_probe timeline_probe session_str_probe session_kf_probe session_lane_probe session_trk_probe session_marker_probe dnd_probe action_log parity audio_rate image_probe image_decode_probe silent_playback audio_group_isolation audio_probe audio_mix_parity audio_drift_parity audio_stall_gap audio_node_latency audio_bus_prime audio_bus_rate_transition audio_scrub_exact audio_backward_scrub audio_scrub_follow audio_decode_integrity still_switch audio_seek_landing audio_clip_stretch audio_clip_tempo audio_clip_tempo_alignment audio_clip_tempo_alignment_valgrind audio_clip_pitch atempo_probe keyframe_probe yuv_exact gpu_nv12 gpu_composite opacity gpu_probe keyed_export zorder subtitle_probe proxy_probe smoke valgrind geom_key_valgrind undo_valgrind render_valgrind render_live_valgrind dnd_valgrind action_log_valgrind parity_valgrind; do
 		echo "=== $t ==="
 		# NOT `|| return 1`. An early bail made the FIRST failure hide every
 		# target after it, so `all` could print "everything green" while two dozen
@@ -2256,6 +2268,7 @@ main() {
 	timeline_probe) target_timeline_probe ;;
 	session_str_probe) target_session_str_probe ;;
 	session_kf_probe) target_session_kf_probe ;;
+	session_lane_probe) target_session_lane_probe ;;
 	session_trk_probe) target_session_trk_probe ;;
 	session_marker_probe) target_session_marker_probe ;;
 	dnd_probe) target_dnd_probe ;;
@@ -2307,7 +2320,7 @@ main() {
 	export_bench) target_export_bench ;;
 	all) target_all ;;
 	*)
-		echo "usage: $SELF [check|shaders|build|probe|transform_probe|session_str_probe|session_kf_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|zoom_skew <project.vyproj>|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
+		echo "usage: $SELF [check|shaders|build|probe|transform_probe|session_str_probe|session_kf_probe|session_lane_probe|session_trk_probe|session_marker_probe|geom_key_probe|render_kf_probe|geom_key_valgrind|undo_valgrind|timeline_probe|dnd_probe|action_log|action_log_valgrind|dnd_valgrind|parity_valgrind|keyframe_probe|image_probe|image_decode_probe|proxy_bg|silent_playback|zoom_skew <project.vyproj>|fuzz <project.vyproj> [iters] [seed]|audio_group_isolation|audio_probe|audio_export_audit|atempo_probe|audio_drift_parity|audio_stall_gap|audio_node_latency|audio_clip_tempo|audio_clip_tempo_alignment|audio_clip_tempo_alignment_valgrind|audio_bus_prime|audio_bus_rate_transition|audio_clip_pitch|audio_clip_stretch|audio_scrub_exact|audio_backward_scrub|audio_decode_integrity|still_switch|audio_seek_landing|yuv_exact|gpu_nv12|gpu_composite|opacity|gpu_probe|keyed_export|zorder|parity|subtitle_probe|proxy_probe|render_valgrind|smoke|valgrind|export_bench|footprint|all]" >&2
 		return 2
 		;;
 	esac

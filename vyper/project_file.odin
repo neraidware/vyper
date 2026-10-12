@@ -357,13 +357,17 @@ session_teardown :: proc() {
 	}
 	free_timeline(&timeline)
 	undo_free_all()
-	// Every Clip, marker and keyframe-track range dies with these session pools.
+	// Every Clip, marker, keyframe-track range and lane window dies with these
+	// session pools. The order is pool-innermost-first: a lane window's slots hold
+	// key ranges, so rewind the keys and the lanes before the track rows that
+	// carry the windows.
 	// Nothing above survives: live timeline and undo snapshots are released first.
 	// Pool resets are blind rewinds for the reason recorded in ~/Notes/Vyper/TODO.md
 	// S0 -- no Clip, snapshot or timeline outlives teardown, so there is nothing
 	// to invalidate beyond the bounds assert on the read side.
 	session_str_reset()
 	session_kf_reset()
+	session_lane_reset()
 	session_trk_reset()
 	session_marker_reset()
 	srt_cache_free_all()

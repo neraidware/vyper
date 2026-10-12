@@ -2129,8 +2129,7 @@ when ODIN_DEBUG {
 		scale_lane := Keyframe_Lane{}
 		session_kf_push(&scale_lane.keys, Keyframe{frame_off=0,value=1.0})
 		session_kf_push(&scale_lane.keys, Keyframe{frame_off=60,value=2.0,interp=.Elastic})
-		scale_track.lanes[0] = scale_lane
-		scale_track.lane_count = 1
+		session_lane_push(&scale_track.lanes, scale_lane)
 		// A section track: "crop" owns one scalar lane per edge, four curves side by
 		// side. This is what the packed [KF_PACK_MAX]f32 knot used to be, except the
 		// edges are separate keys with separate frames instead of four slots in one.
@@ -2144,9 +2143,8 @@ when ODIN_DEBUG {
 			if edge % 2 == 0 {
 				session_kf_push(&crop_lane.keys, Keyframe{frame_off=40,value=f32(edge)+1.5})
 			}
-			crop_track.lanes[edge] = crop_lane
+			session_lane_push(&crop_track.lanes, crop_lane)
 		}
-		crop_track.lane_count = 4
 
 		tr0 := Track {name = strings.clone("V1"), clips = make([dynamic]Clip, 0, 1)}
 		append(&tr0.clips, vclip)
@@ -2368,7 +2366,8 @@ when ODIN_DEBUG {
 			// The section track round-trips as four independent curves: arity from
 			// len(lanes), each lane holding its own scalar value.
 			crop_track := session_trk_view(c.keyframe_tracks, 1)
-			if keyframe_track_name(crop_track) != "crop" || crop_track.lane_count != 4 {
+			if keyframe_track_name(crop_track) != "crop" ||
+				keyframe_lane_count(crop_track) != 4 {
 				fmt.eprintf("[ui-probe] section track lane count mismatch\n")
 				ok = false
 			} else {

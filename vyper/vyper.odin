@@ -1018,17 +1018,20 @@ keyframe_resolve :: proc(r: Keyframe_Ref) -> (cl: ^Clip, keyframe_track: int, k:
 	if !found || r.keyframe_track < 0 || r.keyframe_track >= clip.keyframe_tracks.n {
 		return nil, -1, nil, false
 	}
-	track := session_trk_view_mut(&clip.keyframe_tracks, r.keyframe_track)
-	if r.keyframe_lane < 0 || r.keyframe_lane >= track.lane_count {
+	// One door for both COW steps: the picked key is addressed by (track, lane),
+	// and a lane pointer is only reachable once both the row and the window
+	// behind it are this clip's alone.
+	mutable_lane := keyframe_lane_at_mut(clip, r.keyframe_track, r.keyframe_lane)
+	if mutable_lane == nil {
 		return nil, -1, nil, false
 	}
-	keys := track.lanes[r.keyframe_lane].keys
+	keys := mutable_lane.keys
 	// A shared range COWs into a NEW window; without writing it back the track
 	// still addresses the old one and the pointer returned below is the only thing
 	// holding the copy -- every write through it is lost, which is what the
 	// shared-property interp pick measured.
 	session_kf_make_unique(&keys)
-	track.lanes[r.keyframe_lane].keys = keys
+	mutable_lane.keys = keys
 	return clip, r.keyframe_track, session_kf_at_ptr(keys, r.key), true
 }
 
@@ -2123,6 +2126,12 @@ main :: proc() {
 	when ODIN_DEBUG {
 		if skp, _ := os.lookup_env_alloc("VYPER_SESSION_KF_PROBE", context.temp_allocator); skp != "" {
 			session_kf_probe_run()
+			return
+		}
+	}
+	when ODIN_DEBUG {
+		if slp, _ := os.lookup_env_alloc("VYPER_SESSION_LANE_PROBE", context.temp_allocator); slp != "" {
+			session_lane_probe_run()
 			return
 		}
 	}

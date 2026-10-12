@@ -107,14 +107,21 @@ session_trk_clone_range :: proc(src: Keyframe_Track_Range) -> Keyframe_Track_Ran
 	off := session_trk_alloc(slots)
 	for i in 0..<src.n {
 		session_trk_rows[off+i] = session_trk_rows[src.first+i]
-		// The struct copy carries the lanes INLINE (they are a fixed slot array, not
-		// a heap buffer), so every row owns its own headers and a write-back through
-		// one row can never be visible through another. Only the key RANGES stay
-		// shared -- that is the COW, and it is the whole point: a copied track shares
-		// the key ARENA windows until one of them writes.
-		for lane in 0 ..< session_trk_rows[off+i].lane_count {
-			session_trk_rows[src.first+i].lanes[lane].keys.shared = true
-			session_trk_rows[off+i].lanes[lane].keys.shared = true
+		// The struct copy carries the LANES as a window, so the two rows now
+		// address one lane array. That is COW one level up from the keys: the
+		// copied track shares the lane window, and shares each key window inside
+		// it, until either writes. The first write to a lane goes through
+		// session_lane_at_ptr, which clones the window; the first write to a
+		// lane's keys goes through session_kf_make_unique.
+		lanes := &session_trk_rows[off + i].lanes
+		if lanes.n > 0 {
+			source_lanes := &session_trk_rows[src.first + i].lanes
+			lanes.shared = true
+			source_lanes.shared = true
+			view := session_lane_view(lanes^)
+			for lane in 0 ..< lanes.n {
+				view[lane].keys.shared = true
+			}
 		}
 	}
 	return Keyframe_Track_Range{first=off, slots=slots, n=src.n}

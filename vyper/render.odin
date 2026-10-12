@@ -668,8 +668,8 @@ keyframe_geom_any_lane_tracked :: proc(clip: ^Clip, def: Keyframe_Geom_Section) 
 		return false
 	}
 	track := session_trk_view(clip.keyframe_tracks, section_index)
-	for lane_index in 0 ..< track.lane_count {
-		if track.lanes[lane_index].keys.n > 0 {
+	for lane_index in 0 ..< keyframe_lane_count(track) {
+		if keyframe_lane_view(track, lane_index).n > 0 {
 			return true
 		}
 	}
@@ -718,7 +718,7 @@ keyframe_geom_lane_location :: proc(clip: ^Clip, name: string) -> (track, lane: 
 	if track_index < 0 {
 		return -1, -1, false
 	}
-	if lane_index >= session_trk_view(clip.keyframe_tracks, track_index).lane_count {
+	if lane_index >= keyframe_lane_count(session_trk_view(clip.keyframe_tracks, track_index)) {
 		return -1, -1, false
 	}
 	return track_index, lane_index, true

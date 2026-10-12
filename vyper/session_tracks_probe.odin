@@ -34,25 +34,33 @@ when ODIN_DEBUG {
 		lane := Keyframe_Lane{}
 		session_kf_push(&lane.keys, Keyframe{frame_off=10, value=1.0})
 		source := Keyframe_Track_Range{}
-		session_trk_push(&source, Keyframe_Track{name=session_str_intern("probe"), lane_count=1})
-		session_trk_view_mut(&source, 0).lanes[0] = lane
+		session_trk_push(&source, Keyframe_Track{name=session_str_intern("probe")})
+		session_lane_push(&session_trk_view_mut(&source, 0).lanes, lane)
 		copy := session_trk_share(&source)
 		session_trk_check(source.shared && copy.shared && source.first == copy.first,
 			"copy shares initial track span")
 		copy_track := session_trk_view_mut(&copy, 0)
 		session_trk_check(copy.first != source.first && !copy.shared,
 			"first write clones track rows only")
-		// The lanes are part of the cloned row (a fixed slot array, not a heap
-		// buffer), and the key range inside slot 0 is marked shared, so the source and
-		// the copy still address one key array until one of them writes.
+		// The lane WINDOW is part of the cloned row, and so is the key range inside
+		// it: source and copy address one lane array and one key array until one of
+		// them writes. Lane-window COW is the step above key COW, so the probe writes
+		// through keyframe_lane_at_mut to exercise both.
 		session_trk_check(
 			keyframe_lane_view(session_trk_view(source, 0), 0).shared &&
 			keyframe_lane_view(copy_track, 0).shared,
 			"track clone marks key ranges shared")
-		copy_lane := copy_track.lanes[0].keys
+		// The clip stands in for whatever holds the range, so the probe drives the
+		// production door rather than a private path: it resolves the TRACK row and
+		// then the LANE window, which is the step that did not exist when the lanes
+		// were inline.
+		holder: Clip
+		holder.keyframe_tracks = copy
+		copy_lane := keyframe_lane_at_mut(&holder, 0, 0).keys
 		session_kf_make_unique(&copy_lane)
 		session_kf_at_ptr(copy_lane, 0).value = 9.0
-		copy_track.lanes[0].keys = copy_lane
+		keyframe_lane_at_mut(&holder, 0, 0).keys = copy_lane
+		copy = holder.keyframe_tracks
 		session_trk_check(
 			session_kf_at(keyframe_lane_view(session_trk_view(source, 0), 0), 0).value == 1.0,
 			"key COW preserves source value")

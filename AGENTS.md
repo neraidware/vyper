@@ -228,6 +228,41 @@ addresses, lifetimes, and shares data. Everything else follows from it.
   the call site papering over it — so the next person finds the real
   problem, not another layer on top.
 
+## 3a. Wrong architecture is the defect. Rethink it; never shrink around it.
+
+**When the architecture is wrong, that is the thing to fix.** Not the constant,
+not the call site, not the guard that makes the symptom go away.
+
+- **A cheap fix that preserves a wrong architecture is debt with extra
+  steps.** Shrinking a bound, adding a branch, special-casing the input that
+  breaks — each one is a way of *not* fixing the shape, dressed as a fix. It
+  looks like progress and it is the opposite: the next person inherits the same
+  wrong shape plus a layer they have to reason about.
+- **So: understand the whole design before touching it.** Every change is
+  measured against the architecture it lands in, not against the line it
+  edits. Ask what the data actually is, what bounds it, who owns it, and what
+  the other subsystems assume — then change the shape to match. An answer that
+  only covers the site you were asked about is not an answer.
+- **The wrong shape is not neutral.** It costs on every access, it caps what
+  the system can ever do, and it misleads. A size that is 2x what any real
+  value needs is not a tuning miss, it is a design that has not decided what
+  the data is.
+- **Tidy code in service of a wrong architecture is the worst outcome**,
+  because it buys credibility for the shape. Clean, readable, obviously
+  correct — and built on a premise that does not survive contact with the
+  problem. Nobody will second-guess it.
+- **Architecture over tidiness, always.** When they conflict, the architecture
+  wins and the mess it leaves is the mess you actually have to work in.
+- **The tell:** you reached for the smallest change that made the symptom go
+  away, and you cannot say in one sentence why the shape is right. That
+  sentence not existing IS the finding — write it down, then change the shape
+  until the sentence is true.
+- **Do not preserve a constraint that is not real.** A rule written down is
+  not automatically a fact about the system. If the code says "this must own
+  no heap memory" while a neighbouring field already owns a session window,
+  the rule is stale and it is actively costing you the right design. Check
+  the rule against the code before obeying it.
+
 ## 3c. Boundaries should stay cheap to change
 
 - A module is a black box: keep its interface narrow enough that the

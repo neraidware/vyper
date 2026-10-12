@@ -148,15 +148,20 @@ when ODIN_DEBUG {
 		keyframe_set_key(&smp, "gain", 30, 8.0)
 
 		keyframe_set_lane_interp :: proc(clip: ^Clip, name: string, interp: Keyframe_Interp) {
-			if ti := keyframe_track_index(clip^, name); ti >= 0 {
-				track := session_trk_view_mut(&clip.keyframe_tracks, ti)
-				for lane in 0 ..< track.lane_count {
-					keys := track.lanes[lane].keys
-					session_kf_make_unique(&keys)
-					for k in 0 ..< keys.n {
-						session_kf_at_ptr(keys, k).interp = interp
+			if keyframe_track_index(clip^, name) >= 0 {
+				for track_index in 0 ..< clip.keyframe_tracks.n {
+					lane_count := keyframe_lane_count(
+						session_trk_view(clip.keyframe_tracks, track_index),
+					)
+					for lane_index in 0 ..< lane_count {
+						mutable_lane := keyframe_lane_at_mut(clip, track_index, lane_index)
+						session_kf_make_unique(&mutable_lane.keys)
+						keys := mutable_lane.keys
+						for key_index in 0 ..< keys.n {
+							session_kf_at_ptr(keys, key_index).interp = interp
+						}
+						mutable_lane.keys = keys
 					}
-					track.lanes[lane].keys = keys
 				}
 			}
 		}

@@ -515,8 +515,8 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 		// still hold a key in the new extent.
 		rebuilt: Keyframe_Track
 		rebuilt.name = source.name // pool handle
-		for lane in 0 ..< source.lane_count {
-			source_keys := source.lanes[lane].keys
+		for lane in 0 ..< keyframe_lane_count(source) {
+			source_keys := keyframe_lane_view(source, lane)
 			rescaled := Keyframe_Keys_Range{}
 			prev := i32(-1)
 			for ki in 0 ..< source_keys.n {
@@ -542,13 +542,12 @@ rescale_clip_keyframes :: proc(clip: ^Clip, old_len, new_len: i64) {
 				)
 			}
 			if rescaled.n > 0 {
-				rebuilt.lanes[rebuilt.lane_count] = Keyframe_Lane{keys = rescaled}
-				rebuilt.lane_count += 1
+				session_lane_push(&rebuilt.lanes, Keyframe_Lane{keys = rescaled})
 			} else {
 				session_kf_release(rescaled)
 			}
 		}
-		if rebuilt.lane_count > 0 {
+		if keyframe_lane_count(&rebuilt) > 0 {
 			session_trk_push(&out, rebuilt)
 		}
 	}

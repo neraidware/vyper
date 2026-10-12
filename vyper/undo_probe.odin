@@ -306,8 +306,8 @@ when ODIN_DEBUG {
 		undo_undo()
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
-			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Cubic,
-			"undo restores the mode the key had before the edit (default .Cubic)",
+			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Linear,
+			"undo restores the mode the key had before the edit (the .Linear default)",
 			fail,
 		)
 		undo_redo()
@@ -466,7 +466,7 @@ when ODIN_DEBUG {
 		interp, mixed, seen := keyframe_sel_interp()
 		rcheck(seen, "the aggregate saw the selection", fail)
 		rcheck(mixed, "keys that disagree aggregate as mixed", fail)
-		rcheck(interp == .Cubic, "the mixed aggregate reports the first key's mode (meaningless)", fail)
+		rcheck(interp == .Linear, "the mixed aggregate reports the first key's mode (meaningless)", fail)
 		// One lane -> the name is a shared header. Two lanes -> it is not, because a
 		// track name is a var identity and not a property.
 		_, same := keyframe_sel_same_lane()
@@ -498,7 +498,7 @@ when ODIN_DEBUG {
 		clip0 = &timeline.tracks[0].clips[0]
 		rcheck(
 			session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),1).interp == .Elastic &&
-				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).interp == .Cubic,
+				session_kf_at(keyframe_lane_view(session_trk_view(clip0.keyframe_tracks,0), 0),0).interp == .Linear,
 			"undo restores the per-key modes the set had before the pick",
 			fail,
 		)

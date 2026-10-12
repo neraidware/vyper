@@ -97,25 +97,37 @@ Keyframe_Track :: struct {
 	// owned by the session, so a track copy is a struct copy. Read through
 	// keyframe_track_name, match through keyframe_track_index.
 	name: Session_Str_Handle,
-	// lanes: this track's scalar key curves. Empty (lane_count 0) for a static
+	// lanes: this track's scalar key curves. Empty (n == 0) for a static
 	// property, one for a plain keyed property (gain), N for a keyed group
 	// (transform.x/.y, crop.l/.r/.t/.b). Slot i is the section's lane i, so a
-	// group keeps its order even when a middle lane has no keys.
+	// group keeps its order even when a middle lane has no keys -- which is why
+	// the lane store slides on erase rather than swapping.
 	//
-	// INLINE, not a [dynamic] array: a track row lives in a session POOL whose
-	// teardown is a blind rewind, so a row must own no heap memory of its own or
-	// the rewind leaks one buffer per row. That is not hypothetical -- a
-	// [dynamic] lanes field leaked 2168 bytes across two probes until this was
-	// measured rather than reasoned about.
-	lanes:      [Keyframe_Lane_Max]Keyframe_Lane,
-	lane_count: int,
+	// A SESSION WINDOW, not an inline array (session_lanes.odin). The old inline
+	// `[Keyframe_Lane_Max]Keyframe_Lane` was justified by a rule that is not
+	// real: it said a session-pool row "must own no heap memory of its own",
+	// while `keys` below has always been a session window, so the row already
+	// owned memory it did not store inline. What a row must not do is call the
+	// general allocator, because the session's teardown is a blind rewind --
+	// a different restriction, and one this store satisfies.
+	//
+	// What the inline array actually cost was SIZE: measured, a track row was 272
+	// bytes with the array inline and is 40 with a window (a 32-byte lane is still
+	// 32). Every track in the session paid the 232-byte difference, including a
+	// `gain` track's single lane and the static properties' zero. Lane
+	// count is structural -- `keyframe_geom_sections` is a compile-time table
+	// whose widest section is crop at 4, so the old bound of 8 was 2x over
+	// before anything was measured. Now a track with no lanes costs nothing, and
+	// lane_count is `lanes.n` rather than a second field that can disagree.
+	lanes: Keyframe_Lanes_Range,
 }
 
-// Keyframe_Lane_Max bounds a track's lane count. A lane count is structural, not
-// dynamic: it comes from the section table, a compile-time constant list whose
-// widest section is crop at 4. The bound is asserted at every site that grows the
-// list, so a wider section fails loudly instead of truncating a curve.
-Keyframe_Lane_Max :: 8
+// Keyframe_Lane_Max bounds a track's lane count, so a wider section fails loudly
+// instead of truncating a curve. It is an assert bound, not a storage bound: the
+// lanes live in a session window whose capacity grows on demand, so nothing is
+// sized by it any more. `keyframe_geom_sections` is the authority -- its widest
+// section, crop, is 4.
+Keyframe_Lane_Max :: 4
 
 // keyframe_track_name is the track's name. The result borrows the pool. Note this is
 // the KEYFRAME lane name, not a timeline Track's name -- both are called `name`
@@ -127,24 +139,102 @@ keyframe_track_name :: proc(t: ^Keyframe_Track) -> string {
 // --- lanes ------------------------------------------------------------------
 //
 // A track is a set of scalar LANES, one per keyed property it owns. The arity is
-// track.lane_count: a plain keyed property (gain) has one, a group (transform.x
-// / .y, or crop.l/.r/.t/.b) has several. This replaced a [KF_PACK_MAX]f32 payload
-// plus a runtime `mask` tag (~/Notes/Vyper/TODO.md); arity is now structural, so the
+// `lanes.n`: a plain keyed property (gain) has one, a group (transform.x / .y,
+// or crop.l/.r/.t/.b) has several. This replaced a [KF_PACK_MAX]f32 payload plus
+// a runtime `mask` tag (~/Notes/Vyper/TODO.md); arity is now structural, so the
 // scalar/packed class of bug is gone rather than merely guarded.
+//
+// The lanes live in a session window (session_lanes.odin), so every read and
+// write goes through these accessors rather than indexing `lanes` directly. That
+// is the whole point of the change: there is no longer an inline array to index,
+// and a caller that reaches for one cannot.
 
 // keyframe_lane_count is how many scalar key curves a track carries.
 keyframe_lane_count :: proc(t: ^Keyframe_Track) -> int {
-	return t.lane_count
+	return t.lanes.n
+}
+
+// keyframe_lane_at is lane `i`, read-only. Returns an empty lane when the track
+// has no such lane, so a caller iterating a group never has to bounds check
+// against a count it derived elsewhere.
+keyframe_lane_at :: proc(t: ^Keyframe_Track, i: int) -> Keyframe_Lane {
+	if i < 0 || i >= t.lanes.n {
+		return Keyframe_Lane{}
+	}
+	return session_lane_at(t.lanes, i)
+}
+
+// A MUTABLE lane is two ownership steps, and a signature that hides them is a
+// trap: hold a `^Keyframe_Track` and the lane's window cannot be resolved,
+// because resolving it may RELOCATE the row the pointer came from. Both doors
+// below therefore take the CLIP, and reach the row themselves -- in order,
+// every time:
+//
+//  1. session_trk_make_unique. The clip's track range may be shared with a copy
+//     or an undo snapshot, and resolving that clones the rows.
+//  2. session_lane_make_unique. The fresh row still addresses the ORIGINAL's
+//     lane window, and resolving that clones the window.
+//
+// A caller that took `session_trk_view_mut` first and asked for a mutable lane
+// after was editing the source row's bytes, not its own. That bug shipped once
+// already (keyframe_del_lane_key, which the probe caught the first time the UI
+// path deleted a key from a clip with undo history), which is why the steps live
+// here instead of at the call sites: a rule eight call sites must each remember
+// is a rule one of them will not.
+//
+// The returned pointer aims into the LANE store, which step 1 cannot move. It is
+// valid until the next edit to this track's lanes.
+keyframe_lane_at_mut :: proc(clip: ^Clip, track_index, lane: int) -> ^Keyframe_Lane {
+	if track_index < 0 || track_index >= clip.keyframe_tracks.n {
+		return nil
+	}
+	session_trk_make_unique(&clip.keyframe_tracks)
+	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
+	if lane < 0 || lane >= track.lanes.n {
+		return nil
+	}
+	session_lane_make_unique(&track.lanes)
+	return session_lane_at_ptr(track.lanes, lane)
+}
+
+// keyframe_lane_ensure_mut is keyframe_lane_at_mut for a lane that may not exist
+// yet: it grows the window to reach `lane` and returns it, asserting the section
+// bound so a wider section fails loudly instead of truncating a curve.
+//
+// Growth happens BEFORE the COW steps, on a window this track does not yet own
+// exclusively, so it resolves them first and re-borrows after each relocation:
+// session_trk_make_unique moves rows, session_lane_make_unique moves lanes, and
+// a borrow taken before either addresses memory that has moved.
+keyframe_lane_ensure_mut :: proc(clip: ^Clip, track_index, lane: int) -> ^Keyframe_Lane {
+	if track_index < 0 || track_index >= clip.keyframe_tracks.n {
+		return nil
+	}
+	// Sharing first, and BEFORE the borrow: the clip may be a copy whose rows
+	// another holder still addresses, and writing through those would edit both.
+	session_trk_make_unique(&clip.keyframe_tracks)
+	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
+	assert(
+		lane < Keyframe_Lane_Max,
+		"keyframe_lane_ensure_mut: a track cannot own more lanes than the section table defines",
+	)
+	// Grow to reach the lane by pushing empty lanes: slot i is the section's lane
+	// i, so a section keeps its slots even when a middle lane has no keys yet.
+	// The lane COUNT is `lanes.n`, so this is the only place a track's arity
+	// changes and it cannot drift from what is stored.
+	for lane >= keyframe_lane_count(track) {
+		session_lane_make_unique(&track.lanes)
+		session_lane_push(&track.lanes, Keyframe_Lane{})
+		track = session_trk_view_mut(&clip.keyframe_tracks, track_index)
+	}
+	session_lane_make_unique(&track.lanes)
+	return session_lane_at_ptr(track.lanes, lane)
 }
 
 // keyframe_lane_view is lane `i`'s keys, read-only. Returns an empty range when the
 // track has no such lane, so a caller iterating a group never has to bounds
 // check against a count it derived elsewhere.
 keyframe_lane_view :: proc(t: ^Keyframe_Track, i: int) -> Keyframe_Keys_Range {
-	if i < 0 || i >= t.lane_count {
-		return {}
-	}
-	return t.lanes[i].keys
+	return keyframe_lane_at(t, i).keys
 }
 
 // keyframe_lane_key reads one key by (track, lane, key index). It is the read side of
@@ -187,10 +277,10 @@ keyframe_track_index :: proc(clip: Clip, name: string) -> int {
 // pointer. Never retain returned pointer across a track/key store mutation.
 // `lane` selects which of the track's scalar curves to write.
 keyframe_key_mut :: proc(clip: ^Clip, track_index, lane, key_index: int) -> ^Keyframe {
-	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
-	assert(lane >= 0 && lane < track.lane_count, "keyframe_key_mut: lane out of range")
-	session_kf_make_unique(&track.lanes[lane].keys)
-	return session_kf_at_ptr(track.lanes[lane].keys, key_index)
+	mutable_lane := keyframe_lane_at_mut(clip, track_index, lane)
+	assert(mutable_lane != nil, "keyframe_key_mut: no such lane on this track")
+	session_kf_make_unique(&mutable_lane.keys)
+	return session_kf_at_ptr(mutable_lane.keys, key_index)
 }
 
 // keyframe_fill_snapshot copies `name`'s track into `dst` (a flat fixed array) up to
@@ -211,13 +301,13 @@ keyframe_fill_snapshot :: proc(clip: ^Clip, name: string, dst: []Keyframe) -> (n
 	// knows the group's lane order -- asking here would silently merge two curves
 	// into one array, so a group on this path is a bug and is caught.
 	assert(
-		track.lane_count <= 1,
+		keyframe_lane_count(track) <= 1,
 		"keyframe_fill_snapshot: a group track needs keyframe_geom_fill_snapshot (one lane), not the whole track",
 	)
-	if track.lane_count == 0 {
+	if keyframe_lane_count(track) == 0 {
 		return 0, 0
 	}
-	keys := session_kf_view(track.lanes[0].keys)
+	keys := session_kf_view(keyframe_lane_view(track, 0))
 	total = len(keys)
 	n = min(total, len(dst))
 	if n > 0 {
@@ -287,22 +377,10 @@ keyframe_set_lane_key_interp :: proc(
 		session_trk_push(&clip.keyframe_tracks, Keyframe_Track {name = session_str_intern(name)})
 		track_index = clip.keyframe_tracks.n - 1
 	}
-	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
-	// Sharing first: this clip may be a copy that shares its keys with the clip it
-	// came from, and writing before resolving that would edit both.
-	session_trk_make_unique(&clip.keyframe_tracks)
-	track = session_trk_view_mut(&clip.keyframe_tracks, track_index)
-	// Grow to reach the lane by bumping the count: slot i is the section's lane i,
-	// so a section keeps its slots even when a middle lane has no keys yet.
-	for lane >= track.lane_count {
-		assert(
-			track.lane_count < Keyframe_Lane_Max,
-			"keyframe_set_lane_key_interp: a track cannot own more lanes than the section table defines",
-		)
-		track.lane_count += 1
-	}
-	session_kf_make_unique(&track.lanes[lane].keys)
-	keys := track.lanes[lane].keys
+	// Both COW steps and the lane growth, in the one door that owns that order.
+	mutable_lane := keyframe_lane_ensure_mut(clip, track_index, lane)
+	session_kf_make_unique(&mutable_lane.keys)
+	keys := mutable_lane.keys
 	// Insertion point: last key at-or-before frame_off.
 	insert_position := 0
 	for insert_position < keys.n &&
@@ -316,7 +394,7 @@ keyframe_set_lane_key_interp :: proc(
 		// is the user's own setting and silently restraightening it to the default
 		// would flatten a curve as a side effect of editing one value.
 		session_kf_at_ptr(keys, insert_position - 1).value = value
-		track.lanes[lane].keys = keys
+		mutable_lane.keys = keys
 		return
 	}
 	// One call, replacing the append-a-sentinel-then-slide-the-tail dance. That
@@ -328,41 +406,44 @@ keyframe_set_lane_key_interp :: proc(
 		Keyframe {frame_off = frame_off, value = value, interp = interp},
 	)
 	// keys was re-windowed by the insert (the range can move); write it back so
-	// the lane's own range tracks the new window.
-	track = session_trk_view_mut(&clip.keyframe_tracks, track_index)
-	track.lanes[lane].keys = keys
+	// the lane's own range tracks the new window. The lane POINTER is still
+	// valid: the insert moved the key store, not the lane store.
+	mutable_lane.keys = keys
 }
 
 // keyframe_track_has_keys reports whether any lane of `track` still holds a key.
 // It is the liveness test for dropping a track: a section track with one keyed
 // lane must survive, which is why this asks the lanes rather than lane 0.
 keyframe_track_has_keys :: proc(track: ^Keyframe_Track) -> bool {
-	for lane in 0 ..< track.lane_count {
-		if track.lanes[lane].keys.n > 0 {
+	for lane in 0 ..< keyframe_lane_count(track) {
+		if keyframe_lane_view(track, lane).n > 0 {
 			return true
 		}
 	}
 	return false
 }
 
-// keyframe_track_release_lanes frees every exclusively-held key array a track owns.
-// A shared array stays session-owned because another clip may still address it.
+// keyframe_track_release_lanes frees what a track owns: its key arrays and then
+// the lane window they sit in. A shared array or window stays session-owned,
+// because another clip may still address it.
 //
-// It clears the slots rather than deleting a buffer: the lanes are a fixed array
-// inside the row, so there is nothing to free for them -- the row itself is a pool
-// slot, and the pool teardown is a blind rewind. That is precisely why the lanes
-// had to be inline: a heap-allocated lane array would survive the rewind as one
-// leaked buffer per track, which the memory gate measured at 2168 bytes across two
-// probes before this was fixed.
+// It releases in that order deliberately -- keys first, window second -- because
+// the window's slots are what those keys hang off, and the free list must not
+// hand the window's span to another track while key ranges still point into it.
+//
+// This is the proc that did NOT have to free the lanes when they were an inline
+// array. That is the whole of the old justification for inlining, and it was
+// never a memory-safety argument: it was "there is nothing to free", which is
+// what a fixed array always says, including when it is 2x oversized.
 keyframe_track_release_lanes :: proc(track: ^Keyframe_Track) {
-	for lane in 0 ..< track.lane_count {
-		keys := track.lanes[lane].keys
+	for lane in 0 ..< keyframe_lane_count(track) {
+		keys := keyframe_lane_view(track, lane)
 		if keys.slots > 0 && !keys.shared {
 			session_kf_release(keys)
 		}
-		track.lanes[lane] = {}
 	}
-	track.lane_count = 0
+	session_lane_release(track.lanes)
+	track.lanes = {}
 }
 
 // keyframe_del_key removes the key at frame_off from `name`'s lane 0, where
@@ -382,18 +463,21 @@ keyframe_del_lane_key :: proc(clip: ^Clip, name: string, lane, frame_off: i32) {
 	if track_index < 0 {
 		return
 	}
-	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
-	if lane >= 0 && lane < i32(track.lane_count) {
-		keys := track.lanes[lane].keys
-		session_kf_make_unique(&keys)
-		for i in 0 ..< keys.n {
-			if session_kf_at(keys, i).frame_off == frame_off {
-				session_kf_erase(&keys, i)
+	mutable_lane := keyframe_lane_at_mut(clip, track_index, int(lane))
+	if mutable_lane != nil {
+		session_kf_make_unique(&mutable_lane.keys)
+		keys := mutable_lane.keys
+		for key_index in 0 ..< keys.n {
+			if session_kf_at(keys, key_index).frame_off == frame_off {
+				session_kf_erase(&keys, key_index)
 				break
 			}
 		}
-		track.lanes[lane].keys = keys
+		mutable_lane.keys = keys
 	}
+	// Re-borrow: the door above may have cloned the track rows, so the borrow
+	// taken before it is addressing the source, not this clip.
+	track := session_trk_view_mut(&clip.keyframe_tracks, track_index)
 	if !keyframe_track_has_keys(track) {
 		// The lanes own their key arrays, and the deletion above only POPPED one:
 		// pop shortens without releasing the buffer, so the lane still holds a
@@ -617,10 +701,10 @@ keyframe_sample_lane :: proc(track: ^Keyframe_Track, lane: int, frame_off: i32, 
 // is its whole curve; a section's other lanes are sampled through
 // keyframe_sample_lane, which names the lane.
 keyframe_sample :: proc(track: ^Keyframe_Track, frame_off: i32, base: f32) -> (f32, bool) {
-	if track == nil || track.lane_count == 0 || track.lanes[0].keys.n == 0 {
+	if track == nil || keyframe_lane_count(track) == 0 || keyframe_lane_view(track, 0).n == 0 {
 		return base, false
 	}
-	return keyframe_sample_keys(session_kf_view(track.lanes[0].keys), frame_off, base)
+	return keyframe_sample_keys(session_kf_view(keyframe_lane_view(track, 0)), frame_off, base)
 }
 
 // keyframe_sample_for resolves `name` against the clip and samples at a TIMELINE
@@ -670,8 +754,8 @@ keyframe_rebuild_tracks :: proc(src: Keyframe_Track_Range, lo, hi: i32) -> Keyfr
 		// between two lanes' keys does not resurrect an empty one.
 		rebuilt: Keyframe_Track
 		rebuilt.name = source.name // pool handle
-		for lane in 0 ..< source.lane_count {
-			source_keys := source.lanes[lane].keys
+		for lane in 0 ..< keyframe_lane_count(&source) {
+			source_keys := keyframe_lane_view(&source, lane)
 			kept := Keyframe_Keys_Range{}
 			for i in 0 ..< source_keys.n {
 				k := session_kf_at(source_keys, i)
@@ -690,13 +774,12 @@ keyframe_rebuild_tracks :: proc(src: Keyframe_Track_Range, lo, hi: i32) -> Keyfr
 				}
 			}
 			if kept.n > 0 {
-				rebuilt.lanes[rebuilt.lane_count] = Keyframe_Lane{keys = kept}
-				rebuilt.lane_count += 1
+				session_lane_push(&rebuilt.lanes, Keyframe_Lane{keys = kept})
 			} else {
 				session_kf_release(kept)
 			}
 		}
-		if rebuilt.lane_count > 0 {
+		if keyframe_lane_count(&rebuilt) > 0 {
 			session_trk_push(&out, rebuilt)
 		}
 	}
@@ -743,8 +826,8 @@ keyframe_split_preserve_continuity :: proc(src: Keyframe_Track_Range, left: ^Cli
 		// the old packed-section skip unnecessary -- a section is no longer a knot with
 		// two arms, it is N independent curves, and each is handled by the scalar path
 		// already proven for `gain` (~/Notes/Vyper/TODO.md).
-		for li in 0 ..< st.lane_count {
-			keys := session_kf_view(st.lanes[li].keys)
+		for li in 0 ..< keyframe_lane_count(st) {
+			keys := session_kf_view(keyframe_lane_view(st, li))
 			// Only a lane straddling the cut can be severed by it. A lane whose keys
 			// are all before (or all after) the cut is holding, and its surviving half
 			// already agrees with the resting value -- seeding it would pin a constant
@@ -872,7 +955,7 @@ keyframe_trim_tail :: proc(clip: ^Clip, keep: i32) {
 keyframe_clip_rows :: proc(tracks: Keyframe_Track_Range) -> int {
 	rows := 0
 	for track_index in 0 ..< tracks.n {
-		rows += session_trk_view(tracks, track_index).lane_count
+		rows += keyframe_lane_count(session_trk_view(tracks, track_index))
 	}
 	return rows
 }
@@ -883,7 +966,7 @@ keyframe_clip_rows :: proc(tracks: Keyframe_Track_Range) -> int {
 keyframe_clip_row :: proc(tracks: Keyframe_Track_Range, row_index: int) -> (track, lane: int) {
 	remaining := row_index
 	for track_index in 0 ..< tracks.n {
-		n := session_trk_view(tracks, track_index).lane_count
+		n := keyframe_lane_count(session_trk_view(tracks, track_index))
 		if remaining < n {
 			return track_index, remaining
 		}
@@ -912,7 +995,7 @@ keyframe_clip_row_name :: proc(tracks: Keyframe_Track_Range, row: int) -> string
 
 // keyframe_file_track_lanes is how many file entries a track saves as.
 keyframe_file_track_lanes :: proc(tracks: Keyframe_Track_Range, track_index: int) -> int {
-	return session_trk_view(tracks, track_index).lane_count
+	return keyframe_lane_count(session_trk_view(tracks, track_index))
 }
 
 // keyframe_file_lane_name is the name a lane saves under: the section lane's

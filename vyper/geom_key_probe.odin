@@ -117,7 +117,7 @@ when ODIN_DEBUG {
 		// Name is interned; shared key ranges remain with their other holder. Every
 		// lane's array is released: a section track owns one per lane, and freeing
 		// only lane 0 would leak the rest.
-		for lane in 0 ..< tr.lane_count {
+		for lane in 0 ..< keyframe_lane_count(tr) {
 			keys := keyframe_lane_view(tr, lane)
 			if keys.slots > 0 && !keys.shared {
 				session_kf_release(keys)
@@ -830,18 +830,18 @@ when ODIN_DEBUG {
 			// empty lane 1 behind rather than compacting -- otherwise crop.t's key
 			// would land on crop.r's index.
 			crop_track_row := session_trk_view(cl.keyframe_tracks, crop_track)
-			crop_lane_count := crop_track_row.lane_count
-			crop_lanes := crop_track_row.lanes
+			crop_lane_count := keyframe_lane_count(crop_track_row)
 			geom_key_check(
 				crop_lane_count == 3,
 				"the sibling key must grow the lane list densely (got %d)",
 				crop_lane_count,
 			)
 			geom_key_check(
-				crop_lanes[1].keys.n == 0 && crop_lanes[2].keys.n == 1,
+				keyframe_lane_view(crop_track_row, 1).n == 0 &&
+					keyframe_lane_view(crop_track_row, 2).n == 1,
 				"the gap lane stays empty and the keyed lane holds its key (%d/%d)",
-				crop_lanes[1].keys.n,
-				crop_lanes[2].keys.n,
+				keyframe_lane_view(crop_track_row, 1).n,
+				keyframe_lane_view(crop_track_row, 2).n,
 			)
 			// The first edge's curve is untouched by the sibling's key.
 			lane_l_after := keyframe_lane_view(session_trk_view(cl.keyframe_tracks, crop_track), 0)

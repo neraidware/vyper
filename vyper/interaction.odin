@@ -1262,14 +1262,14 @@ commit_keyframe_drag :: proc() {
 		if !found {
 			continue
 		}
-		track := session_trk_view_mut(&cl.keyframe_tracks, track_index)
-		keys := track.lanes[lane_index].keys
-		session_kf_make_unique(&keys)
+		mutable_lane := keyframe_lane_at_mut(cl, track_index, lane_index)
+		session_kf_make_unique(&mutable_lane.keys)
+		keys := mutable_lane.keys
 		keys_view := session_kf_view(keys)
 		for key_index in 0 ..< len(keys_view) {
 			if keys_view[key_index].frame_off == s.final {
 				session_kf_view_mut(keys)[key_index].interp = s.interp
-				track.lanes[lane_index].keys = keys
+				mutable_lane.keys = keys
 				append(
 					&picked,
 					Keyframe_Ref{
