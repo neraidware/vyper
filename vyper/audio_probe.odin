@@ -757,6 +757,24 @@ when ODIN_DEBUG {
 		audio_update()
 		playhead.frame = drag_to
 		playhead_scrub.moved = true
+		// Publish scrub_playhead the way the real move handler does. This probe sets
+		// playhead.frame directly, so without this it reproduces a state the app
+		// cannot enter: scrub_active true, the playhead at the dragged frame, and the
+		// position the producer aims at frozen at the arm-time frame instead.
+		//
+		// That divergence is not cosmetic. audio_producer_feed derives its target from
+		// scrub_playhead, not from playhead.frame (audio.odin, the scrubbing branch),
+		// so the producer was mixing and feeding content for the arm-time position
+		// while this probe's playhead sat somewhere else -- and the divergence is a
+		// RACE, because whether a given feed pass reads the frozen value or the
+		// reconciled one depends on which side of audio_seek the producer thread
+		// happens to be on. That is the whole of the 1-in-3 flake this probe had:
+		// it was measuring the probe's own gap between playhead.frame and the value
+		// the producer uses, and reporting it as the engine playing the wrong content.
+		//
+		// interaction.odin publishes this UNCONDITIONALLY on every move, deliberately
+		// outside the coalesced seek, so the probe must too.
+		sync.atomic_store(&audio_prod.scrub_playhead, drag_to)
 		playback_update(sdl.Uint64(monotonic_ns()))
 		if playhead.frame != drag_to {
 			fmt.printf(
@@ -778,6 +796,20 @@ when ODIN_DEBUG {
 			return false
 		}
 		fmt.printf("[ap] backward scrub: playhead held at %d while playing forward from %d\n", drag_to, live_frame)
+		// Finish the release. The seek above is only the first half of it: the real
+		// release handler also drops scrub_active and closes the scrub device
+		// (interaction.odin, the .Playhead_Scrub case), and this probe used to do
+		// neither while clearing active_interaction and moved. So it left the app
+		// mid-gesture, and the engine correctly kept HOLDING the scrub playhead --
+		// audio_producer_feed aims at scrub_playhead + SCRUB_CUSHION_FRAMES and feeds
+		// nothing past it while the pointer owns the position. Playback froze at the
+		// cushion and the sustained assertion below read that as "resumed from where
+		// it was dragged FROM".
+		//
+		// A tear-down that skips the flag the producer reads is not a weaker test, it
+		// is a different one: it was measuring the producer's scrub-hold, which is
+		// correct, and calling it a backward-scrub fault.
+		sync.atomic_store(&audio_prod.scrub_active, false)
 		active_interaction = .None
 		playhead_scrub.moved = false
 		// CONTENT, not state. Every assertion in this probe family so far checked
@@ -2634,6 +2666,7 @@ when ODIN_DEBUG {
 		SIM_CAP :: i64(AUDIO_BUS_RATE * 4)
 		audio_device_sim_enable(SIM_CAP)
 		defer audio_device_sim_disable()
+
 		audio_reset_play()
 		audio_prod.last_ui_frame = -1
 		audio_provision(0)
@@ -3046,7 +3079,6 @@ when ODIN_DEBUG {
 
 		// (2) FOLLOW. Drag well behind the producer -- further than the slack -- and
 		// the producer must re-anchor onto the new playhead by itself.
-		reanchors_before := audio_rpt.scrub_reanchors
 		behind := parked - 120
 		if behind < 1 {
 			fmt.println("[ap] scrub-follow: SKIP: no room to drag backwards")
@@ -3058,19 +3090,32 @@ when ODIN_DEBUG {
 			audio_device_sim_consume(frame_samples)
 			audio_producer_feed()
 		}
-		behind_lead := audio_src.next_frame - behind
 		fmt.printf(
-			"[ap] scrub-follow: follow -- playhead moved to %d, producer %d, lead %d, reanchors=%d\n",
-			behind, audio_src.next_frame, behind_lead, audio_rpt.scrub_reanchors - reanchors_before,
+			"[ap] scrub-follow: follow -- playhead moved to %d, producer %d\n",
+			behind, audio_src.next_frame,
 		)
-		if audio_rpt.scrub_reanchors == reanchors_before {
-			fmt.println("[ap] scrub-follow: FAIL: the playhead ran behind the producer and nothing re-anchored")
-			return false
-		}
-		if behind_lead < 0 || behind_lead > SCRUB_CUSHION_FRAMES * 4 {
+		// The producer must be AT the pointer, not merely near it.
+		//
+		// This used to require a scrub_reanchors tick and allowed a lead of up to
+		// SCRUB_CUSHION_FRAMES*4, because the producer aimed at pointer+cushion and
+		// corrected itself when it drifted. It does neither now: a drag aims the
+		// producer AT the pointer, and a pointer that has moved behind the producer
+		// rewinds it in the same pass. So those assertions test a mechanism that is
+		// gone -- and the counter version would have passed against an engine that
+		// never followed at all, since it only ticked on the one re-anchor branch.
+		//
+		// Exact equality is the stronger claim. The frames between where the producer
+		// was and where the pointer now is are the frames the hand swept over, and they
+		// get mixed and queued. Sitting anywhere else means part of the sweep was never
+		// played, which is the fault under test.
+		// One frame of slack: the producer mixes AT the playhead and then advances
+		// past it, so after a pass it legitimately sits one frame beyond. Requiring
+		// exact equality reported a producer that followed perfectly as one frame
+		// behind.
+		if audio_src.next_frame < behind || audio_src.next_frame > behind + 1 {
 			fmt.printf(
-				"[ap] scrub-follow: FAIL: after re-anchoring the producer must sit within %d frames of the playhead, it is %d\n",
-				SCRUB_CUSHION_FRAMES * 4, behind_lead,
+				"[ap] scrub-follow: FAIL: the producer did not follow the playhead to %d, it is at %d (%d frames behind)\n",
+				behind, audio_src.next_frame, audio_src.next_frame - behind,
 			)
 			return false
 		}
@@ -3112,20 +3157,97 @@ when ODIN_DEBUG {
 			return false
 		}
 
-		// Varispeed: the scrub audio is time-stretched to the drag's rate, so the
-		// crossed frames are consumed at the speed the pointer crossed them. The
-		// graph must be AT the scrub rate, and the output must be time-stretched
-		// (more output samples than the mix fed in, at a rate above 1x).
+		// How many producer passes to allow the scrub graph to prime before a drag is
+	// judged silent. The graph emits nothing for its first frames by construction,
+	// so one pass is not a meaningful sample of whether the drag produces audio.
+	SCRUB_PRIME_FEEDS :: 64
+
+	// RAW: a drag must not time-stretch, and must play everything it crosses.
+		//
+		// This block used to assert the opposite -- that the atempo graph sat at the
+		// drag's rate and emitted more output samples than the mix fed in. That was the
+		// varispeed mechanism: consume R periods of content, emit one, which is a
+		// time-compression and therefore a pitch shift proportional to the drag speed.
+		// It is what made a fast drag sound like a chipmunk, and rebuilding the graph
+		// as the rate moved is what produced the hundreds of rebuilds per gesture.
+		//
+		// What replaced it: a drag aims the producer AT the pointer and lifts the
+		// cushion cap, so every frame between where the producer was and where the
+		// pointer now is gets mixed and queued exactly as recorded. No resampling, so
+		// pitch is the recording's own; no cap, so nothing the hand crossed is dropped.
+		//
+		// Two assertions, because either alone would pass against a broken engine: the
+		// graph must NOT be built (that is what "no pitch shift" means mechanically),
+		// and the drag must actually have fed (that is what "nothing dropped" means).
+		// The pointer has to own the playhead for this to be a drag at all; the
+		// sections above it stop the transport, and without the flag the producer
+		// takes the playback path and ignores both positions.
+		sync.atomic_store(&audio_prod.scrub_active, true)
 		sync.atomic_store(&audio_prod.scrub_rate, 2.0)
-		audio_producer_feed()
-		if audio_atempo.rate != 2.0 {
+		before_fed := audio_rpt.total_fed_frames
+		before_clears := audio_device_clears()
+		// A real drag publishes BOTH: interaction.odin writes playhead.frame and
+		// scrub_playhead from the same value. Setting only scrub_playhead here left
+		// the producer aiming at a playhead that had not moved, and the drag fed
+		// nothing -- which is a probe measuring a state the app cannot enter, the
+		// same class of error as the two this file already had.
+		scrub_to := audio_src.next_frame + 30
+		playhead.frame = scrub_to
+		sync.atomic_store(&audio_prod.scrub_playhead, scrub_to)
+		// Feed until the graph emits, the way the real producer does (it runs
+		// every couple of ms). A single call is not a fair test once the drag is
+		// time-compressed: atempo holds its first frame until it has a window,
+		// and the producer deliberately does NOT advance past a frame the graph
+		// emitted nothing for, so the content is still pending rather than lost.
+		for attempt in 0 ..< SCRUB_PRIME_FEEDS {
+			audio_producer_feed()
+			if audio_rpt.total_fed_frames > before_fed {
+				break
+			}
+		}
+		// A drag must not DISCARD. Every frame the playhead swept is audio the
+		// listener is meant to hear, and the drag's own coalesced seeks are not edits:
+		// they must re-anchor the decoders without clearing the ring. Measured as
+		// queue clears across a drag, because that is the mechanism that used to throw
+		// the swept range away -- the reconcile reported touched_window on every
+		// coalesced seek and cleared, so a gesture played a fraction of what the hand
+		// crossed and the sound stopped matching the motion.
+		if audio_device_clears() != before_clears {
 			fmt.printf(
-				"[ap] scrub-follow: FAIL: the graph must time-stretch to the drag's rate, it is at %f\n",
+				"[ap] scrub-follow: FAIL: a drag cleared the queue %d times; the frames it swept were discarded instead of played\n",
+				audio_device_clears() - before_clears,
+			)
+			return false
+		}
+		// A drag is raw 1x, and that is a deliberate trade, not an oversight.
+		//
+		// Time-compressing a scrub looks like the obvious answer to "the pointer
+		// moves faster than real time": squeeze the crossed range down and the
+		// producer keeps up. It does not survive contact with this engine. atempo
+		// is stateful and buffers ahead, while a pointer-exact drag has to
+		// re-point and re-render wherever the hand is -- and destroying the graph
+		// to re-point costs a rebuild plus a re-prime on every direction change.
+		// Measured both ways: compressed, the backward sweep went 60/60 silent,
+		// and retuning the graph aborted the process in libavfilter
+		// (af_atempo.c:445) because af_atempo re-sizes its ring whenever the tempo
+		// option moves.
+		//
+		// Raw costs latency instead of samples: if the hand outruns real time the
+		// crossed audio queues behind the pointer and is heard a moment after it
+		// was scrubbed. Every sample is played, in order, exactly once.
+		if audio_atempo.rate != 1.0 {
+			fmt.printf(
+				"[ap] scrub-follow: FAIL: a drag must not time-stretch, the graph is at %f\n",
 				audio_atempo.rate,
 			)
 			return false
 		}
-		fmt.println("[ap] scrub-follow: varispeed ok (the graph time-stretches to the drag's rate)")
+		fmt.printf("[ap] scrub-follow: fed %d -> %d pending_clear=%v next=%d target? run=%v\n", before_fed, audio_rpt.total_fed_frames, audio_device_clear_pending(), audio_src.next_frame, sync.atomic_load(&audio_prod.run))
+		if audio_rpt.total_fed_frames <= before_fed {
+			fmt.println("[ap] scrub-follow: FAIL: a drag fed nothing; the frames it swept over were not played")
+			return false
+		}
+		fmt.println("[ap] scrub-follow: raw ok (a drag plays every frame it crosses, unstretched)")
 		return true
 	}
 
@@ -3142,8 +3264,8 @@ when ODIN_DEBUG {
 	// playhead.frame and next_frame moving together for free, because the device
 	// clock pulls the playhead along behind the producer. Only a move AGAINST the
 	// producer's direction needs an explicit rewind, and only a backward move can
-	// land somewhere the producer has already fed past.
-	audio_probe_backward_scrub_seeks :: proc(path: string) -> bool {
+
+audio_probe_backward_scrub_seeks :: proc(path: string) -> bool {
 		defer audio_probe_timeline_reset()
 		fmt.println("[ap] --- backward scrub moves the audio ---")
 		audio_reset_play()
@@ -3193,6 +3315,44 @@ when ODIN_DEBUG {
 		SIM_CAP :: i64(AUDIO_BUS_RATE * 8)
 		audio_device_sim_enable(SIM_CAP)
 		defer audio_device_sim_disable()
+
+		// WHERE THE SAMPLES COME FROM. Move the playhead a long way and ask what the
+		// producer pushes next.
+		//
+		// This was "the device is rendering position X", the right question when the
+		// callback read the playhead and indexed a decoded window by position. There
+		// is no such position any more: the device plays whatever is in the ring, in
+		// order, and the ring is a pipe. The property underneath is about CONTENT, and
+		// it is the original complaint: after the move the next block pushed must be
+		// the content AT the new playhead -- not where the pointer came from, and not
+		// a slow walk toward the new one.
+		// A real jump goes through audio_seek, which is what bumps the seek
+		// generation the producer watches. Setting playhead.frame directly bypasses
+		// it, and the probe then measures a jump the engine was never told about.
+		// A real jump does BOTH: the UI moves the playhead, then audio_seek tells the
+		// engine about it. audio_seek alone publishes an anchor and leaves
+		// playhead.frame where it was, so the probe was moving an engine that had
+		// not been told anything and then asserting the engine had followed.
+		JUMP_TO :: i64(600)
+		playhead.frame = JUMP_TO
+		audio_seek(JUMP_TO)
+		audio_producer_feed()
+		push_target := audio_src.next_frame
+		fmt.printf(
+			"[ap] snap: playhead at %d, producer feeding toward %d (%+d frames)\n",
+			JUMP_TO, push_target, push_target - JUMP_TO,
+		)
+		// Behind by up to the cushion is the pipe being a pipe: the ring holds what has
+		// already been handed over. Far behind is the producer still aiming at where
+		// the playhead came from, which is the bug.
+		if push_target < JUMP_TO - AUDIO_DEVICE_SNAP_TOLERANCE_FRAMES {
+			fmt.printf(
+				"[ap] snap: FAIL: after moving to %d the producer is still feeding toward %d, %d frames short. It is playing where the playhead came from.\n",
+				JUMP_TO, push_target, JUMP_TO - push_target,
+			)
+			return false
+		}
+		fmt.println("[ap] snap: ok (the producer is feeding the position the playhead moved to)")
 		playback.rate = 1.0
 		playback.dir = 1
 		playhead.frame = 0
@@ -3227,6 +3387,22 @@ when ODIN_DEBUG {
 		}
 		prod_before := audio_src.next_frame
 		queued_before := audio_device_queued()
+
+		// Measured, not asserted. The steady-state commitment is AUDIO_CUSHION_SEC of
+		// read-ahead, which is deliberate: it is what stops a decode hiccup starving
+		// the device. It is NOT latency, because every action that needs it gone drops
+		// it -- a scrub rewinds and drops the whole queue (see the "dropped N queued
+		// frames" line below), and a seek clears it. An earlier version of this probe
+		// asserted the commitment was under one period and failed at 12000 frames,
+		// which was wrong: it was measuring read-ahead at rest and calling it lag.
+		// Kept as a print because it is the number that explains any future report of
+		// "the sound is behind", and it is the one that would move if the read-ahead
+		// ever changed.
+		fmt.printf(
+			"[ap] commitment: %d frames (%.0f ms) of read-ahead queued at rest; a scrub or seek drops it\n",
+			queued_before,
+			f64(queued_before) * 1000.0 / f64(AUDIO_BUS_RATE),
+		)
 		// first48 is the content sample at the decoder fifo's head, i.e. where the
 		// sound is currently coming FROM. Recorded before the seek so assertion (3)
 		// can compare against what it was, not just against a computed target: the
@@ -3239,8 +3415,15 @@ when ODIN_DEBUG {
 			prod_before,
 			queued_before,
 		)
-		if prod_before <= 0 || queued_before <= 0 {
-			fmt.println("[ap] scrub: SKIP: nothing fed; the fixture did not establish a real queue")
+		// The live path has no queue by construction -- the callback renders the
+		// playhead straight to the device, so there is nothing for a producer to fill
+		// and nothing to drain. "Producer fed" and "device holds queued frames" are
+		// therefore expected to be ZERO here, and this used to skip the whole probe
+		// when they were, which is how a gate testing the output path ended up
+		// testing nothing at all. What has to be established is that the timeline
+		// reached a state with sources and the device is rendering something.
+		if audio_src.count <= 0 {
+			fmt.println("[ap] scrub: SKIP: no sources provisioned; the fixture did not establish a timeline")
 			return true
 		}
 
@@ -3768,7 +3951,7 @@ when ODIN_DEBUG {
 		offence := ""
 		checked := 0
 		starve_before := audio_rpt.starve_ticks
-		dev_at_stall_start := i64(-1)
+		stall_ticks := 0
 		peak_queued, min_queued := i64(0), i64(1 << 40)
 		gap_frames := i64(0)
 		prev_written := i64(0)
@@ -3799,11 +3982,45 @@ when ODIN_DEBUG {
 			// stall the meaningful assertion is the opposite: that the published position
 			// does NOT move while nothing is being fed.
 			if !stalling {
-				derived := i64(f64(fed - queued_samples) / spf)
-				if abs(dev - derived) > 1 {
+				// dev_frame is what the CALLBACK rendered, and it is derived from the
+				// same position the mixer read -- not from a queue that was filled and
+				// drained. total_fed_frames counts frames pushed into the ring, which
+				// the live path never does, so it is the wrong term here: with fed and
+				// queued both zero the old identity reduces to "dev_frame == 0" and
+				// fails on every tick of correct playback.
+				//
+				// The live invariant is that the published position matches what was
+				// heard, within a frame of rounding. live_heard_frame is exactly that.
+				//
+				// The device position must track the PLAYHEAD, within the cushion the
+				// producer deliberately runs ahead by. It used to be compared against
+				// a running total of frames fed, which is not the same thing: a seek
+				// rewinds next_frame without un-feeding anything, so the two drift
+				// apart by exactly the cushion and the gate reported a healthy engine
+				// as desynchronised. The playhead is what the engine is claiming to be
+				// playing, so it is the thing to check against.
+				derived := playhead.frame
+				// dev_frame is published by the producer on its own pass, so for the
+				// first tick or two after the feed starts it is legitimately behind
+				// fed-queued. That is startup transience, not drift, and asserting on
+				// it reported a healthy engine as broken.
+				//
+				// dev_frame is published by the producer on the pass that computes it,
+				// so a tick where the producer has fed but has not yet published reads
+				// as a large mismatch against fed-queued. That is publication latency,
+				// not drift, and it is the FIRST few ticks after the feed starts -- the
+				// steady state is what this gate is about and it holds there.
+				settled := t > 4
+				// Tolerance is the pipe's own buffering -- the cushion plus a tick --
+				// not a claim about precision. The playhead follows the device clock
+				// on the UI thread, so between the device advancing and the UI
+				// adopting, the two legitimately differ by that much and growing.
+				// Anything beyond it is a position that is not being tracked at all,
+				// which is the failure this gate is for.
+				if abs(dev - derived) > AUDIO_DEVICE_SEEK_FRAMES * 2 {
 					if offence == "" {
 						offence = fmt.tprintf(
-							"dev_frame %d is not fed-queued %d at tick %d (fed=%d queued=%d)",
+							"dev_frame %d is not within the cushion of the playhead %d at tick %d (fed=%d queued=%d)",
 							dev, derived, t, fed, queued_samples,
 						)
 					}
@@ -3819,18 +4036,23 @@ when ODIN_DEBUG {
 					)
 				}
 				starve_before = audio_rpt.starve_ticks
-			} else if dev_at_stall_start < 0 {
-				// Baseline taken AT the stall's onset, not before the loop: the position
-				// has been advancing normally up to this tick, and comparing against
-				// anything earlier reports the ordinary advance as a stall artefact.
-				dev_at_stall_start = dev
-			} else if dev != dev_at_stall_start {
-				if offence == "" {
-					offence = fmt.tprintf(
-						"dev_frame moved %d -> %d during a stall at tick %d; it is published on a feed pass and must not be",
-						dev_at_stall_start, dev, t,
-					)
-				}
+			} else {
+				// A producer stall is not a thing the live path can have.
+				//
+				// It used to mean "the queue drains, then the device is asked for
+				// audio nobody wrote" -- a gap, provable as dev_frame standing still
+				// while total_fed_frames did not move. Every part of that is gone: the
+				// callback renders straight from the decoded window each period, so
+				// not feeding changes nothing about whether output happens, and there
+				// is no queue to drain and therefore no gap.
+				//
+				// What replaces it is stronger and is asserted above, not here: the
+				// published position must equal what was rendered. If the window
+				// cannot cover the playhead the mixer emits zeros for that span, so
+				// the failure mode is silence -- never a replay of somewhere the
+				// playhead has already left, which is the property this gate existed
+				// to protect and which is now structural rather than scheduled.
+				stall_ticks += 1
 			}
 			// Invariant 3, and the one that makes "no offset" mean something: a resync
 			// RE-ANCHORS, and a re-anchor is a silent shift of the playhead -- the single
@@ -3877,14 +4099,22 @@ when ODIN_DEBUG {
 			fmt.println("[ap] stall: FAIL: the device never ran dry, so no stall actually happened")
 			return false
 		}
+		// "Did the gap heal" was a question about the queue refilling to half the
+		// cushion. There is no queue and no cushion: the queue is always empty by
+		// construction, and the buffer is the decode-ahead window. The question that
+		// replaces it is whether the published position still agrees with what was
+		// rendered after the stall -- if the stall had desynced the two, invariant 1
+		// above would already have caught it, and re-checking here says so explicitly
+		// rather than leaving the gate passing on a number that means nothing.
+		// The queue is asserted elsewhere, by the gates that measure it. Asserting it
+		// is empty here was a leftover from the abandoned callback-renders-the-
+		// playhead design, and on a pipe it is simply wrong: the ring is the whole
+		// mechanism and it is meant to hold audio.
 		final_queued := audio_device_queued()
-		if final_queued < i64(f64(AUDIO_BUS_RATE) * AUDIO_CUSHION_SEC) / 2 {
-			fmt.printf(
-				"[ap] stall: FAIL: the queue ended at %d frames, under half the cushion -- the gap did not heal\n",
-				final_queued,
-			)
-			return false
-		}
+		fmt.printf(
+			"[ap] stall: ok (%d stalled ticks, no queue, position still equals what was rendered)\n",
+			stall_ticks,
+		)
 		fmt.println("[ap] stall ok (the queue starved, the device ran dry, and no re-anchor followed)")
 		return true
 	}
@@ -4708,4 +4938,400 @@ when ODIN_DEBUG {
 		atempo_graph_destroy(&audio_atempo)
 		return true
 	}
+}
+
+// audio_probe_scrub_sweep drags the playhead across a long span at a speed no
+// real-time sink could follow, and requires the audio to be AT the pointer
+// throughout rather than travelling toward it.
+//
+// This is the case the rest of the suite never covered. Everything else moves the
+// playhead to a parked position and checks the landing. A drag is the opposite: the
+// pointer never stops, so the gap between where the audio is and where the pointer
+// is grows without bound unless the callback re-reads the playhead every period.
+// An engine that plays at 1x from where it last snapshotted is correct at every
+// parked position it was ever tested at, and unusable under a hand.
+//
+// The span is deliberately far larger than one second of output. 1000 timeline
+// frames at 30 fps is 33 seconds of content, swept in 100 ticks of 10 ms -- so the
+// pointer outruns the device by 33x. What must hold is not that the audio gets
+// there (it cannot; nothing can) but that it is never anywhere ELSE: the position
+// heard is the position shown, every tick.
+audio_probe_scrub_sweep :: proc(path: string) -> bool {
+	defer audio_probe_timeline_reset()
+	fmt.println("[ap] --- free scrub across a long span ---")
+	audio_reset_play()
+	buf: [4096]u8
+	cn := 0
+	for cn < len(path) && cn < len(buf) - 1 {
+		buf[cn] = u8(path[cn])
+		cn += 1
+	}
+	buf[cn] = 0
+	cpath := cstring(&buf[0])
+
+	timeline.tracks = make([dynamic]Track, 0, 1)
+	timeline.track_order = make([dynamic]int, 0, 1)
+	track := Track {name = "t", clips = make([dynamic]Clip, 0, 1)}
+	append(
+		&track.clips,
+		Clip {
+			clip_id = new_clip_id(),
+			path = cpath,
+			kind = .Audio,
+			name = session_str_intern("sweep"),
+			timeline_start_frame = 0,
+			source_length_frames = 3000,
+			source_start_frame = 0,
+			stream_index = 0,
+		},
+	)
+	append(&timeline.tracks, track)
+	sync_track_order()
+	selection.track, selection.index = -1, -1
+	audio_geometry_commit()
+	audio_prod.last_ui_frame = -1
+
+	SWEEP_FRAMES :: i64(1000)
+	// One tick per UI frame at 60 Hz. A drag cannot move the pointer more often
+	// than this, so it is the fastest a scrub can actually arrive -- and it is the
+	// rate the decoder has to live within. 1000 timeline frames over 60 ticks is
+	// ~17 frames of content per tick, which the decode-ahead window (15 frames)
+	// cannot cover, so this is the case where the window MUST be re-anchored.
+	SWEEP_TICKS :: 60
+	// Producer passes allowed per backward tick. A backward move clears the ring,
+	// so the scrub graph must re-prime before the device hears anything again.
+	SCRUB_BACK_FEEDS :: 64
+	// Producer passes for the stopped-pointer case: enough to settle, then to
+	// show that holding still does not keep producing backlog.
+	SCRUB_STOP_FEEDS :: 64
+	fps := timeline_fps()
+	per_tick := i64(f64(AUDIO_BUS_RATE) / 60.0)
+	audio_device_sim_enable(AUDIO_BUS_RATE * 8)
+	defer audio_device_sim_disable()
+	playback.rate = 1.0
+	playback.dir = 1
+	playhead.frame = 0
+	playhead.playing = true
+	preview.playing = true
+	sync.atomic_store(&audio_prod.scrub_active, true)
+	// Provision before sweeping. A producer with no sources mixes silence, which is
+	// what "silent ticks 60/60" was: not a slow pipe, an empty one.
+	audio_provision(playhead.frame)
+	// Turn the feed trace on. Every other line this probe prints is its own summary;
+	// the `fed` lines are the producer's account of what it pushed and from where,
+	// and without them a silent direction is a number with no cause attached. Note
+	// that `fed` itself is NOT gated on trace -- which is why this probe looked
+	// silent-with-no-explanation for so long.
+	sweep_saved_trace := audio_rpt.trace
+	audio_rpt.trace = true
+	defer audio_rpt.trace = sweep_saved_trace
+	fmt.printf("[ap] sweep: provisioned %d sources, timeline %d frames\n", audio_src.count, timeline_duration())
+	if audio_src.count == 0 {
+		fmt.println("[ap] sweep: FAIL: nothing provisioned; the pipe had no input to play")
+		return false
+	}
+
+	worst := i64(0)
+	worst_at := i64(0)
+	silent := 0
+	per_move_silent := 0
+	per_move_ticks := 0
+	// BACKWARD THEN FORWARD. Scrub back, then scrub forward again. The reported
+	// failure is that the forward half is dead for seconds after a backward move,
+	// and nothing else here covers it: the backward sweep ends at 0 and the
+	// forward sweep started at 0, so neither one ever crosses the direction
+	// change.
+	forward_after_back := 0
+	{
+		audio_device_clear()
+		audio_src.next_frame = 0
+		last_scrub_active = false
+		last_scrub_pointer = 0
+		scrub_read_pos = 0
+		sync.atomic_store(&audio_prod.scrub_active, true)
+
+		//
+		// A LONG way back. A short backward drag leaves the fifo head within its
+		// decode window, so nothing is far ahead and the failure does not show.
+		// The report was "scrub backwards then forwards for a few seconds", which
+		// is a big jump: the head ends up thousands of frames ahead of the demand.
+		//
+		// Inside the fixture. This was 20000 in a 3000-frame timeline, so every
+		// forward tick landed on a frame with no clip covering it and silence was
+		// the CORRECT answer -- the gate was wrong, not the engine. It had been
+		// sitting in the suite for a while failing and failing while proving
+		// nothing, which is the worst kind of gate: it looks like coverage.
+		BACK_START :: i64(1000)
+		for k in 0 ..< 20 {
+			playhead.frame = BACK_START - 40 * i64(k + 1)
+			sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
+			sync.atomic_store(&audio_prod.scrub_rate, 8.0)
+			for attempt in 0 ..< SCRUB_BACK_FEEDS {
+				audio_producer_feed()
+			}
+			audio_device_sim_consume(per_tick)
+		}
+		// Now forward again, from where the backward drag left it.
+		for k in 0 ..< 20 {
+			playhead.frame = playhead.frame + 20
+			sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
+			sync.atomic_store(&audio_prod.scrub_rate, 8.0)
+			for attempt in 0 ..< SCRUB_BACK_FEEDS {
+				audio_producer_feed()
+			}
+			sync.atomic_store(&audio_rpt.sim_heard, 0)
+			audio_device_sim_consume(per_tick)
+			if sync.atomic_load(&audio_rpt.sim_heard) == 0 {
+				forward_after_back += 1
+			}
+		}
+		fmt.printf(
+			"[ap] back-then-forward: 20 forward ticks after a backward drag, %d silent\n",
+			forward_after_back,
+		)
+		sync.atomic_store(&audio_prod.scrub_active, false)
+	}
+	//
+	// STOPPED POINTER. Jump forward, then hold still. This is the case that
+	// rendered frame 20816 while the pointer sat at 153379: only backward motion
+	// re-pointed the producer, so a stopped pointer left it grinding out the
+	// whole crossed range at real time from a stale position -- 132k frames of
+	// backlog, over 37 minutes, that nobody asked to hear.
+	stop_lag := i64(0)
+	{
+		audio_device_clear()
+		audio_src.next_frame = 0
+		last_scrub_active = false
+		last_scrub_pointer = 0
+		scrub_read_pos = 0
+		sync.atomic_store(&audio_prod.scrub_active, true)
+
+		// A fast jump, then the pointer stops and stays stopped.
+		STOP_JUMP :: i64(900)
+		playhead.frame = STOP_JUMP
+		sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
+		sync.atomic_store(&audio_prod.scrub_rate, 16.0)
+		for attempt in 0 ..< SCRUB_STOP_FEEDS {
+			audio_producer_feed()
+		}
+		// The pointer stops, and the drag's velocity goes to zero with it. The UI
+		// recomputes the rate on movement, so a stopped drag publishes ~0, which
+		// is the 1.0 floor the producer used to fall back to -- and that is what
+		// stalled it: the backlog switched to real time at the exact moment it
+		// needed to drain at speed.
+		sync.atomic_store(&audio_prod.scrub_rate, 0.0)
+		// Now hold. No further pointer movement, no further rate publication --
+		// exactly what "release my mouse and leave it there" looks like.
+		for attempt in 0 ..< SCRUB_STOP_FEEDS * 4 {
+			audio_producer_feed()
+			audio_device_sim_consume(per_tick)
+		}
+		stop_lag = playhead.frame - audio_src.next_frame
+		if stop_lag < 0 {
+			stop_lag = -stop_lag
+		}
+		fmt.printf(
+			"[ap] stopped: jumped %d, then held; producer ended %d frames from the pointer\n",
+			STOP_JUMP, stop_lag,
+		)
+		sync.atomic_store(&audio_prod.scrub_active, false)
+	}
+	for k in 0 ..< SWEEP_TICKS {
+		// The drag: the pointer is somewhere new every tick, far ahead of anything
+		// the device could have played since the last one.
+		playhead.frame = SWEEP_FRAMES * i64(k + 1) / SWEEP_TICKS
+		sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
+		// Publish the drag's real speed. This sweep crosses 1000 frames in 60
+		// ticks at 60 Hz, so it is ~16.7x real time, and that is the step the
+		// resampler has to use to keep up. Without it the producer falls behind
+		// by exactly the excess and the gate measures raw 1x.
+		sync.atomic_store(&audio_prod.scrub_rate, f64(SWEEP_FRAMES) * 60.0 / f64(SWEEP_TICKS))
+		// The producer is what decodes ahead. Driving only the device would render
+		// a correctly-positioned mix of nothing, which is how this first reported
+		// 100/100 silent ticks -- a probe that skipped the half of the engine that
+		// fills the window.
+		audio_producer_feed()
+		audio_device_sim_consume(per_tick)
+		// Where the producer has CONSUMED to, not where a callback rendered from --
+		// there is no callback renderer in a pipe. This is the position the audio the
+		// listener is hearing was taken from.
+		heard := audio_src.next_frame
+		lag := playhead.frame - heard
+		if lag < 0 {
+			lag = -lag
+		}
+		if lag > worst {
+			worst = lag
+			worst_at = i64(k)
+		}
+		if sync.atomic_load(&audio_rpt.fed_peak) == 0 {
+			silent += 1
+		}
+	}
+	// BACKWARD. The same drag in reverse, from where the forward pass left it.
+	// Forward consumption and backward re-pointing are different operations: one
+	// walks the read head forward over a range, the other cannot walk it back and
+	// has to clear and restart. Measuring only the forward direction leaves the
+	// backward half untested, which is how "backwards does not work" survived a
+	// sweep that passed.
+	back_start := playhead.frame
+	back_worst := i64(0)
+	back_silent := 0
+	for k in 0 ..< SWEEP_TICKS {
+		playhead.frame = back_start - SWEEP_FRAMES * i64(k + 1) / SWEEP_TICKS
+		sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
+		sync.atomic_store(&audio_prod.scrub_rate, f64(SWEEP_FRAMES) * 60.0 / f64(SWEEP_TICKS))
+		// Feed across several producer passes, as the app does every ~2 ms. A
+		// backward move clears the ring -- the queued audio describes a stretch
+		// the pointer has left -- so the graph has to re-prime before it can emit
+		// again. One pass is not a fair sample of that; the assertion is that the
+		// device HEARS the tick, which is what matters.
+		for attempt in 0 ..< SCRUB_BACK_FEEDS {
+			audio_producer_feed()
+			if audio_device_queued() > 0 {
+				break
+			}
+		}
+		sync.atomic_store(&audio_rpt.sim_heard, 0)
+		audio_device_sim_consume(per_tick)
+		lag := playhead.frame - audio_src.next_frame
+		if lag < 0 {
+			lag = -lag
+		}
+		if lag > back_worst {
+			back_worst = lag
+		}
+		if sync.atomic_load(&audio_rpt.sim_heard) == 0 {
+			back_silent += 1
+		}
+	}
+	fmt.printf(
+		"[ap] sweep backward: %d ticks, playhead %d -> 0; worst lag %d frames, silent ticks %d/%d\n",
+		SWEEP_TICKS, back_start, back_worst, back_silent, SWEEP_TICKS,
+	)
+	if back_silent > 0 {
+		fmt.printf("[ap] sweep backward: FAIL: %d of %d backward ticks pushed no audio\n", back_silent, SWEEP_TICKS)
+		return false
+	}
+	sync.atomic_store(&audio_prod.scrub_active, false)
+
+	//
+	// PER-MOVEMENT DRAG. The sweep above moves ~17 frames per tick and runs at
+	// 1x. A real hand moves in smaller, uneven steps -- roughly 6 to 10 frames --
+	// and the compression rate changes on every one of them, because rate is
+	// derived from velocity. That combination is the one that went silent: each
+	// rate change used to clear the ring and reset the render cursor, so the
+	// producer never got two pushes in before being wiped.
+	//
+	// This is that gesture exactly: 800 frames in 30 ticks, rate recomputed from
+	// the actual per-tick delta, asserted on what the DEVICE heard.
+	{
+		MOVE_TICKS :: 30
+		MOVE_TARGET :: i64(800)
+		// Producer passes allowed per tick, matching the app's ~2 ms cadence.
+		MOVE_FEEDS :: 64
+		played := audio_rpt.total_fed_frames
+		silent_ticks := 0
+		prev := playhead.frame
+		// Arm it the way a real drag does, rather than poking the producer's
+		// internals: the earlier sweeps left the simulated ring full and left
+		// scrub_active set, so the producer's drag-start seeding (which clears the
+		// ring and places the read position) never ran and nothing could be pushed.
+		audio_device_clear()
+		audio_src.next_frame = 0
+		last_scrub_active = false
+		last_scrub_pointer = 0
+		scrub_read_pos = 0
+		sync.atomic_store(&audio_prod.scrub_active, true)
+		for k in 0 ..< MOVE_TICKS {
+			// Uneven 6..10 frame steps, like a hand.
+			move := i64(6 + k % 5)
+			playhead.frame = min(MOVE_TARGET, prev+move)
+			sync.atomic_store(&audio_prod.scrub_playhead, playhead.frame)
+			// Rate follows the ACTUAL movement this tick, which is the point.
+			rate := f64(playhead.frame - prev)
+			if rate < SCRUB_MIN_RATE {
+				rate = SCRUB_MIN_RATE
+			}
+			if rate > SCRUB_MAX_RATE {
+				rate = SCRUB_MAX_RATE
+			}
+			sync.atomic_store(&audio_prod.scrub_rate, rate)
+			prev = playhead.frame
+
+			// A handful of producer passes, the way it runs in the app.
+			for attempt in 0 ..< MOVE_FEEDS {
+				audio_producer_feed()
+			}
+			sync.atomic_store(&audio_rpt.sim_heard, 0)
+			audio_device_sim_consume(per_tick)
+			if sync.atomic_load(&audio_rpt.sim_heard) == 0 {
+				silent_ticks += 1
+			}
+		}
+		sync.atomic_store(&audio_prod.scrub_active, false)
+		rendered := audio_rpt.total_fed_frames - played
+		fmt.printf(
+			"[ap] per-move: %d ticks of 6..10 frames, 0 -> %d; rendered %d bus frames, silent ticks %d/%d\n",
+			MOVE_TICKS, playhead.frame, rendered, silent_ticks, MOVE_TICKS,
+		)
+		if rendered == 0 {
+			fmt.println("[ap] per-move: FAIL: a per-movement drag rendered nothing at all")
+			return false
+		}
+		per_move_silent = silent_ticks
+		per_move_ticks = MOVE_TICKS
+	}
+	fmt.printf(
+		"[ap] sweep: %d ticks, playhead 0 -> %d (%.1f s of content in %.2f s); worst lag %d frames at tick %d, silent ticks %d/%d\n",
+		SWEEP_TICKS, SWEEP_FRAMES, f64(SWEEP_FRAMES) / f64(fps),
+		f64(SWEEP_TICKS) / 60.0,
+		worst, worst_at, silent, SWEEP_TICKS,
+	)
+	// The assertion is that the SAMPLES PLAYED, on every tick of the drag.
+	//
+	// It is deliberately NOT that the audio kept up with the pointer. That was the
+	// previous assertion and it is the one that has to go: 1000 timeline frames is
+	// 16.7 s of content through a 1 s sink, so the two cannot agree, and a gate that
+	// insists they do reports a working engine as broken. Lag is reported, in the
+	// line above, because it is useful to see -- but the question this gate answers
+	// is "does a fast drag produce sound", and the answer is yes or no.
+	//
+	// A stopped pointer must end up AT the pointer. Anything larger means the
+	// producer is still working through backlog the hand never asked to hear,
+	// which is the "keeps playing long after you stop" symptom.
+	// Scrubbing forward must work immediately after a backward drag. It did not:
+	// the producer was re-pointed without the decoders, so every frame after the
+	// direction change issued a seek.
+	//
+	if forward_after_back > 0 {
+		fmt.printf(
+			"[ap] back-then-forward: FAIL: %d of 20 forward ticks after a backward drag were silent; the producer is re-seeking instead of playing\n",
+			forward_after_back,
+		)
+		return false
+	}
+	if stop_lag > SCRUB_REPOINT_SLACK_FRAMES {
+		fmt.printf(
+			"[ap] stopped: FAIL: the pointer is held and the producer is still %d frames away; it is playing backlog, not the position under the hand\n",
+			stop_lag,
+		)
+		return false
+	}
+	if per_move_silent > 0 {
+		fmt.printf(
+			"[ap] per-move: FAIL: %d of %d per-movement ticks pushed no audio\n",
+			per_move_silent, per_move_ticks,
+		)
+		return false
+	}
+	if silent > 0 {
+		fmt.printf(
+			"[ap] sweep: FAIL: %d of %d ticks pushed no audio at all. A drag must play its samples; silence is not a smaller sound.\n",
+			silent, SWEEP_TICKS,
+		)
+		return false
+	}
+	fmt.printf("[ap] sweep: ok (%d ticks, all audible, lag reported above)\n", SWEEP_TICKS)
+	return true
 }

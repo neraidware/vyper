@@ -73,7 +73,17 @@ Atempo_Graph :: struct {
 	sink:  ^avfilter.FilterContext,
 	stages: [ATEMPO_MAX_STAGES]^avfilter.FilterContext,
 	n_stages: int,
-	rate:  f64, // the rate the graph was built for
+	// retunable is true only for a graph built by atempo_graph_build_fixed, whose
+	// stage rings are sized for the MAXIMUM stage tempo.
+	//
+	// libavfilter sizes an atempo ring from the tempo the filter was CONFIGURED
+	// with and asserts read_size <= ring on every pull. A rate-sized graph can
+	// therefore never be retuned upward: the first retune past the rate it was
+	// built for aborts the process at af_atempo.c:445. Retuning is a capability
+	// of how the graph was built, so it is recorded here rather than inferred
+	// from n_stages, which every graph has.
+	retunable: bool,
+	rate: f64, // the rate the graph was last set to
 	// pitch_ratio is the FREQUENCY ratio applied by the asetrate/aresample stage: 1.0
 	// means no shift. Kept beside the tempo because the two compose in a fixed order --
 	// pitch first (duration-preserving), then tempo (duration-changing) -- and getting
@@ -154,6 +164,9 @@ atempo_graph_destroy :: proc(g: ^Atempo_Graph) {
 	g.output_total = 0
 	g.in_pool_i = 0
 	g.rate = 1.0
+	// A destroyed graph is nothing until something rebuilds it, and only a
+	// fixed build leaves it retunable.
+	g.retunable = false
 }
 
 // atempo_link_stage chained a new filter into the graph after `prev` and
@@ -378,6 +391,7 @@ atempo_graph_build_fixed :: proc(g: ^Atempo_Graph, stage_count: int) {
 	atempo_graph_destroy(g)
 	g.rate = 1.0
 	g.pitch_ratio = 1.0
+	g.retunable = true
 	// clamp into [1, ATEMPO_MAX_STAGES]; proc parameters are immutable in Odin.
 	n := clamp(stage_count, 1, ATEMPO_MAX_STAGES)
 
@@ -439,6 +453,11 @@ atempo_graph_build_fixed :: proc(g: ^Atempo_Graph, stage_count: int) {
 // own window for every rate this supports.
 atempo_rate_set_inplace :: proc(g: ^Atempo_Graph, rate: f64) -> bool {
 	if g.graph == nil || g.n_stages <= 0 {
+		return false
+	}
+	// Retuning a rate-sized graph aborts inside libavfilter, so it is refused
+	// here and the caller is expected to build a fixed graph instead.
+	if !g.retunable {
 		return false
 	}
 	r := rate

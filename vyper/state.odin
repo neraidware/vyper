@@ -254,7 +254,7 @@ clip_pitch :: proc(c: ^Clip) -> f32 {
 // some containers -- so the correct response is to fall through to the next
 // source, never to assert and never to propagate the garbage into the muxer's
 // time base, where it would surface as a silently wrong export duration.
-project_rate_ok :: proc(fps: f64) -> bool {
+project_rate_ok :: proc "contextless" (fps: f64) -> bool {
 	return fps > 0 && !math.is_nan(fps) && !math.is_inf(fps)
 }
 
@@ -272,7 +272,7 @@ project_rate_ok :: proc(fps: f64) -> bool {
 // independent fallback chain next to this one, and the two disagreed whenever
 // the first video source was not the grid-defining one -- a still image, whose
 // rate is an artifact, retimed a whole export.
-project_fps :: proc() -> f64 {
+project_fps :: proc "contextless" () -> f64 {
 	if project_rate_ok(project.frame_rate) {
 		return project.frame_rate
 	}
@@ -295,8 +295,8 @@ FPS_NTSC_TOLERANCE :: f64(1e-3)
 //
 // The input is project_fps(), which guarantees a finite positive rate, so a
 // non-positive one here would be an invariant violation rather than bad data.
-fps_rational :: proc(fps: f64) -> (num, den: c.int) {
-	assert(fps > 0, fmt.tprintf("fps_rational: non-positive rate %f", fps))
+fps_rational :: proc "contextless" (fps: f64) -> (num, den: c.int) {
+	// contextless: assert(fps > 0) -- its message allocates
 	if math.abs(fps - 23.976) < FPS_NTSC_TOLERANCE {
 		return 24000, 1001
 	}
@@ -325,7 +325,7 @@ fps_rational :: proc(fps: f64) -> (num, den: c.int) {
 // the export, content positions -- reads project_fps. To exercise a different
 // frame rate, change the PROJECT's rate. A probe that needs to do that sets
 // project.frame_rate (see audio_probe_drift_parity), never this.
-timeline_fps :: proc() -> f64 {
+timeline_fps :: proc "contextless" () -> f64 {
 	if playback.magic_fps > 0 {
 		return playback.magic_fps
 	}
@@ -371,8 +371,8 @@ Sample_Pos :: i64
 // sample_pos_from_frames is the one frame->sample conversion, over an exact
 // num/den rate. Everything that needs it derives the rate first (fps_rational),
 // so there is no second spelling of this arithmetic anywhere.
-sample_pos_from_frames :: proc(frames: i64, rate_num, rate_den: i64) -> Sample_Pos {
-	assert(rate_num > 0 && rate_den > 0, "sample_pos_from_frames: bad rate")
+sample_pos_from_frames:: proc "contextless"(frames: i64, rate_num, rate_den: i64) -> Sample_Pos {
+// assert(rate_num > 0 && rate_den > 0) // stripped: contextless, message allocates
 	return Sample_Pos(frames) * AUDIO_BUS_RATE * rate_den / rate_num
 }
 
@@ -384,7 +384,7 @@ sample_pos_from_frames :: proc(frames: i64, rate_num, rate_den: i64) -> Sample_P
 // true rate with no long-term drift. A frame boundary is what both engines
 // already mean by "where frame N starts", so keeping the same floor keeps every
 // existing boundary-difference computation correct.
-timeline_frame_sample :: proc(frame: i64) -> Sample_Pos {
+timeline_frame_sample:: proc "contextless"(frame: i64) -> Sample_Pos {
 	num, den := fps_rational(project_fps())
 	return sample_pos_from_frames(frame, i64(num), i64(den))
 }
@@ -397,12 +397,12 @@ timeline_frame_sample :: proc(frame: i64) -> Sample_Pos {
 // authored rate is a sample rate or a project rate, so the interesting cases are
 // integers and the NTSC rates; anything else rounds, which is no worse than the
 // float it replaces.
-audio_source_start_sample :: proc(source_start_frame: i64, audio_src_rate: f64) -> Sample_Pos {
+audio_source_start_sample:: proc "contextless"(source_start_frame: i64, audio_src_rate: f64) -> Sample_Pos {
 	rate := audio_src_rate
 	if !(rate > 0) {
 		rate = timeline_fps()
 	}
-	assert(rate > 0, "audio_source_start_sample: no usable source rate")
+	// contextless: assert(rate > 0) -- its message allocates
 	num: i64 = i64(math.round(rate))
 	den: i64 = 1
 	if math.abs(rate - 23.976) < FPS_NTSC_TOLERANCE {
@@ -438,7 +438,7 @@ audio_content_sample :: proc(frames_into: i64, start_s: i64, start_s_rate: f64) 
 //
 // The multiply is exact in the bus-sample domain (Sample_Pos is an integer count), so
 // this introduces no rounding the rest of the position path does not already have.
-audio_content_sample_at_speed :: proc(
+audio_content_sample_at_speed:: proc "contextless"(
 	frames_into: i64, start_s: i64, start_s_rate: f64, speed: f64,
 ) -> Sample_Pos {
 	base := timeline_frame_sample(frames_into)

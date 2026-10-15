@@ -1921,6 +1921,39 @@ target_audio_scrub_follow() {
 	echo "audio-scrub-follow: ok (scrubbing aims at and follows the playhead, and makes sound on a stopped transport)"
 }
 
+target_audio_scrub_sweep() {
+	require_fresh_binary audio-scrub-sweep || return 1
+	# 25 s of continuous tone. The sweep crosses 1000 timeline frames = 16.7 s of
+	# content, so a fixture shorter than that is mostly digital silence and the
+	# silence assertions measure the fixture rather than the engine. It took a
+	# 125 ms clicks file to produce a "silent ticks 60/60" that looked like an
+	# empty pipe and was a file with 125 ms of audio in it.
+	local src=target/scrubsweep/tone25s.wav
+	mkdir -p target/scrubsweep
+	if [ ! -s "$src" ]; then
+		dev ffmpeg -y -f lavfi -i "sine=frequency=440:sample_rate=48000:duration=25" \
+			-ac 2 -c:a pcm_s16le "$src" >/dev/null 2>&1 || return 1
+	fi
+	local out
+	if ! out=$(VYPER_AUDIO_SCRUB_SWEEP="$PWD/$src" timeout 300 ./target/vyper 2>&1); then
+		echo "$out" >&2
+		echo "audio-scrub-sweep: FAILED -- see the [ap] sweep lines above" >&2
+		return 1
+	fi
+	echo "$out" | grep -E '^\[ap\] sweep'
+	# Silent ticks are a hard fail, and deliberately so. The position assertions
+	# pass on a correctly-placed mix of nothing, so without this the gate would
+	# report a perfect scrub of pure silence.
+	echo "$out" | grep -qE 'silent ticks [0-9]+/[0-9]+' || true
+	local silent
+	silent=$(echo "$out" | sed -n 's/.*silent ticks \([0-9]*\)\/.*/\1/p')
+	if [ -n "$silent" ] && [ "$silent" -gt 0 ]; then
+		echo "audio-scrub-sweep: FAILED -- $silent of the drag's ticks rendered silence" >&2
+		return 1
+	fi
+	echo "audio-scrub-sweep: ok (the drag stayed audible and at the pointer)"
+}
+
 target_audio_backward_scrub() {
 	require_fresh_binary audio-backward-scrub || return 1
 	local src=target/mixparity/tempo_clicks_125ms.wav
@@ -2287,6 +2320,7 @@ main() {
 	audio_scrub_exact) target_audio_scrub_exact ;;
 	audio_scrub_follow) target_audio_scrub_follow ;;
 	audio_backward_scrub) target_audio_backward_scrub ;;
+	audio_scrub_sweep) target_audio_scrub_sweep ;;
 	still_switch) target_still_switch ;;
 	audio_decode_integrity) target_audio_decode_integrity ;;
 	audio_seek_landing) target_audio_seek_landing ;;

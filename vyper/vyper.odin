@@ -2339,6 +2339,14 @@ main :: proc() {
 			os.exit(ok ? 0 : 1)
 		}
 	}
+	// VYPER_AUDIO_SCRUB_SWEEP=<path> -- a long fast drag, which is the only case
+	// where the audio and the pointer can separate at all.
+	when ODIN_DEBUG {
+		if sw, _ := os.lookup_env_alloc("VYPER_AUDIO_SCRUB_SWEEP", context.temp_allocator); sw != "" {
+			ok: bool = audio_probe_scrub_sweep(sw)
+			os.exit(ok ? 0 : 1)
+		}
+	}
 	// VYPER_AUDIO_BACKWARD_SCRUB=<path> -- proves a playhead move reaches the AUDIO:
 	// the producer is rewound, the device queue dropped, and the decoder re-anchored
 	// at the new playhead's content. Separate from the playhead's own position,

@@ -610,7 +610,7 @@ keyframe_del_lane_key :: proc(clip: ^Clip, name: string, lane: string, frame_off
 // keyframe_ease maps normalized segment time t∈[0,1] for the closed-form easing
 // modes (.Cubic is a spline and is never routed here — keyframe_apply_interp
 // resolves it). Elastic may push past [0,1]: that overshoot is the point.
-keyframe_ease :: proc(interp: Keyframe_Interp, t: f32) -> f32 {
+keyframe_ease :: proc "contextless" (interp: Keyframe_Interp, t: f32) -> f32 {
 	switch interp {
 	case .Cubic:
 		// Hermite basis handles spline segments in keyframe_apply_interp.
@@ -648,7 +648,7 @@ keyframe_ease :: proc(interp: Keyframe_Interp, t: f32) -> f32 {
 // (value/frame). It is the natural end condition for the spline: a missing
 // neighbor defaults the tangent to the chord slope, which reduces cubic Hermite
 // to plain linear interpolation on that end.
-keyframe_chord_slope :: proc(a, b: Keyframe) -> f32 {
+keyframe_chord_slope :: proc "contextless" (a, b: Keyframe) -> f32 {
 	return (b.value - a.value) / f32(b.frame_off - a.frame_off)
 }
 
@@ -660,8 +660,8 @@ keyframe_chord_slope :: proc(a, b: Keyframe) -> f32 {
 // interpolates l→r with those tangents. Every other mode is l + (r−l)·keyframe_ease.
 // `span` is in frames and always > 0 (adjacent keys are strictly sorted and
 // distinct).
-keyframe_apply_interp :: proc(l, r: f32, t: f32, interp: Keyframe_Interp, m0, m1: f32, span: f32) -> f32 {
-	assert(span > 0)
+keyframe_apply_interp :: proc "contextless" (l, r: f32, t: f32, interp: Keyframe_Interp, m0, m1: f32, span: f32) -> f32 {
+	// contextless: assert(span > 0)) -- its message allocates
 	switch interp {
 	case .Cubic:
 		t2 := t * t
@@ -696,7 +696,7 @@ keyframe_apply_interp :: proc(l, r: f32, t: f32, interp: Keyframe_Interp, m0, m1
 //   - PAST the last key the track HOLDS its final value. A clip animated to a
 //     new position stays there for the rest of its span rather than snapping
 //     back to the pose it had before any key existed.
-keyframe_sample_keys :: proc(keys: []Keyframe, frame_off: i32, base: f32) -> (f32, bool) {
+keyframe_sample_keys :: proc "contextless" (keys: []Keyframe, frame_off: i32, base: f32) -> (f32, bool) {
 	if len(keys) == 0 {
 		return base, false
 	}

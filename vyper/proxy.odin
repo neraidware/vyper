@@ -1030,11 +1030,19 @@ proxy_pick_for_frame :: proc(
 		}
 		when ODIN_DEBUG {
 			if vyper_trace {
+				// The covered RANGE, not the whole table. A long timeline made
+				// this print hundreds of values per miss, which buried the one
+				// fact that matters -- where the gap starts and how far it runs.
+				covered: i64 = 0
+				if len(rc.idx.segs) > 0 {
+					covered = (i64(rc.idx.segs[len(rc.idx.segs) - 1]) + 1) * PROXY_SEG_FRAMES
+				}
 				fmt.printf(
-					"[pick] seg index %d not covered: len=%d segs=%v\n",
+					"[pick] segment %d (frame %d) is past the index: covered to frame %d of %d entries\n",
 					k,
+					i64(k) * PROXY_SEG_FRAMES,
+					covered,
 					len(rc.idx.segs),
-					rc.idx.segs,
 				)
 			}
 		}

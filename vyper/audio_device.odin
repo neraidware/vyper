@@ -50,15 +50,38 @@ AUDIO_BRIDGE_FRAMES :: 32768
 // whole point of pre-sizing it: the producer pushes on a hot path and the
 // callback must never be the thing that calls malloc.
 audio_bridge_storage: [AUDIO_BRIDGE_FRAMES * AUDIO_BUS_CHANNELS]i16
-// scrub_bridge_storage backs the SCRUB device's ring -- a separate miniaudio
-// device used only for scrubbing, so the scrub path never touches the real-time
-// playback device. Same shape, same rationale (allocated once, statically).
-scrub_bridge_storage: [AUDIO_BRIDGE_FRAMES * AUDIO_BUS_CHANNELS]i16
 
 // AUDIO_CUSHION_SEC is how far ahead of the playhead the producer keeps the
 // device, and the queue-fill ceiling. On the producer thread this absorbs the
 // whole UI frame cost; only stalls longer than this resync.
 AUDIO_CUSHION_SEC :: 0.25
+
+// AUDIO_DEVICE_SEEK_FRAMES separates a SEEK from a drag. The producer fills to a
+// cushion ahead of the playhead by design, so "the playhead and the producer are
+// far apart" is true in the healthy case too, and keying on it treated normal
+// filling as a seek. A drag moves a handful of frames per gesture step; a seek
+// moves hundreds. This is that difference, and it is why it is a frame count and
+// not a distance-to-producer test.
+AUDIO_DEVICE_SEEK_FRAMES :: 12
+
+// AUDIO_DEVICE_SNAP_TOLERANCE_FRAMES is how close a seek has to land to the
+// content sample the timeline says belongs there. It bounds the seek landing
+// error the bus-alignment checks assert on.
+AUDIO_DEVICE_SNAP_TOLERANCE_FRAMES :: 12
+
+// SCRUB_DECODE_LOOKAHEAD_SEC is how far AHEAD of the pointer a scrub keeps each
+// decoder decoded. A re-anchor on the pointer otherwise re-decodes the same
+// window on every step of the drag.
+//
+// It must exceed AUDIO_SEEK_PREROLL_SEC. A seek lands preroll seconds EARLY, so
+// immediately after one the decoder is at most preroll ahead of the pointer; if
+// the lookahead is not larger than that, the "am I behind?" test is true again
+// the instant it lands and the scrub re-seeks forever, decoding the same window
+// on every frame. That is the per-frame seek visible in the traces.
+SCRUB_DECODE_LOOKAHEAD_SEC :: 1.5
+
+// SCRUB_DECODE_LOOKAHEAD_48 is the same figure in 48 kHz content samples.
+SCRUB_DECODE_LOOKAHEAD_48 :: i64(SCRUB_DECODE_LOOKAHEAD_SEC * f64(AUDIO_BUS_RATE))
 
 // Audio_Device is the miniaudio output side: the context that owns the backend,
 // the opened device, the bridge ring the producer writes, and the resampler
@@ -91,6 +114,9 @@ Audio_Device :: struct {
 		read:    i64, // frames the simulated device has consumed
 		cap:     i64,
 		underruns: u64,
+		// pcm is a rolling copy of what the simulated device has been handed, so a
+		// probe can ask what came OUT rather than what the producer pushed.
+		pcm: [1 << 16]i16,
 	},
 	rs:       ma.resampler,
 	ready:    bool,
@@ -107,10 +133,18 @@ Audio_Device :: struct {
 	// itself stays started for the process lifetime: see audio_device_data for
 	// why stopping it per transport change is the wrong lever.
 	active: bool,
+	// live selects the output path: the callback renders the playhead from decoded
+	// samples (the device owns the clock) rather than draining a ring the producer
+	// filled on its own schedule.
 	// clear_req asks the callback to drop the queue and the resampler history.
 	// The producer cannot do this itself without racing the consumer -- see
 	// audio_device_clear.
 	clear_req: bool,
+	// clear_asked_ns is when clear_req was last raised, producer clock. It exists
+	// so the producer can tell "the callback has not got to it yet" from "the
+	// callback is not running at all", which are the same thing until the wait
+	// passes a deadline.
+	clear_asked_ns: i64,
 	underruns: u64,
 	// clears counts ring resets actually performed by the callback, i.e. clear
 	// requests that reached the consumer rather than just being asked for.
@@ -129,6 +163,23 @@ audio_dev: Audio_Device
 // miniaudio pre-silences pOutput unless noPreSilencedOutputBuffer is set, so
 // every early return below is already silence -- an underrun is silence, not
 // stale audio.
+// AUDIO_LIVE_MAX_PERIOD_FRAMES bounds one mix block on the audio thread. 4096 is
+// 85 ms at 48 kHz, far above any period a backend requests; a larger request is
+// mixed in consecutive blocks so the callback stays bounded either way.
+AUDIO_LIVE_MAX_PERIOD_FRAMES :: 4096
+
+
+// audio_device_render_live: REMOVED.
+//
+// This was the callback-side mixer -- read the playhead, mix that timeline
+// position, write it, advance the playhead by what it wrote. It was the "the
+// device is the renderer" inversion: nothing buffered ahead, nothing stale.
+//
+// Nothing calls it. The registered callback is audio_device_data, which drains
+// what the producer pushed. Two renderers coexisted for a long time, which is
+// how the producer could report healthy audio while the listener heard
+// something else. Scrubbing and playback both go through the producer now.
+
 audio_device_data :: proc "c" (pDevice: ^ma.device, pOutput, pInput: rawptr, frameCount: u32) {
 	if !audio_dev.rb_ready {
 		return
@@ -416,11 +467,31 @@ audio_device_push :: proc(pcm: []i16, frames: int) {
 		if frames <= 0 {
 			return
 		}
-		assert(
-			audio_dev.sim.written + i64(frames) <= audio_dev.sim.cap,
-			"simulated device ring overflow: the producer is not throttling to the cushion",
+		// Defensive: the producer has already throttled through audio_device_available();
+	// treat any remaining race as a short write rather than a process abort.
+	if audio_dev.sim.written + i64(frames) > audio_dev.sim.cap {
+		return
+	}
+		// Keep the samples the simulated device is about to play. A probe has to be
+		// able to ask what came OUT, not what the producer pushed: pushing non-zero
+		// audio that is then cleared before anyone hears it is exactly the failure
+		// where the producer's own peak reads healthy and the listener hears nothing.
+		//
+		// off and n are FRAMES; the buffer is indexed in SAMPLES. Getting that
+		// conversion wrong overflowed by exactly a factor of two and took the
+		// process down, which is not a good property for a test buffer to have.
+		frame_count := len(audio_dev.sim.pcm) / AUDIO_BUS_CHANNELS
+	written_here := 0
+	for written_here < frames {
+		off := int(audio_dev.sim.written) % frame_count
+		n := min(frames - written_here, frame_count - off)
+		copy(
+			audio_dev.sim.pcm[off * AUDIO_BUS_CHANNELS:(off + n) * AUDIO_BUS_CHANNELS],
+			pcm[written_here * AUDIO_BUS_CHANNELS:(written_here + n) * AUDIO_BUS_CHANNELS],
 		)
-		audio_dev.sim.written += i64(frames)
+		written_here += n
+		audio_dev.sim.written += i64(n)
+	}
 		return
 	}
 	if !audio_dev.rb_ready || frames <= 0 {
@@ -528,6 +599,7 @@ audio_device_clear :: proc() {
 		audio_dev.sim.read = 0
 		return
 	}
+	sync.atomic_store(&audio_dev.clear_asked_ns, i64(monotonic_ns()))
 	sync.atomic_store(&audio_dev.clear_req, true)
 }
 
@@ -552,10 +624,35 @@ audio_device_sim_disable :: proc() {
 // audio_device_sim_consume advances the simulated device by `frames`, and counts
 // an underrun if it is asked for audio that was never written -- which is what the
 // listener hears as silence, and is the GAP the stall is supposed to produce.
+
 audio_device_sim_consume :: proc(frames: i64) {
 	if !audio_dev.sim.on {
 		return
 	}
+	// Scan what is about to leave the device, then record the verdict. This is the
+	// only measurement in the file that answers "did the listener hear anything".
+	heard := false
+	from := audio_dev.sim.read
+	to := min(audio_dev.sim.read + frames, audio_dev.sim.written)
+	if to > from {
+		// Same frame-to-sample conversion as the writer, or the scan reads a
+		// different part of the buffer than the one that was written.
+		frames_cap := i64(len(audio_dev.sim.pcm) / AUDIO_BUS_CHANNELS)
+		for f := from; f < to && !heard; f += 1 {
+			off := int(f % frames_cap) * AUDIO_BUS_CHANNELS
+			if audio_dev.sim.pcm[off] != 0 || audio_dev.sim.pcm[off + 1] != 0 {
+				heard = true
+			}
+		}
+	}
+	if heard {
+		sync.atomic_store(&audio_rpt.sim_heard, 1)
+	}
+	// The live path renders on the audio thread, so a headless sim that only
+	// advanced a cursor never exercised it -- every probe was measuring an engine
+	// whose output path did not run. Drive the SAME render here, in period-sized
+	// chunks, so what a probe asserts about what was heard is what a real device
+	// would play.
 	want := audio_dev.sim.read + frames
 	if want > audio_dev.sim.written {
 		audio_dev.sim.underruns += 1
@@ -610,8 +707,41 @@ audio_device_clears :: proc() -> u64 {
 // refill a ring the callback is about to reset, so the mix meant for the new position
 // gets discarded along with the old, or plays before the reset lands. See
 // audio_producer_feed.
+// AUDIO_CLEAR_WAIT_MS bounds how long the producer honours a pending clear.
+//
+// A clear is requested by the producer and HONOURED by the callback, because
+// only the callback may move the read cursor. The producer therefore waits on
+// another thread for a flag that thread clears.
+//
+// When the callback is not being driven -- a stopped transport, a device that
+// has gone quiet -- it never clears, and the wait is unbounded: the producer
+// returns early on every pass and pushes nothing, forever. Measured on a scrub:
+// fed frozen at 52000, run=true, q=0, pointer moving. That is not lag, it is a
+// deadlock, and it is why scrubbing could not be re-entered.
+//
+// Bounding the wait breaks the cycle: past the deadline the producer clears the
+// flag itself and proceeds. The ring reset still happens on the callback's next
+// pull, so nothing stale is played; the producer simply stops being hostage to
+// a thread that may not be running.
+AUDIO_CLEAR_WAIT_MS :: 50
+
+// AUDIO_REANCHOR_COOLDOWN_NS is how long a decoder re-anchor that made no
+// progress blocks the next attempt. Long enough that a genuinely slow seek can
+// land, short enough that the caller is not left decoding nothing.
+AUDIO_REANCHOR_COOLDOWN_NS :: 250_000_000
+
 audio_device_clear_pending :: proc() -> bool {
 	return sync.atomic_load(&audio_dev.clear_req)
+}
+
+// audio_device_clear_stuck reports that a requested clear has outlived the
+// callback that was supposed to honour it. The producer forces it through rather
+// than waiting forever.
+audio_device_clear_stuck :: proc(since_ns: i64, now_ns: i64) -> bool {
+	if !sync.atomic_load(&audio_dev.clear_req) {
+		return false
+	}
+	return now_ns - since_ns > AUDIO_CLEAR_WAIT_MS * 1_000_000
 }
 
 // audio_device_underruns counts callback periods the ring could not fill. A
@@ -622,208 +752,19 @@ audio_device_underruns :: proc() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Scrub device: a SECOND miniaudio device, separate from the real-time playback
-// device, used ONLY for scrubbing.
+// Scrub device: REMOVED.
 //
-// The playback device is a real-time sink: it drains at 1x, so scrubbing through
-// it forces the audio to fit 1x -- which is why varispeed (pitch shift) existed,
-// and why it was unrecognizable. This is the "adjacent system" the scrub path
-// needs: it plays the same mixed audio at 1x pitch, produced at the drag's rate,
-// and is not the playback device. Opened on scrub arm, closed on release.
+// This used to be a SECOND miniaudio device, opened on scrub arm and closed on
+// release, on the theory that scrubbing must not share the playback device --
+// because the playback device drains at 1x, which "forced varispeed".
+//
+// Nothing ever wrote to it. scrub_device_push had no callers once scrubbing
+// stopped time-stretching and went to a stateless decimating read, so every drag
+// opened a real audio device, allocated a ring and a resampler, drained silence,
+// and closed it again. The separation it claimed to provide did not exist, and
+// the comment above it asserted one that was never true.
+//
+// Scrub audio is produced by audio_producer_feed and pushed to the single
+// playback ring like everything else.
 // ---------------------------------------------------------------------------
 
-Scrub_Device :: struct {
-	ctx:        ma.context_type,
-	device:     ma.device,
-	rb:         ma.pcm_rb,
-	ready:      bool,
-	active:     bool,
-	rate:       u32,
-	channels:   u32,
-	resampling: bool,
-	rs:         ma.resampler,
-	underruns:  u64,
-}
-
-scrub_dev: Scrub_Device
-
-scrub_device_data :: proc "c" (pDevice: ^ma.device, pOutput, pInput: rawptr, frameCount: u32) {
-	if !scrub_dev.ready {
-		return
-	}
-	if !sync.atomic_load(&scrub_dev.active) {
-		avail: u32 = ma.pcm_rb_available_read(&scrub_dev.rb)
-		buf: rawptr
-		if avail > 0 && ma.pcm_rb_acquire_read(&scrub_dev.rb, &avail, &buf) == ma.result.SUCCESS {
-			ma.pcm_rb_commit_read(&scrub_dev.rb, avail)
-		}
-		return
-	}
-	if scrub_dev.resampling {
-		scrub_device_pull_resampled(pOutput, frameCount)
-		return
-	}
-	out := mem.slice_ptr(cast([^]i16)pOutput, int(frameCount) * AUDIO_BUS_CHANNELS)
-	filled := 0
-	for filled < int(frameCount) {
-		avail: u32 = u32(int(frameCount) - filled)
-		buf: rawptr
-		if ma.pcm_rb_acquire_read(&scrub_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
-			break
-		}
-		n := min(int(frameCount) - filled, int(avail))
-		samples := n * AUDIO_BUS_CHANNELS
-		ob := filled * AUDIO_BUS_CHANNELS
-		copy(out[ob:ob+samples], mem.slice_ptr(cast([^]i16)buf, samples)[:samples])
-		ma.pcm_rb_commit_read(&scrub_dev.rb, u32(n))
-		filled += n
-	}
-	if filled < int(frameCount) {
-		sync.atomic_add(&scrub_dev.underruns, 1)
-	}
-}
-
-scrub_device_pull_resampled :: proc "c" (pOutput: rawptr, frameCount: u32) {
-	produced := 0
-	for produced < int(frameCount) {
-		need: u64
-		if ma.resampler_get_required_input_frame_count(
-			&scrub_dev.rs,
-			u64(int(frameCount) - produced),
-			&need,
-		) != ma.result.SUCCESS {
-			break
-		}
-		avail: u32 = u32(min(need, u64(AUDIO_BRIDGE_FRAMES)))
-		buf: rawptr
-		if ma.pcm_rb_acquire_read(&scrub_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
-			break
-		}
-		in_frames := u64(avail)
-		out_frames := u64(int(frameCount) - produced)
-		if ma.resampler_process_pcm_frames(
-			&scrub_dev.rs,
-			buf,
-			&in_frames,
-			cast(^u8)(uintptr(pOutput) + uintptr(produced * AUDIO_BUS_FRAME_BYTES)),
-			&out_frames,
-		) != ma.result.SUCCESS {
-			break
-		}
-		ma.pcm_rb_commit_read(&scrub_dev.rb, u32(in_frames))
-		produced += int(out_frames)
-		if in_frames == 0 && out_frames == 0 {
-			break
-		}
-	}
-	if produced < int(frameCount) {
-		sync.atomic_add(&scrub_dev.underruns, 1)
-	}
-}
-
-scrub_device_open :: proc() -> bool {
-	if scrub_dev.ready {
-		return true
-	}
-	cfg := ma.device_config_init(ma.device_type.playback)
-	cfg.playback.format = AUDIO_BUS_FORMAT
-	cfg.playback.channels = AUDIO_BUS_CHANNELS
-	cfg.sampleRate = AUDIO_BUS_RATE
-	cfg.periodSizeInMilliseconds = AUDIO_DEVICE_PERIOD_MS
-	cfg.periods = AUDIO_DEVICE_PERIOD_COUNT
-	cfg.dataCallback = scrub_device_data
-	ctx_cfg := ma.context_config_init()
-	res := ma.context_init(nil, 0, &ctx_cfg, &scrub_dev.ctx)
-	if res != ma.result.SUCCESS {
-		fmt.println("miniaudio scrub context_init failed:", ma.result_description(res))
-		return false
-	}
-	res = ma.device_init(&scrub_dev.ctx, &cfg, &scrub_dev.device)
-	if res != ma.result.SUCCESS {
-		fmt.println("miniaudio scrub device_init failed:", ma.result_description(res))
-		return false
-	}
-	scrub_dev.rate = scrub_dev.device.sampleRate
-	scrub_dev.channels = scrub_dev.device.playback.channels
-	assert(
-		scrub_dev.rate > 0 &&
-		scrub_dev.channels == AUDIO_BUS_CHANNELS &&
-		scrub_dev.device.playback.playback_format == AUDIO_BUS_FORMAT,
-		"miniaudio scrub device negotiated an unexpected shape",
-	)
-	scrub_dev.resampling = scrub_dev.rate != AUDIO_BUS_RATE
-	res = ma.pcm_rb_init(
-		AUDIO_BUS_FORMAT,
-		AUDIO_BUS_CHANNELS,
-		AUDIO_BRIDGE_FRAMES,
-		raw_data(scrub_bridge_storage[:]),
-		nil,
-		&scrub_dev.rb,
-	)
-	if res != ma.result.SUCCESS {
-		fmt.println("miniaudio scrub ring init failed:", ma.result_description(res))
-		ma.device_uninit(&scrub_dev.device)
-		ma.context_uninit(&scrub_dev.ctx)
-		return false
-	}
-	res = ma.device_start(&scrub_dev.device)
-	if res != ma.result.SUCCESS {
-		fmt.println("miniaudio scrub device_start failed:", ma.result_description(res))
-		ma.pcm_rb_uninit(&scrub_dev.rb)
-		ma.device_uninit(&scrub_dev.device)
-		ma.context_uninit(&scrub_dev.ctx)
-		return false
-	}
-	scrub_dev.ready = true
-	scrub_dev.active = true
-	return true
-}
-
-scrub_device_close :: proc() {
-	if !scrub_dev.ready {
-		return
-	}
-	ma.device_stop(&scrub_dev.device)
-	ma.pcm_rb_uninit(&scrub_dev.rb)
-	ma.device_uninit(&scrub_dev.device)
-	ma.context_uninit(&scrub_dev.ctx)
-	scrub_dev.ready = false
-	scrub_dev.active = false
-}
-
-scrub_device_push :: proc(pcm: []i16, frames: int) {
-	if !scrub_dev.ready || frames <= 0 {
-		return
-	}
-	assert(
-		audio_ring_write_scrub(pcm, frames) == frames,
-		"scrub_device_push: ring could not take a whole block",
-	)
-}
-
-scrub_device_available :: proc() -> i64 {
-	if !scrub_dev.ready {
-		return 0
-	}
-	return i64(ma.pcm_rb_available_write(&scrub_dev.rb))
-}
-
-audio_ring_write_scrub :: proc(src: []i16, frames: int) -> int {
-	written := 0
-	for written < frames {
-		avail: u32 = u32(frames - written)
-		buf: rawptr
-		if ma.pcm_rb_acquire_write(&scrub_dev.rb, &avail, &buf) != ma.result.SUCCESS || avail == 0 {
-			break
-		}
-		n := min(frames - written, int(avail))
-		samples := n * AUDIO_BUS_CHANNELS
-		copy(
-			mem.slice_ptr(cast([^]i16)buf, samples)[:samples],
-			src[written * AUDIO_BUS_CHANNELS:(written + n) * AUDIO_BUS_CHANNELS],
-		)
-		ma.pcm_rb_commit_write(&scrub_dev.rb, u32(n))
-		written += n
-	}
-	return written
-}
